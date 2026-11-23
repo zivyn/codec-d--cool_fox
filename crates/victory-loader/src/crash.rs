@@ -153,6 +153,11 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
+                if let Some(len) = clwb_len(code.cast::<[u8; 15]>().read_unaligned()) {
+                    // A write-back hint: the PC's memory is coherent, so it has nothing to do.
+                    context.Rip += len as u64;
+                    return true;
+                }
                 let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
@@ -163,6 +168,33 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         context.Rip += 3;
     }
     true
+}
+
+/// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
+/// Ice Lake lack: its length, or `None` for any other instruction.
+fn clwb_len(code: [u8; 15]) -> Option<usize> {
+    let at = if code[1] & 0xf0 == 0x40 { 2 } else { 1 };
+    if code[0] != 0x66 || code[at] != 0x0f || code[at + 1] != 0xae {
+        return None;
+    }
+    let modrm = code[at + 2];
+    let (mode, rm) = (modrm >> 6, modrm & 7);
+    if mode == 3 || (modrm >> 3) & 7 != 6 {
+        return None;
+    }
+    let mut len = at + 3;
+    let mut base = rm;
+    if rm == 4 {
+        base = code[len] & 7;
+        len += 1;
+    }
+    len += match mode {
+        0 if rm == 5 || (rm == 4 && base == 5) => 4,
+        1 => 1,
+        2 => 4,
+        _ => 0,
+    };
+    Some(len)
 }
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
@@ -455,6 +487,24 @@ mod tests {
             .collect();
         let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
         assert_eq!(ours, system);
+    }
+
+    #[test]
+    fn clwb_lengths() {
+        let pad = |b: &[u8]| {
+            let mut c = [0u8; 15];
+            c[..b.len()].copy_from_slice(b);
+            c
+        };
+        assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])), Some(8)); // [rax+disp32]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])), Some(8)); // [rip+disp32]
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
+        assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
+        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form
     }
 
     #[test]

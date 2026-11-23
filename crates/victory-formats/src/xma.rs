@@ -53,7 +53,8 @@ pub struct Packet {
 }
 
 pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
-    let b = data.get(index * PACKET_BYTES..index * PACKET_BYTES + 4)?;
+    let start = index.checked_mul(PACKET_BYTES)?;
+    let b = data.get(start..)?.get(..4)?;
     let h = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     Some(Packet {
         frames: h >> 26,
@@ -1110,6 +1111,12 @@ mod tests {
         for i in n..5 * n {
             assert!((out[i] - signal[i]).abs() < 1e-3, "{i}: {} vs {}", out[i], signal[i]);
         }
+    }
+
+    #[test]
+    fn packet_rejects_out_of_range_indices_and_partial_headers() {
+        assert!(packet(&[0; 4], usize::MAX / PACKET_BYTES + 1).is_none());
+        assert!(packet(&[0; 3], 0).is_none());
     }
 
     #[test]

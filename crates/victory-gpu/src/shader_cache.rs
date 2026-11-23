@@ -36,13 +36,25 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file.
+/// What identifies this build: the BLAKE3 of our executable file and of
+/// the translation settings it runs with (the loop limit, which a
+/// diagnostics build can change at run time).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
         let exe = std::env::current_exe().and_then(std::fs::read);
+        let limit = victory_shader::emit::loop_limit();
+        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+            tracing::warn!(
+                limit,
+                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+            );
+        }
         match exe {
-            Ok(bytes) => *blake3::hash(&bytes).as_bytes(),
+            Ok(mut bytes) => {
+                bytes.extend_from_slice(&limit.to_le_bytes());
+                *blake3::hash(&bytes).as_bytes()
+            }
             Err(e) => {
                 // Without it no entry can be trusted: a fresh key per run.
                 tracing::warn!(error = %e, "cannot read our executable; shader cache unused");

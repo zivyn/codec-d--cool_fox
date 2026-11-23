@@ -183,6 +183,10 @@ struct Lower<'a> {
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
     ballots: HashMap<Value, (V, V)>,
+    /// Masks whose ballot is being built: a mask whose lane bit needs its
+    /// own value as a number (an opaque mask keyed by a dword it shares
+    /// with another) would otherwise recurse until the stack overflows.
+    balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
@@ -472,6 +476,7 @@ impl<'a> Lower<'a> {
             },
             mask_ok: false,
             ballots: HashMap::new(),
+            balloting: HashSet::new(),
             def_block: p
                 .blocks
                 .iter()
@@ -1161,7 +1166,12 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                let bit = self.boolean(m, at)?;
+                if !self.balloting.insert(lo) {
+                    return Err("a lane mask whose lanes depend on its own value");
+                }
+                let bit = self.boolean(m, at);
+                self.balloting.remove(&lo);
+                let bit = bit?;
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self

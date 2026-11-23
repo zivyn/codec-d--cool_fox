@@ -609,12 +609,13 @@ mod tests {
     fn emulated_sse4a_length_0_is_64_bits() {
         let mut xmm = [reg(0, 0); 16];
         xmm[0] = reg(0x1122_3344_5566_7788, 0);
-        // extrq xmm0, length 0 (64), index 8
+        // extrq xmm0, length 0 (64), index 0. A non-zero index with
+        // length 64 goes past bit 63, and AMD leaves that result undefined.
         assert_eq!(
-            emulate(&[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x08], 0, &mut xmm),
+            emulate(&[0x66, 0x0f, 0x78, 0xc0, 0x00, 0x00], 0, &mut xmm),
             Some(6)
         );
-        assert_eq!(low(&xmm, 0), 0x0011_2233_4455_6677);
+        assert_eq!(low(&xmm, 0), 0x1122_3344_5566_7788);
         // insertq xmm0, xmm1, length 0 (64), index 0
         xmm[1] = reg(0xdead_beef_cafe_f00d, 0);
         assert_eq!(

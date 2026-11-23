@@ -471,14 +471,3 @@ mod tests {
         ));
     }
 }
-
-#[cfg(test)]
-mod dbg_tls {
-    #[test]
-    fn dump_tls() {
-        let data = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-        let info = super::ImageInfo::parse(&data).unwrap();
-        eprintln!("TLS = {:?}", info.tls);
-        eprintln!("image_base = {:x}", info.image_base);
-    }
-}

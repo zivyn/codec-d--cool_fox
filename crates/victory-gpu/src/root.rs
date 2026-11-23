@@ -221,20 +221,20 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn host_serialized_blobs_create_root_signatures() {
-        #[repr(C)]
-        struct Constants {
-            kind: u32,
-            register: u32,
-            space: u32,
-            count: u32,
-            visibility: u32,
-        }
-        let parameter = Constants {
-            kind: 1,
-            register: 0,
-            space: 0,
-            count: 1,
-            visibility: 0,
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_ROOT_CONSTANTS, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+            D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS, D3D12_SHADER_VISIBILITY_ALL,
+        };
+        let parameter = D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
         };
         let desc = Desc {
             parameter_count: 1,

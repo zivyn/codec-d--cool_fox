@@ -1013,8 +1013,10 @@ impl<'a> Lower<'a> {
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
         self.s.inputs.iter().enumerate().find_map(|(id, e)| {
             let r = e.row?;
+            // `then`, not `then_some`: the channel is only past `col` when
+            // the condition holds.
             (r == u32::from(row) && channel >= e.col && channel < e.col + e.cols)
-                .then_some((id, channel - e.col))
+                .then(|| (id, channel - e.col))
         })
     }
 

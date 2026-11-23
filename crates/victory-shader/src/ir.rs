@@ -806,8 +806,18 @@ fn effects(
                 regs(c, &mut w)?;
             }
             match name {
-                "v_swap_b32" => regs(&v.src[0], &mut w)?,
-                "v_swaprel_b32" => indexed(&v.src[0], &mut w)?,
+                "v_swap_b32" => {
+                    regs(&v.src[0], &mut w)?;
+                    if let Some(d) = &v.dst {
+                        regs(d, &mut r)?;
+                    }
+                }
+                "v_swaprel_b32" => {
+                    indexed(&v.src[0], &mut w)?;
+                    if let Some(d) = &v.dst {
+                        indexed(d, &mut r)?;
+                    }
+                }
                 _ => {}
             }
             if name.starts_with("v_interp_") || src_indexed || dst_indexed {

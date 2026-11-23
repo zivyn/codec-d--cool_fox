@@ -35,8 +35,8 @@ impl PreparedImage {
 ///
 /// * `IMAGE_FILE_DLL` set, entry point cleared: the OS maps it like a DLL
 ///   and calls nothing;
-/// * import directory made empty and bound-import directory cleared: we bind imports
-///   ourselves, using `info.imports` from the original;
+/// * import, bound-import and IAT directories cleared: we bind the original
+///   IAT slots ourselves, using `info.imports`;
 /// * TLS callback pointer cleared: the OS still allocates static TLS for
 ///   the image, but callbacks only run when we call them (after binding);
 ///   its base relocation is made a no-op so the 0 survives a rebase;
@@ -64,20 +64,12 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         dll_characteristics,
     )?;
 
-    // Windows 10 can read the import directory when an IAT is still
-    // advertised. Point it at the empty descriptor that ends the table.
-    if let Some(at) = layout::data_directory_offset(&bytes, dir::IMPORT) {
-        let terminator = import_terminator(&bytes, &info, at);
-        write_u32(&mut bytes, at, terminator.unwrap_or(0))?;
-        write_u32(
-            &mut bytes,
-            at + 4,
-            terminator.map_or(0, |_| IMPORT_DESCRIPTOR_SIZE),
-        )?;
-    }
-    if let Some(at) = layout::data_directory_offset(&bytes, dir::BOUND_IMPORT) {
-        write_u32(&mut bytes, at, 0)?;
-        write_u32(&mut bytes, at + 4, 0)?;
+    // Clear the IAT directory along with the import directory for Windows 10.
+    // The slots themselves stay in the image for our binder.
+    for index in [dir::IMPORT, dir::BOUND_IMPORT, dir::IAT] {
+        if let Some(at) = layout::data_directory_offset(&bytes, index) {
+            write(&mut bytes, at, &[0; layout::DATA_DIRECTORY_SIZE])?;
+        }
     }
 
     if let Some(tls) = &info.tls
@@ -108,21 +100,6 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         bytes,
         original_hash: blake3::hash(original),
     })
-}
-
-const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
-
-/// The RVA of the all-zero descriptor at the end of the import directory.
-fn import_terminator(bytes: &[u8], info: &ImageInfo, directory: usize) -> Option<u32> {
-    let rva = layout::read_u32(bytes, directory)?;
-    if rva == 0 {
-        return None;
-    }
-    let size = layout::read_u32(bytes, directory + 4)?;
-    let end_rva = rva.checked_add(size.checked_sub(IMPORT_DESCRIPTOR_SIZE)?)?;
-    let offset = info.rva_to_file_offset(end_rva)? as usize;
-    let descriptor = bytes.get(offset..offset + IMPORT_DESCRIPTOR_SIZE as usize)?;
-    descriptor.iter().all(|&byte| byte == 0).then_some(end_rva)
 }
 
 /// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
@@ -197,18 +174,13 @@ mod tests {
         assert!(patched.is_dll());
         assert_eq!(patched.entry_rva, 0);
         assert!(patched.imports.is_empty());
-        let import = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
-        let rva = layout::read_u32(&original, import).unwrap();
-        let size = layout::read_u32(&original, import + 4).unwrap();
-        assert_ne!(rva, 0);
-        assert_eq!(
-            layout::read_u32(&prepared.bytes, import),
-            Some(rva + size - IMPORT_DESCRIPTOR_SIZE)
-        );
-        assert_eq!(
-            layout::read_u32(&prepared.bytes, import + 4),
-            Some(IMPORT_DESCRIPTOR_SIZE)
-        );
+        for index in [dir::IMPORT, dir::BOUND_IMPORT, dir::IAT] {
+            let at = layout::data_directory_offset(&original, index).unwrap();
+            assert_eq!(
+                &prepared.bytes[at..at + layout::DATA_DIRECTORY_SIZE],
+                &[0; 8]
+            );
+        }
         assert_eq!(patched.dll_characteristics & dll_flags::FORCE_INTEGRITY, 0);
         if let Some(tls) = &patched.tls {
             assert_eq!(tls.callbacks_va, 0);
@@ -223,6 +195,30 @@ mod tests {
         // Nothing else moved: same sections, same size.
         assert_eq!(patched.sections.len(), prepared.info.sections.len());
         assert_eq!(prepared.bytes.len(), original.len());
+    }
+
+    #[test]
+    fn keeps_iat_slots_when_import_size_excludes_the_terminator() {
+        let mut original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let info = ImageInfo::parse(&original).unwrap();
+        let directory = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
+        // This linker layout counts the descriptors for real modules only.
+        let descriptor_bytes = u32::try_from(info.imports.len() * 20).unwrap();
+        write_u32(&mut original, directory + 4, descriptor_bytes).unwrap();
+        let prepared = prepare(&original).unwrap();
+        let iat = layout::data_directory_offset(&original, dir::IAT).unwrap();
+        assert_ne!(layout::read_u32(&original, iat), Some(0));
+        assert_eq!(
+            &prepared.bytes[iat..iat + layout::DATA_DIRECTORY_SIZE],
+            &[0; 8]
+        );
+        assert_eq!(prepared.info.import_count(), info.import_count());
+        for module in &prepared.info.imports {
+            for entry in &module.entries {
+                let at = info.rva_to_file_offset(entry.iat_slot_rva).unwrap() as usize;
+                assert_eq!(&prepared.bytes[at..at + 8], &original[at..at + 8]);
+            }
+        }
     }
 
     #[test]

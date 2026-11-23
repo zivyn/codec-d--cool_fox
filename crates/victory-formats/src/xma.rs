@@ -1162,11 +1162,13 @@ mod tests {
     fn walks_saved_streams() {
         let dir = std::env::var("VICTORY_XMA_STREAMS").unwrap();
         let mut bad = 0;
+        let mut streams = 0;
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|e| e != "xma") {
                 continue;
             }
+            streams += 1;
             let data = std::fs::read(&path).unwrap();
             let counted: u32 = (0..data.len() / PACKET_BYTES)
                 .map(|i| packet(&data, i).unwrap().frames)
@@ -1192,6 +1194,7 @@ mod tests {
             );
             bad += u32::from(walked != counted || errors > 0);
         }
+        assert!(streams > 0, "VICTORY_XMA_STREAMS contains no .xma files");
         assert_eq!(bad, 0);
     }
 

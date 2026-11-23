@@ -35,7 +35,7 @@ impl PreparedImage {
 ///
 /// * `IMAGE_FILE_DLL` set, entry point cleared: the OS maps it like a DLL
 ///   and calls nothing;
-/// * import and bound-import directories cleared: we bind imports
+/// * import directory made empty and bound-import directory cleared: we bind imports
 ///   ourselves, using `info.imports` from the original;
 /// * TLS callback pointer cleared: the OS still allocates static TLS for
 ///   the image, but callbacks only run when we call them (after binding);
@@ -64,11 +64,20 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         dll_characteristics,
     )?;
 
-    for index in [dir::IMPORT, dir::BOUND_IMPORT] {
-        if let Some(at) = layout::data_directory_offset(&bytes, index) {
-            write_u32(&mut bytes, at, 0)?;
-            write_u32(&mut bytes, at + 4, 0)?;
-        }
+    // Windows 10 can read the import directory when an IAT is still
+    // advertised. Point it at the empty descriptor that ends the table.
+    if let Some(at) = layout::data_directory_offset(&bytes, dir::IMPORT) {
+        let terminator = import_terminator(&bytes, &info, at);
+        write_u32(&mut bytes, at, terminator.unwrap_or(0))?;
+        write_u32(
+            &mut bytes,
+            at + 4,
+            terminator.map_or(0, |_| IMPORT_DESCRIPTOR_SIZE),
+        )?;
+    }
+    if let Some(at) = layout::data_directory_offset(&bytes, dir::BOUND_IMPORT) {
+        write_u32(&mut bytes, at, 0)?;
+        write_u32(&mut bytes, at + 4, 0)?;
     }
 
     if let Some(tls) = &info.tls
@@ -99,6 +108,21 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         bytes,
         original_hash: blake3::hash(original),
     })
+}
+
+const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
+
+/// The RVA of the all-zero descriptor at the end of the import directory.
+fn import_terminator(bytes: &[u8], info: &ImageInfo, directory: usize) -> Option<u32> {
+    let rva = layout::read_u32(bytes, directory)?;
+    if rva == 0 {
+        return None;
+    }
+    let size = layout::read_u32(bytes, directory + 4)?;
+    let end_rva = rva.checked_add(size.checked_sub(IMPORT_DESCRIPTOR_SIZE)?)?;
+    let offset = info.rva_to_file_offset(end_rva)? as usize;
+    let descriptor = bytes.get(offset..offset + IMPORT_DESCRIPTOR_SIZE as usize)?;
+    descriptor.iter().all(|&byte| byte == 0).then_some(end_rva)
 }
 
 /// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
@@ -173,6 +197,18 @@ mod tests {
         assert!(patched.is_dll());
         assert_eq!(patched.entry_rva, 0);
         assert!(patched.imports.is_empty());
+        let import = layout::data_directory_offset(&original, dir::IMPORT).unwrap();
+        let rva = layout::read_u32(&original, import).unwrap();
+        let size = layout::read_u32(&original, import + 4).unwrap();
+        assert_ne!(rva, 0);
+        assert_eq!(
+            layout::read_u32(&prepared.bytes, import),
+            Some(rva + size - IMPORT_DESCRIPTOR_SIZE)
+        );
+        assert_eq!(
+            layout::read_u32(&prepared.bytes, import + 4),
+            Some(IMPORT_DESCRIPTOR_SIZE)
+        );
         assert_eq!(patched.dll_characteristics & dll_flags::FORCE_INTEGRITY, 0);
         if let Some(tls) = &patched.tls {
             assert_eq!(tls.callbacks_va, 0);

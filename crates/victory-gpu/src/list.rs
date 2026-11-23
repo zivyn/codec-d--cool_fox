@@ -510,6 +510,8 @@ extern "system" fn copy_texture_region(
         };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
+        #[cfg(feature = "diagnostics")]
+        let mut read = None;
         if src.kind == FOOTPRINT {
             let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
                 return;
@@ -523,6 +525,11 @@ extern "system" fn copy_texture_region(
             list.defer_copy(staging, data, bytes as usize);
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
+            #[cfg(feature = "diagnostics")]
+            {
+                // SAFETY: a live buffer.
+                read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
+            }
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
@@ -537,21 +544,27 @@ extern "system" fn copy_texture_region(
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            // SAFETY: a live texture; the box is the title's or null.
-            let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
-            format!(
-                "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
-                dst.resource,
-                d.Width,
-                d.Height,
-                d.Format.0,
-                dst.kind,
-                src.resource,
-                src.kind,
-                (src.kind == FOOTPRINT).then_some(src.footprint)
-            )
-        });
+        {
+            let text = || {
+                // SAFETY: a live texture; the box is the title's or null.
+                let (d, b) = unsafe { (to.GetDesc(), host_box.map(|b| *b)) };
+                format!(
+                    "copy to {:?} {}x{} f{} sub/kind {} at {x},{y},{z} from {:?} kind {} footprint {:?} box {b:?}",
+                    dst.resource,
+                    d.Width,
+                    d.Height,
+                    d.Format.0,
+                    dst.kind,
+                    src.resource,
+                    src.kind,
+                    (src.kind == FOOTPRINT).then_some(src.footprint)
+                )
+            };
+            match read {
+                Some(range) => list.note_read(text, range),
+                None => list.note_op(text),
+            }
+        }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
@@ -1110,9 +1123,77 @@ fn count_draw() {
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
+#[cfg(not(windows))]
 extern "system" fn draw(_: This) {
     count_draw();
 }
+
+/// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
+/// offset)`. Grand Theft Auto VI's signatures (2026-11-23) hold one
+/// argument each: draw (stride 16), indexed draw (20), dispatch (12), mesh
+/// dispatch (12), and a console type 105 (stride 12, fields 0, 60000, 0,
+/// over its 174 MB buffer) whose meaning is unknown. Those of PC types run
+/// through the host's indirect execution (`State::execute_indirect`).
+/// shortcut: type 105 and signatures that change root arguments are
+/// dropped (logged once per signature); decode 105 when its draws are
+/// missed.
+extern "system" fn execute_indirect(
+    this: This,
+    signature: This,
+    max: u32,
+    arguments: This,
+    offset: u64,
+    count: This,
+    count_offset: u64,
+) {
+    count_draw();
+    let Some((stride, args)) = crate::signature::layout(signature) else {
+        return;
+    };
+    let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
+    let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
+    let mut ran = false;
+    // shortcut: off unless `VICTORY_INDIRECT` is set (diagnostics builds):
+    // with it the world presented no frame for 30 s and the title's own
+    // GPU watchdog ended it (2026-11-24, cause not found); without it the
+    // world runs, with most geometry missing.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_INDIRECT").is_some()
+    });
+    #[cfg(windows)]
+    if on
+        && let ([[kind, ..]], Some(address)) = (args, address)
+        && (count.is_null() || counter.is_some())
+    {
+        with_state(this, |list, s| {
+            ran = s.execute_indirect(list, (*kind, stride, max), address, counter);
+        });
+    }
+    if ran {
+        return;
+    }
+    INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&(signature as usize)) {
+        seen.push(signature as usize);
+        tracing::info!(
+            stride,
+            ?args,
+            max,
+            address = ?address.map(|a| format!("{a:#x}")),
+            counted = !count.is_null(),
+            "indirect execution dropped (first time for this signature)"
+        );
+    }
+}
+
+/// Indirect executions dropped since the last call.
+pub(crate) fn take_indirect() -> u64 {
+    INDIRECT.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+static INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn count_dispatch() {
     DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1231,7 +1312,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
-    (59, draw as *const ()),                      // 0x1d8 indirect
+    (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228

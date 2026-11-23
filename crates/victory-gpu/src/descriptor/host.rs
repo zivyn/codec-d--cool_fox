@@ -22,9 +22,37 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The host resource each slot views, held while the slot does: shaders
+    /// index heaps directly, so a slot the title has not rewritten since it
+    /// released the resource may still be read, and a freed host resource
+    /// read there is a GPU page fault (the console reads stale memory).
+    kept: Mutex<Vec<Option<ID3D12Resource>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
+}
+
+/// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
+/// device-removed reports: a shader indexing a heap past its end faults.
+static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
+
+/// For device-removed reports: where host GPU address `va` lies against
+/// the host descriptor heaps.
+pub(crate) fn near_heaps(va: u64) -> String {
+    let ranges = GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = String::new();
+    for &(start, bytes, step, sampler) in ranges.iter() {
+        let kind = if sampler { "sampler" } else { "view" };
+        let place = if va < start {
+            format!("{:#x} below", start - va)
+        } else if va < start + bytes {
+            format!("inside, slot {}", (va - start) / step)
+        } else {
+            format!("{:#x} past its end (slot {})", va - start - bytes, (va - start) / step)
+        };
+        text.push_str(&format!("; {kind} heap {start:#x}+{bytes:#x}: {place}"));
+    }
+    text
 }
 
 /// The host's limit for shader-visible view heaps on resource binding
@@ -78,6 +106,14 @@ impl HostHeap {
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
+        // SAFETY: a live shader-visible heap.
+        let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
+            gpu,
+            u64::from(count + extra) * u64::from(step),
+            u64::from(step),
+            sampler,
+        ));
         let h = HostHeap {
             heap,
             cpu,
@@ -85,6 +121,7 @@ impl HostHeap {
             count,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
@@ -215,9 +252,11 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        if !make(view, self.cpu(index)) {
+        let kept = make(view, self.cpu(index));
+        if kept.is_none() {
             null_for(view, self.cpu(index));
         }
+        self.keep(index, kept.flatten());
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -227,11 +266,21 @@ impl HostHeap {
         } else {
             null_view(self.cpu(index));
         }
+        self.keep(index, None);
+    }
+
+    /// Slot `index` now views `resource` (or nothing of the host's).
+    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = kept.get_mut(index as usize) {
+            *slot = resource;
+        }
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory.
+    /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
+        self.keep(index, None);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -276,9 +325,15 @@ impl HostHeap {
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
-            if (later || !make(&view, self.cpu(index))) && !self.sampler {
+            let kept = if later {
+                None
+            } else {
+                make(&view, self.cpu(index))
+            };
+            if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            self.keep(index, kept.flatten());
         }
         Some(view)
     }
@@ -398,15 +453,16 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+/// The host resource a slot made by [`make`] views, if any.
+type Kept = Option<ID3D12Resource>;
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> bool {
-    let Some(shadow) = crate::shadow::find(address, len) else {
-        return false;
-    };
+) -> Option<Kept> {
+    let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -417,16 +473,16 @@ fn buffer_srv(
             element,
             "buffer view not on an element of its host copy"
         );
-        return false;
+        return None;
     }
     buffer.FirstElement += offset / element;
-    let Some(host) = host() else { return false };
+    let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    true
+    Some(Some(shadow.buffer.clone()))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -439,15 +495,13 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
-) -> bool {
-    let Some(shadow) = crate::shadow::find(address, len) else {
-        return false;
-    };
+) -> Option<Kept> {
+    let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
-        return false;
+        return None;
     }
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -461,17 +515,17 @@ fn buffer_uav(
     let offset = shadow.offset(address);
     if element == 0 || offset % element != 0 {
         once!(offset, element, "unordered buffer view not on an element of its host copy");
-        return false;
+        return None;
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
-    let Some(host) = host() else { return false };
+    let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
-    true
+    Some(Some(shadow.buffer.clone()))
 }
 
 /// Whether the host can make a shader (or unordered access) view of
@@ -527,22 +581,21 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     true
 }
 
-/// Makes the host descriptor for `view` at `at`; false if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
-    let Some(host) = host() else { return false };
+/// Makes the host descriptor for `view` at `at`: the host resource it
+/// views, or `None` if it cannot.
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    let host = host()?;
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
-                return false;
-            };
+            let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
                     "constant buffer not 256-byte aligned on the host"
                 );
-                return false;
+                return None;
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
@@ -550,14 +603,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            true
+            Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
             if let Some(texture) = crate::resource::host_resource(resource) {
                 let mut desc = desc.as_ref().map(srv_desc);
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
-                    return false;
+                    return None;
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -567,13 +620,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
                         at,
                     )
                 };
-                true
+                Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
                 buffer_srv(data as u64, len, srv_desc(desc), at)
             } else {
-                false
+                None
             }
         }
         View::Unordered(resource, _counter, desc) => {
@@ -583,12 +636,12 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
                     }
-                    _ => false,
+                    _ => None,
                 };
             };
             let mut desc = desc.as_ref().map(uav_desc);
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
-                return false;
+                return None;
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
@@ -599,7 +652,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
                     at,
                 )
             };
-            true
+            Some(Some(texture.clone()))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -610,13 +663,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            true
+            Some(None)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
-            true
+            Some(None)
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
@@ -628,7 +681,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
                 once!(dimension = resource[0], "placed unordered texture view not mirrored");
-                return false;
+                return None;
             }
             // The resource description's width, after the alignment.
             let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
@@ -662,12 +715,30 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
 /// view. Writes to it are dropped, reads give zeros.
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     let buffer = match view {
-        View::Unordered(r, _, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_some(),
+        View::Unordered(r, _, _) => is_buffer(r),
         View::Placed(true, resource, _) => resource[0] == 1,
+        // Shader views of buffers read nothing through a null buffer view:
+        // a null 2D view where the shader expects a buffer is a mismatch
+        // the hardware does not survive in general (GPU-based validation
+        // reports it).
+        View::Shader(r, _) if is_buffer(r) => return null_buffer_view(at),
+        View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
+        // Textures: a null view of the title's dimension (1D, arrays, 3D,
+        // cubes), not always 2D.
+        View::Shader(_, Some(desc)) => return null_like(desc, at),
+        View::Placed(false, _, desc) => {
+            return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
+        }
+        View::Constant(..) => {
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+            // SAFETY: a slot of our heap; a zero location makes a null view.
+            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+        }
         _ => return null_view(at),
     };
-    let Some(host) = host() else { return };
     let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
         Format: DXGI_FORMAT_R32_UINT,
         ViewDimension: if buffer {
@@ -685,6 +756,56 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             Some(&desc),
             at,
         )
+    };
+}
+
+/// A buffer view that reads zeros (raw, as translated shaders mostly read
+/// buffers).
+fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    let Some(host) = host() else { return };
+    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                NumElements: 1,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+    };
+}
+
+/// A texture view that reads zeros with the dimension (and mip and array
+/// counts) of the title's description `words`; 2D if it names none.
+fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    const TEXTURES: std::ops::RangeInclusive<u32> = 2..=10;
+    if !TEXTURES.contains(&words[1]) {
+        return null_view(at);
+    }
+    let Some(host) = host() else { return };
+    // One mip, one slice or cube, plane 0: fields a null view still checks.
+    let mut w = [0u32; 10];
+    w[1] = words[1];
+    match words[1] {
+        6 => {}
+        7 => w[5] = 1,
+        3 | 5 | 10 => (w[5], w[7]) = (1, 1),
+        _ => w[5] = 1,
+    }
+    let mut desc = srv_desc(&w);
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    // SAFETY: a slot of our heap; a null resource is allowed with a desc.
+    unsafe {
+        host.device
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
     };
 }
 

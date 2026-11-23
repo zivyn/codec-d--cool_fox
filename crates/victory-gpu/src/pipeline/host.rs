@@ -406,6 +406,7 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
+            crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
@@ -430,6 +431,7 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
+            crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
@@ -478,6 +480,7 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, "host pipeline");
+        crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,

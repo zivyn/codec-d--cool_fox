@@ -113,14 +113,30 @@ impl Shadow {
     /// back into title memory (unmapped pages left alone). Pages wholly
     /// written are current in this copy, so our own write is not taken for
     /// the title's.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) {
+    /// Returns the bytes written.
+    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        let mut written = 0;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from < to {
-            // SAFETY: inside the mapping.
-            let at = unsafe { self.data.add(from - start) };
-            crate::watch::writing(from, to - from);
-            crate::host::write_mapped(from as *mut u8, at, to - from);
+            // Only the pieces that differ: shaders rewrite part of what they
+            // may write, and writing title memory through the kernel (and
+            // opening guarded blocks) was the world's biggest cost (~1 s per
+            // frame for 450 MB).
+            const PIECE: usize = 64 << 10;
+            let mut title = vec![0u8; PIECE];
+            let mut at = from;
+            while at < to {
+                let n = (PIECE - at % PIECE).min(to - at);
+                // SAFETY: inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(at - start), n) };
+                if !crate::host::read_into(at as *const u8, &mut title[..n]) || title[..n] != *host {
+                    crate::watch::writing(at, n);
+                    crate::host::write_mapped(at as *mut u8, host.as_ptr(), n);
+                    written += n;
+                }
+                at += n;
+            }
             let (first, last) = (from.div_ceil(PAGE), to / PAGE);
             if first < last
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
@@ -131,10 +147,10 @@ impl Shadow {
                 copied[first - base..last - base].fill(now);
             }
         }
+        // Every submitted step that declared the range is done with it.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = pending.iter().position(|&r| r == (address, address + len)) {
-            pending.swap_remove(i);
-        }
+        pending.retain(|&r| r != (address, address + len));
+        written
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -155,20 +171,28 @@ impl Shadow {
             .filter(|&(a, e)| a < to && e > from)
             .collect();
         if !busy.is_empty() {
-            // Rare: around ranges shaders are writing, everything is copied.
+            // Around ranges shaders are writing: the gaps, each as below
+            // (in the world most submissions have such ranges; copying the
+            // gaps whole cost ~1 s per frame).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
                 if a > at {
-                    bytes += self.copy(at, a);
+                    bytes += self.update_free(at, a);
                 }
                 at = at.max(e);
             }
             if at < to {
-                bytes += self.copy(at, to);
+                bytes += self.update_free(at, to);
             }
             return bytes;
         }
+        self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
+    /// shader writes.
+    fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
@@ -206,14 +230,20 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
-                *at = now;
+                // A page only partly in the range is copied in part: it
+                // stays stale for the rest.
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                    *at = now;
+                }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy(first * PAGE, page * PAGE);
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
         }
+        // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy(first * PAGE, (last + 1) * PAGE);
+            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
         bytes
     }

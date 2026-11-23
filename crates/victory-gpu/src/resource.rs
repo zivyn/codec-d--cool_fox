@@ -748,11 +748,19 @@ struct Resource {
     /// Textures also live on the host GPU (decision 0007); buffers do not
     /// yet.
     #[cfg(windows)]
-    host: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
-    /// The state the host texture is in. The title's barriers name console
-    /// states (looser than the host's), so we transition from this one.
-    #[cfg(windows)]
-    host_state: std::sync::atomic::AtomicU32,
+    host: Option<std::sync::Arc<HostTexture>>,
+}
+
+/// A title texture's host copy and the state it is in. The title's barriers
+/// name console states (looser than the host's), so we transition from this
+/// one. Lists that use the texture hold it until they are reset: the title
+/// may release a resource whose commands it recorded but not yet submitted
+/// (console memory outlives the object; a host texture must outlive the
+/// lists that name it).
+#[cfg(windows)]
+pub(crate) struct HostTexture {
+    pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    pub(crate) state: std::sync::atomic::AtomicU32,
 }
 
 /// Moves the host texture to `wanted` (a host texture state); the host
@@ -760,21 +768,11 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
     use windows::core::Interface;
-    let r = resource(this);
-    let host = r.host.as_ref()?;
-    let before = r
-        .host_state
+    let host = resource(this).host.as_ref()?;
+    let before = host
+        .state
         .swap(wanted, std::sync::atomic::Ordering::Relaxed);
-    (before != wanted).then(|| (host.as_raw(), before))
-}
-
-/// Sets the state the host texture is in after a submission; returns the
-/// one it was in.
-#[cfg(windows)]
-pub(crate) fn swap_host_state(this: This, state: u32) -> u32 {
-    resource(this)
-        .host_state
-        .swap(state, std::sync::atomic::Ordering::Relaxed)
+    (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
 /// The host GPU's copy of a title resource, if it has one.
@@ -785,7 +783,16 @@ pub(crate) fn host_resource<'a>(
     if this.is_null() {
         return None;
     }
-    resource(this).host.as_ref()
+    resource(this).host.as_deref().map(|h| &h.texture)
+}
+
+/// A title texture's host copy, shared, for a list to hold.
+#[cfg(windows)]
+pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+    if this.is_null() {
+        return None;
+    }
+    resource(this).host.clone()
 }
 
 /// A host texture like the title's: same description, in GPU memory,
@@ -929,12 +936,13 @@ fn hand_out_resource(
         heap_flags,
         backing,
         #[cfg(windows)]
-        host_state: host
-            .as_ref()
-            .map_or(0, |t| crate::host::legal_state(t, crate::host::texture_state(state)))
-            .into(),
-        #[cfg(windows)]
-        host,
+        host: host.map(|texture| {
+            let state = crate::host::legal_state(&texture, crate::host::texture_state(state));
+            std::sync::Arc::new(HostTexture {
+                texture,
+                state: state.into(),
+            })
+        }),
     });
     #[cfg(windows)]
     if desc.dimension == BUFFER {
@@ -947,6 +955,24 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        if self
+            .host
+            .as_ref()
+            .is_some_and(|h| std::sync::Arc::strong_count(h) > 1)
+        {
+            // Before lists held their textures, this freed a texture that
+            // lists not yet run still named (a GPU page fault).
+            static OUTLIVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = OUTLIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    n,
+                    desc = ?self.desc,
+                    "a title texture was released while a list not yet reset names its host copy"
+                );
+            }
+        }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
@@ -1432,7 +1458,7 @@ mod tests {
         slot::<Custom>(device, 0xd0)(&mut p, device, 1, 1);
         assert_eq!(p.cpu_pages, 1, "default: not CPU-visible");
 
-        // 0x428: a buffer over memory the title owns, as GTA VI asks.
+        // 0x428: a buffer over memory the title owns, as the title asks.
         type At = extern "system" fn(
             This,
             u64,
@@ -1705,6 +1731,8 @@ mod tests {
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
         let (_, before) = host_transition(image, 0x800).unwrap();
+        // The upload list holds the texture until it is reset.
+        assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         use windows::core::Interface;
         let out_to = Location {
             resource: readback.as_raw().cast_const().cast(),

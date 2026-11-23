@@ -29,6 +29,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 mod host;
+#[cfg(windows)]
+mod indirect;
 pub mod list;
 pub mod object;
 pub mod pipeline;

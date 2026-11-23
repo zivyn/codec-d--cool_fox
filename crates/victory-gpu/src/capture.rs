@@ -203,7 +203,10 @@ pub(crate) fn save_read_back(
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
 /// (what each holds at the end of the frame; formats normalized to show
 /// structure: floats scaled by their largest value, depth by its range).
-static TARGETS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// The host copies are held: the title may release a target before the
+/// frame is presented.
+static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
+    std::sync::Mutex::new(Vec::new());
 
 fn dump_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -216,33 +219,28 @@ pub(crate) fn note_target(resource: crate::object::This) {
         return;
     }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.contains(&(resource as usize)) {
-        targets.push(resource as usize);
+    if !targets.iter().any(|&(r, _)| r == resource as usize)
+        && let Some(copy) = crate::resource::host_copy(resource)
+    {
+        targets.push((resource as usize, copy));
     }
 }
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
-    for (i, &resource) in targets.iter().enumerate() {
-        let resource = resource as crate::object::This;
-        let Some(texture) = crate::resource::host_resource(resource) else {
-            continue;
-        };
+    for (i, (resource, copy)) in targets.iter().enumerate() {
+        let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
             continue;
         }
-        const COPY_SOURCE: u32 = 0x800;
-        let Some(before) = crate::resource::host_transition(resource, COPY_SOURCE).map(|(_, b)| b)
-        else {
-            dump_one(host, texture, COPY_SOURCE, frame, i, resource, &d);
-            continue;
-        };
-        dump_one(host, texture, before, frame, i, resource, &d);
-        crate::resource::host_transition(resource, before);
+        // Every submission has run; the dump's list moves it there and back.
+        let state = copy.state.load(Relaxed);
+        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
     }
 }
 
@@ -363,8 +361,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         15..=16 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 1)), 0.0])),
         35..=38 => (4, Box::new(move |b| [f32::from(u16_at(b, 0)), f32::from(u16_at(b, 1)), 0.0])),
         48..=52 => (2, Box::new(move |b| [f32::from(b[0]), f32::from(b[1]), 0.0])),
-        // Single channels: shown as grey.
+        // Single channels (and depth planes): shown as grey.
         39..=43 => (4, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        19..=22 => (8, Box::new(move |b| [f32::from_bits(u32_at(b, 0)); 3])),
+        44..=47 => (4, Box::new(move |b| [(u32_at(b, 0) & 0xff_ffff) as f32; 3])),
         53..=54 => (2, Box::new(move |b| [half(u16_at(b, 0)); 3])),
         55..=59 => (2, Box::new(move |b| [f32::from(u16_at(b, 0)); 3])),
         60..=65 => (1, Box::new(move |b| [f32::from(b[0]); 3])),
@@ -374,7 +374,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .flat_map(|y| (0..w).map(move |x| (x, y)))
         .map(|(x, y)| decode(px(x, y, n)))
         .collect();
-    let grey = matches!(format, 39..=43 | 53..=65);
+    let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
     let (low, high) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))

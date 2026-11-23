@@ -65,6 +65,17 @@ pub(crate) extern "system" fn create(
     object::hand_out(COMMAND_SIGNATURE, signature, iid, &SIGNATURE_IIDS, out)
 }
 
+/// A signature's record stride and arguments (type, then up to three
+/// fields each).
+pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes one of our signatures.
+    let s = unsafe { &*this.cast::<Signature>() };
+    Some((s.stride, &s.arguments))
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)

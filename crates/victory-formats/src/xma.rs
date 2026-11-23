@@ -136,7 +136,14 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let mut number = 0;
     while at < start {
         let mut cursor = Cursor { data, pos: at };
-        at += cursor.bits(LENGTH_BITS)? as usize;
+        let bits = cursor.bits(LENGTH_BITS)? as usize;
+        // The same rule as `read_frame`: a length that does not cover its own
+        // field is not a frame. A zero length would never move `at`, so a
+        // damaged packet would loop here for good.
+        if bits <= LENGTH_BITS as usize {
+            return None;
+        }
+        at += bits;
         number += 1;
     }
     let last = number + 1 >= header.frames;
@@ -1014,6 +1021,30 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `value` as `n` bits, MSB first, at bit `pos`.
+    fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
+        for i in 0..n as usize {
+            if value >> (n as usize - 1 - i) & 1 == 1 {
+                data[(pos + i) / 8] |= 1 << (7 - (pos + i) % 8);
+            }
+        }
+    }
+
+    /// A damaged packet whose first frame says it is 0 bits long: finding
+    /// the frame after a later one must give up, not walk in place forever
+    /// (found by random-input testing).
+    #[test]
+    fn a_zero_length_frame_before_the_start_ends_the_search() {
+        let mut data = vec![0u8; PACKET_BYTES];
+        // Two frames, the first at payload bit 0; its 15-bit length stays 0.
+        put_bits(&mut data, 0, 32, 2 << 26);
+        let start = HEADER_BITS + 100;
+        put_bits(&mut data, start, LENGTH_BITS, 200);
+        let frame = read_frame(&data, start).expect("the frame at `start` is well formed");
+        assert_eq!(frame.bits, 200);
+        assert_eq!(frame.next, None);
+    }
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
     /// the standard formula, negated).

@@ -215,7 +215,8 @@ impl ImageInfo {
                 0 => s.file_size,
                 vs => vs.min(s.file_size),
             };
-            (delta < backed).then(|| s.file_offset + delta)
+            // Header values are untrusted: an offset near 4 GiB overflows.
+            (delta < backed).then(|| s.file_offset.checked_add(delta))?
         })
     }
 
@@ -431,6 +432,17 @@ mod tests {
         let info = ImageInfo::parse(&data).unwrap();
         let off = info.rva_to_file_offset(info.entry_rva).unwrap() as usize;
         assert!(off < data.len());
+    }
+
+    #[test]
+    fn rva_to_file_offset_rejects_offsets_past_4_gib() {
+        let mut info = ImageInfo::parse(&own_image()).unwrap();
+        let rva = info.sections[0].rva + 0x20;
+        assert!(info.rva_to_file_offset(rva).is_some());
+        // Used to overflow (a panic in debug builds, a wrong offset in
+        // release ones).
+        info.sections[0].file_offset = u32::MAX - 0x10;
+        assert_eq!(info.rva_to_file_offset(rva), None);
     }
 
     #[test]

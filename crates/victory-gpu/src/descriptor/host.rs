@@ -234,6 +234,12 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// The title slots this heap has host slots for; fewer than the title's
+    /// when the host caps its size.
+    pub(crate) fn count(&self) -> u32 {
+        self.count
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -305,6 +311,17 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
+            // Diagnostic (NVIDIA heap cap): the highest title slot past the
+            // host heap seen so far.
+            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+                tracing::warn!(
+                    index,
+                    count = self.count,
+                    for_draw,
+                    "title slot past the host heap"
+                );
+            }
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.

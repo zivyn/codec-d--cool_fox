@@ -99,6 +99,8 @@ impl Hasher for Fx {
 
 const TERMINAL: u32 = u32::MAX;
 const MAX_NODES: usize = 1 << 21;
+/// Case splits [`Bools::meet`] makes before it gives up.
+const MAX_MEET: usize = 1 << 16;
 
 impl Bools {
     fn new() -> Self {
@@ -221,6 +223,38 @@ impl Bools {
         self.ite(a, nb, b)
     }
 
+    /// Whether some lane can satisfy every `(b, holds)` of `all` at once:
+    /// `b` where `holds`, its negation where not. Yes when the search grows
+    /// too large to finish.
+    pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
+        let mut budget = MAX_MEET;
+        self.meet_in(all.to_vec(), &mut budget)
+    }
+
+    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
+        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
+        if all.iter().any(fails) {
+            return false;
+        }
+        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        if all.is_empty() || *budget == 0 {
+            return true;
+        }
+        *budget -= 1;
+        let top = |b: Bool| self.nodes[b.0 as usize].0;
+        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
+        [false, true].into_iter().any(|value| {
+            let next = all
+                .iter()
+                .map(|&(b, holds)| {
+                    let (lo, hi) = self.split(b, v);
+                    (if value { hi } else { lo }, holds)
+                })
+                .collect();
+            self.meet_in(next, budget)
+        })
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -306,6 +340,9 @@ pub struct Structured {
     /// enough (lanes outside EXEC then never get there, so a VGPR write
     /// needs no old value). Always `None` for scalar instructions.
     pub guards: Vec<Vec<Option<Bool>>>,
+    /// Per block: what holds in every lane that enters it (over forward
+    /// edges; a loop header forgets what its loop redefines).
+    pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
@@ -587,6 +624,7 @@ impl<'a> Lanes<'a> {
             bools: self.b,
             exits,
             guards,
+            reach: cond.to_vec(),
         })
     }
 

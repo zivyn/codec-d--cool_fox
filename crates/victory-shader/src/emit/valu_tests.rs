@@ -123,9 +123,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     };
 
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let res = resource::track(&p, &native.layout, native.stage).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
     let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,

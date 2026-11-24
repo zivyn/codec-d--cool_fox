@@ -3183,6 +3183,9 @@ impl<'a> Lower<'a> {
         {
             return self.used_kind(args.first()?);
         }
+        if let Source::LanePhi { args, .. } = src {
+            return args.iter().flatten().find_map(|a| self.used_kind(a));
+        }
         if let Source::Built { address, .. } = src {
             let rp = self.x.native.layout.get(address.param)?;
             return self
@@ -3317,7 +3320,7 @@ impl<'a> Lower<'a> {
                 let index = self.s.m.select(self.cur, cond, set, clear);
                 Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
             }
-            Source::Fetched { .. } | Source::Lanes { .. } => {
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
@@ -3328,7 +3331,8 @@ impl<'a> Lower<'a> {
     }
 
     /// The heap index of a descriptor that may differ between lanes,
-    /// computed in the current block.
+    /// computed in the current block (or, chosen by control flow, at the
+    /// join).
     fn lane_heap_index(&mut self, src: &Source, sampler: bool) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
@@ -3354,6 +3358,36 @@ impl<'a> Lower<'a> {
                 let set = self.lane_heap_index(a, sampler)?;
                 let clear = self.lane_heap_index(b, sampler)?;
                 Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            Source::LanePhi { block, args } => {
+                // Each predecessor computes its heap index at its end (what
+                // it reads is there: the dwords are, on that edge); the join
+                // picks the one of the edge the lane came by. An edge no
+                // lane reading it takes gives index 0.
+                let join =
+                    self.block[*block].ok_or("a per-lane descriptor chosen by control flow")?;
+                let mut incoming = Vec::new();
+                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+                    if self.block[q].is_none() {
+                        continue;
+                    }
+                    let tail =
+                        self.tail[q].ok_or("a per-lane descriptor joined from a later block")?;
+                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                    let index = match arg {
+                        Some(arg) => {
+                            let here = std::mem::replace(&mut self.cur, at);
+                            let index = self.lane_heap_index(arg, sampler);
+                            self.cur = here;
+                            index?
+                        }
+                        None => self.s.m.i32(0),
+                    };
+                    incoming.push((index, at));
+                }
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, incoming);
+                Ok(phi)
             }
             _ => Err("a per-lane descriptor from neither a heap load nor a choice of them"),
         }
@@ -6710,9 +6744,9 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, false, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage).unwrap();
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
             p: &p,
@@ -6760,9 +6794,9 @@ mod tests {
             code,
         };
         let p = ir::build(&native.code, wave64, 256).unwrap();
-        let res = resource::track(&p, &native.layout, native.stage)?;
-        let io = io::raise(&p, &native).unwrap();
         let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
         lower(&Parts {
             native: &native,
             p: &p,
@@ -6893,6 +6927,34 @@ mod tests {
             let l = lower_wave(words, layout, used, wave64).unwrap();
             // The loop's reads of the first lane became each lane's own
             // dwords: no wave operation is left.
+            assert_eq!(l.nonuniform_handles, 1);
+            assert!(!l.wave_ops);
+        }
+    }
+
+    /// [`texture_tables`] with a raw buffer UAV at dword 16 of the first.
+    pub(crate) fn texture_and_uav_tables() -> (Vec<RootParam>, Vec<UsedResource>) {
+        let (layout, mut used) = texture_tables();
+        used.push(UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 16,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        });
+        (layout, used)
+    }
+
+    #[test]
+    fn waterfall_loops_over_descriptors_joined_per_lane_sample_with_each_lanes_own() {
+        use crate::resource::tests::{WATERFALL_JOINED_MIXED_WAVE32, WATERFALL_JOINED_WAVE32};
+        for words in [WATERFALL_JOINED_WAVE32, WATERFALL_JOINED_MIXED_WAVE32] {
+            let (layout, used) = texture_and_uav_tables();
+            let l = lower_wave(words, layout, used, false).unwrap();
+            // One image handle, from the join's per-lane heap index.
             assert_eq!(l.nonuniform_handles, 1);
             assert!(!l.wave_ops);
         }

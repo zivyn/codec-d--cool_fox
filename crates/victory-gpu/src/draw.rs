@@ -242,6 +242,12 @@ impl State {
         }
     }
 
+    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+            *slot = VertexView::default();
+        }
+    }
+
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
     }

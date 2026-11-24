@@ -41,7 +41,7 @@ const DEVICE_ID: &str = "VkljdG9yeSBvZmZsaW5lIGRldmljZSBpZGVudGl0eSE=";
 pub static OBJECT: Object = Object::new("system", &VTABLE);
 pub static ANALYTICS_OBJECT: Object = Object::new("analytics", &ANALYTICS_VTABLE);
 
-/// The interface as Grand Theft Auto VI (2026) asks for it; it calls the
+/// The interface as the title (2026) asks for it; it calls the
 /// same three slots (0x18, 0x20, 0x28) with the same arguments.
 pub const IID_2026: Guid = Guid::new(
     0x1861_cf2e,

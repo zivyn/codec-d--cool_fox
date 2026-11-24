@@ -12,7 +12,7 @@
 //! Mixed audio leaves through the host's WASAPI, which titles and
 //! middleware reach through COM like on PC. fmod's console build sets up
 //! the coprocessor inside `System_Create` and waits there for its first
-//! command to be acknowledged; Grand Theft Auto VI uses only XMA contexts.
+//! command to be acknowledged; the title uses only XMA contexts.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

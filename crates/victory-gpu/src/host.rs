@@ -808,7 +808,7 @@ struct TwinUse {
 ///
 /// A 16-bit twin holds whole steps of 1/65535, and the depth written is
 /// the step times the float nearest 1/65535 (0x37800080). That is how
-/// Grand Theft Auto VI's tiled lighting computes the depth of the
+/// The title's tiled lighting computes the depth of the
 /// rectangles it then draws with the test "equal", one class of materials
 /// a draw (all six of its vertex shaders multiply the class number by that
 /// constant), so the pass and the draw give the host the same float, and
@@ -1129,7 +1129,7 @@ fn record_twin_copy(
     // shortcut: the depth plane's twin is not given the plane (that is a
     // pass the other way: the plane read by a shader, the twin as its
     // target). The twin then lacks what draws and clears wrote to the
-    // plane since shaders last wrote the twin. In Grand Theft Auto VI
+    // plane since shaders last wrote the twin. In the title
     // nothing writes that plane but the twin's pass (its 192 draws against
     // it only test, run 29), so the twin lacks nothing. Counted.
     if colour && twin.plane.is_some() {
@@ -4636,7 +4636,7 @@ impl HostList {
     /// are given what was written, and left readable by shaders. Shaders
     /// that pick a view from the heap by a computed index are not seen by
     /// `twin_use` and read the depth texture in lists that never name it
-    /// (in a captured frame of Grand Theft Auto VI no table names a shadow
+    /// (in a captured frame of the title no table names a shadow
     /// map for reading but the pass that fills the next one).
     fn twins_to_depth(&self) {
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;

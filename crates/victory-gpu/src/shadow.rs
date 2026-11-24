@@ -2838,8 +2838,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
-/// Titles also use memory outside any buffer object as GPU memory (Grand
-/// Theft Auto VI's interface vertices, from its own allocator). Such memory
+/// Titles also use memory outside any buffer object as GPU memory (
+/// the title's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches.
 /// A window nothing names any more is let go ([`let_go_idle`]).
 /// shortcut: a window is 4 MiB however little of it is read (the memory

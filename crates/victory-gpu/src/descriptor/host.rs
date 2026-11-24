@@ -76,7 +76,7 @@ pub(crate) struct HostHeap {
     /// the last [`TABLED_FRAMES`] frames is due only [`TABLED_GRACE`]
     /// frames later, by when its draw has read it. A title that builds a
     /// table per draw writes thousands of texture views a frame into slots
-    /// only tables read (Grand Theft Auto VI: some 2,500 a frame in its
+    /// only tables read (the title: some 2,500 a frame in its
     /// opening cutscene, a few hundred textures over and over), and every
     /// one of them stood in the queue of textures picked by index, ahead
     /// of or behind the ones shaders do pick by index.
@@ -252,7 +252,7 @@ const TABLED_FRAMES: u64 = 240;
 /// Frames a write of a table's slot waits in the queue for the draw that
 /// reads it, before the slot is taken for one shaders pick by index.
 /// Frames as `crate::frame::current` counts them: in its opening cutscene
-/// Grand Theft Auto VI begins two or three of them per frame it presents
+/// The title begins two or three of them per frame it presents
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
 const TABLED_GRACE: u64 = 8;
 
@@ -512,7 +512,7 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
 /// and if so tells the translator now (`set_view_heap_limit`) instead of
 /// when the title's heap is made: a shader keeps the limit it was
-/// translated with, and Grand Theft Auto VI makes 25 pipelines (their
+/// translated with, and the title makes 25 pipelines (their
 /// shaders translated at once) before it makes its view heap. Those would
 /// read a view index past the heap unclamped, the read that hangs NVIDIA.
 /// Called before a shader is translated.

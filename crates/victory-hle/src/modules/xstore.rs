@@ -20,7 +20,7 @@ pub const PROVIDER: Guid = Guid::new(
     0x448c,
     [0xb9, 0x2b, 0x39, 0x60, 0xfb, 0x5b, 0xd3, 0x0c],
 );
-/// As Grand Theft Auto VI (2026) asks for it; every slot it calls takes
+/// As the title (2026) asks for it; every slot it calls takes
 /// the public API's arguments in the 2020 order.
 pub const IID_2026: Guid = Guid::new(
     0xb09d_803c,

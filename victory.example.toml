@@ -4,7 +4,7 @@
 # VICTORY_CONFIG selects a different config file.
 
 [paths]
-# Your own dump of Grand Theft Auto VI.     env: VICTORY_GAME_DIR
+# Your own dump of the title.     env: VICTORY_GAME_DIR
 game_dir = 'D:\victory-data\game'
 
 # Derived data. Default: %LOCALAPPDATA%\victory\cache.   env: VICTORY_CACHE_DIR

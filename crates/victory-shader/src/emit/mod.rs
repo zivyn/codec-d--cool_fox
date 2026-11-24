@@ -29,7 +29,7 @@
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
 //!   address the title sets is the buffer's.
-//! * **Vertex fetch** (added 2026-11-23). Grand Theft Auto VI's mesh and
+//! * **Vertex fetch** (added 2026-11-23). The title's mesh and
 //!   vertex programs fetch vertices themselves with typed-format loads
 //!   (`tbuffer_load_format_*`): the format (8_8_8_8 unorm, 16_16 snorm,
 //!   2_10_10_10 unorm, 8_8_8_8 and 16_16_16_16 uint...) is in the
@@ -612,7 +612,7 @@ fn emit_program(
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
     // shortcut: older containers fall back to the group's lane count, right
-    // when the HLSL group fills its waves (Grand Theft Auto VI's do).
+    // when the HLSL group fills its waves (the title's do).
     let mesh_stride = match &native.io {
         crate::native::StageIo::Ms(ms) => {
             let psv = c.part(FourCC::PSV0).map(|p| p.data);

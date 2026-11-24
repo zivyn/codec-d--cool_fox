@@ -178,8 +178,8 @@ fn footprint(desc: &ResourceDesc) -> Option<AllocationInfo> {
         && let Some(t) = texture_layout(desc)
     {
         // As the console: the layout's own alignment unless more is asked
-        // (4 KiB for 4 KiB modes, where PC says 64 KiB). Grand Theft Auto
-        // VI keeps these sizes in its texture tables, and its streaming
+        // (4 KiB for 4 KiB modes, where PC says 64 KiB).
+        // The title keeps these sizes in its texture tables, and its streaming
         // asserts when they disagree with the streamed layout.
         let alignment = desc.alignment.max(t.alignment);
         if !alignment.is_power_of_two() {
@@ -239,8 +239,8 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// The format of a texture the host GPU renders to or writes as unordered
 /// access, for the title's `format`. The console's GPU does both with the
-/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and Grand Theft
-/// Auto VI has full-screen targets in both; a host that refuses either use
+/// 16-bit colour formats B5G5R5A1 (86) and B4G4R4A4 (115), and
+/// the title has full-screen targets in both; a host that refuses either use
 /// (NVIDIA) refused the whole texture, so every pass that wrote it drew
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
@@ -327,8 +327,8 @@ pub(crate) fn depth_and_unordered(this: This) -> bool {
 /// when a side is used after the other was written
 /// (`HostList::twin_use`).
 /// shortcut: whole textures are copied, not the mips and slices written.
-/// A depth texture with a stencil plane gets a twin for each plane (Grand
-/// Theft Auto VI's tiled lighting writes each pixel's material class into
+/// A depth texture with a stencil plane gets a twin for each plane (
+/// the title's tiled lighting writes each pixel's material class into
 /// the depth plane and masks into the stencil plane, then draws each class
 /// with the depth test "equal"): the stencil plane's is copied through a
 /// buffer, the depth plane's is drawn into the plane by a pass of ours
@@ -921,7 +921,7 @@ static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
-/// memory themselves (Grand Theft Auto VI places its back buffers in a
+/// memory themselves (the title places its back buffers in a
 /// block of its own and checks they fill it). The runtime names it before
 /// the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
@@ -1133,7 +1133,7 @@ pub(crate) struct HostTexture {
 type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 
 /// A title texture's host side. The host copy is made when something first
-/// uses the texture, not when the title creates it: Grand Theft Auto VI
+/// uses the texture, not when the title creates it: the title
 /// had created 3,871 textures (9.2 GB on the host) before its world's first
 /// frame, of which a frame's lists name some hundreds (run 23), on a card
 /// with 12 GB. A title texture is memory the title has either way; its host
@@ -1189,7 +1189,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// same memory, if there is one of the same size, levels and layers with
 /// texels of the same width. The console reads such a texture through the
 /// view as it is
-/// (Grand Theft Auto VI packs light as R9G9B9E5 into R32_UINT textures
+/// (the title packs light as R9G9B9E5 into R32_UINT textures
 /// with compute shaders, which cannot write R9G9B9E5, and samples them
 /// through R9G9B9E5 views placed at the textures' addresses: the sky, the
 /// sky and light probes, the bounced light the lighting pass adds). On the
@@ -1633,7 +1633,7 @@ fn host_texture(
     d.alignment = 0;
     d.flags &= PC_FLAGS;
     // PC refuses depth targets that are also unordered-access (the console
-    // allows both; Grand Theft Auto VI's shadow maps ask for it).
+    // allows both; the title's shadow maps ask for it).
     // The host copy loses the unordered access: shaders write a colour
     // twin instead ([`Twin`]).
     const DEPTH: u32 = 2;
@@ -1895,7 +1895,7 @@ pub(crate) extern "system" fn create_committed(
     )
 }
 
-/// Device method 0x3f8, inferred from Grand Theft Auto VI's calls
+/// Device method 0x3f8, inferred from the title's calls
 /// (title+0x193e1b4: its back buffers, heap flag "allow display"): the
 /// committed resource creation of the enhanced-barrier interfaces,
 /// `(heap, heap flags, desc1, initial layout, clear value, protected
@@ -1958,7 +1958,7 @@ pub(crate) extern "system" fn unregister_page_pool(_: This, handle: usize) -> HR
 }
 
 /// Device method 0x428, one of the `ID3D12Device9` to `ID3D12Device11`
-/// additions. From Grand Theft Auto VI's call: a resource at a virtual
+/// additions. From the title's call: a resource at a virtual
 /// address the title mapped itself, `(address, desc1, initial barrier
 /// layout, clear value, iid, out)`, as `CreatePlacedResourceX` with
 /// enhanced barriers. GPU addresses are CPU addresses, so the resource is
@@ -2008,7 +2008,7 @@ pub(crate) extern "system" fn create_at_address(
 }
 
 /// Textures the title placed in its own memory and views without a
-/// resource object (device 0x230, Grand Theft Auto VI's streamed and
+/// resource object (device 0x230, the title's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
 /// The resource is kept for the run (views and lists name its address);

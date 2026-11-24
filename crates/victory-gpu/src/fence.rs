@@ -182,7 +182,7 @@ mod tests {
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
         assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
-        // Grand Theft Auto VI reads the value at the fence's address.
+        // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
         assert_eq!(unsafe { *(at as *const u64) }, 5);

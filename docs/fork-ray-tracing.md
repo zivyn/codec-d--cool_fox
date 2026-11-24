@@ -6,7 +6,7 @@ game. Everything here is off by default.
 
 ## What the title does
 
-Grand Theft Auto VI's indirect light (probes, bounce, reflections) and the
+The title's indirect light (probes, bounce, reflections) and the
 shadows of its lamps and sun are ray traced. Without them, anything the sun
 does not hit directly is black: interiors, the shadowed side of a face, rooms
 lit only by lamps.

@@ -13,7 +13,7 @@ use crate::policy::ensure_outside_repo;
 
 #[derive(Debug, Default, Clone)]
 pub struct Config {
-    /// The user's dump of Grand Theft Auto VI.
+    /// The user's dump of the title.
     pub game_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,

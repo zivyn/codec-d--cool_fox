@@ -31,11 +31,11 @@ pub(crate) fn listed(n: u64) -> bool {
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
-    // the 80th (Grand Theft Auto VI opens with a cutscene made in the
+    // the 80th (the title opens with a cutscene made in the
     // engine: later shots of it, in case the first is dark by design).
     //
     // `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted
-    // from that first one (Grand Theft Auto VI's blue patches show from
+    // from that first one (the title's blue patches show from
     // about the 118th frame on, when the window's model has arrived and
     // the reflections hold values: none of the four above has them).
     static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
@@ -63,7 +63,7 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
         // it starts (`before-world-ops.txt`): what the title drew just
-        // before (Grand Theft Auto VI shows a title card there, whose text
+        // before (the title shows a title card there, whose text
         // did not show).
         if world_on() && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
             // At most 300 lines of a frame: the world's first frame alone

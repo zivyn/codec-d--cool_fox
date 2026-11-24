@@ -18,7 +18,7 @@ pub const PROVIDER: Guid = Guid::new(
     [0xb7, 0x2f, 0x36, 0xed, 0xb1, 0x85, 0x33, 0x1a],
 );
 
-/// As Grand Theft Auto VI (2026) asks for it; the slots it calls (0x18-0x88)
+/// As the title (2026) asks for it; the slots it calls (0x18-0x88)
 /// take the same arguments as under the provider's own id (older titles).
 pub const IID_2026: Guid = Guid::new(
     0xbf23_46b2,

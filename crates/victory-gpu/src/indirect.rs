@@ -85,7 +85,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
         // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (Grand Theft Auto VI leaves all
+        // slot the title has not filled (the title leaves all
         // ones there): empty, and not counted below either.
         if (ahead && g.x > 65535u) {
             g = uint3(0, 0, 0);

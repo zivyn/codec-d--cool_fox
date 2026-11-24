@@ -36,7 +36,7 @@ pub const CAPTURE_PROVIDER: Guid = Guid::new(
     0x4485,
     [0xb0, 0x08, 0xa7, 0xc2, 0x6d, 0x52, 0xac, 0x27],
 );
-/// As Grand Theft Auto VI (2026) asks for it; it calls 0x28 (take a
+/// As the title (2026) asks for it; it calls 0x28 (take a
 /// screenshot) with the public API's arguments.
 pub const CAPTURE_IID_2026: Guid = Guid::new(
     0x22e6_72d7,

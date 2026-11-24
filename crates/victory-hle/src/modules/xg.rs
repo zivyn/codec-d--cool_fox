@@ -3,7 +3,7 @@
 //! slice lies, and to copy linear data into tiled memory and back. Served
 //! from `victory_formats::texture`.
 //!
-//! Grand Theft Auto VI imports `XGCreateTextureComputer` and
+//! The title imports `XGCreateTextureComputer` and
 //! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
 //! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
 //! and the 64 KiB tiling (0x50). The other slots log and fail.
@@ -165,7 +165,7 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
 const MIPS: usize = 15;
 
 /// One mip in the layout the title reads (offsets 0x00, 0x08, 0x10 and
-/// 0x1c are read by Grand Theft Auto VI; the rest follow the library's
+/// 0x1c are read by the title; the rest follow the library's
 /// older public shape).
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy)]
@@ -539,7 +539,7 @@ extern "system" fn tiling(
 }
 
 /// Slot 0x30 `(plane, mip, x, y, z or slice, sample, bit position)`: an
-/// element's byte offset from the texture's start. Grand Theft Auto VI reads
+/// element's byte offset from the texture's start. The title reads
 /// texels of a 128x4 `4KB_S` texture on the CPU through it (title+0x5151c90);
 /// an error returned as an offset made it read wild memory. 0 if outside.
 extern "system" fn element_offset(

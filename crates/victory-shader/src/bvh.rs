@@ -61,7 +61,7 @@
 //! public software emulation of this instruction in the open-source Vulkan
 //! driver for this GPU family (box test and sorting network as there; the
 //! triangle test is the watertight one it uses, Woop, Benthin and Wald,
-//! JCGT 2013), and agree with what Grand Theft Auto VI's own structure
+//! JCGT 2013), and agree with what the title's own structure
 //! builder writes and its trace programs read. Not known from either: how
 //! the console rounds, which of two boxes entered at the same distance it
 //! returns first, and what it returns for a ray exactly through an edge

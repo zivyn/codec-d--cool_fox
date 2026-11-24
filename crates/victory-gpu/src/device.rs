@@ -29,7 +29,7 @@ pub static IID: Iid = guid(
 );
 
 /// The levels the device answers to, as on PC: `ID3D12Device1` to
-/// `ID3D12Device8`, and `ID3D12Device11`, which Grand Theft Auto VI creates
+/// `ID3D12Device8`, and `ID3D12Device11`, which the title creates
 /// its device as. Each level's table is the one before plus its methods.
 const LEVEL_IIDS: [Iid; 9] = [
     guid(
@@ -94,7 +94,7 @@ pub(crate) fn is_device(iid: *const Iid) -> bool {
 }
 
 /// The interface version these layouts were checked against (2.4). Both
-/// Minecraft (March 2022) and Grand Theft Auto VI (April 2026) pass it.
+/// Minecraft (March 2022) and the title (April 2026) pass it.
 pub const CHECKED_VERSION: u32 = 0x0002_0004;
 
 /// Feature level 12_2, what the console hardware supports.
@@ -160,7 +160,7 @@ pub extern "system" fn create(
 /// queues then have the newer layouts (two more methods each; see
 /// `list` and `queue`), although the interface version stays 2.4.
 /// shortcut: the creation interface is the only sign of the newer layouts
-/// we have (Grand Theft Auto VI, April 2026, versus Minecraft, March 2022);
+/// we have (the title, April 2026, versus Minecraft, March 2022);
 /// look for a better one if a title breaks the rule.
 static NEWER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -346,7 +346,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). Grand Theft Auto VI calls both
+/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn newer_device_levels_are_the_same_device() {
-        // ID3D12Device11, as Grand Theft Auto VI asks for it.
+        // ID3D12Device11, as the title asks for it.
         let (hr, device) = create_as(&LEVEL_IIDS[8]);
         assert_eq!((hr, device), (S_OK, super::device()));
         let mut same = std::ptr::null();

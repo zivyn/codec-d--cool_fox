@@ -37,7 +37,7 @@ Converting them ahead of time from files is only a warm-up.
 | `victory-shader` | Xbox shader containers → host shaders |
 | `victory-formats` | the GPU's texture layouts (sizes, tiling, detiling), audio codecs; planned: BCPack |
 | `victory-pipeline` | converter trait, content-addressed cache |
-| `victory-game` | Grand Theft Auto VI-specific formats, build identities, hooks |
+| `victory-game` | the title-specific formats, build identities, hooks |
 | `apps/victory` | command-line front end |
 | `xtask` | asset-policy check, git hooks |
 | `tests/fixtures/hle-probe` | a stand-in "title" (our own code) for loader tests |

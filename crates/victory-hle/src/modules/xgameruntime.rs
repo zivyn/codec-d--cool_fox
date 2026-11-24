@@ -202,7 +202,7 @@ pub extern "system" fn InitializeApiImplEx(version: u64, build: u64, flags: u64)
 
 /// The stub prefers this one when present. It passes the same three values
 /// and a pointer to the title's initialisation options, null unless the
-/// title initialises with options (Grand Theft Auto VI does not).
+/// title initialises with options (the title does not).
 pub extern "system" fn InitializeApiImplEx2(
     version: u64,
     build: u64,

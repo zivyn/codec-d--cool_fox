@@ -63,8 +63,8 @@ extern "system" fn title_id(_: This, out: *mut u32) -> HRESULT {
 }
 
 /// As documented: the title ends (suspended first, as on any end) and the
-/// game starts again in a new process; this never returns. Grand Theft
-/// Auto VI relaunches itself (its own path from `GetModuleFileNameA`) with
+/// game starts again in a new process; this never returns.
+/// The title relaunches itself (its own path from `GetModuleFileNameA`) with
 /// arguments from its configuration. The new `victory run` gets the same
 /// options, the new executable, and the title's arguments after `--`
 /// (the title reads the whole command line).

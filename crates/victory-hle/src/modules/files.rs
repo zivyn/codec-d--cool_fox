@@ -516,7 +516,7 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 
 // Kernel reads into title memory. The GPU side leaves blocks of title GPU
 // buffers read-only to see the title's next write, and the kernel's writes
-// fail there instead of faulting into its handler; Grand Theft Auto VI's
+// fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
 // is opened first.

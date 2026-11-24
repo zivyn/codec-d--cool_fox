@@ -34,7 +34,7 @@ pub(crate) struct HeapDesc {
     nodes: u32,
 }
 
-/// Newer titles (Grand Theft Auto VI) pass the description followed by
+/// Newer titles (the title) pass the description followed by
 /// memory of their own for the descriptors: an address and its size in
 /// bytes, or a null address to have the heap allocate (inferred from the
 /// title's call sites; older titles pass the plain description).
@@ -73,7 +73,7 @@ impl Heap {
     }
 
     /// The host heap, made on first use from what the title wrote so far.
-    /// Made late because a host view heap the size of Grand Theft Auto VI's
+    /// Made late because a host view heap the size of the title's
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
@@ -330,7 +330,7 @@ impl View {
 /// Views without a resource object have nothing that releases them, and a
 /// title copies descriptors as bytes, so nothing says when the last
 /// descriptor naming an entry is gone: such entries were kept for the run.
-/// Grand Theft Auto VI writes some 14,000 constant buffer views a frame,
+/// The title writes some 14,000 constant buffer views a frame,
 /// each at the address its constants have that frame: 2,450,139 entries
 /// after four minutes of play, 1,047 MB with the index, and 11,000 more
 /// every second (run 65). So the two kinds that carry an address are not
@@ -600,7 +600,7 @@ impl View {
 
 /// Title slots (their handles) written with a view of a texture object
 /// that had no host copy then, by texture. A title texture gets its host
-/// copy on first use (`resource.rs` `Hosted`), and Grand Theft Auto VI
+/// copy on first use (`resource.rs` `Hosted`), and the title
 /// writes each texture's views into its view heap when it creates the
 /// texture: making those host slots would make every host copy at once.
 /// They are made when the texture is: translated shaders index the heap
@@ -1157,7 +1157,7 @@ mod tests {
         assert_ne!(old, new, "a new generation");
     }
 
-    /// Grand Theft Auto VI places its shader-visible heap in its own memory
+    /// The title places its shader-visible heap in its own memory
     /// and checks that the heap starts there.
     #[test]
     fn placed_heaps_start_at_the_title_memory() {

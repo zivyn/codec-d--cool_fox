@@ -81,7 +81,7 @@ pub static DEVICE_OBJECT: Object = Object::new("user devices", &DEVICE_VTABLE);
 
 pub const INTERFACES: &[Interface] = &[
     (PROVIDER, IID, &OBJECT),
-    // Grand Theft Auto VI (2026) asks with the provider's id; its thunks call
+    // The title (2026) asks with the provider's id; its thunks call
     // the same slots with the same arguments (0x108/0x110 change events).
     (PROVIDER, PROVIDER, &OBJECT),
     (PROVIDER, GAMERTAG_IID, &GAMERTAG_OBJECT),

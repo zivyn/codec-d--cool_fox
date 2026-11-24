@@ -141,7 +141,7 @@ const CASES: &[(&str, &str)] = &[
         }"#,
     ),
     // 16-bit outputs and inputs (one value per dword with the 2020
-    // compiler; Grand Theft Auto VI's two per dword cannot be compiled
+    // compiler; the title's two per dword cannot be compiled
     // here) and the front face.
     (
         "16-bit varyings and front face",
@@ -354,7 +354,7 @@ const CS_CASES: &[(&str, &str)] = &[
                 uint4(w * 7 + h, l + asuint(r), n * 5 + ns * 3 + st, b + raw.Load(4 * (i & 31))));
         }"#,
     ),
-    // Typed loads (`tbuffer_load_format_*`, Grand Theft Auto VI's vertex
+    // Typed loads (`tbuffer_load_format_*`, the title's vertex
     // fetch) convert by the format the instruction names: the PC reads the
     // same bytes through typed views in those formats. Channels past the
     // format's read (0, 0, 0, 1); a byte format at unaligned offsets.
@@ -587,7 +587,7 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             }
         }"#,
     ),
-    // Two waves per group, as Grand Theft Auto VI's mesh programs run: the
+    // Two waves per group, as the title's mesh programs run: the
     // second wave's lanes are threads 64-127.
     (
         "two waves",
@@ -605,7 +605,7 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             tris[i] = i & 1 ? uint3(c + 1, c + 10, c + 9) : uint3(c, c + 1, c + 9);
         }"#,
     ),
-    // Quad reads (DPP quad permutations on the console; Grand Theft Auto VI's
+    // Quad reads (DPP quad permutations on the console; the title's
     // tessellating mesh programs swizzle within quads too).
     (
         "quad reads",

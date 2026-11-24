@@ -2,7 +2,7 @@
 //! to begin. Ours is a clock started by the first interval set, ticking
 //! once per interval; the token is the frame number. Each event kind
 //! (origin, vblank, flip) happens once per tick, so two waits for the same
-//! kind never end on the same tick: Grand Theft Auto VI polls the origin
+//! kind never end on the same tick: the title polls the origin
 //! with "token on time-out" (starting its next frame at once) and is paced
 //! by a blocking wait for the flip before each present.
 //!

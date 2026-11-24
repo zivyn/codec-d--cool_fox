@@ -1,14 +1,14 @@
-# victory-fork
+# VIctory fork (work in progress)
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
-compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
-natively on Windows from files the user supplies. This fork follows upstream
+A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
+compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies. This fork follows upstream
 `main` and adds fixes aimed at one goal: getting the game's world to render
 correctly and playably on one particular PC.
 
 **This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the publisher Games or
-Take-Two Interactive.
+copy of the game. It is not affiliated with or endorsed by the game's
+developer or publisher.
 
 ## Credits
 
@@ -80,7 +80,7 @@ status section describes upstream, not this fork.
 
 # VIctory
 
-Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
+Runs the title (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
 The title's x86-64 code runs unchanged inside our process; VIctory supplies

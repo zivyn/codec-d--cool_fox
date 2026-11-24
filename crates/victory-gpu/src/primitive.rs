@@ -1,6 +1,6 @@
 //! Console primitive types the host lacks. A rectangle list gives three
 //! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
+//! the hardware adds the fourth at `v0 + v2 - v1` (the title's
 //! full-screen rectangles come as top left, bottom left, bottom right); on
 //! the host each rectangle becomes two triangles, with the fourth vertex
 //! made from the other three on the CPU.

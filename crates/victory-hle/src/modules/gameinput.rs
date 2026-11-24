@@ -637,7 +637,7 @@ fn relative(
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
     // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; Grand Theft Auto VI walks
+    // not every device's readings in time order; the title walks
     // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
@@ -712,7 +712,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -911,7 +911,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -1149,7 +1149,7 @@ mod host {
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
-            // to the pad (Grand Theft Auto VI's start screen) saw nothing.
+            // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
@@ -1181,8 +1181,8 @@ mod host {
                     // SAFETY: plain query.
                     scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
                     virtual_key: vk,
-                    // shortcut: no characters (code point 0); Grand Theft
-                    // Auto VI reads scan codes and virtual keys only.
+                    // shortcut: no characters (code point 0);
+                    // the title reads scan codes and virtual keys only.
                     ..Default::default()
                 })
                 .collect()

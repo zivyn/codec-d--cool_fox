@@ -175,7 +175,9 @@ fn far_jump<'a>(
             (Encoding::Sop2, Some(op @ ("s_add_u32" | "s_sub_u32")))
                 if sdst == n && ssrc0 == n && ssrc1 == 0xFF && delta.is_none() =>
             {
-                let literal = i64::from(prev.words[1]);
+                // The low dword of a signed 64-bit offset: a backward jump
+                // adds a negative one (its high dword is -1).
+                let literal = i64::from(prev.words[1] as i32);
                 delta = Some(if op == "s_add_u32" { literal } else { -literal });
             }
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
@@ -444,6 +446,33 @@ mod tests {
         );
         // Through other registers (a handover to another stage): the path ends.
         assert_eq!(summary(&[0xBE80_2018, S_ENDPGM]).len(), 1);
+    }
+
+    #[test]
+    fn follows_far_jumps_backward() {
+        // The compiler's backward far jump adds a negative offset: the low
+        // dword as a 32-bit literal, the high dword as -1 with the carry.
+        let code = [
+            sopp(0x02, 1), // s_branch -> 8, past the jump target
+            S_ENDPGM,      // the far jump's target: only it reaches here
+            0xBE88_1F00,   // s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            0xFFFF_FFF8, // s_add_u32 s8, s8, -8 -> 12 - 8 = 4
+            0x8209_C109, // s_addc_u32 s9, s9, -1
+            0xBE80_2008, // s_setpc_b64 s[8:9]
+        ];
+        let found: Vec<_> = summary(&code).iter().map(|i| (i.0, i.2)).collect();
+        assert_eq!(
+            found,
+            [
+                (0, "s_branch"),
+                (4, "s_endpgm"),
+                (8, "s_getpc_b64"),
+                (12, "s_add_u32"),
+                (20, "s_addc_u32"),
+                (24, "s_setpc_b64"),
+            ]
+        );
     }
 
     #[test]

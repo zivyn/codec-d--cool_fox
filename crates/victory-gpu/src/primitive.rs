@@ -8,7 +8,9 @@
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
 //! shaders linear in their inputs (blits, 2D quads). Inputs in formats
-//! [`components`] does not know keep the first vertex's value.
+//! [`components`] does not know keep the first vertex's value, and so do
+//! components past the end of the vertex (an element that reaches into the
+//! next one, which the layout allows).
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
@@ -29,7 +31,10 @@ pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: 
             let Some((n, kind)) = components(format) else {
                 continue;
             };
-            for c in 0..n {
+            // Only the components inside the vertex: the rest belong to the
+            // next one.
+            let inside = stride.saturating_sub(at) / kind.bytes();
+            for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
                 let value = get(0) + get(2) - get(1);
                 kind.write(&mut fourth[at..], c, value);
@@ -158,5 +163,19 @@ mod tests {
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x3e00), 1.5);
         assert_eq!(half_to_f32(0xc000), -2.0);
+    }
+
+    /// An element that reaches past the stride (float4 at 4 in 8-byte
+    /// vertices, RGBA8 at the stride itself): the components inside get
+    /// the fourth corner, the rest keep the first vertex's bytes. The old
+    /// code indexed past the vertex and panicked.
+    #[test]
+    fn elements_past_the_stride_are_left_alone() {
+        let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let src = [vertex(0.0, 2.0), vertex(1.0, 3.0), vertex(5.0, 7.0)].concat();
+        let mut dst = vec![0u8; 6 * 8];
+        expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)]);
+        assert_eq!(dst[..40], [&src[..], &src[..8], &src[16..]].concat()[..]);
+        assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
     }
 }

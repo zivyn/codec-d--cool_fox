@@ -6,7 +6,7 @@
 //! the table as a call.
 //!
 //! Each list records onto a host command list as its methods are called
-//! (decision 0007); draw state lives in [`crate::draw`]. Methods not
+//! (decision 0007); draw state lives in `crate::draw`. Methods not
 //! written yet log once with their caller, so a run lists what to do next.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 

@@ -86,6 +86,8 @@ mod sampler;
 mod shader;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(all(test, windows))]
+mod valu_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};

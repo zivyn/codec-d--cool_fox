@@ -486,4 +486,59 @@ mod tests {
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
     }
+
+    /// A pixel shader reading channel z of an input whose element starts at
+    /// w. Looking the channel up subtracted the element's first channel
+    /// before checking the channel lies in it, so in a build with overflow
+    /// checks (tests, debug) any read below an element that starts at z or
+    /// w panicked, whichever row it was in (found by random-input testing).
+    #[test]
+    fn reading_a_channel_below_an_input_element_does_not_underflow() {
+        // v_interp_mov_f32 v3, p0, attr0.z; s_endpgm
+        let words = [0xC80E_0202u32, 0xBF81_0000];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b1000,
+                    attr: 0,
+                    flat: false,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let w_only = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 3,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[w_only], true);
+        let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        // Translated or refused with a reason; it must not panic.
+        let _ = super::emit(&c, &native, &p, &st, &io, &res);
+    }
 }

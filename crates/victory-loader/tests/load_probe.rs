@@ -20,11 +20,12 @@ fn workspace_root() -> PathBuf {
 }
 
 /// Builds the fixture into its own target dir (the outer cargo holds the
-/// lock on the main one while tests run).
+/// lock on the main one while tests run), in the outer one's scratch folder
+/// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
+/// build.
 fn build_probe() -> PathBuf {
-    let root = workspace_root();
-    let manifest = root.join("tests/fixtures/hle-probe/Cargo.toml");
-    let target = root.join("target/fixtures");
+    let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
+    let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))
         .args(["build", "--quiet", "--manifest-path"])
         .arg(&manifest)

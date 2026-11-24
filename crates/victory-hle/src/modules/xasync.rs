@@ -635,7 +635,9 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
         return E_INVALIDARG;
     }
     let hr = status(block);
-    if hr == S_OK {
+    // Any nonnegative completion carries a result, not just S_OK: S_FALSE
+    // is a success code too and a provider may return data with it.
+    if hr >= 0 {
         // SAFETY: checked non-null.
         unsafe { out.write(words(block).1.load(Ordering::Acquire)) };
     }
@@ -664,8 +666,8 @@ pub fn XAsyncGetResult(
     }
     let hr = status(block);
     let size = words(block).1.load(Ordering::Acquire);
-    if hr != S_OK || size == 0 {
-        if hr == S_OK && !used.is_null() {
+    if hr < 0 || size == 0 {
+        if hr >= 0 && !used.is_null() {
             // SAFETY: checked non-null.
             unsafe { used.write(0) };
         }
@@ -1129,6 +1131,55 @@ mod tests {
         );
         assert_eq!((value, used), (42, 8));
         assert!(call(&mut block).is_none(), "the call ends with its result");
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn a_nonnegative_completion_still_returns_its_payload() {
+        const S_FALSE: HRESULT = 1;
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let data = unsafe { &*data };
+            match op {
+                OP_BEGIN => XAsyncSchedule(data.block, 0),
+                OP_DO_WORK => {
+                    XAsyncComplete(data.block, S_FALSE, 8);
+                    S_OK
+                }
+                OP_GET_RESULT => {
+                    // SAFETY: the caller checked eight bytes.
+                    unsafe { data.buffer.cast::<u64>().write(0x1234) };
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let identity = 0x77 as *const c_void;
+        assert_eq!(
+            XAsyncBegin(&mut block, std::ptr::null_mut(), identity, std::ptr::null(), Some(provider)),
+            S_OK
+        );
+        assert!(XTaskQueueDispatch(q, WORK, 0));
+        assert_eq!(XAsyncGetStatus(&mut block, false), S_FALSE);
+        let mut size = 0;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_FALSE);
+        assert_eq!(size, 8);
+        let mut value = 0u64;
+        let mut used = 0;
+        assert_eq!(
+            XAsyncGetResult(&mut block, identity, 8, (&mut value as *mut u64).cast(), &mut used),
+            S_OK
+        );
+        assert_eq!((value, used), (0x1234, 8));
+        assert!(call((&raw mut block)).is_none(), "the call ends with its result");
         XTaskQueueCloseHandle(q);
     }
 

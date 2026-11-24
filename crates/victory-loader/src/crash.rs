@@ -512,10 +512,19 @@ fn unwind(context: CONTEXT) -> Vec<u64> {
     frames
 }
 
+/// A `CONTEXT` at the 16-byte alignment the unwind and capture functions need.
+#[repr(C, align(16))]
+pub(crate) struct Aligned16(pub(crate) CONTEXT);
+
 /// [`unwind`] for any thread of the process, its stack being `low..high`;
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
-pub(crate) fn unwind_into(mut context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+    // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
+    // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
+    // the stack can land 8 bytes off and fault (seen in a debug build).
+    let mut aligned = Aligned16(context);
+    let context = &mut aligned.0;
     frames.push(context.Rip);
     while frames.len() < MAX_FRAMES {
         // Stop where reading the stack would fault inside this handler.
@@ -539,7 +548,7 @@ pub(crate) fn unwind_into(mut context: CONTEXT, low: usize, high: usize, frames:
                     image,
                     context.Rip,
                     entry,
-                    &mut context,
+                    context,
                     &mut data,
                     &mut frame,
                     null_mut(),
@@ -591,11 +600,12 @@ mod tests {
     fn unwinds_like_the_system_walk() {
         // SAFETY: zeroed CONTEXT is valid; both calls write our buffers.
         let (frames, walked) = unsafe {
-            let mut context: CONTEXT = std::mem::zeroed();
-            RtlCaptureContext(&mut context);
+            // `RtlCaptureContext` wants it 16-byte aligned too.
+            let mut context = Aligned16(std::mem::zeroed());
+            RtlCaptureContext(&mut context.0);
             let mut walked = [null_mut(); 8];
             let n = RtlCaptureStackBackTrace(0, 8, walked.as_mut_ptr(), null_mut());
-            (unwind(context), walked[..usize::from(n)].to_vec())
+            (unwind(context.0), walked[..usize::from(n)].to_vec())
         };
         // Frame 0 differs (two call sites in this function); callers agree.
         assert!(walked.len() >= 4, "{walked:?}");

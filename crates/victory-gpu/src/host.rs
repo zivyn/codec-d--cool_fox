@@ -333,6 +333,9 @@ enum Step {
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Brings a texture's staging buffer up to date: once per submission,
+    /// whichever lists sample it, until a `Copy` or `Run` intervenes.
+    Texture(std::sync::Arc<crate::texture::Staging>),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -1101,6 +1104,12 @@ impl HostList {
         self.deferred().copies.push(Step::Host(Box::new(work)));
     }
 
+    /// Brings a texture's staging buffer up to date when the list is
+    /// submitted, keeping it alive until the list is reset.
+    pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().copies.push(Step::Texture(staging));
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
@@ -1116,7 +1125,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.flush();
+                    batch.title_written();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1140,7 +1149,7 @@ impl HostList {
                 }
                 Step::Run(work) | Step::Host(work) => {
                     if matches!(step, Step::Run(_)) {
-                        batch.flush();
+                        batch.title_written();
                     }
                     work();
                     #[cfg(feature = "diagnostics")]
@@ -1156,6 +1165,12 @@ impl HostList {
                     shadow.writing(*address, *len);
                     continue;
                 }
+                Step::Texture(staging) => {
+                    if batch.texture_due(staging) {
+                        staging.refresh();
+                    }
+                    continue;
+                }
             };
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
@@ -1166,20 +1181,46 @@ impl HostList {
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
+///
+/// Also the textures brought up to date in the submission so far: most
+/// lists of a world submission sample the same textures, and a texture in
+/// physical-page memory is hashed whole each time it is checked. Checked
+/// once, it is checked again only after a step that writes title memory.
 #[derive(Default)]
-struct Batch(Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>);
+struct Batch {
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Staging buffers (by address) refreshed since the last title write.
+    textures: std::collections::HashSet<usize>,
+}
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
-        match self.0.iter_mut().find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow)) {
+        match self
+            .refreshes
+            .iter_mut()
+            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+        {
             Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.0.push((shadow.clone(), address, end)),
+            None => self.refreshes.push((shadow.clone(), address, end)),
         }
     }
 
+    /// Whether `staging` is still to be refreshed in this submission (and
+    /// notes it refreshed).
+    fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
+        self.textures.insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
+    }
+
+    /// Before a step that writes title memory: pending refreshes are done
+    /// first, and textures are checked again after it.
+    fn title_written(&mut self) {
+        self.flush();
+        self.textures.clear();
+    }
+
     fn flush(&mut self) {
-        for (shadow, from, to) in self.0.drain(..) {
+        for (shadow, from, to) in self.refreshes.drain(..) {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
@@ -1877,5 +1918,79 @@ fn pump() {
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Batch;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_texture_is_checked_once_per_submission() {
+        let mut batch = Batch::default();
+        let (a, b) = (Arc::new([0u8; 16]), Arc::new([0u8; 16]));
+        // The first list sampling each texture checks it ...
+        assert!(batch.texture_due(&a));
+        assert!(batch.texture_due(&b));
+        // ... later lists of the same submission do not.
+        assert!(!batch.texture_due(&a));
+        assert!(!batch.texture_due(&a.clone()));
+        assert!(!batch.texture_due(&b));
+    }
+
+    #[test]
+    fn title_writes_make_textures_due_again() {
+        let mut batch = Batch::default();
+        let a = Arc::new(1u32);
+        assert!(batch.texture_due(&a));
+        assert!(!batch.texture_due(&a));
+        // A copy into title memory or work that may write it may have
+        // changed the texture's memory.
+        batch.title_written();
+        assert!(batch.texture_due(&a));
+        assert!(!batch.texture_due(&a));
+        // A fresh submission starts over.
+        let mut next = Batch::default();
+        assert!(next.texture_due(&a));
+    }
+
+    /// The hashing a submission does for textures in physical-page memory,
+    /// with every list checking the textures it samples (before) and with
+    /// each checked once (after). Run with
+    /// `cargo test --release -p victory-gpu -- --ignored --nocapture texture_checks`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn texture_checks_per_submission() {
+        const TEXTURES: usize = 48;
+        const SIZE: usize = 4 << 20;
+        const LISTS: usize = 12;
+        let textures: Vec<Arc<Vec<u8>>> = (0..TEXTURES)
+            .map(|t| Arc::new((0..SIZE).map(|i| (i * 31 + t) as u8).collect()))
+            .collect();
+        let submit = |dedupe: bool| {
+            let mut batch = Batch::default();
+            let mut hashed = 0usize;
+            let started = std::time::Instant::now();
+            for _ in 0..LISTS {
+                for t in &textures {
+                    if !dedupe || batch.texture_due(t) {
+                        std::hint::black_box(blake3::hash(t));
+                        hashed += 1;
+                    }
+                }
+            }
+            (started.elapsed(), hashed)
+        };
+        submit(false); // warm up
+        let (before, n_before) = submit(false);
+        let (after, n_after) = submit(true);
+        assert_eq!((n_before, n_after), (TEXTURES * LISTS, TEXTURES));
+        println!(
+            "{LISTS} lists sampling {TEXTURES} textures of {} MiB: \
+             before {n_before} hashes in {before:?}, after {n_after} in {after:?} ({:.1}x)",
+            SIZE >> 20,
+            before.as_secs_f64() / after.as_secs_f64()
+        );
     }
 }

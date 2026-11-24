@@ -420,6 +420,52 @@ fn v_fract_f16_never_returns_one() {
     });
 }
 
+/// RDNA2's flt16_to_snorm16 / flt16_to_unorm16: clamp, scale by 32767 or
+/// 65535, round the exact product to nearest even; NaN gives 0.
+fn cvt_norm16_reference(bits: u16, signed: bool) -> u16 {
+    let x = f16_to_f32(bits);
+    if x.is_nan() {
+        return 0;
+    }
+    let (lo, scale) = if signed {
+        (-1.0, 32767.0)
+    } else {
+        (0.0, 65535.0)
+    };
+    // f64 holds the product of an f16 and a 16-bit scale exactly.
+    let p = f64::from(x.clamp(lo, 1.0)) * scale;
+    p.round_ties_even() as i32 as u16
+}
+
+#[test]
+fn v_cvt_norm_i16_and_u16_f16_round_the_exact_product() {
+    // Every 251st f16 pattern, plus the values where an f32 product would
+    // round before the rounding to an integer, ties, and the edges.
+    let mut bits: Vec<u16> = (0..=u16::MAX).step_by(251).collect();
+    bits.extend([
+        0x0000, 0x8000, 0x0001, 0x8001, 0x03FF, 0x0400, 0x3800, 0xB800, 0x3801, 0xB801, 0x37FF,
+        0x3BFF, 0xBBFF, 0x3C00, 0xBC00, 0x3C01, 0x7BFF, 0x7C00, 0xFC00, 0x7E00, 0xFE00, 0x7C01,
+        0x3A9B, 0xBA9B, 0x2E66, 0x1400,
+    ]);
+    for (op, signed, what) in [
+        (0x063u16, true, "v_cvt_norm_i16_f16"),
+        (0x064, false, "v_cvt_norm_u16_f16"),
+    ] {
+        // v_cvt_norm_*16_f16 v0, v1 (VOP1); v0's high half starts at 0.
+        let shader = build_valu_cs(&[vop1(0x001, 0, 128), vop1(op, 0, vgpr(1))]);
+        let inputs: Vec<[u32; 4]> = bits.iter().map(|&b| [u32::from(b), 0, 0, 0]).collect();
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let want = cvt_norm16_reference(bits[i], signed);
+            assert_eq!(
+                got,
+                u32::from(want),
+                "{backend}: {what}({:#06x}) = {got:#010x}, want {want:#06x}",
+                bits[i],
+            );
+        });
+    }
+}
+
 #[test]
 fn v_sin_and_v_cos_f32_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x035, 0, vgpr(1))]);

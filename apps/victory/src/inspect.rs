@@ -10,6 +10,7 @@ pub fn run(file: &Path, list_imports: bool, list_exports: bool) -> Result<()> {
     let info = ImageInfo::parse(&data).with_context(|| format!("parsing {}", file.display()))?;
 
     println!("file           {}", file.display());
+    println!("file size      {} bytes", data.len());
     println!("blake3         {}", blake3::hash(&data).to_hex());
     if let Some(cv) = &info.codeview {
         println!("pdb            {}  (key {})", cv.pdb_path, cv.symbol_key());

@@ -18,8 +18,8 @@ use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
     MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile3,
-    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_RESERVE,
-    UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
+    MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
+    SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -28,6 +28,19 @@ use windows_sys::core::BOOL;
 use crate::{HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
+
+/// Whether we run under Wine (its ntdll exports `wine_get_version`).
+pub(crate) fn on_wine() -> bool {
+    static WINE: LazyLock<bool> = LazyLock::new(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: plain lookups in ntdll, always loaded.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    });
+    *WINE
+}
 
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
@@ -388,7 +401,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         CreateFileMappingW(
             INVALID_HANDLE_VALUE,
             std::ptr::null(),
-            PAGE_READWRITE | SEC_RESERVE,
+            // Under Wine a committed section is a sparse file, free until
+            // touched, and committing a reserved one page by page costs a
+            // wineserver request each that scans every range committed so
+            // far: commit it whole there.
+            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -712,6 +729,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
+    if on_wine() {
+        return true; // sections are committed whole there
+    }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     let done =
         !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null();

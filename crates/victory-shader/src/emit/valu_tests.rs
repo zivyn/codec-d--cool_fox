@@ -232,6 +232,27 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 #[test]
+fn packed_add_selects_halves_of_inline_constants() {
+    // Add the inline constant 1/(2*pi) to v1 (zero) to read back its two halves.
+    // The same GFX10 source field (248) has a different bit pattern for a
+    // packed floating-point and a packed integer instruction.
+    let cases = [
+        // v_pk_add_f16 v0, 0x3118, v1
+        ([0xcc0f4000, 0x1a0202f8], 0x0000_3118),
+        // v_pk_add_f16 v0, 0x3118, v1 op_sel_hi:[0,1] (use low twice)
+        ([0xcc0f4000, 0x120202f8], 0x3118_3118),
+        // v_pk_add_u16 v0, 0x3e22f983, v1
+        ([0xcc0a4000, 0x1a0202f8], 0x3e22_f983),
+    ];
+    for (words, expected) in cases {
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: {words:08x?}");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));

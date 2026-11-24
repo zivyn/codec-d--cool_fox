@@ -118,8 +118,11 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
+        // `from_str_radix` accepts a leading sign, so `%+1` would decode as
+        // a control byte. A percent escape is exactly two hex digits.
         let hex = b
             .get(i + 1..i + 3)
+            .filter(|h| h.iter().all(|c| c.is_ascii_hexdigit()))
             .and_then(|h| std::str::from_utf8(h).ok());
         match (b[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
             (b'%', Some(v)) => {
@@ -491,6 +494,15 @@ mod tests {
 
     fn text(v: &[u16]) -> String {
         String::from_utf16_lossy(v.strip_suffix(&[0]).unwrap_or(v))
+    }
+
+    #[test]
+    fn percent_decode_requires_two_hex_digits() {
+        assert_eq!(percent_decode("%20"), " ");
+        assert_eq!(percent_decode("%+1"), "%+1");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("%%20"), "% ");
+        assert_eq!(percent_decode("a%2Gb"), "a%2Gb");
     }
 
     #[test]

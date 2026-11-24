@@ -786,6 +786,11 @@ extern "system" fn read_result(
 ) -> HRESULT {
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
+    // The documented error for a small buffer; the result stays for a
+    // retry with a larger one.
+    if hr == xasync::E_NOT_SUFFICIENT_BUFFER {
+        return BUFFER_TOO_SMALL;
+    }
     if hr < 0 {
         return hr;
     }
@@ -1209,6 +1214,10 @@ mod tests {
         );
         let mut buffer = vec![0u64; size.div_ceil(8)];
         let mut count = 0;
+        assert_eq!(
+            read_result(this, &mut b, 8, buffer.as_mut_ptr().cast(), &mut count),
+            BUFFER_TOO_SMALL
+        );
         assert_eq!(
             read_result(this, &mut b, size, buffer.as_mut_ptr().cast(), &mut count),
             S_OK

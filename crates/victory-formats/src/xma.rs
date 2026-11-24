@@ -102,6 +102,25 @@ impl Cursor<'_> {
     fn bits(&mut self, n: u32) -> Option<u32> {
         (0..n).try_fold(0, |v, _| Some(v << 1 | self.bit()?))
     }
+
+    /// A payload byte, MSB first. At a packet edge the individual bits
+    /// may be separated by a header and other streams' packets.
+    fn byte(&mut self) -> Option<u8> {
+        let in_packet = self.pos % PACKET_BITS;
+        if in_packet == 0 || in_packet > PACKET_BITS - 8 {
+            return self.bits(8).map(|v| v as u8);
+        }
+        let at = self.pos / 8;
+        let shift = self.pos % 8;
+        let first = *self.data.get(at)?;
+        let byte = if shift == 0 {
+            first
+        } else {
+            (first << shift) | (self.data.get(at + 1)? >> (8 - shift))
+        };
+        self.pos += 8;
+        Some(byte)
+    }
 }
 
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
@@ -112,10 +131,14 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
         return None;
     }
-    let mut out = vec![0u8; bits.div_ceil(8)];
+    let mut out = Vec::with_capacity(bits.div_ceil(8));
     let mut cursor = Cursor { data, pos: start };
-    for i in 0..bits {
-        out[i / 8] |= (cursor.bit()? as u8) << (7 - i % 8);
+    for _ in 0..bits / 8 {
+        out.push(cursor.byte()?);
+    }
+    let tail = (bits % 8) as u32;
+    if tail != 0 {
+        out.push((cursor.bits(tail)? << (8 - tail)) as u8);
     }
     let end = cursor.pos;
     let next = next_frame(data, start, end);
@@ -1424,6 +1447,24 @@ mod tests {
     }
 
     #[test]
+    fn payload_bytes_match_bit_reads_at_packet_edges() {
+        let mut data: Vec<u8> = (0..3 * PACKET_BYTES).map(|i| (i * 37 + 11) as u8).collect();
+        data[..4].copy_from_slice(&1u32.to_be_bytes()); // packet 1 belongs to another stream
+        data[PACKET_BYTES..2 * PACKET_BYTES].fill(0xee);
+        for edge in [HEADER_BITS + 8, PACKET_BITS, 3 * PACKET_BITS] {
+            for pos in edge - 8..=edge {
+                let mut bytes = Cursor { data: &data, pos };
+                let mut bits = Cursor { data: &data, pos };
+                let expected = bits.bits(8).map(|v| v as u8);
+                assert_eq!(bytes.byte(), expected, "bit {pos}");
+                if expected.is_some() {
+                    assert_eq!(bytes.pos, bits.pos);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn packet_headers_and_frame_walk() {
         // Two packets: frame A (100 bits) and B (16300 bits, crossing into
         // packet 1 by 48 bits), then C (60 bits) in packet 1; the rest is
@@ -1451,6 +1492,7 @@ mod tests {
         assert_eq!((b.bits, b.next), (16300, Some(c_start)));
         // Its last bits come from after packet 1's header.
         assert_eq!(b.data.len(), 16300usize.div_ceil(8));
+        assert_eq!(b.data.last(), Some(&0xf0)); // unused bits stay zero
         let c = read_frame(&data, c_start).unwrap();
         assert_eq!(c.bits, 60);
         // C was packet 1's only frame: the next would be in packet 2.

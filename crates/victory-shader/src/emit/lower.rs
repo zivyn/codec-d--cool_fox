@@ -3609,6 +3609,22 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_swap_b32" => {
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("v_swap_b32");
+                };
+                let a = self.i32_of(inst.read(Reg::V(dreg)).ok_or("v_swap_b32")?)?;
+                let b = self.i32_of(inst.read(Reg::V(sreg)).ok_or("v_swap_b32")?)?;
+                self.write_placed(inst, Reg::V(dreg), b, guard);
+                if dreg != sreg {
+                    self.write_placed(inst, Reg::V(sreg), a, guard);
+                }
+                Ok(())
+            }
             "v_ffbh_u32" | "v_ffbh_i32" => {
                 // Counted from the top bit, -1 when none (DXIL's too).
                 let a = s(self, 0)?;
@@ -4559,6 +4575,12 @@ impl<'a> Lower<'a> {
                     _ => (Bin::Mul, a, b),
                 };
                 self.s.m.bin(c, op, a, b)
+            }
+            "v_xnor_b32" => {
+                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let x = self.s.m.bin(c, Bin::Xor, a, b);
+                let ones = k(self, u32::MAX);
+                self.s.m.bin(c, Bin::Xor, x, ones)
             }
             "v_not_b32" => {
                 let a = s(self, 0)?;

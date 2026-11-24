@@ -312,6 +312,10 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    // The hash a run's log names the shader by (`hash=` in "first bind",
+    // "shader does not translate", "host pipeline refused").
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
@@ -319,17 +323,61 @@ fn translate(
     let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    // `~`: the hash of the code alone; containers that differ only around
+    // it are translated once, the others listed as duplicates of it.
+    let code = blake3::hash(dxil);
+    let code8 = code.to_hex()[..8].to_owned();
+    let example = || format!("{} ~{code8}", example());
+    // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
+    // line holds one of the texts (a name, `#hash`), as the title has them.
+    if let Ok(spec) = std::env::var("VICTORY_DUMP_MATCH")
+        && let Some((dir, texts)) = spec.split_once(';')
+    {
+        let line = example();
+        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+            let name: String = source
+                .label()
+                .chars()
+                .skip_while(|c| *c != ' ')
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(70)
+                .collect();
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+        }
+    }
+    if !lock(seen).insert(code) {
         t.duplicates += 1;
+        if t.list {
+            t.lines.push(format!("{}  duplicate", example()));
+        }
         return;
     }
     let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
+    // has them (`.cdxil`), to work on a translator gap offline
+    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
+    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    translate_programs(&container, programs, &example, t, checks);
+    if let (Some(dir), Some(before)) = (dump, before) {
+        for (reason, (n, _)) in &t.failed {
+            let was = before.get(reason).copied().unwrap_or(0);
+            if *n > was && was < 3 {
+                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+            }
+        }
+    }
+}
+
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
+        match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
@@ -390,7 +438,7 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(&container, &p, &program, &s, &i, &r) {
+                    match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
@@ -525,6 +573,7 @@ fn tally_io(r: &io::Io, t: &mut Tally) {
         match i {
             io::Interp::Interpolated { .. } => t.interpolated += 1,
             io::Interp::Vertex { .. } => t.vertex_values += 1,
+            io::Interp::Weighted { .. } => t.interpolated += 1,
         }
     }
     for e in &r.exports {

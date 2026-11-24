@@ -129,8 +129,8 @@ impl Tables {
     /// alpha 64 B and colour 256 B, BC4 64 B, BC5 64 B), 512 u16 BC7 control
     /// words, then 255 dictionary entries per format in format order: BC1
     /// 6 + 16 B, BC3 8 + 32 B, BC4 2 + 16 B, BC5 4 + 32 B, BC6H (u8 mode,
-    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 32 i16).
-    /// Little-endian, no padding. Every model must tile 65536.
+    /// 12 u16, u8 mode, 16 i16), BC7 (u16 control, 24 u16, 2 u8, 2 B,
+    /// 16 + 15 i16). Little-endian, no padding. Every model must tile 65536.
     pub fn parse(bytes: &[u8]) -> Result<Tables, Error> {
         if bytes.len() != TABLES_SIZE {
             return Err(Error("table file has the wrong size"));
@@ -222,7 +222,10 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                for v in ix.ix.as_flattened_mut() {
+                // Unused: the widths again in all entries but the first.
+                r.u16();
+                // Only 15 slots for set 1, which no entry uses (0 bits).
+                for v in &mut ix.ix.as_flattened_mut()[..31] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
@@ -1589,5 +1592,17 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    /// A dictionary entry stands in for a block the decoder made: a set with
+    /// 0 index bits holds no indices, and pixel 0 is the anchor (top bit clear).
+    #[test]
+    fn bc7_dictionary_indices_line_up() {
+        let t = Tables::builtin().unwrap();
+        for (k, (_, ix)) in t.bc7.iter().enumerate() {
+            let anchor = 0..1 << (ix.bits[0] - 1);
+            let ok = (ix.bits[1] != 0 || ix.ix[1] == [0; 16]) && anchor.contains(&ix.ix[0][0]);
+            assert!(ok, "entry {k}: {:?}", ix.ix);
+        }
     }
 }

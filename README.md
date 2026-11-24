@@ -1,3 +1,79 @@
+# victory-fork
+
+A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
+compatibility layer that runs the Xbox Series build of Grand Theft Auto VI
+natively on Windows from files the user supplies. This fork follows upstream
+`main` and adds fixes aimed at one goal: getting the game's world to render
+correctly and playably on one particular PC.
+
+**This repository contains no game files, code or assets.** You need your own
+copy of the game. It is not affiliated with or endorsed by the publisher Games or
+Take-Two Interactive.
+
+## Credits
+
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
+  contributors is the base of everything here: the loader, the runtime
+  services, the Direct3D 12 back end and the shader recompiler. Licensed
+  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
+  the single commit that carries this fork's changes.
+- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
+  (GPL-2.0-only) was used as a reference for how the same title behaves under
+  another layer. Fixes inspired by it were written anew in VIctory's code.
+- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+
+## Status of this fork (2026-11-25)
+
+**Not playable yet: about 3 frames per second, and shadowed areas are black.**
+Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
+32 GB RAM. The Series X profile is used throughout.
+
+| Stage | State in this fork |
+|-------|--------------------|
+| Boot, menus, start screen | works, 30 fps (as upstream) |
+| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
+| Saves | the game autosaves a checkpoint and loads it again |
+| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
+| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
+| Frame rate in the world | 2-3.5 fps (270-450 ms per frame), from 3-6 seconds per frame at the start |
+| Stability | no driver hang or device loss in normal runs |
+
+### What this fork changed (summary)
+
+Rendering:
+- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
+- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
+- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
+- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
+- Gathers at a named mip level (with and without an offset) read level 0; fixed.
+- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
+- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
+- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, and the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU).
+
+Speed and memory:
+- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
+- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
+- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`, new and untested in the game).
+- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
+- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+
+Most of the newer speed changes sit behind environment switches that are off
+by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
+`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
+Each is described in a comment where it is read.
+
+### Known problems
+
+- Everything in shadow is black (see above).
+- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
+- Around 24 GB of memory is in use during play.
+- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
+
+Everything below this line is upstream VIctory's own README, unchanged; its
+status section describes upstream, not this fork.
+
+---
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files

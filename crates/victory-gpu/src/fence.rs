@@ -75,7 +75,7 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
-extern "system" fn completed(this: This) -> u64 {
+pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
@@ -88,6 +88,19 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         return S_OK;
     }
     if event.is_null() {
+        // With submissions sent to the card and not waited for
+        // (`crate::host::late`) the signal may be behind them: they are
+        // settled, which sets it.
+        #[cfg(windows)]
+        if crate::host::late() {
+            drop(waiters);
+            crate::host::settle_for_fence();
+            if fence.value.load(Ordering::Acquire) >= value {
+                return S_OK;
+            }
+            tracing::warn!(value, "blocking fence wait not implemented");
+            return E_NOTIMPL;
+        }
         // shortcut: a null event means "block until reached"; nothing can
         // reach it while no GPU work runs, so fail instead of hanging.
         tracing::warn!(value, "blocking fence wait not implemented");
@@ -96,7 +109,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     waiters.push((value, event as usize));
     S_OK
 }
-pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+/// Moves the fence to `value` and sets the events that waited for it.
+pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
@@ -107,6 +121,12 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
         }
         !reached
     });
+}
+pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
+    set(this, value);
+    // A queue may have waited for it: what it held runs now.
+    #[cfg(windows)]
+    crate::queue::release_held(false);
     S_OK
 }
 

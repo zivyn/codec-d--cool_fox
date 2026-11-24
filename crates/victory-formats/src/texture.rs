@@ -671,6 +671,13 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // A mip can end partway through the last run. Check the other runs
+        // once so each row can copy them with a compile-time length.
+        let (body, last) = runs.split_at(runs.len().saturating_sub(1));
+        let run_len = body
+            .first()
+            .map(|run| run.2)
+            .filter(|&len| body.iter().all(|run| run.2 == len));
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
@@ -681,13 +688,30 @@ impl Layout {
                     copy(tiled_row as usize, linear_row, bytes);
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
-                    for &(tiled, linear, len) in &runs {
-                        copy(tiled_row + tiled, linear_row + linear, len);
+                    match run_len {
+                        Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
+                        Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
+                        Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
+                        _ => copy_runs::<0>(body, tiled_row, linear_row, &mut copy),
                     }
+                    copy_runs::<0>(last, tiled_row, linear_row, &mut copy);
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Copy micro-tile runs inline at a known width, or use each run's length for N = 0.
+fn copy_runs<const N: usize>(
+    runs: &[(usize, usize, usize)],
+    tiled_row: usize,
+    linear_row: usize,
+    copy: &mut impl FnMut(usize, usize, usize),
+) {
+    for &(tiled, linear, len) in runs {
+        let len = if N == 0 { len } else { N };
+        copy(tiled_row + tiled, linear_row + linear, len);
     }
 }
 

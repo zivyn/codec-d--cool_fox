@@ -16,7 +16,7 @@ use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
-use crate::structure::{Bool, LaneExit, Structured};
+use crate::structure::{Bool, LaneExit, Meets, Structured};
 
 /// An instruction: block and index in [`crate::ir::Block::insts`].
 pub type Site = (usize, usize);
@@ -37,6 +37,24 @@ pub struct Address {
 /// compiler appends after the code and reads through `s_getpc_b64`; the
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
+
+/// [`Address::param`] of title memory at an address no root parameter
+/// gives: one the code computes from root constants, reads out of a
+/// descriptor or loads from other memory (compute programs only: the
+/// ray-tracing structure builder and the programs that walk its
+/// structures). Offset and computed term are not used: lowering takes the
+/// 64-bit address from the instruction's operands.
+pub const MEMORY: usize = usize::MAX - 1;
+
+/// The reasons an address traces to no root parameter for which the
+/// address is then taken as it stands ([`MEMORY`]).
+const RAW: [&str; 5] = [
+    "an address not from a root parameter",
+    "an address from a root parameter that is no address",
+    "an address in an SGPR that is no root parameter",
+    "an address loaded from memory",
+    "an address from a phi",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -107,16 +125,52 @@ pub struct Descriptor {
     pub source: Source,
 }
 
+/// A view-heap descriptor whose byte address can be evaluated when binding
+/// the draw, using a table base and a root constant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootIndexedView {
+    pub table_slot: u8,
+    pub constant_slot: u8,
+    pub constant_dword: u32,
+    pub byte_offset: u32,
+    pub shift: u8,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Resources {
     /// Every scalar memory access by address (`s_load_*`, `s_store_*`), and
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    /// Direct descriptor sources with a draw-evaluable index.
+    pub root_indexed_views: Vec<RootIndexedView>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
+    /// Scalar loads of one descriptor the code keeps per lane in VGPRs
+    /// ([`Tracer::lane_copies`]): they read one address, so their dwords
+    /// stand in for each other.
+    pub lane_copied: Vec<Site>,
     pub waterfall: Waterfall,
+    /// Every `image_bvh_intersect_ray` and `image_bvh64_intersect_ray`: where
+    /// its nodes are.
+    pub bvh: Vec<(Site, BvhNodes)>,
+}
+
+/// Where a ray-tracing node test ([`crate::bvh`]) reads its nodes. Its
+/// descriptor operand names a range of memory, not a texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BvhNodes {
+    /// A buffer of the host: the descriptor is loaded from a table (it is
+    /// among [`Resources::descriptors`]), and node pointers count from the
+    /// buffer's start. Its flags are not known to the shader: boxes are
+    /// sorted and triangles return barycentrics, as every descriptor Grand
+    /// Theft Auto VI builds asks.
+    Resource,
+    /// Title memory by address: the code makes the descriptor from numbers
+    /// (the title: the whole address space, or one structure's address in
+    /// dword 0). Dwords 1 and 3, which hold its flags.
+    Memory { word1: u32, word3: u32 },
 }
 
 /// Waterfall loops over descriptors that differ between lanes: each pass
@@ -170,6 +224,7 @@ pub fn track(
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
+        t.at.set(Some(b));
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
             let fail = |what| ShaderError::Unsupported {
@@ -180,11 +235,15 @@ pub fn track(
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
-                first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
+                // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
+                // is the same in every lane: its loop is lowered as it stands
+                // and needs no proof.
+                if !t.kept_per_lane(inst, op) {
+                    first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
+                }
                 if let Source::Loaded { load, .. } = source
-                    && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
-                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
-                    && t.first_lane_source(v).is_some()
+                    && out.scalar.iter().any(|s| s.0 == load)
+                    && let Some(v) = t.first_lane_offset(load)
                 {
                     offset.push((v, load));
                 }
@@ -192,13 +251,44 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                Fields::Image { rsrc, .. } if inst.name().starts_with("image_bvh") => {
+                    // The ray and node test names no texture. A descriptor
+                    // whose flag dwords the code sets as numbers and whose
+                    // type is a ray-tracing structure is a range of title
+                    // memory (the title: all of it, or from one structure's
+                    // address on), and the node's address is among the
+                    // operands; any other descriptor must be a resource of
+                    // the host.
+                    let word = |k: u8| match *rsrc {
+                        Operand::Scalar { code, dwords } if k < dwords => {
+                            inst.read(Reg::S(code + k)).map(|v| t.origin(v))
+                        }
+                        _ => None,
+                    };
+                    match (word(1), word(3)) {
+                        (Some(Term::Const(word1)), Some(Term::Const(word3)))
+                            if word3 >> 28 == crate::bvh::DESCRIPTOR_TYPE =>
+                        {
+                            out.bvh.push((site, BvhNodes::Memory { word1, word3 }));
+                        }
+                        _ => {
+                            descriptor(rsrc, Role::Resource)?;
+                            out.bvh.push((site, BvhNodes::Resource));
+                        }
+                    }
+                }
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
                         descriptor(s, Role::Sampler)?;
                     }
                 }
-                Fields::Buffer { rsrc, .. } => descriptor(rsrc, Role::Resource)?,
+                // Cache invalidations name a buffer's address space but do
+                // not read its descriptor; the host has no cache to drop.
+                Fields::Buffer { rsrc, .. } if !inst.name().ends_with("_inv") => {
+                    descriptor(rsrc, Role::Resource)?
+                }
+                Fields::Buffer { .. } => {}
                 Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
                     descriptor(base, Role::Resource)?;
                 }
@@ -208,7 +298,10 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address = t
+                        .smem_address(inst, base, *offset, soffset)
+                        .or_else(|why| t.by_address(why))
+                        .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -219,6 +312,7 @@ pub fn track(
                 } if inst.name().starts_with("global_") => {
                     let address = t
                         .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .or_else(|why| t.by_address(why))
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -239,6 +333,8 @@ pub fn track(
             }
         }
     }
+    // What follows traces no access of one block.
+    t.at.set(None);
     // The proof needs the per-lane form. Without it nothing is emitted, and
     // its failure is the one to report, so the reads stay unproven here.
     if t.lanes.is_none() {
@@ -267,6 +363,14 @@ pub fn track(
             out.waterfall.loads.extend(loads);
         }
     }
+    out.lane_copied = t.lane_copied.take();
+    out.lane_copied.sort_unstable();
+    out.lane_copied.dedup();
+    out.root_indexed_views = out
+        .descriptors
+        .iter()
+        .filter_map(|d| t.root_indexed_view(d, &out.scalar))
+        .collect();
     Ok(out)
 }
 
@@ -296,9 +400,19 @@ struct Tracer<'a> {
     /// Register per input value.
     inputs: Vec<Option<Reg>>,
     origin: Vec<Term>,
+    /// See [`Resources::lane_copied`].
+    lane_copied: std::cell::RefCell<Vec<Site>>,
     lanes: Option<&'a Structured>,
+    /// While set, [`Self::sum`] keeps the first-lane read of an index as
+    /// the computed term instead of what the lanes hold.
+    read_first_lane: std::cell::Cell<bool>,
+    /// What the conditions asked of `lanes` so far came down to: the proofs
+    /// of one program ask about the same blocks and masks again and again.
+    meets: std::cell::RefCell<Meets>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// The block of the access being traced ([`Self::live`]).
+    at: std::cell::Cell<Option<usize>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -307,6 +421,8 @@ type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+/// VGPR values followed for one dword of a descriptor kept per lane.
+const MAX_COPIES: usize = 64;
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -358,8 +474,12 @@ impl<'a> Tracer<'a> {
             phis,
             inputs,
             origin: Vec::new(),
+            lane_copied: Default::default(),
             lanes,
+            read_first_lane: Default::default(),
+            meets: Default::default(),
             rpo,
+            at: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         Ok(t)
@@ -420,6 +540,15 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// Whether some lane can satisfy all of `conditions` ([`Bools::meet`]).
+    ///
+    /// [`Bools::meet`]: crate::structure::Bools::meet
+    fn meet(&self, lanes: &Structured, conditions: &[(Bool, bool)]) -> bool {
+        lanes
+            .bools
+            .meet_seen(conditions, &mut self.meets.borrow_mut())
+    }
+
     fn inst(&self, (b, i): Site) -> &'a Inst {
         &self.p.blocks[b].insts[i]
     }
@@ -453,7 +582,7 @@ impl<'a> Tracer<'a> {
         })
     }
 
-    /// The SOP2 operands of `v` if an `s_add` with one of `names` wrote it.
+    /// The SOP2 operands of `v` if an instruction with one of `names` wrote it.
     fn sop2(&self, v: Value, names: &[&str]) -> Option<(&'a Inst, [Term; 2])> {
         let inst = self.def(v)?;
         if !names.contains(&inst.name()) || inst.writes.first()?.1 != v {
@@ -469,6 +598,42 @@ impl<'a> Tracer<'a> {
                 self.term(inst, src.get(1)?)?,
             ],
         ))
+    }
+
+    fn root_indexed_view(
+        &self,
+        descriptor: &Descriptor,
+        scalar: &[(Site, Address)],
+    ) -> Option<RootIndexedView> {
+        if descriptor.role != Role::Resource {
+            return None;
+        }
+        let Source::Loaded { load, first } = descriptor.source else {
+            return None;
+        };
+        let i = scalar.binary_search_by_key(&load, |(site, _)| *site).ok()?;
+        let address = scalar[i].1;
+        let base = self.layout.get(address.param)?;
+        if base.root != RootType::Table {
+            return None;
+        }
+        let dynamic = address.dynamic?;
+        let (input, shift) = match self.sop2(dynamic, &["s_lshl_b32"]) {
+            Some((_, [Term::Value(input), Term::Const(shift)])) => (input, (shift & 31) as u8),
+            _ => (dynamic, 0),
+        };
+        let (param, constant_dword) = self.param_of(self.inputs[input.0 as usize]?)?;
+        let constant = self.layout.get(param)?;
+        if constant.root != RootType::Constants {
+            return None;
+        }
+        Some(RootIndexedView {
+            table_slot: base.slot,
+            constant_slot: constant.slot,
+            constant_dword,
+            byte_offset: address.offset.wrapping_add(u32::from(first) * 4),
+            shift,
+        })
     }
 
     fn sum(&self, t: Term) -> Sum {
@@ -504,6 +669,34 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        // Paths that each add an index to a table in the code and meet before one
+        // load: the join itself is the computed term. Lowering gives every
+        // `s_getpc_b64` its own offset in the code as its value, so the join is the
+        // byte in the code whichever table a path took ([`Self::address`] adds no
+        // base to it).
+        if let Some(pc) = self.code_join(v) {
+            return Sum {
+                base: Some(pc),
+                offset: 0,
+                dynamic: Some(v),
+            };
+        }
+        // An address computed in VGPRs and taken from the first lane (a
+        // table in the code indexed by a value held per lane, or a table
+        // offset held per lane, the console's waterfall): the sum of what
+        // the lanes hold. Loads at one offset in different loops (each with
+        // its own `v_readfirstlane_b32`) then have one address, which is
+        // what tells lowering that they read one descriptor. With
+        // `read_first_lane` a first-lane read of an index alone stays the
+        // computed term ([`Self::first_lane_offset`]).
+        if let Some(lane) = self.first_lane(v) {
+            let per_lane = self.sum(self.vorigin(lane));
+            return if per_lane.base.is_some() || !self.read_first_lane.get() {
+                per_lane
+            } else {
+                dynamic
+            };
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -519,6 +712,106 @@ impl<'a> Tracer<'a> {
             base: x.base.or(y.base),
             offset: x.offset.wrapping_add(y.offset),
             dynamic: x.dynamic.or(y.dynamic),
+        }
+    }
+
+    /// For a join `v` whose every incoming value adds to an `s_getpc_b64` low
+    /// dword: the first of those (one level of joins only). The paths may add
+    /// to different ones: two tables in the code, one picked by control flow
+    /// (Grand Theft Auto VI's fog reconstruction reads its sample offsets from
+    /// one of two tables, by the sample's number; refused, the lit frame was
+    /// multiplied by a fog transmittance nothing had written).
+    fn code_join(&self, v: Value) -> Option<Value> {
+        let (b, i) = self.phis[v.0 as usize]?;
+        let mut base = None;
+        for &a in &self.p.blocks[b].phis[i].args {
+            let Term::Value(x) = self.vorigin(a) else {
+                return None;
+            };
+            if x == v {
+                continue;
+            }
+            let pc = self.code_base(x, 4)?;
+            base = base.or(Some(pc));
+        }
+        base
+    }
+
+    /// `t` is the high dword of an `s_getpc_b64`, or `s_addc_u32`s of one:
+    /// the carry may be added in steps (the counter's high dword plus 0
+    /// where the table's offset is added, then plus the index's high dword).
+    fn code_high(&self, t: Term) -> bool {
+        self.code_high_in(t, 4)
+    }
+
+    /// [`Self::code_high`], at most `depth` additions deep.
+    fn code_high_in(&self, t: Term, depth: u32) -> bool {
+        let Term::Value(x) = t else { return false };
+        if self.def(x).is_some_and(|i| {
+            i.name() == "s_getpc_b64" && i.writes.get(1).is_some_and(|w| w.1 == x)
+        }) {
+            return true;
+        }
+        depth > 0
+            && self.sop2(x, &["s_addc_u32"]).is_some_and(|(_, [p, q])| {
+                self.code_high_in(p, depth - 1) || self.code_high_in(q, depth - 1)
+            })
+    }
+
+    /// The `s_getpc_b64` low dword among the terms `v` adds up (`depth`
+    /// additions deep; joins are not followed).
+    fn code_base(&self, v: Value, depth: u32) -> Option<Value> {
+        if self.getpc(v).is_some() {
+            return Some(v);
+        }
+        // Computed in VGPRs and taken from the first lane.
+        if let Some(lane) = self.first_lane(v) {
+            return match self.vorigin(lane) {
+                Term::Value(x) => self.code_base(x, depth),
+                Term::Const(_) => None,
+            };
+        }
+        if depth == 0 || self.phis[v.0 as usize].is_some() {
+            return None;
+        }
+        let terms = self
+            .sop2(v, &["s_add_u32", "s_add_i32"])
+            .map(|(_, t)| t)
+            .or_else(|| self.vadd(v))?;
+        terms.into_iter().find_map(|t| match t {
+            Term::Value(x) => self.code_base(x, depth - 1),
+            Term::Const(_) => None,
+        })
+    }
+
+    /// `t` is `high` or an `s_addc_u32` of it.
+    fn is_high(&self, t: Term, high: Value) -> bool {
+        match t {
+            Term::Value(x) => {
+                x == high
+                    || self
+                        .sop2(x, &["s_addc_u32"])
+                        .is_some_and(|(_, [p, q])| p == Term::Value(high) || q == Term::Value(high))
+            }
+            Term::Const(_) => false,
+        }
+    }
+
+    /// The VGPR value `v_readfirstlane_b32` reads to write the scalar `v`.
+    fn first_lane(&self, v: Value) -> Option<Value> {
+        let inst = self.def(v)?;
+        if inst.name() != "v_readfirstlane_b32" || inst.writes.first()?.1 != v {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            return None;
+        }
+        match *f.src.first()? {
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            _ => None,
         }
     }
 
@@ -579,6 +872,21 @@ impl<'a> Tracer<'a> {
         self.origin(v)
     }
 
+    /// The address of an access that traces to no root parameter (`why`
+    /// says how it failed): title memory at the address as it stands, in a
+    /// compute program.
+    fn by_address(&self, why: &'static str) -> Result<Address, &'static str> {
+        if self.stage == HwStage::Cs && RAW.contains(&why) {
+            Ok(Address {
+                param: MEMORY,
+                offset: 0,
+                dynamic: None,
+            })
+        } else {
+            Err(why)
+        }
+    }
+
     /// A global memory address: an SGPR pair plus a VGPR offset, or a VGPR
     /// pair.
     fn flat_address(
@@ -627,6 +935,15 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        // The high half as the lanes that read through the address hold
+        // it, where that is a constant or what a register held on entry
+        // (the code clears a table address's high half inside a branch
+        // and uses the address after the join).
+        let hi = match self.live(hi) {
+            t @ Term::Const(_) => t,
+            Term::Value(v) if self.inputs[v.0 as usize].is_some() => Term::Value(v),
+            _ => hi,
+        };
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -638,11 +955,13 @@ impl<'a> Tracer<'a> {
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
                 return Err("an address with an untracked high half");
             }
+            // A join of paths into tables in the code is the byte in the code
+            // already: each path's `s_getpc_b64` counts as its own offset.
+            let joined = s.dynamic.is_some_and(|d| self.code_join(d).is_some());
+            let first = if joined { 0 } else { pc.machine.offset as u32 + 4 };
             return Ok(Address {
                 param: CODE,
-                offset: (pc.machine.offset as u32 + 4)
-                    .wrapping_add(s.offset)
-                    .wrapping_add(extra.offset),
+                offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
@@ -689,6 +1008,39 @@ impl<'a> Tracer<'a> {
         let Term::Value(v) = hi else { return false };
         if v == high {
             return true;
+        }
+        // A join ([`Self::code_join`]): every path carries into the table's high half.
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            // A path may carry into another table's high half ([`Self::code_join`]).
+            let high_of = |t: Term| self.is_high(t, high) || self.code_high(t);
+            return self.p.blocks[b].phis[i].args.iter().all(|&a| {
+                let t = self.vorigin(a);
+                if t == Term::Value(v) || high_of(t) {
+                    return true;
+                }
+                let Term::Value(x) = t else {
+                    return false;
+                };
+                // Computed in VGPRs and taken from the first lane.
+                let x = match self.first_lane(x).map(|lane| self.vorigin(lane)) {
+                    Some(Term::Value(y)) => y,
+                    Some(Term::Const(_)) => return false,
+                    None => x,
+                };
+                let Some(inst) = self.def(x) else {
+                    return false;
+                };
+                let Fields::Valu(f) = &inst.fields else {
+                    return false;
+                };
+                inst.name() == "v_add_co_ci_u32"
+                    && f.src[..2.min(f.src.len())]
+                        .iter()
+                        .any(|o| self.vterm(inst, o).is_some_and(high_of))
+            });
+        }
+        if let Some(lane) = self.first_lane(v) {
+            return self.carried(self.vorigin(lane), high);
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high) || self.carried(b, high);
@@ -794,6 +1146,10 @@ impl<'a> Tracer<'a> {
             Term::Const(_) => None,
         };
         if let Some(sources) = words.iter().map(read).collect::<Option<Vec<_>>>() {
+            // One descriptor the code keeps per lane: the lanes agree.
+            if let Some(source) = self.lane_copies(words) {
+                return Ok(source);
+            }
             // Read from the first active lane, as a waterfall loop does: the
             // dwords each lane holds.
             let lanes: Vec<Term> = sources.into_iter().map(Term::Value).collect();
@@ -848,6 +1204,91 @@ impl<'a> Tracer<'a> {
         })
     }
 
+    /// The one edge into the join `block` that lanes satisfying `known`
+    /// can have taken, if the lanes' paths ([`Structured`]) rule out every
+    /// other: the console compiler loads a descriptor (or clears an
+    /// address's high half) inside a branch that skips code when no lane
+    /// is left for it, and uses it after the join, where only lanes that
+    /// ran the branch are left (Grand Theft Auto VI's
+    /// `CS_Alpha_Schedule`: the registers' values from before the branch,
+    /// which the join also sees, are what a wave with no such lane holds).
+    /// None at loop headers and without the lanes' paths.
+    fn only_edge(&self, block: usize, known: &mut Known) -> Option<usize> {
+        let lanes = self.lanes?;
+        let preds = &self.p.blocks[block].preds;
+        if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let mut only = None;
+        for (j, &q) in preds.iter().enumerate() {
+            let n = known.len();
+            known.push((lanes.reach[q], true));
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[q]
+                && taken != not_taken
+            {
+                known.push((when, taken == block));
+            }
+            let possible = self.meet(lanes, known);
+            known.truncate(n);
+            if possible {
+                if only.is_some() {
+                    return None;
+                }
+                only = Some(j);
+            }
+        }
+        only
+    }
+
+    /// Whether lowering can make a handle for `source` in any block: its
+    /// heap index comes from root parameters and constants alone (a table
+    /// offset the code computes exists only where the load is).
+    fn anywhere(&self, source: &Source) -> bool {
+        match source {
+            Source::Constant(_) => true,
+            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                match &inst.fields {
+                    Fields::Smem {
+                        base,
+                        offset,
+                        soffset,
+                        ..
+                    } => self
+                        .smem_address(inst, base, *offset, soffset)
+                        .is_ok_and(|a| a.dynamic.is_none()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `t` as the lanes that reach the access being traced hold it: through
+    /// joins they can have entered by one edge only ([`Self::only_edge`]).
+    fn live(&self, mut t: Term) -> Term {
+        let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
+            return t;
+        };
+        let mut known = vec![(lanes.reach[at], true)];
+        for _ in 0..MAX_JOINS {
+            let Term::Value(v) = t else { break };
+            let Some((block, i)) = self.phis[v.0 as usize] else {
+                break;
+            };
+            let Some(j) = self.only_edge(block, &mut known) else {
+                break;
+            };
+            t = self.origin(self.p.blocks[block].phis[i].args[j]);
+        }
+        t
+    }
+
     /// Words that phis of one block join, traced per predecessor (words
     /// defined before the join hold on every edge).
     fn phi(
@@ -875,20 +1316,35 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
+        let edge = |j: usize| -> Vec<Term> {
+            words
+                .iter()
+                .map(|w| match phi_of(w) {
+                    Some((_, i)) => self.origin(phis[i].args[j]),
+                    None => *w,
+                })
+                .collect()
+        };
         let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
-                let edge: Vec<Term> = words
-                    .iter()
-                    .map(|w| match phi_of(w) {
-                        Some((_, i)) => self.origin(phis[i].args[j]),
-                        None => *w,
-                    })
-                    .collect();
-                self.classify(&edge, joins, known)
-            })
+            .map(|j| self.classify(&edge(j), joins, known))
             .collect::<Result<_, _>>();
+        let source = match args {
+            Ok(args) => Ok(Source::Phi { block, args }),
+            // An edge holds no descriptor. With only one edge the lanes
+            // that read the descriptor can have come by, it is what the
+            // registers hold on that one (a wave that took another edge
+            // has no lane left that reads it), if that can be named where
+            // it is read.
+            Err(e) => match self.only_edge(block, known) {
+                Some(j) => match self.classify(&edge(j), joins, known) {
+                    Ok(source) if self.anywhere(&source) => Ok(source),
+                    _ => Err(e),
+                },
+                None => Err(e),
+            },
+        };
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        source.map(Some)
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1021,6 +1477,42 @@ impl<'a> Tracer<'a> {
         inst.read(Reg::V(reg))
     }
 
+    /// The `v_readfirstlane_b32` result the scalar load at `load` adds to
+    /// its address as a table offset (the console's waterfall,
+    /// `s_load_dwordx8 .., s[4:5], s20`): `track` proves the waterfall from
+    /// it, and lowering reads it per lane there.
+    fn first_lane_offset(&self, load: Site) -> Option<Value> {
+        let inst = self.inst(load);
+        let Fields::Smem {
+            base,
+            offset,
+            soffset,
+            ..
+        } = &inst.fields
+        else {
+            return None;
+        };
+        self.read_first_lane.set(true);
+        let address = self.smem_address(inst, base, *offset, soffset);
+        self.read_first_lane.set(false);
+        match self.origin(address.ok()?.dynamic?) {
+            Term::Value(v) if self.first_lane_source(v).is_some() => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Whether the descriptor operand `op` of `inst` is one the code keeps
+    /// per lane ([`Self::lane_copies`]).
+    fn kept_per_lane(&self, inst: &Inst, op: &Operand) -> bool {
+        let Operand::Scalar { code, dwords } = *op else {
+            return false;
+        };
+        (0..dwords)
+            .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+            .collect::<Option<Vec<_>>>()
+            .is_some_and(|words| self.lane_copies(&words).is_some())
+    }
+
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
     /// `inst` is, when every dword is one.
     fn first_lane_words(&self, inst: &Inst, op: &Operand) -> Option<Vec<Value>> {
@@ -1119,7 +1611,7 @@ impl<'a> Tracer<'a> {
         };
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
-        if lanes.bools.meet(&skips) {
+        if self.meet(lanes, &skips) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
         }
         Ok(())
@@ -1382,7 +1874,7 @@ impl<'a> Tracer<'a> {
             {
                 known.push((when, taken == block));
             }
-            let arg = if lanes.bools.meet(known) {
+            let arg = if self.meet(lanes, known) {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
@@ -1483,7 +1975,7 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| lanes.bools.meet(conditions);
+        let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -1594,6 +2086,162 @@ impl<'a> Tracer<'a> {
             load,
             first: first as u8,
         })
+    }
+
+    /// A descriptor the code keeps per lane: every dword of `words` is the
+    /// first lane (`v_readfirstlane_b32`) of a VGPR that `v_mov_b32` filled
+    /// from SGPRs. The console compiler does this to a descriptor loaded on
+    /// both sides of a per-lane branch: the join is per lane, so it lives in
+    /// VGPRs, and the instruction that needs it in SGPRs runs in a loop over
+    /// the distinct values (the first lane's, the lanes holding the same,
+    /// then the rest). When every scalar those moves copy is the same dword
+    /// of loads from one constant address, the lanes agree and the
+    /// descriptor is any of those loads.
+    // shortcut: what else the VGPRs held (numbers, on paths or in lanes that
+    // never read them as a descriptor) is ignored, and a move is taken to
+    // leave either its source or what a move before it wrote; a descriptor
+    // read per lane from memory (`global_load_*`) refuses.
+    fn lane_copies(&self, words: &[Term]) -> Option<Source> {
+        let mut loads: Vec<Site> = Vec::new();
+        let mut first = None;
+        for (k, w) in words.iter().enumerate() {
+            let Term::Value(v) = *w else { return None };
+            let mut copies = Vec::new();
+            if !self.scalar_copies(self.first_lane(v)?, &mut copies) {
+                return None;
+            }
+            let mut found = false;
+            for c in copies {
+                let Term::Value(c) = c else { continue };
+                let Some(site) = self.defs[c.0 as usize] else {
+                    continue;
+                };
+                let load = self.inst(site);
+                if !load.name().starts_with("s_load_") {
+                    continue;
+                }
+                // Dword k of the operand is dword `first + k` of each load.
+                let dword = load.writes.iter().position(|x| x.1 == c)?;
+                let f = dword.checked_sub(k)?;
+                if *first.get_or_insert(f) != f {
+                    return None;
+                }
+                if !loads.contains(&site) {
+                    loads.push(site);
+                }
+                found = true;
+            }
+            if !found {
+                return None;
+            }
+        }
+        let address = |site: Site| {
+            let inst = self.inst(site);
+            match &inst.fields {
+                Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } => self.smem_address(inst, base, *offset, soffset).ok(),
+                _ => None,
+            }
+        };
+        let a = address(*loads.first()?)?;
+        if a.dynamic.is_some() || loads.iter().any(|&l| address(l) != Some(a)) {
+            return None;
+        }
+        // The handle is made where the descriptor is used, from the load's
+        // operands: take a load whose base is the root parameter's own SGPR.
+        loads.sort_unstable();
+        let load = *loads.iter().find(|&&l| self.base_from_entry(l))?;
+        self.lane_copied.borrow_mut().extend(&loads);
+        Some(Source::Loaded {
+            load,
+            first: first? as u8,
+        })
+    }
+
+    /// The scalars (as origins) that `v_mov_b32` copies put in VGPR value
+    /// `v`, through joins, moves between VGPRs and per-lane selects; a move
+    /// keeps what it wrote over in the lanes it does not run. False if the
+    /// VGPR may hold something read per lane from memory.
+    fn scalar_copies(&self, v: Value, out: &mut Vec<Term>) -> bool {
+        let (mut seen, mut work) = (Vec::new(), vec![v]);
+        while let Some(v) = work.pop() {
+            if seen.contains(&v) {
+                continue;
+            }
+            if seen.len() == MAX_COPIES {
+                return false;
+            }
+            seen.push(v);
+            if let Some((b, i)) = self.phis[v.0 as usize] {
+                work.extend(&self.p.blocks[b].phis[i].args);
+                continue;
+            }
+            // An entry value, or a number some instruction computed.
+            let Some(inst) = self.def(v) else { continue };
+            if inst.name().starts_with("global_load_") {
+                return false;
+            }
+            let Fields::Valu(f) = &inst.fields else {
+                continue;
+            };
+            let sources = match inst.name() {
+                "v_mov_b32" => 1,
+                "v_cndmask_b32" => 2,
+                _ => continue,
+            };
+            if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                continue;
+            }
+            for op in f.src.iter().take(sources) {
+                match *op {
+                    Operand::Vector { reg, .. } => work.extend(inst.read(Reg::V(reg))),
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        out.extend(inst.read(Reg::S(code)).map(|s| self.origin(s)));
+                    }
+                    _ => {}
+                }
+            }
+            // Lanes outside EXEC keep the old value.
+            if let Some(Operand::Vector { reg, .. }) = f.dst {
+                work.extend(inst.read(Reg::V(reg)));
+            }
+        }
+        true
+    }
+
+    /// The load at `site` has a constant offset and takes its base from a
+    /// root parameter's SGPR through moves alone: a value that exists
+    /// wherever the descriptor is used.
+    fn base_from_entry(&self, site: Site) -> bool {
+        let inst = self.inst(site);
+        let Fields::Smem {
+            base: Operand::Scalar { code, .. },
+            soffset: Operand::Scalar { code: NULL, .. },
+            ..
+        } = &inst.fields
+        else {
+            return false;
+        };
+        let Some(mut v) = inst.read(Reg::S(*code)) else {
+            return false;
+        };
+        loop {
+            if self.inputs[v.0 as usize].is_some() {
+                return true;
+            }
+            let Some(def) = self.def(v) else { return false };
+            let Some(k) = def.writes.iter().position(|w| w.1 == v) else {
+                return false;
+            };
+            match copy_source(def, k) {
+                Some(Moved::Value(s)) => v = s,
+                _ => return false,
+            }
+        }
     }
 }
 
@@ -1840,16 +2488,17 @@ pub(crate) mod tests {
     fn heap_indices_from_root_constants_in_a_merged_stage() {
         // User data starts at s8: the constant (index 6) is s14, the heap
         // (index 10) s18.
+        let code = [
+            0x8F08_850E, // s_lshl_b32 s8, s14, 5
+            0xBE93_0380, // s_mov_b32 s19, 0
+            0xF408_0209,
+            0x1000_0000, // s_load_dwordx4 s[8:11], s[18:19], s8
+            0xE000_2000,
+            0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
+            S_ENDPGM,
+        ];
         let r = track_words(
-            &[
-                0x8F08_850E, // s_lshl_b32 s8, s14, 5
-                0xBE93_0380, // s_mov_b32 s19, 0
-                0xF408_0209,
-                0x1000_0000, // s_load_dwordx4 s[8:11], s[18:19], s8
-                0xE000_2000,
-                0x8002_0400, // buffer_load_format_x v4, v0, s[8:11], 0 idxen
-                S_ENDPGM,
-            ],
+            &code,
             &[param(Constants, 6, 1), param(ResourceHeap, 10, 1)],
             HwStage::Ms,
         );
@@ -1865,6 +2514,24 @@ pub(crate) mod tests {
                 first: 0
             }
         );
+        assert!(r.root_indexed_views.is_empty());
+        let table = RootParam {
+            slot: 7,
+            ..param(Table, 10, 1)
+        };
+        let indexed = track_words(&code, &[param(Constants, 6, 1), table], HwStage::Ms);
+        assert_eq!(
+            indexed.root_indexed_views,
+            [RootIndexedView {
+                table_slot: 7,
+                constant_slot: 0,
+                constant_dword: 0,
+                byte_offset: 0,
+                shift: 5,
+            }]
+        );
+        let nonconstant = track_words(&code, &[param(Table, 6, 1), table], HwStage::Ms);
+        assert!(nonconstant.root_indexed_views.is_empty());
     }
 
     #[test]
@@ -1922,6 +2589,134 @@ pub(crate) mod tests {
         assert!(
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
+        );
+    }
+
+    /// Two paths add an index to one table in the code and meet before one load
+    /// (hair `CS_InterpolateStrands`): the join is the computed term, counted
+    /// from the `s_getpc_b64`.
+    #[test]
+    fn two_paths_into_one_code_table_load() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+                0x8002_FF02,
+                0x0000_0040, // s_add_u32 s2, s2, 0x40
+                0x8203_8003, // s_addc_u32 s3, s3, 0
+                0xBF06_8001, // 0x10: s_cmp_eq_u32 s1, 0
+                0xBF85_0005, // 0x14: s_cbranch_scc1 -> 0x2c
+                0xD70F_0457,
+                0x0000_054A, // 0x18: v_add_co_u32 v87, s4, v74, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xBF82_0004, // 0x28: s_branch -> 0x3c
+                0xD70F_0457,
+                0x0000_054B, // 0x2c: v_add_co_u32 v87, s4, v75, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0xDC34_8000,
+                0x577D_0057, // 0x3c: global_load_dwordx2 v[87:88], v[87:88], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 0));
+        assert!(a.dynamic.is_some(), "the join is the computed term, the byte in the code");
+    }
+
+    /// An address into a table in the code computed per lane and taken from
+    /// the first lane (`avgLuminanceCompute` `ColorDownsample`): the per-lane
+    /// sum carries the `s_getpc_b64` base, so the first-lane read is looked
+    /// through and the lane's index is the computed term. (A first-lane read
+    /// of an index alone stays the computed term itself; see
+    /// `the_console_waterfall_over_a_first_lane_offset_is_one`.)
+    #[test]
+    fn a_code_table_address_taken_from_the_first_lane() {
+        let r = track_words(
+            &[
+                0xBE82_1F00, // 0x00: s_getpc_b64 s[2:3]
+                0xD70F_0457,
+                0x0000_054A, // v_add_co_u32 v87, s4, v74, s2
+                0xD528_0458,
+                0x0010_0680, // v_add_co_ci_u32 v88, s4, 0, s3, s4
+                0x7E0C_0557, // v_readfirstlane_b32 s6, v87
+                0x7E0E_0558, // v_readfirstlane_b32 s7, v88
+                0xF400_0203,
+                0xFA00_0000, // s_load_dword s8, s[6:7], 0x0
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        assert_eq!(r.scalar.len(), 1);
+        let a = r.scalar[0].1;
+        assert_eq!((a.param, a.offset), (CODE, 4));
+        assert!(a.dynamic.is_some(), "the lane's index is the computed term");
+    }
+
+    #[test]
+    fn a_descriptor_kept_per_lane_is_its_load_and_needs_no_waterfall() {
+        // The console compiler's way with a descriptor it joins per lane:
+        // the dwords go to VGPRs and come back from the first lane. Every
+        // lane holds the one load's dwords, so the descriptor is that load
+        // (`lane_copied`), and no waterfall is asked for.
+        let mut words = vec![
+            0xBE82_0309, // s_mov_b32 s2, s9
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+        ];
+        // v_mov_b32 v10.., s0..; v_readfirstlane_b32 s16.., v10..
+        words.extend((0..8).map(|k| 0x7E00_0200 | (10 + k) << 17 | k));
+        words.extend((0..8).map(|k| 0x7E00_0400 | (16 + k) << 17 | 0x100 + 10 + k));
+        words.extend([
+            0xF000_1700,
+            0x0004_0D06, // image_load v[13:15], v6, s[16:23]
+            S_ENDPGM,
+        ]);
+        let r = track_words(&words, &[param(Table, 9, 1)], HwStage::Ps);
+        let load = (0, 2);
+        assert_eq!(r.scalar, [(load, at(0, 0))]);
+        let sources: Vec<_> = r.descriptors.iter().map(|d| &d.source).collect();
+        assert_eq!(sources, [&Source::Loaded { load, first: 0 }]);
+        assert_eq!(r.lane_copied, [load]);
+        assert_eq!(r.waterfall, Waterfall::default());
+    }
+
+    #[test]
+    fn loads_at_one_first_lane_offset_have_one_address() {
+        // Two loads of the table entry at the offset v4 holds, each with
+        // its own first-lane read, as the console compiler loads a
+        // descriptor again wherever it needs it: one address, by which
+        // lowering knows them for the same descriptor.
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0x7E08_0504, // v_readfirstlane_b32 s4, v4
+                0xF40C_0201,
+                0x0800_0000, // s_load_dwordx8 s[8:15], s[2:3], s4
+                0x7E0A_0504, // v_readfirstlane_b32 s5, v4
+                0xF40C_0401,
+                0x0A00_0000, // s_load_dwordx8 s[16:23], s[2:3], s5
+                0xF000_1700,
+                0x0004_0D06, // image_load v[13:15], v6, s[16:23]
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let [(_, a), (_, b)] = r.scalar[..] else {
+            panic!("{:?}", r.scalar)
+        };
+        assert_eq!(a, b);
+        assert_eq!((a.param, a.offset), (0, 0));
+        assert!(
+            a.dynamic.is_some(),
+            "the lane's offset is the computed term"
         );
     }
 

@@ -1144,7 +1144,21 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            #[allow(unused_mut)]
+            let mut pad = convert(&state.Gamepad);
+            // The scripted keys (`VICTORY_KEYS`) also press the first
+            // pad's buttons, by the stand-in pad's table: with a real pad
+            // connected the stand-in is not there, and a title that listens
+            // to the pad (Grand Theft Auto VI's start screen) saw nothing.
+            #[cfg(feature = "diagnostics")]
+            if slot == 0 {
+                for vk in scripted() {
+                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                        pad.buttons |= button;
+                    }
+                }
+            }
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {

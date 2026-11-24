@@ -114,6 +114,11 @@ fn heap_alloc(size: usize, align: usize) -> Option<(*mut u8, u32)> {
     heap.blocks
         .insert(ptr as usize, Block { size, apu, layout });
     heap.by_apu.insert(apu, ptr as usize);
+    // The big ones are named in the log: they are the title's audio memory
+    // given out of our allocator, which the memory line counts as ours.
+    if size >= 32 << 20 {
+        tracing::info!(mb = size >> 20, at = ?ptr, "audio memory for the title from our allocator");
+    }
     Some((ptr, apu))
 }
 

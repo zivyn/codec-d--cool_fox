@@ -11,6 +11,12 @@
 //! [`components`] does not know keep the first vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
+//!
+//! A pipeline the title makes for rectangles completes them on the GPU
+//! instead, in a geometry stage (`victory_shader::emit::rect_list_gs`):
+//! from the vertex shader's outputs, whichever vertex the corner is, for
+//! direct, indexed and indirect draws alike. This expansion is what is
+//! left for a pipeline that could not get that stage.
 
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both

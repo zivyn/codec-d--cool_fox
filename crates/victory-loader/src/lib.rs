@@ -22,6 +22,7 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
+mod console_insn;
 mod crash;
 pub mod prepare;
 pub mod resolve;

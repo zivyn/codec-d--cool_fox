@@ -976,6 +976,16 @@ fn into_destination(
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
     } else {
+        // Said aloud: Grand Theft Auto VI never reads a request's result
+        // (it only polls for completion), so a destination left unwritten
+        // is a model or texture that silently holds whatever its pages
+        // held before.
+        tracing::warn!(
+            offset,
+            len,
+            pages = pages.len(),
+            "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+        );
         Err(E_INVALIDARG)
     }
 }

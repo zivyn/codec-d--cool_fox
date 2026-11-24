@@ -129,7 +129,10 @@ fn f32_to_half(v: f32) -> u16 {
     if exp <= 0 {
         return sign; // too small: zero
     }
-    sign | (exp as u16) << 10 | ((man + 0x1000) >> 13) as u16
+    // Rounded to nearest: a carry out of the mantissa is added into the
+    // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
+    let half = (exp as u32) << 10;
+    sign | (half + ((man + 0x1000) >> 13)) as u16
 }
 
 #[cfg(test)]
@@ -163,6 +166,24 @@ mod tests {
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x3e00), 1.5);
         assert_eq!(half_to_f32(0xc000), -2.0);
+    }
+
+    /// A rounding that carries out of the mantissa raises the exponent
+    /// (the carry used to be or-ed into an odd exponent, halving the value).
+    #[test]
+    fn halves_round_up_into_the_next_power_of_two() {
+        assert_eq!(f32_to_half(2.0 - 2f32.powi(-12)), 0x4000);
+        assert_eq!(f32_to_half(0.5 - 2f32.powi(-13)), 0x3800);
+        assert_eq!(f32_to_half(65520.0), 0x7c00, "past the largest half");
+        // An R16_FLOAT element at 1.0, 2^-12 and 1.0: the fourth corner is
+        // 2 - 2^-12, which rounds to 2.0.
+        let src: Vec<u8> = [0x3c00_u16, 0x0c00, 0x3c00]
+            .iter()
+            .flat_map(|h| h.to_le_bytes())
+            .collect();
+        let mut dst = vec![0u8; 6 * 2];
+        expand_rects(&src, &mut dst, 2, &[(0, 54)]);
+        assert_eq!(dst[10..], 0x4000_u16.to_le_bytes());
     }
 
     /// An element that reaches past the stride (float4 at 4 in 8-byte

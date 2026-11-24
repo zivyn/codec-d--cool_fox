@@ -88,7 +88,8 @@ const LEVEL_IIDS: [Iid; 9] = [
     ),
 ];
 
-fn is_device(iid: *const Iid) -> bool {
+/// Whether `iid` names the device: its first interface or a newer level.
+pub(crate) fn is_device(iid: *const Iid) -> bool {
     object::is(iid, &[IID]) || object::is(iid, &LEVEL_IIDS)
 }
 
@@ -443,6 +444,54 @@ mod tests {
         // A Device8 method we have not written fails without crashing.
         let missing = slot::<extern "system" fn() -> HRESULT>(device, 0x3a0);
         assert_eq!(missing(), E_NOTIMPL);
+    }
+
+    /// A device child, and the DXGI device, hand out the device as any
+    /// interface the device itself answers to.
+    #[test]
+    fn the_device_is_found_at_every_level_through_others() {
+        type Get = extern "system" fn(This, *const Iid, *mut This) -> HRESULT;
+        let fence_iid = &crate::fence::FENCE_IIDS[0];
+        let mut fence = std::ptr::null();
+        assert_eq!(
+            crate::fence::create(std::ptr::null(), 0, 0, fence_iid, &mut fence),
+            S_OK
+        );
+        let get_device = slot::<Get>(fence, 0x38);
+        let dxgi = dxgi::device();
+        let query = slot::<Get>(dxgi, 0);
+        for iid in std::iter::once(&IID).chain(&LEVEL_IIDS) {
+            let mut found = std::ptr::null();
+            assert_eq!(get_device(fence, iid, &mut found), S_OK, "{iid:02x?}");
+            assert_eq!(found, device());
+            let mut found = std::ptr::null();
+            assert_eq!(query(dxgi, iid, &mut found), S_OK, "{iid:02x?}");
+            assert_eq!(found, device());
+        }
+        // What the device is not, it is not through them either.
+        let mut found = device();
+        assert_eq!(get_device(fence, fence_iid, &mut found), E_NOINTERFACE);
+        assert!(found.is_null());
+        slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence);
+    }
+
+    /// The host's: a fence's `GetDevice` for `ID3D12Device5`.
+    #[cfg(windows)]
+    #[test]
+    fn the_hosts_children_hand_out_newer_device_levels() {
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_FENCE_FLAG_NONE, ID3D12Device5, ID3D12Fence,
+        };
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        // SAFETY: plain calls on the host device and its fence.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let mut device: Option<ID3D12Device5> = None;
+            assert!(fence.GetDevice(&mut device).is_ok());
+            assert!(device.is_some());
+        }
     }
 
     #[test]

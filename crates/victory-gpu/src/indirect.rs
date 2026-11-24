@@ -132,12 +132,15 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         InterlockedMax(largest_asked, asked, was);
         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
-    if (gi == 0) {
+    // The group's own records: none for a group past a count buffer's
+    // count (an execution may ask for thousands and count a few), which
+    // touches the budget not at all, as its threads did not before.
+    uint first = id.x - gi;
+    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+    if (gi == 0 && n > 0) {
         // What the records charge, from `before` on, in lane order: a
         // record that does not fit whole runs empty and takes the rest.
         // Only the group's own records are walked (one, clamped alone).
-        uint first = id.x;
-        uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
         uint before;
         budget.InterlockedOr(0, 0, before);
         [allow_uav_condition]
@@ -167,7 +170,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         }
     }
     GroupMemoryBarrierWithGroupSync();
-    if (gi == 0 && kind > 2) {
+    if (gi == 0 && kind > 2 && n > 0) {
         uint was;
         budget.InterlockedMax(4, largest_asked, was);
         budget.InterlockedAdd(8, all_asked, was);

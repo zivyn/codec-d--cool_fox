@@ -533,7 +533,11 @@ fn pump(context: Context, voice: &mut Voice) {
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
-        if write == context.field(9, 0, 5) {
+        // The read block is the title's: taken modulo the ring like the
+        // write block and `advance_read`'s. Compared as it is, one at or
+        // past the end would never be met, and a stream that loops would
+        // keep this voice (and its lock) filling forever.
+        if write == context.field(9, 0, 5) % size {
             // Full: nothing more until the title advances its read block.
             context.set_field(1, 31, 1, 0);
         }
@@ -1005,6 +1009,86 @@ mod tests {
             }
         }
         data
+    }
+
+    /// A read block past the end of the ring (6 on a ring of four) is block
+    /// 2 of it: a stream that loops forever fills blocks 0 and 1 and the
+    /// pass ends. It used to fill the ring for good, holding the voice.
+    #[test]
+    fn xma_read_blocks_past_the_ring_end_wrap() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+        // SAFETY: the ring was just allocated.
+        unsafe { output.cast::<u8>().write_bytes(0x55, 0x400) };
+
+        // As in `xma_contexts_decode_into_their_output_rings`, but looping
+        // forever from the first frame to the last, and read block 6.
+        context.set(0, 2 | 255 << 12 | 1 << 20 | 4 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 32);
+        context.set(3, 32);
+        context.set(4, (xma::PACKET_BYTES * 8 + 32 + 2 * 31) as u32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+        context.set(9, 6);
+
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        assert_eq!((m.connect)(acp, 0x1000, 0x1000), S_OK);
+        let submit = |command: u32, words: &[u32]| {
+            assert_eq!(
+                (m.submit)(acp, command, 0xf1, u32::MAX, words.as_ptr().cast(), 0),
+                S_OK
+            );
+        };
+        submit(ENABLE_XMA, &[1]);
+        // A pass on a thread of its own (the decoding thread runs them too),
+        // so that one that never ends fails this test instead of hanging it.
+        let (done, passed) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            xma().pump();
+            let _ = done.send(());
+        });
+        let five = std::time::Duration::from_secs(5);
+        let wait = || passed.recv_timeout(five).is_ok();
+        let ended = wait();
+        if !ended {
+            // End it as a full ring would, to release the contexts below.
+            context.set_field(1, 31, 1, 0);
+            assert!(wait(), "the XMA pass did not end on a full ring either");
+        }
+        let (write, writable) = (context.field(0, 27, 5), context.field(1, 31, 1));
+        // SAFETY: the ring.
+        let ring = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), 0x400) }.to_vec();
+
+        submit(DISABLE_XMA, &[1]);
+        (m.release)(acp);
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+        assert!(ended, "the XMA pass never ended");
+        // Blocks 0 and 1 written (silence), 2 and 3 left for the title.
+        assert_eq!((write, writable), (2, 0));
+        assert!(ring[..0x200].iter().all(|&b| b == 0));
+        assert!(ring[0x200..].iter().all(|&b| b == 0x55));
     }
 
     #[test]

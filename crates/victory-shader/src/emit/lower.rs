@@ -172,6 +172,10 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh: the vertex count the host declares when it is below the
+    /// program's own (see [`mesh_vertex_limit`]), and whether this lane's
+    /// vertex is within it (made in the entry block).
+    vertex_cap: Option<(u32, V)>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -317,6 +321,29 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
             (o.row, (o.pack2, b.map(|i| free.remove(i))))
         })
         .collect()
+}
+
+/// The host's limit on a mesh shader's vertex plus primitive outputs
+/// (DXC's `kMaxMSOutputTotalBytes`); the console has none this small.
+const MESH_OUTPUT_BYTES: u32 = 32768;
+
+/// The most vertices a mesh shader with these outputs can declare, at most
+/// the program's own maximum: the validator counts four bytes for every
+/// declared component of every vertex and primitive, for each count rounded
+/// up to 32. `None` when not even 32 vertices fit.
+fn mesh_vertex_limit(
+    outputs: &[SigElement],
+    prims: &[SigElement],
+    mesh: super::shader::Mesh,
+) -> Option<u32> {
+    let bytes = |els: &[SigElement]| 4 * els.iter().map(|e| u32::from(e.cols)).sum::<u32>();
+    let room =
+        MESH_OUTPUT_BYTES.checked_sub(bytes(prims) * mesh.max_primitives.next_multiple_of(32))?;
+    let fit = room.checked_div(bytes(outputs)).unwrap_or(u32::MAX);
+    if mesh.max_vertices.next_multiple_of(32) <= fit {
+        return Some(mesh.max_vertices);
+    }
+    Some(fit / 32 * 32).filter(|&n| n > 0)
 }
 
 fn unsupported(offset: usize, what: Why) -> Stop {
@@ -468,6 +495,7 @@ impl<'a> Lower<'a> {
             src0: None,
             console_lanes,
             flat: None,
+            vertex_cap: None,
             no_barrier,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -1875,15 +1903,28 @@ impl<'a> Lower<'a> {
         if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
             return Err("a mesh shader beyond the host's limits");
         }
+        // shortcut: the host holds less output than the console, so a
+        // program asking for more vertices than fit gets the most that do.
+        // Lanes past that write no vertex and primitives that index one are
+        // culled (see `export` and `emit_indices`): a group with more
+        // vertices than the host's limit loses the excess, defined but not
+        // exact.
+        let limit = mesh_vertex_limit(&self.s.outputs, &self.s.prims, mesh)
+            .ok_or("mesh outputs beyond the host's 32 KiB")?;
+        self.s.mesh = Some(super::shader::Mesh {
+            max_vertices: limit,
+            ..mesh
+        });
         let e = self.s.entry;
         let void = self.s.t.void;
-        let (v, p) = (
-            self.s.m.i32(mesh.max_vertices),
-            self.s.m.i32(mesh.max_primitives),
-        );
+        let (v, p) = (self.s.m.i32(limit), self.s.m.i32(mesh.max_primitives));
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
         let flat = self.mesh_thread();
+        if limit < mesh.max_vertices {
+            let k = self.s.m.i32(limit);
+            self.vertex_cap = Some((limit, self.s.m.cmp(e, pred::IULT, flat, k)));
+        }
         let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
         let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
@@ -6257,6 +6298,12 @@ impl<'a> Lower<'a> {
         }
         // A mesh lane writes its own vertex or primitive, where it exports.
         let at = if mesh {
+            let guard = match self.vertex_cap {
+                Some((_, fits)) if !primitive && !stores.is_empty() => {
+                    Some(guard.map_or(fits, |g| self.s.m.bin(self.cur, Bin::And, g, fits)))
+                }
+                _ => guard,
+            };
             self.begin_guarded(guard)
         } else {
             None
@@ -6318,19 +6365,29 @@ impl<'a> Lower<'a> {
     }
 
     /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// indices 0: no area), as does an index of a vertex the host does not
+    /// have.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
         let at = self.begin_guarded(guard);
         let c = self.cur;
         let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
+        let mut culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut indices = Vec::with_capacity(3);
         for k in 0..3 {
             let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x3FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
+            if let Some((cap, _)) = self.vertex_cap {
+                let cap = self.s.m.i32(cap);
+                let past = self.s.m.cmp(c, pred::IUGE, i, cap);
+                culled = self.s.m.bin(c, Bin::Or, culled, past);
+            }
+            indices.push(i);
+        }
+        let mut args = vec![self.mesh_thread()];
+        for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
         }
         let void = self.s.t.void;
@@ -6559,8 +6616,11 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use super::super::shader::Mesh;
+    use super::super::validator::Validator;
+    use super::{Numeric, Parts, SigElement, buffer_format, lower, mesh_vertex_limit};
+    use crate::dxbc::{Container, FourCC};
+    use crate::native::{ComputeIo, HwStage, MeshIo, NativeProgram, StageIo, Usage, VsOutput};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6649,5 +6709,133 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    fn vertex_output(row: u32, kind: u8) -> SigElement {
+        SigElement {
+            name: if kind == 3 { "SV_Position" } else { "TEXCOORD" }.into(),
+            index: row,
+            kind,
+            comp: 9,
+            interp: if kind == 3 { 4 } else { 2 },
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    fn mesh_of(max_vertices: u32, max_primitives: u32) -> Mesh {
+        Mesh {
+            max_vertices,
+            max_primitives,
+            topology: 2,
+        }
+    }
+
+    #[test]
+    fn a_mesh_shader_declares_the_vertices_the_host_holds() {
+        let rows = |n| (0..n).map(|r| vertex_output(r, 0)).collect::<Vec<_>>();
+        let limit = |outputs: &[SigElement], prims: &[SigElement], v, p| {
+            mesh_vertex_limit(outputs, prims, mesh_of(v, p))
+        };
+        // 16 rows of 4 components fill 32 KiB at 128 vertices exactly.
+        assert_eq!(limit(&rows(16), &[], 128, 128), Some(128));
+        // A 17th row overflows it, and the counts round up to 32: 97 to 127
+        // vertices cost what 128 do, so 96 is the most.
+        assert_eq!(limit(&rows(17), &[], 128, 128), Some(96));
+        assert_eq!(limit(&rows(17), &[], 100, 128), Some(96));
+        assert_eq!(limit(&rows(17), &[], 96, 128), Some(96));
+        // A shader that declares fewer keeps its own.
+        assert_eq!(limit(&rows(17), &[], 64, 128), Some(64));
+        assert_eq!(limit(&[], &[], 128, 128), Some(128));
+        // Primitive outputs take their share: 4 components at 128 primitives
+        // leave 30 KiB, which holds 128 vertices of 15 rows but not of 16.
+        let prims = [vertex_output(0, 0)];
+        assert_eq!(limit(&rows(15), &prims, 128, 128), Some(128));
+        assert_eq!(limit(&rows(16), &prims, 128, 128), Some(96));
+        // Down to 32 vertices, and past what 32 can hold or what the
+        // primitives leave.
+        assert_eq!(limit(&rows(50), &[], 128, 128), Some(32));
+        assert_eq!(limit(&rows(65), &[], 128, 128), None);
+        assert_eq!(limit(&[], &rows(65), 128, 128), None);
+    }
+
+    /// A mesh shader exporting a position, one parameter and a primitive,
+    /// whose signature has `rows` parameters beyond them.
+    fn mesh_with(rows: u32) -> Result<Vec<u8>, crate::ShaderError> {
+        let words = [
+            0x7E02_0280u32, // v_mov_b32 v1, 0
+            0xF800_08CF,
+            0x0101_0101, // exp pos0, v1, v1, v1, v1 done
+            0xF800_020F,
+            0x0101_0101, // exp param0, v1, v1, v1, v1
+            0xF800_0941,
+            0x0000_0001, // exp prim, v1, off, off, off done
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![VsOutput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+                clip_cntl: 0,
+                threads: 128,
+                max_vertices: 128,
+                max_primitives: 128,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let mut outputs = vec![vertex_output(0, 3)];
+        outputs.extend((1..=rows).map(|r| vertex_output(r, 0)));
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs,
+            prims: vec![],
+            mesh_stride: 128,
+        })
+        .map(|l| l.dxil)
+    }
+
+    /// The maximum vertex count in a mesh shader's `PSV0`.
+    fn declared_vertices(dxil: &[u8]) -> u16 {
+        let c = Container::parse(dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        u16::from_le_bytes([psv[4 + 12], psv[4 + 13]])
+    }
+
+    #[test]
+    fn a_mesh_shader_past_the_hosts_output_limit_declares_fewer_vertices() {
+        // 16 rows (position and 15 parameters) fit 128 vertices; 20 do not.
+        for (rows, vertices) in [(15, 128), (19, 96)] {
+            let mut dxil = mesh_with(rows).unwrap();
+            assert_eq!(declared_vertices(&dxil), vertices, "{rows} parameters");
+            if let Ok(mut v) = Validator::load(Validator::default_path().as_deref()) {
+                v.validate(&mut dxil)
+                    .unwrap_or_else(|e| panic!("{rows} parameters: {e}"));
+            }
+        }
     }
 }

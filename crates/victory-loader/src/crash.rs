@@ -452,7 +452,7 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
             1 => "write",
             _ => "execute",
         };
-        format!(" ({kind} {:#x})", p[1])
+        format!(" ({kind} {:#x}: {})", p[1], memory_at(p[1]))
     } else if code == CPP_EXCEPTION && record.NumberParameters >= 4 && p[0] == CPP_MAGIC {
         // SAFETY: a live MSVC throw.
         format!(" (C++ {} thrown)", unsafe { thrown(&p) })
@@ -598,6 +598,48 @@ fn module_of(address: usize) -> Option<String> {
     Some(format!("{name}+{:#x}", address - module as usize))
 }
 
+/// What is at `address`, for an access violation there: nothing, memory
+/// reserved but never committed, a guard page, or the protection the access
+/// broke (with the module, for an image's pages). Each points at a different
+/// cause: a wild pointer, an allocation whose commit failed, a stack
+/// overrun, a write to code or constants.
+fn memory_at(address: usize) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_IMAGE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE,
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_NOACCESS, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: reads the address space's bookkeeping, not `address` itself.
+    let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        // Above the process's address space: Windows reports a
+        // non-canonical address as all ones.
+        return "outside the address space".into();
+    }
+    let protect = match info.State {
+        MEM_FREE => return "nothing mapped there".into(),
+        MEM_RESERVE => return "reserved, never committed".into(),
+        _ if info.Protect & PAGE_GUARD != 0 => return "a guard page".into(),
+        _ => match info.Protect & 0xff {
+            PAGE_NOACCESS => "no access".into(),
+            PAGE_READONLY => "read-only".into(),
+            PAGE_READWRITE => "read-write".into(),
+            PAGE_WRITECOPY => "copy-on-write".into(),
+            PAGE_EXECUTE => "execute-only".into(),
+            PAGE_EXECUTE_READ => "read-execute".into(),
+            PAGE_EXECUTE_READWRITE => "read-write-execute".into(),
+            PAGE_EXECUTE_WRITECOPY => "copy-on-write, executable".into(),
+            _ => format!("protection {:#x}", info.Protect),
+        },
+    };
+    match module_of(address) {
+        Some(module) if info.Type == MEM_IMAGE => format!("{protect}, in {module}"),
+        _ => protect,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -624,6 +666,41 @@ mod tests {
             .collect();
         let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
         assert_eq!(ours, system);
+    }
+
+    #[test]
+    fn memory_at_names_what_an_access_hit() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READONLY,
+            PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: reserves four pages of ours and commits three of them;
+        // nothing reads or writes them.
+        let base = unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 0x4000, MEM_RESERVE, PAGE_NOACCESS);
+            assert!(!base.is_null());
+            let page = |i: usize, protect| {
+                let at = base.cast::<u8>().add(i * 0x1000).cast();
+                assert!(!VirtualAlloc(at, 0x1000, MEM_COMMIT, protect).is_null());
+            };
+            page(1, PAGE_READONLY);
+            page(2, PAGE_READWRITE | PAGE_GUARD);
+            page(3, PAGE_NOACCESS);
+            base as usize
+        };
+        assert_eq!(memory_at(base + 8), "reserved, never committed");
+        assert_eq!(memory_at(base + 0x1008), "read-only");
+        assert_eq!(memory_at(base + 0x2008), "a guard page");
+        assert_eq!(memory_at(base + 0x3008), "no access");
+        // SAFETY: releases the reservation made above.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(memory_at(base + 8), "nothing mapped there");
+        assert_eq!(memory_at(0), "nothing mapped there");
+        assert_eq!(memory_at(usize::MAX), "outside the address space");
+        // This test's own code: an image page, named by its module.
+        let code = memory_at(memory_at_names_what_an_access_hit as *const () as usize);
+        let named = code.starts_with("read-execute, in victory_loader-");
+        assert!(named, "{code}");
     }
 
     /// On an Intel CPU, the real instructions go through the vectored

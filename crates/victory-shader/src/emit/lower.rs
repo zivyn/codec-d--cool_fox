@@ -205,13 +205,14 @@ struct Lower<'a> {
     abort: Option<usize>,
 }
 
-/// Iterations after which a loop is left (per entry into it). The console
-/// runs a loop as long as its data says; data the host has not mirrored
-/// yet (a null view reads zeros) can make that four billion iterations,
-/// which hangs the host GPU until the driver resets it. A lane that
-/// reaches the limit leaves the program as killed (a pixel discards).
+/// Iterations after which a loop is left (per entry into it), unless
+/// [`super::loop_limit`] says otherwise. The console runs a loop as long as
+/// its data says; data the host has not mirrored yet (a null view reads
+/// zeros) can make that four billion iterations, which hangs the host GPU
+/// until the driver resets it. A lane that reaches the limit leaves the
+/// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
-const LOOP_LIMIT: u32 = 1 << 20;
+pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -6462,7 +6463,7 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(LOOP_LIMIT);
+        let limit = self.s.m.i32(super::loop_limit());
         self.counters
             .get_mut(&to)
             .expect("header")

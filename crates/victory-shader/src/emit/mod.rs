@@ -97,6 +97,44 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use sampler::StaticSampler;
 pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 
+/// The loop limit without an override: 2^20.
+pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+
+/// The iteration count after which a translated loop is left, per lane and
+/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+///
+/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
+/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
+/// every lane of a full-screen pass still runs for seconds (2^20 times a
+/// 4K screen is about 10^13 iterations); a much lower limit shows whether
+/// such loops are what makes a frame slow. The value is part of the
+/// translation, so the shader cache must key on it (`victory-gpu`'s does).
+pub fn loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
+        } else {
+            lower::LOOP_LIMIT
+        }
+    })
+}
+
+/// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
+/// unreadable or 0. Pure, for testing.
+fn parse_loop_limit(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    match parsed {
+        Some(n) if n > 0 => n,
+        _ => lower::LOOP_LIMIT,
+    }
+}
+
 /// A translated shader and what the host binds for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
@@ -355,6 +393,19 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 #[cfg(test)]
 mod tests {
     use super::bitcode::Attr;
+    use super::lower::LOOP_LIMIT;
+    use super::parse_loop_limit;
+
+    #[test]
+    fn the_loop_limit_switch_parses_or_falls_back() {
+        assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
+        assert_eq!(parse_loop_limit(Some("4096")), 4096);
+        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
+        assert_eq!(parse_loop_limit(Some("1")), 1);
+        for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
+            assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+        }
+    }
     use super::container::SigElement;
     use super::shader::Shader;
     use super::*;

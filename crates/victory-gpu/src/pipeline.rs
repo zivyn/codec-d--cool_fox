@@ -207,19 +207,64 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
-/// Draws and dispatches dropped since the last [`take_drops`], by why their
-/// pipeline has no host pipeline (diagnostics).
+/// Draws and dispatches dropped since the last [`take_drops`], by reason
+/// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Counts a draw or dispatch of `this` dropped for want of a host pipeline
-/// (diagnostics).
+/// Shader hashes as printed in the pipeline diagnostics.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn parse_skip_hashes(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|hash| !hash.is_empty())
+        .filter_map(|hash| {
+            if hash.len() == 16 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                Some(hash.to_ascii_lowercase())
+            } else {
+                tracing::warn!(
+                    hash,
+                    "VICTORY_SKIP_PIPELINES expects 16-digit shader hashes"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+        parse_skip_hashes(&value)
+    });
+    if hashes.is_empty() {
+        return None;
+    }
+    p.shaders
+        .iter()
+        .find(|shader| hashes.contains(&shader.hash))
+        .map(|shader| shader.hash.as_str())
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn is_skipped(this: This) -> bool {
+    !this.is_null() && skipped_shader(pipeline(this)).is_some()
+}
+
+/// Counts a draw or dispatch of `this` intentionally skipped or dropped
+/// for want of a host pipeline (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn note_drop(this: This) {
     let why = if this.is_null() {
         Some("no pipeline set".to_owned())
     } else {
-        make::missing(&pipeline(this).host)
+        let p = pipeline(this);
+        skipped_shader(p)
+            .map(|hash| format!("skipped shader {hash}"))
+            .or_else(|| make::missing(&p.host))
     };
     if let Some(why) = why {
         note_why(why);
@@ -458,6 +503,16 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn skip_hashes_accepts_full_hashes_only() {
+        assert!(super::parse_skip_hashes(" , ").is_empty());
+        assert_eq!(
+            super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
+            ["0123456789abcdef", "0011223344556677"]
+        );
+    }
+
     use super::*;
     use crate::object::{S_OK, slot};
 

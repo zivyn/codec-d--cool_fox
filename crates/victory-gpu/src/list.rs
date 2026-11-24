@@ -538,6 +538,9 @@ extern "system" fn copy_texture_region(
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::texture::title_written(texture) {
+                crate::texture::upload(list, src.resource, texture);
+            }
             ensure_state(list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
         }

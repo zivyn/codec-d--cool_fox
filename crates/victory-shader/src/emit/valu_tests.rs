@@ -251,6 +251,11 @@ fn run_cases_on(
         }
         ran += 1;
     }
+    if ran == 0 && devices.iter().all(|&(_, warp)| !warp) {
+        // A case for the hardware adapter alone, on a machine without one.
+        eprintln!("no SM 6.6 hardware device; a hardware-only case not run");
+        return;
+    }
     assert!(ran > 0, "no SM 6.6 device available ({devices:?})");
 }
 

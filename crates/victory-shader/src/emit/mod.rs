@@ -108,6 +108,7 @@ use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
+pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
@@ -165,6 +166,38 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// The clean-up passes that run over a translated program before it is
+/// written (`bitcode::opt`): a set of that module's pass bits. Every pass
+/// is exact, so the switch is for telling a translator fault from a
+/// clean-up fault, and for measuring what the clean-up is worth.
+/// `VICTORY_SHADER_OPT`:
+/// - unset: every pass.
+/// - `0`: none (the module as the lowering made it).
+/// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
+///   and identities, 4 one instruction for one value, 8 what a branch taken
+///   says about its condition, 16 one read for one place within a block,
+///   32 a first-lane read of two host waves without the round that asks
+///   which half has a lane (where every lane has one).
+///
+/// Part of the translation: the shader cache keys on it (`victory-gpu`'s
+/// does).
+pub fn shader_opt() -> u32 {
+    static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+/// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
+/// unreadable. Pure, for testing.
+fn parse_shader_opt(value: Option<&str>) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
 }
 
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
@@ -726,6 +759,17 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn the_clean_up_switch_parses_or_runs_every_pass() {
+        let all = super::bitcode::opt::ALL;
+        assert_eq!(parse_shader_opt(None), all);
+        assert_eq!(parse_shader_opt(Some("0")), 0);
+        assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
+        assert_eq!(parse_shader_opt(Some("0x1")), 1);
+        assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
+        assert_eq!(parse_shader_opt(Some("on")), all);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

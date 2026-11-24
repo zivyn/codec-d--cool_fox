@@ -440,6 +440,7 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
@@ -460,6 +461,51 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
             }
         }
     }
+}
+
+/// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
+/// its label, the console program's instructions by encoding class (a
+/// static count of the whole program, not of one thread's path), and the
+/// host module's instructions by kind (`emit::census::KINDS`).
+fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
+    use std::io::Write;
+    use victory_shader::gfx10::Fields;
+    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    }) else {
+        return;
+    };
+    let Some(census) = emit::census::take(&shader.dxil) else {
+        return;
+    };
+    // total, vector, scalar, descriptor loads, buffer and memory, image, LDS, control, other
+    let mut console = [0u32; 9];
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        console[0] += 1;
+        let k = match &inst.fields {
+            Fields::Valu(_) => 1,
+            Fields::Sop { .. } => 2,
+            Fields::Smem { .. } => 3,
+            Fields::Buffer { .. } | Fields::Flat { .. } => 4,
+            Fields::Image { .. } => 5,
+            Fields::Ds { .. } => 6,
+            Fields::Sopp { .. } => 7,
+            _ => 8,
+        };
+        console[k] += 1;
+    }
+    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    line.push('\n');
+    let _ = lock(out).write_all(line.as_bytes());
 }
 
 /// Validates an emitted shader if asked to.

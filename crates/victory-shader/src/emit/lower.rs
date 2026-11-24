@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
-use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
+use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
@@ -2645,6 +2645,7 @@ impl<'a> Lower<'a> {
         let page = self
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
+        self.s.m.tag(page, Tag::Clamp);
         let k3 = k(self, 3);
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
@@ -3787,7 +3788,9 @@ impl<'a> Lower<'a> {
                     // The validator refuses reads of undef.
                     _ => self.s.m.i32(0),
                 };
-                self.s.m.select(self.cur, g, x, old)
+                let v = self.s.m.select(self.cur, g, x, old);
+                self.s.m.tag(v, Tag::Guard);
+                v
             }
             _ => x,
         };
@@ -6175,6 +6178,7 @@ impl<'a> Lower<'a> {
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
         let i32t = self.s.t.i32;
         let slot = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
         let two = self.s.m.i32(2);
         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
         let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
@@ -7288,16 +7292,26 @@ impl<'a> Lower<'a> {
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
-                    let i32t = self.s.t.i32;
-                    let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                    let (lo_has, hi_has) = self.exchange_halves(c, has);
-                    let (lo, hi) = self.exchange_halves(c, mine);
-                    let z = self.s.m.i32(0);
-                    let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
-                    let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
-                    // neither half has a lane in EXEC: the console reads lane 0
-                    let hi = self.s.m.select(c, in_hi, hi, lo);
-                    self.s.m.select(c, in_lo, lo, hi)
+                    if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
+                        // Every lane is in EXEC: the console's first lane is
+                        // lane 0, which the lower half of every console wave
+                        // has. No half needs to ask the other whether it has
+                        // a lane (an exchange of the constant 1: two group
+                        // barriers), and the lower half's value is the answer.
+                        let (lo, _) = self.exchange_halves(c, mine);
+                        lo
+                    } else {
+                        let i32t = self.s.t.i32;
+                        let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
+                        let (lo_has, hi_has) = self.exchange_halves(c, has);
+                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let z = self.s.m.i32(0);
+                        let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
+                        let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
+                        // neither half has a lane in EXEC: the console reads lane 0
+                        let hi = self.s.m.select(c, in_hi, hi, lo);
+                        self.s.m.select(c, in_lo, lo, hi)
+                    }
                 } else {
                     mine
                 };
@@ -10511,6 +10525,8 @@ impl<'a> Lower<'a> {
         let (phi, _) = self.counters[&to];
         let one = self.s.m.i32(1);
         let next = self.s.m.bin(c, Bin::Add, phi, one);
+        self.s.m.tag(phi, Tag::Counter);
+        self.s.m.tag(next, Tag::Counter);
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -10534,7 +10550,9 @@ impl<'a> Lower<'a> {
             .expect("header")
             .1
             .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
+        let over = self.s.m.cmp(c, p, next, limit);
+        self.s.m.tag(over, Tag::Counter);
+        over
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

@@ -24,7 +24,7 @@ Take-Two Interactive.
 
 ## Status of this fork (2026-11-25)
 
-**Not playable yet: 2 to 4 frames per second, and shadowed areas are black.**
+**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -57,6 +57,8 @@ Speed and memory:
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+
+- Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
 Most of the newer speed changes sit behind environment switches that are off
 by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,

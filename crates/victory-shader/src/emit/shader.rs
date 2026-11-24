@@ -402,7 +402,9 @@ impl Shader {
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);
             let i32t = self.t.i32;
-            self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null])
+            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, null]);
+            self.m.tag(v, super::bitcode::Tag::Clamp);
+            v
         } else if sampler {
             // A sampler heap has at most 2,048 samplers on any host: an
             // index past that (a number read from memory the host has not
@@ -411,7 +413,9 @@ impl Shader {
             // heap smaller than 2,048 would need.
             let last = self.m.i32(2047);
             let i32t = self.t.i32;
-            self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
+            let v = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+            self.m.tag(v, super::bitcode::Tag::Clamp);
+            v
         } else {
             index
         };
@@ -437,6 +441,26 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The clean-up, before anything is declared about the code: a
+        // feature whose last use it removed must not be declared (the
+        // validator compares the flags with what the code uses).
+        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        if passes != 0 {
+            self.m.optimise(passes);
+            let used = self.m.usage();
+            for (flag, used) in [
+                (flags::WAVE_OPS, used.wave_ops),
+                (flags::INT64, used.int64),
+                (flags::TYPED_UAV_LOADS, used.typed_uav_loads),
+                (flags::RESOURCE_HEAP, used.heap_views),
+                (flags::SAMPLER_HEAP, used.heap_samplers),
+                (flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64, used.atomic64),
+            ] {
+                if !used {
+                    self.flags &= !flag;
+                }
+            }
+        }
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -737,6 +761,7 @@ impl Shader {
         self.m.named_md("dx.entryPoints", vec![entry]);
 
         let bitcode = self.m.write();
+        super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());
         dxil.extend((kind << 16 | 0x66).to_le_bytes());
         dxil.extend((((24 + bitcode.len()) / 4) as u32).to_le_bytes());

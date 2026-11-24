@@ -73,6 +73,8 @@ fn build() -> &'static [u8; 32] {
                     }
                     bytes.push(0);
                 }
+                // And which clean-up passes ran over the translated code.
+                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

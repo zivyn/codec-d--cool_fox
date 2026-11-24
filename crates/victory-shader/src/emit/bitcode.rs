@@ -7,8 +7,23 @@
 
 use std::collections::HashMap;
 
+pub mod census;
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
@@ -208,6 +223,8 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
@@ -353,6 +370,16 @@ impl Module {
             self.globals[n as usize].init = Some(i);
         }
         g
+    }
+
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
+        }
     }
 
     pub fn new_block(&mut self) -> usize {

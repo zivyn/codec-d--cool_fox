@@ -37,6 +37,7 @@ pub mod dir {
     pub const BASERELOC: usize = 5;
     pub const LOAD_CONFIG: usize = 10;
     pub const BOUND_IMPORT: usize = 11;
+    pub const IAT: usize = 12;
 }
 
 /// `IMAGE_FILE_HEADER::Characteristics` flags.

@@ -743,8 +743,10 @@ fn commit(base: usize, len: usize) -> bool {
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION::default();
-        info.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+        let mut info = PERFORMANCE_INFORMATION {
+            cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+            ..Default::default()
+        };
         // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
         victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
@@ -781,6 +783,12 @@ fn commit_limit_message(
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
+    // No bytes: no view to return. The search below would still find the
+    // view holding `base` and cut it in two there, and its range of views
+    // starting inside would run backwards (which `BTreeMap` panics on).
+    if len == 0 {
+        return;
+    }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
@@ -1103,6 +1111,48 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
+
+    #[test]
+    fn mapping_no_pages_changes_nothing() {
+        let pages = allocate(2);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 2, pages.as_ptr()), a);
+        // SAFETY: both pages are mapped read-write.
+        unsafe { a.cast::<u8>().write(5) };
+        let second = a.wrapping_byte_add(PAGE);
+
+        // A count of 0 at the start of a view, inside it and past it: with
+        // pages, without (an unmap), and as the GPU's page-mapping copy.
+        for at in [a, second, a.wrapping_byte_add(2 * PAGE)] {
+            assert_eq!(XMemMapPhysicalPages(at, 0, pages.as_ptr()), at);
+            assert_eq!(XMemMapPhysicalPages(at, 0, std::ptr::null()), at);
+            assert!(map_alias(at as u64, a as u64, 0));
+            assert!(map_alias(at as u64, 0, 0));
+        }
+
+        // The view is still the one view it was.
+        let view = physical().views.get(&(a as usize)).map(|v| v.0);
+        assert_eq!(view, Some(2 * PAGE));
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        assert_eq!(query(second).host.State, MEM_COMMIT);
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { a.cast::<u8>().read() }, 5);
+
+        // A count of 1 still unmaps that page alone.
+        assert_eq!(XMemMapPhysicalPages(second, 1, std::ptr::null()), second);
+        assert_eq!(query(second).host.State, MEM_RESERVE);
+        assert_eq!(query(a).host.State, MEM_COMMIT);
+        assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
     /// `n` pages of one new allocation.
     fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);

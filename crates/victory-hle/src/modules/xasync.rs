@@ -105,7 +105,7 @@ impl Port {
             let worker = port.clone();
             std::thread::spawn(move || {
                 loop {
-                    match worker.take(1000) {
+                    match worker.take(1000, || false) {
                         Some(task) => task.run(false),
                         None if Arc::strong_count(&worker) == 1 => break,
                         None => {}
@@ -127,17 +127,19 @@ impl Port {
         }
     }
 
-    /// The next queued task, waiting up to `timeout_ms`.
-    fn take(&self, timeout_ms: u32) -> Option<Task> {
+    /// The next queued task, waiting up to `timeout_ms`, or until `ended`
+    /// (checked whenever the port is woken) says no task will come.
+    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
+        let waiting = |t: &mut VecDeque<Task>| t.is_empty() && !ended();
         let tasks = lock(&self.tasks);
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
-                .wait_while(tasks, |t| t.is_empty())
+                .wait_while(tasks, waiting)
                 .unwrap_or_else(|e| e.into_inner())
         } else {
             let timeout = Duration::from_millis(timeout_ms.into());
             self.ready
-                .wait_timeout_while(tasks, timeout, |t| t.is_empty())
+                .wait_timeout_while(tasks, timeout, waiting)
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
@@ -332,7 +334,9 @@ pub fn XTaskQueueCloseHandle(handle: *const Queue) {
     }
 }
 
-/// Runs one queued callback of a manual port; false if none came in time.
+/// Runs one queued callback of a manual port; false if none came in time,
+/// or none can come: the queue was terminated (which ends a wait under way,
+/// as a dispatcher thread's loop expects).
 pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> bool {
     let Some(queue) = queue(handle) else {
         return false;
@@ -343,7 +347,7 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     if port.mode != Mode::Manual {
         return false;
     }
-    match port.take(timeout_ms) {
+    match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
         Some(task) => {
             task.run(false);
             true
@@ -379,6 +383,10 @@ pub fn XTaskQueueTerminate(
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
         let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
+        // Dispatches waiting on this queue end: nothing more will come.
+        // (Those of other queues on the port see theirs is open and wait
+        // on.) After the lock above, so none misses both flag and wake.
+        port.ready.notify_all();
         for task in pending {
             task.run(true);
         }
@@ -1177,6 +1185,73 @@ mod tests {
         }
         assert!(FIRST.load(Ordering::SeqCst));
         XTaskQueueCloseHandle(q);
+    }
+
+    /// A dispatcher thread's loop, `while (XTaskQueueDispatch(queue, port,
+    /// INFINITE));`, ends when its queue is terminated: nothing can be
+    /// submitted to it any more, so nothing else would ever wake it.
+    #[test]
+    fn terminate_ends_a_waiting_dispatch() {
+        static RAN: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn ran(_: *mut c_void, _: bool) {
+            RAN.fetch_add(1, Ordering::SeqCst);
+        }
+        /// Dispatches `queue`'s work until a dispatch returns false, then
+        /// says so.
+        fn dispatcher(queue: *const Queue) -> std::sync::mpsc::Receiver<()> {
+            let (done, ended) = std::sync::mpsc::channel();
+            let queue = queue as usize;
+            std::thread::spawn(move || {
+                while XTaskQueueDispatch(queue as *const Queue, WORK, INFINITE) {}
+                let _ = done.send(());
+            });
+            ended
+        }
+        let run_one = |queue, total| {
+            let none = std::ptr::null_mut();
+            assert_eq!(
+                XTaskQueueSubmitDelayedCallback(queue, WORK, 0, none, Some(ran)),
+                S_OK
+            );
+            for _ in 0..500 {
+                if RAN.load(Ordering::SeqCst) == total {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("callback {total} did not run");
+        };
+        let (long, short) = (Duration::from_secs(5), Duration::from_millis(200));
+        let none = std::ptr::null_mut();
+
+        // Two queues on the same manual ports.
+        let (mut a, mut b) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueCreate(0, 0, &mut a), S_OK);
+        let (mut work, mut completion) = (std::ptr::null(), std::ptr::null());
+        assert_eq!(XTaskQueueGetPort(a, WORK, &mut work), S_OK);
+        assert_eq!(XTaskQueueGetPort(a, COMPLETION, &mut completion), S_OK);
+        assert_eq!(XTaskQueueCreateComposite(work, completion, &mut b), S_OK);
+
+        let ended = dispatcher(a);
+        run_one(a, 1);
+        // The other queue's end is not this one's: the wait goes on and
+        // still runs what comes in.
+        assert_eq!(XTaskQueueTerminate(b, false, none, None), S_OK);
+        assert!(
+            ended.recv_timeout(short).is_err(),
+            "ended with another queue"
+        );
+        run_one(a, 2);
+        // Its own queue's end is.
+        assert_eq!(XTaskQueueTerminate(a, false, none, None), S_OK);
+        assert!(
+            ended.recv_timeout(long).is_ok(),
+            "still waiting on a terminated queue"
+        );
+        // And a dispatch that starts after the end returns at once.
+        assert!(!XTaskQueueDispatch(a, WORK, INFINITE));
+        XTaskQueueCloseHandle(a);
+        XTaskQueueCloseHandle(b);
     }
 
     #[test]

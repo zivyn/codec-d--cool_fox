@@ -154,16 +154,23 @@ extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
 extern "system" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
     put(out, 0)
 }
-/// The same name for every component (classic, modern, suffix, unique).
+/// The user's gamertag as the component asked for (`XUserGamertagComponent`):
+/// it has no suffix, so the modern suffix is empty and every other component
+/// (classic, modern, unique modern) is the name itself.
 extern "system" fn get_gamertag(
     _: This,
     _: Handle,
-    _component: u32,
+    component: u32,
     size: usize,
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
-    put_string(GAMERTAG, size, buffer, used)
+    const MODERN_SUFFIX: u32 = 2;
+    let text = match component {
+        MODERN_SUFFIX => "",
+        _ => GAMERTAG,
+    };
+    put_string(text, size, buffer, used)
 }
 /// Granted; deny reason 0 (none).
 extern "system" fn check_privilege(
@@ -321,6 +328,25 @@ mod tests {
     use super::*;
     use crate::modules::xasync::E_NOT_SUFFICIENT_BUFFER;
     use crate::modules::xgameruntime::method as slot;
+
+    #[test]
+    fn a_gamertag_without_a_suffix_has_an_empty_modern_suffix() {
+        type Gamertag =
+            extern "system" fn(This, Handle, u32, usize, *mut u8, *mut usize) -> HRESULT;
+        let this: This = &OBJECT;
+        let user = std::ptr::null();
+        // Classic, modern, modern suffix, unique modern; through both slots.
+        let expected: [&[u8]; 4] = [b"Player\0", b"Player\0", b"\0", b"Player\0"];
+        for (object, at) in [(&GAMERTAG_OBJECT, 0x18), (&OBJECT, 0x78)] {
+            let get = slot::<Gamertag>(object, at);
+            for (component, expected) in (0..).zip(expected) {
+                let (mut name, mut used) = ([0xff_u8; 16], 0);
+                let hr = get(this, user, component, 16, name.as_mut_ptr(), &mut used);
+                assert_eq!(hr, S_OK);
+                assert_eq!(&name[..used], expected, "component {component}");
+            }
+        }
+    }
 
     #[test]
     fn startup_adds_the_user_and_reads_its_id() {

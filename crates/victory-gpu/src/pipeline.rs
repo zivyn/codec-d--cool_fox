@@ -283,7 +283,9 @@ pub(crate) fn note_why(why: String) {
 pub(crate) fn take_drops() -> Vec<(String, u64)> {
     let drops = DROPS.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut drops: Vec<(String, u64)> = drops.into_iter().flatten().collect();
-    drops.sort_by_key(|d| std::cmp::Reverse(d.1));
+    // Frame reports only show the first 40 reasons. Keep ties ordered so
+    // a HashMap iteration order change cannot change which reasons appear.
+    drops.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     drops
 }
 

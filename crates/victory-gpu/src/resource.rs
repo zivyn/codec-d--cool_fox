@@ -1374,7 +1374,7 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// instead). Past the budget the system moves the card's memory into the PC's,
 /// which ended runs 20 and 24.
 #[cfg(windows)]
-pub(crate) fn room() -> bool {
+pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1386,7 +1386,6 @@ pub(crate) fn room() -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    let memory = crate::host::host().and_then(|h| h.video_memory());
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
         return true;

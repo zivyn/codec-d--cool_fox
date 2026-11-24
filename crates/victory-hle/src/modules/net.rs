@@ -1048,15 +1048,23 @@ mod tests {
                 named.name
             );
         }
-        // Every override names a real export of its DLL.
+        // Every override names a real export of its DLL. Some exports only
+        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
+        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
+        // them only when the host really lacks them.
+        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
             } else {
                 "ws2_32.dll"
             };
+            let present = crate::host::function(dll, e.name).is_some();
+            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+                continue;
+            }
             assert!(
-                crate::host::function(dll, e.name).is_some(),
+                present,
                 "{dll} lacks {}",
                 e.name
             );

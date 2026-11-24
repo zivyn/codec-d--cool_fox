@@ -355,6 +355,43 @@ mod tests {
     use super::bitcode::Attr;
     use super::container::SigElement;
     use super::shader::Shader;
+    use super::*;
+    use crate::native::{ComputeIo, StageIo};
+
+    /// A wave64 compute program that writes only EXEC's high dword
+    /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask is
+    /// opaque and keyed by the unchanged low dword, so building its lane bit
+    /// needed the mask's own value: lowering recursed until the stack
+    /// overflowed, which takes the whole process down (found by
+    /// random-input testing). Now the instruction fails like any other that
+    /// cannot be expressed: its result is missing, and only a side effect
+    /// that uses it would stop the translation.
+    #[test]
+    fn an_exec_high_write_does_not_overflow_the_stack() {
+        // s_mov_b32 exec_hi, 0; v_mov_b32 v1, v0; s_endpgm
+        let words = [0xBEFF_0380u32, 0x7E02_0300, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        if let Err(e) = emit(&c, &native, &p, &st, &io, &res) {
+            assert!(e.to_string().contains("its own value"), "{e}");
+        }
+    }
 
     /// A pixel shader writing a constant colour.
     fn constant_color() -> Vec<u8> {

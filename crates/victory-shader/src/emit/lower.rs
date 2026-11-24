@@ -22,6 +22,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+/// Why a descriptor the code picks by control flow stops a program.
+const WHY: Why = "a descriptor chosen by control flow";
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -150,6 +153,9 @@ struct Lower<'a> {
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
+    /// While an image access runs once per immediate sampler a phi picks
+    /// among: the predecessor whose sampler this run uses.
+    sampler_pick: Option<usize>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -450,6 +456,7 @@ impl<'a> Lower<'a> {
             user_data: None,
             user_reads: BTreeMap::new(),
             samplers: Vec::new(),
+            sampler_pick: None,
             descriptors: x
                 .res
                 .descriptors
@@ -2232,7 +2239,7 @@ impl<'a> Lower<'a> {
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
-            Fields::Image { .. } => self.image(inst, b, i),
+            Fields::Image { .. } => self.image_by_sampler(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
@@ -3265,29 +3272,114 @@ impl<'a> Lower<'a> {
                 }
             }
             Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let (Some(tail), Source::Loaded { load, first }) = (self.tail[q], arg) else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+                if sampler && args.iter().all(|a| matches!(a, Source::Constant(_))) {
+                    // The access runs once per sampler: see `image_by_sampler`.
+                    let j = self.sampler_pick.ok_or(WHY)?;
+                    return self.handle(site, &args[j], true, props);
+                }
+                let index = self.phi_index(*block, args, sampler)?;
+                Ok(self.s.heap_handle(self.cur, index, sampler, props))
+            }
+        }
+    }
+
+    /// The heap index a phi of loaded descriptors picks: each predecessor
+    /// computes its own at its end (a phi of phis, one level down), and the
+    /// join picks one.
+    fn phi_index(&mut self, block: usize, args: &[Source], sampler: bool) -> Result<V, Why> {
+        let mut incoming = Vec::new();
+        for (&q, arg) in self.x.p.blocks[block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let at = self.edges.get(&(q, block)).copied().unwrap_or(tail);
+            let index = match arg {
+                Source::Loaded { load, first } => {
                     let here = std::mem::replace(&mut self.cur, at);
                     let index = self.heap_index(*load, *first, sampler);
                     self.cur = here;
-                    incoming.push((index?, at));
+                    index?
                 }
-                let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, props))
-            }
+                Source::Phi { block, args } => self.phi_index(*block, args, sampler)?,
+                _ => return Err(WHY),
+            };
+            incoming.push((index, at));
         }
+        let join = self.block[block].ok_or(WHY)?;
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok(phi)
+    }
+
+    /// An image access with a sampler the code picks among immediate ones
+    /// (constants, one per predecessor of the join): it is lowered once per
+    /// distinct sampler, and a phi of which one each edge brought picks the
+    /// results. A handle cannot do the picking: the validator wants every
+    /// handle to come from `createHandle`, and a range of static samplers
+    /// is not bound by the root signature.
+    fn image_by_sampler(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let Some(Source::Phi { block, args }) = self.descriptors.get(&((b, i), true)).copied()
+        else {
+            return self.image(inst, b, i);
+        };
+        if !args.iter().all(|a| matches!(a, Source::Constant(_))) {
+            return self.image(inst, b, i);
+        }
+        let join = self.block[*block].ok_or(WHY)?;
+        // The first predecessor of each distinct sampler, and the sampler's
+        // number on each edge.
+        let mut picks: Vec<usize> = Vec::new();
+        let mut incoming = Vec::new();
+        for (j, (&q, arg)) in self.x.p.blocks[*block].preds.iter().zip(args).enumerate() {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let tail = self.tail[q].ok_or(WHY)?;
+            let n = picks
+                .iter()
+                .position(|&p| args[p] == *arg)
+                .unwrap_or_else(|| {
+                    picks.push(j);
+                    picks.len() - 1
+                });
+            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+            incoming.push((self.s.m.i32(n as u32), at));
+        }
+        let mut runs = Vec::new();
+        for &j in &picks {
+            self.sampler_pick = Some(j);
+            let done = self.image(inst, b, i);
+            self.sampler_pick = None;
+            done?;
+            let mut got = Vec::new();
+            for &(_, w) in &inst.writes {
+                let Some(Val::I32(x)) = self.vals.get(&w) else {
+                    return Err("an image result");
+                };
+                got.push(*x);
+            }
+            runs.push(got);
+        }
+        let Some(last) = runs.pop() else {
+            return Err(WHY);
+        };
+        if runs.is_empty() {
+            return Ok(());
+        }
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        for (n, &(_, w)) in inst.writes.iter().enumerate() {
+            let mut x = last[n];
+            for (k, run) in runs.iter().enumerate().rev() {
+                let k = self.s.m.i32(k as u32);
+                let is = self.s.m.cmp(self.cur, pred::EQ, phi, k);
+                x = self.s.m.select(self.cur, is, run[n], x);
+            }
+            self.vals.insert(w, Val::I32(x));
+        }
+        Ok(())
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar

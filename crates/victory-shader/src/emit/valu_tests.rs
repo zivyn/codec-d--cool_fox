@@ -6,6 +6,7 @@
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
 use super::host::{Dispatch, Host, Root, View};
+use super::sampler::StaticSampler;
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -82,11 +83,31 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
 
+    lower_cs(
+        &words,
+        8,
+        vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+    )
+}
+
+/// Lowers a 1-thread compute shader of `words` that receives 4 dwords of
+/// root constants in `s0..s3` and a descriptor table at `s4`; the DXIL is
+/// validated by `dxil.dll` when present.
+fn lower_cs(words: &[u32], vgprs: u16, used: Vec<UsedResource>) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
-        vgprs: 8,
+        vgprs,
         layout: vec![
             RootParam {
                 root: RootType::Constants,
@@ -105,16 +126,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
                 slot: 1,
             },
         ],
-        used: vec![UsedResource {
-            kind: ResourceType::Uav,
-            root: RootType::Table,
-            table_offset_dwords: 0,
-            lower_bound: 0,
-            stride: 0,
-            dwords: 4,
-            user_data: 4,
-            slot: 1,
-        }],
+        used,
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
             threads: [1, 1, 1],
@@ -143,8 +155,16 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
+        static_samplers: (lowered.samplers.iter().enumerate())
+            .map(|(n, &w)| {
+                let mut s = StaticSampler::from_words(w);
+                if lowered.cmp_samplers >> n & 1 != 0 {
+                    s.filter |= 0x80;
+                }
+                s
+            })
+            .collect(),
         samplers: lowered.samplers,
-        static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
     };
@@ -672,4 +692,199 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+}
+
+// ---- immediate samplers and descriptors the code picks by control flow ----
+
+const S_WAIT_ALL: u32 = 0xBF8C_0000;
+/// `s_cmp_eq_u32 s<n>, 0`.
+const fn s_cmp_eq_zero(n: u8) -> u32 {
+    0xBF06_8000 | n as u32
+}
+
+/// SMEM `s_load_dwordx4` (or `x8`) `s[dst..], s[4:5], <byte offset>`: the
+/// descriptor at that offset of the table.
+const fn s_load_table(x8: bool, dst: u8, offset: u32) -> [u32; 2] {
+    let op = if x8 { 3 } else { 2 };
+    [
+        0x3D << 26 | op << 18 | (dst as u32) << 6 | 2,
+        125 << 25 | offset,
+    ]
+}
+
+/// SOP1 `s_mov_b32 s<d>, <literal>`.
+const fn s_mov_lit(d: u8, lit: u32) -> [u32; 2] {
+    [0xBE80_03FF | (d as u32) << 16, lit]
+}
+
+/// VOP1 `v_mov_b32 v<d>, <literal>`.
+const fn v_mov_lit(d: u8, lit: u32) -> [u32; 2] {
+    [0x7E00_02FF | (d as u32) << 17, lit]
+}
+
+/// MIMG `image_sample_lz v[vdata..vdata+3], v[1:2], s[img..img+7],
+/// s[samp..samp+3] dmask:0xf dim:SQ_RSRC_IMG_2D`.
+const fn image_sample_lz(vdata: u8, img: u8, samp: u8) -> [u32; 2] {
+    [
+        0xF09C_0F08,
+        (samp as u32 / 4) << 21 | (img as u32 / 4) << 16 | (vdata as u32) << 8 | 1,
+    ]
+}
+
+/// Sampler words: point sampling, all three coordinates clamped or wrapped.
+const CLAMP: [u32; 4] = [0x92, 0, 0, 0];
+const WRAP: [u32; 4] = [0, 0, 0, 0];
+
+/// Samples a 4x1 texture (table entry 0) at u = 1.375 with a sampler the
+/// code picks: wrap when `s0` is zero, clamp otherwise (word 0 of the
+/// sampler set in either arm, the rest after the join). Then once more with
+/// the clamp sampler set outside the branch. Stores both red channels to the
+/// output buffer (entry 1).
+fn sample_with_a_sampler_picked_by_a_branch() -> HostShader {
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend(s_load_table(true, 16, 0));
+    w.extend(s_load_table(false, 24, 0x20));
+    w.extend([
+        s_cmp_eq_zero(0),
+        0xBF85_0003, // s_cbranch_scc1 -> wrap
+    ]);
+    w.extend(s_mov_lit(8, CLAMP[0]));
+    w.push(0xBF82_0002); // s_branch -> join
+    w.extend(s_mov_lit(8, WRAP[0])); // wrap:
+    for k in 1..4 {
+        w.extend(s_mov_lit(8 + k, CLAMP[k as usize])); // join:
+    }
+    w.push(S_WAIT_ALL);
+    w.extend(v_mov_lit(1, 1.375f32.to_bits()));
+    w.extend(v_mov_lit(2, 0.5f32.to_bits()));
+    w.extend(image_sample_lz(4, 16, 8));
+    for k in 0..4 {
+        w.extend(s_mov_lit(12 + k, CLAMP[k as usize]));
+    }
+    w.extend(image_sample_lz(8, 16, 12));
+    w.push(S_WAIT_ALL);
+    w.extend(buffer_store_dword(4, 24, 0));
+    w.extend(buffer_store_dword(8, 24, 4));
+    w.push(S_ENDPGM);
+    lower_cs(&w, 16, vec![])
+}
+
+/// Samples a 1x1 texture at its centre with the clamp sampler; the texture
+/// is entry 0 when `s0` and `s1` are not zero, entry 1 when only `s0` is
+/// not, entry 2 when `s0` is zero: the descriptor is joined in one block
+/// from entries 0 and 1, and in another from that join and entry 2. Stores
+/// the red channel to the output buffer (entry 3).
+fn sample_a_texture_joined_twice() -> HostShader {
+    let mut w = vec![s_mov_b32(5, 0x80)];
+    w.extend(s_load_table(false, 24, 0x60));
+    w.extend([
+        s_cmp_eq_zero(0),
+        0xBF85_0009, // s_cbranch_scc1 -> entry 2
+        s_cmp_eq_zero(1),
+        0xBF85_0003, // s_cbranch_scc1 -> entry 1
+    ]);
+    w.extend(s_load_table(true, 16, 0));
+    w.push(0xBF82_0002); // s_branch -> first join
+    w.extend(s_load_table(true, 16, 0x20));
+    w.extend([
+        0xBF80_0000, // first join: s_nop 0
+        0xBF82_0002, // s_branch -> second join
+    ]);
+    w.extend(s_load_table(true, 16, 0x40));
+    for k in 0..4 {
+        w.extend(s_mov_lit(8 + k, CLAMP[k as usize])); // second join:
+    }
+    w.push(S_WAIT_ALL);
+    w.extend(v_mov_lit(1, 0.5f32.to_bits()));
+    w.extend(v_mov_lit(2, 0.5f32.to_bits()));
+    w.extend(image_sample_lz(4, 16, 8));
+    w.push(S_WAIT_ALL);
+    w.extend(buffer_store_dword(4, 24, 0));
+    w.push(S_ENDPGM);
+    lower_cs(&w, 16, vec![])
+}
+
+/// Dispatches `shader` over `views` on every available SM 6.6 host (hardware
+/// GPU and WARP) for each pair of root constants and invokes
+/// `check(backend, case_index, first_uav_dwords)`.
+fn run_views(
+    shader: &HostShader,
+    views: &[View],
+    cases: &[[u32; 2]],
+    mut check: impl FnMut(&str, usize, &[u32]),
+) {
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (i, &inputs) in cases.iter().enumerate() {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => inputs.get(u.dword as usize).copied().unwrap_or(0),
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            check(label, i, &out[0]);
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn a_sampler_picked_by_a_branch_samples_with_the_picked_one() {
+    let shader = sample_with_a_sampler_picked_by_a_branch();
+    // Both are static samplers of their own: a range of them is not one a
+    // root signature binds.
+    assert_eq!(shader.samplers.len(), 2);
+    assert!(shader.samplers.contains(&CLAMP) && shader.samplers.contains(&WRAP));
+    let texels = [0.1f32, 0.2, 0.3, 0.4].map(|r| [r, 0.0, 0.0, 1.0]);
+    let views = [View::Texture(4, 1, &texels), View::RawUav(2)];
+    // Texel 1 (0.2) wraps, texel 3 (0.4) is where clamping ends.
+    let want = [[0.2f32, 0.4], [0.4, 0.4]];
+    run_views(&shader, &views, &[[0, 0], [1, 0]], |backend, i, out| {
+        let got = [f32::from_bits(out[0]), f32::from_bits(out[1])];
+        assert_eq!(got, want[i], "{backend}: s0 = {i}");
+    });
+}
+
+#[test]
+fn a_texture_joined_through_two_phis_is_the_one_the_path_loaded() {
+    let shader = sample_a_texture_joined_twice();
+    let texture = |r: f32| [[r, 0.0, 0.0, 1.0]];
+    let (t0, t1, t2) = (texture(1.0), texture(2.0), texture(3.0));
+    let views = [
+        View::Texture(1, 1, &t0),
+        View::Texture(1, 1, &t1),
+        View::Texture(1, 1, &t2),
+        View::RawUav(1),
+    ];
+    let want = [3.0f32, 2.0, 1.0];
+    run_views(
+        &shader,
+        &views,
+        &[[0, 0], [1, 0], [1, 1]],
+        |backend, i, out| {
+            assert_eq!(f32::from_bits(out[0]), want[i], "{backend}: case {i}");
+        },
+    );
 }

@@ -153,6 +153,20 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if at.is_null() {
+        let error = std::io::Error::last_os_error();
+        if kind & MEM_COMMIT != 0 {
+            commit_refused(size, "virtual memory", error);
+        } else {
+            tracing::warn!(
+                size,
+                kind = format_args!("{kind:#x}"),
+                flags = format_args!("{flags:#x}"),
+                %error,
+                "XMemVirtualAlloc refused"
+            );
+        }
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -299,6 +313,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
+        tracing::warn!(size, "XMemAllocDefault: the host heap is out of memory");
         return block.cast();
     }
     // SAFETY: the block holds the alignment (at least the header) and then
@@ -1051,7 +1066,14 @@ fn commit(base: usize, len: usize) -> bool {
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
         return true;
     }
-    let error = std::io::Error::last_os_error();
+    commit_refused(len, "physical pages", std::io::Error::last_os_error());
+    false
+}
+
+/// Reports memory the host would not give: at the Windows commit limit to
+/// `crashes.log`, since the title usually faults soon after on the null it
+/// gets; otherwise as a warning.
+fn commit_refused(len: usize, what: &str, error: std::io::Error) {
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
         let mut info = PERFORMANCE_INFORMATION {
             cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
@@ -1059,20 +1081,25 @@ fn commit(base: usize, len: usize) -> bool {
         };
         // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
-        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
+        victory_loader::log_crash(&commit_limit_message(
+            len,
+            what,
+            &error,
+            queried.then_some(&info),
+        ));
     } else {
-        tracing::warn!(len, %error, "committing physical pages failed");
+        tracing::warn!(len, %error, "committing {what} failed");
     }
-    false
 }
 
 fn commit_limit_message(
     len: usize,
+    what: &str,
     error: &std::io::Error,
     info: Option<&PERFORMANCE_INFORMATION>,
 ) -> String {
     let mut message = format!(
-        "VIctory: Windows commit limit reached while committing {len} bytes of physical pages: {error}.\n"
+        "VIctory: Windows commit limit reached while committing {len} bytes of {what}: {error}.\n"
     );
     if let Some(info) = info {
         use std::fmt::Write;
@@ -1371,10 +1398,11 @@ mod tests {
             PageSize: 4096,
             ..Default::default()
         };
-        let report = commit_limit_message(4 * MIB, &error, Some(&info));
-        assert!(report.contains("4194304 bytes"));
+        let report = commit_limit_message(4 * MIB, "physical pages", &error, Some(&info));
+        assert!(report.contains("4194304 bytes of physical pages"));
         assert!(report.contains("2 MiB of 3 MiB in use"));
-        let fallback = commit_limit_message(4 * MIB, &error, None);
+        let fallback = commit_limit_message(4 * MIB, "virtual memory", &error, None);
+        assert!(fallback.contains("4194304 bytes of virtual memory"));
         for report in [&report, &fallback] {
             assert!(report.contains("os error 1455"));
             assert!(report.contains("Windows paging file size"));

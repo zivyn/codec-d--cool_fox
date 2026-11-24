@@ -540,6 +540,82 @@ mod tests {
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
     }
 
+    /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
+    /// barycentrics, `SPI_PS_INPUT_ADDR` bit 0) runs at sample frequency:
+    /// DXC's PSV0 says so in PSInfo.SampleFrequency (runtime info byte 1)
+    /// whenever an input is interpolated per sample.
+    #[test]
+    fn sample_interpolated_inputs_set_psv_sample_frequency() {
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let psv_of = |input_addr: u32| {
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![crate::native::PsInput {
+                        usage: crate::native::Usage::Generic,
+                        row: 0,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: false,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    input_addr,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let el = |name: &str, kind, usage| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage,
+                half: false,
+            };
+            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
+            let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
+            let bytes =
+                crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            // dxil.dll, where there is one, checks PSV0 against the module.
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            let host = super::Container::parse(&out.dxil).unwrap();
+            host.part(super::FourCC::PSV0).unwrap().data.to_vec()
+        };
+        // Runtime info starts after its size; PSInfo is {DepthOutput, SampleFrequency}.
+        let center = psv_of(1 << 1);
+        assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
+        let sample = psv_of(1 << 0);
+        assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
+    }
+
     /// A pixel shader reading channel z of an input whose element starts at
     /// w. Looking the channel up subtracted the element's first channel
     /// before checking the channel lies in it, so in a build with overflow

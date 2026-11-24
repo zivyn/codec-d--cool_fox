@@ -161,6 +161,15 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
     u32s(&mut out, &[48]);
     let mut info = [0u8; 48];
     info[0] = u8::from(p.flag);
+    if p.stage == 0 {
+        // PSInfo.SampleFrequency: an input interpolated per sample, or the
+        // sample index.
+        info[1] = u8::from(
+            p.inputs
+                .iter()
+                .any(|e| matches!(e.interp, 6 | 7) || e.kind == 12),
+        );
+    }
     let (min, max) = p.wave_size.map_or((0, u32::MAX), |n| (n, n));
     info[16..20].copy_from_slice(&min.to_le_bytes());
     info[20..24].copy_from_slice(&max.to_le_bytes());

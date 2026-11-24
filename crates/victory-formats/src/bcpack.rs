@@ -80,7 +80,12 @@ struct Bc7Ix {
 /// The format's constant tables.
 pub struct Tables {
     freq: [[u32; BUCKETS]; MODELS],
-    start: [[u32; BUCKETS]; MODELS],
+    /// Each bucket's first slot; 65536 past the model's last, and one more
+    /// 65536 at the end so a bucket always has a next start.
+    start: [[u32; BUCKETS + 1]; MODELS],
+    /// Per model, the bucket of the first slot of each 256-slot window: the
+    /// search for a slot's bucket starts there and seldom moves on.
+    bucket: Box<[[u8; 256]; MODELS]>,
     /// ceil(2^32 / freq): exact division for the offsets inside a bucket.
     recip: [[u64; BUCKETS]; MODELS],
     rank1: [u8; 256],
@@ -132,7 +137,8 @@ impl Tables {
         }
         let mut r = Reader(bytes);
         let mut freq = [[0u32; BUCKETS]; MODELS];
-        let mut start = [[0u32; BUCKETS]; MODELS];
+        let mut start = [[0u32; BUCKETS + 1]; MODELS];
+        let mut bucket = Box::new([[0u8; 256]; MODELS]);
         let mut recip = [[0u64; BUCKETS]; MODELS];
         for m in 0..MODELS {
             for f in &mut freq[m] {
@@ -153,6 +159,10 @@ impl Tables {
                 return Err(Error("a model does not tile 65536"));
             }
             start[m][used..].fill(1 << 16);
+            for (window, b) in bucket[m].iter_mut().enumerate() {
+                let first = (window as u32) << 8;
+                *b = start[m][1..].iter().filter(|&&s| s <= first).count() as u8;
+            }
         }
         let rank1 = r.bytes();
         let rank3a = r.bytes();
@@ -221,6 +231,7 @@ impl Tables {
         Ok(Tables {
             freq,
             start,
+            bucket,
             recip,
             rank1,
             rank3a,
@@ -342,33 +353,20 @@ impl Lane {
             let start = &t.start[usize::from(self.model)];
             let slot = x & 0xffff;
             // The bucket: starts are ascending, and 65536 past the model's last.
-            let b = start[1..].iter().filter(|&&s| s <= slot).count();
-            // Buckets 0 and 1 hold one symbol. Elsewhere offset and frequency
-            // are below 2^16, where the reciprocal divides exactly.
-            let sym = match b {
-                0 => 0,
-                1 => 1,
-                _ => {
-                    let rec = t.recip[usize::from(self.model)][b];
-                    (1 << (b - 1)) + ((u64::from(slot - start[b]) * rec) >> 32) as u8
-                }
-            };
-            // Slot 0 is never used: symbol 0 owns 1 .. f[0] - 1.
-            let (f, c) = if sym == 0 {
-                (freq[0] - 1, 1)
+            let b = bucket_of(t, self.model, slot);
+            // Bucket 0 holds symbol 0, which owns slots 1 .. f[0] - 1 (slot 0
+            // is never used). Bucket b > 0 holds 2^(b-1) symbols of frequency
+            // f[b] from start[b] on; offset and frequency are below 2^16, where
+            // the reciprocal divides exactly.
+            let (sym, f, rem) = if b == 0 {
+                (0, freq[0] - 1, slot.wrapping_sub(1))
             } else {
-                let k = (8 - sym.leading_zeros()) as usize;
-                let f = freq[k];
-                (
-                    f,
-                    (u32::from(sym) - (1 << (k - 1)))
-                        .wrapping_mul(f)
-                        .wrapping_add(start[k])
-                        & 0xffff,
-                )
+                let offset = slot - start[b];
+                let q = ((u64::from(offset) * t.recip[usize::from(self.model)][b]) >> 32) as u32;
+                ((1u32 << (b - 1)) + q, freq[b], offset - q * freq[b])
             };
-            self.x = (x >> 16).wrapping_mul(f).wrapping_sub(c).wrapping_add(slot);
-            self.out = Some(sym);
+            self.x = (x >> 16).wrapping_mul(f).wrapping_add(rem);
+            self.out = Some(sym as u8);
         } else if self.left != 0 {
             // At exactly 2^24 the lane neither reads nor decodes again; only a
             // lane that has delivered its symbols may end up there.
@@ -383,6 +381,19 @@ impl Lane {
         }
         Ok(())
     }
+}
+
+/// The bucket holding `slot` (below 65536): the last whose start is at or
+/// below it. The window table gives the bucket of the window's first slot;
+/// later buckets that start inside the window are stepped over.
+#[inline]
+fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
+    let start = &t.start[usize::from(model)];
+    let mut b = usize::from(t.bucket[usize::from(model)][(slot >> 8) as usize]);
+    while start[b + 1] <= slot {
+        b += 1;
+    }
+    b
 }
 
 /// Decodes `per` symbols per block on every lane into `records` (one record
@@ -409,6 +420,8 @@ fn lanes(
     let stride = widths.len() * per;
     let full = (1u32 << widths.len()) - 1;
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
+    // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
+    let mut at = 0;
     while pos < blocks * per {
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
@@ -429,13 +442,18 @@ fn lanes(
             if !lane.stalled
                 && let Some(sym) = lane.out.take()
             {
-                records[pos / per * stride + j * per + pos % per] = sym;
+                records[at + j * per] = sym;
                 done |= bit;
                 moved = true;
             }
         }
         if done == full {
             pos += 1;
+            at += if pos.is_multiple_of(per) {
+                stride - per + 1
+            } else {
+                1
+            };
             done = 0;
             moved = true;
         }
@@ -1366,6 +1384,183 @@ mod tests {
                 let mut dst = vec![0u8; 16 * (1 + round % 40)];
                 let _ = decode(bc, &src, &mut dst, &t);
             }
+        }
+    }
+
+    /// The window table finds the bucket a scan of the starts finds, for
+    /// every slot of every model, in the shipped tables and in ours (whose
+    /// buckets are wide) and in tables whose buckets are one slot wide.
+    #[test]
+    fn bucket_lookup_matches_a_scan_of_the_starts() {
+        let mut narrow = tables();
+        for m in 0..MODELS {
+            // Buckets 1.. of one slot each where they fit; bucket 0 takes the rest.
+            let used = m / 16 + 2;
+            let rest = (1u32 << 16) - (1..used).map(|b| 1u32 << (b - 1)).sum::<u32>();
+            for b in 0..used {
+                let f = if b == 0 { rest } else { 1 };
+                narrow[(m * BUCKETS + b) * 2..][..2].copy_from_slice(&(f as u16).to_le_bytes());
+            }
+        }
+        for t in [
+            Tables::builtin().unwrap(),
+            Tables::parse(&tables()).unwrap(),
+            Tables::parse(&narrow).unwrap(),
+        ] {
+            for model in 0..MODELS as u8 {
+                let start = &t.start[usize::from(model)];
+                for slot in 0..1u32 << 16 {
+                    let scan = start[1..].iter().filter(|&&s| s <= slot).count();
+                    assert_eq!(
+                        bucket_of(&t, model, slot),
+                        scan,
+                        "model {model} slot {slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// One rANS decode as first written: scan for the bucket, divide for the
+    /// symbol, rebuild its frequency and start from the symbol.
+    fn reference_decode(t: &Tables, model: u8, x: u32) -> (u8, u32) {
+        let (freq, start) = (&t.freq[usize::from(model)], &t.start[usize::from(model)]);
+        let slot = x & 0xffff;
+        let b = start[1..BUCKETS].iter().filter(|&&s| s <= slot).count();
+        let sym = match b {
+            0 => 0,
+            1 => 1,
+            _ => (1u32 << (b - 1)) + (slot - start[b]) / freq[b],
+        } as u8;
+        let (f, c) = if sym == 0 {
+            (freq[0] - 1, 1)
+        } else {
+            let k = (8 - sym.leading_zeros()) as usize;
+            let f = freq[k];
+            (
+                f,
+                ((u32::from(sym) - (1 << (k - 1))) * f + start[k]) & 0xffff,
+            )
+        };
+        (
+            sym,
+            (x >> 16).wrapping_mul(f).wrapping_sub(c).wrapping_add(slot),
+        )
+    }
+
+    /// A payload step decodes the symbol and state the first version did, for
+    /// every model and slot of the shipped tables and ours, at assorted states.
+    #[test]
+    fn payload_step_matches_the_reference_decode() {
+        for t in [
+            Tables::builtin().unwrap(),
+            Tables::parse(&tables()).unwrap(),
+        ] {
+            for model in 0..MODELS as u8 {
+                for high in [0x100u32, 0x1234, 0xffff] {
+                    for slot in 0..1u32 << 16 {
+                        let x = high << 16 | slot;
+                        if x <= LOW {
+                            continue;
+                        }
+                        let mut lane = Lane {
+                            phase: 3,
+                            model,
+                            x,
+                            left: 1,
+                            ..Default::default()
+                        };
+                        lane.step(&t).unwrap();
+                        let (sym, next) = reference_decode(&t, model, x);
+                        assert_eq!(
+                            (lane.out, lane.x),
+                            (Some(sym), next),
+                            "model {model} x {x:#x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pseudo-random records that fit each lane's alphabet; BC7 keeps control
+    /// code 0 (mode 6), the only one the synthetic tables define.
+    fn random_records(widths: &[u8], per: usize, blocks: usize, bc7: bool) -> Vec<Vec<u8>> {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        (0..blocks)
+            .map(|_| {
+                let mut r: Vec<u8> = (0..widths.len() * per)
+                    .map(|k| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let alphabet = 1u32 << (widths[k / per] + 1);
+                        (seed as u32 % alphabet) as u8
+                    })
+                    .collect();
+                if bc7 {
+                    r[30] = 0;
+                    r[31] = 0;
+                }
+                r
+            })
+            .collect()
+    }
+
+    /// The fast paths decode exactly what one lane step at a time does, on
+    /// every format's lane layout, with short and long fragments.
+    #[test]
+    fn every_layout_round_trips_through_the_lanes() {
+        let t = Tables::parse(&tables()).unwrap();
+        let layouts: [(&[u8], usize); 6] = [
+            (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
+            (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
+            (&BC4_LANES, 1),
+            (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
+            (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
+            (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
+        ];
+        for (widths, per) in layouts {
+            for blocks in [1, 2, 17, 300, 1000] {
+                let records = random_records(widths, per, blocks, false);
+                let src = stream(&t, widths, per, &records);
+                let mut got = vec![0u8; records.concat().len()];
+                let mut next = src.iter().copied();
+                lanes(&t, widths, per, blocks, |_| next.next(), &mut got).unwrap();
+                assert_eq!(got, records.concat(), "{widths:?} x{per}, {blocks} blocks");
+            }
+        }
+    }
+
+    /// Decode throughput on synthetic streams (no game data):
+    /// `cargo test --release -p victory-formats bcpack_throughput -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bcpack_throughput() {
+        let t = Tables::parse(&tables()).unwrap();
+        let cases: [(u8, &[u8], usize, usize); 3] = [
+            (1, &[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1, 8),
+            (4, &BC4_LANES, 1, 8),
+            (7, &[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2, 16),
+        ];
+        for (bc, widths, per, block) in cases {
+            // One fragment per lane holds at most 65792 bytes.
+            let blocks = 1 << 14;
+            let records = random_records(widths, per, blocks, bc == 7);
+            let src = stream(&t, widths, per, &records);
+            let mut dst = vec![0u8; blocks * block];
+            decode(bc, &src, &mut dst, &t).unwrap();
+            let runs = 40;
+            let started = std::time::Instant::now();
+            for _ in 0..runs {
+                decode(bc, std::hint::black_box(&src), &mut dst, &t).unwrap();
+            }
+            let secs = started.elapsed().as_secs_f64() / f64::from(runs);
+            println!(
+                "BC{bc}: {blocks} blocks, {:.1} MB out/s, {:.1} ns/block",
+                (blocks * block) as f64 / secs / 1e6,
+                secs * 1e9 / blocks as f64
+            );
         }
     }
 

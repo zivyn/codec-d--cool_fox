@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -58,8 +59,17 @@ impl Cache {
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
-        std::fs::write(&tmp, &output)?;
-        std::fs::rename(&tmp, &path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        let written = file.write_all(&output);
+        drop(file);
+        let published = written.and_then(|()| std::fs::rename(&tmp, &path));
+        if published.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        published?;
         Ok(path)
     }
 }
@@ -107,6 +117,25 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(std::fs::read(&a).unwrap(), b"ABC");
         assert_eq!(conv.runs.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn failed_publication_removes_the_staging_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert!(cache.get_or_convert(&conv, b"abc").is_err());
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 
     #[test]

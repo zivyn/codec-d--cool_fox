@@ -247,12 +247,15 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
-        if open(&mut guards(), at, at + 1) {
+        // Held across both checks: another thread may have opened the block
+        // since this one faulted, and a copy may have guarded it again since
+        // (then it is ours again, not read-only for some other reason).
+        let mut g = guards();
+        if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        // Another thread may have opened the block since this one faulted.
         if writable(at) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {

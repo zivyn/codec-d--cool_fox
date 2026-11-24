@@ -42,6 +42,7 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
     });
 
     let mut images = 0usize;
+    let mut seen = BTreeSet::new();
     let mut failed = Vec::new();
     let mut dlls: BTreeMap<String, DllStats> = BTreeMap::new();
     let mut missing: BTreeMap<(String, String), BTreeSet<PathBuf>> = BTreeMap::new();
@@ -60,6 +61,11 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
             };
             let path = entry.path();
             if !entry.file_type().is_file() || !looks_like_pe(path) {
+                continue;
+            }
+            // Use the resolved path for deduplication and keep the original for output.
+            let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            if !seen.insert(identity) {
                 continue;
             }
             let info = match std::fs::read(path)

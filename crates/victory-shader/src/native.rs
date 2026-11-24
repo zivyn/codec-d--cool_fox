@@ -799,6 +799,21 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
     })
 }
 
+fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|e| VsOutput {
+            usage: Usage::from_raw(e[0]),
+            row: e[1],
+            param: e[2],
+            fp16: e[5] & 1 != 0,
+            pack2: e[5] & 2 != 0,
+        })
+        .collect())
+}
+
 fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
     let inputs = semantics(data, VS_INPUTS, 5, VS_INPUT_COUNT)?
         .as_chunks::<5>()
@@ -811,25 +826,12 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
             vgpr: e[3],
         })
         .collect();
-    let outputs = semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
-        .as_chunks::<6>()
-        .0
-        .iter()
-        .map(|e| VsOutput {
-            usage: Usage::from_raw(e[0]),
-            row: e[1],
-            param: e[2],
-            fp16: e[5] & 1 != 0,
-            pack2: e[5] & 2 != 0,
-        })
-        .collect();
+    let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
-    let StageIo::Vs { outputs, .. } = vs_io(data)? else {
-        unreachable!()
-    };
+    let outputs = vs_outputs(data)?;
     let info = data
         .get(MS_INFO..MS_INFO + 8)
         .ok_or(Malformed("stage data out of bounds"))?;
@@ -1127,6 +1129,16 @@ mod tests {
                 lds_bytes: 16,
             })
         );
+    }
+
+    #[test]
+    fn mesh_stage_io_ignores_unused_vs_input_count() {
+        let mut blob = fssm(&[(HwStage::Ms, &VS_CODE)]);
+        let e = stage_data_at(&blob, HwStage::Ms);
+        // Mesh stage data has no vertex inputs; E+0xc4 is unused by MS.
+        blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let p = &native_programs(&part(&[(KIND_NATIVE, &xbch(&blob))])).unwrap()[0];
+        assert!(matches!(p.io, StageIo::Ms(_)));
     }
 
     #[test]

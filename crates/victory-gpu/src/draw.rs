@@ -937,6 +937,12 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        // Skip before the argument clamp can mutate the indirect buffer.
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_drop(self.pipeline as This);
+            return false;
+        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
@@ -945,12 +951,6 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");

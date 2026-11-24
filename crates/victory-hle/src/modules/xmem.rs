@@ -13,7 +13,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
     MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
@@ -21,7 +23,10 @@ use windows_sys::Win32::System::Memory::{
     MemExtendedParameterAddressRequirements, PAGE_NOACCESS, PAGE_READWRITE, SEC_COMMIT,
     SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc, VirtualAlloc2, VirtualFree, VirtualQueryEx,
 };
-use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::System::ProcessStatus::{
+    K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
+    PROCESS_MEMORY_COUNTERS,
+};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
@@ -733,16 +738,44 @@ fn commit(base: usize, len: usize) -> bool {
         return true; // sections are committed whole there
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
-    let done =
-        !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null();
-    if !done {
-        tracing::warn!(
-            len,
-            error = %std::io::Error::last_os_error(),
-            "committing physical pages failed"
+    if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        return true;
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
+        let mut info = PERFORMANCE_INFORMATION::default();
+        info.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+        // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
+        let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
+        victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));
+    } else {
+        tracing::warn!(len, %error, "committing physical pages failed");
+    }
+    false
+}
+
+fn commit_limit_message(
+    len: usize,
+    error: &std::io::Error,
+    info: Option<&PERFORMANCE_INFORMATION>,
+) -> String {
+    let mut message = format!(
+        "VIctory: Windows commit limit reached while committing {len} bytes of physical pages: {error}.\n"
+    );
+    if let Some(info) = info {
+        use std::fmt::Write;
+
+        let committed = info.CommitTotal * info.PageSize / MIB;
+        let limit = info.CommitLimit * info.PageSize / MIB;
+        let _ = writeln!(
+            message,
+            "System commit: {committed} MiB of {limit} MiB in use."
         );
     }
-    done
+    message.push_str(
+        "Close other applications or increase the Windows paging file size, then retry.\n",
+    );
+    message
 }
 
 /// Returns `[base, base + len)` to placeholders; views reaching past it
@@ -972,6 +1005,26 @@ mod tests {
         assert_eq!(size_of::<WorkingSet>(), 0x50);
         assert_eq!(size_of::<BasicInformation>(), 0x40);
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
+    }
+
+    #[test]
+    fn commit_limit_report_includes_request_and_system_commit() {
+        let error = std::io::Error::from_raw_os_error(ERROR_COMMITMENT_LIMIT as i32);
+        let info = PERFORMANCE_INFORMATION {
+            CommitTotal: 512,
+            CommitLimit: 768,
+            PageSize: 4096,
+            ..Default::default()
+        };
+        let report = commit_limit_message(4 * MIB, &error, Some(&info));
+        assert!(report.contains("4194304 bytes"));
+        assert!(report.contains("2 MiB of 3 MiB in use"));
+        let fallback = commit_limit_message(4 * MIB, &error, None);
+        for report in [&report, &fallback] {
+            assert!(report.contains("os error 1455"));
+            assert!(report.contains("Windows paging file size"));
+        }
+        assert!(!fallback.contains("System commit:"));
     }
 
     #[test]

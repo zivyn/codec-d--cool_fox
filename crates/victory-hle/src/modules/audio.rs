@@ -471,7 +471,8 @@ impl Xma {
         // The decoder writes the same words.
         let mut slot = lock(&self.voices[index as usize]);
         let size = context.field(0, 22, 5).max(1);
-        let read = (context.field(9, 0, 5) + blocks) % size;
+        // The count is the title's: reduced first, so the sum stays small.
+        let read = (context.field(9, 0, 5) + blocks % size) % size;
         context.set_field(9, 0, 5, read);
         if blocks > 0 {
             context.set_field(1, 31, 1, 1);
@@ -1061,6 +1062,13 @@ mod tests {
         assert_eq!(produced(&xma()), Some(26 * SAMPLES_PER_BLOCK));
         assert_eq!(context.field(0, 20, 2), 0, "input used up");
         assert_eq!(context.field(2, 26, 5), INPUT_INVALID);
+
+        // A count near `u32::MAX` wraps the read block like any other
+        // (3 + 0xffff_ffff blocks on a ring of four is block 2); the sum
+        // used to overflow.
+        context.set_field(9, 0, 5, 3);
+        submit(ADVANCE_XMA_READ, &[1, u32::MAX]);
+        assert_eq!(context.field(9, 0, 5), 2);
 
         submit(DISABLE_XMA, &[1]);
         assert_eq!(produced(&xma()), None);

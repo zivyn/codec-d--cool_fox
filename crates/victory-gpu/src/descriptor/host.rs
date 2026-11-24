@@ -735,13 +735,15 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
     let buffer = match view {
-        View::Unordered(r, _, _) => is_buffer(r),
+        View::Unordered(r, _, desc) => is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
         View::Placed(true, resource, _) => resource[0] == 1,
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
         // reports it).
-        View::Shader(r, _) if is_buffer(r) => return null_buffer_view(at),
+        View::Shader(r, desc) if is_buffer(r) || desc.is_some_and(|d| d[1] == 1) => {
+            return null_buffer_view(at);
+        }
         View::Placed(false, resource, _) if resource[0] == 1 => return null_buffer_view(at),
         // Textures: a null view of the title's dimension (1D, arrays, 3D,
         // cubes), not always 2D.

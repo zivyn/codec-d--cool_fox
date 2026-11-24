@@ -1600,6 +1600,11 @@ struct Deferred {
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
+    /// The indirect scratch buffer (`HostList::indirect_args`, by its
+    /// interface pointer) that a clamp in this recording left readable as
+    /// indirect arguments; 0 if none. It stays readable until the next
+    /// clamp into it ([`HostList::indirect_state`]).
+    indirect_readable: usize,
 }
 
 impl Deferred {
@@ -4406,6 +4411,10 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some((scratch, _)) = scratch {
+            self.indirect_common(&scratch);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -5033,9 +5042,55 @@ impl HostList {
         let old = slot.replace((buffer.clone(), alloc));
         drop(slot);
         if let Some((old_buf, _)) = old {
+            // It ends the list common, as every scratch buffer does.
+            self.indirect_common(&old_buf);
             self.keep(&old_buf);
         }
         Some(buffer)
+    }
+
+    /// Moves `scratch` back to the common state if a clamp left it readable
+    /// as indirect arguments ([`HostList::indirect_readable`]): where the
+    /// list's first clamp expects it. Done before the list closes and before
+    /// a bigger scratch buffer replaces it: one barrier per list (where
+    /// there was one per indirect execution), and the list ends as it
+    /// begins however it is submitted.
+    fn indirect_common(&self, scratch: &ID3D12Resource) {
+        {
+            let mut deferred = self.deferred();
+            if deferred.indirect_readable != scratch.as_raw() as usize {
+                return;
+            }
+            deferred.indirect_readable = 0;
+        }
+        let barrier = transition(
+            scratch,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            D3D12_RESOURCE_STATE_COMMON,
+        );
+        // SAFETY: an open list and a live buffer this recording left in
+        // `INDIRECT_ARGUMENT`.
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
+    }
+
+    /// The state the list's indirect scratch buffer `scratch` is in at this
+    /// point of the recording: indirect arguments if a clamp in this
+    /// recording left it so ([`HostList::indirect_readable`]), otherwise
+    /// common: the state a buffer is made in, and the one a recording
+    /// leaves it in when it closes or replaces it ([`HostList::indirect_common`]).
+    pub(crate) fn indirect_state(&self, scratch: &ID3D12Resource) -> D3D12_RESOURCE_STATES {
+        if self.deferred().indirect_readable == scratch.as_raw() as usize {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        }
+    }
+
+    /// A clamp recorded in this list left `scratch` readable as indirect
+    /// arguments. It stays so for every execution that reads it, until the
+    /// next clamp moves it back to unordered access.
+    pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
+        self.deferred().indirect_readable = scratch.as_raw() as usize;
     }
 
     /// Keeps `object` alive until the list is reset.

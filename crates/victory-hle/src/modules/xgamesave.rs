@@ -362,11 +362,14 @@ fn take<T>(handle: *mut T) {
 
 impl Provider {
     /// The provider for the only user and `config` (the service
-    /// configuration id), under `saves`.
+    /// configuration id), under `saves`. An empty id names no
+    /// configuration, like none: as a folder name it would be the user's
+    /// folder itself, where the other configurations' folders are.
     fn open(saves: &Path, config: Option<&str>) -> Result<Provider, HRESULT> {
+        let config = config.filter(|c| !c.is_empty()).unwrap_or("default");
         let root = saves
             .join(format!("{:016X}", xuser::XUID))
-            .join(file_name(config.unwrap_or("default")));
+            .join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
         containers(&root); // converts old containers now
@@ -1106,6 +1109,31 @@ mod tests {
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
         assert_eq!((v.number, v.display.as_str()), (1, "Chapter 1"));
+    }
+
+    /// An empty configuration id names none. As a folder name it would be
+    /// the folder every configuration lives in, whose folders then look
+    /// like containers of the old layout and are converted away.
+    #[test]
+    fn an_empty_configuration_id_is_the_default_one() {
+        let saves = tempfile::tempdir().unwrap();
+        let scid = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert_eq!(update(&scid.root, "one", &[("a", Some("kept"))]), S_OK);
+        let kept = Some(("one".into(), vec![("a".into(), "kept".into())]));
+        assert_eq!(state(&scid.root), kept);
+
+        let empty = Provider::open(saves.path(), Some("")).unwrap();
+        assert!(scid.root.is_dir(), "another configuration's saves are gone");
+        assert_eq!(state(&scid.root), kept);
+        let default = Provider::open(saves.path(), None).unwrap();
+        assert_eq!(empty.root, default.root);
+
+        // Named configurations stay apart, from it and from each other.
+        assert_ne!(empty.root, scid.root);
+        assert_eq!(state(&empty.root), None);
+        let other = Provider::open(saves.path(), Some("other")).unwrap();
+        assert_eq!(state(&other.root), None);
+        assert_eq!(state(&scid.root), kept);
     }
 
     #[test]

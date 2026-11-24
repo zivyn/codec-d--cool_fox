@@ -279,6 +279,32 @@ fn v_med3_f32_matches_rdna2_with_nan() {
     });
 }
 
+/// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
+/// FMin compare and select, which can give either zero.
+#[test]
+fn max_and_min_order_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0_u32, 0x8000_0000_u32);
+    // Each case has a -0 and a +0 among its first two operands.
+    let cases = [
+        [nz, pz, nz, 0],
+        [pz, nz, nz, 0],
+        [nz, pz, pz, 0],
+        [pz, nz, pz, 0],
+    ];
+    let ops = [
+        ("v_max_f32", 0x110, pz),
+        ("v_min_f32", 0x10F, nz),
+        ("v_max3_f32", 0x154, pz),
+        ("v_min3_f32", 0x151, nz),
+    ];
+    for (name, op, want) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    }
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)

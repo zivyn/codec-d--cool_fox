@@ -4989,26 +4989,35 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                let p = match op {
-                    "f" => pred::FALSE,
-                    "lt" => pred::OLT,
-                    "eq" => pred::OEQ,
-                    "le" => pred::OLE,
-                    "gt" => pred::OGT,
-                    "lg" => pred::ONE,
-                    "ge" => pred::OGE,
-                    "o" => pred::ORD,
-                    "u" => pred::UNO,
-                    "nge" => pred::ULT,
-                    "nlg" => pred::UEQ,
-                    "ngt" => pred::ULE,
-                    "nle" => pred::UGT,
-                    "neq" => pred::UNE,
-                    "nlt" => pred::UGE,
-                    "tru" => pred::TRUE,
-                    _ => return Err(inst.name()),
-                };
-                self.s.m.cmp(c, p, a, b)
+                if op == "lg" {
+                    // Ordered and not equal, false for a NaN, as `olt | ogt`.
+                    // `fcmp one` means the same, but the AMD D3D12 driver
+                    // runs it as unordered (true for a NaN) where NVIDIA
+                    // and WARP do not; olt and ogt agree on all three.
+                    let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                    let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                    self.s.m.bin(c, Bin::Or, lt, gt)
+                } else {
+                    let p = match op {
+                        "f" => pred::FALSE,
+                        "lt" => pred::OLT,
+                        "eq" => pred::OEQ,
+                        "le" => pred::OLE,
+                        "gt" => pred::OGT,
+                        "ge" => pred::OGE,
+                        "o" => pred::ORD,
+                        "u" => pred::UNO,
+                        "nge" => pred::ULT,
+                        "nlg" => pred::UEQ,
+                        "ngt" => pred::ULE,
+                        "nle" => pred::UGT,
+                        "neq" => pred::UNE,
+                        "nlt" => pred::UGE,
+                        "tru" => pred::TRUE,
+                        _ => return Err(inst.name()),
+                    };
+                    self.s.m.cmp(c, p, a, b)
+                }
             }
             "u64" | "i64" => {
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);

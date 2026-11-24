@@ -320,6 +320,58 @@ fn v_med3_f16_matches_rdna2_with_nan() {
     });
 }
 
+/// `v_cmp_lg_*` is "less or greater": ordered and not equal, so false when
+/// either operand is a NaN (RDNA2 ISA; the same on gfx1036 hardware).
+#[test]
+fn v_cmp_lg_is_false_for_nan() {
+    // v_cmp_lg_{f32,f16}_e64 s20, v1, v2 (VOPC 0x005 / 0x0cd in VOP3);
+    // v_cndmask_b32_e64 v0, 0, 1, s20 (VOP3 0x101)
+    let nan = f32::NAN.to_bits();
+    let (inf, ninf) = (f32::INFINITY.to_bits(), f32::NEG_INFINITY.to_bits());
+    let f = f32::to_bits;
+    let f32_cases: &[([u32; 4], u32)] = &[
+        ([f(1.0), f(2.0), 0, 0], 1),
+        ([f(2.0), f(1.0), 0, 0], 1),
+        ([f(1.0), f(1.0), 0, 0], 0),
+        ([f(0.0), f(-0.0), 0, 0], 0),
+        ([inf, ninf, 0, 0], 1),
+        ([inf, inf, 0, 0], 0),
+        ([nan, f(1.0), 0, 0], 0),
+        ([f(1.0), nan, 0, 0], 0),
+        ([nan, nan, 0, 0], 0),
+        ([0x7F80_0001, f(0.0), 0, 0], 0), // a signalling NaN
+    ];
+    let f16_cases: &[([u32; 4], u32)] = &[
+        ([0x3C00, 0x4000, 0, 0], 1),
+        ([0x4000, 0x3C00, 0, 0], 1),
+        ([0x3C00, 0x3C00, 0, 0], 0),
+        ([0x0000, 0x8000, 0, 0], 0),
+        ([0x7C00, 0xFC00, 0, 0], 1),
+        ([0x7E00, 0x3C00, 0, 0], 0),
+        ([0x3C00, 0x7E00, 0, 0], 0),
+        ([0x7E00, 0x7E00, 0, 0], 0),
+        ([0x7C01, 0x0000, 0, 0], 0),           // a signalling NaN
+        ([0xABCD_3C00, 0x1234_7E00, 0, 0], 0), // only the low halves are read
+    ];
+    for (op, what, cases) in [
+        (0x005u16, "v_cmp_lg_f32", f32_cases),
+        (0x0cd, "v_cmp_lg_f16", f16_cases),
+    ] {
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+        run_cases(&shader, &inputs, |backend, i, inp, got| {
+            let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+}
+
 #[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)

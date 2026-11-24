@@ -89,6 +89,9 @@ removes EXEC: lane masks become per-lane booleans, wave-wide mask tests
 become per-lane branches, and vector instructions keep a guard only where
 a lane can reach them with its EXEC bit clear. `victory_shader::resource`
 traces each descriptor and scalar memory address to the root parameter it
-comes from (table, heap, root descriptor or constant). `victory translate`
+comes from (table, heap, root descriptor or constant). A descriptor a
+waterfall loop reads from the first lane (`v_readfirstlane_b32`) is traced
+to the per-lane load or choice that gives each lane its own, and accessed
+with a non-uniform heap index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.

@@ -92,6 +92,11 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
                     rest.push(name.to_os_string());
                     existing = parent;
                 }
+                // `file_name()` is None for a trailing `..`; keep it so `normalize` resolves it.
+                (Some(parent), None) if existing.ends_with("..") => {
+                    rest.push("..".into());
+                    existing = parent;
+                }
                 _ => {
                     return Err(PolicyError::Io {
                         path: path.to_path_buf(),
@@ -155,5 +160,13 @@ mod tests {
     fn accepts_unrelated_directories() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_outside_repo(&tmp.path().join("does").join("not").join("exist")).unwrap();
+    }
+
+    #[test]
+    fn resolves_dot_dot_in_a_path_that_does_not_exist_yet() {
+        let base = std::env::temp_dir().join("victory-policy-no-such");
+        let path = base.join("a").join("..").join("b");
+        let resolved = resolve(&path).expect("a `..` in the missing tail must resolve lexically");
+        assert_eq!(resolved, resolve(&base.join("b")).unwrap());
     }
 }

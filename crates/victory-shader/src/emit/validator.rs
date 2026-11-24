@@ -1,6 +1,6 @@
 //! The DXIL validator in `dxil.dll` (`IDxcValidator`), for tests and the
 //! offline batch. Translated shaders do not need it: they carry the
-//! container hash we compute ([`super::container::hash`]).
+//! container hash we compute (`container::hash`).
 //!
 //! The DLL is found at `VICTORY_DXIL` if set, else the newest Windows SDK's
 //! `bin\<version>\x64\dxil.dll`, else wherever `LoadLibrary` finds it.

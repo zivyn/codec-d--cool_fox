@@ -244,6 +244,12 @@ impl State {
         }
     }
 
+    pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+            *slot = VertexView::default();
+        }
+    }
+
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
     }
@@ -1156,7 +1162,11 @@ fn describe(view: Option<&View>) -> String {
         None => "no view".into(),
         Some(v @ View::Shader(r, _)) => texture(*r as This)
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
-        Some(View::Unordered(r, ..)) => format!("uav {:?}", texture(*r as This)),
+        // A buffer has no host texture: its title range, as for a shader view.
+        Some(v @ View::Unordered(r, ..)) => texture(*r as This).map_or_else(
+            || format!("uav buffer {:?}", crate::descriptor::host::buffer_range(v)),
+            |t| format!("uav {t}"),
+        ),
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
             r[0],

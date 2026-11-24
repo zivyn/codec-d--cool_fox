@@ -6,7 +6,7 @@
 //! atomically; an entry that does not read back is translated again.
 //!
 //! The entry is our own encoding of [`HostShader`]: a field added to it
-//! must be added to [`encode`] and [`decode`] too (entries of older builds
+//! must be added to `encode` and `decode` too (entries of older builds
 //! are ignored anyway).
 
 use std::path::PathBuf;

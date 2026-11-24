@@ -127,7 +127,19 @@ fn f32_to_half(v: f32) -> u16 {
         return sign | 0x7c00; // too large: infinity
     }
     if exp <= 0 {
-        return sign; // too small: zero
+        if exp < -10 {
+            return sign; // below half the smallest subnormal: zero
+        }
+        // Half subnormals are `m * 2^-24`. An f32 in this range is still
+        // normal (exponent field >= 1), so its significand has the implicit
+        // leading 1; shift it into the half mantissa, rounding to even.
+        let sig = (1u32 << 23) | man;
+        let shift = (14 - exp) as u32;
+        let halfway = 1u32 << (shift - 1);
+        let q = sig >> shift;
+        let r = sig & ((1u32 << shift) - 1);
+        let m = q + u32::from(r > halfway || (r == halfway && (q & 1) != 0));
+        return sign | m as u16;
     }
     // Rounded to nearest: a carry out of the mantissa is added into the
     // exponent (`2 - 2^-12` is 2.0); at most it reaches infinity, 0x7c00.
@@ -198,5 +210,22 @@ mod tests {
         expand_rects(&src, &mut dst, 8, &[(0, 16), (4, 2), (8, 28)]);
         assert_eq!(dst[..40], [&src[..], &src[..8], &src[16..]].concat()[..]);
         assert_eq!(dst[40..], vertex(4.0, 6.0)[..]);
+    }
+
+    /// `half_to_f32` reads subnormals, so an f16 rectangle output must be
+    /// able to write them back instead of flushing every one to zero.
+    #[test]
+    fn half_subnormals_convert_in_both_directions() {
+        assert_eq!(f32_to_half(2f32.powi(-24)), 0x0001);
+        assert_eq!(f32_to_half(-2f32.powi(-24)), 0x8001);
+        assert_eq!(f32_to_half(2f32.powi(-23)), 0x0002);
+        assert_eq!(f32_to_half(1023.0 * 2f32.powi(-24)), 0x03ff);
+        // Ties go to an even mantissa: 0/1 and 1/2.
+        assert_eq!(f32_to_half(2f32.powi(-25)), 0x0000);
+        assert_eq!(f32_to_half(3.0 * 2f32.powi(-25)), 0x0002);
+        // Below half the smallest subnormal, and normal values, are unchanged.
+        assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
+        assert_eq!(f32_to_half(1.5), 0x3e00);
+        assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
     }
 }

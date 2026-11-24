@@ -336,7 +336,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
-        87..=93 => {
+        // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
+        87 | 88 | 90..=93 => {
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
@@ -345,7 +346,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             }
             return Some(out);
         }
-        23..=25 => (4, Box::new(move |b| {
+        23..=25 | 89 => (4, Box::new(move |b| {
             let v = u32_at(b, 0);
             [(v & 0x3ff) as f32, (v >> 10 & 0x3ff) as f32, (v >> 20 & 0x3ff) as f32]
         })),
@@ -353,7 +354,8 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             let v = u32_at(b, 0);
             [small_float(v & 0x7ff, 6), small_float(v >> 11 & 0x7ff, 6), small_float(v >> 22, 5)]
         })),
-        9..=11 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
+        9..=10 => (8, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), half(u16_at(b, 2))])),
+        11..=14 => (8, Box::new(move |b| [0, 1, 2].map(|i| f32::from(u16_at(b, i))))),
         33..=34 => (4, Box::new(move |b| [half(u16_at(b, 0)), half(u16_at(b, 1)), 0.0])),
         1..=2 => (16, Box::new(move |b| {
             [0, 1, 2].map(|i| f32::from_bits(u32_at(b, i)))
@@ -521,5 +523,19 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+    }
+
+    /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,
+    /// not B8G8R8A8.
+    #[test]
+    fn unorm16_and_xr_bias_targets_decode_as_their_formats() {
+        // Red 0x8000 (a half-float -0), green 0x4000, blue 0.
+        let unorm16 = [0x00, 0x80, 0x00, 0x40, 0, 0, 0xff, 0xff];
+        assert_eq!(super::to_rgba(11, 1, 1, 8, &unorm16), Some(vec![255, 127, 0, 255]));
+        // Red 0x3ff, green 0x1ff, blue 0, alpha 3.
+        let xr = (0x3ffu32 | 0x1ff << 10 | 3 << 30).to_le_bytes();
+        assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
+        // B8G8R8A8 still swaps to RGBA.
+        assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
     }
 }

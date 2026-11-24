@@ -319,6 +319,15 @@ impl ComputeIo {
         (ids, take(10))
     }
 
+    /// SGPRs the hardware initializes: the user SGPRs, the enabled system
+    /// ones, then the scratch wave offset when scratch is enabled (bit 0).
+    /// The ones above hold whatever the previous wave left.
+    pub fn initialized_sgprs(&self) -> u8 {
+        let (ids, info) = self.system_sgprs();
+        let end = ids.into_iter().chain([info]).flatten().map(|s| s + 1).max();
+        end.unwrap_or(0).max(self.user_sgprs()) + (self.rsrc2 & 1) as u8
+    }
+
     /// Thread id components in v0, v1, v2 (1 to 3).
     pub fn thread_id_vgprs(&self) -> u8 {
         (self.rsrc2 >> 11 & 3) as u8 + 1
@@ -946,6 +955,28 @@ mod tests {
         };
         assert_eq!(cs.system_sgprs(), ([Some(6), Some(7), Some(8)], None));
         assert_eq!((cs.thread_id_vgprs(), cs.lds_bytes()), (3, 0));
+    }
+
+    #[test]
+    fn initialized_sgprs_covers_user_system_and_scratch() {
+        // 5 user SGPRs, group ids x and y (s5, s6), no scratch: s0..=s6.
+        let cs = ComputeIo {
+            rsrc2: 0x1098A,
+            threads: [16, 16, 1],
+        };
+        assert_eq!(cs.initialized_sgprs(), 7);
+        // All three group ids after 6 user SGPRs, plus the info SGPR: s0..=s9.
+        let cs = ComputeIo {
+            rsrc2: 0x78C,
+            threads: [8, 8, 1],
+        };
+        assert_eq!(cs.initialized_sgprs(), 10);
+        // The same with scratch enabled adds the wave offset: s0..=s10.
+        let cs = ComputeIo {
+            rsrc2: 0x78D,
+            threads: [8, 8, 1],
+        };
+        assert_eq!(cs.initialized_sgprs(), 11);
     }
 
     #[test]

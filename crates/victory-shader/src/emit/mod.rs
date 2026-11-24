@@ -246,6 +246,13 @@ pub fn emit(
             _ => 0,
         };
     }
+    // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
+    // wants the position centroid (or per sample), as DXC declares it then.
+    if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
+        for e in inputs.iter_mut().filter(|e| e.kind == 3) {
+            e.interp = 5;
+        }
+    }
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.
@@ -416,6 +423,68 @@ mod tests {
     use super::*;
     use crate::native::{ComputeIo, StageIo};
 
+    /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
+    /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
+    /// output signature has SV_StencilRef, and the feature bit
+    /// D3D_SHADER_FEATURE_STENCIL_REF (0x200) in SFI0; the validator checks
+    /// both against the module.
+    #[test]
+    fn a_stencil_export_declares_the_stencil_ref_feature() {
+        let words = [
+            0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+            0x7E02_0285,    // v_mov_b32 v1, 5
+            0xF800_1883,
+            0x0000_0100, // exp mrtz v0, v1, off, off done vm
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 2,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let el = |name: &str, kind, comp| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp: 0,
+            row: None,
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let osg1 =
+            container::signature(&[el("SV_Depth", 17, 9), el("SV_StencilRef", 20, 5)], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+        // dxil.dll, where there is one, checks the flags against the module.
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+        let host = Container::parse(&out.dxil).unwrap();
+        let sfi0 = host.part(FourCC::SFI0).unwrap().data;
+        let features = u64::from_le_bytes(sfi0.try_into().unwrap());
+        assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
     /// A wave64 compute program that writes only EXEC's high dword
     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask is
     /// opaque and keyed by the unchanged low dword, so building its lane bit
@@ -452,6 +521,7 @@ mod tests {
     }
 
     /// A pixel shader writing a constant colour.
+    #[cfg(windows)]
     fn constant_color() -> Vec<u8> {
         let mut s = Shader::new(true);
         s.outputs.push(SigElement {
@@ -543,6 +613,83 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
+    /// barycentrics, `SPI_PS_INPUT_ADDR` bit 0) runs at sample frequency:
+    /// DXC's PSV0 says so in PSInfo.SampleFrequency (runtime info byte 1)
+    /// whenever an input is interpolated per sample.
+    #[test]
+    fn sample_interpolated_inputs_set_psv_sample_frequency() {
+        let words = [
+            0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000,
+        ];
+        let psv_of = |input_addr: u32| {
+            let native = super::NativeProgram {
+                stage: super::HwStage::Ps,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: crate::native::StageIo::Ps {
+                    inputs: vec![crate::native::PsInput {
+                        usage: crate::native::Usage::Generic,
+                        row: 0,
+                        mask: 0b1111,
+                        attr: 0,
+                        flat: false,
+                        fp16: false,
+                        pack2: false,
+                        row2: 0,
+                    }],
+                    input_addr,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let el = |name: &str, kind, usage| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage,
+                half: false,
+            };
+            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
+            let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
+            let bytes =
+                crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+            let c = super::Container::parse(&bytes).unwrap();
+            let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res =
+                crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            // dxil.dll, where there is one, checks PSV0 against the module.
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+            let host = super::Container::parse(&out.dxil).unwrap();
+            host.part(super::FourCC::PSV0).unwrap().data.to_vec()
+        };
+        // Runtime info starts after its size; PSInfo is {DepthOutput, SampleFrequency}.
+        let center = psv_of(1 << 1);
+        assert_eq!(center[4 + 1], 0, "center interpolation is per pixel");
+        let sample = psv_of(1 << 0);
+        assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
     }
 
     /// A pixel shader reading channel z of an input whose element starts at

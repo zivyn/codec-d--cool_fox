@@ -140,7 +140,7 @@ fn elements(text: &str) -> Vec<(String, String)> {
         } else if rest.starts_with("<![CDATA[") {
             rest.find("]]>").map(|e| e + 3)
         } else {
-            rest.find('>').map(|e| e + 1)
+            tag_end(rest)
         };
         let Some(end) = end else { break };
         let tag = &rest[1..end - 1];
@@ -171,6 +171,21 @@ fn elements(text: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Where the tag that starts `text` ends, past its `>`; a `>` in a quoted
+/// attribute value is part of the value (XML allows it there unescaped).
+fn tag_end(text: &str) -> Option<usize> {
+    let mut quote = None;
+    for (at, c) in text.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if c == open => quote = None,
+            (None, '>') => return Some(at + 1),
+            _ => {}
+        }
+    }
+    None
 }
 
 static TITLE: Mutex<Option<Title>> = Mutex::new(None);
@@ -222,6 +237,15 @@ pub fn use_console_timers() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quoted_angle_bracket_does_not_end_its_tag() {
+        let text = "<Game><ShellVisuals DefaultDisplayName=\"A > B\" Description='x>y'/>\
+                    <TitleId>639AA8DD</TitleId>\
+                    <PersistentLocalStorage><SizeMB>64</SizeMB></PersistentLocalStorage></Game>";
+        let t = Title::from_manifest(text);
+        assert_eq!((t.id, t.storage_bytes), (0x639A_A8DD, 64 << 20));
+    }
 
     #[test]
     fn reads_title_id_store_id_and_storage_quota() {

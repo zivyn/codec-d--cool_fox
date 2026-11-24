@@ -1626,6 +1626,153 @@ mod barycentric_tests {
         validate(&shader);
     }
 
+    #[test]
+    fn a_standalone_first_half_reads_the_vertices() {
+        let shader = first_half_pixel(false);
+        let (_, inputs) = parts(&shader);
+        assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    #[test]
+    fn a_first_half_read_beside_its_pair_keeps_its_partial_value() {
+        let shader = first_half_pixel(true);
+        assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    fn first_half_pixel(paired: bool) -> HostShader {
+        let [e0, e1] = exp_mrt0(2);
+        let mut words = vec![0xC808_0000]; // v_interp_p1_f32 v2, v0, attr0.x
+        if paired {
+            words.extend([
+                0x7E06_0302, // v_mov_b32 v3, v2 (keep the partial value)
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                v_add_f32(2, 2, 3),
+            ]);
+        }
+        words.extend([e0, e1, 0xBF81_0000]);
+        pixel(&words, PERSP_CENTER).unwrap()
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn first_half_values_render_on_hardware_and_warp() {
+        use super::bitcode::{Attr, Term};
+        use super::host::{Draw, Host};
+        use super::shader::Shader;
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Pass POSITION and TEXCOORD through, with TEXCOORD in the same
+        // output row as the translated pixel shader's input signature.
+        let mut s = Shader::new(false);
+        s.inputs = vec![element("POSITION", 0, 0), element("TEXCOORD", 0, 1)];
+        for e in &mut s.inputs {
+            e.usage = 15;
+        }
+        s.outputs = vec![element("TEXCOORD", 0, 0), element("SV_Position", 3, 1)];
+        for (i, e) in s.outputs.iter_mut().enumerate() {
+            e.usage = 15;
+            e.interp = if i == 1 { 4 } else { 2 };
+        }
+        for row in 0..2 {
+            for col in 0..4 {
+                let args = [s.m.i32(row), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+                let v = s.op(s.entry, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+                let args = [s.m.i32(1 - row), s.m.i32(0), s.m.i8(col), v];
+                s.op(
+                    s.entry,
+                    "storeOutput.f32",
+                    Attr::NoUnwind,
+                    s.t.void,
+                    5,
+                    &args,
+                );
+            }
+        }
+        s.m.terminate(s.entry, Term::Ret);
+        let vs = HostShader {
+            stage: HwStage::Vs,
+            dxil: s.finish(),
+            user_data: Vec::new(),
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: Vec::new(),
+            root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
+            root_indexed_views: Vec::new(),
+        };
+        validate(&vs);
+        // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
+        let vertices = [
+            -1.0, 1.0, 0.5, 1.0, 2.0, 0.0, 0.0, 0.0, -1.0, -3.0, 0.5, 1.0, 6.0, 0.0, 0.0, 0.0, 3.0,
+            1.0, 0.5, 1.0, 10.0, 0.0, 0.0, 0.0,
+        ];
+        let mut ran = 0;
+        for (backend, warp) in [("hardware", false), ("WARP", true)] {
+            let Ok(host) = Host::new(warp) else { continue };
+            let mut options =
+                windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+            // SAFETY: a correctly sized output for the feature query.
+            unsafe {
+                host.device
+                    .CheckFeatureSupport(
+                        windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS3,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .unwrap();
+            }
+            if !options.BarycentricsSupported.as_bool() {
+                eprintln!("no barycentrics on {backend}; skipped");
+                continue;
+            }
+            for paired in [false, true] {
+                let ps = first_half_pixel(paired);
+                validate(&ps);
+                let (root, pso) = host.pipeline(&vs, &ps).expect("interpolation pipeline");
+                let out = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: Vec::new(),
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &vertices,
+                            stride: 32,
+                            size: (8, 8),
+                            mesh_groups: 0,
+                        },
+                    )
+                    .expect("draw partial interpolation");
+                for (n, texel) in out.iter().enumerate() {
+                    let i = (n / 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let j = (n % 8) as f32 / 16.0 + 0.5 / 16.0;
+                    let partial = 2.0 + i * 4.0;
+                    let want = if paired {
+                        partial + 2.0 + i * 4.0 + j * 8.0
+                    } else {
+                        partial
+                    };
+                    for &got in texel {
+                        assert!(
+                            (got - want).abs() < 1e-5,
+                            "{backend} paired={paired} pixel={n}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+            ran += 1;
+            eprintln!("partial interpolation renders correctly on {backend}");
+        }
+        if ran == 0 {
+            eprintln!("no SM 6.6 host with barycentrics; GPU checks skipped");
+        }
+    }
+
     /// Both: the attribute is interpolated and J is used as a value.
     #[test]
     fn interpolation_and_a_barycentric_value_together() {

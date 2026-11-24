@@ -80,10 +80,10 @@ impl Config {
     ) -> Result<Self> {
         let env_path = |k: &str| env(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         let test_titles = match env("VICTORY_TEST_TITLES") {
-            Some(v) => std::env::split_paths(&v)
+            Some(v) if !v.is_empty() => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect(),
-            None => file.test_titles,
+            _ => file.test_titles,
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
             .or(file.cache_dir)
@@ -163,6 +163,29 @@ mod tests {
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
+    }
+
+    #[test]
+    fn empty_test_titles_env_is_ignored() {
+        let file = FilePaths {
+            test_titles: vec!["from-file".into()],
+            ..Default::default()
+        };
+        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
+    }
+
+    #[test]
+    fn test_titles_env_splits_paths() {
+        let value = std::env::join_paths(["first", "second"]).unwrap();
+        let file = FilePaths::default();
+        let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(
+            cfg.test_titles,
+            vec![PathBuf::from("first"), PathBuf::from("second")]
+        );
     }
 
     #[test]

@@ -54,13 +54,18 @@ pub enum Source {
     /// Chosen by control flow: one source per predecessor of `block`, in
     /// [`crate::ir::Block::preds`] order.
     Phi { block: usize, args: Vec<Source> },
+    /// Chosen by SCC (`scc`, the value an `s_cselect` or `s_cmov` of each
+    /// dword reads): the source when it is set, then when it is clear.
+    Select { scc: Value, args: Vec<Source> },
 }
 
 impl Source {
     /// The sources this one picks from (itself unless a phi).
     pub fn leaves(&self) -> Vec<&Source> {
         match self {
-            Source::Phi { args, .. } => args.iter().flat_map(Source::leaves).collect(),
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().flat_map(Source::leaves).collect()
+            }
             s => vec![s],
         }
     }
@@ -644,6 +649,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.phi(words, joins)? {
             return Ok(source);
         }
+        if let Some(source) = self.select(words, joins)? {
+            return Ok(source);
+        }
         if let Some(consts) = words
             .iter()
             .map(|w| match *w {
@@ -726,6 +734,96 @@ impl<'a> Tracer<'a> {
             .collect::<Result<_, _>>();
         joins.pop();
         Ok(Some(Source::Phi { block, args: args? }))
+    }
+
+    /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
+    /// per outcome (other words are the same for both).
+    fn select(
+        &self,
+        words: &[Term],
+        joins: &mut Vec<usize>,
+    ) -> Result<Option<Source>, &'static str> {
+        let picks: Vec<_> = words
+            .iter()
+            .map(|w| match *w {
+                Term::Value(v) => self.picked(v),
+                Term::Const(_) => None,
+            })
+            .collect();
+        let Some(scc) = picks.iter().flatten().map(|p| p.0).next() else {
+            return Ok(None);
+        };
+        if picks.iter().flatten().any(|p| p.0 != scc) {
+            return Err("a descriptor chosen by several conditions");
+        }
+        // Each level doubles the sources; selects count like joins (a
+        // marker no block index reaches).
+        if joins.len() >= MAX_JOINS {
+            return Err("a descriptor joined too often");
+        }
+        joins.push(usize::MAX);
+        let side = |set: bool| -> Vec<Term> {
+            words
+                .iter()
+                .zip(&picks)
+                .map(|(w, p)| match p {
+                    Some((_, t, f)) => {
+                        if set {
+                            *t
+                        } else {
+                            *f
+                        }
+                    }
+                    None => *w,
+                })
+                .collect()
+        };
+        let args = [true, false]
+            .into_iter()
+            .map(|set| self.classify(&side(set), joins))
+            .collect::<Result<_, _>>();
+        joins.pop();
+        Ok(Some(Source::Select { scc, args: args? }))
+    }
+
+    /// For `v` written by `s_cselect_b32`/`_b64` or `s_cmov_b32`/`_b64`:
+    /// the SCC it reads and the dword it is when SCC is set, then clear.
+    fn picked(&self, v: Value) -> Option<(Value, Term, Term)> {
+        let inst = self.def(v)?;
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            return None;
+        };
+        let k = inst.writes.iter().position(|w| w.1 == v)? as u8;
+        let wide = match inst.name() {
+            "s_cselect_b32" | "s_cmov_b32" => false,
+            "s_cselect_b64" | "s_cmov_b64" => true,
+            _ => return None,
+        };
+        // A dword of a 32- or 64-bit operand: 64-bit inline integers are
+        // sign-extended; 64-bit literals and float constants are not
+        // followed.
+        let dword = |op: &Operand| match *op {
+            Operand::Scalar { code: NULL, .. } => Some(Term::Const(0)),
+            Operand::Scalar { code, .. } => Some(self.origin(inst.read(Reg::S(code + k))?)),
+            Operand::Const(c) if !wide => inline(c).map(Term::Const),
+            Operand::Const(c @ 128..=208) => {
+                let low = inline(c)?;
+                Some(Term::Const(if k == 0 {
+                    low
+                } else {
+                    ((low as i32) >> 31) as u32
+                }))
+            }
+            Operand::Literal(x) if !wide => Some(Term::Const(x)),
+            _ => None,
+        };
+        let set = dword(src.first()?)?;
+        let clear = if inst.name().starts_with("s_cmov") {
+            dword(dst.as_ref()?)?
+        } else {
+            dword(src.get(1)?)?
+        };
+        Some((inst.read(Reg::Scc)?, set, clear))
     }
 
     /// `v` as some other dword with constant bits set.
@@ -1094,6 +1192,81 @@ mod tests {
         assert!(
             offsets.contains(&0) && offsets.contains(&0x10),
             "{offsets:?}"
+        );
+    }
+
+    #[test]
+    fn descriptors_selected_by_scc_are_traced_per_outcome() {
+        // Two buffer descriptors loaded from the table at s9 and one
+        // picked with s_cselect_b64 per half, as the compiler makes a
+        // conditional choice of resources without a branch.
+        let r = track_words(
+            &[
+                0xBE8C_0309, // s_mov_b32 s12, s9
+                0xBE8D_0380, // s_mov_b32 s13, 0
+                0xF408_0006,
+                0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+                0xF408_0106,
+                0xFA00_0010, // s_load_dwordx4 s[4:7], s[12:13], 0x10
+                0xBF06_800E, // s_cmp_eq_u32 s14, 0
+                0x8588_0400, // s_cselect_b64 s[8:9], s[0:1], s[4:5]
+                0x858A_0602, // s_cselect_b64 s[10:11], s[2:3], s[6:7]
+                0xF420_0404,
+                0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+        let Source::Select { args, .. } = &r.descriptors[0].source else {
+            panic!("{:?}", r.descriptors)
+        };
+        // SCC set picks the first operand.
+        assert_eq!(
+            args[..],
+            [
+                Source::Loaded {
+                    load: (0, 2),
+                    first: 0
+                },
+                Source::Loaded {
+                    load: (0, 3),
+                    first: 0
+                },
+            ]
+        );
+        assert_eq!(r.scalar, [((0, 2), at(0, 0)), ((0, 3), at(0, 0x10))]);
+    }
+
+    #[test]
+    fn a_selection_that_mixes_two_descriptors_fails() {
+        // The high half picked from the first load whatever SCC is: when
+        // clear, the descriptor is half of one load and half of the other.
+        let code: Vec<u8> = [
+            0xBE8C_0309, // s_mov_b32 s12, s9
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0006,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[12:13], null
+            0xF408_0106,
+            0xFA00_0010, // s_load_dwordx4 s[4:7], s[12:13], 0x10
+            0xBF06_800E, // s_cmp_eq_u32 s14, 0
+            0x8588_0400, // s_cselect_b64 s[8:9], s[0:1], s[4:5]
+            0x858A_0202, // s_cselect_b64 s[10:11], s[2:3], s[2:3]
+            0xF420_0404,
+            0xFA00_0000, // s_buffer_load_dword s16, s[8:11], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let err = track(&p, &[param(Table, 9, 1)], HwStage::Ps).unwrap_err();
+        assert_eq!(
+            err,
+            ShaderError::Unsupported {
+                offset: 36,
+                what: "a descriptor changed after loading"
+            }
         );
     }
 

@@ -941,7 +941,8 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
 /// Runs `fill` on the destination's first `len` bytes; `fill` returns how
 /// many it produced. GPU-visible destinations are host memory like the
 /// rest (GPU address = CPU address), so an address is written in place;
-/// physical pages go through a buffer.
+/// physical pages are too when they are consecutive pages of one
+/// allocation, and otherwise go through a buffer.
 fn into_destination(
     request: &Request,
     len: usize,
@@ -956,12 +957,22 @@ fn into_destination(
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         return fill(out).map(drop);
     }
+    let offset = (request.page_offset & 0xffff) as usize;
+    // SAFETY: the title passes a page number per 64 KiB of destination,
+    // which holds at least `len` bytes from `offset`.
+    let pages = unsafe {
+        std::slice::from_raw_parts(
+            request.destination.cast::<usize>(),
+            (offset + len).div_ceil(PAGE),
+        )
+    };
+    // Consecutive pages of one allocation (the usual case): written in
+    // place through one view.
+    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        return fill(window.bytes()).map(drop);
+    }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
-    let offset = (request.page_offset & 0xffff) as usize;
-    let pages = (offset + n).div_ceil(PAGE);
-    // SAFETY: the title passes a page number per 64 KiB of destination.
-    let pages = unsafe { std::slice::from_raw_parts(request.destination.cast::<usize>(), pages) };
     if super::xmem::write_physical(pages, offset, &data[..n]) {
         Ok(())
     } else {
@@ -1472,5 +1483,63 @@ mod tests {
         // SAFETY: both pages are mapped read-write.
         let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>().add(PAGE - 40), 100) };
         assert_eq!(seen, plain);
+    }
+    #[test]
+    fn zlib_into_pages_in_place_and_across_allocations() {
+        use crate::modules::xmem;
+        let allocate = |n: usize| {
+            let (mut pages, mut given) = (vec![0usize; n], n);
+            assert_eq!(
+                xmem::XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),
+                1
+            );
+            pages
+        };
+        let (a, b) = (allocate(3), allocate(1));
+        let plain = pattern(2 * PAGE + 100);
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        // One allocation's pages in order (one window), then pages of two
+        // (through a buffer), both from 50 bytes into the first.
+        let mut destinations = [a.clone(), vec![a[0], a[1], b[0]]];
+        let (queue, array) = (new_queue(1), status_array(1));
+        for pages in &mut destinations {
+            let mut r = request(
+                ZLIB | PAGE_DESTINATION | MEMORY_SOURCE,
+                pages.as_mut_ptr().cast(),
+                plain.len(),
+                packed.as_ptr().cast(),
+                0,
+                packed.len(),
+            );
+            r.page_offset = 50;
+            enqueue(queue, &r);
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        for pages in &destinations {
+            let mapped = xmem::XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                0x2000 | 0x2040_0000, // reserve, 64 KiB pages
+                0,
+                0x04,
+            );
+            assert!(!mapped.is_null());
+            assert_eq!(
+                xmem::XMemMapPhysicalPages(mapped, 3, pages.as_ptr()),
+                mapped
+            );
+            // SAFETY: all three pages are mapped read-write.
+            let seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 3 * PAGE) };
+            assert!(seen[..50].iter().all(|&b| b == 0));
+            assert_eq!(seen[50..50 + plain.len()], plain);
+            assert_eq!(
+                xmem::XMemMapPhysicalPages(mapped, 3, std::ptr::null()),
+                mapped
+            );
+        }
+        assert_eq!(xmem::XMemFreePhysicalPages(3, a.as_ptr()), 1);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 }

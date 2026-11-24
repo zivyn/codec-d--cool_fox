@@ -166,6 +166,11 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    // One test at a time: with these tests on the hardware adapter and WARP
+    // from several test threads at once, now and then none of their
+    // dispatches ever completes and the test binary hangs.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {

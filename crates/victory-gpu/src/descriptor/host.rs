@@ -234,6 +234,12 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
+    /// The title slots this heap has host slots for; fewer than the title's
+    /// when the host caps its size.
+    pub(crate) fn count(&self) -> u32 {
+        self.count
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -305,6 +311,17 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
+            // Diagnostic (NVIDIA heap cap): the highest title slot past the
+            // host heap seen so far.
+            static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+                tracing::warn!(
+                    index,
+                    count = self.count,
+                    for_draw,
+                    "title slot past the host heap"
+                );
+            }
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
@@ -810,6 +827,9 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
+/// shortcut: slots with no view at all (kind unknown) get this null 2D
+/// view; null buffer views there did not stop the world's low-address
+/// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {

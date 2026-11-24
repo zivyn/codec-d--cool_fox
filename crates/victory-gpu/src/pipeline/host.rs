@@ -169,6 +169,34 @@ impl GraphicsState {
         }
     }
 
+    /// Everything the state holds, as text: part of a pipeline's name in
+    /// the library and of the key a title pipeline is started early by.
+    pub(crate) fn describe(&self) -> String {
+        let inputs: Vec<String> = self
+            .inputs
+            .iter()
+            .zip(&self.names)
+            .map(|(e, name)| {
+                format!(
+                    "{name:?} {} {} {} {} {} {}",
+                    e.SemanticIndex, e.Format.0, e.InputSlot, e.AlignedByteOffset, e.InputSlotClass.0, e.InstanceDataStepRate
+                )
+            })
+            .collect();
+        format!(
+            "{:?} {} {:?} {:?} {inputs:?} {} {} {:?} {} {:?}",
+            self.blend,
+            self.sample_mask,
+            self.rasterizer,
+            self.depth,
+            self.strip_cut.0,
+            self.topology.0,
+            self.targets,
+            self.depth_format.0,
+            self.samples
+        )
+    }
+
     /// The vertex buffer slots the input layout reads.
     fn slots(&self) -> u32 {
         self.inputs
@@ -373,7 +401,7 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let root = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -396,8 +424,15 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            // SAFETY: the description points at live data.
-            let pso = match unsafe { host.device.CreateComputePipelineState(&desc) } {
+            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let made = super::library::pipeline(
+                &name,
+                // SAFETY: the description points at live data.
+                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+                // SAFETY: as above.
+                || unsafe { host.device.CreateComputePipelineState(&desc) },
+            );
+            let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
@@ -421,8 +456,15 @@ impl HostPipeline {
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
         };
+        let state = g.describe();
         if mesh.is_some() {
-            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g) {
+            let name = super::library::name(
+                "mesh",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+                &state,
+            );
+            let pso = match mesh_pipeline(&host.device, &root, code(0), code(1), g, &name) {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
@@ -470,8 +512,20 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        // SAFETY: the description points at live data.
-        let pso = match unsafe { host.device.CreateGraphicsPipelineState(&desc) } {
+        let name = super::library::name(
+            "graphics",
+            &root_blob,
+            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
+            &state,
+        );
+        let made = super::library::pipeline(
+            &name,
+            // SAFETY: the description points at live data.
+            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+            // SAFETY: as above.
+            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+        );
+        let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
@@ -511,6 +565,7 @@ fn mesh_pipeline(
     ms: D3D12_SHADER_BYTECODE,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
+    name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
     use windows::core::Interface;
     /// A stream subobject: its type, then its description, pointer-aligned.
@@ -545,8 +600,23 @@ fn mesh_pipeline(
         SizeInBytes: size_of::<Stream>(),
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
     };
-    // SAFETY: the stream holds whole subobjects pointing at live data.
-    unsafe { device.cast::<ID3D12Device2>()?.CreatePipelineState(&desc) }
+    let device = device.cast::<ID3D12Device2>()?;
+    super::library::pipeline(
+        name,
+        // SAFETY: the stream holds whole subobjects pointing at live data.
+        |library, name| unsafe { library.LoadPipeline(name, &desc) },
+        // SAFETY: as above.
+        || unsafe { device.CreatePipelineState(&desc) },
+    )
+}
+
+/// The bytes of shader code (none for an absent stage).
+fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
+    if code.pShaderBytecode.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: a translation's own bytes, alive while its shader is.
+    unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
 fn root_signature(
@@ -554,7 +624,7 @@ fn root_signature(
     params: &[D3D12_ROOT_PARAMETER1],
     samplers: &[D3D12_STATIC_SAMPLER_DESC],
     compute: bool,
-) -> windows::core::Result<ID3D12RootSignature> {
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -592,6 +662,6 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        device.CreateRootSignature(0, bytes)
+        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
 }

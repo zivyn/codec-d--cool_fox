@@ -115,7 +115,8 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
-fn dropped() {
+fn dropped(pipeline: usize) {
+    crate::pipeline::note_drop(pipeline as This);
     if let Some(last) = FRAME.lock().unwrap_or_else(|e| e.into_inner()).last_mut() {
         last.push_str(" DROPPED");
     }
@@ -494,6 +495,8 @@ impl State {
                 "a dispatch without a host pipeline dropped"
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_drop(self.pipeline as This);
             return;
         };
         if !p.compute {
@@ -565,7 +568,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped();
+            dropped(self.pipeline);
         }
     }
 
@@ -612,6 +615,27 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        // Tables reaching past a host heap smaller than the title's (the
+        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
+        // title's slots there have no host slot of their own.
+        for u in used.iter().filter(tables) {
+            if fresh.contains(&u.slot) {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let end = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(table) else {
+                continue;
+            };
+            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+                continue;
+            };
+            if index >= host.count() {
+                fresh.push(u.slot);
+            }
+        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -797,7 +821,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped();
+            dropped(self.pipeline);
         }
     }
 
@@ -884,7 +908,7 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped();
+            dropped(self.pipeline);
         }
     }
 }
@@ -907,14 +931,22 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        #[cfg(feature = "diagnostics")]
+        let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+        #[cfg(not(feature = "diagnostics"))]
+        let why = |_: &str| {};
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
+            why("arguments outside title buffers");
             return false;
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
-                None => return false,
+                None => {
+                    why("count outside title buffers");
+                    return false;
+                }
             },
             None => None,
         };
@@ -922,6 +954,7 @@ impl State {
             .then(|| host_signature(kind, stride))
             .flatten()
         else {
+            why("no host signature");
             return false;
         };
         args.refresh(list, arguments, len);
@@ -930,6 +963,7 @@ impl State {
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+            why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
         self.host_pipeline = 0;
@@ -948,6 +982,11 @@ impl State {
         };
         if !ran {
             crate::indirect::done(list, &args.buffer);
+            #[cfg(feature = "diagnostics")]
+            match crate::pipeline::host_pipeline(self.pipeline as This) {
+                None => crate::pipeline::note_drop(self.pipeline as This),
+                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]

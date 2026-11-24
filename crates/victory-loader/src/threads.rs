@@ -6,9 +6,9 @@
 //! callbacks, then a DLL's `DllMain`.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{DLL_PROCESS_DETACH, LoadedImage};
 
@@ -99,20 +99,35 @@ extern "C" fn detach_all() {
         "process exit: ending other threads, detaching title images"
     );
     EXITING.store(true, Ordering::SeqCst);
-    end_other_threads();
     // As on Windows, a lock a thread held when it ended stays taken; detach
-    // code that waits for one would hang the exit.
-    std::thread::spawn(|| {
+    // code that waits for one would hang the exit. The watchdog runs before
+    // the other threads end: a thread that ends can hold the heap lock or
+    // the loader lock, and a new thread needs both to start. After the
+    // deadline it only ends the process; it does not log, because logging
+    // needs the heap and the log writer's lock.
+    // Its thread id, set when it runs its own code; 0 until then.
+    static WATCHDOG: AtomicU32 = AtomicU32::new(0);
+    drop(std::thread::spawn(|| {
+        // SAFETY: a plain query of the calling thread.
+        let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        WATCHDOG.store(id, Ordering::SeqCst);
         std::thread::sleep(DETACH_DEADLINE);
-        tracing::warn!("process exit: title images did not detach in time; ending");
-        // SAFETY: ends this process, which is exiting anyway.
-        unsafe {
-            windows_sys::Win32::System::Threading::TerminateProcess(
-                windows_sys::Win32::System::Threading::GetCurrentProcess(),
-                1,
-            )
-        };
-    });
+        end_process();
+    }));
+    // Its start (loader notices, Rust's thread set-up) is done only when
+    // it runs its own code. The loader notices need the loader lock. This
+    // thread can hold it, or a thread that waits for this thread can hold
+    // it. Then the watchdog does not start, so this wait has the same
+    // deadline.
+    let waiting = Instant::now();
+    let watchdog = loop {
+        match WATCHDOG.load(Ordering::SeqCst) {
+            0 if waiting.elapsed() >= DETACH_DEADLINE => end_process(),
+            0 => std::thread::yield_now(),
+            id => break id,
+        }
+    };
+    end_other_threads(&[watchdog]);
     for image in dlls.iter().chain(&exes) {
         // SAFETY: attached images are bound. A non-null third argument
         // tells the entry points the process is ending.
@@ -126,11 +141,24 @@ extern "C" fn detach_all() {
     }
 }
 
-/// Ends every thread of the process but this one (and the ones started
-/// while doing so), as `ExitProcess` does first; except the system's
-/// thread-pool workers, which `TerminateThread` refuses (the process fails
-/// fast) and which run no title code (no title image uses that pool).
-fn end_other_threads() {
+/// Ends this process when the title images do not detach in time. It does
+/// not use the heap or any lock: a thread that ended can hold them.
+fn end_process() {
+    // SAFETY: ends this process, which is exiting anyway.
+    unsafe {
+        windows_sys::Win32::System::Threading::TerminateProcess(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            1,
+        )
+    };
+}
+
+/// Ends every thread of the process but this one and those in `keep` (and
+/// the ones started while doing so), as `ExitProcess` does first; except
+/// the system's thread-pool workers, which `TerminateThread` refuses (the
+/// process fails fast) and which run no title code (no title image uses
+/// that pool).
+fn end_other_threads(keep: &[u32]) {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -156,7 +184,10 @@ fn end_other_threads() {
             let mut ids = Vec::new();
             let mut more = Thread32First(snapshot, &mut entry) != 0;
             while more {
-                if entry.th32OwnerProcessID == process && entry.th32ThreadID != me {
+                if entry.th32OwnerProcessID == process
+                    && entry.th32ThreadID != me
+                    && !keep.contains(&entry.th32ThreadID)
+                {
                     ids.push(entry.th32ThreadID);
                 }
                 more = Thread32Next(snapshot, &mut entry) != 0;
@@ -338,32 +369,57 @@ fn starts_in(thread: windows_sys::Win32::Foundation::HANDLE, module: &std::ffi::
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::time::Duration;
 
-    /// In a child process of the next test: ends the other threads and
-    /// checks that a busy one stopped.
+    /// A thread that counts in `ticks` until it ends; returns its thread id
+    /// when it has counted once.
+    fn busy(ticks: &'static AtomicU64) -> u32 {
+        static ID: AtomicU32 = AtomicU32::new(0);
+        ID.store(0, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            // SAFETY: a plain query of the calling thread.
+            let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+            ID.store(id, Ordering::SeqCst);
+            loop {
+                ticks.fetch_add(1, Ordering::SeqCst);
+                std::thread::yield_now();
+            }
+        });
+        while ticks.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        ID.load(Ordering::SeqCst)
+    }
+
+    /// Whether `ticks` stays the same for a short time.
+    fn stopped(ticks: &AtomicU64) -> bool {
+        let at = ticks.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(50));
+        ticks.load(Ordering::SeqCst) == at
+    }
+
+    /// In a child process of the next test: ends the other threads but one
+    /// kept thread, and checks that a busy thread stopped and the kept one
+    /// did not.
     #[test]
     fn exit_child() {
         if std::env::var_os("VICTORY_EXIT_CHILD").is_none() {
             return;
         }
-        static TICKS: AtomicU64 = AtomicU64::new(0);
-        std::thread::spawn(|| {
-            loop {
-                TICKS.fetch_add(1, Ordering::SeqCst);
-                std::thread::yield_now();
-            }
-        });
-        while TICKS.load(Ordering::SeqCst) == 0 {
-            std::thread::yield_now();
-        }
-        super::end_other_threads();
-        let at = TICKS.load(Ordering::SeqCst);
-        std::thread::sleep(Duration::from_millis(50));
-        let ended = TICKS.load(Ordering::SeqCst) == at;
+        static ENDS: AtomicU64 = AtomicU64::new(0);
+        static KEPT: AtomicU64 = AtomicU64::new(0);
+        busy(&ENDS);
+        let kept = busy(&KEPT);
+        super::end_other_threads(&[kept]);
+        let ended = stopped(&ENDS);
+        let still_running = !stopped(&KEPT);
         // The test harness's threads are gone too: leave at once.
-        println!("{}", if ended { "ENDED" } else { "STILL RUNNING" });
+        println!(
+            "{} {}",
+            if ended { "ENDED" } else { "STILL RUNNING" },
+            if still_running { "KEPT" } else { "NOT KEPT" }
+        );
         std::process::exit(0);
     }
 
@@ -375,6 +431,9 @@ mod tests {
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(out.status.success() && text.contains("ENDED"), "{text}");
+        assert!(
+            out.status.success() && text.contains("ENDED KEPT"),
+            "{text}"
+        );
     }
 }

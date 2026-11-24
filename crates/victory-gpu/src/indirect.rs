@@ -6,13 +6,15 @@
 //! just before its execution, by a compute shader of ours (HLSL compiled by
 //! the system's compiler; a 5.1 shader with its root signature inside).
 //!
-//! Each list also has a budget (2^28 vertex instances or threads, mesh
-//! groups counted as 128): records past it run empty, so a list of
-//! thousands of garbage records cannot run for seconds either.
+//! Each list also has a budget (2^27 vertex instances or threads, groups
+//! counted as 64 threads, mesh groups as 128): records past it run empty,
+//! so a list of thousands of garbage records cannot run for seconds
+//! either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension, one-dimensional mesh dispatches, the budget) cut
-//! legitimate work beyond them; raise them if the title needs more.
+//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! dispatches, the budget) cut legitimate work beyond them; raise them if
+//! the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -28,7 +30,9 @@ RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
-static const uint BUDGET = 1u << 28;
+static const uint BUDGET = 1u << 27;
+// Groups of one dispatch; more run empty.
+static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -43,7 +47,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         args.Store2(at, uint2(count, instances));
     } else if (kind == 2) {
         uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        cost = min(g.x * g.y * g.z, 1u << 20) * 64;
+        // x * y fits 32 bits; the whole count may not.
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64;
         args.Store3(at, g);
     } else {
         // Mesh dispatches: the console's are one-dimensional.

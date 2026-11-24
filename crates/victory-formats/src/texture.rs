@@ -249,6 +249,13 @@ fn spread(bits: &[u32]) -> Vec<u32> {
 
 const MAX_MIPS: u32 = 16;
 
+/// The largest width, height and depth (or array size) accepted, in texels.
+/// GFX10's image descriptors hold at most 16384 texels per side, so no
+/// texture the GPU can use is refused. The bound also keeps every size
+/// computed below within `u64` (and its `u32` steps), which unchecked
+/// values from a title would otherwise overflow.
+const MAX_EXTENT: u32 = 1 << 14;
+
 /// 256-byte micro tile dimensions by log2 element size, 2D and 3D.
 const BLOCK_256_2D: [[u32; 2]; 5] = [[16, 16], [16, 8], [8, 8], [8, 4], [4, 4]];
 const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4], [2, 2, 4]];
@@ -258,9 +265,9 @@ impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
-        let valid = d.width > 0
-            && d.height > 0
-            && d.depth > 0
+        let valid = (1..=MAX_EXTENT).contains(&d.width)
+            && (1..=MAX_EXTENT).contains(&d.height)
+            && (1..=MAX_EXTENT).contains(&d.depth)
             && (1..=MAX_MIPS).contains(&d.mips)
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
@@ -835,6 +842,27 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    /// Sizes past the hardware's 16384 texels per side are refused instead
+    /// of overflowing the size arithmetic (found by random-input testing).
+    #[test]
+    fn extents_past_the_hardware_limit_are_invalid() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_D_X] {
+            let largest = Layout::new(&desc(MAX_EXTENT, MAX_EXTENT, 15, 16, swizzle)).unwrap();
+            assert!(largest.size >= u64::from(MAX_EXTENT) * u64::from(MAX_EXTENT) * 16);
+            for (w, h) in [
+                (MAX_EXTENT + 1, 1),
+                (1, MAX_EXTENT + 1),
+                (u32::MAX, u32::MAX),
+            ] {
+                let result = Layout::new(&desc(w, h, 1, 16, swizzle));
+                assert_eq!(result, Err(Error::Invalid), "{w}x{h}");
+            }
+            let mut deep = desc(1, 1, 1, 16, swizzle);
+            deep.depth = u32::MAX;
+            assert_eq!(Layout::new(&deep), Err(Error::Invalid));
         }
     }
 

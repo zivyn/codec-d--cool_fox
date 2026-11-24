@@ -2520,15 +2520,8 @@ impl<'a> Lower<'a> {
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let cin = self.scc_in(inst)?;
-                let cin32 = self.s.m.cast(c, Cast::ZExt, cin, self.s.t.i32);
-                let op = if name == "s_addc_u32" {
-                    Bin::Add
-                } else {
-                    Bin::Sub
-                };
-                let t = self.s.m.bin(c, op, a, b);
-                let r = self.s.m.bin(c, op, t, cin32);
-                (r, None)
+                let (r, carry) = self.add_sub_carry(c, name == "s_addc_u32", a, b, Some(cin));
+                (r, Some(carry))
             }
             "s_mul_i32" | "s_mulk_i32" => {
                 let a = src32(self, 0)?;
@@ -2677,6 +2670,31 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// `a + b (+ cin)` or `a - b (- cin)` with the carry (borrow) out, as the
+    /// scalar and vector add-with-carry instructions set it.
+    fn add_sub_carry(&mut self, c: usize, add: bool, a: V, b: V, cin: Option<V>) -> (V, V) {
+        let op = if add { Bin::Add } else { Bin::Sub };
+        let mut r = self.s.m.bin(c, op, a, b);
+        // Without a carry in: a + b wraps below a; a - b borrows when a < b.
+        let mut carry = if add {
+            self.s.m.cmp(c, pred::IULT, r, a)
+        } else {
+            self.s.m.cmp(c, pred::IULT, a, b)
+        };
+        if let Some(cin) = cin {
+            let one = self.s.m.cast(c, Cast::ZExt, cin, self.s.t.i32);
+            let t = r;
+            r = self.s.m.bin(c, op, t, one);
+            // The carry in carries on when the partial result is all ones
+            // (add) or zero (sub).
+            let edge = self.s.m.i32(if add { u32::MAX } else { 0 });
+            let at_edge = self.s.m.cmp(c, pred::EQ, t, edge);
+            let more = self.s.m.bin(c, Bin::And, cin, at_edge);
+            carry = self.s.m.bin(c, Bin::Or, carry, more);
+        }
+        (r, carry)
     }
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
@@ -3928,26 +3946,7 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                let add = name.starts_with("v_add");
-                let op = if add { Bin::Add } else { Bin::Sub };
-                let mut r = self.s.m.bin(c, op, a, bb);
-                // Without a carry in: a + b wraps below a; a - b borrows when a < b.
-                let mut carry = if add {
-                    self.s.m.cmp(c, pred::IULT, r, a)
-                } else {
-                    self.s.m.cmp(c, pred::IULT, a, bb)
-                };
-                if let Some(cin) = cin {
-                    let one = self.s.m.cast(c, Cast::ZExt, cin, self.s.t.i32);
-                    let t = r;
-                    r = self.s.m.bin(c, op, t, one);
-                    // The carry in carries on when the partial result is all
-                    // ones (add) or zero (sub).
-                    let edge = self.s.m.i32(if add { u32::MAX } else { 0 });
-                    let at_edge = self.s.m.cmp(c, pred::EQ, t, edge);
-                    let more = self.s.m.bin(c, Bin::And, cin, at_edge);
-                    carry = self.s.m.bin(c, Bin::Or, carry, more);
-                }
+                let (r, carry) = self.add_sub_carry(c, name.starts_with("v_add"), a, bb, cin);
                 int(self, r)?;
                 if let Some(Operand::Scalar { code, .. }) = v.carry
                     && let Some(w) = inst.write(Reg::S(code))
@@ -6556,7 +6555,76 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, buffer_format};
+    use super::{Numeric, Parts, buffer_format, lower};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use crate::{io, ir, resource, structure};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// Lowers a compute program of constants: whether it translates.
+    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [1, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, false, 256).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        })
+        .map(|_| ())
+    }
+
+    #[test]
+    fn a_scalar_carry_chain_reaches_the_select() {
+        // The high dword of a 64-bit add or subtract, then a select on the
+        // carry (borrow) the high half leaves in SCC, and a branch on it
+        // (only code with an effect needs its operands).
+        let add = [
+            0xBE80_03C1, // s_mov_b32 s0, -1
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x8000_8100, // s_add_u32 s0, s0, 1
+            0x8201_8001, // s_addc_u32 s1, s1, 0
+            0x8502_0001, // s_cselect_b32 s2, s1, s0
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        let sub = [
+            0xBE80_0380, // s_mov_b32 s0, 0
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0x8080_8100, // s_sub_u32 s0, s0, 1
+            0x8281_8001, // s_subb_u32 s1, s1, 0
+            0x8502_0001, // s_cselect_b32 s2, s1, s0
+            0xBF07_8002, // s_cmp_lg_u32 s2, 0
+            0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+            0xBE83_0380, // s_mov_b32 s3, 0
+            S_ENDPGM,
+        ];
+        for words in [add, sub] {
+            lowers(&words).unwrap();
+        }
+    }
 
     #[test]
     fn buffer_formats_by_number() {

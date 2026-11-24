@@ -280,7 +280,6 @@ fn unspill(
     let mut used = [false; 128];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
-    let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     for inst in list.iter() {
         let Some(name) = inst.name() else { return Vec::new() };
         let fields = inst.fields(wave64);
@@ -289,28 +288,13 @@ fn unspill(
             return Vec::new();
         };
         let mut codes = Vec::new();
-        let mut from = Vec::new();
         if let Some((reads, writes)) = effects {
             for &reg in &writes {
                 if let Reg::S(c) = reg {
                     codes.push(c);
                 }
             }
-            for &reg in &reads {
-                if let Reg::S(c) = reg {
-                    from.push(c);
-                }
-            }
-            // An M0-relative read (`v_movrels_b32`) names every VGPR from its
-            // base up; the compiler indexes a small array with it, never the
-            // lanes it parks scalars in, so it does not make those VGPRs
-            // ordinary ones. (Relative writes still do.)
-            let relative = name == "v_movrels_b32";
-            let n_reads = reads.len();
-            for (k, reg) in reads.into_iter().chain(writes).enumerate() {
-                if relative && k < n_reads && matches!(reg, Reg::V(_)) {
-                    continue;
-                }
+            for reg in reads.into_iter().chain(writes) {
                 match reg {
                     Reg::S(c) => used[usize::from(c)] = true,
                     Reg::V(r) if park.is_some_and(|p| p.1 == r) => stores[usize::from(r)] = true,
@@ -321,7 +305,6 @@ fn unspill(
         }
         parks.push(park);
         written.push(codes);
-        read.push(from);
     }
     for (i, park) in parks.iter_mut().enumerate() {
         if park.is_some_and(|p| other[usize::from(p.1)]) {
@@ -364,25 +347,8 @@ fn unspill(
             }
             None
         } else {
-            // The second restore may come a few instructions later (the
-            // compiler schedules other work between the two): the pair is
-            // restored at the first, so nothing between may read or write
-            // the second register, write the first, or save into the lanes.
-            let mut j = i + 1;
-            while j < list.len() && !leader(j) {
-                if parks[j] == Some((false, reg, code + 1, lane + 1)) {
-                    return Some(j);
-                }
-                if parks[j].is_some_and(|p| p.0 && p.1 == reg && (p.3 == lane || p.3 == lane + 1))
-                    || written[j].contains(&code)
-                    || written[j].contains(&(code + 1))
-                    || read[j].contains(&(code + 1))
-                {
-                    return None;
-                }
-                j += 1;
-            }
-            None
+            let j = i + 1;
+            (j < list.len() && !leader(j) && parks[j] == Some((false, reg, code + 1, lane + 1))).then_some(j)
         }
     };
     let mut pairs: Vec<(u8, u32)> = Vec::new();

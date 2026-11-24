@@ -332,6 +332,9 @@ fn parse_exports(file: &PeFile64<'_>) -> Result<Vec<ExportInfo>, PeError> {
     Ok(table
         .exports()?
         .into_iter()
+        // An address of 0 marks an unused slot in the address table (a gap
+        // in the ordinals), not an export at the image base.
+        .filter(|e| !matches!(e.target, ExportTarget::Address(0)))
         .map(|e| {
             let (rva, forward) = match e.target {
                 ExportTarget::Address(rva) => (Some(rva), None),
@@ -469,5 +472,76 @@ mod tests {
             ImageInfo::parse(&data),
             Err(PeError::Malformed(_))
         ));
+    }
+    /// A minimal PE32+ image: one section at RVA 0x1000 holding `body`, with
+    /// the export directory (RVA 0x1000, 0x80 bytes) pointing at it.
+    fn synthetic_image(body: &[u8]) -> Vec<u8> {
+        let mut d = vec![0u8; 0x200];
+        d[0..2].copy_from_slice(b"MZ");
+        d[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        d[0x40..0x44].copy_from_slice(b"PE\0\0");
+        d[0x44..0x46].copy_from_slice(&MACHINE_AMD64.to_le_bytes());
+        d[0x46..0x48].copy_from_slice(&1u16.to_le_bytes()); // sections
+        d[0x54..0x56].copy_from_slice(&240u16.to_le_bytes()); // optional header size
+        d[0x56..0x58].copy_from_slice(&0x2022u16.to_le_bytes()); // DLL, large address aware
+        let opt = 0x58;
+        d[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        d[opt + 24..opt + 32].copy_from_slice(&0x1_8000_0000u64.to_le_bytes());
+        d[opt + 32..opt + 36].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[opt + 36..opt + 40].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 56..opt + 60].copy_from_slice(&0x2000u32.to_le_bytes());
+        d[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        d[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        d[opt + 112..opt + 116].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[opt + 116..opt + 120].copy_from_slice(&0x80u32.to_le_bytes());
+        let sec = opt + 240;
+        d[sec..sec + 6].copy_from_slice(b".edata");
+        d[sec + 8..sec + 12].copy_from_slice(&0x200u32.to_le_bytes()); // virtual size
+        d[sec + 12..sec + 16].copy_from_slice(&0x1000u32.to_le_bytes());
+        d[sec + 16..sec + 20].copy_from_slice(&0x200u32.to_le_bytes()); // raw size
+        d[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes()); // raw offset
+        d.extend_from_slice(body);
+        d.resize(0x400, 0);
+        d
+    }
+
+    #[test]
+    fn unused_export_slots_are_not_exports() {
+        // Ordinal base 1; three address slots: "alpha", an unused hole (0),
+        // and "gamma". The Windows loader treats address 0 as "not exported".
+        let mut body = vec![0u8; 0x100];
+        let put32 =
+            |b: &mut Vec<u8>, at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put32(&mut body, 12, 0x1040); // name of the DLL
+        put32(&mut body, 16, 1); // ordinal base
+        put32(&mut body, 20, 3); // number of functions
+        put32(&mut body, 24, 2); // number of names
+        put32(&mut body, 28, 0x1028); // address table
+        put32(&mut body, 32, 0x1034); // name pointer table
+        put32(&mut body, 36, 0x103C); // name ordinal table
+        put32(&mut body, 0x28, 0x1200);
+        put32(&mut body, 0x2C, 0);
+        put32(&mut body, 0x30, 0x1204);
+        put32(&mut body, 0x34, 0x1044);
+        put32(&mut body, 0x38, 0x104A);
+        body[0x3C..0x3E].copy_from_slice(&0u16.to_le_bytes());
+        body[0x3E..0x40].copy_from_slice(&2u16.to_le_bytes());
+        body[0x40..0x44].copy_from_slice(b"t.dl");
+        body[0x44..0x4A].copy_from_slice(b"alpha\0");
+        body[0x4A..0x50].copy_from_slice(b"gamma\0");
+
+        let info = ImageInfo::parse(&synthetic_image(&body)).unwrap();
+        let exports: Vec<_> = info
+            .exports
+            .iter()
+            .map(|e| (e.name.as_deref(), e.ordinal, e.rva))
+            .collect();
+        assert_eq!(
+            exports,
+            [
+                (Some("alpha"), 1, Some(0x1200)),
+                (Some("gamma"), 3, Some(0x1204))
+            ]
+        );
     }
 }

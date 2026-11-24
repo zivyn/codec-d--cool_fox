@@ -463,6 +463,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    if first_halves.is_empty() {
+        return Ok(io);
+    }
     // A loaded i/j pair normally becomes one host interpolation: its first
     // half need not be evaluated. A first half also read as data (or used
     // without a second half) must keep P0 + i * P10. Follow phi uses too,

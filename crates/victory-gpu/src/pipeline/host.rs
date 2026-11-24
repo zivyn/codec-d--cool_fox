@@ -902,6 +902,10 @@ mod tests {
         let Some(host) = host() else {
             return; // no host GPU here
         };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;
@@ -911,6 +915,8 @@ mod tests {
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
         let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
         let mut g = GraphicsState::default();
+        // This pipeline has only a color target, with no depth buffer.
+        g.depth.DepthEnable = false.into();
         g.targets.NumRenderTargets = 1;
         g.targets.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
         let name = super::super::library::name("mesh test", &root_blob, &[&ms, &ps], &g.describe());

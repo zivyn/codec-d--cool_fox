@@ -159,10 +159,6 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     }
 }
 
-/// `code` as hex, for a log line.
-pub fn hex(code: &[u8]) -> String {
-    code.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
-}
 
 #[cfg(test)]
 mod tests {

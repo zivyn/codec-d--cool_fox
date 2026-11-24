@@ -83,6 +83,7 @@ static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::Ato
 /// the library's file (kept whole while the library lives) and what its
 /// last save wrote.
 #[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn kept() -> [u64; 7] {
     use std::sync::atomic::Ordering::Relaxed;
     [

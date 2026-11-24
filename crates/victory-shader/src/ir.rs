@@ -594,11 +594,73 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// after it could see that (a scalar register or SCC that the region
 /// changes and the join merges with the value from before; EXEC aside,
 /// which is empty either way). `None` if nothing changes.
-pub(crate) fn without_skips(p: &Program) -> Option<Program> {
+///
+/// `deep` looks closer at what the code after the branch can see. A scalar the region moves
+/// away and back (the compiler parks scalars in VGPR lanes around a branch and takes them
+/// back before the join, `unspill`) is the value it copies; a join nothing reads shows no
+/// one the difference (a restore of EXEC that the next one overwrites reads nothing); and
+/// the join may have other ways in (an inner branch that ends together with an outer one).
+/// That leaves out most of the skips of the title's large lighting programs, whose bodies
+/// are then code every lane runs.
+pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
             && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
+    };
+    // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
+    // comes back by such a move, `unspill`) are the value they copy.
+    let mut copy: std::collections::HashMap<Value, Value> = Default::default();
+    // Values something reads, directly or through joins. A scalar operation none of whose
+    // results is read reads nothing either (the compiler restores EXEC from a saved mask
+    // and overwrites it at once where two branches end together).
+    let mut live: std::collections::HashSet<Value> = Default::default();
+    let idle = |inst: &Inst, live: &std::collections::HashSet<Value>| {
+        let name = inst.name();
+        matches!(inst.fields, crate::gfx10::Fields::Sop { .. })
+            && !(name.starts_with("s_setpc")
+                || name.starts_with("s_swappc")
+                || name.starts_with("s_call")
+                || name.starts_with("s_rfe")
+                || name.starts_with("s_movrel")
+                || name.starts_with("s_subvector"))
+            && inst.writes.iter().all(|w| !live.contains(&w.1))
+    };
+    for block in &p.blocks {
+        for inst in &block.insts {
+            if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+                && inst.reads.len() == inst.writes.len()
+                && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(_)))
+            {
+                copy.extend(inst.writes.iter().zip(&inst.reads).map(|(w, r)| (w.1, r.1)));
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in &p.blocks {
+            for inst in &block.insts {
+                if !idle(inst, &live) {
+                    for r in &inst.reads {
+                        changed |= live.insert(r.1);
+                    }
+                }
+            }
+            for phi in &block.phis {
+                if live.contains(&phi.value) {
+                    for &a in &phi.args {
+                        changed |= live.insert(a);
+                    }
+                }
+            }
+        }
+    }
+    let root = |mut v: Value| {
+        while deep && let Some(&c) = copy.get(&v) {
+            v = c;
+        }
+        v
     };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
@@ -631,18 +693,21 @@ pub(crate) fn without_skips(p: &Program) -> Option<Program> {
                 Reg::Scc => true,
                 Reg::V(_) => false,
             };
-            if !scalar {
+            // (a join nothing reads shows no one the difference)
+            if !scalar || deep && !live.contains(&phi.value) {
                 continue;
             }
             let before: Vec<Value> =
-                join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| *a).collect();
-            let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| *a);
+                join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
+            let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
             if within.into_iter().any(|a| !before.contains(&a)) {
                 return None;
             }
         }
-        // other ways into the join than the branch and the region: not a plain `if`
-        if join.preds.iter().any(|&q| q != b && !inside[q]) {
+        // Other ways into the join than the branch and the region (an inner branch that ends
+        // together with an outer one) change nothing in that: the lanes that would have
+        // skipped arrive from the region instead, with the same scalars.
+        if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
             return None;
         }
         Some(inside)
@@ -1456,6 +1521,56 @@ mod tests {
 
     fn input(p: &Program, reg: Reg) -> Value {
         p.inputs.iter().find(|i| i.0 == reg).expect("input").1
+    }
+
+    /// `if (v0 < s0) { ... }` whose body changes s6: `body` are its words, `after` what
+    /// follows the join.
+    fn skip(body: &[u32], after: &[u32]) -> Program {
+        let mut w = vec![
+            0xBE94_0306,                     // s_mov_b32 s20, s6
+            0x7D88_0000,                     // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A,                     // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0000 | body.len() as u32, // s_cbranch_execz past the body
+        ];
+        w.extend_from_slice(body);
+        w.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
+        w.extend_from_slice(after);
+        w.push(S_ENDPGM);
+        build_words(&w, true)
+    }
+
+    fn skips(p: &Program) -> usize {
+        p.blocks
+            .iter()
+            .filter(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+            .count()
+    }
+
+    #[test]
+    fn a_skip_is_left_out_when_the_scalars_it_changes_come_back_or_are_not_read() {
+        const SET: u32 = 0xBE86_0385; // s_mov_b32 s6, 5
+        const USE: u32 = 0x7E02_0206; // v_mov_b32 v1, s6
+        const BACK: u32 = 0xBE86_0314; // s_mov_b32 s6, s20
+        const READ: u32 = 0x7E04_0206; // v_mov_b32 v2, s6
+        // s6 is changed in the body and read after the join: the branch stays
+        let kept = skip(&[SET, USE], &[READ]);
+        assert_eq!(skips(&kept), 1);
+        assert!(without_skips(&kept, false).is_none());
+        assert!(without_skips(&kept, true).is_none());
+        // ... put back by a copy of what it held (as a scalar parked in a VGPR lane comes
+        // back): every lane may walk the body
+        let back = skip(&[SET, USE, BACK], &[READ]);
+        assert!(without_skips(&back, false).is_none());
+        assert_eq!(skips(&without_skips(&back, true).expect("left out")), 0);
+        // ... or not read after the join at all
+        let unread = skip(&[SET, USE], &[]);
+        assert_eq!(skips(&without_skips(&unread, false).expect("left out")), 0);
+        assert_eq!(skips(&without_skips(&unread, true).expect("left out")), 0);
+        // ... or read only by a restore of EXEC that nothing uses before the next one
+        // (s_mov_b64 exec, s[6:7]; s_mov_b64 exec, s[12:13]; v_mov_b32 v2, s0)
+        let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
+        assert!(without_skips(&idle, false).is_none());
+        assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
     }
 
     #[test]

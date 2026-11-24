@@ -853,7 +853,7 @@ const NOT_WATCHED: u8 = 2;
 fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
     let whole = a.len().min(b.len()) / 8 * 8;
     let from = a[..whole]
-        .chunks_exact(8)
+        .as_chunks::<8>().0.iter()
         .zip(b[..whole].chunks_exact(8))
         .position(|(x, y)| x != y)
         .map_or(whole, |word| word * 8);
@@ -867,7 +867,7 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         return Some(whole + i);
     }
     let word = a[..whole]
-        .chunks_exact(8)
+        .as_chunks::<8>().0.iter()
         .zip(b[..whole].chunks_exact(8))
         .rposition(|(x, y)| x != y)?
         * 8;

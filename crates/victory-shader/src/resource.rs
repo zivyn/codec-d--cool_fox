@@ -2671,7 +2671,7 @@ pub(crate) mod tests {
         ];
         // v_mov_b32 v10.., s0..; v_readfirstlane_b32 s16.., v10..
         words.extend((0..8).map(|k| 0x7E00_0200 | (10 + k) << 17 | k));
-        words.extend((0..8).map(|k| 0x7E00_0400 | (16 + k) << 17 | 0x100 + 10 + k));
+        words.extend((0..8).map(|k| 0x7E00_0400 | (16 + k) << 17 | (0x100 + 10 + k)));
         words.extend([
             0xF000_1700,
             0x0004_0D06, // image_load v[13:15], v6, s[16:23]

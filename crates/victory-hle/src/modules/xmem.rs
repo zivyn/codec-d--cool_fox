@@ -890,7 +890,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     // title asking.
     static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let asked = ASKED.fetch_add(1, Ordering::Relaxed);
-    if asked % 1024 == 0 {
+    if asked.is_multiple_of(1024) {
         tracing::info!(
             asked = asked + 1,
             which = _which,

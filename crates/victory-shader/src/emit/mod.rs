@@ -89,6 +89,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod own_bits;
 mod rect;
 mod sampler;
 mod shader;
@@ -99,6 +100,8 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+#[cfg(all(test, windows))]
+mod wave64_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -270,6 +273,8 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    // (what an earlier program's lowering on this thread left behind)
+    lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -278,9 +283,12 @@ pub fn emit(
     // body from being a block every lane runs.
     let stuck = match &original {
         Ok((_, wave)) => *wave == Some(64),
-        Err(ShaderError::Unsupported { what, .. }) => what.ends_with("where not every lane runs"),
+        Err(ShaderError::Unsupported { what, .. }) => lower::needs_every_lane(what),
         Err(_) => false,
     };
+    // (a mask with lanes elsewhere is only helped by the exact forms: not by each half-wave
+    // on its own)
+    let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
@@ -322,7 +330,7 @@ pub fn emit(
         };
         let forms = [
             ("without early-outs", form(ir::without_early_outs(p))),
-            ("without skips", form(ir::without_skips(p))),
+            ("without skips", form(ir::without_skips(p, false))),
         ];
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
@@ -333,31 +341,70 @@ pub fn emit(
                 }
             }
         }
-        if local_on {
-            // exact first (every form), then approximate
-            for exact in [true, false] {
-                if !exact && strict {
-                    break;
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        // exact first: each host wave on its own where that is exact (the idiom, every
+        // form; no barriers), then the other exact forms; then approximate
+        for exact in [true, false] {
+            if !exact {
+                // Before anything approximate, the exact forms that cost group barriers.
+                // Every skip left out that the code after it cannot see
+                // ([`ir::without_skips`], `deep`): most of the body is then code every
+                // lane runs, where the two host waves can exchange.
+                // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
+                let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                if let Some((p, st, io, res)) = &deep {
+                    let again = emit_program(c, native, p, st, io, res);
+                    report("without skips, scalars followed", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
                 }
-                for (name, f) in &forms {
-                    if let Some((p, st, io, res)) = f
-                        && idiom(p, st) == exact
-                    {
-                        let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                        report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
-                        if done(&local) {
-                            return local.map(|(shader, _)| shader);
+                // Still stopped where not every lane runs: the per-lane branches around
+                // those places taken as the console takes them, by the whole wave at once
+                // ([`widen`]), at two group barriers per such branch.
+                if wide_on {
+                    let bases = [
+                        deep.as_ref().map(|f| &f.0),
+                        forms[1].1.as_ref().map(|f| &f.0),
+                        forms[0].1.as_ref().map(|f| &f.0),
+                        Some(p),
+                    ];
+                    if let Some(base) = bases.into_iter().flatten().next() {
+                        let again = widen(c, native, base, why);
+                        report("wave-wide branches", &again);
+                        if done(&again) {
+                            return again.map(|(shader, _)| shader);
                         }
                     }
                 }
-                if idiom(p, st) == exact {
+                if strict {
+                    break;
+                }
+            }
+            if !local_on || exact_only {
+                continue;
+            }
+            for (name, f) in &forms {
+                if let Some((p, st, io, res)) = f
+                    && idiom(p, st) == exact
+                {
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                    report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
+                    report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
                         return local.map(|(shader, _)| shader);
                     }
                 }
             }
+            if idiom(p, st) == exact {
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
                 for (name, f) in &forms {
@@ -377,6 +424,23 @@ pub fn emit(
             }
         }
     }
+    // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
+    // trace programs): right once the wave takes that skip together ([`widen`]; the
+    // lowering has named the skipped blocks).
+    let original = match original {
+        Err(ShaderError::Unsupported { what, .. })
+            if native.stage == HwStage::Cs
+                && what == lower::LANE_MASK
+                && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
+        {
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            match again {
+                Ok(_) => again,
+                Err(_) => emit_program(c, native, p, st, io, res),
+            }
+        }
+        other => other,
+    };
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
@@ -392,6 +456,69 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
+/// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
+/// lowering names the blocks where the two host waves must meet and could not
+/// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
+/// it translates or a branch cannot be widened. Only where a thread group is one console
+/// wave: with several, the waves of a group would decide differently and a barrier inside
+/// such a branch would wait for threads that never come.
+fn widen(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    const NOT: ShaderError = ShaderError::Unsupported {
+        offset: 0,
+        what: "wave-wide branches in a thread group of several console waves",
+    };
+    match native.io {
+        // (a program whose waves are the host's meets no one: no barrier, any group)
+        crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
+        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) => {
+            if why {
+                eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
+            }
+            return Err(NOT);
+        }
+        _ => return Err(NOT),
+    }
+    let mut wide = std::collections::HashSet::new();
+    loop {
+        let st = structure::structure_wide(p, &wide)?;
+        let io = io::raise(p, native)?;
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        lower::take_needs();
+        let r = emit_program(c, native, p, &st, &io, &res);
+        let needs = lower::take_needs();
+        // (or translated for 64-lane waves still: shared memory read and written where not
+        // every lane runs, whose blocks the lowering names too)
+        let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
+                if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
+            || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+        if !stuck {
+            if why {
+                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+            }
+            return r;
+        }
+        let more: Vec<usize> = lower::branches_around(&st, &needs)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|b| !wide.contains(b))
+            .collect();
+        if more.is_empty() {
+            if why {
+                eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
+            }
+            return r;
+        }
+        wide.extend(more);
+    }
 }
 
 /// The translated program, and the wave size it requires of the host.

@@ -1534,13 +1534,13 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
     let f = format.0 as u32;
     let element = if raw {
         // raw: R32 typeless, counted in dwords, starting on 16 bytes
-        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || first % 4 != 0 {
+        if format != DXGI_FORMAT_R32_TYPELESS || stride != 0 || !first.is_multiple_of(4) {
             return false;
         }
         4
     } else if stride > 0 {
         // structured: no format, a stride the host takes
-        if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || stride % 4 != 0 {
+        if format != DXGI_FORMAT_UNKNOWN || stride > 2048 || !stride.is_multiple_of(4) {
             return false;
         }
         u64::from(stride)

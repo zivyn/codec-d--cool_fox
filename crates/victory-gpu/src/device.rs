@@ -377,7 +377,7 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             let mut bytes = [0u8; 128];
             (at != 0 && crate::host::read_into(at as *const u8, &mut bytes)).then(|| {
                 bytes
-                    .chunks_exact(8)
+                    .as_chunks::<8>().0.iter()
                     .map(|c| c.iter().rev().fold(0u64, |v, &b| v << 8 | u64::from(b)))
                     .collect()
             })

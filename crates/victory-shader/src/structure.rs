@@ -434,6 +434,15 @@ pub struct Structured {
     /// Incoming lane boolean per predecessor edge (in block predecessor order)
     /// for each [`Atom::Phi`] id.
     pub phi_masks: HashMap<Value, Vec<Bool>>,
+    /// Blocks whose closing branch the whole wave takes together ([`structure_wide`]): its
+    /// `when` is still the lane's own bit; the wave goes by all of them.
+    pub wide: HashSet<usize>,
+    /// Per block closed by a branch on a lane mask: whether the console takes it when some
+    /// lane's `when` holds (`true`) or when every lane's does (`false`).
+    pub wave_any: Vec<Option<bool>>,
+    /// SCC values a mask operation sets when some lane's bit of its result is set, with that
+    /// lane bit: as data such an SCC is "some lane of the wave has it".
+    pub scc_some: HashMap<Value, Bool>,
 }
 
 impl Structured {
@@ -448,7 +457,20 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
+    structure_wide(program, &HashSet::new())
+}
+
+/// [`structure`], with the branches that close the blocks of `wide` kept as the console has
+/// them: one decision for the whole wave (`s_cbranch_execz` and `vccz`: taken when no lane's
+/// bit is set; `execnz` and `vccnz`: when some lane's is; SCC of a mask operation likewise,
+/// [`Structured::wave_any`]), which every lane follows. A lane
+/// then learns nothing about its own bit from the way it went, so past such a branch EXEC
+/// stays a guard on every vector instruction, as it is on the console. For a console wave
+/// run as two host waves, which exchange that decision and can then meet (a group barrier)
+/// inside the branch.
+pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.wide = wide.clone();
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -508,6 +530,13 @@ struct Lanes<'a> {
     when: Vec<Option<Bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
+    /// See [`Structured::wide`].
+    wide: HashSet<usize>,
+    /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
+    /// two masks: "no lane differs"); the others are set when some lane's is.
+    scc_every: HashSet<Value>,
+    /// See [`Structured::wave_any`].
+    wave_any: Vec<Option<bool>>,
 }
 
 /// A mask join taken as `value` in every lane that reaches `block`: each
@@ -585,6 +614,9 @@ impl<'a> Lanes<'a> {
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
             active: HashSet::new(),
+            wide: HashSet::new(),
+            scc_every: HashSet::new(),
+            wave_any: vec![None; blocks.len()],
         })
     }
 
@@ -594,6 +626,8 @@ impl<'a> Lanes<'a> {
         self.other.clear();
         self.seen.clear();
         self.scc_lane.clear();
+        self.scc_every.clear();
+        self.wave_any.fill(None);
         self.joins.clear();
         self.phi_joins.clear();
         self.phi_join_ids.clear();
@@ -652,6 +686,7 @@ impl<'a> Lanes<'a> {
                 && let Some(last) = p.blocks[b].insts.last()
             {
                 self.when[b] = Some(self.branch(last));
+                self.wave_any[b] = self.wave_kind(last);
             }
         }
         execs
@@ -659,6 +694,10 @@ impl<'a> Lanes<'a> {
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
+        if self.wide.contains(&q) {
+            // the wave's decision: it says nothing about this lane's own bit
+            return c;
+        }
         match self.when[q] {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -809,6 +848,14 @@ impl<'a> Lanes<'a> {
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
+            wide: self.wide,
+            wave_any: self.wave_any,
+            scc_some: self
+                .scc_lane
+                .iter()
+                .filter(|(scc, _)| !self.scc_every.contains(scc))
+                .map(|(&scc, &m)| (scc, m))
+                .collect(),
             phi_masks,
             bools: self.b,
             exits,
@@ -1184,6 +1231,9 @@ impl<'a> Lanes<'a> {
                         ne
                     };
                     self.scc_lane.insert(scc, m);
+                    if rest.starts_with("eq") {
+                        self.scc_every.insert(scc);
+                    }
                 }
                 // `s_bcnt1` of a mask every running lane sees alike (EXEC under a scalar
                 // condition, or EXEC itself): its SCC, "some lane is set", is each lane's own
@@ -1252,6 +1302,27 @@ impl<'a> Lanes<'a> {
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
+    /// How the console decides the branch `inst` on a lane mask, in terms of the lanes' own
+    /// `when` ([`Self::branch`]): taken when some lane's holds (`true`) or when every lane's
+    /// does (`false`). `execnz`/`vccnz` ask for some set bit, `execz`/`vccz` for none; SCC
+    /// of a mask operation is "some lane's bit is set", SCC of `s_cmp_eq` of two masks is
+    /// "every lane's is" ([`Self::scc_every`]), and `scc0` branches on the opposite. None
+    /// for a branch on a scalar condition.
+    fn wave_kind(&self, inst: &Inst) -> Option<bool> {
+        match inst.name() {
+            "s_cbranch_execnz" | "s_cbranch_vccnz" => Some(true),
+            "s_cbranch_execz" | "s_cbranch_vccz" => Some(false),
+            n @ ("s_cbranch_scc0" | "s_cbranch_scc1") => {
+                let scc = inst.read(Reg::Scc)?;
+                self.scc_lane.get(&scc)?;
+                // set: SCC is 1 when some lane's bit is set (every lane's, for a compare)
+                let every = self.scc_every.contains(&scc);
+                Some((n == "s_cbranch_scc1") != every)
+            }
+            _ => None,
+        }
+    }
+
     fn branch(&mut self, inst: &Inst) -> Bool {
         let exec = self.exec(inst);
         match inst.name() {

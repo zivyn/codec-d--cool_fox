@@ -305,6 +305,10 @@ fn bench_indirect_draw_barriers() {
         }
         let (budget, budget_ptr) = host.shared_buffer(256).unwrap();
         let budget_gpu = budget.GetGPUVirtualAddress();
+        // The same words in the card's own memory (zeroed when made; the
+        // runs below charge far less than the budget).
+        let card_budget = host.uav_buffer(256).unwrap();
+        let card_budget_gpu = card_budget.GetGPUVirtualAddress();
         let scratch = host
             .uav_buffer(u64::from(WINDOW * STEP).max(64 << 10))
             .unwrap();
@@ -370,7 +374,7 @@ fn bench_indirect_draw_barriers() {
 
         // One frame's lists: GPU ms (timestamps around the list), CPU ms
         // recording it, ms from submission to the end of its run.
-        let mut frame = |barriers: Barriers, clamp: &Clamp, window: u32| -> [f64; 3] {
+        let mut frame = |barriers: Barriers, clamp: &Clamp, window: u32, card: bool| -> [f64; 3] {
             allocator.Reset().unwrap();
             list.Reset(&allocator, None).unwrap();
             let recording = std::time::Instant::now();
@@ -399,7 +403,7 @@ fn bench_indirect_draw_barriers() {
                     clamp,
                     &list,
                     (&scratch, state),
-                    budget_gpu,
+                    if card { card_budget_gpu } else { budget_gpu },
                     (&src, u64::from(first * STEP)),
                     None,
                     (0, STEP, records),
@@ -445,21 +449,25 @@ fn bench_indirect_draw_barriers() {
         // What `main` records, then this branch; the windows a step at a
         // time (barriers, then the clamp's one charge per group).
         let (old, new) = (&clamps[0], &clamps[1]);
-        let cases: [(&str, Barriers, &Clamp, u32); 5] = [
-            ("one at a time, main", Barriers::Old, old, 1),
-            ("one at a time, this", Barriers::New, new, 1),
-            ("windows of 32, main", Barriers::Old, old, WINDOW),
-            ("windows, new barriers", Barriers::New, old, WINDOW),
-            ("windows of 32, this", Barriers::New, new, WINDOW),
+        // The last two keep the budget in the card's memory instead of
+        // memory the CPU maps (where the list's budget is now).
+        let cases: [(&str, Barriers, &Clamp, u32, bool); 7] = [
+            ("one at a time, main", Barriers::Old, old, 1, false),
+            ("one at a time, this", Barriers::New, new, 1, false),
+            ("windows of 32, main", Barriers::Old, old, WINDOW, false),
+            ("windows, new barriers", Barriers::New, old, WINDOW, false),
+            ("windows of 32, this", Barriers::New, new, WINDOW, false),
+            ("one at a time, card", Barriers::New, new, 1, true),
+            ("windows of 32, card", Barriers::New, new, WINDOW, true),
         ];
         // Warm up, then the cases in turn, so drift falls on all alike.
-        for &(_, barriers, clamp, window) in &cases {
-            frame(barriers, clamp, window);
+        for &(_, barriers, clamp, window, card) in &cases {
+            frame(barriers, clamp, window, card);
         }
         let mut times: Vec<Vec<[f64; 3]>> = vec![Vec::new(); cases.len()];
         for _ in 0..RUNS {
-            for (i, &(_, barriers, clamp, window)) in cases.iter().enumerate() {
-                times[i].push(frame(barriers, clamp, window));
+            for (i, &(_, barriers, clamp, window, card)) in cases.iter().enumerate() {
+                times[i].push(frame(barriers, clamp, window, card));
             }
         }
         let median = |v: &[[f64; 3]], k: usize| {
@@ -481,7 +489,7 @@ fn bench_indirect_draw_barriers() {
                 median(&times[i], 2),
             );
         }
-        for (from, to) in [(0, 1), (2, 3), (3, 4), (2, 4)] {
+        for (from, to) in [(0, 1), (2, 3), (3, 4), (2, 4), (1, 5), (4, 6)] {
             let (a, b) = (median(&times[from], 0), median(&times[to], 0));
             eprintln!(
                 "  {} -> {}: GPU time {:+.1} %",

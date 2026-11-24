@@ -594,11 +594,8 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        let n = self.desc.element_bytes as usize;
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, count| {
-            for (i, len) in runs(t, count, n) {
-                linear[l + i * n..][..len].copy_from_slice(&tiled[t[i] as usize..][..len]);
-            }
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+            linear[l..][..len].copy_from_slice(&tiled[t..][..len]);
         })
     }
 
@@ -612,16 +609,12 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        let n = self.desc.element_bytes as usize;
-        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, count| {
-            for (i, len) in runs(t, count, n) {
-                tiled[t[i] as usize..][..len].copy_from_slice(&linear[l + i * n..][..len]);
-            }
+        self.walk(tiled.len(), mip, slice, linear.len(), row_pitch, depth_pitch, |t, l, len| {
+            tiled[t..][..len].copy_from_slice(&linear[l..][..len]);
         })
     }
 
-    /// Calls `row(tiled offsets, linear offset, elements)` for each row of a
-    /// subresource, after checking both buffers are large enough.
+    /// Visits contiguous runs as (tiled byte offset, linear byte offset, length).
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &self,
@@ -631,7 +624,7 @@ impl Layout {
         linear_len: usize,
         row_pitch: usize,
         depth_pitch: usize,
-        mut row: impl FnMut(&[u64], usize, usize),
+        mut copy: impl FnMut(usize, usize, usize),
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
@@ -661,51 +654,41 @@ impl Layout {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
-        let columns: Vec<u64> = (0..m.width)
-            .map(|x| {
-                if linear {
-                    u64::from(x) * n as u64
-                } else {
-                    self.column(m, x)
+        // The row and depth contribute one common base to every column, so
+        // the same contiguous runs repeat on every row, including mip tails.
+        let mut runs = Vec::new();
+        if !linear {
+            let mut first_linear = 0;
+            let mut first_tiled = self.column(m, 0) as usize;
+            for x in 1..m.width {
+                let offset = self.column(m, x) as usize;
+                let at = x as usize * n;
+                if offset != first_tiled + (at - first_linear) {
+                    runs.push((first_tiled, first_linear, at - first_linear));
+                    first_tiled = offset;
+                    first_linear = at;
                 }
-            })
-            .collect();
-        let mut offsets = vec![0u64; m.width as usize];
+            }
+            runs.push((first_tiled, first_linear, bytes - first_linear));
+        }
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
             for y in 0..m.height {
-                let start = if linear {
-                    base + u64::from(y) * u64::from(m.pitch) * n as u64
+                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+                if linear {
+                    let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                    copy(tiled_row as usize, linear_row, bytes);
                 } else {
-                    base + self.row(m, y, inner)
-                };
-                for (o, c) in offsets.iter_mut().zip(&columns) {
-                    *o = start + c;
+                    let tiled_row = (base + self.row(m, y, inner)) as usize;
+                    for &(tiled, linear, len) in &runs {
+                        copy(tiled_row + tiled, linear_row + linear, len);
+                    }
                 }
-                row(&offsets, z as usize * depth_pitch + y as usize * row_pitch, m.width as usize);
             }
         }
         Ok(())
     }
-}
-
-/// The first `count` element offsets as runs of contiguous memory: (first
-/// element, bytes), so a linear row (or a swizzle's contiguous columns) is
-/// copied at once rather than element by element.
-fn runs(t: &[u64], count: usize, n: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
-    let mut i = 0;
-    std::iter::from_fn(move || {
-        if i >= count {
-            return None;
-        }
-        let start = i;
-        i += 1;
-        while i < count && t[i] == t[i - 1] + n as u64 {
-            i += 1;
-        }
-        Some((start, (i - start) * n))
-    })
 }
 
 /// What a DXGI format stores per element: bytes, texels per element side
@@ -905,6 +888,11 @@ mod tests {
             desc(33, 17, 6, 1, Swizzle::SW_4KB_D),
             desc(40, 9, 3, 2, Swizzle::SW_64KB_S),
             desc(30, 20, 5, 4, Swizzle::LINEAR),
+            desc(83, 31, 6, 1, Swizzle::SW_256B_S),
+            Desc {
+                block: 4,
+                ..desc(109, 71, 6, 16, Swizzle::SW_256B_D)
+            },
             Desc {
                 depth: 3,
                 ..desc(70, 70, 4, 16, Swizzle::SW_4KB_S)
@@ -924,25 +912,32 @@ mod tests {
             for slice in 0..slices {
                 for mip in 0..d.mips {
                     let m = l.mips[mip as usize];
-                    let row = m.width as usize * n;
-                    let plane = row * m.height as usize;
+                    let active = m.width as usize * n;
+                    let row = active + 13;
+                    let plane = row * m.height as usize + 11;
                     let linear: Vec<u8> = (0..plane * m.depth as usize)
                         .map(|i| (i * 7 + mip as usize * 13 + slice as usize) as u8)
                         .collect();
                     l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
-                    let mut back = vec![0u8; linear.len()];
+                    let mut back = vec![0xcc; linear.len()];
                     l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
-                    assert_eq!(back, linear, "{d:?} mip {mip}");
                     for z in 0..m.depth {
+                        let base = z as usize * plane;
                         for y in 0..m.height {
+                            let start = base + y as usize * row;
+                            assert_eq!(back[start..start + active], linear[start..start + active]);
+                            assert!(back[start + active..start + row].iter().all(|&b| b == 0xcc));
                             for x in 0..m.width {
                                 let at = l.offset(mip, x, y, slice + z).unwrap() as usize;
+                                let source = start + x as usize * n;
+                                assert_eq!(tiled[at..at + n], linear[source..source + n]);
                                 assert!(at + n <= seen.len(), "{d:?} mip {mip} outside");
                                 assert!(at.is_multiple_of(n));
                                 assert!(!seen[at], "{d:?} mip {mip} ({x},{y},{z}) twice");
                                 seen[at] = true;
                             }
                         }
+                        assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
                     }
                 }
             }

@@ -204,4 +204,14 @@ mod tests {
         };
         assert!(cfg.cache_subdir("x").is_err());
     }
+
+    #[test]
+    fn data_inside_repo_is_refused() {
+        let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+        let cfg = Config {
+            data_dir: inside,
+            ..Default::default()
+        };
+        assert!(cfg.data_subdir("x").is_err());
+    }
 }

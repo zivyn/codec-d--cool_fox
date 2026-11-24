@@ -1063,11 +1063,7 @@ mod tests {
             if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
                 continue;
             }
-            assert!(
-                present,
-                "{dll} lacks {}",
-                e.name
-            );
+            assert!(present, "{dll} lacks {}", e.name);
         }
     }
 }

@@ -827,6 +827,9 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
+/// shortcut: slots with no view at all (kind unknown) get this null 2D
+/// view; null buffer views there did not stop the world's low-address
+/// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {

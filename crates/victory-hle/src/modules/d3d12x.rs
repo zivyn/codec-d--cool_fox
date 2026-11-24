@@ -37,10 +37,14 @@ fn host_gpu_failed(what: &str) -> ! {
 }
 
 /// Keeps the host's translations of the title's shaders in `dir` (a
-/// folder of the cache) across runs.
+/// folder of the cache) across runs, and its compiled pipelines beside it
+/// (`pipelines`).
 pub fn use_shader_cache(dir: std::path::PathBuf) {
     #[cfg(windows)]
-    victory_gpu::shader_cache::use_shader_cache(dir);
+    {
+        victory_gpu::pipeline::use_pipeline_cache(dir.with_file_name("pipelines"));
+        victory_gpu::shader_cache::use_shader_cache(dir);
+    }
     #[cfg(not(windows))]
     let _ = dir;
 }

@@ -341,7 +341,12 @@ pub fn emit(
                 }
             }
         }
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0");
+        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
+        // waves: this form puts group barriers inside branches and loops, and runs 121-124
+        // lost the card in a submission of two programs that had just moved to it
+        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
+        // has no barrier, stays on.
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {

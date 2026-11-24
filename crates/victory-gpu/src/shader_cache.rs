@@ -56,6 +56,23 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
+                // So are the switches that pick the form of a wave64 program:
+                // without them here a run with `VICTORY_WAVE_WIDE=0` was
+                // served the translations an earlier run of the same
+                // executable had cached with the switch unset.
+                for name in [
+                    "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_DEEP_SKIPS",
+                    "VICTORY_WAVE_OWN_BITS",
+                    "VICTORY_F16_NEAREST",
+                ] {
+                    bytes.extend_from_slice(name.as_bytes());
+                    bytes.push(b'=');
+                    if let Some(value) = std::env::var_os(name) {
+                        bytes.extend_from_slice(value.as_encoded_bytes());
+                    }
+                    bytes.push(0);
+                }
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

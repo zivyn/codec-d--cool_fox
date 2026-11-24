@@ -140,6 +140,8 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
     };
     // `v_readfirstlane_b32` results descriptors are read from.
     let mut first_lane: Vec<Value> = Vec::new();
+    // Per descriptor read from the first lane: where, and those results.
+    let mut first_lane_at: Vec<(usize, Vec<Value>)> = Vec::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -149,7 +151,11 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
             };
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op).map_err(fail)?;
-                first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
+                let words = t.first_lane_words(inst, op).unwrap_or_default();
+                if !words.is_empty() {
+                    first_lane_at.push((inst.machine.offset, words.clone()));
+                }
+                first_lane.extend(words);
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
             };
@@ -189,6 +195,17 @@ pub fn track(p: &Program, layout: &[RootParam], stage: HwStage) -> Result<Resour
         }
     }
     out.waterfall = t.waterfall(&first_lane);
+    // Taking the first lane's descriptor as each lane's own holds only in
+    // a waterfall loop: one whose compare of the first lane's dwords with
+    // the lane's own repeats the access until every lane has had its turn.
+    for (offset, words) in first_lane_at {
+        if words.iter().any(|w| !out.waterfall.reads.contains(w)) {
+            return Err(ShaderError::Unsupported {
+                offset,
+                what: "a descriptor read from the first lane outside a waterfall loop",
+            });
+        }
+    }
     Ok(out)
 }
 
@@ -1157,7 +1174,9 @@ impl<'a> Tracer<'a> {
                                 return None;
                             };
                             let lane = inst.read(Reg::V(reg + k))?;
+                            let (d, _) = self.defs[x.0 as usize]?;
                             let same = reads.contains(&x)
+                                && self.same_loop(b, d)
                                 && self.lane_term(Term::Value(self.first_lane_source(x)?))
                                     == self.lane_term(Term::Value(lane));
                             same.then_some(x)
@@ -1178,6 +1197,26 @@ impl<'a> Tracer<'a> {
             }
         }
         out
+    }
+
+    /// Whether blocks `a` and `b` are in one loop: each reaches the other
+    /// (a block reaches itself only through a back edge).
+    fn same_loop(&self, a: usize, b: usize) -> bool {
+        let reaches = |from: usize, to: usize| {
+            let mut seen = vec![false; self.p.blocks.len()];
+            let mut stack = self.p.blocks[from].exit.successors();
+            while let Some(x) = stack.pop() {
+                if x == to {
+                    return true;
+                }
+                if std::mem::replace(&mut seen[x], true) {
+                    continue;
+                }
+                stack.extend(self.p.blocks[x].exit.successors());
+            }
+            false
+        };
+        reaches(a, b) && reaches(b, a)
     }
 
     /// Consecutive dwords of one scalar load.
@@ -1845,6 +1884,46 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(offsets, [0, 0x20]);
         assert_eq!(r.waterfall.compares.len(), 4);
+    }
+
+    #[test]
+    fn a_first_lane_read_outside_a_loop_is_no_waterfall() {
+        // The waterfall without its back edge: the s_cbranch_execnz is an
+        // s_nop, so lanes the first one does not match never get a pass.
+        let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
+        let back = words.iter().position(|&w| w == 0xBF89_FFE6).unwrap();
+        words[back] = 0xBF80_0000;
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor read from the first lane outside a waterfall loop",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_first_lane_read_without_its_compare_is_no_waterfall() {
+        // The loop without the compare of dwords 0 and 1: nothing makes
+        // the first lane's dwords the lane's own there.
+        let mut words = WATERFALL_FETCHED_WAVE32.to_vec();
+        let cmp = words.iter().position(|&w| w == 0x0002_080C).unwrap();
+        words[cmp - 1..=cmp].copy_from_slice(&[0xBF80_0000, 0xBF80_0000]);
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor read from the first lane outside a waterfall loop",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

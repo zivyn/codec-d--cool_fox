@@ -345,12 +345,24 @@ pub struct Structured {
     pub reach: Vec<Bool>,
     /// The lane's bit of each lane-mask value, by its low dword's value.
     pub masks: HashMap<Value, Bool>,
+    /// Exact Wave64 pairs for checking masks at their uses.
+    paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
     pub active: HashSet<Value>,
+}
+
+impl Structured {
+    pub(crate) fn mask_bits(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        match high {
+            Some(high) => self.paired_masks.get(&(low, high)),
+            None => self.masks.get(&low),
+        }
+        .copied()
+    }
 }
 
 /// Builds the per-lane form of `program`.
@@ -620,6 +632,7 @@ impl<'a> Lanes<'a> {
                 .filter(|(lo, hi)| lo != hi)
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
+            paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             bools: self.b,
             exits,

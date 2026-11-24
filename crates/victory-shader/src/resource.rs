@@ -14,7 +14,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Bool, LaneExit, Structured};
 
@@ -159,10 +159,9 @@ pub fn track(
             .collect(),
         ..Resources::default()
     };
-    // `v_readfirstlane_b32` results descriptors are read from.
-    let mut first_lane: Vec<Value> = Vec::new();
-    // Per descriptor read from the first lane: where, and those results.
-    let mut first_lane_at: Vec<(usize, Vec<Value>)> = Vec::new();
+    // Group accesses in the same loop so a shared mask can select several
+    // descriptors together.
+    let mut first_lane_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -170,13 +169,10 @@ pub fn track(
                 offset: inst.machine.offset,
                 what,
             };
+            let mut first_lane = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
-                let words = t.first_lane_words(inst, op).unwrap_or_default();
-                if !words.is_empty() {
-                    first_lane_at.push((inst.machine.offset, words.clone()));
-                }
-                first_lane.extend(words);
+                first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
             };
@@ -213,19 +209,24 @@ pub fn track(
                 }
                 _ => {}
             }
+            if !first_lane.is_empty() {
+                let (accesses, reads) = first_lane_at.entry(b).or_default();
+                accesses.push(i);
+                reads.extend(first_lane);
+            }
         }
     }
-    out.waterfall = t.waterfall(&first_lane);
-    // Taking the first lane's descriptor as each lane's own holds only in
-    // a waterfall loop: one whose compare of the first lane's dwords with
-    // the lane's own repeats the access until every lane has had its turn.
-    for (offset, words) in first_lane_at {
-        if words.iter().any(|w| !out.waterfall.reads.contains(w)) {
-            return Err(ShaderError::Unsupported {
-                offset,
-                what: "a descriptor read from the first lane outside a waterfall loop",
-            });
-        }
+    for (block, (accesses, mut reads)) in first_lane_at {
+        reads.sort_unstable();
+        reads.dedup();
+        let proof =
+            t.waterfall(block, &accesses, &reads)
+                .ok_or_else(|| ShaderError::Unsupported {
+                    offset: t.inst((block, accesses[0])).machine.offset,
+                    what: "a descriptor read from the first lane outside a waterfall loop",
+                })?;
+        out.waterfall.compares.extend(proof.compares);
+        out.waterfall.reads.extend(proof.reads);
     }
     Ok(out)
 }
@@ -1384,77 +1385,128 @@ impl<'a> Tracer<'a> {
         false
     }
 
-    /// The waterfall loops over descriptors read from the first lane (the
-    /// `v_readfirstlane_b32` results `reads`): the `v_cmp_eq` of those
-    /// results with the dwords they read.
-    fn waterfall(&self, reads: &[Value]) -> Waterfall {
-        let mut out = Waterfall::default();
-        if reads.is_empty() {
-            return out;
+    /// Prove a single-block waterfall at the descriptor access. In each
+    /// iteration the access serves exactly the matching lanes, and the
+    /// back edge keeps exactly the other lanes active.
+    fn waterfall(&self, b: usize, accesses: &[usize], reads: &[Value]) -> Option<Waterfall> {
+        let access = accesses[0];
+        let block = &self.p.blocks[b];
+        let lanes = self.lanes?;
+        let exit = block.insts.last()?;
+        if !matches!(block.exit, Exit::Branch { taken, not_taken } if taken == b && not_taken != b)
+            || exit.name() != "s_cbranch_execnz"
+        {
+            return None;
         }
-        for (b, block) in self.p.blocks.iter().enumerate() {
-            for (i, inst) in block.insts.iter().enumerate() {
-                let Fields::Valu(f) = &inst.fields else {
-                    continue;
-                };
-                let Some(ty) = inst
-                    .name()
-                    .strip_prefix("v_cmp_eq_")
-                    .or(inst.name().strip_prefix("v_cmpx_eq_"))
+        let mask = |low: Option<Value>, high: Option<Value>| {
+            let high = if self.p.wave64 { Some(high?) } else { None };
+            lanes.mask_bits(low?, high)
+        };
+        let exec = |inst: &Inst| mask(inst.read(Reg::S(EXEC)), inst.read(Reg::S(EXEC + 1)));
+        let selected = exec(&block.insts[access])?;
+        if accesses
+            .iter()
+            .any(|&i| exec(&block.insts[i]) != Some(selected))
+        {
+            return None;
+        }
+        let retry = exec(exit)?;
+        let first = self.defs[reads[0].0 as usize]?;
+        let remaining = exec(self.inst(first))?;
+        if reads.iter().any(|v| {
+            self.defs[v.0 as usize].is_none_or(|at| {
+                at.0 != b || at.1 >= access || exec(self.inst(at)) != Some(remaining)
+            })
+        }) {
+            return None;
+        }
+        let reach = (lanes.reach[b], true);
+        let meet = |conditions: &[(Bool, bool)]| lanes.bools.meet(conditions);
+        let mut out = Waterfall::default();
+        let mut required = vec![(remaining, true)];
+        for (i, inst) in block.insts[..access].iter().enumerate() {
+            let Fields::Valu(f) = &inst.fields else {
+                continue;
+            };
+            let Some(ty) = inst
+                .name()
+                .strip_prefix("v_cmp_eq_")
+                .or(inst.name().strip_prefix("v_cmpx_eq_"))
+            else {
+                continue;
+            };
+            let dwords = match ty {
+                "u32" | "i32" => 1,
+                "u64" | "i64" => 2,
+                _ => continue,
+            };
+            if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                continue;
+            }
+            // The first lane's dwords on one side, the lane's own on the
+            // other.
+            let pair = |first: &Operand, own: &Operand| -> Option<Vec<Value>> {
+                let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) = (first, own)
                 else {
+                    return None;
+                };
+                (0..dwords)
+                    .map(|k| {
+                        let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
+                            return None;
+                        };
+                        let lane = inst.read(Reg::V(reg + k))?;
+                        let (_, read) = self.defs[x.0 as usize]?;
+                        let same = reads.contains(&x)
+                            && read < i
+                            && self.lane_term(Term::Value(self.first_lane_source(x)?))
+                                == self.lane_term(Term::Value(lane));
+                        same.then_some(x)
+                    })
+                    .collect()
+            };
+            let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
+                continue;
+            };
+            if let Some(xs) = pair(a, c).or_else(|| pair(c, a)) {
+                let code = if inst.name().starts_with("v_cmpx_") {
+                    EXEC
+                } else if let Some(Operand::Scalar { code, .. }) = f.dst {
+                    code
+                } else {
                     continue;
                 };
-                let dwords = match ty {
-                    "u32" | "i32" => 1,
-                    "u64" | "i64" => 2,
-                    _ => continue,
+                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+                    continue;
                 };
-                if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+                if meet(&[reach, (selected, true), (matched, false)]) {
                     continue;
                 }
-                // The first lane's dwords on one side, the lane's own on the
-                // other.
-                let pair = |first: &Operand, own: &Operand| -> Option<Vec<Value>> {
-                    let (&Operand::Scalar { code, .. }, &Operand::Vector { reg, .. }) =
-                        (first, own)
-                    else {
-                        return None;
-                    };
-                    (0..dwords)
-                        .map(|k| {
-                            let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
-                                return None;
-                            };
-                            let lane = inst.read(Reg::V(reg + k))?;
-                            let (d, _) = self.defs[x.0 as usize]?;
-                            let same = reads.contains(&x)
-                                && self.same_loop(b, d)
-                                && self.lane_term(Term::Value(self.first_lane_source(x)?))
-                                    == self.lane_term(Term::Value(lane));
-                            same.then_some(x)
-                        })
-                        .collect()
-                };
-                let (Some(a), Some(c)) = (f.src.first(), f.src.get(1)) else {
-                    continue;
-                };
-                if let Some(xs) = pair(a, c).or_else(|| pair(c, a)) {
-                    out.compares.push((b, i));
-                    for x in xs {
-                        if !out.reads.contains(&x) {
-                            out.reads.push(x);
-                        }
+                required.push((matched, true));
+                out.compares.push((b, i));
+                for x in xs {
+                    if !out.reads.contains(&x) {
+                        out.reads.push(x);
                     }
                 }
             }
         }
-        out
-    }
-
-    /// Whether blocks `a` and `b` are in one loop: each reaches the other
-    /// (a block reaches itself only through a back edge).
-    fn same_loop(&self, a: usize, b: usize) -> bool {
-        self.reaches(a, b) && self.reaches(b, a)
+        if reads.iter().any(|v| !out.reads.contains(v))
+            || meet(&[reach, (selected, true), (remaining, false)])
+        {
+            return None;
+        }
+        // The access must take every match. The retry must keep exactly
+        // the lanes that were eligible but did not perform the access.
+        required.extend([reach, (selected, false)]);
+        if meet(&required)
+            || meet(&[reach, (retry, true), (remaining, false)])
+            || meet(&[reach, (retry, true), (selected, true)])
+            || meet(&[reach, (remaining, true), (selected, false), (retry, false)])
+        {
+            return None;
+        }
+        Some(out)
     }
 
     /// Consecutive dwords of one scalar load.
@@ -2467,6 +2519,69 @@ pub(crate) mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_compare_that_does_not_mask_the_access_is_no_waterfall() {
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let save = words.iter().position(|&w| w == 0xBE95_3C15).unwrap();
+        words[save] = 0xBE95_037E; // s_mov_b32 s21, exec_lo
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor read from the first lane outside a waterfall loop",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_loop_that_drops_unmatched_lanes_is_no_waterfall() {
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let retry = words.iter().position(|&w| w == 0x897E_157E).unwrap();
+        words[retry] = 0xBEFE_0380; // s_mov_b32 exec_lo, 0
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor read from the first lane outside a waterfall loop",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_descriptor_used_after_exec_is_restored_is_no_waterfall() {
+        let mut words = WATERFALL_JOINED_WAVE32.to_vec();
+        let sample = words.iter().position(|&w| w == 0xF09C_0F08).unwrap();
+        let restore = words.iter().position(|&w| w == 0xBEFE_0317).unwrap();
+        let image = [words[sample], words[sample + 1]];
+        words[sample..sample + 2].fill(0xBF80_0000); // Keep the branch offsets.
+        words.splice(restore + 1..restore + 1, image);
+        let err = waterfall(&words, false).unwrap_err();
+        assert!(matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor read from the first lane outside a waterfall loop",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_wave64_access_with_exec_hi_overwritten_is_no_waterfall() {
+        let mut words = WATERFALL_FETCHED_WAVE64.to_vec();
+        let save = words.iter().position(|&w| w == 0xBE96_2416).unwrap();
+        words[save + 1] = 0xBEFF_03C1; // s_mov_b32 exec_hi, -1
+        let err = waterfall(&words, true).unwrap_err();
+        assert!(matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor read from the first lane outside a waterfall loop",
+                ..
+            }
+        ));
     }
 
     #[test]

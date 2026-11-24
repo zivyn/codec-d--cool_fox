@@ -1259,3 +1259,92 @@ fn v_cmp_class_f16_matches_rdna2() {
         );
     });
 }
+
+#[test]
+fn v_cvt_f32_f64_matches_ieee754() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f -> VOP3 opcode 0x18f).
+    let plain = build_valu_cs(&[vop1(0x00f, 0, vgpr(1))]);
+    // Same with abs + neg on src0 (VOP3: abs[0] = bit 8 of w0, neg[0] = bit 29 of w1).
+    let [mut w0, mut w1] = vop3(0x18f, 0, vgpr(1), 0, 0);
+    w0 |= 1 << 8;
+    w1 |= 1 << 29;
+    let neg_abs = build_valu_cs(&[w0, w1]);
+
+    let values: &[f64] = &[
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        3.5,
+        -123456.75,
+        // Tie-to-even: even mantissa stays, odd mantissa rounds up.
+        f64::from_bits(0x3FF0_0000_1000_0000), // 1.0 + 0.5 ulp(f32) -> 1.0
+        f64::from_bits(0x3FF0_0000_3000_0000), // (1.0 + 1 ulp) + 0.5 ulp -> 1.0 + 2 ulp
+        f64::from_bits(0x3FF0_0000_1000_0001), // > 0.5 ulp -> rounds up
+        // Largest finite f32 and overflow to +Inf / -Inf.
+        f64::from(f32::MAX),
+        f64::from(f32::MAX) * 1.000_001,
+        -f64::from(f32::MAX) * 1.000_001,
+        1e300,
+        // Subnormal range (exp64 in [874, 896]), including carry into smallest normal.
+        f64::from(f32::MIN_POSITIVE),
+        f64::from(f32::MIN_POSITIVE) * 0.5,
+        f64::from(f32::MIN_POSITIVE) * 0.75,
+        f64::from(f32::from_bits(0x007F_FFFF)),
+        f64::from_bits(0x380F_FFFF_F000_0000), // max subnormal + 0.5 ulp -> min normal
+        // exp64 == 873: exact 2^-150 ties to 0; strictly greater rounds to min subnormal (1).
+        f64::from_bits(0x3690_0000_0000_0000),
+        f64::from_bits(0x3690_0000_0000_0001),
+        f64::from_bits(0xB690_0000_0000_0001),
+        // Deep underflow -> +/-0.0.
+        1e-200,
+        -1e-200,
+        // Infinities and NaNs.
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::from_bits(0x7FF8_0000_0000_0000), // +qNaN
+        f64::from_bits(0x7FF0_0000_0000_0001), // +sNaN -> quieted
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .map(|&x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&plain, &inputs, |backend, i, _, got| {
+        let x = values[i];
+        let want = (x as f32).to_bits();
+        if x.is_nan() {
+            assert!(
+                f32::from_bits(got).is_nan() && (got & 0x0040_0000) != 0,
+                "{backend}: v_cvt_f32_f64({:#018x}) = {got:#010x}, expected qNaN",
+                x.to_bits(),
+            );
+        } else {
+            assert_eq!(
+                got, want,
+                "{backend}: v_cvt_f32_f64({x} / {:#018x}) = {got:#010x}, want {want:#010x}",
+                x.to_bits(),
+            );
+        }
+    });
+
+    // -|x| via VOP3 abs + neg modifiers.
+    let mod_values: &[f64] = &[2.5, -2.5, 0.0, f64::INFINITY];
+    let mod_in: Vec<[u32; 4]> = mod_values
+        .iter()
+        .map(|&x| {
+            let b = x.to_bits();
+            [b as u32, (b >> 32) as u32, 0, 0]
+        })
+        .collect();
+    run_cases(&neg_abs, &mod_in, |backend, i, _, got| {
+        let x = mod_values[i];
+        let want = (-(x.abs()) as f32).to_bits();
+        assert_eq!(
+            got, want,
+            "{backend}: v_cvt_f32_f64(-|{x}|) = {got:#010x}, want {want:#010x}",
+        );
+    });
+}

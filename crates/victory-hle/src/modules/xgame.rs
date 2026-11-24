@@ -81,13 +81,18 @@ extern "system" fn launch_new_game(
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
-    super::lifecycle::end_title(
-        "XLaunchNewGame",
-        Box::new(move || super::lifecycle::relaunch(command)),
-    );
-    loop {
-        std::thread::park();
+    #[cfg(windows)]
+    {
+        super::lifecycle::end_title(
+            "XLaunchNewGame",
+            Box::new(move || super::lifecycle::relaunch(command)),
+        );
+        loop {
+            std::thread::park();
+        }
     }
+    #[cfg(not(windows))]
+    let _ = command;
 }
 
 /// Our own arguments for the relaunch: the title's executable replaced by
@@ -99,14 +104,53 @@ fn relaunch_args(
     args: &str,
 ) -> Vec<std::ffi::OsString> {
     let mut out: Vec<_> = ours.into_iter().take_while(|a| a != "--").collect();
+    // `runtime` makes the image path absolute when it maps the title, so a
+    // relative launch argument is not textually equal to it. Normalise the
+    // same way before matching, or a relaunch would run the old executable.
     if !exe.is_empty()
-        && let Some(slot) = out.iter_mut().find(|a| a.as_os_str() == current)
+        && let Some(slot) = out.iter_mut().find(|a| {
+            a.as_os_str() == current
+                || std::path::absolute(a).is_ok_and(|p| p.as_os_str() == current)
+        })
     {
         *slot = exe.into();
     }
     if !args.trim().is_empty() {
         out.push("--".into());
-        out.extend(args.split_whitespace().map(Into::into));
+        out.extend(split_args(args).into_iter().map(Into::into));
+    }
+    out
+}
+
+/// Splits the title's command-line tail into arguments, keeping quoted
+/// strings together (including empty ones). `split_whitespace` would hand
+/// the child a quoted path as several broken arguments.
+fn split_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for c in args.chars() {
+        match c {
+            '"' | '\'' if quote == Some(c) => quote = None,
+            '"' | '\'' if quote.is_none() => {
+                quote = Some(c);
+                started = true;
+            }
+            c if quote.is_none() && c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            c => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(current);
     }
     out
 }
@@ -207,6 +251,36 @@ mod tests {
         let other = relaunch_args(ours, current, "G:/other.exe", "");
         assert_eq!(other.len(), 5);
         assert_eq!(other[1], "G:/other.exe");
+    }
+
+    #[test]
+    fn a_relaunch_replaces_a_relative_startup_executable() {
+        // `runtime::set_image_path` makes this absolute before the launch.
+        let current = std::path::absolute("game.exe").unwrap();
+        let ours: Vec<std::ffi::OsString> =
+            ["run", "game.exe", "--execute", "--console", "series-s", "--", "-old"]
+                .map(Into::into)
+                .into();
+        let again = relaunch_args(
+            ours,
+            current.as_os_str(),
+            "other.exe",
+            r#"--config="C:\Program Files\game" "" -y"#,
+        );
+        let expected: Vec<std::ffi::OsString> = [
+            "run",
+            "other.exe",
+            "--execute",
+            "--console",
+            "series-s",
+            "--",
+            r"--config=C:\Program Files\game",
+            "",
+            "-y",
+        ]
+        .map(Into::into)
+        .into();
+        assert_eq!(again, expected, "the requested exe and quoted args survive");
     }
 
     #[test]

@@ -4979,28 +4979,50 @@ impl<'a> Lower<'a> {
         let (op, ty) = rest.rsplit_once('_').ok_or("a compare")?;
         let c = self.cur;
         let r = match ty {
-            "f32" if op == "class" => {
+            "f32" | "f16" if op == "class" => {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
-                let x = self.fsrc(inst, 0)?;
-                let x = self.as_int(x);
+                let f16 = ty == "f16";
+                let x = if f16 {
+                    let Fields::Valu(v) = &inst.fields else {
+                        unreachable!()
+                    };
+                    let mut h = self.half_src(inst, 0)?;
+                    if v.abs & 1 != 0 {
+                        let m = self.s.m.i32(0x7FFF);
+                        h = self.s.m.bin(c, Bin::And, h, m);
+                    }
+                    if v.neg & 1 != 0 {
+                        let s = self.s.m.i32(0x8000);
+                        h = self.s.m.bin(c, Bin::Xor, h, s);
+                    }
+                    h
+                } else {
+                    let x = self.fsrc(inst, 0)?;
+                    self.as_int(x)
+                };
                 let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k23, k31, kff, mant, quiet) = (
-                    k(self, 23),
-                    k(self, 31),
-                    k(self, 0xFF),
-                    k(self, 0x7F_FFFF),
-                    k(self, 0x40_0000),
+                let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
+                    (10, 15, 0x1F, 0x03FF, 0x0200)
+                } else {
+                    (23, 31, 0xFF, 0x7F_FFFF, 0x40_0000)
+                };
+                let (k_exp, k_sign, k_emax, mant, quiet) = (
+                    k(self, exp_sh),
+                    k(self, sign_sh),
+                    k(self, exp_mask),
+                    k(self, mant_mask),
+                    k(self, quiet_bit),
                 );
-                let e = self.s.m.bin(c, Bin::LShr, x, k23);
-                let e = self.s.m.bin(c, Bin::And, e, kff);
+                let e = self.s.m.bin(c, Bin::LShr, x, k_exp);
+                let e = self.s.m.bin(c, Bin::And, e, k_emax);
                 let m = self.s.m.bin(c, Bin::And, x, mant);
-                let neg = self.s.m.bin(c, Bin::LShr, x, k31);
+                let neg = self.s.m.bin(c, Bin::LShr, x, k_sign);
                 let zero = k(self, 0);
-                let (e0, e255) = (
+                let (e0, emax) = (
                     self.s.m.cmp(c, pred::EQ, e, zero),
-                    self.s.m.cmp(c, pred::EQ, e, kff),
+                    self.s.m.cmp(c, pred::EQ, e, k_emax),
                 );
                 let m0 = self.s.m.cmp(c, pred::EQ, m, zero);
                 let q = self.s.m.bin(c, Bin::And, x, quiet);
@@ -5010,7 +5032,7 @@ impl<'a> Lower<'a> {
                     (k(self, 8), k(self, 9), k(self, 6), k(self, 7));
                 let t = self.s.m.select(c, m0, zero_c, denorm);
                 let t = self.s.m.select(c, e0, t, normal);
-                let t = self.s.m.select(c, e255, inf, t);
+                let t = self.s.m.select(c, emax, inf, t);
                 let eleven = k(self, 11);
                 let mirrored = self.s.m.bin(c, Bin::Sub, eleven, t);
                 let is_neg = self.s.m.cmp(c, pred::NE, neg, zero);
@@ -5019,7 +5041,7 @@ impl<'a> Lower<'a> {
                 let nan_class = self.s.m.select(c, q, one, snan);
                 let yes = self.s.m.bool(true);
                 let nan = self.s.m.bin(c, Bin::Xor, m0, yes);
-                let nan = self.s.m.bin(c, Bin::And, nan, e255);
+                let nan = self.s.m.bin(c, Bin::And, nan, emax);
                 let t = self.s.m.select(c, nan, nan_class, t);
                 let bit = self.s.m.bin(c, Bin::LShr, mask, t);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);

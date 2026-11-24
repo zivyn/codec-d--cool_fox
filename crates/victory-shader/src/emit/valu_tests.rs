@@ -666,6 +666,51 @@ fn v_min3_max3_med3_integer_forms_match_rdna2() {
 }
 
 #[test]
+fn v_min3_max3_med3_integer_forms_match_rdna2() {
+    // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
+    let ops: [(&str, u16, fn([u32; 3]) -> u32); 6] = [
+        ("v_min3_i32", 0x152, |t| {
+            t.into_iter().min_by_key(|&x| x as i32).unwrap()
+        }),
+        ("v_min3_u32", 0x153, |t| t.into_iter().min().unwrap()),
+        ("v_max3_i32", 0x155, |t| {
+            t.into_iter().max_by_key(|&x| x as i32).unwrap()
+        }),
+        ("v_max3_u32", 0x156, |t| t.into_iter().max().unwrap()),
+        ("v_med3_i32", 0x158, |mut t| {
+            t.sort_by_key(|&x| x as i32);
+            t[1]
+        }),
+        ("v_med3_u32", 0x159, |mut t| {
+            t.sort_unstable();
+            t[1]
+        }),
+    ];
+    // Every ordering of three values, with the sign bit set on some so that
+    // the signed and unsigned answers differ.
+    let values = [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF];
+    let mut cases = Vec::new();
+    for a in values {
+        for b in values {
+            for c in values {
+                cases.push([a, b, c, 0]);
+            }
+        }
+    }
+    for (name, op, pick) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            let want = pick([inp[0], inp[1], inp[2]]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1], inp[2],
+            );
+        });
+    }
+}
+
+#[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
     let shader = build_valu_cs(&vop3(0x357, 0, vgpr(1), vgpr(2), vgpr(3)));

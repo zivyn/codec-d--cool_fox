@@ -85,6 +85,18 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
+                // A machine without a graphics card gives the software
+                // adapter as its default one (a hosted test runner): that
+                // is no hardware device, and the tests that ask for one
+                // skip it, as they do where there is none.
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                if let Ok(first) = factory.EnumAdapters1(0)
+                    && let Ok(desc) = first.GetDesc1()
+                    && desc.Flags & 2 != 0
+                {
+                    return Err("the default adapter is a software adapter".to_owned());
+                }
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             }
             let device = device.ok_or("no device")?;

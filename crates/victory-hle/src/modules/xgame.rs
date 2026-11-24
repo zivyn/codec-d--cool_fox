@@ -122,22 +122,21 @@ fn relaunch_args(
     out
 }
 
-/// Splits the title's command-line tail into arguments, keeping quoted
-/// strings together (including empty ones). `split_whitespace` would hand
-/// the child a quoted path as several broken arguments.
+/// Splits the title's command-line tail into arguments, keeping double-quoted
+/// strings together (including empty ones). Windows command lines quote only
+/// with `"`: an apostrophe is ordinary text, as in `O'Brien`.
 fn split_args(args: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
-    let mut quote = None;
+    let mut quoted = false;
     let mut started = false;
     for c in args.chars() {
         match c {
-            '"' | '\'' if quote == Some(c) => quote = None,
-            '"' | '\'' if quote.is_none() => {
-                quote = Some(c);
+            '"' => {
+                quoted = !quoted;
                 started = true;
             }
-            c if quote.is_none() && c.is_whitespace() => {
+            c if !quoted && c.is_whitespace() => {
                 if started {
                     out.push(std::mem::take(&mut current));
                     started = false;
@@ -265,7 +264,7 @@ mod tests {
             ours,
             current.as_os_str(),
             "other.exe",
-            r#"--config="C:\Program Files\game" "" -y"#,
+            r#"--config="C:\Program Files\game" "" -name=O'Brien -y"#,
         );
         let expected: Vec<std::ffi::OsString> = [
             "run",
@@ -276,6 +275,7 @@ mod tests {
             "--",
             r"--config=C:\Program Files\game",
             "",
+            "-name=O'Brien",
             "-y",
         ]
         .map(Into::into)

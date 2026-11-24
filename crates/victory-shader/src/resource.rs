@@ -133,6 +133,9 @@ pub struct Waterfall {
     /// The `v_readfirstlane_b32` results they compare, each the lane's own
     /// source dword.
     pub reads: Vec<Value>,
+    /// Descriptor loads at a table offset among `reads` (the console
+    /// compiler's form): each lane loads its own entry.
+    pub loads: Vec<Site>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
@@ -162,6 +165,10 @@ pub fn track(
     // Group accesses in the same loop so a shared mask can select several
     // descriptors together.
     let mut first_lane_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
+    // The console compiler's waterfall reads the first lane's table offset
+    // and loads that entry: accesses, offset reads and loads by block.
+    let mut offset_at =
+        std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -170,9 +177,17 @@ pub fn track(
                 what,
             };
             let mut first_lane = Vec::new();
+            let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
                 let source = t.descriptor(inst, op, b).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
+                if let Source::Loaded { load, .. } = source
+                    && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
+                    && let Some(Term::Value(v)) = a.dynamic.map(|d| t.origin(d))
+                    && t.first_lane_source(v).is_some()
+                {
+                    offset.push((v, load));
+                }
                 out.descriptors.push(Descriptor { site, role, source });
                 Ok(())
             };
@@ -214,6 +229,14 @@ pub fn track(
                 accesses.push(i);
                 reads.extend(first_lane);
             }
+            if !offset.is_empty() {
+                let (accesses, reads, loads) = offset_at.entry(b).or_default();
+                accesses.push(i);
+                for (v, load) in offset {
+                    reads.push(v);
+                    loads.push(load);
+                }
+            }
         }
     }
     // The proof needs the per-lane form. Without it nothing is emitted, and
@@ -232,6 +255,17 @@ pub fn track(
             })?;
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
+    }
+    // Unproven, an offset read stays the first lane's (one uniform entry),
+    // which is what the hardware reads outside a waterfall loop.
+    for (block, (accesses, mut reads, loads)) in offset_at {
+        reads.sort_unstable();
+        reads.dedup();
+        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
+            out.waterfall.compares.extend(proof.compares);
+            out.waterfall.reads.extend(proof.reads);
+            out.waterfall.loads.extend(loads);
+        }
     }
     Ok(out)
 }
@@ -2232,6 +2266,64 @@ pub(crate) mod tests {
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
+
+    /// The console compiler's waterfall (Grand Theft Auto VI's ray-tracing
+    /// resolve and others): each lane holds its entry's byte offset in the
+    /// table at s0 (v7 = (lane & 1) * 32); the loop reads the first active
+    /// lane's offset, narrows EXEC to the lanes with the same one
+    /// (`v_cmpx_eq_u32`), loads that entry with `s_load_dwordx8` and samples,
+    /// then drops those lanes (`s_andn2_wrexec_b32`). The sample goes to the
+    /// buffer at dword 16 of the table, at lane * 4.
+    pub(crate) const WATERFALL_INDEXED_WAVE32: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE97_037E, // s_mov_b32 s23, exec_lo
+        0xBE95_037E, // s_mov_b32 s21, exec_lo
+        0x7E28_0507, // 0x40: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec_lo, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE95_4715, // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x40
+        0xBEFE_0317, // s_mov_b32 exec_lo, s23
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one() {
+        let r = waterfall(WATERFALL_INDEXED_WAVE32, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        let (_, address) = r.scalar.iter().find(|s| s.0 == load).unwrap();
+        assert!(address.dynamic.is_some(), "{address:?}");
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
 
     /// [`WATERFALL_JOINED_WAVE32`] with other sources on each path: lanes
     /// below 16 load table entry (lane & 1) with two `global_load_dwordx4`,

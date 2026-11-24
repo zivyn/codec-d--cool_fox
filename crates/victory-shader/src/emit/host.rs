@@ -85,19 +85,22 @@ impl Host {
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
-                // A machine without a graphics card gives the software
-                // adapter as its default one (a hosted test runner): that
-                // is no hardware device, and the tests that ask for one
-                // skip it, as they do where there is none.
-                let factory: IDXGIFactory4 =
-                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
-                if let Ok(first) = factory.EnumAdapters1(0)
-                    && let Ok(desc) = first.GetDesc1()
-                    && desc.Flags & 2 != 0
-                {
-                    return Err("the default adapter is a software adapter".to_owned());
-                }
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                // A machine without a graphics card gives the software
+                // adapter as its default device (a hosted test runner,
+                // whose first adapter is a display stub that cannot make a
+                // device): that is no hardware device, and the tests that
+                // ask for one skip it, as they do where there is none.
+                if let Some(made) = &device {
+                    let factory: IDXGIFactory4 =
+                        CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                    if let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(made.GetAdapterLuid())
+                        && let Ok(desc) = adapter.GetDesc1()
+                        && (desc.Flags & 2 != 0 || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c))
+                    {
+                        return Err("the default device is the software adapter".to_owned());
+                    }
+                }
             }
             let device = device.ok_or("no device")?;
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {

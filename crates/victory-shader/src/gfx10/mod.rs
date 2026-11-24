@@ -56,12 +56,16 @@ pub struct Instruction {
     pub opcode: u16,
     /// Every dword of the instruction, including literals and extra dwords.
     pub words: Vec<u32>,
+    /// [`name`] of `encoding` and `opcode`, resolved once at decode time.
+    /// The translator asks about every instruction eight times; the table is
+    /// a binary search.
+    name: Option<&'static str>,
 }
 
 impl Instruction {
     /// AMD's name for the opcode, if it is in our table.
     pub fn name(&self) -> Option<&'static str> {
-        name(self.encoding, self.opcode)
+        self.name
     }
 }
 
@@ -282,11 +286,13 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
             _ => return Err(isa(offset, "unknown encoding")),
         }
     };
+    let opcode = opcode as u16;
     Ok(Instruction {
         offset,
         encoding,
-        opcode: opcode as u16,
+        opcode,
         words: (0..len).map(word).collect::<Result<_, _>>()?,
+        name: name(encoding, opcode),
     })
 }
 

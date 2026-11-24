@@ -236,7 +236,7 @@ pub(super) const SOPP: &[(u16, &str)] = &[
     (0x023, "s_waitcnt_depctr"),
     (0x024, "s_round_mode"),
     (0x025, "s_denorm_mode"),
-    (0x026, "s_ttracedata_imm"),
+    (0x028, "s_ttracedata_imm"),
 ];
 
 pub(super) const SMEM: &[(u16, &str)] = &[
@@ -1313,3 +1313,21 @@ pub(super) const SCRATCH: &[(u16, &str)] = &[
     (0x024, "scratch_load_short_d16"),
     (0x025, "scratch_load_short_d16_hi"),
 ];
+
+#[cfg(test)]
+mod tests {
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// `s_ttracedata_imm 0x1234` as LLVM's GFX10 disassembler tests have it
+    /// (`gfx10_sopp.txt`: `0x34,0x12,0xa8,0xbf`), SOPP opcode 0x28 as in
+    /// AMD's RDNA2 ISA. A thread-trace marker, which translation drops.
+    #[test]
+    fn s_ttracedata_imm_is_sopp_0x28() {
+        let code = bytes(&[0xBFA8_1234, 0xBF81_0000]);
+        let decoded = super::super::decode(&code).unwrap();
+        assert_eq!(decoded[0].name(), Some("s_ttracedata_imm"));
+        assert!(crate::ir::build(&code, false, 1).is_ok());
+    }
+}

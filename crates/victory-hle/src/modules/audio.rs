@@ -608,18 +608,25 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let ends_loop = loop_end != 0
         && (frame.start == loop_end
             || (frame.start < loop_end && frame.next.is_none_or(|n| loop_end < n)));
-    if loops > 0 && ends_loop {
+    let looping = loops > 0 && ends_loop;
+    if looping {
         let keep = (context.field(1, 12, 2) as usize + 1) * xma::SUBFRAME_SAMPLES * channels;
         pcm.truncate(keep);
         next = context.field(3, 0, 26) as usize;
-        voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
         if loops != 255 {
             context.set_field(0, 12, 8, loops - 1);
         }
     }
+    // What is still to skip is this frame's (the stream's first, or a
+    // loop's first when it is its last too).
     let skip = (voice.skip * channels).min(pcm.len());
     voice.skip -= skip / channels;
     voice.pcm.extend(&pcm[skip..]);
+    if looping {
+        // The loop's own skip is of its first frame, decoded next: not of
+        // this one, its last.
+        voice.skip = context.field(1, 17, 3) as usize * xma::SUBFRAME_SAMPLES;
+    }
     if next == 0 {
         context.set_field(0, 20 + current, 1, 0);
     }
@@ -1081,6 +1088,69 @@ mod tests {
         ApuFree(input);
         ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// A loop over the first two frames, which ends after the second
+    /// frame's second subframe and starts two subframes into the first.
+    /// Each end of the loop is cut in its own frame.
+    #[test]
+    fn a_loop_skips_subframes_of_its_first_frame() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        // SAFETY: two packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+
+        // Frames start at bits 32, 63 and 94 of each packet.
+        let (first, second, third) = (32, 63, 94);
+        let (end_subframe, skip_subframes) = (1, 2);
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        // Two packets, one loop, input 0 valid; 48 kHz mono.
+        context.set(0, 2 | 1 << 12 | 1 << 20 | 4 << 22);
+        context.set(
+            1,
+            1 << 31 | 3 << 27 | end_subframe << 12 | skip_subframes << 17,
+        );
+        context.set(2, first);
+        context.set(3, first);
+        context.set(4, second);
+        context.set(5, input_apu);
+        let mut voice = Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+        let mut step = |expect_next: u32| {
+            let before = voice.pcm.len();
+            assert!(decode(context, &mut voice));
+            assert_eq!(context.field(2, 0, 26), expect_next);
+            voice.pcm.len() - before
+        };
+        let subframe = xma::SUBFRAME_SAMPLES;
+        // Before the loop: the first frame whole.
+        assert_eq!(step(second), 4 * subframe);
+        // The loop's last frame: its first two subframes, then back.
+        assert_eq!(step(first), 2 * subframe, "the loop's last frame");
+        assert_eq!(context.field(0, 12, 8), 0, "one loop, taken");
+        // The loop's first frame again: without its first two subframes.
+        assert_eq!(step(second), 2 * subframe, "the loop's first frame");
+        // No loops left: both frames whole, and on to the third.
+        assert_eq!(step(third), 4 * subframe);
+        ApuFree(input);
     }
 
     #[test]

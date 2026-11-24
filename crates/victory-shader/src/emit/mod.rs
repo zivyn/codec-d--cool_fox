@@ -241,6 +241,13 @@ pub fn emit(
             _ => 0,
         };
     }
+    // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
+    // wants the position centroid (or per sample), as DXC declares it then.
+    if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
+        for e in inputs.iter_mut().filter(|e| e.kind == 3) {
+            e.interp = 5;
+        }
+    }
     // Per-primitive outputs are constant. The console never exports a
     // primitive id or cull flag a mesh shader writes (it culls with the
     // primitive export), so those rows are left out.

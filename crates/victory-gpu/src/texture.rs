@@ -32,7 +32,7 @@ macro_rules! once {
 
 /// A texture's upload state: the staging buffer laid out as the host
 /// texture's subresources, and what was last detiled.
-struct Staging {
+pub(crate) struct Staging {
     buffer: ID3D12Resource,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
@@ -165,13 +165,14 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    list.defer_host(move || staging.refresh());
+    // Once per submission however many of its lists sample the texture.
+    list.defer_texture(staging);
 }
 
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
-    fn refresh(&self) {
+    pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let read = self.refresh_now();

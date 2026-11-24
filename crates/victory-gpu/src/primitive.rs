@@ -22,9 +22,15 @@
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
+    let (Some(in_rect), Some(out_rect)) = (stride.checked_mul(3), stride.checked_mul(6)) else {
+        return;
+    };
     for (rect, out) in src
-        .chunks_exact(3 * stride)
-        .zip(dst.chunks_exact_mut(6 * stride))
+        .chunks_exact(in_rect)
+        .zip(dst.chunks_exact_mut(out_rect))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
         for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
@@ -277,5 +283,84 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    #[test]
+    fn zero_or_overflowing_stride_is_ignored_without_panicking() {
+        let mut dst = [0xAAu8; 16];
+        expand_rects(&[1, 2, 3], &mut dst, 0, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+        expand_rects(&[1, 2, 3], &mut dst, usize::MAX / 2, &[(0, 16)]);
+        assert_eq!(dst, [0xAAu8; 16]);
+    }
+
+    #[test]
+    fn unorm16_unorm8_clamping_and_unknown_formats_expand_correctly() {
+        // Vertex layout (12 bytes):
+        //   0..4: R16G16_UNORM (format 35)
+        //   4..8: R8G8B8A8_UNORM (format 28) — tests clamping below 0 and above 1
+        //   8..12: unknown format (999) — must keep v0's bytes verbatim
+        let v = |u0: u16, u1: u16, c: [u8; 4], raw: [u8; 4]| {
+            let mut b = Vec::with_capacity(12);
+            b.extend(u0.to_le_bytes());
+            b.extend(u1.to_le_bytes());
+            b.extend(c);
+            b.extend(raw);
+            b
+        };
+        let src = [
+            v(
+                10_000,
+                50_000,
+                [10, 200, 100, 255],
+                [0xDE, 0xAD, 0xBE, 0xEF],
+            ),
+            v(20_000, 10_000, [100, 50, 100, 255], [1, 2, 3, 4]),
+            v(30_000, 20_000, [20, 200, 100, 255], [5, 6, 7, 8]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 6 * 12];
+        expand_rects(&src, &mut dst, 12, &[(0, 35), (4, 28), (8, 999)]);
+        let fourth = &dst[60..72];
+        // u0: 10000 + 30000 - 20000 = 20000; u1: 50000 + 20000 - 10000 = 60000
+        assert_eq!(u16::from_le_bytes([fourth[0], fourth[1]]), 20_000);
+        assert_eq!(u16::from_le_bytes([fourth[2], fourth[3]]), 60_000);
+        // c0: 10 + 20 - 100 -> clamped to 0; c1: 200 + 200 - 50 -> clamped to 255
+        assert_eq!(&fourth[4..8], &[0, 255, 100, 255]);
+        // Unknown format keeps v0 bytes
+        assert_eq!(&fourth[8..12], &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    #[test]
+    fn multiple_rectangles_and_f32_f16_vector_formats_expand_in_sequence() {
+        // Two rectangles of R32G32B32_FLOAT (format 6, 12 bytes) + R16G16_FLOAT (format 34, 4 bytes) = 16 bytes
+        let v = |p: [f32; 3], uv: [f32; 2]| {
+            let mut b = Vec::with_capacity(16);
+            for x in p {
+                b.extend(x.to_le_bytes());
+            }
+            for x in uv {
+                b.extend(f32_to_half(x).to_le_bytes());
+            }
+            b
+        };
+        let src = [
+            // Rect 0
+            v([0.0, 1.0, 0.5], [0.0, 0.0]),
+            v([0.0, 0.0, 0.5], [0.0, 1.0]),
+            v([2.0, 0.0, 0.5], [1.0, 1.0]),
+            // Rect 1
+            v([10.0, 20.0, 1.0], [0.25, 0.5]),
+            v([10.0, 10.0, 1.0], [0.25, 1.0]),
+            v([14.0, 10.0, 1.0], [0.75, 1.0]),
+        ]
+        .concat();
+        let mut dst = vec![0u8; 12 * 16];
+        expand_rects(&src, &mut dst, 16, &[(0, 6), (12, 34)]);
+        assert_eq!(&dst[5 * 16..6 * 16], &v([2.0, 1.0, 0.5], [1.0, 0.0])[..]);
+        assert_eq!(
+            &dst[11 * 16..12 * 16],
+            &v([14.0, 20.0, 1.0], [0.75, 0.5])[..]
+        );
     }
 }

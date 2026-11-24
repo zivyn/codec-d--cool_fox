@@ -7,7 +7,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL};
+use super::xasync::{self, AsyncBlock, E_ILLEGAL_METHOD_CALL, E_INVALIDARG};
 use super::xgameruntime::{
     Guid, HRESULT, Interface, Methods, Object, S_OK, add_ref, missing, put, put_string, text, token,
 };
@@ -301,7 +301,8 @@ extern "system" fn install_async(
 }
 
 /// The game's own store id maps to its installation; nothing else is
-/// installed.
+/// installed, and any other id gets the documented E_INVALIDARG (not
+/// XPackage's "could not resolve" error).
 extern "system" fn package_identifier(
     _: This,
     store_id: *const c_char,
@@ -313,7 +314,7 @@ extern "system" fn package_identifier(
         Some(id) if !title.store_id.is_empty() && id == title.store_id => {
             put_string(&xpackage::identifier(), size, buffer, std::ptr::null_mut())
         }
-        _ => xpackage::NO_PACKAGE,
+        _ => E_INVALIDARG,
     }
 }
 
@@ -475,5 +476,16 @@ mod tests {
         assert!(!method::<extern "system" fn(This, Handle) -> bool>(
             &OBJECT, 0xb0
         )(this, l));
+    }
+
+    #[test]
+    fn a_store_id_without_a_package_is_an_invalid_argument() {
+        type Query = extern "system" fn(This, *const c_char, usize, *mut u8) -> HRESULT;
+        let query = method::<Query>(&OBJECT, 0x208);
+        let mut id = [0u8; 33];
+        assert_eq!(
+            query(&OBJECT, c"9NOTINSTALLED".as_ptr(), 33, id.as_mut_ptr()),
+            E_INVALIDARG
+        );
     }
 }

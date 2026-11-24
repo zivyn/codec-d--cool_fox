@@ -185,11 +185,14 @@ mod tests {
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();
-        assert_eq!(
-            method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle),
-            S_OK
-        );
-        assert!(!handle.is_null());
-        method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+        match method::<Acquire>(&SHELL_OBJECT, 0x20)(&SHELL_OBJECT, &mut handle) {
+            S_OK => {
+                assert!(!handle.is_null());
+                method::<Close>(&SHELL_OBJECT, 0x28)(&SHELL_OBJECT, handle);
+            }
+            // Windows can reject display power requests on some hosts.
+            NOT_SUPPORTED => assert!(handle.is_null()),
+            hr => panic!("unexpected display deferral HRESULT {:#010x}", hr as u32),
+        }
     }
 }

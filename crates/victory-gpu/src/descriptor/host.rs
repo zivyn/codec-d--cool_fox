@@ -62,7 +62,9 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
-const DYNAMIC: u32 = 1 << 16;
+/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
+/// each a device removal shortly after; #59).
+const DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {

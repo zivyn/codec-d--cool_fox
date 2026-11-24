@@ -92,7 +92,7 @@ fn query(kind: usize, iid: *const Iid, known: &[Iid], found: This, out: *mut Thi
 
 /// The DXGI device also answers for the D3D12 device.
 extern "system" fn device_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
-    if object::is(iid, &[crate::device::IID]) {
+    if crate::device::is_device(iid) {
         return object::answer(DXGI_DEVICE, iid, Some(crate::device::device()), out);
     }
     query(DXGI_DEVICE, iid, &DEVICE_IIDS, this, out)

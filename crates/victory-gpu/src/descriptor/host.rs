@@ -17,8 +17,11 @@ pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
     step: u32,
-    /// Slots mirroring the title's; view heaps have [`DYNAMIC`] more.
+    /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
+    /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
+    /// where the host takes them, else [`MIN_DYNAMIC`].
+    dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -66,6 +69,10 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// each a device removal shortly after; #59).
 const DYNAMIC: u32 = 1 << 18;
 
+/// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
+/// (a capped heap, NVIDIA): the title's slots keep their room first.
+const MIN_DYNAMIC: u32 = 1 << 16;
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -86,18 +93,31 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count) = match make(count + extra) {
-            Ok(heap) => (heap, count),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out;
-                // a title that reaches them needs remapping.
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra)
+        // The larger dynamic range only where the host takes it on top of
+        // every title slot; else the smaller one, and the cap after that.
+        let (heap, count, extra) = if sampler {
+            match make(count) {
+                Ok(heap) => (heap, count, 0),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        } else if let Ok(heap) = make(count + DYNAMIC) {
+            (heap, count, DYNAMIC)
+        } else {
+            match make(count + MIN_DYNAMIC) {
+                Ok(heap) => (heap, count, MIN_DYNAMIC),
+                Err(e) if count + MIN_DYNAMIC > PORTABLE_VIEWS => {
+                    // shortcut: descriptors past the host's limit are left
+                    // out; a title that reaches them needs remapping.
+                    tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}");
+                    (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - MIN_DYNAMIC, MIN_DYNAMIC)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
         };
         // SAFETY: a live heap.
@@ -121,10 +141,11 @@ impl HostHeap {
             cpu,
             step,
             count,
+            dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
+            next: Mutex::new((0, vec![false; extra as usize])),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -203,14 +224,14 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > DYNAMIC {
+        if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
         // Search from `next` on, then from the start.
-        let starts = (*next as usize..DYNAMIC as usize).chain(0..*next as usize);
+        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -232,7 +253,7 @@ impl HostHeap {
             return None;
         };
         taken[first..first + n].fill(true);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -251,7 +272,7 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(DYNAMIC) as usize;
+        let end = (at + n).min(self.dynamic) as usize;
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
             slots.fill(false);
         }
@@ -864,13 +885,13 @@ mod tests {
         let Some(heap) = HostHeap::new(false, 4) else {
             return; // no host GPU
         };
-        let a = heap.dynamic(DYNAMIC - 100).unwrap();
+        let a = heap.dynamic(heap.dynamic - 100).unwrap();
         let b = heap.dynamic(60).unwrap();
-        assert_eq!((a, b), (4, 4 + DYNAMIC - 100));
+        assert_eq!((a, b), (4, 4 + heap.dynamic - 100));
         // 40 left at the end: 50 do not fit until something is given back.
         assert_eq!(heap.dynamic(50), None);
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
-        assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+        assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 }

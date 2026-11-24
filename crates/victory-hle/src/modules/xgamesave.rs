@@ -393,6 +393,21 @@ fn remaining(root: &Path) -> u64 {
         .min(storage::disk_free(root))
 }
 
+/// Why an update writing `written` bytes, `replaced` of them over blobs it
+/// replaces, does not fit: past the per-user quota (`used` bytes kept), or
+/// past the host disk's `free` bytes, which is not the user's quota (the
+/// new version is written before the old one goes, so nothing it replaces
+/// counts there).
+fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
+    if written > QUOTA.saturating_sub(used) + replaced {
+        Some(QUOTA_EXCEEDED)
+    } else if written > free {
+        Some(OUT_OF_LOCAL_STORAGE)
+    } else {
+        None
+    }
+}
+
 fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
     tracing::warn!(dir = %dir.display(), %e, "game save");
     if e.kind() == std::io::ErrorKind::StorageFull {
@@ -446,8 +461,9 @@ impl Update {
             changed.map(|(_, size)| size).sum()
         });
         let root = self.dir.parent().unwrap_or(&self.dir);
-        if written as u64 > remaining(root) + replaced {
-            return QUOTA_EXCEEDED;
+        let free = storage::disk_free(root);
+        if let Some(hr) = no_room(written as u64, replaced, used_bytes(root), free) {
+            return hr;
         }
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
@@ -948,6 +964,17 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             }
         }
+    }
+
+    /// The per-user quota and the host disk fail with their own errors.
+    #[test]
+    fn a_full_disk_is_not_the_quota() {
+        let mb = 1 << 20;
+        assert_eq!(no_room(2 * mb, 0, 0, mb), Some(OUT_OF_LOCAL_STORAGE));
+        assert_eq!(no_room(2 * mb, 0, QUOTA - mb, 100 * mb), Some(QUOTA_EXCEEDED));
+        // Replacing a blob of the same size fits a full quota.
+        assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
+        assert_eq!(no_room(mb, 0, 0, mb), None);
     }
 
     fn update(root: &Path, display: &str, changes: &[(&str, Option<&str>)]) -> HRESULT {

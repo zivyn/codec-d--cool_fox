@@ -743,8 +743,10 @@ fn commit(base: usize, len: usize) -> bool {
     }
     let error = std::io::Error::last_os_error();
     if error.raw_os_error() == Some(ERROR_COMMITMENT_LIMIT as i32) {
-        let mut info = PERFORMANCE_INFORMATION::default();
-        info.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+        let mut info = PERFORMANCE_INFORMATION {
+            cb: size_of::<PERFORMANCE_INFORMATION>() as u32,
+            ..Default::default()
+        };
         // SAFETY: the buffer and size describe a writable PERFORMANCE_INFORMATION.
         let queried = unsafe { K32GetPerformanceInfo(&mut info, info.cb) } != 0;
         victory_loader::log_crash(&commit_limit_message(len, &error, queried.then_some(&info)));

@@ -299,6 +299,26 @@ fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
 
+#[test]
+fn a_branch_to_fallthrough_keeps_both_values_at_a_join() {
+    let shader = build_valu_cs(&[
+        0xBF06_0100,            // s_cmp_eq_u32 s0, s1
+        0xBF85_0002,            // s_cbranch_scc1 -> the s2 = 1 path
+        s_mov_b32(2, 128),      // s2 = 0
+        0xBF82_0002,            // s_branch -> the join
+        s_mov_b32(2, 129),      // s2 = 1
+        0xBF85_0000,            // s_cbranch_scc1 -> the following instruction
+        vop1(0x001, 0, sgpr(2)), // join: v0 = s2
+    ]);
+    run_cases(
+        &shader,
+        &[[7, 7, 0, 0], [7, 5, 0, 0]],
+        |backend, _, inputs, actual| {
+            assert_eq!(actual, u32::from(inputs[0] == inputs[1]), "{backend}");
+        },
+    );
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = u32::from(bits >> 15) << 31;
     let exp = (bits >> 10) & 0x1F;

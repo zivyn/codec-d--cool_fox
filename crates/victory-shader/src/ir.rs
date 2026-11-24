@@ -1,7 +1,8 @@
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
-//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped.
+//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...) and redundant conditional
+//! branches.
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -187,6 +188,15 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             (*to, *from) = (parked[k].1, parked[k].2);
         }
         let fallthrough = || block_at(next.ok_or(isa(machine.offset, "falls off the code"))?);
+        // A conditional SOPP branch to fallthrough has no register effects
+        // and contributes one edge to the join. Calls also use Flow::Branch
+        // but write a return address.
+        if machine.encoding == gfx10::Encoding::Sopp
+            && matches!(flow, Flow::Branch(target) if Some(target) == next)
+        {
+            blocks[b].exit = Exit::Jump(fallthrough()?);
+            continue;
+        }
         let ends = flow != Flow::Next || next.is_none_or(|n| leaders.binary_search(&n).is_ok());
         if ends {
             blocks[b].exit = match flow {

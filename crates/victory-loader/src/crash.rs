@@ -153,7 +153,29 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
             [0x0f, 0x01, 0xfa] => {}
             [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             _ => {
-                if let Some(len) = clwb_len(code.cast::<[u8; 15]>().read_unaligned()) {
+                // Only bytes inside the faulting instruction's page are read: the next page may
+                // not be mapped.
+                let room = 0x1000 - (context.Rip as usize & 0xfff);
+                let mut bytes = [0u8; 32];
+                let n = room.min(bytes.len());
+                std::ptr::copy_nonoverlapping(code, bytes.as_mut_ptr(), n);
+                if let Some(pass) = clwb_loop(&bytes[..n]) {
+                    // A whole write-back loop in one exception (see `clwb_loop`).
+                    let limit = *gpr(context, pass.limit);
+                    let base = gpr(context, pass.base);
+                    *base = if *base <= limit {
+                        base.wrapping_add(((limit - *base) / 64 + 1) * 64)
+                    } else {
+                        base.wrapping_add(64)
+                    };
+                    let flags = cmp_flags(*base, limit);
+                    context.EFlags = context.EFlags & !CMP_FLAGS | flags;
+                    context.Rip += pass.len as u64;
+                    return true;
+                }
+                if n >= 15
+                    && let Some(len) = clwb_len(bytes[..15].try_into().unwrap_or([0; 15]))
+                {
                     // A write-back hint: the PC's memory is coherent, so it has nothing to do.
                     context.Rip += len as u64;
                     return true;
@@ -197,13 +219,109 @@ fn clwb_len(code: [u8; 15]) -> Option<usize> {
     Some(len)
 }
 
+/// A `clwb` write-back loop as the title's compilers build it, one cache line a
+/// pass (`base` and `limit` any registers):
+///
+/// ```text
+/// top: clwb [base]
+///      add  base, 0x40
+///      cmp  base, limit
+///      jbe  top
+/// ```
+///
+/// An exception costs about a microsecond and the title writes back whole
+/// buffers this way while it loads, so the loop is done in one: `clwb` has
+/// nothing to do on the PC, `base` ends past `limit` as the last pass leaves it.
+struct ClwbLoop {
+    base: u8,
+    limit: u8,
+    /// Bytes from `clwb` to the instruction after `jbe`.
+    len: usize,
+}
+
+fn clwb_loop(code: &[u8]) -> Option<ClwbLoop> {
+    // clwb [base]: 66 [40|41] 0f ae, ModRM mod 00, reg 6, no SIB or displacement.
+    let (rex, at) = match code.get(1)? {
+        0x40 | 0x41 => (code[1], 2),
+        _ => (0, 1),
+    };
+    if *code.first()? != 0x66 || code.get(at..at + 2)? != [0x0f, 0xae] {
+        return None;
+    }
+    let modrm = *code.get(at + 2)?;
+    let rm = modrm & 7;
+    if modrm >> 6 != 0 || (modrm >> 3) & 7 != 6 || rm == 4 || rm == 5 {
+        return None;
+    }
+    let base = rm | (rex & 1) << 3;
+    // add base, 0x40: REX.W(+B) 83 /0 ib.
+    let add = at + 3;
+    if *code.get(add..add + 4)? != [0x48 | base >> 3, 0x83, 0xc0 | (base & 7), 0x40] {
+        return None;
+    }
+    // cmp base, limit: REX.W 39 /r with base in r/m.
+    let cmp = add + 4;
+    let &[cmp_rex @ 0x48..=0x4f, 0x39, cmp_modrm] = code.get(cmp..cmp + 3)? else {
+        return None;
+    };
+    if cmp_modrm >> 6 != 3 || (cmp_modrm & 7 | (cmp_rex & 1) << 3) != base {
+        return None;
+    }
+    let limit = (cmp_modrm >> 3) & 7 | (cmp_rex & 4) << 1;
+    // jbe top.
+    let jump = cmp + 3;
+    let len = jump + 2;
+    if *code.get(jump)? != 0x76 || i64::from(*code.get(jump + 1)? as i8) != -(len as i64) {
+        return None;
+    }
+    (limit != base).then_some(ClwbLoop { base, limit, len })
+}
+
+/// The general register numbered `n` as instructions encode it.
+fn gpr(context: &mut CONTEXT, n: u8) -> &mut u64 {
+    match n & 15 {
+        0 => &mut context.Rax,
+        1 => &mut context.Rcx,
+        2 => &mut context.Rdx,
+        3 => &mut context.Rbx,
+        4 => &mut context.Rsp,
+        5 => &mut context.Rbp,
+        6 => &mut context.Rsi,
+        7 => &mut context.Rdi,
+        8 => &mut context.R8,
+        9 => &mut context.R9,
+        10 => &mut context.R10,
+        11 => &mut context.R11,
+        12 => &mut context.R12,
+        13 => &mut context.R13,
+        14 => &mut context.R14,
+        _ => &mut context.R15,
+    }
+}
+
+/// The status flags `cmp a, b` leaves (CF, PF, AF, ZF, SF, OF) as `EFLAGS` bits.
+fn cmp_flags(a: u64, b: u64) -> u32 {
+    let r = a.wrapping_sub(b);
+    u32::from(a < b)
+        | u32::from((r as u8).count_ones().is_multiple_of(2)) << 2
+        | (((a ^ b ^ r) >> 4) as u32 & 1) << 4
+        | u32::from(r == 0) << 6
+        | ((r >> 63) as u32) << 7
+        | ((((a ^ b) & (a ^ r)) >> 63) as u32) << 11
+}
+const CMP_FLAGS: u32 = 0x8d5;
+
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
 /// the saved XMM registers; returns the instruction's length.
 unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     // SAFETY: the caller's code bytes are readable up to the instruction's end.
     let b = |i: usize| unsafe { code.add(i).read() };
     let prefix = b(0);
-    let (rex, at) = if b(1) & 0xf0 == 0x40 { (b(1), 2) } else { (0, 1) };
+    let (rex, at) = if b(1) & 0xf0 == 0x40 {
+        (b(1), 2)
+    } else {
+        (0, 1)
+    };
     if !matches!(prefix, 0x66 | 0xf2) || b(at) != 0x0f || !matches!(b(at + 1), 0x78 | 0x79) {
         return None;
     }
@@ -490,6 +608,39 @@ mod tests {
     }
 
     #[test]
+    fn clwb_loops() {
+        // clwb [rcx]; add rcx, 0x40; cmp rcx, rax; jbe top
+        let a = clwb_loop(&[
+            0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf3,
+        ])
+        .expect("rcx loop");
+        assert_eq!((a.base, a.limit, a.len), (1, 0, 13));
+        // clwb [r9]; add r9, 0x40; cmp r9, rax; jbe top
+        let b = clwb_loop(&[
+            0x66, 0x41, 0x0f, 0xae, 0x31, 0x49, 0x83, 0xc1, 0x40, 0x49, 0x39, 0xc1, 0x76, 0xf2,
+        ])
+        .expect("r9 loop");
+        assert_eq!((b.base, b.limit, b.len), (9, 0, 14));
+        // A different stride, a jump elsewhere, or a cut-off loop is not one.
+        assert!(
+            clwb_loop(&[
+                0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x20, 0x48, 0x39, 0xc1, 0x76, 0xf3
+            ])
+            .is_none()
+        );
+        assert!(
+            clwb_loop(&[
+                0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40, 0x48, 0x39, 0xc1, 0x76, 0xf0
+            ])
+            .is_none()
+        );
+        assert!(clwb_loop(&[0x66, 0x0f, 0xae, 0x31, 0x48, 0x83, 0xc1, 0x40]).is_none());
+        // The flags the last cmp leaves: base just past limit.
+        assert_eq!(cmp_flags(0x1040, 0x1000) & 0x41, 0); // CF and ZF clear: the loop ends
+        assert_eq!(cmp_flags(0x1000, 0x1000) & 0x40, 0x40);
+    }
+
+    #[test]
     fn clwb_lengths() {
         let pad = |b: &[u8]| {
             let mut c = [0u8; 15];
@@ -499,9 +650,15 @@ mod tests {
         assert_eq!(clwb_len(pad(&[0x66, 0x41, 0x0f, 0xae, 0x31])), Some(5)); // clwb [r9]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x30])), Some(4)); // clwb [rax]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x70, 0x40])), Some(5)); // clwb [rax+0x40]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])), Some(8)); // [rax+disp32]
+        assert_eq!(
+            clwb_len(pad(&[0x66, 0x0f, 0xae, 0xb0, 0, 1, 0, 0])),
+            Some(8)
+        ); // [rax+disp32]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x34, 0x24])), Some(5)); // clwb [rsp]
-        assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])), Some(8)); // [rip+disp32]
+        assert_eq!(
+            clwb_len(pad(&[0x66, 0x0f, 0xae, 0x35, 0, 0, 0, 0])),
+            Some(8)
+        ); // [rip+disp32]
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0x38])), None); // clflushopt, /7
         assert_eq!(clwb_len(pad(&[0x0f, 0xae, 0x30])), None); // xsaveopt, no 66
         assert_eq!(clwb_len(pad(&[0x66, 0x0f, 0xae, 0xf0])), None); // register form

@@ -13,7 +13,7 @@
 //! (`ComputeSurfaceInfoMacroTiled`, `ComputeThinBlockDimension`,
 //! `GetMipTailDim`, `GetMaxNumMipsInTail`, `HwlComputeSurfaceInfoLinear`,
 //! `ComputeSurfaceAddrFromCoordMacroTiled`), and the 256-byte micro tile
-//! patterns in [`MICRO`] from `gfx10SwizzlePattern.h` (the RB+ tables, as on
+//! patterns in `MICRO` from `gfx10SwizzlePattern.h` (the RB+ tables, as on
 //! RDNA2). addrlib carries this notice:
 //!
 //! Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.

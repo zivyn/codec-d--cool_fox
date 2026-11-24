@@ -31,9 +31,11 @@
 //! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
 //! primitives << 12).
 
+use std::rc::Rc;
+
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
-use crate::ir::{Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, PsInput, StageIo, Usage};
 use crate::resource::Site;
 
@@ -342,6 +344,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                     attr,
                                     inst.read(Reg::V(d)),
                                     inst.read(Reg::V(reg)),
+                                    inst,
                                     &barycentric,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
@@ -359,7 +362,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             _ => None,
                         };
                         let interp = halves
-                            .pair(&v.src[0], read(2), read(1), &barycentric)
+                            .pair(&v.src[0], read(2), read(1), inst, &barycentric)
                             .map_err(|what| unsupported(at, what))?;
                         io.interps.push((site, interp.with(attribute)));
                     }
@@ -432,6 +435,168 @@ fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
     out
 }
 
+/// Mask definitions one [`Walk`] looks into before it gives up.
+const MASK_STEPS: u32 = 4096;
+
+/// How a lane mask (one dword of it) is made from others.
+enum Mask<'a> {
+    /// The lanes in both.
+    And(Value, Value),
+    /// The lanes of the first that are not in the second.
+    AndNot(Value, Value),
+    /// The same lanes as another mask.
+    Copy(Value),
+    /// Some of the lanes of another mask: EXEC narrowed by a compare.
+    Within(Value),
+    /// One of these (one per predecessor), by the path taken to the block.
+    Phi(usize, &'a [Value]),
+    Unknown,
+}
+
+/// What is known of a lane mask: masks it is within, and masks that share
+/// no lane with it.
+struct Facts {
+    within: Vec<Value>,
+    apart: Vec<Value>,
+}
+
+/// Reasoning about the lane masks of two instructions, the first of which
+/// is in block `from`: whatever it does reaches the second along a path
+/// that leaves `from`, so a phi in a block ahead of it is one of the
+/// arguments from the blocks ahead too.
+struct Walk<'a> {
+    halves: &'a Halves<'a>,
+    from: usize,
+    /// The blocks a path from `from` enters.
+    ahead: Vec<bool>,
+    steps: u32,
+    known: std::collections::HashMap<Value, Rc<Facts>>,
+}
+
+impl<'a> Walk<'a> {
+    fn new(halves: &'a Halves<'a>, from: usize) -> Self {
+        let blocks = &halves.p.blocks;
+        let mut ahead = vec![false; blocks.len()];
+        let mut work = blocks[from].exit.successors();
+        while let Some(b) = work.pop() {
+            if !std::mem::replace(&mut ahead[b], true) {
+                work.extend(blocks[b].exit.successors());
+            }
+        }
+        Self {
+            halves,
+            from,
+            ahead,
+            steps: MASK_STEPS,
+            known: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The arguments of the phi of block `b` that a path from `from` can
+    /// bring.
+    fn arms<'s>(&'s self, b: usize, args: &'s [Value]) -> impl Iterator<Item = Value> + 's {
+        let preds = &self.halves.p.blocks[b].preds;
+        args.iter()
+            .zip(preds)
+            .filter(move |&(_, &p)| !self.ahead[b] || self.ahead[p] || p == self.from)
+            .map(|(&a, _)| a)
+    }
+
+    /// The mask `v` is a copy of, through copies.
+    fn root(&self, mut v: Value) -> Value {
+        while let Mask::Copy(x) = self.halves.mask(v) {
+            v = x;
+        }
+        v
+    }
+
+    /// What the way lane mask `v` is made says of it.
+    fn facts(&mut self, v: Value) -> Rc<Facts> {
+        let v = self.root(v);
+        if let Some(f) = self.known.get(&v) {
+            return Rc::clone(f);
+        }
+        let mut f = Facts {
+            within: vec![v],
+            apart: vec![],
+        };
+        if self.steps > 0 {
+            self.steps -= 1;
+            let halves = self.halves;
+            match halves.mask(v) {
+                Mask::And(x, y) => {
+                    let (x, y) = (self.facts(x), self.facts(y));
+                    f.within.extend(x.within.iter().chain(&y.within));
+                    f.apart.extend(x.apart.iter().chain(&y.apart));
+                }
+                Mask::AndNot(x, y) => {
+                    let x = self.facts(x);
+                    f.within.extend(&x.within);
+                    f.apart.extend(&x.apart);
+                    f.apart.push(self.root(y));
+                }
+                Mask::Within(x) | Mask::Copy(x) => {
+                    let x = self.facts(x);
+                    f.within.extend(&x.within);
+                    f.apart.extend(&x.apart);
+                }
+                Mask::Phi(b, args) => {
+                    // What holds whichever way the phi was entered.
+                    let args: Vec<Value> = self.arms(b, args).collect();
+                    let mut args = args.into_iter().map(|x| self.facts(x));
+                    if let Some(first) = args.next() {
+                        let (mut within, mut apart) = (first.within.clone(), first.apart.clone());
+                        for x in args {
+                            within.retain(|m| x.within.contains(m));
+                            apart.retain(|m| x.apart.contains(m));
+                        }
+                        f.within.extend(within);
+                        f.apart = apart;
+                    }
+                }
+                Mask::Unknown => {}
+            }
+        }
+        let f = Rc::new(f);
+        self.known.insert(v, Rc::clone(&f));
+        f
+    }
+
+    /// Whether `write` runs in every lane `at` runs in (`covers`), or in
+    /// none of them.
+    fn lanes(&mut self, write: &Inst, at: &Inst, covers: bool) -> bool {
+        (0..1 + u8::from(self.halves.p.wave64)).all(|k| {
+            match (write.read(Reg::S(EXEC + k)), at.read(Reg::S(EXEC + k))) {
+                (Some(w), Some(a)) if covers => {
+                    let a = self.facts(a);
+                    self.within(&a.within, w, 4)
+                }
+                (Some(w), Some(a)) => self.disjoint(w, a),
+                _ => false,
+            }
+        })
+    }
+
+    /// Whether lane masks `a` and `b` share no lane: one is within a mask
+    /// (or a phi of masks) that the other has no lane in.
+    fn disjoint(&mut self, a: Value, b: Value) -> bool {
+        let (a, b) = (self.facts(a), self.facts(b));
+        let held =
+            |within: &[Value], apart: &[Value]| apart.iter().any(|&m| self.within(within, m, 4));
+        held(&b.within, &a.apart) || held(&a.within, &b.apart)
+    }
+
+    /// Whether a lane mask known to be within all of `within` is within
+    /// `m`: one of them, or a phi of such.
+    fn within(&self, within: &[Value], m: Value, depth: u8) -> bool {
+        let m = self.root(m);
+        within.contains(&m)
+            || depth > 0
+                && matches!(self.halves.mask(m), Mask::Phi(b, args)
+                    if self.arms(b, args).all(|x| self.within(within, x, depth - 1)))
+    }
+}
+
 /// An interpolation before its attribute is known.
 struct Pair {
     barycentric: Barycentric,
@@ -456,14 +621,15 @@ struct Halves<'a> {
 }
 
 impl Halves<'_> {
-    /// The interpolation whose second half reads the first half's result
-    /// `acc`, the barycentric `j`, and attribute `attr`: every first half
-    /// must read the same attribute channel and the same kind's i.
+    /// The interpolation whose second half `at` reads the first half's
+    /// result `acc`, the barycentric `j`, and attribute `attr`: every first
+    /// half must read the same attribute channel and the same kind's i.
     fn pair(
         &self,
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
+        at: &Inst,
         barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
     ) -> Result<Pair, &'static str> {
         let mut first = Vec::new();
@@ -472,7 +638,7 @@ impl Halves<'_> {
             &mut Vec::new(),
             &mut first,
         )?;
-        let Some((kind, 1)) = barycentric(j) else {
+        let Some((kind, 1)) = self.lanes_barycentric(j, at, barycentric) else {
             return Err("an interpolation with computed barycentrics");
         };
         for &(b, i) in &first {
@@ -492,7 +658,7 @@ impl Halves<'_> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if barycentric(i) != Some((kind, 0)) {
+            if self.lanes_barycentric(i, inst, barycentric) != Some((kind, 0)) {
                 return Err("an interpolation with computed barycentrics");
             }
         }
@@ -500,6 +666,146 @@ impl Halves<'_> {
             barycentric: kind,
             first,
         })
+    }
+
+    /// The barycentric kind and index `v` holds in every lane `at` runs in:
+    /// as loaded, or after vector writes that run in none of those lanes.
+    /// (The compiler gives the lanes a discard kills other values in i and
+    /// j, then runs the rest of the program in the lanes that survive; the
+    /// interpolation reads i and j through a phi of the two.)
+    fn lanes_barycentric(
+        &self,
+        v: Option<Value>,
+        at: &Inst,
+        loaded: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+    ) -> Option<(Barycentric, u8)> {
+        let v = v?;
+        if let Some(b) = loaded(Some(v)) {
+            return Some(b);
+        }
+        let mut found = None;
+        let ok = self.same_lanes(v, at, loaded, &mut Vec::new(), &mut found);
+        found.filter(|_| ok)
+    }
+
+    /// Whether `v` is one barycentric (`found`) in the lanes `at` runs in.
+    fn same_lanes(
+        &self,
+        v: Value,
+        at: &Inst,
+        loaded: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+        seen: &mut Vec<Value>,
+        found: &mut Option<(Barycentric, u8)>,
+    ) -> bool {
+        if let Some(b) = loaded(Some(v)) {
+            return *found.get_or_insert(b) == b;
+        }
+        if seen.contains(&v) {
+            return true;
+        }
+        seen.push(v);
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            return !self.loops_back(b)
+                && self.p.blocks[b].phis[i]
+                    .args
+                    .iter()
+                    .all(|&a| self.same_lanes(a, at, loaded, seen, found));
+        }
+        // A vector write keeps the old value in the lanes outside EXEC (but
+        // a lane write goes to its lane whatever EXEC says).
+        let Some(&(b, i)) = self.defs.get(&v) else {
+            return false;
+        };
+        let write = &self.p.blocks[b].insts[i];
+        let Some(&(reg @ Reg::V(_), _)) = write.writes.iter().find(|w| w.1 == v) else {
+            return false;
+        };
+        let Some(old) = write
+            .read(reg)
+            .filter(|_| write.name() != "v_writelane_b32")
+        else {
+            return false;
+        };
+        let mut walk = Walk::new(self, b);
+        // A copy of another register in all of the lanes `at` runs in.
+        let source = match &write.fields {
+            Fields::Valu(v)
+                if write.name() == "v_mov_b32"
+                    && (v.neg, v.abs, v.omod, v.opsel) == (0, 0, 0, 0)
+                    && !v.clamp
+                    && v.sdwa.is_none()
+                    && v.dpp.is_none() =>
+            {
+                match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) => write.read(Reg::V(reg)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(source) = source.filter(|_| walk.lanes(write, at, true)) {
+            return self.same_lanes(source, at, loaded, seen, found);
+        }
+        walk.lanes(write, at, false) && self.same_lanes(old, at, loaded, seen, found)
+    }
+
+    /// Whether block `b` is entered from a later one: its phis merge values
+    /// of different iterations, which no mask below is about.
+    fn loops_back(&self, b: usize) -> bool {
+        self.p.blocks[b].preds.iter().any(|&p| p >= b)
+    }
+
+    /// How the lane mask `v` (one dword) is made from others.
+    fn mask(&self, v: Value) -> Mask<'_> {
+        if let Some(&(b, i)) = self.phis.get(&v) {
+            return if self.loops_back(b) {
+                Mask::Unknown
+            } else {
+                Mask::Phi(b, &self.p.blocks[b].phis[i].args)
+            };
+        }
+        let Some(&(b, i)) = self.defs.get(&v) else {
+            return Mask::Unknown;
+        };
+        let inst = &self.p.blocks[b].insts[i];
+        let Some(&(reg @ Reg::S(r), _)) = inst.writes.iter().find(|w| w.1 == v) else {
+            return Mask::Unknown;
+        };
+        let name = inst.name();
+        if name.starts_with("v_cmpx") {
+            // EXEC where it was and the compare holds.
+            return inst.read(reg).map_or(Mask::Unknown, Mask::Within);
+        }
+        let Fields::Sop {
+            dst: Some(Operand::Scalar { code, .. }),
+            src,
+            ..
+        } = &inst.fields
+        else {
+            return Mask::Unknown;
+        };
+        let read = |op: Option<&Operand>, k: u8| match op {
+            Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code + k)),
+            _ => None,
+        };
+        if name.contains("saveexec") {
+            // The destination gets EXEC; EXEC gets EXEC and the source.
+            if r < EXEC {
+                let old = inst.read(Reg::S(EXEC + r.wrapping_sub(*code)));
+                return old.map_or(Mask::Unknown, Mask::Copy);
+            }
+            return match (inst.read(reg), read(src.first(), r - EXEC)) {
+                (Some(old), Some(s)) => Mask::And(old, s),
+                _ => Mask::Unknown,
+            };
+        }
+        let k = r.wrapping_sub(*code);
+        match (name, read(src.first(), k), read(src.get(1), k)) {
+            ("s_and_b32" | "s_and_b64", Some(a), Some(b)) => Mask::And(a, b),
+            ("s_andn2_b32" | "s_andn2_b64", Some(a), Some(b)) => Mask::AndNot(a, b),
+            ("s_mov_b32" | "s_mov_b64", Some(a), _) => Mask::Copy(a),
+            _ => Mask::Unknown,
+        }
     }
 
     /// The instructions `v` comes from, through phis (`seen`: phis on the
@@ -625,6 +931,114 @@ mod tests {
         // attr1 is not in the stage data.
         let other = program(&[0xC808_0400, S_ENDPGM]); // v_interp_p1_f32 v2, v0, attr1.x
         assert!(raise(&other, &pixel(vec![TEXCOORD], 2)).is_err());
+    }
+
+    /// A pixel program that kills the lanes where a bit test fails and
+    /// interpolates in the others. The lanes it kills get 1.0 in i and j
+    /// first (as the compiler does, to keep them harmless). With `restore`
+    /// the interpolation runs in all lanes again, those included.
+    fn kills_then_interpolates(wave64: bool, restore: bool) -> Program {
+        let w = |lo: u32, hi: u32| if wave64 { hi } else { lo };
+        let code: Vec<u32> = if restore {
+            vec![
+                w(0xBE84_037E, 0xBE84_047E), // s_mov_b32 s4, exec_lo (b64: s[4:5], exec)
+                0x7DA4_0A80,                 // v_cmpx_eq_u32 exec, 0, v5
+                0xBF88_0002,                 // s_cbranch_execz to the join
+                0x7E00_02F2,                 // v_mov_b32 v0, 1.0
+                0x7E02_02F2,                 // v_mov_b32 v1, 1.0
+                w(0xBEFE_0304, 0xBEFE_0404), // join: s_mov_b32 exec_lo, s4 (b64: exec, s[4:5])
+            ]
+        } else {
+            vec![
+                w(0xBE82_037E, 0xBE82_047E), // s_mov_b32 s2, exec_lo: the lanes still alive
+                w(0xBE84_037E, 0xBE84_047E), // s_mov_b32 s4, exec_lo: all of them
+                0x7DA4_0A80,                 // v_cmpx_eq_u32 exec, 0, v5: the lanes to kill
+                0xBF88_0005,                 // s_cbranch_execz to the join
+                w(0x8A02_7E02, 0x8A82_7E02), // s_andn2_b32 s2, s2, exec_lo
+                0xBF84_0009,                 // s_cbranch_scc0 to the end: all killed
+                w(0x877E_027E, 0x87FE_027E), // s_and_b32 exec_lo, exec_lo, s2
+                0x7E00_02F2,                 // v_mov_b32 v0, 1.0
+                0x7E02_02F2,                 // v_mov_b32 v1, 1.0
+                // join: the lanes that were not in the kill's branch
+                w(0x8A7E_7E04, 0x8AFE_7E04), // s_andn2_b32 exec_lo, s4, exec_lo
+                w(0x877E_027E, 0x87FE_027E), // s_and_b32 exec_lo, exec_lo, s2
+            ]
+        };
+        let mut words = code;
+        words.extend([
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0302_0102, // exp mrt0, v2, v1, v2, v3 done vm
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        crate::ir::build(&code, wave64, 256).unwrap()
+    }
+
+    #[test]
+    fn killed_lanes_may_hold_other_barycentrics() {
+        for wave64 in [false, true] {
+            // v0 and v1 are phis of the loaded values and 1.0, but 1.0 is
+            // only in lanes the interpolation does not run in.
+            let p = kills_then_interpolates(wave64, false);
+            let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+            let [(site, interp)] = &io.interps[..] else {
+                panic!("{:?}", io.interps)
+            };
+            assert_eq!(*site, (3, 3));
+            let Interp::Interpolated {
+                barycentric, first, ..
+            } = interp
+            else {
+                panic!("{interp:?}")
+            };
+            assert_eq!(*barycentric, Barycentric::PerspectiveCenter);
+            assert_eq!(first, &[(3, 2)]);
+
+            // Restoring the whole mask runs it in the lanes that got 1.0
+            // too: those barycentrics are computed.
+            let p = kills_then_interpolates(wave64, true);
+            assert_eq!(
+                raise(&p, &pixel(vec![TEXCOORD], 2)),
+                Err(ShaderError::Unsupported {
+                    offset: 28,
+                    what: "an interpolation with computed barycentrics",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn interpolation_may_read_a_copy_of_j() {
+        let p = program(&[
+            0x7E0C_0301, // v_mov_b32 v6, v1
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0006, // v_interp_p2_f32 v2, v6, attr0.x
+            S_ENDPGM,
+        ]);
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        let [((0, 2), Interp::Interpolated { first, .. })] = &io.interps[..] else {
+            panic!("{:?}", io.interps)
+        };
+        assert_eq!(first, &[(0, 1)]);
+        // A copy that ran in fewer lanes than the interpolation does.
+        let p = program(&[
+            0xBE84_037E, // s_mov_b32 s4, exec_lo
+            0x7DA4_0A80, // v_cmpx_eq_u32 exec, 0, v5
+            0x7E0C_0301, // v_mov_b32 v6, v1
+            0xBEFE_0304, // s_mov_b32 exec_lo, s4
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0006, // v_interp_p2_f32 v2, v6, attr0.x
+            S_ENDPGM,
+        ]);
+        assert_eq!(
+            raise(&p, &pixel(vec![TEXCOORD], 2)),
+            Err(ShaderError::Unsupported {
+                offset: 20,
+                what: "an interpolation with computed barycentrics",
+            })
+        );
     }
 
     #[test]

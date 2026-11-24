@@ -90,6 +90,8 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 mod own_bits;
+#[cfg(all(test, windows))]
+mod permlane_tests;
 mod rect;
 mod sampler;
 mod shader;

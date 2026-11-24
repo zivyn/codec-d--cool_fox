@@ -151,21 +151,62 @@ pub extern "system" fn CreateWindowExA(
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches).
+/// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
+/// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
         unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
-    let fitted = fit_into(&area, width, height);
+    let limit = window_limit();
+    let fitted = fit_with_limit(&area, width, height, limit);
     if !parent.is_null() || known == 0 || fitted == (width, height) {
         return (x, y, width, height);
     }
-    tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
+    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
     let (w, h) = fitted;
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
+    let (width, height) = value.trim().split_once(['x', 'X'])?;
+    let (width, height) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn window_limit() -> Option<(i32, i32)> {
+    static LIMIT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_WINDOW_MAX")?;
+        let parsed = value.to_str().and_then(parse_window_limit);
+        if parsed.is_none() {
+            tracing::warn!(
+                ?value,
+                "ignoring invalid VICTORY_WINDOW_MAX; expected positive WIDTHxHEIGHT"
+            );
+        }
+        parsed
+    })
+}
+
+fn fit_with_limit(
+    area: &RECT,
+    width: i32,
+    height: i32,
+    limit: Option<(i32, i32)>,
+) -> (i32, i32) {
+    let Some((max_width, max_height)) = limit else {
+        return fit_into(area, width, height);
+    };
+    let bounded = RECT {
+        left: 0,
+        top: 0,
+        right: (area.right - area.left).min(max_width),
+        bottom: (area.bottom - area.top).min(max_height),
+    };
+    fit_into(&bounded, width, height)
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
@@ -431,6 +472,63 @@ mod tests {
             fit_into(&area, wm::CW_USEDEFAULT, 0),
             (wm::CW_USEDEFAULT, 0)
         );
+    }
+
+    #[test]
+    fn configured_window_limit_fits_4k_into_1080p() {
+        let area = RECT {
+            left: 100,
+            top: 50,
+            right: 2660,
+            bottom: 1490,
+        };
+        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((1920, 1080))), (1920, 1080));
+        assert_eq!(fit_with_limit(&area, 640, 480, Some((1920, 1080))), (640, 480));
+        assert_eq!(fit_with_limit(&area, 3840, 2160, None), (2560, 1440));
+    }
+
+    #[test]
+    fn configured_window_limit_still_respects_the_work_area() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        assert_eq!(fit_with_limit(&area, 3840, 2160, Some((2560, 1440))), (1848, 1040));
+        assert_eq!(
+            fit_with_limit(&area, wm::CW_USEDEFAULT, 0, Some((1920, 1080))),
+            (wm::CW_USEDEFAULT, 0)
+        );
+    }
+
+    #[test]
+    fn configured_window_limit_preserves_non_widescreen_proportions() {
+        let area = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        assert_eq!(fit_with_limit(&area, 1600, 1200, Some((1920, 1080))), (1440, 1080));
+    }
+
+    #[test]
+    fn window_limit_requires_two_positive_dimensions() {
+        assert_eq!(parse_window_limit("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_window_limit(" 1920 X 1080 "), Some((1920, 1080)));
+        for bad in [
+            "",
+            "1920",
+            "0x1080",
+            "1920x0",
+            "-1x1080",
+            "1920x-1",
+            "1920x1080x2",
+            "2147483648x1080",
+        ] {
+            assert_eq!(parse_window_limit(bad), None, "{bad}");
+        }
     }
 
     #[test]

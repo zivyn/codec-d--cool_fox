@@ -67,26 +67,44 @@ pub mod subsystem {
 /// Offset of the optional header from the start of the file.
 pub fn optional_header_offset(data: &[u8]) -> Option<usize> {
     let lfanew = read_u32(data, DOS_E_LFANEW)? as usize;
-    Some(lfanew + NT_SIGNATURE_SIZE + FILE_HEADER_SIZE)
+    lfanew.checked_add(NT_SIGNATURE_SIZE + FILE_HEADER_SIZE)
 }
 
 /// Offset of the file header from the start of the file.
 pub fn file_header_offset(data: &[u8]) -> Option<usize> {
     let lfanew = read_u32(data, DOS_E_LFANEW)? as usize;
-    Some(lfanew + NT_SIGNATURE_SIZE)
+    lfanew.checked_add(NT_SIGNATURE_SIZE)
 }
 
 /// Offset of data directory `index` from the start of the file.
 pub fn data_directory_offset(data: &[u8], index: usize) -> Option<usize> {
     let opt = optional_header_offset(data)?;
-    let count = read_u32(data, opt + OPT_NUMBER_OF_RVA_AND_SIZES)? as usize;
-    (index < count).then_some(opt + OPT_DATA_DIRECTORY + index * DATA_DIRECTORY_SIZE)
+    let count = read_u32(data, opt.checked_add(OPT_NUMBER_OF_RVA_AND_SIZES)?)? as usize;
+    if index >= count {
+        return None;
+    }
+    opt.checked_add(OPT_DATA_DIRECTORY)?
+        .checked_add(index.checked_mul(DATA_DIRECTORY_SIZE)?)
 }
 
 pub fn read_u32(data: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(data.get(at..at + 4)?.try_into().ok()?))
+    let end = at.checked_add(4)?;
+    Some(u32::from_le_bytes(data.get(at..end)?.try_into().ok()?))
 }
 
 pub fn read_u64(data: &[u8], at: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(data.get(at..at + 8)?.try_into().ok()?))
+    let end = at.checked_add(8)?;
+    Some(u64::from_le_bytes(data.get(at..end)?.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_reject_overflowing_offsets() {
+        let data = [0u8; 16];
+        assert_eq!(read_u32(&data, usize::MAX - 1), None);
+        assert_eq!(read_u64(&data, usize::MAX - 2), None);
+    }
 }

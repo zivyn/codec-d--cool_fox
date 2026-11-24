@@ -53,7 +53,8 @@ pub struct Packet {
 }
 
 pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
-    let b = data.get(index * PACKET_BYTES..index * PACKET_BYTES + 4)?;
+    let start = index.checked_mul(PACKET_BYTES)?;
+    let b = data.get(start..)?.get(..4)?;
     let h = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     Some(Packet {
         frames: h >> 26,
@@ -1113,6 +1114,12 @@ mod tests {
     }
 
     #[test]
+    fn packet_rejects_out_of_range_indices_and_partial_headers() {
+        assert!(packet(&[0; 4], usize::MAX / PACKET_BYTES + 1).is_none());
+        assert!(packet(&[0; 3], 0).is_none());
+    }
+
+    #[test]
     fn packet_headers_and_frame_walk() {
         // Two packets: frame A (100 bits) and B (16300 bits, crossing into
         // packet 1 by 48 bits), then C (60 bits) in packet 1; the rest is
@@ -1155,11 +1162,13 @@ mod tests {
     fn walks_saved_streams() {
         let dir = std::env::var("VICTORY_XMA_STREAMS").unwrap();
         let mut bad = 0;
+        let mut streams = 0;
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_none_or(|e| e != "xma") {
                 continue;
             }
+            streams += 1;
             let data = std::fs::read(&path).unwrap();
             let counted: u32 = (0..data.len() / PACKET_BYTES)
                 .map(|i| packet(&data, i).unwrap().frames)
@@ -1185,6 +1194,7 @@ mod tests {
             );
             bad += u32::from(walked != counted || errors > 0);
         }
+        assert!(streams > 0, "VICTORY_XMA_STREAMS contains no .xma files");
         assert_eq!(bad, 0);
     }
 

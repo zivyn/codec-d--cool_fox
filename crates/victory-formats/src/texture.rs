@@ -651,7 +651,12 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let need = (depth as usize - 1) * depth_pitch + (m.height as usize - 1) * row_pitch + bytes;
+        let need = (depth as usize - 1)
+            .checked_mul(depth_pitch)
+            .zip((m.height as usize - 1).checked_mul(row_pitch))
+            .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
+            .and_then(|offset| offset.checked_add(bytes))
+            .ok_or(Error::TooSmall)?;
         if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
@@ -1008,6 +1013,37 @@ mod tests {
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
         assert!(!t.planes[0].layout.addressable());
+    }
+
+    #[test]
+    fn texture_copies_reject_overflowing_pitches() {
+        let layout = Layout::new(&desc(4, 2, 1, 4, Swizzle::LINEAR)).unwrap();
+        let mut tiled = vec![0; layout.size as usize];
+        let mut linear = [0; 32];
+        assert_eq!(
+            layout.detile(&tiled, 0, 0, &mut linear, usize::MAX, 0),
+            Err(Error::TooSmall)
+        );
+        assert_eq!(
+            layout.tile(&mut tiled, 0, 0, &linear, usize::MAX, 0),
+            Err(Error::TooSmall)
+        );
+    }
+
+    #[test]
+    fn volume_copy_rejects_overflowing_depth_pitch() {
+        let layout = Layout::new(&Desc {
+            dimension: Dimension::Tex3d,
+            depth: 3,
+            ..desc(4, 2, 1, 4, Swizzle::LINEAR)
+        })
+        .unwrap();
+        let tiled = vec![0; layout.size as usize];
+        let mut linear = [0; 96];
+        assert_eq!(
+            layout.detile(&tiled, 0, 0, &mut linear, 16, usize::MAX),
+            Err(Error::TooSmall)
+        );
     }
 
     #[test]

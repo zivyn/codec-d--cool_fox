@@ -1983,7 +1983,7 @@ impl<'a> Lower<'a> {
             .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
         let arg = self
             .s
-            .op(c, "makeDouble", Attr::ReadNone, f64t, 101, &[lo, hi]);
+            .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
         let (k0, k0b) = (self.s.m.i8(0), self.s.m.i8(0));
         let sum = self
             .s
@@ -2003,10 +2003,10 @@ impl<'a> Lower<'a> {
             let c = self.cur;
             let d0 = self
                 .s
-                .op(c, "makeDouble", Attr::ReadNone, f64t, 101, &[lo0, hi0]);
+                .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo0, hi0]);
             let d1 = self
                 .s
-                .op(c, "makeDouble", Attr::ReadNone, f64t, 101, &[lo1, hi1]);
+                .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo1, hi1]);
             let total = self.s.m.bin(c, Bin::Add, d0, d1);
             let split = self
                 .s

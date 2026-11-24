@@ -333,7 +333,7 @@ extern "system" fn unregister(_: This, _: Handle, _token: u64, _wait: bool) -> b
     true
 }
 
-static VTABLE: Methods<76> = Methods([
+static VTABLE: Methods<77> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
@@ -368,9 +368,9 @@ static VTABLE: Methods<76> = Methods([
     missing::<31> as *const (),              // 0xf8
     missing::<32> as *const (),              // 0x100
     consumable_balance_async as *const (),   // 0x108
-    status as *const (),                     // 0x110
+    count_status as *const (),               // 0x110
     report_fulfillment_async as *const (),   // 0x118
-    missing::<36> as *const (),              // 0x120
+    count_status as *const (),               // 0x120
     user_id_async as *const (),              // 0x128 collections id
     size_status as *const (),                // 0x130
     string_status as *const (),              // 0x138
@@ -384,11 +384,11 @@ static VTABLE: Methods<76> = Methods([
     missing::<47> as *const (),              // 0x178
     missing::<48> as *const (),              // 0x180
     purchase_ui_async as *const (),          // 0x188
-    missing::<50> as *const (),              // 0x190
+    status as *const (),                     // 0x190
     missing::<51> as *const (),              // 0x198 rate and review
     missing::<52> as *const (),              // 0x1a0
     redeem_ui_async as *const (),            // 0x1a8
-    missing::<54> as *const (),              // 0x1b0
+    status as *const (),                     // 0x1b0
     updates_async as *const (),              // 0x1b8
     count_status as *const (),               // 0x1c0
     array_status as *const (),               // 0x1c8
@@ -410,6 +410,7 @@ static VTABLE: Methods<76> = Methods([
     missing::<73> as *const (),              // 0x248 associated products page
     missing::<74> as *const (),              // 0x250
     product_page_ui_async as *const (),      // 0x258
+    status as *const (),                     // 0x260
 ]);
 
 #[cfg(test)]
@@ -424,6 +425,133 @@ mod tests {
             callback: None,
             internal: [0; 4],
         }
+    }
+
+    #[test]
+    fn offline_async_calls_report_network_error_from_their_result_slots() {
+        assert!(VTABLE.0.len() > 0x260 / 8);
+
+        let this: This = &OBJECT;
+        type StoreIdAsync =
+            extern "system" fn(This, Handle, *const c_char, *mut AsyncBlock) -> HRESULT;
+        type ReportFulfillmentAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            u32,
+            *const c_void,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type PurchaseUiAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const c_char,
+            *const c_char,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type RedeemUiAsync = extern "system" fn(
+            This,
+            Handle,
+            *const c_char,
+            *const *const c_char,
+            usize,
+            bool,
+            *mut AsyncBlock,
+        ) -> HRESULT;
+        type StatusResult = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
+        type CountResult = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+
+        let mut b = block();
+        assert_eq!(
+            method::<StoreIdAsync>(&OBJECT, 0x258)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x260)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        let mut remaining = 7u32;
+        assert_eq!(
+            method::<ReportFulfillmentAsync>(&OBJECT, 0x118)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                1,
+                std::ptr::null(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<CountResult>(&OBJECT, 0x120)(this, &mut b, &mut remaining),
+            NETWORK_ERROR
+        );
+        assert_eq!(remaining, 7);
+
+        let mut b = block();
+        assert_eq!(
+            method::<PurchaseUiAsync>(&OBJECT, 0x188)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x190)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        assert_eq!(
+            method::<RedeemUiAsync>(&OBJECT, 0x1a8)(
+                this,
+                handle(&CONTEXT),
+                c"DUMMY-TOKEN".as_ptr(),
+                std::ptr::null(),
+                0,
+                false,
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<StatusResult>(&OBJECT, 0x1b0)(this, &mut b),
+            NETWORK_ERROR
+        );
+
+        let mut b = block();
+        let mut balance = 3u32;
+        assert_eq!(
+            method::<StoreIdAsync>(&OBJECT, 0x108)(
+                this,
+                handle(&CONTEXT),
+                c"9DUMMY".as_ptr(),
+                &mut b,
+            ),
+            S_OK
+        );
+        assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
+        assert_eq!(
+            method::<CountResult>(&OBJECT, 0x110)(this, &mut b, &mut balance),
+            NETWORK_ERROR
+        );
+        assert_eq!(balance, 3);
     }
 
     #[test]

@@ -722,9 +722,12 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 }
 
 /// Asks the provider to cancel; the call fails with `E_ABORT` unless the
-/// provider completed it first.
+/// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
+        if *lock(&call.done) {
+            return;
+        }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
         complete_call(&call, block, E_ABORT, 0);
     }
@@ -1420,6 +1423,68 @@ mod tests {
         );
         assert_eq!((value, used), (0x1234, 8));
         assert!(call(&raw mut block).is_none(), "the call ends with its result");
+        XTaskQueueCloseHandle(q);
+    }
+
+    #[test]
+    fn canceling_a_completed_call_leaves_it_alone() {
+        static CANCELS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
+            // SAFETY: the runtime passes valid provider data.
+            let data = unsafe { &*data };
+            match op {
+                OP_BEGIN => {
+                    XAsyncComplete(data.block, S_OK, 1);
+                    S_OK
+                }
+                OP_CANCEL => {
+                    CANCELS.fetch_add(1, Ordering::SeqCst);
+                    S_OK
+                }
+                OP_GET_RESULT => {
+                    // SAFETY: the runtime checked one byte.
+                    unsafe { data.buffer.cast::<u8>().write(0x5a) };
+                    S_OK
+                }
+                _ => S_OK,
+            }
+        }
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(0, 0, &mut q), S_OK);
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        let identity = 0x78 as *const c_void;
+        assert_eq!(
+            XAsyncBegin(
+                &mut block,
+                std::ptr::null_mut(),
+                identity,
+                std::ptr::null(),
+                Some(provider),
+            ),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut block, false), S_OK);
+        XAsyncCancel(&mut block);
+        assert_eq!(CANCELS.load(Ordering::SeqCst), 0);
+        assert_eq!(XAsyncGetStatus(&mut block, false), S_OK);
+        let mut byte = 0u8;
+        let mut used = 0;
+        assert_eq!(
+            XAsyncGetResult(
+                &mut block,
+                identity,
+                1,
+                (&mut byte as *mut u8).cast(),
+                &mut used,
+            ),
+            S_OK
+        );
+        assert_eq!((byte, used), (0x5a, 1));
         XTaskQueueCloseHandle(q);
     }
 

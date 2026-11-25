@@ -104,13 +104,20 @@ impl Player {
                     }
                     roots += 1;
                     // The shortest start of the rest that differs.
-                    let works: Vec<usize> = (from..cmds.len()).filter(|&c| cmds[c].works()).collect();
+                    let works: Vec<usize> =
+                        (from..cmds.len()).filter(|&c| cmds[c].works()).collect();
                     let (mut lo, mut hi) = (0, works.len() - 1);
                     while lo < hi {
                         let mid = (lo + hi) / 2;
-                        let cut = Unit { to: works[mid] + 1, ..unit };
+                        let cut = Unit {
+                            to: works[mid] + 1,
+                            ..unit
+                        };
                         self.put_back(&states)?;
-                        if self.trials(&reader, &cut, &states, s.runs, s.wait_all)?.is_empty() {
+                        if self
+                            .trials(&reader, &cut, &states, s.runs, s.wait_all)?
+                            .is_empty()
+                        {
                             lo = mid + 1;
                         } else {
                             hi = mid;
@@ -172,13 +179,18 @@ impl Player {
         let mut states = self.start_states();
         for (here, &(i, j, cmds)) in flat.iter().enumerate() {
             let inside = s.lists.is_some_and(|(a, b)| a == b && a as usize == here);
-            let looks = s.lists.is_none_or(|(a, b)| (a as usize..=b as usize).contains(&here));
+            let looks = s
+                .lists
+                .is_none_or(|(a, b)| (a as usize..=b as usize).contains(&here));
             let works: Vec<usize> = (0..cmds.len()).filter(|&c| cmds[c].works()).collect();
             // Where the list is cut.
             let mut cuts: Vec<usize> = vec![0];
             if inside {
                 let (a, b) = commands.unwrap_or((0, u32::MAX));
-                let some = works.iter().map(|&c| c + 1).filter(|c| (a as usize..=b as usize).contains(c));
+                let some = works
+                    .iter()
+                    .map(|&c| c + 1)
+                    .filter(|c| (a as usize..=b as usize).contains(c));
                 cuts.extend(some.step_by(step.max(1)));
             }
             for (k, &from) in cuts.iter().enumerate() {
@@ -189,14 +201,26 @@ impl Player {
                             self.put_back(&states)?;
                         }
                         let mut now = states.clone();
-                        let first = Unit { submit: i, cmds, from, to: cmds.len(), delta: j == 0 && from == 0 };
+                        let first = Unit {
+                            submit: i,
+                            cmds,
+                            from,
+                            to: cmds.len(),
+                            delta: j == 0 && from == 0,
+                        };
                         self.go(&first, s.wait_all)?;
                         now = self.after(&first, &now);
                         for (n, &(i, j, cmds)) in flat.iter().enumerate().skip(here + 1) {
                             if flat[n - 1].0 != i {
                                 now.decay();
                             }
-                            let unit = Unit { submit: i, cmds, from: 0, to: cmds.len(), delta: j == 0 };
+                            let unit = Unit {
+                                submit: i,
+                                cmds,
+                                from: 0,
+                                to: cmds.len(),
+                                delta: j == 0,
+                            };
                             self.go(&unit, s.wait_all)?;
                             now = self.after(&unit, &now);
                         }
@@ -222,7 +246,13 @@ impl Player {
                 }
                 // On to the next cut.
                 let to = cuts.get(k + 1).copied().unwrap_or(cmds.len());
-                let unit = Unit { submit: i, cmds, from, to, delta: j == 0 && from == 0 };
+                let unit = Unit {
+                    submit: i,
+                    cmds,
+                    from,
+                    to,
+                    delta: j == 0 && from == 0,
+                };
                 self.go(&unit, s.wait_all)?;
                 self.commit(&unit, &mut states)?;
                 self.at = states.clone();
@@ -248,7 +278,9 @@ impl Player {
     fn start_states(&self) -> States {
         let mut states = States::default();
         for (id, all) in &self.start {
-            let Some(o) = self.objects.get(id) else { continue };
+            let Some(o) = self.objects.get(id) else {
+                continue;
+            };
             let flags = self.frame.resources[o.index].desc.flags;
             let decays = flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0 != 0;
             states.add(*id, o.subs, all[0], decays);
@@ -285,38 +317,73 @@ impl Player {
             let start = self.start_states();
             let before = self.hashes_now(&reader, &start)?;
             let mut again = self.hashes_now(&reader, &start)?;
-            say(format!("read twice, {} parts differ", before.iter().zip(&again).filter(|(a, b)| a != b).count()));
+            say(format!(
+                "read twice, {} parts differ",
+                before.iter().zip(&again).filter(|(a, b)| a != b).count()
+            ));
             for i in 0..3 {
-                self.run(&Options { loops: 1, ..Options::default() })?;
+                self.run(&Options {
+                    loops: 1,
+                    ..Options::default()
+                })?;
                 let ran = {
-                    let end: Vec<(u32, Vec<u32>)> = self.end.iter().map(|(k, v)| (*k, v.clone())).collect();
+                    let end: Vec<(u32, Vec<u32>)> =
+                        self.end.iter().map(|(k, v)| (*k, v.clone())).collect();
                     let mut s = start.clone();
                     for (id, v) in end {
                         for (sub, st) in v.iter().enumerate() {
                             let sub = if v.len() == 1 { ALL } else { sub as u32 };
-                            s.change(&states::Change { res: id, sub, after: *st, promoted: false, alias: false });
+                            s.change(&states::Change {
+                                res: id,
+                                sub,
+                                after: *st,
+                                promoted: false,
+                                alias: false,
+                            });
                         }
                     }
                     self.hashes_now(&reader, &s)?
                 };
                 self.restore(true)?;
                 again = self.hashes_now(&reader, &start)?;
-                let differ: Vec<usize> = (0..before.len()).filter(|&i| before[i] != again[i]).collect();
+                let differ: Vec<usize> = (0..before.len())
+                    .filter(|&i| before[i] != again[i])
+                    .collect();
                 let changed = (0..before.len()).filter(|&i| before[i] != ran[i]).count();
-                say(format!("run {i}: {changed} parts changed by the frame, {} not put back as they were", differ.len()));
+                say(format!(
+                    "run {i}: {changed} parts changed by the frame, {} not put back as they were",
+                    differ.len()
+                ));
                 for &d in differ.iter().take(20) {
-                    let pieces = before[d].iter().zip(&again[d]).filter(|(a, b)| a != b).count();
-                    say(format!("    {} {:?}: {pieces} of {} pieces", self.called(reader.parts[d].id), reader.parts[d].sub.map(|s| s.0), before[d].len()));
+                    let pieces = before[d]
+                        .iter()
+                        .zip(&again[d])
+                        .filter(|(a, b)| a != b)
+                        .count();
+                    say(format!(
+                        "    {} {:?}: {pieces} of {} pieces",
+                        self.called(reader.parts[d].id),
+                        reader.parts[d].sub.map(|s| s.0),
+                        before[d].len()
+                    ));
                 }
             }
         }
         let put_back: HashSet<u32> = self.masters.iter().map(|m| m.0).collect();
-        let others: Vec<u32> = self.objects.keys().copied().filter(|id| !put_back.contains(id)).collect();
+        let others: Vec<u32> = self
+            .objects
+            .keys()
+            .copied()
+            .filter(|id| !put_back.contains(id))
+            .collect();
         let reader = self.reader(&others)?;
         self.restore(true)?;
         let start = self.start_states();
         let before = self.hashes_now(&reader, &start)?;
-        let o = Options { loops: 1, ..Options::default() };
+        let o = Options {
+            loops: 1,
+            ..Options::default()
+        };
         self.run(&o)?;
         self.restore(true)?;
         let after = self.hashes_now(&reader, &start)?;
@@ -337,7 +404,11 @@ impl Player {
                 ));
             }
         }
-        say(format!("{} parts of {} resources looked at, {n} changed", reader.parts.len(), others.len()));
+        say(format!(
+            "{} parts of {} resources looked at, {n} changed",
+            reader.parts.len(),
+            others.len()
+        ));
         Ok(())
     }
 
@@ -381,7 +452,12 @@ impl Player {
         }
         let mut blocks = Vec::new();
         for size in sizes {
-            let (b, data) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_READBACK, size, D3D12_RESOURCE_FLAG_NONE)?;
+            let (b, data) = gpu::buffer(
+                &self.device,
+                D3D12_HEAP_TYPE_READBACK,
+                size,
+                D3D12_RESOURCE_FLAG_NONE,
+            )?;
             blocks.push((b, data as usize));
         }
         Ok(Reader { blocks, parts })
@@ -410,12 +486,22 @@ impl Player {
         let before: Vec<Cmd> = unit.cmds[..unit.from]
             .iter()
             .filter(|c| {
-                !c.works() && !matches!(c, Cmd::Barriers { .. } | Cmd::BeginQuery { .. } | Cmd::EndQuery { .. })
+                !c.works()
+                    && !matches!(
+                        c,
+                        Cmd::Barriers { .. } | Cmd::BeginQuery { .. } | Cmd::EndQuery { .. }
+                    )
             })
             .cloned()
             .collect();
         self.translate(&l.1, &before, unit.submit, None, false);
-        self.translate(&l.1, &unit.cmds[unit.from..unit.to], unit.submit, None, wait);
+        self.translate(
+            &l.1,
+            &unit.cmds[unit.from..unit.to],
+            unit.submit,
+            None,
+            wait,
+        );
         // SAFETY: an open list.
         unsafe { l.1.Close()? };
         lists.push(l);
@@ -437,7 +523,10 @@ impl Player {
             for p in parts.iter().filter(|p| p.sub.is_some()) {
                 if seen.insert(p.id) {
                     let state = states.get(p.id).unwrap_or(vec![COMMON]);
-                    let to: Vec<u32> = state.iter().map(|&s| if s & COPY_SOURCE != 0 { s } else { COPY_SOURCE }).collect();
+                    let to: Vec<u32> = state
+                        .iter()
+                        .map(|&s| if s & COPY_SOURCE != 0 { s } else { COPY_SOURCE })
+                        .collect();
                     gpu::moves(&objects[&p.id].res, &state, &to, &mut before);
                     gpu::moves(&objects[&p.id].res, &to, &state, &mut after);
                 }
@@ -453,7 +542,14 @@ impl Player {
                             None => list.CopyBufferRegion(to, p.at, res, 0, p.len),
                             Some((sub, mut f)) => {
                                 f.Offset = p.at;
-                                list.CopyTextureRegion(&gpu::placed_location(to, f), 0, 0, 0, &gpu::sub_location(res, sub), None);
+                                list.CopyTextureRegion(
+                                    &gpu::placed_location(to, f),
+                                    0,
+                                    0,
+                                    0,
+                                    &gpu::sub_location(res, sub),
+                                    None,
+                                );
                             }
                         }
                     }
@@ -462,7 +558,8 @@ impl Player {
             })?;
         }
         let next = AtomicUsize::new(0);
-        let out: std::sync::Mutex<Vec<Vec<u64>>> = std::sync::Mutex::new(vec![Vec::new(); reader.parts.len()]);
+        let out: std::sync::Mutex<Vec<Vec<u64>>> =
+            std::sync::Mutex::new(vec![Vec::new(); reader.parts.len()]);
         std::thread::scope(|scope| {
             for _ in 0..16 {
                 scope.spawn(|| {
@@ -488,7 +585,14 @@ impl Player {
 
     /// Runs the unit `runs` times (memory is as at its start, and is put
     /// back between runs) and compares. Memory is as the last run left it.
-    fn trials(&mut self, reader: &Reader, unit: &Unit, states: &States, runs: u32, wait: bool) -> Result<Pieces> {
+    fn trials(
+        &mut self,
+        reader: &Reader,
+        unit: &Unit,
+        states: &States,
+        runs: u32,
+        wait: bool,
+    ) -> Result<Pieces> {
         let after = self.after(unit, states);
         let mut first: Option<Vec<Vec<u64>>> = None;
         let mut pieces = std::collections::BTreeSet::new();
@@ -505,7 +609,13 @@ impl Player {
                 None => first = Some(now),
                 Some(first) => {
                     for (p, (a, b)) in first.iter().zip(&now).enumerate() {
-                        pieces.extend(a.iter().zip(b).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| (p, i)));
+                        pieces.extend(
+                            a.iter()
+                                .zip(b)
+                                .enumerate()
+                                .filter(|(_, (a, b))| a != b)
+                                .map(|(i, _)| (p, i)),
+                        );
                     }
                 }
             }
@@ -537,12 +647,18 @@ impl Player {
     /// Copies the masters over the resources (which are in `from` and go to
     /// `to`), or the resources into the masters.
     fn copy_masters(&mut self, from: &States, to: &States, save: bool) -> Result<()> {
-        let known: HashMap<u32, &ID3D12Resource> = self.masters.iter().map(|(id, m)| (*id, m)).collect();
+        let known: HashMap<u32, &ID3D12Resource> =
+            self.masters.iter().map(|(id, m)| (*id, m)).collect();
         let (mut before, mut after, mut plain) = (Vec::new(), Vec::new(), Vec::new());
         let here = if save { COPY_SOURCE } else { COPY_DEST };
         for id in self.start.keys() {
-            let Some(o) = self.objects.get(id) else { continue };
-            let (a, b) = (from.get(*id).unwrap_or(vec![COMMON]), to.get(*id).unwrap_or(vec![COMMON]));
+            let Some(o) = self.objects.get(id) else {
+                continue;
+            };
+            let (a, b) = (
+                from.get(*id).unwrap_or(vec![COMMON]),
+                to.get(*id).unwrap_or(vec![COMMON]),
+            );
             let Some(m) = known.get(id) else {
                 gpu::moves(&o.res, &a, &b, &mut plain);
                 continue;
@@ -590,27 +706,59 @@ impl Player {
             match c {
                 Cmd::Pipeline { pso: p } => pso = *p,
                 Cmd::RootSignature { graphics, .. } => binds.retain(|k, _| k.0 != *graphics),
-                Cmd::RootView { graphics, kind, param, va } => {
-                    let kind = ["", "cbv", "srv", "uav"].get(*kind as usize).copied().unwrap_or("");
+                Cmd::RootView {
+                    graphics,
+                    kind,
+                    param,
+                    va,
+                } => {
+                    let kind = ["", "cbv", "srv", "uav"]
+                        .get(*kind as usize)
+                        .copied()
+                        .unwrap_or("");
                     let text = match va {
-                        Va::At { res, offset } => format!("{kind} {} +{offset:#x}", self.called(*res)),
+                        Va::At { res, offset } => {
+                            format!("{kind} {} +{offset:#x}", self.called(*res))
+                        }
                         _ => format!("{kind} null"),
                     };
                     binds.insert((*graphics, *param), text);
                 }
-                Cmd::Table { graphics, param, heap, slot } => {
-                    binds.insert((*graphics, *param), format!("table heap {heap} slot {slot}"));
+                Cmd::Table {
+                    graphics,
+                    param,
+                    heap,
+                    slot,
+                } => {
+                    binds.insert(
+                        (*graphics, *param),
+                        format!("table heap {heap} slot {slot}"),
+                    );
                 }
-                Cmd::Constants { graphics, param, offset, values } => {
+                Cmd::Constants {
+                    graphics,
+                    param,
+                    offset,
+                    values,
+                } => {
                     let text = format!("constants +{offset} {values:x?}");
-                    binds.entry((*graphics, *param)).and_modify(|t| *t = format!("{t}, {text}")).or_insert(text);
+                    binds
+                        .entry((*graphics, *param))
+                        .and_modify(|t| *t = format!("{t}, {text}"))
+                        .or_insert(text);
                 }
                 Cmd::Targets { colors, depth } => {
-                    let all: Vec<String> = colors.iter().chain(depth).map(|s| self.called(s.res)).collect();
+                    let all: Vec<String> = colors
+                        .iter()
+                        .chain(depth)
+                        .map(|s| self.called(s.res))
+                        .collect();
                     targets = all.join(", ");
                 }
                 Cmd::Barriers { all } => since.extend(all.iter().map(|b| match b {
-                    Barrier::Transition { res, before, after, .. } => format!("{} {before:#x}->{after:#x}", self.called(*res)),
+                    Barrier::Transition {
+                        res, before, after, ..
+                    } => format!("{} {before:#x}->{after:#x}", self.called(*res)),
                     Barrier::Uav { res: 0, .. } => "all uav".into(),
                     Barrier::Uav { res, .. } => format!("uav {}", self.called(*res)),
                     Barrier::Alias { .. } => "alias".into(),
@@ -622,7 +770,11 @@ impl Player {
             }
         }
         let graphics = !matches!(cmds[at], Cmd::Dispatch { .. });
-        let binds: Vec<String> = binds.iter().filter(|(k, _)| k.0 == graphics).map(|(k, t)| format!("[{}] {t}", k.1)).collect();
+        let binds: Vec<String> = binds
+            .iter()
+            .filter(|(k, _)| k.0 == graphics)
+            .map(|(k, t)| format!("[{}] {t}", k.1))
+            .collect();
         let mut text = format!("{:?}", cmds[at]);
         if cmds[at].runs_shaders() {
             text += &format!(" of {}", self.pipeline_name(pso));
@@ -631,12 +783,20 @@ impl Player {
                 text += &format!("\n    targets: {targets}");
             }
         }
-        text + &format!("\n    barriers since the command before: {}", since.join("; "))
+        text + &format!(
+            "\n    barriers since the command before: {}",
+            since.join("; ")
+        )
     }
 
     /// Says which lists (of the list in `s.lists`: which commands) change
     /// words of a buffer, and to what.
-    pub fn watch(&mut self, s: &Search, parts: &[(u32, u64, u64)], say: &mut dyn FnMut(String)) -> Result<()> {
+    pub fn watch(
+        &mut self,
+        s: &Search,
+        parts: &[(u32, u64, u64)],
+        say: &mut dyn FnMut(String),
+    ) -> Result<()> {
         let mut report = Report::default();
         let submits = self.edited(&s.options, &mut report, &[]);
         self.restore(true)?;
@@ -646,7 +806,10 @@ impl Player {
                 .iter()
                 .map(|&(id, at, len)| {
                     let bytes = p.slice(id, at, len)?;
-                    Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect())
+                    Ok(bytes
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default()))
+                        .collect())
                 })
                 .collect()
         };
@@ -666,13 +829,25 @@ impl Player {
                     cuts.push(cmds.len());
                 }
                 for k in 0..cuts.len() - 1 {
-                    let unit = Unit { submit: i, cmds, from: cuts[k], to: cuts[k + 1], delta: j == 0 && k == 0 };
+                    let unit = Unit {
+                        submit: i,
+                        cmds,
+                        from: cuts[k],
+                        to: cuts[k + 1],
+                        delta: j == 0 && k == 0,
+                    };
                     self.go(&unit, s.wait_all)?;
                     let now = words(self)?;
                     if now != was {
                         if inside {
-                            let last = (unit.from..unit.to).rev().find(|&c| cmds[c].works()).unwrap_or(unit.to - 1);
-                            say(format!("list {here} (submission {i}, its list {j}) command {last}: {}", self.describe(cmds, last)));
+                            let last = (unit.from..unit.to)
+                                .rev()
+                                .find(|&c| cmds[c].works())
+                                .unwrap_or(unit.to - 1);
+                            say(format!(
+                                "list {here} (submission {i}, its list {j}) command {last}: {}",
+                                self.describe(cmds, last)
+                            ));
                         } else {
                             say(format!("list {here} (submission {i}, its list {j})"));
                         }
@@ -703,7 +878,12 @@ impl Player {
     /// Each draw of one list whose pipeline's name has `text` in it, run
     /// alone (with what prepares its arguments) from the memory at the list's
     /// start, `runs` times: how many different contents its targets get.
-    pub fn diverge_draws(&mut self, s: &Search, text: &str, say: &mut dyn FnMut(String)) -> Result<()> {
+    pub fn diverge_draws(
+        &mut self,
+        s: &Search,
+        text: &str,
+        say: &mut dyn FnMut(String),
+    ) -> Result<()> {
         let mut report = Report::default();
         let submits = self.edited(&s.options, &mut report, &[]);
         let flat: Vec<(usize, usize, &Vec<Cmd>)> = submits
@@ -717,7 +897,13 @@ impl Player {
         let mut states = self.start_states();
         for (here, &(i, j, cmds)) in flat.iter().enumerate() {
             if here < wanted {
-                let unit = Unit { submit: i, cmds, from: 0, to: cmds.len(), delta: j == 0 };
+                let unit = Unit {
+                    submit: i,
+                    cmds,
+                    from: 0,
+                    to: cmds.len(),
+                    delta: j == 0,
+                };
                 self.go(&unit, s.wait_all)?;
                 self.commit(&unit, &mut states)?;
                 if flat.get(here + 1).is_none_or(|n| n.0 != i) {
@@ -732,10 +918,23 @@ impl Player {
             for (c, cmd) in cmds.iter().enumerate() {
                 match cmd {
                     Cmd::Pipeline { pso: p } => pso = *p,
-                    Cmd::Targets { colors, depth } => targets = colors.iter().chain(depth).map(|s| s.res).filter(|r| *r != NONE).collect(),
+                    Cmd::Targets { colors, depth } => {
+                        targets = colors
+                            .iter()
+                            .chain(depth)
+                            .map(|s| s.res)
+                            .filter(|r| *r != NONE)
+                            .collect()
+                    }
                     _ => {}
                 }
-                if !matches!(cmd, Cmd::Indirect { .. } | Cmd::Draw { .. } | Cmd::DrawIndexed { .. } | Cmd::DispatchMesh { .. }) {
+                if !matches!(
+                    cmd,
+                    Cmd::Indirect { .. }
+                        | Cmd::Draw { .. }
+                        | Cmd::DrawIndexed { .. }
+                        | Cmd::DispatchMesh { .. }
+                ) {
                     continue;
                 }
                 let from = std::mem::replace(&mut last, c + 1);
@@ -745,12 +944,20 @@ impl Player {
                 targets.sort_unstable();
                 targets.dedup();
                 let reader = self.reader(&targets)?;
-                let unit = Unit { submit: i, cmds, from, to: c + 1, delta: false };
+                let unit = Unit {
+                    submit: i,
+                    cmds,
+                    from,
+                    to: c + 1,
+                    delta: false,
+                };
                 // Barriers before it in the list are made up for: textures
                 // are in the states the list has them in here.
                 let mut before = states.clone();
                 let mut all = Vec::new();
-                cmds[..from].iter().for_each(|c| states::changes(c, &mut all));
+                cmds[..from]
+                    .iter()
+                    .for_each(|c| states::changes(c, &mut all));
                 all.iter().for_each(|c| before.change(c));
                 let after = self.after(&unit, &before);
                 let mut kinds: HashMap<Vec<Vec<u64>>, u32> = HashMap::new();
@@ -770,7 +977,12 @@ impl Player {
                 }
                 let mut counts: Vec<u32> = kinds.values().copied().collect();
                 counts.sort_unstable();
-                say(format!("command {c} (from {from}) {:?} of {}: {} outcomes {counts:?}", cmd, self.pipeline_name(pso), counts.len()));
+                say(format!(
+                    "command {c} (from {from}) {:?} of {}: {} outcomes {counts:?}",
+                    cmd,
+                    self.pipeline_name(pso),
+                    counts.len()
+                ));
             }
             break;
         }
@@ -779,13 +991,20 @@ impl Player {
 
     /// `len` bytes of a buffer from `at`.
     fn slice(&mut self, id: u32, at: u64, len: u64) -> Result<Vec<u8>> {
-        let Some(o) = self.objects.get(&id) else { return Ok(Vec::new()) };
+        let Some(o) = self.objects.get(&id) else {
+            return Ok(Vec::new());
+        };
         let len = len.min(self.frame.resources[o.index].desc.width.saturating_sub(at));
         if len == 0 {
             return Ok(Vec::new());
         }
         let res = o.res.clone();
-        let (back, data) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_READBACK, len, D3D12_RESOURCE_FLAG_NONE)?;
+        let (back, data) = gpu::buffer(
+            &self.device,
+            D3D12_HEAP_TYPE_READBACK,
+            len,
+            D3D12_RESOURCE_FLAG_NONE,
+        )?;
         self.worker.run(|list| {
             // SAFETY: an open list; live buffers.
             unsafe { list.CopyBufferRegion(&back, 0, &res, at, len) };
@@ -796,20 +1015,39 @@ impl Player {
 
     /// The words of a buffer view (raw or typed, of words).
     fn view_words(&mut self, s: &Slot, first: u64, n: u64) -> Result<Vec<u32>> {
-        let at = u64::from_le_bytes([s.desc[16], s.desc[17], s.desc[18], s.desc[19], s.desc[20], s.desc[21], s.desc[22], s.desc[23]]);
-        let count = u64::from(u32::from_le_bytes([s.desc[24], s.desc[25], s.desc[26], s.desc[27]]));
+        let at = u64::from_le_bytes([
+            s.desc[16], s.desc[17], s.desc[18], s.desc[19], s.desc[20], s.desc[21], s.desc[22],
+            s.desc[23],
+        ]);
+        let count = u64::from(u32::from_le_bytes([
+            s.desc[24], s.desc[25], s.desc[26], s.desc[27],
+        ]));
         let n = n.min(count.saturating_sub(first));
         let bytes = self.slice(s.res, (at + first) * 4, n * 4)?;
-        Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect())
+        Ok(bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default()))
+            .collect())
     }
 
     /// What a mesh draw of the title's (with its usual constants) reads.
-    fn peek(&mut self, cmds: &[Cmd], at: usize, submit: usize, say: &mut dyn FnMut(String)) -> Result<()> {
+    fn peek(
+        &mut self,
+        cmds: &[Cmd],
+        at: usize,
+        submit: usize,
+        say: &mut dyn FnMut(String),
+    ) -> Result<()> {
         let mut v = [0u32; 16];
         let mut heap = NONE;
         for c in &cmds[..at] {
             match c {
-                Cmd::Constants { graphics: true, param: 0, offset, values } => {
+                Cmd::Constants {
+                    graphics: true,
+                    param: 0,
+                    offset,
+                    values,
+                } => {
                     for (k, x) in values.iter().enumerate() {
                         if let Some(at) = v.get_mut(*offset as usize + k) {
                             *at = *x;
@@ -834,20 +1072,33 @@ impl Player {
             ("x+2848", v[8] + 2848, 0),
         ] {
             let s = slot(self, byte);
-            let words = if s.kind == slot::SRV { self.view_words(&s, 0, n)? } else { Vec::new() };
-            say(format!("    {name}: slot {} {}: {words:x?}", byte >> 5, self.slot_text(&s)));
+            let words = if s.kind == slot::SRV {
+                self.view_words(&s, 0, n)?
+            } else {
+                Vec::new()
+            };
+            say(format!(
+                "    {name}: slot {} {}: {words:x?}",
+                byte >> 5,
+                self.slot_text(&s)
+            ));
         }
         // The list of visible meshlets, as the mesh shader finds it.
         let lists = slot(self, v[8] + 2752);
         let word = self.view_words(&lists, u64::from((v[13] & 0x07ff_ffff) & 0x07ff_ffff), 4)?;
         let typed = slot(self, v[8] + 1600);
         let index = self.view_words(&typed, 510, 1)?;
-        say(format!("    list words {word:x?} (count {}, first {}), typed view slot {index:x?}", word.first().map_or(0, |w| w >> 15), word.first().map_or(0, |w| w & 0x7fff)));
+        say(format!(
+            "    list words {word:x?} (count {}, first {}), typed view slot {index:x?}",
+            word.first().map_or(0, |w| w >> 15),
+            word.first().map_or(0, |w| w & 0x7fff)
+        ));
         if let (Some(w), Some(i)) = (word.first(), index.first()) {
             let s = self.slot_at(heap, i & 0x07ff_ffff, submit);
             say(format!("    typed view: {}", self.slot_text(&s)));
             if s.kind == slot::SRV && s.res != NONE {
-                let list = self.view_words(&s, u64::from(w & 0x7fff) * 16, u64::from(w >> 15) + 16)?;
+                let list =
+                    self.view_words(&s, u64::from(w & 0x7fff) * 16, u64::from(w >> 15) + 16)?;
                 say(format!("    visible meshlets: {list:x?}"));
             }
         }
@@ -868,7 +1119,12 @@ impl Player {
                     let mut heap = NONE;
                     for c in &cmds[..command] {
                         match c {
-                            Cmd::Constants { param, offset, values: v, .. } => {
+                            Cmd::Constants {
+                                param,
+                                offset,
+                                values: v,
+                                ..
+                            } => {
                                 for (k, x) in v.iter().enumerate() {
                                     if let Some(all) = values.get_mut(*param as usize)
                                         && let Some(at) = all.get_mut(*offset as usize + k)
@@ -882,7 +1138,12 @@ impl Player {
                         }
                     }
                     say(format!("heap {heap}, constants {values:x?}"));
-                    let mut bases: Vec<u32> = values.iter().flatten().map(|v| v >> 5).filter(|v| *v > 64).collect();
+                    let mut bases: Vec<u32> = values
+                        .iter()
+                        .flatten()
+                        .map(|v| v >> 5)
+                        .filter(|v| *v > 64)
+                        .collect();
                     bases.dedup();
                     for base in bases {
                         for k in 0..12 {
@@ -904,10 +1165,19 @@ impl Player {
     /// A heap slot as it was for a submission.
     fn slot_at(&self, heap: u32, at: u32, submit: usize) -> Slot {
         let late = self.frame.submits[..=submit].iter().rev().find_map(|s| {
-            s.views.iter().rev().find(|(h, i, _)| *h == heap && *i == at).map(|v| v.2)
+            s.views
+                .iter()
+                .rev()
+                .find(|(h, i, _)| *h == heap && *i == at)
+                .map(|v| v.2)
         });
         late.unwrap_or_else(|| {
-            let runs = self.frame.descriptor_heaps.iter().find(|h| h.id == heap).map(|h| &h.runs);
+            let runs = self
+                .frame
+                .descriptor_heaps
+                .iter()
+                .find(|h| h.id == heap)
+                .map(|h| &h.runs);
             runs.and_then(|runs| {
                 let k = runs.partition_point(|r| r.0 <= at).checked_sub(1)?;
                 let (first, n, s) = &runs[k];
@@ -918,9 +1188,23 @@ impl Player {
     }
 
     fn slot_text(&self, s: &Slot) -> String {
-        let word = |i: usize| u32::from_le_bytes([s.desc[i * 4], s.desc[i * 4 + 1], s.desc[i * 4 + 2], s.desc[i * 4 + 3]]);
-        let kind = ["empty", "cbv", "srv", "uav", "sampler", "rtv", "dsv"].get(s.kind as usize).copied().unwrap_or("?");
-        let res = if s.res == NONE { "null".into() } else { self.called(s.res) };
+        let word = |i: usize| {
+            u32::from_le_bytes([
+                s.desc[i * 4],
+                s.desc[i * 4 + 1],
+                s.desc[i * 4 + 2],
+                s.desc[i * 4 + 3],
+            ])
+        };
+        let kind = ["empty", "cbv", "srv", "uav", "sampler", "rtv", "dsv"]
+            .get(s.kind as usize)
+            .copied()
+            .unwrap_or("?");
+        let res = if s.res == NONE {
+            "null".into()
+        } else {
+            self.called(s.res)
+        };
         match s.kind {
             slot::CBV => format!("cbv {res} +{:#x} size {:#x}", s.address(), word(2)),
             _ => format!(
@@ -935,7 +1219,7 @@ impl Player {
         }
     }
 
-    fn called(&self, id: u32) -> String {
+    pub(super) fn called(&self, id: u32) -> String {
         let Some(o) = self.objects.get(&id) else {
             return format!("resource {id} (not there)");
         };
@@ -948,12 +1232,22 @@ impl Player {
             };
             format!("#{id} '{}' buffer {:#x} {kind}", r.name, d.width)
         } else {
-            format!("#{id} '{}' {}x{}x{} m{} f{}", r.name, d.width, d.height, d.depth, d.mips, d.format)
+            format!(
+                "#{id} '{}' {}x{}x{} m{} f{}",
+                r.name, d.width, d.height, d.depth, d.mips, d.format
+            )
         }
     }
 
     /// Runs the unit until two runs differ, and says how.
-    fn compare(&mut self, reader: &Reader, unit: &Unit, states: &States, pieces: &Pieces, wait: bool) -> Result<Vec<String>> {
+    fn compare(
+        &mut self,
+        reader: &Reader,
+        unit: &Unit,
+        states: &States,
+        pieces: &Pieces,
+        wait: bool,
+    ) -> Result<Vec<String>> {
         let after = self.after(unit, states);
         let parts: std::collections::BTreeSet<usize> = pieces.iter().map(|p| p.0).collect();
         let mut seen: Vec<(Vec<Vec<u64>>, Vec<Vec<u8>>)> = Vec::new();
@@ -966,7 +1260,10 @@ impl Player {
             if seen.iter().any(|(h, _)| *h == hashes) {
                 continue;
             }
-            let data = parts.iter().map(|&p| reader.bytes(&reader.parts[p]).to_vec()).collect();
+            let data = parts
+                .iter()
+                .map(|&p| reader.bytes(&reader.parts[p]).to_vec())
+                .collect();
             seen.push((hashes, data));
             if seen.len() == 2 {
                 break;
@@ -978,9 +1275,16 @@ impl Player {
             && let Some((p, part)) = reader.parts.iter().enumerate().find(|(_, p)| p.id == *args)
         {
             let bytes = &reader.bytes(part)[*at as usize..];
-            let words: Vec<u32> = bytes.chunks_exact(4).take(8).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect();
+            let words: Vec<u32> = bytes
+                .chunks_exact(4)
+                .take(8)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default()))
+                .collect();
             let each: HashSet<&Vec<u64>> = seen.iter().map(|s| &s.0[p]).collect();
-            out.push(format!("arguments {words:x?} (the same in all runs: {})", each.len() == 1));
+            out.push(format!(
+                "arguments {words:x?} (the same in all runs: {})",
+                each.len() == 1
+            ));
         }
         self.at = after;
         let [(_, a), (_, b)] = &seen[..] else {
@@ -988,13 +1292,19 @@ impl Player {
             return Ok(out);
         };
         // And without the command.
-        let before = Unit { to: unit.to - 1, ..*unit };
+        let before = Unit {
+            to: unit.to - 1,
+            ..*unit
+        };
         self.put_back(states)?;
         self.go(&before, wait)?;
         self.at = self.after(&before, states);
         let now = self.at.clone();
         self.hashes_now(reader, &now)?;
-        let without: Vec<Vec<u8>> = parts.iter().map(|&p| reader.bytes(&reader.parts[p]).to_vec()).collect();
+        let without: Vec<Vec<u8>> = parts
+            .iter()
+            .map(|&p| reader.bytes(&reader.parts[p]).to_vec())
+            .collect();
         let to = self.folder.join("diverge");
         let _ = std::fs::create_dir_all(&to);
         for (k, &p) in parts.iter().enumerate().take(12) {
@@ -1002,13 +1312,28 @@ impl Player {
             // Both contents, to look at.
             let sub = part.sub.map_or(0, |s| s.0);
             let _ = std::fs::write(to.join(format!("{}-{sub}-0.bin", part.id)), &without[k]);
-            let changed = |v: &[u8]| v.chunks_exact(4).zip(without[k].chunks_exact(4)).filter(|(x, y)| x != y).count();
-            out.push(format!("it changes {} dwords in one run, {} in another", changed(&a[k]), changed(&b[k])));
+            let changed = |v: &[u8]| {
+                v.chunks_exact(4)
+                    .zip(without[k].chunks_exact(4))
+                    .filter(|(x, y)| x != y)
+                    .count()
+            };
+            out.push(format!(
+                "it changes {} dwords in one run, {} in another",
+                changed(&a[k]),
+                changed(&b[k])
+            ));
             let _ = std::fs::write(to.join(format!("{}-{sub}-a.bin", part.id)), &a[k]);
             let _ = std::fs::write(to.join(format!("{}-{sub}-b.bin", part.id)), &b[k]);
-            let words = |v: &[u8]| -> Vec<u32> { v.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect() };
+            let words = |v: &[u8]| -> Vec<u32> {
+                v.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default()))
+                    .collect()
+            };
             let (x, y) = (words(&a[k]), words(&b[k]));
-            let differ: Vec<usize> = (0..x.len().min(y.len())).filter(|&i| x[i] != y[i]).collect();
+            let differ: Vec<usize> = (0..x.len().min(y.len()))
+                .filter(|&i| x[i] != y[i])
+                .collect();
             if differ.is_empty() {
                 continue;
             }
@@ -1018,9 +1343,19 @@ impl Player {
                 s.sort_unstable();
                 s
             };
-            let order = if sorted(&x) == sorted(&y) { " (the same values in another order)" } else { "" };
-            let sub = part.sub.map_or(String::new(), |(s, f)| format!(" subresource {s} pitch {}", f.Footprint.RowPitch));
-            let sample: Vec<String> = differ.iter().take(8).map(|&i| format!("+{:#x}: {:08x} {:08x}", i * 4, x[i], y[i])).collect();
+            let order = if sorted(&x) == sorted(&y) {
+                " (the same values in another order)"
+            } else {
+                ""
+            };
+            let sub = part.sub.map_or(String::new(), |(s, f)| {
+                format!(" subresource {s} pitch {}", f.Footprint.RowPitch)
+            });
+            let sample: Vec<String> = differ
+                .iter()
+                .take(8)
+                .map(|&i| format!("+{:#x}: {:08x} {:08x}", i * 4, x[i], y[i]))
+                .collect();
             out.push(format!(
                 "writes {}{sub}: {} of {} dwords differ, {:#x}..{:#x}{order}: {}",
                 self.called(part.id),
@@ -1041,6 +1376,11 @@ impl Player {
 impl Reader {
     fn bytes(&self, p: &Part) -> &[u8] {
         // SAFETY: a part of a mapped block; copies into it have run.
-        unsafe { std::slice::from_raw_parts((self.blocks[p.block].1 + p.at as usize) as *const u8, p.len as usize) }
+        unsafe {
+            std::slice::from_raw_parts(
+                (self.blocks[p.block].1 + p.at as usize) as *const u8,
+                p.len as usize,
+            )
+        }
     }
 }

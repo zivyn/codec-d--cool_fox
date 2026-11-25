@@ -30,6 +30,7 @@ use super::wire::{
 };
 
 pub mod diverge;
+mod merge;
 
 /// The name of the argument clamp's pipeline, by which its passes are
 /// recognised.
@@ -69,6 +70,9 @@ pub struct Options {
     pub skip_clamps: bool,
     pub skip_hash_passes: bool,
     pub one_submit: bool,
+    /// Copies of what the CPU wrote leave alone what the card wrote in this
+    /// run (`merge`).
+    pub merge: bool,
     /// A full wait after every command that works.
     pub wait_all: bool,
     /// Each list sent on its own, and waited for.
@@ -98,6 +102,7 @@ impl Default for Options {
             skip_clamps: false,
             skip_hash_passes: false,
             one_submit: false,
+            merge: true,
             wait_all: false,
             wait_lists: false,
             only: None,
@@ -372,6 +377,11 @@ pub struct Player {
     /// States at the start of the frame and after it.
     start: HashMap<u32, Vec<u32>>,
     end: HashMap<u32, Vec<u32>>,
+    /// For `Options::merge`.
+    merger: Option<merge::Merger>,
+    merging: bool,
+    /// Resources the card may write in the frame.
+    card_writes: HashSet<u32>,
     /// The results of clamp passes ([`RESULTS`]).
     results: Option<ID3D12Resource>,
     commands: Vec<Vec<Cmd>>,
@@ -437,6 +447,9 @@ impl Player {
             delta_parts: Vec::new(),
             start: HashMap::new(),
             end: HashMap::new(),
+            merger: None,
+            merging: false,
+            card_writes: HashSet::new(),
             results: None,
             commands,
             fresh: true,
@@ -463,12 +476,22 @@ impl Player {
         step("descriptors", &mut at);
         player.load_contents()?;
         step("contents", &mut at);
-        player.make_masters()?;
+        player.make_masters(options.buffers)?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
             .map(|(w, d)| format!("{w} {:.1} s", d.as_secs_f64()))
             .collect();
+        if let Some([budget, used, pc]) = player.memory() {
+            let over = if used + 256 > budget {
+                ": over the budget, so the system moves memory to the PC's and the times are not the card's"
+            } else {
+                ""
+            };
+            player.notes.push(format!(
+                "{used} MB of the card's memory used, budget {budget} MB; {pc} MB of the PC's{over}"
+            ));
+        }
         player.notes.push(format!(
             "loaded in {:.1} s: {}",
             began.elapsed().as_secs_f64(),
@@ -1422,7 +1445,7 @@ impl Player {
     }
 
     /// Copies of what the frame changes; and the states it leaves.
-    fn make_masters(&mut self) -> Result<()> {
+    fn make_masters(&mut self, buffers: Buffers) -> Result<()> {
         let mut states = States::default();
         for r in &self.frame.resources {
             if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
@@ -1454,6 +1477,7 @@ impl Player {
             .filter(|r| r.state.iter().any(|s| s & WRITE != 0))
             .map(|r| r.id)
             .collect();
+        let mut by_cpu: HashSet<u32> = HashSet::new();
         for (i, s) in self.frame.submits.iter().enumerate() {
             for &l in s.lists.iter().filter(|&&l| l != MISSING) {
                 for c in &self.commands[l as usize] {
@@ -1504,7 +1528,7 @@ impl Player {
             }
             states.decay();
             if i > 0 {
-                written.extend(self.delta_parts[i].iter().map(|(d, _)| d.res));
+                by_cpu.extend(self.delta_parts[i].iter().map(|(d, _)| d.res));
             }
         }
         // Buffers any unordered-access view names.
@@ -1537,6 +1561,8 @@ impl Player {
                 }
             }
         }
+        self.card_writes = written.clone();
+        written.extend(by_cpu);
         for id in self.start.keys() {
             self.end
                 .insert(*id, states.get(*id).unwrap_or(vec![COMMON]));
@@ -1568,7 +1594,10 @@ impl Player {
             let size = unsafe { self.device.GetResourceAllocationInfo(0, &[desc]) }.SizeInBytes;
             let room = self.room();
             let buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
-            let pc = buffer && room.is_some_and(|room| room < size + (1 << 30));
+            // With all buffers in the card's memory there is no room for
+            // their copies as well.
+            let pc = buffer
+                && (buffers == Buffers::Card || room.is_some_and(|room| room < size + (1 << 30)));
             let props = if pc {
                 D3D12_HEAP_PROPERTIES {
                     Type: D3D12_HEAP_TYPE_CUSTOM,
@@ -1642,6 +1671,31 @@ impl Player {
         Ok(())
     }
 
+    /// The card's memory budget and use, and the use of the PC's memory, in
+    /// MB.
+    fn memory(&self) -> Option<[u64; 3]> {
+        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut pc = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: plain queries.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter3 = factory
+                .EnumAdapterByLuid(self.device.GetAdapterLuid())
+                .ok()?;
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
+                .ok()?;
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut pc)
+                .ok()?;
+        }
+        Some([
+            own.Budget >> 20,
+            own.CurrentUsage >> 20,
+            pc.CurrentUsage >> 20,
+        ])
+    }
+
     /// What is free of the card's memory budget.
     fn room(&self) -> Option<u64> {
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -1695,6 +1749,13 @@ impl Player {
                 barriers(list, &into);
                 for (id, m) in &restored {
                     list.CopyResource(&objects[id].res, *m);
+                }
+                if let Some(merger) = &self.merger {
+                    for (id, base) in &merger.bases {
+                        if let Some((_, m)) = self.masters.iter().find(|m| m.0 == *id) {
+                            list.CopyResource(base, m);
+                        }
+                    }
                 }
                 barriers(list, &back);
             }
@@ -1886,10 +1947,15 @@ impl Player {
                     unsafe {
                         let mut seen = HashSet::new();
                         let mut after = Vec::new();
+                        let mut merges = Vec::new();
                         for (d, at) in parts {
                             let Some(ob) = self.objects.get(&d.res) else {
                                 continue;
                             };
+                            if self.merging && self.card_writes.contains(&d.res) {
+                                merges.push((d.res, d.at, *at, d.len));
+                                continue;
+                            }
                             open.1.CopyBufferRegion(&ob.res, d.at, from, *at, d.len);
                             if seen.insert(d.res) {
                                 // Back to the common state by itself, for
@@ -1898,6 +1964,11 @@ impl Player {
                             }
                         }
                         barriers(&open.1, &after);
+                        if !merges.is_empty() {
+                            self.wait_for_all(&open.1);
+                            self.merge_all(&open.1, from.GetGPUVirtualAddress(), &merges);
+                            self.wait_for_all(&open.1);
+                        }
                     }
                     Some(self.close(open, &heap, &mut next, Vec::new())?)
                 }
@@ -2077,13 +2148,51 @@ impl Player {
             .collect();
         let mut stamps = Vec::new();
         let mut bound = NONE;
+        // What the compute side has bound.
+        let mut compute: Vec<Cmd> = Vec::new();
         for c in cmds {
             if let Cmd::Pipeline { pso } = c {
                 bound = *pso;
             }
-            // SAFETY: an open list; the objects are the frame's, alive with
-            // the player; commands the host recorded the same way.
-            unsafe { self.command(list, c, version) };
+            let merged = self.merged_copy(c);
+            if let Some((from, what)) = merged {
+                // SAFETY: an open list; live buffers; what the compute side
+                // of it had bound is bound again.
+                unsafe {
+                    self.wait_for_all(list);
+                    self.merge_all(list, from, &[what]);
+                    self.wait_for_all(list);
+                    for c in &compute {
+                        self.command(list, c, version);
+                    }
+                }
+            } else {
+                // SAFETY: an open list; the objects are the frame's, alive
+                // with the player; commands the host recorded the same way.
+                unsafe { self.command(list, c, version) };
+            }
+            match c {
+                Cmd::RootSignature {
+                    graphics: false, ..
+                } => {
+                    compute.retain(|c| matches!(c, Cmd::Pipeline { .. }));
+                    compute.push(c.clone());
+                }
+                Cmd::Pipeline { .. } => {
+                    compute.retain(|c| !matches!(c, Cmd::Pipeline { .. }));
+                    compute.push(c.clone());
+                }
+                Cmd::Table {
+                    graphics: false, ..
+                }
+                | Cmd::Constants {
+                    graphics: false, ..
+                }
+                | Cmd::RootView {
+                    graphics: false, ..
+                } => compute.push(c.clone()),
+                _ => {}
+            }
             if wait && c.works() {
                 // SAFETY: an open list.
                 unsafe { self.wait_for_all(list) };
@@ -2608,6 +2717,7 @@ impl Player {
             notes: self.notes.clone(),
             ..Default::default()
         };
+        self.set_merging(o.merge)?;
         let clamps = if o.skip_clamps {
             self.clamp_results(&mut report)?
         } else {
@@ -2653,6 +2763,10 @@ impl Player {
         }
         if o.detailed {
             self.detail(&built, &stamps, o, &mut report);
+        }
+        if self.merging {
+            let notes = self.merge_notes(o.loops)?;
+            report.notes.extend(notes);
         }
         self.picture(o, &mut report)?;
         if let Some(q) = &self.info {

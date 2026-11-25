@@ -406,9 +406,7 @@ impl Capture {
                 }
                 // SAFETY: the reference just taken. (The count does not tell
                 // all that are dying: `Recorder::gone` takes those out.)
-                held.insert(res.id, unsafe {
-                    ID3D12Resource::from_raw(object.as_raw())
-                });
+                held.insert(res.id, unsafe { ID3D12Resource::from_raw(object.as_raw()) });
                 all.push(res.clone());
             }
         }

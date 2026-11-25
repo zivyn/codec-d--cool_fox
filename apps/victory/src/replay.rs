@@ -62,6 +62,10 @@ pub(crate) struct Replay {
     /// One ExecuteCommandLists for the whole frame.
     #[arg(long)]
     one_submit: bool,
+    /// Let copies of what the CPU wrote also overwrite what the card wrote in
+    /// the replay (as the recorded commands say).
+    #[arg(long)]
+    no_merge: bool,
     /// A full wait after every draw, dispatch, copy and clear.
     #[arg(long)]
     wait_all: bool,
@@ -158,6 +162,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         skip_clamps: r.skip_clamps,
         skip_hash_passes: r.skip_hash_passes,
         one_submit: r.one_submit,
+        merge: !r.no_merge,
         wait_all: r.wait_all,
         wait_lists: r.wait_lists,
         only,
@@ -179,13 +184,27 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     }
     let mut watched = Vec::new();
     for text in &r.watch {
-        let mut n = text.split(':').map(|p| u64::from_str_radix(p.trim_start_matches("0x"), 16));
-        let mut next = || n.next().and_then(Result::ok).with_context(|| format!("--watch {text}"));
-        let id = text.split(':').next().and_then(|p| p.parse().ok()).with_context(|| format!("--watch {text}"))?;
+        let mut n = text
+            .split(':')
+            .map(|p| u64::from_str_radix(p.trim_start_matches("0x"), 16));
+        let mut next = || {
+            n.next()
+                .and_then(Result::ok)
+                .with_context(|| format!("--watch {text}"))
+        };
+        let id = text
+            .split(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .with_context(|| format!("--watch {text}"))?;
         let _ = next();
         watched.push((id, next()?, next()?));
     }
-    if let Some(runs) = r.diverge.or(r.diverge_picture).or((!watched.is_empty()).then_some(2)) {
+    if let Some(runs) = r
+        .diverge
+        .or(r.diverge_picture)
+        .or((!watched.is_empty()).then_some(2))
+    {
         let lists = match &r.lists {
             Some(text) => Some(range(text).with_context(|| format!("--lists {text}"))?),
             None => None,
@@ -209,7 +228,8 @@ pub(crate) fn run(r: Replay) -> Result<()> {
                 Some(text) => Some(range(text).with_context(|| format!("--commands {text}"))?),
                 None => None,
             };
-            return player.diverge_picture(&search, commands, r.step, &mut |line| println!("{line}"));
+            return player
+                .diverge_picture(&search, commands, r.step, &mut |line| println!("{line}"));
         }
         return player.diverge(&search, &mut |line| println!("{line}"));
     }

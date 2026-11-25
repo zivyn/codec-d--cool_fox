@@ -609,7 +609,9 @@ impl Recorder {
                 // would be a call into what is there then.
                 if let Some(dead) = lock(&self.held).remove(&id) {
                     std::mem::forget(dead);
-                    self.problem("a resource died as the frame started: its contents may be missing");
+                    self.problem(
+                        "a resource died as the frame started: its contents may be missing",
+                    );
                 }
                 self.ids.remove(ptr, id);
                 write(&self.resources).remove(&id);

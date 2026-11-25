@@ -237,7 +237,10 @@ impl Pool {
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
-            let _ = std::thread::Builder::new().name(format!("victory-land-{i}")).spawn(move || pool.help());
+            let _ = std::thread::Builder::new().name(format!("victory-land-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-land");
+                pool.help()
+            });
         }
         pool
     }

@@ -38,6 +38,8 @@ mod thunks;
 #[cfg(windows)]
 mod tls;
 #[cfg(windows)]
+pub mod write_sites;
+#[cfg(windows)]
 mod windows;
 
 #[cfg(windows)]

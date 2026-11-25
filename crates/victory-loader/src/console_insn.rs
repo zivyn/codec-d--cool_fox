@@ -77,7 +77,7 @@ fn patches_clzero() -> bool {
 }
 
 /// `jmp rel32` at `at` to `to`, if it reaches.
-fn jump(at: usize, to: usize) -> Option<[u8; 5]> {
+pub(crate) fn jump(at: usize, to: usize) -> Option<[u8; 5]> {
     let rel = i32::try_from(to as i64 - (at as i64 + 5)).ok()?;
     let [a, b, c, d] = rel.to_le_bytes();
     Some([0xe9, a, b, c, d])
@@ -111,10 +111,10 @@ fn clzero_stub(at: usize, stub: usize, cmp: [u8; 3]) -> Option<Vec<u8>> {
 
 /// Room for [`clzero_stub`]s near the title's code: where it is and the bytes used.
 static STUBS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
-const STUBS_LEN: usize = 64 << 10;
+pub(crate) const STUBS_LEN: usize = 64 << 10;
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
-fn near(at: usize) -> Option<usize> {
+pub(crate) fn near(at: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
     let at = at & !0xffff;
     (0x10_0000..0x7000_0000).step_by(0x10_0000).flat_map(|d| [at.checked_sub(d), at.checked_add(d)]).flatten().find_map(|place| {

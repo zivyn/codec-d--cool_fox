@@ -254,6 +254,11 @@ struct Lower<'a> {
     stale: HashSet<Value>,
     /// See [`ordered_section`] (pixel programs).
     ordered: HashSet<Site>,
+    /// Raw UAV buffers (see [`Lower::entry`]) the program loads from past its
+    /// wave's cache (GLC): other groups write what it waits for. On the host
+    /// they are globally coherent; a load in a loop that only waits would
+    /// be made once otherwise.
+    coherent: HashSet<(usize, u32)>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -1546,6 +1551,7 @@ impl<'a> Lower<'a> {
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             stale: HashSet::new(),
+            coherent: HashSet::new(),
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
             } else {
@@ -2219,6 +2225,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2811,15 +2818,7 @@ impl<'a> Lower<'a> {
     /// the program has an integer atomic on the same table entry, which
     /// takes no other view.
     fn is_counter(&self, src: &Source) -> bool {
-        let entry = |s: &Source| match s {
-            Source::Loaded { load, first } => self
-                .scalar
-                .get(load)
-                .filter(|a| a.dynamic.is_none())
-                .map(|a| (a.param, a.offset + 4 * u32::from(*first))),
-            _ => None,
-        };
-        let Some(this) = entry(src) else {
+        let Some(this) = self.entry(src) else {
             return false;
         };
         self.x.res.descriptors.iter().any(|d| {
@@ -2838,8 +2837,35 @@ impl<'a> Lower<'a> {
                         | "image_atomic_umin"
                         | "image_atomic_umax"
                 )
-                && entry(&d.source) == Some(this)
+                && self.entry(&d.source) == Some(this)
         })
+    }
+
+    /// Which table entry `src` is loaded from: its root parameter and byte.
+    fn entry(&self, src: &Source) -> Option<(usize, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load).filter(|a| a.dynamic.is_none())?;
+        Some((a.param, a.offset + 4 * u32::from(*first)))
+    }
+
+    /// See [`Lower::coherent`].
+    fn find_coherent(&mut self) {
+        let found: Vec<_> = self
+            .x
+            .res
+            .descriptors
+            .iter()
+            .filter(|d| {
+                let i = &self.x.p.blocks[d.site.0].insts[d.site.1];
+                matches!(&i.fields, Fields::Buffer { cache, .. } if cache.glc)
+                    && i.name().starts_with("buffer_load_dword")
+                    && self.used_kind(&d.source).is_some_and(|u| u.kind == ResourceType::Uav)
+            })
+            .filter_map(|d| self.entry(&d.source))
+            .collect();
+        self.coherent.extend(found);
     }
 
     /// The kind of a view no instruction uses (in this program, or through
@@ -3280,11 +3306,6 @@ impl<'a> Lower<'a> {
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
-            }
-            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
-                let by = made.map(|b| &self.x.p.blocks[b]);
-                let def = by.and_then(|b| b.insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)));
-                eprintln!("MASK-WHY {v:?} made in {made:?} by {:?} at {:x?}; read in block at {:#x}; phi {}", def.map(|i| i.name()), def.map(|i| i.machine.offset), self.x.p.blocks[self.cur_ir].offset, self.phi_at.contains_key(&lo));
             }
             return Err(MASK_ELSEWHERE);
         }
@@ -6089,8 +6110,19 @@ impl<'a> Lower<'a> {
                 // A raw view counts bytes; the descriptor's record count is in elements.
                 let n = field(self, 0);
                 let stride = used.map_or(0, |u| u.stride);
+                let counted = inst
+                    .write(Reg::S(code + first + 2))
+                    .is_some_and(|v| self.read_as_number(v));
                 let n = if props.0 & 0xFF == 11 && stride > 1 {
                     let k = self.s.m.i32(stride);
+                    self.s.m.bin(c, Bin::UDiv, n, k)
+                } else if props.0 & 0xFF == 11
+                    && counted
+                    && let Some(stride) = self.slot_stride(&src)?
+                {
+                    // Picked from the heap: the host's table has the stride.
+                    let (i32t, one) = (self.s.t.i32, self.s.m.i32(1));
+                    let k = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 39, &[stride, one]);
                     self.s.m.bin(c, Bin::UDiv, n, k)
                 } else {
                     n
@@ -10765,7 +10797,10 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let uav = store || atomic.is_some() || used.is_some_and(|u| u.kind == ResourceType::Uav);
-        let u = if uav { 0x1000 } else { 0 };
+        let mut u = if uav { 0x1000 } else { 0 };
+        if uav && !typed && self.entry(src).is_some_and(|e| self.coherent.contains(&e)) {
+            u |= 0x4000;
+        }
         let iu = self.s.m.undef(self.s.t.i32);
         if let Some((bits, signed)) = narrow {
             // Below a dword: raw buffers are read and written in dwords on

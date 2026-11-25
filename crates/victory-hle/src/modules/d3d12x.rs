@@ -50,6 +50,20 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// The fork's offline warm-up (`victory translate --warm`), by
+/// [`precompile`]: whether it was translated now.
+pub fn warm_shader(container: &[u8]) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::precompile(container).map(|was_there| !was_there)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        Err("no shader cache on this host".into())
+    }
+}
+
 /// Keeps the host's translations of the title's shaders in `dir` (a
 /// folder of the cache) across runs, and its compiled pipelines beside it
 /// (`pipelines`).

@@ -286,12 +286,13 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [twins, as_is] = [0, 1].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
-            "raw twins of buffer views made per frame (VICTORY_RAW_VIEWS=0: none): {:.0}, of them {:.1} as the title's view is (it does not begin on 16 bytes)",
+            "raw twins of buffer views made per frame (VICTORY_RAW_VIEWS=0: none): {:.0}, of them {:.1} that do not begin on 16 bytes ({:.1} null)",
             twins as f64 / frames,
-            as_is as f64 / frames
+            moved as f64 / frames,
+            lost as f64 / frames
         );
     }
     let [pages, looked, mirrored, micros, tabled, later] = [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));

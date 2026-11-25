@@ -96,6 +96,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         } else {
             if (record[0] > 65535u) {
                 record[0] = 0;
+                record[1] = 0;
+                record[2] = 0;
             }
             asked = record[0];
             record[1] = min(record[1], 1u);

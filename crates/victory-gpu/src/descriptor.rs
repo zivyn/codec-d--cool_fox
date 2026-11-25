@@ -333,17 +333,38 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     }
 }
 
+/// Runs `f` with the host heap of the title's largest view heap, if there is
+/// one (reports: nothing is waited for).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<T> {
+    let heaps = SHADER_HEAPS.try_read().ok()?;
+    let host = heaps
+        .iter()
+        // SAFETY: registered heaps are live (removed when dropped).
+        .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
+        .filter(|heap| !heap.samplers())
+        .filter_map(|heap| heap.host.get()?.as_ref())
+        .max_by_key(|host| host.count())?;
+    Some(f(host))
+}
+
 /// Makes dynamic slot `index` of the host heap behind the title heap at
 /// `heap`, if that heap still exists, the constant buffer view of `size`
-/// bytes at `gpu`.
+/// bytes of `buffer` at `gpu`.
 #[cfg(windows)]
-pub(crate) fn constant_slot(heap: usize, index: u32, gpu: u64, size: u32) {
+pub(crate) fn constant_slot(
+    heap: usize,
+    index: u32,
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    gpu: u64,
+    size: u32,
+) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
-        host.constant_at(index, gpu, size);
+        host.constant_at(index, buffer, gpu, size);
     }
 }
 

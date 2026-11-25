@@ -600,7 +600,7 @@ pub(crate) mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
@@ -981,6 +981,134 @@ void main() {
             }
             let mb = f64::from(rounds * passes * pieces) / 16.0;
             println!("{rounds} rounds of {passes} passes of {pieces} pieces: {best:.2} ms ({mb:.0} MB, {:.0} GB/s)", mb / best / 1.024);
+        }
+    }
+
+    /// What raw loads through views that are not raw give past the view's
+    /// end (ignored: a measurement of the card). A buffer view of 4 KiB in a
+    /// buffer of 1 MiB whose every dword says where it lies: zeros past the
+    /// view, or the bytes there (whatever the card has in that place).
+    #[test]
+    #[ignore]
+    fn raw_loads_past_views() {
+        let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
+            return;
+        };
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4,b0), DescriptorTable(SRV(t0,numDescriptors=8)), UAV(u0), DescriptorTable(CBV(b1,numDescriptors=8))"
+cbuffer C : register(b0) { uint which; uint first; uint step; uint at; }
+ByteAddressBuffer v[8] : register(t0);
+struct Block { uint4 d[4096]; };
+ConstantBuffer<Block> c[8] : register(b1);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
+    if (step == 0) { if (id.x == 0) o.Store(at, v[which].Load(first)); }
+    else if (step == 1) { if (id.x == 0) o.Store(at, c[which].d[first / 16][(first / 4) & 3]); }
+    else { o.Store(at + id.x * 4, v[which].Load(first + id.x * step)); }
+}
+"#;
+        let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
+        let (buffer, data, _) = gpu.shared_buffer(1 << 20);
+        for i in 0..(1usize << 18) {
+            // SAFETY: inside the mapping.
+            unsafe { data.cast::<u32>().add(i).write(0xA000_0000 | i as u32) };
+        }
+        let (_out, out_ptr, out_gpu) = gpu.shared_buffer(1 << 16);
+        // SAFETY: plain heap creation, views of a live buffer.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            gpu.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 16,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        }
+        .unwrap();
+        // SAFETY: as above.
+        let (cpu, table, step) = unsafe {
+            (
+                heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                heap.GetGPUDescriptorHandleForHeapStart(),
+                gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
+            )
+        };
+        let names = ["raw", "structured 24 at 24", "structured 16", "typed u32", "typed u16", "typed 4 x u32", "constant buffer", "null raw"];
+        let view = |i: usize, format: i32, first: u64, count: u32, stride: u32, raw: bool, null: bool| {
+            let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT(format),
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: count,
+                        StructureByteStride: stride,
+                        Flags: if raw { D3D12_BUFFER_SRV_FLAG_RAW } else { D3D12_BUFFER_SRV_FLAG_NONE },
+                    },
+                },
+            };
+            let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + i * step };
+            // SAFETY: a slot of our heap, a live buffer.
+            unsafe { gpu.device.CreateShaderResourceView(if null { None } else { Some(&buffer) }, Some(&desc), at) };
+        };
+        for base in [0, 8] {
+            view(base, 39, 0, 1024, 0, true, false);
+            view(base + 1, 0, 1, 170, 24, false, false);
+            view(base + 2, 0, 0, 256, 16, false, false);
+            view(base + 3, 42, 0, 1024, 0, false, false);
+            view(base + 4, 57, 0, 2048, 0, false, false);
+            view(base + 5, 3, 0, 256, 0, false, false);
+            view(base + 7, 39, 0, 1, 0, true, true);
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                // SAFETY: a live buffer.
+                BufferLocation: unsafe { buffer.GetGPUVirtualAddress() },
+                SizeInBytes: 4096,
+            };
+            // SAFETY: a slot of our heap.
+            unsafe { gpu.device.CreateConstantBufferView(Some(&desc), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + (base + 6) * step }) };
+        }
+        let table2 = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: table.ptr + 8 * step as u64 };
+        let offsets = [0u32, 4092, 4096, 4104, 8192, 65536, 524_288, (1 << 20) - 4];
+        for mode in ["one load (uniform)", "a load a thread", "constant buffer load"] {
+            println!("{mode}:");
+            for (which, name) in names.iter().enumerate() {
+                // SAFETY: our open list, live buffers.
+                unsafe {
+                    std::ptr::write_bytes(out_ptr, 0x77, 1 << 16);
+                    gpu.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                    gpu.list.SetComputeRootSignature(&pass.root);
+                    gpu.list.SetPipelineState(&pass.pso);
+                    gpu.list.SetComputeRootDescriptorTable(1, table);
+                    gpu.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                    gpu.list.SetComputeRootDescriptorTable(3, table2);
+                    for (k, &offset) in offsets.iter().enumerate() {
+                        let step = match mode.as_bytes()[0] {
+                            b'o' => 0u32,
+                            b'c' => 1,
+                            _ => 4,
+                        };
+                        // (A thread's loads end at the offset.)
+                        let first = if step == 4 { offset.saturating_sub(63 * 4) } else { offset };
+                        let constants = [which as u32, first, step, k as u32 * 256];
+                        gpu.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                        gpu.list.Dispatch(1, 1, 1);
+                    }
+                }
+                gpu.submit_and_wait();
+                let found: Vec<String> = offsets
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &offset)| {
+                        let thread = if mode.as_bytes()[0] == b'a' { (offset.min(63 * 4) / 4) as usize } else { 0 };
+                        // SAFETY: inside the mapping.
+                        let word = unsafe { out_ptr.cast::<u32>().add(k * 64 + thread).read_volatile() };
+                        format!("{offset}: {word:#x}")
+                    })
+                    .collect();
+                println!("  {name:20} {}", found.join("  "));
+            }
         }
     }
 

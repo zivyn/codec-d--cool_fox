@@ -715,7 +715,7 @@ impl Host {
                 To::Slot(heap, index) => {
                     DONE[0].fetch_add(1, Ordering::Relaxed);
                     // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, gpu + op.at, op.len as u32);
+                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
                 }
                 To::Buffer(_) => {
                     DONE[0].fetch_add(1, Ordering::Relaxed);

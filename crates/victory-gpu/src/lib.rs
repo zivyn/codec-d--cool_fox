@@ -46,6 +46,8 @@ pub mod pipeline;
 mod picked;
 #[cfg(windows)]
 mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
 #[cfg(windows)]
 mod primitive;
 pub mod query;

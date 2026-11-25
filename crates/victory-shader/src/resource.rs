@@ -2611,6 +2611,42 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
     }
 
+    /// A VGPR a wave reduction used is free again after it: from the first
+    /// save on it holds parked scalars alone (an upscaler program parks a
+    /// constant buffer's descriptor that way).
+    #[test]
+    fn a_vgpr_used_before_holds_spilled_sgprs_from_its_first_save() {
+        let before = [
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0300, // v_mov_b32 v1, v0
+        ];
+        let park = [
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            0xBE83_0380, // s_mov_b32 s3, 0
+        ];
+        let load = [
+            0xF40C_0001,
+            0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+            S_ENDPGM,
+        ];
+        let words = [&before[..], &park, &load].concat();
+        let r = track_words(&words, &[param(Table, 9, 1)], HwStage::Ps);
+        assert_eq!(r.scalar, [((0, 5), at(0, 0x20))]);
+        // Still lane reads: a lane restored before it is saved, and a
+        // register with an ordinary use after the first save.
+        let restored_first = [&before[..], &park[2..4], &park[..2], &load].concat();
+        let used_after = [&before[..], &park, &before[1..], &load].concat();
+        for words in [restored_first, used_after] {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 8).unwrap();
+            let insts = p.blocks.iter().flat_map(|b| &b.insts);
+            assert_eq!(insts.filter(|i| i.name() == "v_readlane_b32").count(), 1);
+        }
+    }
+
     #[test]
     fn descriptors_joined_by_control_flow_are_traced_per_edge() {
         let r = track_words(

@@ -242,6 +242,9 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// is left of a cross-lane operation, which a console wave run as two host
 /// waves could not do where not every lane runs (the lane may be in the other
 /// wave, or not running).
+/// A VGPR of other uses is such a store too from its first save on, when every
+/// use from there is one of the two forms, in one block, and saves a lane
+/// before it restores it (a register free again after a wave reduction).
 /// A register pair parked in two neighbouring lanes (a lane mask, a 64-bit
 /// address) moves as a pair (`s_mov_b64`) when every save and every restore
 /// of the two lanes come together, so a parked lane mask comes back as the
@@ -276,7 +279,7 @@ fn unspill(
     // VGPRs used by parking alone, the scalar codes the program uses, and
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
-    let mut other = [false; 256];
+    let mut other: [Option<usize>; 256] = [None; 256]; // the last such use
     let mut used = [false; 128];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
@@ -314,7 +317,7 @@ fn unspill(
                 match reg {
                     Reg::S(c) => used[usize::from(c)] = true,
                     Reg::V(r) if park.is_some_and(|p| p.1 == r) => stores[usize::from(r)] = true,
-                    Reg::V(r) => other[usize::from(r)] = true,
+                    Reg::V(r) => other[usize::from(r)] = Some(parks.len()),
                     Reg::Scc => {}
                 }
             }
@@ -323,16 +326,33 @@ fn unspill(
         written.push(codes);
         read.push(from);
     }
-    for (i, park) in parks.iter_mut().enumerate() {
-        if park.is_some_and(|p| other[usize::from(p.1)]) {
-            *park = None;
+    let leader = |i: usize| leaders.binary_search(&list[i].offset).is_ok();
+    for reg in 0..256 {
+        let Some(last) = other[reg] else { continue };
+        let of = |p: &Option<(bool, u8, u8, u32)>| p.filter(|p| usize::from(p.1) == reg);
+        let first = parks.iter().position(|p| of(p).is_some_and(|p| p.0));
+        let late = first.is_some_and(|first| {
+            let end = parks.iter().rposition(|p| of(p).is_some()).unwrap_or(first);
+            let mut saved = Vec::new();
+            last < first
+                && !(first + 1..=end).any(leader)
+                && parks[first..=end].iter().filter_map(of).all(|(save, _, _, lane)| {
+                    if save {
+                        saved.push(lane);
+                    }
+                    saved.contains(&lane)
+                })
+        });
+        let from = if late { first.unwrap_or(0) } else { parks.len() };
+        for park in &mut parks[..from] {
+            if of(park).is_some() {
+                *park = None;
+            }
         }
-        let _ = i;
     }
     if parks.iter().all(Option::is_none) {
         return Vec::new();
     }
-    let leader = |i: usize| leaders.binary_search(&list[i].offset).is_ok();
     // Lane pairs (register, lower lane) that always move together: each
     // save of the lower lane is followed, in the same block and before its
     // register changes, by the save of the next register into the next

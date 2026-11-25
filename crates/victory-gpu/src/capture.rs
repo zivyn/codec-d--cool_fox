@@ -873,12 +873,20 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            // The PNG drops alpha: its range and how many texels have each
+            // channel zero are logged.
+            let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
+                    for c in 0..4 {
+                        (low[c], high[c]) = (low[c].min(p[c]), high[c].max(p[c]));
+                        zero[c] += usize::from(p[c] == 0);
+                    }
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
+            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).

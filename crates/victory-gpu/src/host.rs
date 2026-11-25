@@ -8804,6 +8804,19 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_over(texture, state, None, frame)
+    }
+
+    /// LOCAL (port of fxceless #1189): [`Self::present`], with a second
+    /// plane laid over `texture` if there is one (`crate::compose`): its
+    /// texture and its state, which it is left in.
+    pub(crate) fn present_over(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8887,7 +8900,13 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            // LOCAL (port of fxceless #1189): the second plane laid over the
+            // first, into a texture of ours shown instead (`crate::compose`).
+            let laid = over.and_then(|(ui, ui_state)| crate::compose::record(&self.device, list, texture, ui, ui_state));
+            if let Some(laid) = &laid {
+                copy.keep(laid);
+            }
+            list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))

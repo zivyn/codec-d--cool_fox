@@ -525,13 +525,22 @@ void main() {
 
     impl WarpHarness {
         fn new() -> Option<Self> {
-            // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
+            Self::on(true)
+        }
+
+        /// On the software adapter, or the first one (for measurements).
+        fn on(software: bool) -> Option<Self> {
+            // SAFETY: plain DXGI query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-                let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+                let adapter: IDXGIAdapter = if software {
+                    factory.EnumWarpAdapter().ok()?
+                } else {
+                    factory.EnumAdapters(0).ok()?
+                };
                 let desc = adapter.cast::<IDXGIAdapter1>().ok()?.GetDesc1().ok()?;
-                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                if software != (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0) {
                     return None;
                 }
                 let mut device: Option<ID3D12Device> = None;
@@ -760,7 +769,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -788,6 +797,61 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// What the passes over copies in the card's memory cost on the card
+    /// (ignored: a measurement): rounds of a few passes of some pieces and a
+    /// wait, as a frame has them. `VICTORY_BENCH_CS=<file>` times another
+    /// source of the shader.
+    #[test]
+    #[ignore]
+    fn card_compare_costs() {
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        let other = std::env::var("VICTORY_BENCH_CS").ok().map(|f| std::fs::read_to_string(f).unwrap());
+        let source: &'static str = other.map_or(crate::host::CARD_COMPARE, |s| Box::leak(s.into_boxed_str()));
+        let walked_alone = source.contains("SV_DispatchThreadID");
+        let compare = compile_cs(&gpu.device, source).expect("the compare must compile");
+        let now = gpu.default_uav(256 << 20);
+        let hashes = gpu.default_uav(64 << 10);
+        let differs = gpu.default_uav(64 << 10);
+        for (rounds, passes, pieces) in [(80u32, 5u32, 1u32), (80, 5, 5), (80, 5, 64), (80, 5, 500), (1, 1, 4000)] {
+            let mut best = f64::MAX;
+            for _ in 0..6 {
+                // SAFETY: our open list, live buffers, the compare's own
+                // root signature; the pieces lie in the buffers.
+                unsafe {
+                    gpu.list.SetComputeRootSignature(&compare.root);
+                    gpu.list.SetPipelineState(&compare.pso);
+                    gpu.list.SetComputeRootShaderResourceView(1, now.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
+                    gpu.list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
+                    for _ in 0..rounds {
+                        for pass in 0..passes {
+                            let first = if pieces * passes < 4096 { pass * pieces } else { 0 };
+                            let constants = [first, 0u32, 256 << 20, pieces, 0, 1];
+                            gpu.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            gpu.list.Dispatch(if walked_alone { pieces.div_ceil(64) } else { pieces }, 1, 1);
+                        }
+                        gpu.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                    pResource: std::mem::ManuallyDrop::new(None),
+                                }),
+                            },
+                            ..Default::default()
+                        }]);
+                    }
+                }
+                let t = std::time::Instant::now();
+                gpu.submit_and_wait();
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            let mb = f64::from(rounds * passes * pieces) / 16.0;
+            println!("{rounds} rounds of {passes} passes of {pieces} pieces: {best:.2} ms ({mb:.0} MB, {:.0} GB/s)", mb / best / 1.024);
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

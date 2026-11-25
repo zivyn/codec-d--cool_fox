@@ -61,7 +61,15 @@ static BOOK: Mutex<Option<Book>> = Mutex::new(None);
 /// Root descriptors given by address lately: time, address, bytes.
 static ROOTS: Mutex<VecDeque<(u64, u64, u64)>> = Mutex::new(VecDeque::new());
 
+/// Tests that want the book.
+#[cfg(test)]
+static FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) fn on() -> bool {
+    #[cfg(test)]
+    if FORCED.load(Ordering::Relaxed) {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("VICTORY_BOOK").is_none_or(|v| v != "0")
@@ -334,10 +342,15 @@ pub(crate) fn block(heap: &ID3D12Heap, resource: &ID3D12Resource, offset: u64, b
     let raw = heap.as_raw() as usize;
     let now = crate::host::now_ms();
     let id = with(|b| {
-        if b.by_object.contains_key(&raw) {
+        let at = b.by_object.get(&(object.as_raw() as usize)).and_then(|id| b.live.get(id))?.start;
+        // Known, unless the entry is of what had the pointer before.
+        if b.by_object
+            .get(&raw)
+            .and_then(|id| b.live.get(id))
+            .is_some_and(|e| at >= e.start && at - e.start < e.size)
+        {
             return None;
         }
-        let at = b.by_object.get(&(object.as_raw() as usize)).and_then(|id| b.live.get(id))?.start;
         Some(b.add(raw, at.checked_sub(offset)?, bytes, "a block of textures".into(), now))
     });
     if let Some(id) = id {
@@ -652,6 +665,40 @@ mod tests {
     }
 
     /// Who has an address, and who had it, newest first.
+    /// A texture of the pool and its block stand in the book while they
+    /// live, and not after.
+    #[test]
+    fn a_pooled_texture_and_its_block_are_in_the_book() {
+        let Some(host) = crate::host::host() else { return };
+        FORCED.store(true, Ordering::Relaxed);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 128,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(83),
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: a valid description.
+        let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) };
+        if let Some(texture) = texture {
+            let at = texture_address(&texture, &desc);
+            println!("address {at:x?}");
+            if let Some(at) = at {
+                let names = || with(|b| b.holders(at).iter().map(|e| e.what.clone()).collect::<Vec<_>>());
+                let found = names();
+                println!("held by {found:?}");
+                assert!(found.iter().any(|n| n.contains("a texture in a block")), "{found:?}");
+                assert!(found.iter().any(|n| n.contains("a block of textures")), "{found:?}");
+                drop(texture);
+                assert!(!names().iter().any(|n| n.contains("a texture in a block")));
+            }
+        }
+        FORCED.store(false, Ordering::Relaxed);
+    }
+
     #[test]
     fn the_book_knows_what_is_gone() {
         let mut b = Book::default();

@@ -25,7 +25,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
-/// Bytes of a block; pieces of more than half of one are not pooled.
+/// Bytes of a block; pieces of more than half of one are not pooled (with
+/// blocks made ahead, [`ahead`]: of more than one).
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
@@ -64,6 +65,49 @@ pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
 }
+
+/// How many blocks of textures are made ahead, so that one has been there
+/// for a while when its first piece is taken (`VICTORY_RIPE_BLOCKS`, 12;
+/// 0: none, and new blocks are used at once, as before).
+///
+/// A page fault of lists already on the card, in a texture made the same
+/// tenth of a second as the first piece of a block made for it, lost the
+/// device in runs n08 and n11 (2026-11-25): the title gives a slot that
+/// those lists read by index a new texture. Why the card does not have the
+/// new block's addresses yet is not known (n11 waited for `MakeResident`;
+/// `indirect::tests::new_blocks_under_readers` never loses it). A block that
+/// every submission begun before its making has left behind ([`Ripe`]) has
+/// no such lists: pieces are cut from those first.
+fn ahead() -> usize {
+    static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+}
+
+/// Submissions begun and finished ([`crate::host::submissions`]), and how
+/// many blocks to make ahead (0: every block is ripe at once).
+#[derive(Clone, Copy)]
+struct Ripe {
+    started: u64,
+    finished: u64,
+    ahead: usize,
+}
+
+impl Ripe {
+    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0 };
+
+    fn now() -> Ripe {
+        let (started, finished) = crate::host::submissions();
+        // Not more than are kept ([`room`]): they would go and be made again.
+        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
+    }
+
+    fn is<B>(self, block: &Block<B>) -> bool {
+        self.ahead == 0 || block.made <= self.finished
+    }
+}
+
+/// Pieces cut from blocks that were not ripe, for want of a ripe one.
+static UNRIPE: AtomicU64 = AtomicU64::new(0);
 
 /// The free ranges of a block: start and length, never two that touch.
 struct Ranges(BTreeMap<u64, u64>);
@@ -121,6 +165,8 @@ struct Block<B> {
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
+    /// The newest submission begun when it was made ([`Ripe`]).
+    made: u64,
 }
 
 struct Pool<B> {
@@ -140,40 +186,80 @@ impl<B: Clone> Pool<B> {
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
-    fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnOnce() -> Option<B>) -> Option<(Piece, B, bool)> {
-        if len == 0 || len > BLOCK / 2 {
+    fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
+        self.take_ripe(len, align, now, Ripe::ALL, make)
+    }
+
+    /// The same from a block that is ripe, if one has room; `make` makes one
+    /// ahead too, when few are empty.
+    fn take_ripe(
+        &mut self,
+        len: u64,
+        align: u64,
+        now: u64,
+        ripe: Ripe,
+        mut make: impl FnMut() -> Option<B>,
+    ) -> Option<(Piece, B, bool)> {
+        // With blocks made ahead, what would be an allocation of its own (and
+        // new when the card first reads it) lies in one of those too.
+        if len == 0 || len > if ripe.ahead > 0 { BLOCK } else { BLOCK / 2 } {
             return None;
         }
         self.rested(now);
         let mut found = None;
         for (i, block) in self.blocks.iter_mut().enumerate() {
             if let Some(block) = block
+                && ripe.is(block)
                 && let Some(start) = block.free.take(len, align)
             {
                 found = Some((i, start));
                 break;
             }
         }
+        if found.is_none() && ripe.ahead > 0 {
+            // The one that has been there the longest.
+            let mut unripe: Vec<(u64, usize)> =
+                self.blocks.iter().enumerate().filter_map(|(i, b)| Some((b.as_ref()?.made, i))).collect();
+            unripe.sort_unstable();
+            found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+        }
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let mut block = Block { memory: make()?, free: Ranges::new(BLOCK), used_to: 0 };
-                let start = block.free.take(len, align)?;
-                let i = match self.blocks.iter().position(Option::is_none) {
-                    Some(i) => i,
-                    None => {
-                        self.blocks.push(None);
-                        self.blocks.len() - 1
-                    }
-                };
-                self.blocks[i] = Some(block);
-                (i, start)
+                let i = self.add(make()?, ripe.started);
+                (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
+        if ripe.ahead > 0 {
+            if !ripe.is(self.blocks[i].as_ref()?) {
+                let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!("textures cut from blocks made while lists ran that still run: {n}");
+                }
+            }
+            let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+            if empty < ripe.ahead
+                && let Some(memory) = make()
+            {
+                self.add(memory, ripe.started);
+            }
+        }
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    fn add(&mut self, memory: B, made: u64) -> usize {
+        let i = match self.blocks.iter().position(Option::is_none) {
+            Some(i) => i,
+            None => {
+                self.blocks.push(None);
+                self.blocks.len() - 1
+            }
+        };
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made });
+        i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
@@ -369,17 +455,23 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    let (piece, heap, _) = lock(&TEXTURES).take(info.SizeInBytes, info.Alignment.max(1), now(), || {
+    let (piece, heap, _) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
         };
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
             tracing::warn!(error = %e, "no block of texture memory");
+        }
+        if let Some(h) = &heap
+            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
+        {
+            tracing::warn!(error = %e, "a block of texture memory is not resident");
+            return None;
         }
         heap
     })?;
@@ -465,6 +557,39 @@ mod tests {
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
         let mut none: Pool<u32> = Pool::new(SPARE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
+    }
+
+    #[test]
+    fn pieces_come_from_blocks_older_than_the_lists_that_run() {
+        let mut pool: Pool<u64> = Pool::new(SPARE_KEPT);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let at = |started, finished| Ripe { started, finished, ahead: 2 };
+        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
+        // Nothing runs: at once, and two are made ahead, one a time.
+        assert_eq!(take(&mut pool, at(0, 0)), 1);
+        assert_eq!(made.get(), 2);
+        assert_eq!(take(&mut pool, at(0, 0)), 1);
+        assert_eq!(made.get(), 3);
+        // 4 is made while submission 5 runs.
+        assert_eq!(take(&mut pool, at(5, 4)), 2);
+        assert_eq!(made.get(), 4);
+        assert_eq!(take(&mut pool, at(5, 4)), 2);
+        assert_eq!(take(&mut pool, at(6, 4)), 3);
+        assert_eq!(take(&mut pool, at(6, 4)), 3);
+        // None is ripe: the oldest; it is ripe once 5 has finished.
+        assert_eq!(take(&mut pool, at(7, 4)), 4);
+        assert_eq!(take(&mut pool, at(7, 5)), 4);
+        // A whole block's worth too.
+        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), make).unwrap().1, 5);
+        // Off: the first with room, whatever its age, none ahead.
+        let n = made.get();
+        assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);
+        assert_eq!(made.get(), n);
+        assert!(pool.take(BLOCK, 65536, 0, make).is_none());
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not

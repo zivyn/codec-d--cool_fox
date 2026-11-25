@@ -939,6 +939,8 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+/// Watched, not by the kernel but by the guards, when last asked about.
+const GUARDED: u8 = 3;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -1505,30 +1507,34 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
-/// Whether pages of a copy in the card's memory that a refresh takes again
-/// go up to the card only where they are not what the CPU's side holds
-/// already (`VICTORY_SEND_CHANGED=1`; off by default).
+/// Whether a refresh of a copy in the card's memory takes, and sends up,
+/// the dwords that title memory changed and no others
+/// (`VICTORY_SEND_CHANGED=0`: the 64 KiB pages written since it last took
+/// them, whole, as before).
 ///
-/// A refresh copies the 64 KiB pages that were written since it last took
-/// them, and all of each went up and was hashed there again. Most of them
-/// the title did not write: the relay put what shaders wrote into title
-/// memory, and the card and the CPU's side hold those bytes already
-/// ([`Shadow::card_merge_relay`]). Run record-1: 1,500 pieces (98 MB) a
-/// frame fetched from the card, 103 MB in 328 ranges sent up, 322 hash
-/// passes, while the title's own writes took some 260 guards off.
+/// A page that counts as written is mostly not the title's doing, or not all
+/// of it: a word the title wrote, and around it what shaders wrote and the
+/// title never touched; or only what the relay put into title memory, which
+/// the card and the CPU's side hold already ([`Shadow::card_merge_relay`]).
+/// Sent up whole, such a page goes over whatever the card holds there that
+/// did not come back yet, or never will (a write through a view nobody
+/// declared): what stood on the card, newer, was gone.
 ///
-/// What it rests on: the card's side holds what the CPU's side holds, but
-/// for ranges shaders may be writing (no refresh touches them) and what is
-/// still to go up. A page's first taking always goes up whole, so does one
-/// that could not be read; after that every byte that changes on the CPU's
-/// side goes up (the bytes compared are the bytes stored).
+/// What it rests on: the CPU's side is what the card's side was last known
+/// to hold, for every range no shader may be writing (no refresh touches
+/// the others). So a dword goes up only if title memory holds another value
+/// of it than the CPU's side, which then holds it too; title memory is read
+/// once, what is compared is what is stored and sent. Dwords, not bytes:
+/// no shader writes less, and the title's bytes beside a changed one in its
+/// dword are those the CPU's side holds.
 ///
-/// Why it is not on by default: a shader that writes a copy through a view
-/// nobody declared (`crate::draw`, buffers picked by index) breaks that
-/// rule. Taken again, its page went up over what it wrote; with the switch
-/// its bytes stay, as they would on the console, until the title changes the
-/// same 64 bytes: clearing them to the zeros they held before is then no
-/// change.
+/// A page never taken goes up whole as long as no shader's write was ever
+/// declared for the copy. After that it is compared as any other: the CPU's
+/// side and the card's began as zeros, both.
+///
+/// What it cannot know: that the title wrote a value over the same value.
+/// Where a shader wrote in between, through a view nobody declared, the
+/// shader's stays.
 fn send_changed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1536,19 +1542,19 @@ fn send_changed() -> bool {
         if crate::copystat::mode() != 0 {
             return false;
         }
-        std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v == "1") && crate::safecopy::on()
+        std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0")
     })
 }
 
-/// Since the last frame-rate line, of pages taken again into copies in the
+/// Since the last frame-rate line, of pages taken into copies in the
 /// card's memory ([`send_changed`]): bytes compared, those of pages that
-/// held the same, and bytes to go up.
-static SEND: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// held the same, bytes to go up, and the runs they are.
+static SEND: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// [`SEND`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn send_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| SEND[i].swap(0, Ordering::Relaxed))
+pub(crate) fn send_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| SEND[i].swap(0, Ordering::Relaxed))
 }
 
 /// Whether what shaders wrote goes into title memory run by run
@@ -1602,6 +1608,7 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
     if crate::safecopy::on() {
         PUT[0].fetch_add(1, Ordering::Relaxed);
         PUT[2].fetch_add(merged.len() as u64, Ordering::Relaxed);
+        let since = crate::watch::changes();
         // SAFETY: title memory; a page of it that is not there fails the
         // put, and the rest is put page by page.
         if unsafe { crate::safecopy::put_changed(at as *mut u8, title, merged) } {
@@ -1610,8 +1617,14 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
         let mut from = 0;
         while from < merged.len() {
             let n = (4096 - (at + from) % 4096).min(merged.len() - from);
+            let (was, now) = (&title[from..from + n], &merged[from..from + n]);
             // SAFETY: as above.
-            unsafe { crate::safecopy::put_changed((at + from) as *mut u8, &title[from..from + n], &merged[from..from + n]) };
+            let put = || unsafe { crate::safecopy::put_changed((at + from) as *mut u8, was, now) };
+            // A page that is away only while the runtime changes a mapping
+            // beside it gets its bytes when that is done.
+            if !put() && !crate::watch::again_after_change(since, put) {
+                crate::watch::lost("what shaders wrote", at + from, n);
+            }
             from += n;
         }
         return merged.len();
@@ -1655,7 +1668,35 @@ pub(crate) fn land_as_before(start: usize, now: usize, held: usize, n: usize, ti
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{changed_runs, dword_runs};
+    use super::{changed_runs, dword_runs, put_changed};
+
+    /// What shaders wrote reaches a page that is away only while the runtime
+    /// changes a mapping; a page that stays away loses it, and nothing else.
+    #[test]
+    fn a_put_waits_for_a_change_of_mapping() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a reservation of ours, nothing of it committed.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 1 << 16, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(at, 0);
+        put_changed(at, &[0; 64], &[3; 64]);
+        let (began, wait) = std::sync::mpsc::channel();
+        let change = std::thread::spawn(move || {
+            let _changing = crate::watch::title_memory_remapping();
+            began.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: the reservation's first page.
+            assert!(!unsafe { VirtualAlloc(at as _, 4096, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        });
+        wait.recv().unwrap();
+        put_changed(at, &[0; 64], &[1; 64]);
+        change.join().unwrap();
+        // SAFETY: committed by now.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 64) }, [1; 64]);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
+    }
 
     /// Whole dwords around every changed byte and no other, whatever the
     /// alignment; small gaps joined only when asked.
@@ -2015,6 +2056,14 @@ impl Shadow {
     /// every refresh then copies its whole range.
     pub(crate) fn unwatched(&self) -> bool {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
+    }
+
+    /// Whether a submission asks the kernel about the copy's ranges ahead:
+    /// not of memory that is not watched, nor of view memory, which the
+    /// kernel would refuse (and with it the ranges asked about together).
+    pub(crate) fn asked_ahead(&self) -> bool {
+        let watched = self.watched.load(Ordering::Relaxed);
+        watched != NOT_WATCHED && (watched != GUARDED || !crate::watch::light())
     }
 
     /// The copy's own number (see the field).
@@ -2774,7 +2823,7 @@ impl Shadow {
         if from >= to {
             return true;
         }
-        if self.watched.load(Ordering::Relaxed) != 1 {
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
@@ -2804,7 +2853,8 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+                let guarded = crate::watch::guarded(from, to);
+                self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
@@ -2982,34 +3032,47 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
-        if !known || self.card.is_none() || !send_changed() {
-            return self.copy(from, to);
+        thread_local! {
+            /// A page of title memory, as read.
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        let Some(card) = self.card.as_ref().filter(|_| send_changed()) else {
+            return self.copy(from, to);
+        };
+        let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let start = self.start as usize;
-        let mut at = from;
-        while at < to {
-            let n = (PAGE - at % PAGE).min(to - at);
-            // SAFETY: inside the mapping of the copy's CPU side, which
-            // nothing else writes there: no shader's range holds it.
-            let found = unsafe { crate::safecopy::update(self.data.add(at - start), at as *const u8, n) };
-            SEND[0].fetch_add(n as u64, Ordering::Relaxed);
-            match found {
-                crate::safecopy::Updated::Same => {
+        TITLE.with_borrow_mut(|title| {
+            title.resize(PAGE, 0);
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                let title = &mut title[..n];
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: inside the mapping of the copy's CPU side, which
+                // nothing else reads or writes there (the card copies from
+                // it): no shader's range holds it, and the parts of a
+                // refresh lie apart.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let was = crate::host::upcheck::on().then(|| held.to_vec());
+                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                for &(a, len) in &runs {
+                    held[a..a + len].copy_from_slice(&title[a..a + len]);
+                    self.changed(at - start + a, at - start + a + len);
+                }
+                self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
+                if let Some(was) = was {
+                    crate::host::upcheck::note(self.id, at - start, &was, held);
+                }
+                SEND[0].fetch_add(n as u64, Ordering::Relaxed);
+                if runs.is_empty() {
                     SEND[1].fetch_add(n as u64, Ordering::Relaxed);
                 }
-                crate::safecopy::Updated::Changed(a, b) => {
-                    SEND[2].fetch_add((b - a) as u64, Ordering::Relaxed);
-                    self.changed(at - start + a, at - start + b);
-                    self.card_changed(at - start + a, at - start + b);
-                }
-                // A page is not there: as before, around it, and all of it
-                // goes up.
-                crate::safecopy::Updated::Failed => {
-                    self.copy(at, at + n);
-                }
+                SEND[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                SEND[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                at += n;
             }
-            at += n;
-        }
+        });
         to - from
     }
 
@@ -3044,16 +3107,24 @@ impl Shadow {
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
+        self.card_changed_runs(std::iter::once((from, to)));
+    }
+
+    /// [`Shadow::card_changed`] of each of `runs`.
+    fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
             return;
         };
-        if from >= to {
+        let mut runs = runs.filter(|r| r.0 < r.1).peekable();
+        if runs.peek().is_none() {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+        for (from, to) in runs {
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
         }
     }
 
@@ -3379,7 +3450,7 @@ impl Shadow {
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             put += merged;
         }
@@ -3409,7 +3480,33 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes) }
+        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+    }
+
+    /// What shaders wrote in 64 KiB block `block` (of title memory) of this
+    /// copy was put into title memory beside the guard, which was noted as a
+    /// write with number `now`, `before` the number of the block's last write
+    /// before. If the copy held title memory's bytes of the block ahead of
+    /// that it holds them still, and is noted to ([`crate::land`] says why);
+    /// whether it was.
+    ///
+    /// That it did: it took the whole block after that write, and no other
+    /// came that is not noted yet. Looked at after the note, whatever comes
+    /// later has a number above it: a write of the title's takes the block's
+    /// bit, until an asking has noted it.
+    pub(crate) fn landed(&self, block: usize, before: u64, now: u64) -> bool {
+        let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
+            return false;
+        };
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = copied.get_mut(page) else {
+            return false;
+        };
+        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        if held {
+            *at = (*at).max(now);
+        }
+        held
     }
 }
 

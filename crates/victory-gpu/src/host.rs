@@ -704,6 +704,22 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Zeros for a title destination that went meanwhile are no fault.
+    #[test]
+    fn zeros_where_nothing_is_are_lost() {
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: a reservation of ours, its first page committed.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 1 << 16, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE).is_null());
+            at.write_bytes(7, 4096);
+            super::zero(at, 4096);
+            assert!(std::slice::from_raw_parts(at, 4096).iter().all(|&b| b == 0));
+            super::zero(at.add(4096), 4096);
+            VirtualFree(at.cast(), 0, MEM_RELEASE);
+        }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -4709,7 +4725,7 @@ impl Host {
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
+                        && shadow.asked_ahead()
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -4719,6 +4735,8 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            #[cfg(feature = "diagnostics")]
+            SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             crate::watch::ask_once(&ranges);
             #[cfg(feature = "diagnostics")]
             split.part(0);
@@ -6215,9 +6233,11 @@ impl std::hash::Hasher for AddressHash {
 /// in under flights' writes; the lists' steps, the refreshes among them; the
 /// snapshots; what goes to copies in the card's memory; the lists sent; and
 /// of the steps: the refreshes, and the copies and fills (those with the
-/// refreshes a copy of title memory flushes).
+/// refreshes a copy of title memory flushes). Of the asking, which ranges it
+/// is of. Of the refreshes, those before ranges are given to shaders, one
+/// copy at a time: nanoseconds, and how many.
 #[cfg(feature = "diagnostics")]
-static SPLIT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+static SPLIT: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
@@ -6234,6 +6254,11 @@ impl Split {
         Split(std::cell::Cell::new(std::time::Instant::now()))
     }
 
+    /// Nanoseconds since the last part.
+    fn so_far(&self) -> u64 {
+        self.0.get().elapsed().as_nanos() as u64
+    }
+
     /// What came since the last part was part `i`.
     fn part(&self, i: usize) {
         let now = std::time::Instant::now();
@@ -6248,13 +6273,14 @@ fn split_line(frames: f64) {
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
-    let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / (1 << 20) as f64 / frames).collect();
+    let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
     tracing::info!(
-        "preparing per frame, the submitting thread: {:.1} ms asking the write watch, {:.1} putting the title's bytes under flights' \
+        "preparing per frame, the submitting thread: {:.1} ms asking the write watch ({:.1} of them finding what to ask), {:.1} putting the title's bytes under flights' \
          writes, {:.1} in the lists' steps (refreshes {:.1} in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on \
-         several threads; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
+         several threads, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
          card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {})",
         ms[0],
+        ms[8],
         ms[1],
         ms[2],
         ms[6],
@@ -6262,6 +6288,8 @@ fn split_line(frames: f64) {
         f[1],
         f[2],
         f[3],
+        ms[9],
+        ms[10] * 1e6,
         ms[7],
         ms[3],
         ms[4],
@@ -6269,12 +6297,17 @@ fn split_line(frames: f64) {
         if crate::watch::light() { "on" } else { "off" },
     );
     tracing::info!(
-        "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB; view ranges: {:.0} answered by their \
+        "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
+         written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
-         waiting for the guards, {:.1} ms changing protections; pages taken again for the card: {:.1} MB compared, {:.1} MB of them \
-         as they were, {:.1} MB to go up (VICTORY_SEND_CHANGED)",
+         waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
+         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
         a[0],
         a[1] / 1024.0,
+        a[11] / 1e6,
+        a[12],
+        a[10],
+        a[9],
         a[2],
         a[3],
         a[4],
@@ -6282,9 +6315,10 @@ fn split_line(frames: f64) {
         a[6],
         a[7] / 1e6,
         a[8] / 1e6,
-        s[0],
-        s[1],
-        s[2],
+        s[0] / 1048576.0,
+        s[1] / 1048576.0,
+        s[2] / 1048576.0,
+        s[3],
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures",
@@ -6414,7 +6448,12 @@ impl Batch {
             Self::update(&shadow, from, to);
         }
         #[cfg(feature = "diagnostics")]
-        SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        {
+            let ns = started.elapsed().as_nanos() as u64;
+            SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+            SPLIT[9].fetch_add(ns, Ordering::Relaxed);
+            SPLIT[10].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6497,7 +6536,7 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
+                .filter(|r| r.0.asked_ahead())
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
@@ -6586,7 +6625,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let since = crate::watch::changes();
+    // (A title destination that is away only while the runtime changes a
+    // mapping beside it is written when that is done.)
+    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6596,6 +6638,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // not all mapped. Then the destination stays as it is (the kernel may
     // have written its first pages).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
+        crate::watch::lost("a copy of the title's", dst as usize, len);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -6655,12 +6698,27 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    zero(to, n);
                 }
             });
         }
     });
+}
+
+/// Zeros at `to`, in one 4 KiB page or two. It may be title memory (the
+/// destination of a title's copy), which can go between the question whether
+/// it is there and this.
+fn zero(to: *mut u8, n: usize) {
+    static ZEROS: [u8; 4096] = [0; 4096];
+    if n <= ZEROS.len() && crate::safecopy::on() {
+        // SAFETY: a destination that is not there fails the copy.
+        if !unsafe { crate::safecopy::copy(to, ZEROS.as_ptr(), n) } {
+            crate::watch::lost("zeros", to as usize, n);
+        }
+        return;
+    }
+    // SAFETY: inside the destination, which is mapped.
+    unsafe { to.write_bytes(0, n) };
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -6716,6 +6774,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    let since = crate::watch::changes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         if crate::safecopy::on() {
@@ -6742,7 +6801,16 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                if write(at, n) {
+                    return;
+                }
+                // The kernel's write (`VICTORY_SAFE_COPY=0`) fails where a
+                // refresh guarded the block again since the caller opened
+                // it; and any where the runtime was changing a mapping.
+                crate::watch::writing(at, n);
+                if !write(at, n) && !crate::watch::again_after_change(since, || write(at, n)) {
+                    crate::watch::lost("a host copy's bytes", at, n);
+                }
             });
         }
     });
@@ -7795,6 +7863,50 @@ mod refresh_tests {
         at
     }
 
+    /// Title memory of `blocks` pages in a placeholder, one view to a page,
+    /// and every fourth page not there: as a title that streams has it.
+    fn with_holes(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS,
+            VirtualAlloc2, VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a placeholder and a section of our own.
+        unsafe {
+            let at = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                blocks * PAGE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(at, 0);
+            let len = blocks * PAGE;
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null());
+            for block in (0..blocks).filter(|b| b % 4 != 3) {
+                let to = at + block * PAGE;
+                VirtualFree(to as *mut _, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                let view = MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    to as *const _,
+                    (block * PAGE) as u64,
+                    PAGE,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(view.Value as usize, to);
+                crate::title_memory_remapped(to, PAGE);
+            }
+            at
+        }
+    }
+
     fn memory(len: usize) -> *mut u8 {
         // SAFETY: a plain allocation.
         unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast() }
@@ -7946,6 +8058,10 @@ mod refresh_tests {
     /// card's side of those that have one, hold what title memory holds, and
     /// title memory what was written last.
     ///
+    /// Into the first copy shaders write besides through a view nobody
+    /// declared, words the title does not write: nothing that goes up ever
+    /// puts an older value over those.
+    ///
     /// (It fails in the first rounds if `landed_beside` notes nothing, or
     /// only takes the block out of the guards' clean ones and leaves its bit,
     /// or if a fault leaves the bit; in some thousand rounds,
@@ -7964,6 +8080,9 @@ mod refresh_tests {
             let data = memory(len);
             (Shadow::unbacked(start as u64, data, len as u64, false), start, len, data as usize)
         };
+        // What was last written so, by offset.
+        let mut undeclared = std::collections::HashMap::new();
+        let exact = std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0");
         let stop = AtomicBool::new(false);
         // Also when an assertion fails on one of the threads.
         struct Stop<'a>(&'a AtomicBool);
@@ -8068,6 +8187,16 @@ mod refresh_tests {
             let mut value = 1u32;
             for round in 0..rounds {
                 check(round, &mut random, false);
+                if exact {
+                    let c = &carded[0];
+                    let mut card = c.card.lock().unwrap();
+                    for _ in 0..40 {
+                        value += 1;
+                        let at = random.below(LEN / 32) * 32 + 4 * 6;
+                        card.2[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                        undeclared.insert(at, value);
+                    }
+                }
                 // The flight of this submission: its shaders' writes.
                 for (which, c) in carded.iter().enumerate() {
                     if c.flying.swap(true, Ordering::Acquire) {
@@ -8113,7 +8242,17 @@ mod refresh_tests {
                     let (held, there) = (bytes(c.data, c.len), bytes(c.start, c.len));
                     assert_eq!(first(held, there), None, "round {round}: a card copy's CPU side (class {})", c.class);
                     let card = c.card.lock().unwrap();
-                    assert_eq!(first(&card.2, there), None, "round {round}: a card copy's card side (class {})", c.class);
+                    let mut side = card.2.clone();
+                    if c.class == carded[0].class {
+                        // (They may have been landed meanwhile, by a flight
+                        // that declared their range, and may not.)
+                        for (&at, &value) in &undeclared {
+                            let on_card = u32::from_le_bytes(side[at..at + 4].try_into().unwrap());
+                            assert_eq!(on_card, value, "round {round}: an older value at {at:#x}");
+                            side[at..at + 4].copy_from_slice(&there[at..at + 4]);
+                        }
+                    }
+                    assert_eq!(first(&side, there), None, "round {round}: a card copy's card side (class {})", c.class);
                 }
                 assert_eq!(first(bytes(plain.3, plain.2), bytes(plain.1, plain.2)), None, "round {round}: the other copy");
             }
@@ -8197,8 +8336,9 @@ mod refresh_tests {
         }
     }
 
-    /// A part of a copy in the card's memory taken again goes up only if it
-    /// differs (with `VICTORY_SEND_CHANGED=1`), whole when never taken.
+    /// Of a copy in the card's memory only the dwords title memory changed go
+    /// up, and none beside them, not even between two in 64 bytes; a page
+    /// never taken goes up whole.
     #[test]
     fn only_what_differs_goes_up() {
         let region = title(4 * PAGE, true);
@@ -8217,18 +8357,24 @@ mod refresh_tests {
         copy.update(region, 4 * PAGE);
         let again = copy.take_dirty();
         // SAFETY: as above.
-        unsafe { ((region + 2 * PAGE + 128) as *mut u8).write_volatile(9) };
+        unsafe {
+            ((region + 2 * PAGE + 129) as *mut u8).write_volatile(9);
+            ((region + 2 * PAGE + 136) as *mut u32).write_volatile(9);
+            ((region + 2 * PAGE + 140) as *mut u32).write_volatile(9);
+            // The value that was there.
+            ((region + 2 * PAGE + 132) as *mut u32).write_volatile(0);
+        }
         copy.update(region, 4 * PAGE);
         let written = copy.take_dirty();
-        if std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v == "1") {
+        if std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0") {
             assert_eq!(again, []);
-            assert_eq!(written, [(2 * PAGE + 128, 2 * PAGE + 192)]);
+            assert_eq!(written, [(2 * PAGE + 128, 2 * PAGE + 132), (2 * PAGE + 136, 2 * PAGE + 144)]);
         } else {
             assert_eq!(again, [(PAGE, 2 * PAGE)]);
             assert_eq!(written, [(2 * PAGE, 3 * PAGE)]);
         }
         // SAFETY: as above.
-        assert_eq!(unsafe { data.add(2 * PAGE + 128).read() }, 9);
+        assert_eq!(unsafe { data.add(2 * PAGE + 129).read() }, 9);
     }
 
     /// The refreshes of a frame as run record-1 had them: 30 submissions, the
@@ -8243,12 +8389,17 @@ mod refresh_tests {
         const EACH: usize = 224 << 10;
         const BIG: usize = 174 << 20;
         let watched = title(3000 * EACH, false);
-        let views = title(1400 * EACH, true);
+        // `VICTORY_BENCH_HOLES=0`: views without holes.
+        let holes = std::env::var_os("VICTORY_BENCH_HOLES").is_none_or(|v| v != "0");
+        let views = if holes { with_holes(1400 * EACH / PAGE) } else { title(1400 * EACH, true) };
+        let there = |at: usize| !holes || (at - views) / PAGE % 4 != 3;
         let big = title(BIG, true);
         // SAFETY: the test's own memory.
         unsafe {
             std::ptr::write_bytes(watched as *mut u8, 1, 3000 * EACH);
-            std::ptr::write_bytes(views as *mut u8, 1, 1400 * EACH);
+            for at in (views..views + 1400 * EACH).step_by(PAGE).filter(|&at| there(at)) {
+                std::ptr::write_bytes(at as *mut u8, 1, PAGE);
+            }
             std::ptr::write_bytes(big as *mut u8, 1, BIG);
         }
         let mut small = Vec::new();
@@ -8271,8 +8422,10 @@ mod refresh_tests {
                 // The title's writes, and the relay's beside the submission.
                 for _ in 0..9 {
                     let at = views + random.below(1400 * EACH / 8) * 8;
-                    // SAFETY: the test's own memory.
-                    unsafe { (at as *mut u64).write_volatile(frame as u64) };
+                    if there(at) {
+                        // SAFETY: the test's own memory.
+                        unsafe { (at as *mut u64).write_volatile(frame as u64) };
+                    }
                 }
                 for _ in 0..60 {
                     let at = watched + random.below(3000 * EACH / 8) * 8;

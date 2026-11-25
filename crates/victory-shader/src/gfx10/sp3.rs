@@ -137,6 +137,12 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
             cache,
         } => {
             if let Some(data) = data {
+                let data = match (name, data) {
+                    ("s_atc_probe" | "s_atc_probe_buffer", Operand::Literal(imm)) => {
+                        atc_immediate(*imm)
+                    }
+                    _ => data.to_string(),
+                };
                 let off = match (soffset, offset) {
                     (Operand::Scalar { code: NULL, .. }, 0) => soffset.to_string(),
                     (Operand::Scalar { code: NULL, .. }, _) => {
@@ -333,6 +339,15 @@ fn operands(inst: &Instruction, name: &str, fields: &Fields) -> String {
         }
     }
     out
+}
+
+/// `s_atc_probe` immediate: 0..=64 in decimal, larger values in hex.
+fn atc_immediate(imm: u32) -> String {
+    if imm <= 64 {
+        imm.to_string()
+    } else {
+        format!("0x{imm:x}")
+    }
 }
 
 /// Cache flags; images write `dlc` first.
@@ -660,7 +675,7 @@ fn valu(name: &str, v: &Valu, encoding: Encoding) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::gfx10::{Fields, Operand, decode};
+    use crate::gfx10::{Cache, Fields, Operand, decode};
 
     /// Text of each instruction in `words` (a straight-line program).
     fn texts(words: &[u32], wave64: bool) -> Vec<String> {
@@ -698,6 +713,69 @@ mod tests {
             one(&[0xF420_0144, 0x0400_0000], true),
             "s_buffer_load_dword s5, s[8:11], s2"
         );
+    }
+
+    /// `s_atc_probe` / `s_atc_probe_buffer`: SDATA is a 7-bit immediate, the
+    /// buffer resource is 4 dwords, and GLC/DLC are not operands.
+    ///
+    /// Words checked with `llvm-mc -arch=amdgcn -mcpu=gfx1030 --disassemble`.
+    /// The offset keeps this printer's 6-digit hex (`0x000064`, not `0x64`).
+    #[test]
+    fn atc_probe_immediate_is_not_a_register() {
+        let cases = [
+            (
+                [0xF498_01C2, 0xFA00_0064],
+                "s_atc_probe 7, s[4:5], 0x000064",
+                Operand::Literal(7),
+                Operand::Scalar { code: 4, dwords: 2 },
+            ),
+            (
+                [0xF498_1FF4, 0x0A00_0001],
+                "s_atc_probe 0x7f, s[104:105], s5 offset:0x000001",
+                Operand::Literal(0x7f),
+                Operand::Scalar {
+                    code: 104,
+                    dwords: 2,
+                },
+            ),
+            (
+                [0xF498_0000, 0xFA00_0000],
+                "s_atc_probe 0, s[0:1], null",
+                Operand::Literal(0),
+                Operand::Scalar { code: 0, dwords: 2 },
+            ),
+            (
+                [0xF49C_01C4, 0xFA00_0020],
+                "s_atc_probe_buffer 7, s[8:11], 0x000020",
+                Operand::Literal(7),
+                Operand::Scalar { code: 8, dwords: 4 },
+            ),
+            (
+                [0xF499_41C2, 0xFA00_0000],
+                "s_atc_probe 7, s[4:5], null",
+                Operand::Literal(7),
+                Operand::Scalar { code: 4, dwords: 2 },
+            ),
+        ];
+        for (words, text, data, base) in cases {
+            assert_eq!(one(&words, false), text, "{words:08x?}");
+            assert_eq!(one(&words, true), text, "{words:08x?}");
+            let mut code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            code.extend(0xBF81_0000u32.to_le_bytes());
+            let inst = &decode(&code).unwrap()[0];
+            let Fields::Smem {
+                data: got,
+                base: got_base,
+                cache,
+                ..
+            } = inst.fields(false)
+            else {
+                panic!("not an SMEM instruction");
+            };
+            assert_eq!(got, Some(data), "{words:08x?}");
+            assert_eq!(got_base, base, "{words:08x?}");
+            assert_eq!(cache, Cache::default(), "{words:08x?}");
+        }
     }
 
     #[test]

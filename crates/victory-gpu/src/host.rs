@@ -117,6 +117,34 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// How long host copies of textures the title fills must have been idle to
+/// be let go, in milliseconds, and how many bytes of them go at most (the
+/// longest idle first): none but those of ten minutes while what is in use
+/// of the card (`used`: without what our own blocks have free, with what is
+/// kept free for others) is under 88 % of its budget, else enough to come
+/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// all that are idle; `=1`: that rule with its two longer times.
+///
+/// (By those times everything idle for 2.5 s went from 75 % of the budget
+/// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
+/// 80 %, of which 13,000 were made and uploaded again.)
+pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    const KEPT_MS: u64 = 600_000;
+    const IDLE_MS: u64 = 5_000;
+    const SHORT_MS: u64 = 1_500;
+    if budget == 0 {
+        return (IDLE_MS, u64::MAX);
+    }
+    let share = |percent: u64| budget / 100 * percent;
+    if used < share(88) {
+        (KEPT_MS, u64::MAX)
+    } else if used < share(95) {
+        (IDLE_MS, used - share(85))
+    } else {
+        (SHORT_MS, used - share(85))
+    }
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -157,11 +185,37 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
     }
 }
 
+/// Whether memory the card was given stays with it while there is room (on
+/// by default; `VICTORY_KEEP_FREED=0`: it is given back as before). A shader
+/// that reads past a view (a raw load through a typed, structured or
+/// constant buffer view has no end on AMD: `indirect::tests::raw_loads_past_views`)
+/// or through a slot that shows wrong data reads whatever lies there, and
+/// nothing happens; where memory was given back it is a page fault, and the
+/// device is lost. Both losses of 2026-11-25 were reads in memory given back
+/// seconds before (a block of textures; a list's scratch and a window of
+/// title memory). Kept are: empty blocks of textures ([`crate::pool`]) below
+/// 85 % of the card's budget, windows of title memory and staging buffers
+/// for five minutes with 12 GiB of the PC's memory free, and 1 GiB of
+/// scratch chunks.
+pub(crate) fn keep_freed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
+/// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    ram_idle_for(avail_phys, keep_freed())
+}
+
+fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
+    const KEPT_MS: u64 = 300_000;
+    if keep && avail_phys.is_some_and(|avail| avail >= 12 * GIB) {
+        return KEPT_MS;
+    }
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
@@ -215,10 +269,17 @@ fn sweep() {
     {
         return;
     }
+    crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+}
+
+/// The number of the newest submission begun, and of the newest of which all
+/// before it have finished too.
+pub(crate) fn submissions() -> (u64, u64) {
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -889,6 +950,9 @@ pub(crate) struct HostList {
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// What its indirect executions ran, for the report of a removed device.
+    #[cfg(feature = "diagnostics")]
+    indirects: indirects::Shared,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -1407,7 +1471,14 @@ pub(crate) fn dred_faults() -> bool {
 #[cfg(feature = "diagnostics")]
 #[allow(clippy::type_complexity)]
 static LIST_NOTES: Mutex<
-    std::collections::BTreeMap<u32, (std::sync::Weak<Mutex<Vec<Note>>>, std::sync::Weak<Mutex<std::collections::BTreeSet<String>>>)>,
+    std::collections::BTreeMap<
+        u32,
+        (
+            std::sync::Weak<Mutex<Vec<Note>>>,
+            std::sync::Weak<Mutex<std::collections::BTreeSet<String>>>,
+            std::sync::Weak<Mutex<indirects::Indirects>>,
+        ),
+    >,
 > = Mutex::new(std::collections::BTreeMap::new());
 
 /// The number in the name of a list of ours ("victory host list 7", which the
@@ -1534,6 +1605,8 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
+/// The same with [`keep_freed`].
+const SPARE_KEPT: u64 = 1 << 30;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1614,7 +1687,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
             } else {
                 Some(chunk)
             };
@@ -3159,6 +3232,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 mod card_steps;
+pub(crate) mod indirects;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -3527,6 +3601,8 @@ impl Host {
             let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
             let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
             #[cfg(feature = "diagnostics")]
+            let indirects = indirects::Shared::default();
+            #[cfg(feature = "diagnostics")]
             if dred_on() || dred_light() {
                 static NUMBER: AtomicU32 = AtomicU32::new(0);
                 let number = NUMBER.fetch_add(1, Ordering::Relaxed);
@@ -3535,7 +3611,14 @@ impl Host {
                 if number.is_multiple_of(256) {
                     all.retain(|_, l| l.0.strong_count() > 0);
                 }
-                all.insert(number, (std::sync::Arc::downgrade(&notes), std::sync::Arc::downgrade(&pipelines)));
+                all.insert(
+                    number,
+                    (
+                        std::sync::Arc::downgrade(&notes),
+                        std::sync::Arc::downgrade(&pipelines),
+                        std::sync::Arc::downgrade(&indirects),
+                    ),
+                );
             }
             Ok(HostList {
                 allocator,
@@ -3546,6 +3629,8 @@ impl Host {
                 twins: Mutex::default(),
                 prelude,
                 pipelines,
+                #[cfg(feature = "diagnostics")]
+                indirects,
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
@@ -5294,7 +5379,12 @@ impl Host {
                     #[cfg(feature = "diagnostics")]
                     let by_name = list_number(&named).and_then(|n| {
                         let all = LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner());
-                        all.get(&n).map(|(notes, pipelines)| (notes.upgrade(), pipelines.upgrade()))
+                        all.get(&n).map(|(notes, pipelines, _)| (notes.upgrade(), pipelines.upgrade()))
+                    });
+                    #[cfg(feature = "diagnostics")]
+                    let indirects = run.map(|r| r.indirects.clone()).or_else(|| {
+                        let n = list_number(&named)?;
+                        LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner()).get(&n)?.2.upgrade()
                     });
                     #[cfg(not(feature = "diagnostics"))]
                     #[allow(clippy::type_complexity)]
@@ -5323,6 +5413,10 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(indirects) = indirects {
+                        text.push_str(&indirects_around(history, done as usize, &indirects));
                     }
                     // (Without markers a list that stopped midway says what
                     // it may have been at only by what it binds.)
@@ -5545,6 +5639,8 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
+        self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
@@ -5577,8 +5673,10 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        // SAFETY: as in `crate::resource::host_resource`; the list's states
+        // hold the copy from here on.
+        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
@@ -5951,6 +6049,15 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Notes an indirect execution, while device-removed data is kept
+    /// ([`indirects`]).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn ran_indirect(&self, pipeline: usize, name: &str, kind: u32, count: u32, user: &[u32]) {
+        if dred_on() || dred_light() {
+            self.indirects.lock().unwrap_or_else(|e| e.into_inner()).note(pipeline, name, kind, count, user);
+        }
+    }
+
     /// Notes a pipeline the list binds.
     pub(crate) fn used_pipeline(&self, name: &str) {
         let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
@@ -6070,6 +6177,15 @@ impl HostList {
         let (buffer, at, data) = self.scratch_at(len)?;
         // SAFETY: a live buffer.
         Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+    }
+
+    /// [`HostList::scratch`] and the buffer it lies in, for a descriptor
+    /// slot to hold: the slot outlives the list's use of it.
+    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        let (buffer, at, data) = self.scratch_at(len)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() } + at;
+        Some((buffer, gpu, data))
     }
 
     /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
@@ -7655,6 +7771,20 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
             }
+            if crate::resource::held_only() {
+                let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
+                let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures from the first level viewed (VICTORY_HELD_LEVELS=0: whole), since the start: {copies} host copies of the \
+                     levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
+                     {flipped} slots made from their new view after its upload had run ({missed} written again first); {} uploads left \
+                     out as the host copy held those bytes (VICTORY_TEXTURE_SAME=0: made); {} MB of texture blocks free",
+                    bytes >> 20,
+                    whole >> 20,
+                    crate::draw::HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
+                    crate::pool::texture_room() >> 20
+                );
+            }
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
@@ -8224,6 +8354,34 @@ fn fault_in(va: u64, (start, bytes): (u64, u64)) -> String {
 /// barriers overlaps on the GPU), by kind, and what the markers just
 /// before them say (`HostList::note_op`: diagnostics builds with
 /// device-removed data on).
+/// For a list that stopped at command `done`: what the indirect executions
+/// there ran, from the one before it to the next barrier (four at most), and
+/// what the heap slots their user data names hold now.
+#[cfg(feature = "diagnostics")]
+fn indirects_around(history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize, all: &indirects::Shared) -> String {
+    let indirect = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT;
+    let all = all.lock().unwrap_or_else(|e| e.into_inner());
+    let mut text = String::new();
+    let mut shown = 0;
+    for (at, op) in history.iter().enumerate().skip(done.saturating_sub(1)) {
+        if shown == 4 || (at > done && *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER) {
+            break;
+        }
+        if !indirect(op) {
+            continue;
+        }
+        shown += 1;
+        let Some((what, words)) = all.nth(indirects::before(history, at, indirect)) else {
+            continue;
+        };
+        text.push_str(&format!("; command {at} ran {what}"));
+        for (word, slot, what) in crate::descriptor::host::describe_slots(words) {
+            text.push_str(&format!(", word {word} slot {slot}: {what}"));
+        }
+    }
+    text
+}
+
 fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], done: usize) -> String {
     let barrier = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER;
     let from = history[..done].iter().rposition(barrier).map_or(0, |b| b + 1);
@@ -9153,8 +9311,23 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 
     #[test]
+    fn textures_are_kept_while_the_card_has_room() {
+        use super::vram_keep;
+        let gib = 1 << 30;
+        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
+        // Past it: the longest idle ones, enough to come down to 85 %.
+        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
+        assert_eq!((ms, bytes), (5_000, 5 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
+        assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        use super::ram_idle_ms;
+        let ram_idle_ms = |avail| super::ram_idle_for(avail, false);
+        assert_eq!(super::ram_idle_for(Some(12 << 30), true), 300_000);
+        assert_eq!(super::ram_idle_for(Some((12 << 30) - 1), true), 10_000);
+        assert_eq!(super::ram_idle_for(None, true), 10_000);
         let gib = 1024 * 1024 * 1024;
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);

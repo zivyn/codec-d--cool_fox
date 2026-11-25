@@ -1026,6 +1026,25 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
+        // The first copy into a texture of the title's: what it does not
+        // write is what title memory holds, as on the console. (The host
+        // copy is cut from a block and held whatever lay there, and no
+        // upload is made once a copy wrote it: the atlas the title copies
+        // its baked decorations into, a 2048x2048 BC3 texture of which a
+        // bake writes 256x256 at most, was drawn over a character's face
+        // with other textures' bytes wherever nothing was baked, runs n01 and
+        // textures-1.)
+        static OVER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OVER.get_or_init(|| std::env::var_os("VICTORY_COPY_OVER_TITLE").is_none_or(|v| v != "0"))
+            && crate::texture::title_written(to)
+            && !crate::texture::host_wrote(dst.resource as usize)
+        {
+            crate::texture::upload(list, dst.resource, to);
+            // (Done before the title's copy writes over it.)
+            if list.used(dst.resource as usize) {
+                ensure_state(list, dst.resource, COPY_SOURCE);
+            }
+        }
         // A destination made level by level gets the level's memory ahead
         // of this list (`crate::tiles`): the title's bake copies each level
         // of its result into a block-compressed texture of that kind, and

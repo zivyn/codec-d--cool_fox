@@ -115,9 +115,9 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, (priority, base, affinity)) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}) affinity {affinity:#x}",
             name_of(thread),
             locate(start_of(thread))
         );
@@ -130,7 +130,7 @@ pub fn dump_stacks() {
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
-pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -144,7 +144,7 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
+        return (frames, (0, 0, 0));
     }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
@@ -159,7 +159,7 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     if status != 0 || info.teb.is_null() {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0));
+        return (frames, (0, 0, 0));
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
     // holds the stack base at +8 and the stack limit at +0x10.
@@ -176,7 +176,7 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, (info.priority, info.base_priority, info.affinity))
 }
 
 pub(crate) fn start_of(thread: HANDLE) -> usize {

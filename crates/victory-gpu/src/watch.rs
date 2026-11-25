@@ -1433,10 +1433,69 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
-/// and the frame it last was.
-static LANDED: Mutex<Option<std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>>> = Mutex::new(None);
+/// and the frame it last was: in pieces made when first needed and never let
+/// go. Some 20,000 pages a frame are noted by the relay and the landing
+/// threads: in a map behind one lock that was 309 waits for it and 280 looks
+/// at its table in the 40 s of a profile, as many as all else of the landings'
+/// notes (run faults-5).
+struct Landed([std::sync::atomic::AtomicPtr<LandedPiece>; Landed::PIECES]);
 
-/// A page's number, spread: some 20,000 a frame are noted in [`LANDED`].
+/// Of 256 MiB: the frame (its low 31 bits and one), 0 for never.
+type LandedPiece = [std::sync::atomic::AtomicU32; Landed::PAGES];
+
+impl Landed {
+    const PAGES: usize = 1 << 16;
+    /// 128 TiB, what a process has.
+    const PIECES: usize = 1 << 19;
+
+    fn stamp(frame: u64) -> u32 {
+        (frame as u32 & 0x7fff_ffff) + 1
+    }
+
+    fn note(&self, page: usize, frame: u64) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        let Some(place) = self.0.get(page / Landed::PAGES) else {
+            return;
+        };
+        let mut piece = place.load(Acquire);
+        if piece.is_null() {
+            let made: Box<LandedPiece> = Box::new([const { std::sync::atomic::AtomicU32::new(0) }; Landed::PAGES]);
+            let made = Box::into_raw(made);
+            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                Ok(_) => made,
+                Err(there) => {
+                    // SAFETY: made just now, and another thread's is there.
+                    drop(unsafe { Box::from_raw(made) });
+                    there
+                }
+            };
+        }
+        // SAFETY: a piece, which is never freed.
+        let at = unsafe { &(&*piece)[page % Landed::PAGES] };
+        let stamp = Landed::stamp(frame);
+        // (Most are noted several times a frame: no write then.)
+        if at.load(Relaxed) != stamp {
+            at.store(stamp, Relaxed);
+        }
+    }
+
+    /// Whether `page` was noted in a frame from `since` on, up to `now`.
+    fn since(&self, page: usize, since: u64, now: u64) -> bool {
+        let Some(place) = self.0.get(page / Landed::PAGES) else {
+            return false;
+        };
+        // SAFETY: null, or a piece, which is never freed.
+        let Some(piece) = (unsafe { place.load(std::sync::atomic::Ordering::Acquire).as_ref() }) else {
+            return false;
+        };
+        let stamp = piece[page % Landed::PAGES].load(std::sync::atomic::Ordering::Relaxed);
+        stamp != 0 && u64::from(Landed::stamp(now).wrapping_sub(stamp) & 0x7fff_ffff) <= now.saturating_sub(since)
+    }
+}
+
+static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+
+/// A page's number, spread.
 #[derive(Default)]
 struct PageHash(u64);
 
@@ -1461,15 +1520,13 @@ impl std::hash::Hasher for PageHash {
 pub(crate) fn landing(at: usize, len: usize) {
     {
         let frame = crate::frame::current();
-        let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
-        let landed = landed.get_or_insert_with(Default::default);
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
-        landed.extend((first..=last).map(|page| (page, frame)));
+        (first..=last).for_each(|page| LANDED.note(page, frame));
         for (block, others) in elsewhere(at, len) {
             let block = block / KERNEL_PAGE;
             let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
             for other in others {
-                landed.extend(here.clone().map(|page| (page - block + other / KERNEL_PAGE, frame)));
+                here.clone().for_each(|page| LANDED.note(page - block + other / KERNEL_PAGE, frame));
             }
         }
     }
@@ -1502,15 +1559,13 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     let elsewhere: Vec<(usize, Vec<usize>)> = spans.iter().flat_map(|&(at, len)| elsewhere(at, len)).collect();
     {
         let frame = crate::frame::current();
-        let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
-        let landed = landed.get_or_insert_with(Default::default);
         for &page in pages {
-            landed.insert(page, frame);
+            LANDED.note(page, frame);
         }
         for (block, others) in &elsewhere {
             let first = block / KERNEL_PAGE;
             for &page in pages.iter().filter(|&&page| (first..first + BLOCK / KERNEL_PAGE).contains(&page)) {
-                landed.extend(others.iter().map(|other| (page - first + other / KERNEL_PAGE, frame)));
+                others.iter().for_each(|other| LANDED.note(page - first + other / KERNEL_PAGE, frame));
             }
         }
     }
@@ -1554,11 +1609,8 @@ pub(crate) fn block_published(block: usize) -> bool {
 /// Whether shaders' writes went into a page of `[at, at + len)` in the last
 /// `frames` frames.
 pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
-    let since = crate::frame::current().saturating_sub(frames);
-    let landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
-    landed.as_ref().is_some_and(|landed| {
-        (at / 4096..=(at + len.max(1) - 1) / 4096).any(|page| landed.get(&page).is_some_and(|&f| f >= since))
-    })
+    let now = crate::frame::current();
+    (at / 4096..=(at + len.max(1) - 1) / 4096).any(|page| LANDED.since(page, now.saturating_sub(frames), now))
 }
 
 /// Whether every block of `[at, at + len)` is view memory written since a
@@ -3657,6 +3709,24 @@ mod tests {
         assert_eq!(tracked.take(p, p + 4 * PAGE), [(p + 2 * PAGE, p + 2 * PAGE + 4096), (p + 2 * PAGE + 8192, p + 2 * PAGE + 12288)]);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The frames pages were last landed in.
+    #[test]
+    fn landed_pages_are_known_by_their_frame() {
+        static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+        let landed = &LANDED;
+        for page in [0, 5, Landed::PAGES - 1, Landed::PAGES, 7 * Landed::PAGES + 3] {
+            assert!(!landed.since(page, 0, 100));
+            landed.note(page, 100);
+            assert!(landed.since(page, 100, 100) && landed.since(page, 0, 100) && landed.since(page, 90, 110));
+            assert!(!landed.since(page, 101, 110));
+            landed.note(page, 0x1_0000_0005);
+            assert!(landed.since(page, 0x1_0000_0000, 0x1_0000_0007) && !landed.since(page, 0x1_0000_0006, 0x1_0000_0007));
+            assert!(!landed.since(page + 1, 0, 0x1_0000_0007));
+        }
+        landed.note(usize::MAX / 4096, 1);
+        assert!(!landed.since(usize::MAX / 4096, 0, 1));
     }
 
     /// The set of blocks against another of the same.

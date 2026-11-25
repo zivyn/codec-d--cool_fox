@@ -1465,6 +1465,7 @@ fn workers() -> &'static Workers {
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
                         }
                     };
+                    let _working = crate::timeline::span("a job for another thread");
                     job();
                 }
             });
@@ -1483,6 +1484,7 @@ fn wide(jobs: Vec<Job>) {
         return;
     }
     let workers = workers();
+    let _wide = crate::timeline::span("work spread over threads");
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());

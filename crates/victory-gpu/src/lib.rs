@@ -68,10 +68,13 @@ mod shadow;
 mod tiles;
 pub mod signature;
 mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
 mod texture;
+pub mod timeline;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]

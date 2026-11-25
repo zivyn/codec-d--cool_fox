@@ -2894,7 +2894,9 @@ fn late_helper() {
             }
         };
         let Some(target) = target else {
+            let mut helping = crate::timeline::span("helper: landed lists reset and given back");
             land();
+            helping.next("helper: looking at what queues hold");
             crate::queue::release_held(false);
             continue;
         };
@@ -2903,6 +2905,8 @@ fn late_helper() {
         // SAFETY: our fence and event.
         unsafe {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(Some(target));
                 WaitForSingleObject(event, INFINITE);
             }
         }
@@ -2960,6 +2964,15 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    let _waiting = crate::timeline::span(match why {
+        WHY_SYNC => "waiting for landings: everything (a present, the sweep)",
+        WHY_VALUE => "waiting for landings: a memory value",
+        WHY_STALE => "waiting for landings: title memory changed under shader writes",
+        WHY_READ => "waiting for landings: title memory read",
+        WHY_MOST => "waiting for landings: lists in the air",
+        WHY_FENCE => "waiting for landings: a blocking fence wait",
+        _ => "waiting for landings: another reason",
+    });
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
@@ -3051,6 +3064,8 @@ fn relay_worker() {
             Ok(items) => host.relay_land(items, &mut fetch),
             Err(target) => {
                 let waiting = std::time::Instant::now();
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
@@ -3281,6 +3296,10 @@ pub(crate) use send::{goes_as_words, words_under};
 pub(crate) mod spans;
 mod torn;
 pub(crate) mod upcheck;
+#[cfg(feature = "diagnostics")]
+mod stamps;
+#[cfg(feature = "diagnostics")]
+pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
 mod late_tests {
@@ -4300,11 +4319,14 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
+                    #[cfg(feature = "diagnostics")]
+                    let _card = crate::timeline::card_wait(None);
                     WaitForSingleObject(event, INFINITE);
                     return Ok(behind);
                 }
@@ -4318,6 +4340,8 @@ impl Host {
                 self.queue.Signal(&fence, sent)?;
                 meanwhile();
                 fence.SetEventOnCompletion(sent, event)?;
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(None);
                 WaitForSingleObject(event, INFINITE);
                 Ok(after)
             })()
@@ -4336,6 +4360,7 @@ impl Host {
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
         let merging = std::time::Instant::now();
+        let _merging = crate::timeline::span("landing: merging fetched pieces");
         let mut written = 0;
         if land::on() {
             let titles: Vec<(usize, usize)> =
@@ -4404,6 +4429,7 @@ impl Host {
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
                 .iter()
@@ -4436,12 +4462,16 @@ impl Host {
                     }
                 }
                 let mut hand_back = relay_hand_back(&back);
+                stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
                     if crate::land::on() {
+                        let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
                 });
+                stage.next("landing: copies in the PC's memory");
                 hand_back.merge();
+                stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
@@ -4457,6 +4487,7 @@ impl Host {
             }
         }
         // In the order given: what tells the title the card is done.
+        stage.next("landing: read-backs, telling the title");
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
@@ -4490,6 +4521,7 @@ impl Host {
             FINISHED.store(last, Ordering::Release);
             bury(last);
         }
+        stage.next("landing: the rest");
         self.log_messages();
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4726,6 +4758,7 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        let _landing = crate::timeline::span("landed lists reset and given back");
         land();
     }
 
@@ -4791,6 +4824,7 @@ impl Host {
             return;
         }
         let was_working = working(true);
+        let _settling = crate::timeline::span("settling flights");
         let mut counted = false;
         loop {
             let items = {
@@ -4820,6 +4854,8 @@ impl Host {
                     match self.fence.SetEventOnCompletion(*submitted, self.event) {
                         Ok(()) => {
                             working(false);
+                            #[cfg(feature = "diagnostics")]
+                            let _card = crate::timeline::card_wait(Some(*submitted));
                             WaitForSingleObject(self.event, INFINITE);
                             stood(waiting);
                             working(true);
@@ -4962,6 +4998,7 @@ impl Host {
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
@@ -4969,6 +5006,7 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -4976,6 +5014,7 @@ impl Host {
         let own = if late { self.card_steps(runs) } else { None };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
+        stage.next("submit: waiting for flights it reads from");
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
@@ -5005,6 +5044,7 @@ impl Host {
             }
             None => runs,
         };
+        stage.next("submit: the sweep");
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5028,6 +5068,7 @@ impl Host {
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         let behind = late && flying();
+        stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5067,9 +5108,11 @@ impl Host {
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
+            stage.next("submit: asking the write watch");
             crate::watch::ask_once(&ranges);
             #[cfg(feature = "diagnostics")]
             split.part(0);
+            stage.next("submit: title bytes under flights' writes");
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
@@ -5095,9 +5138,11 @@ impl Host {
         split.part(1);
         // What flights in the air may write.
         let air = line().written.clone();
+        stage.next("submit: refreshes ahead of writes");
         if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
+        stage.next("submit: the lists' steps");
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
@@ -5107,10 +5152,12 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.fill();
+        stage.next("submit: the last refreshes");
         batch.flush();
         crate::watch::ask_once_end();
         #[cfg(feature = "diagnostics")]
         split.part(2);
+        stage.next("submit: snapshots");
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5123,6 +5170,7 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(3);
+        stage.next("submit: copies in the card's memory");
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -5149,6 +5197,7 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(4);
+        stage.next("submit: waiting for the heaps' records");
         drop(heaps_synced);
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
@@ -5156,6 +5205,18 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(15);
         let prepared = std::time::Instant::now();
+        stage.next("submit: sending");
+        // When it runs on the card, for the timeline.
+        #[cfg(feature = "diagnostics")]
+        let stamp = stamps::take();
+        #[cfg(feature = "diagnostics")]
+        if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+            lists.insert(0, Some(ahead));
+            lists.push(Some(behind));
+            firsts.iter_mut().for_each(|first| *first += 1);
+        }
+        #[cfg(feature = "diagnostics")]
+        let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
@@ -5169,7 +5230,10 @@ impl Host {
                 self.queue.Signal(&self.fence, *submitted)
             };
             awake::sent(&self.device);
+            #[cfg(feature = "diagnostics")]
+            crate::timeline::sent(sending, *submitted, stamp);
             self.card_sent();
+            stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -5216,9 +5280,13 @@ impl Host {
                     .queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::sent(sending, *submitted, stamp);
                 match waited {
                     Ok(()) => {
                         working(false);
+                        #[cfg(feature = "diagnostics")]
+                        let _card = crate::timeline::card_wait(Some(*submitted));
                         WaitForSingleObject(self.event, INFINITE);
                         stood(started);
                         working(true);
@@ -5285,6 +5353,7 @@ impl Host {
             ));
         }
         submitting(3, runs.len());
+        stage.next("submit: copying back");
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -5633,6 +5702,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
@@ -5685,6 +5755,7 @@ impl HostList {
     pub(crate) fn reset(&self) {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -6622,6 +6693,7 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                     }
+                    let _step = crate::timeline::span("a step of ours");
                     work();
                     // It wrote title memory, where is not known here: the
                     // submission's one asking ends, later refreshes ask anew.
@@ -7052,6 +7124,7 @@ impl Batch {
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
+        let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
         #[cfg(feature = "diagnostics")]
@@ -7155,6 +7228,7 @@ impl Batch {
             self.due.drain(..).for_each(|staging| staging.refresh());
             return;
         }
+        let _textures = crate::timeline::span("textures brought up to date");
         // The time counted is the time it took, not the threads' sum.
         let started = std::time::Instant::now();
         let before = PREPARING[2].load(Ordering::Relaxed);
@@ -7172,6 +7246,7 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let (began, all) = (std::time::Instant::now(), self.refreshes.len());
+        let _flush = crate::timeline::span("refreshes of copies");
         self.flush_all();
         #[cfg(feature = "diagnostics")]
         {
@@ -8095,8 +8170,11 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
+            let mut showing = crate::timeline::span("the host's Present");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            showing.next("the frame meter");
             p.meter.frame(p.hwnd);
+            showing.end();
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]

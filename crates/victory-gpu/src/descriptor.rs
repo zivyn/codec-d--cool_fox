@@ -249,6 +249,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     last = std::time::Instant::now();
                     Over
                 });
+                let _round =
+                    crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
                 let _ = std::panic::catch_unwind(sync_heaps);
             }
         });

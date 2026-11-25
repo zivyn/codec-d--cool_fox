@@ -1846,6 +1846,7 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        let mut stage = crate::timeline::span("the heap pass: begun, or done here");
         if crate::host::aside::on() {
             let at = std::ptr::from_ref(heap) as usize;
             list.refreshes_coming(move || {
@@ -1860,7 +1861,9 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
+        stage.next("the heap pass: textures");
         self.heap_textures(list, heap, host);
+        stage.end();
         #[cfg(feature = "diagnostics")]
         HEAP_SPLIT[2].fetch_add(refreshed.elapsed().as_nanos() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);

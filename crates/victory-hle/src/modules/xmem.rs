@@ -1065,6 +1065,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
     let mut costed = Costed::begin(Some(n));
+    let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
     let mut physical = physical();
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;

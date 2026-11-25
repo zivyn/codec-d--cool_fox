@@ -148,6 +148,7 @@ pub(crate) extern "system" fn wait(
         tick -= 1;
         wait = Duration::ZERO;
     }
+    let _called = crate::timeline::span("the title's frame wait");
     let hr = if wait > limit {
         std::thread::sleep(limit);
         TIMEOUT

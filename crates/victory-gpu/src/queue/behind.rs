@@ -340,6 +340,12 @@ impl Work for Job {
 
     fn go(self, forced: bool) {
         let began = Instant::now();
+        let _doing = crate::timeline::span(match self {
+            Job::Run(..) => "the line: a submission",
+            Job::Present(..) => "the line: a present",
+            Job::Signal(..) => "the line: a signal",
+            _ => "the line: a wait that is met",
+        });
         if forced {
             STATS[FORCED].fetch_add(1, Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -426,11 +432,27 @@ thread_local! {
 /// (`VICTORY_ASYNC_SUBMIT=1`; needs flights with the present sent ahead, as
 /// the relay has them, and lists cut at their waits).
 pub(super) fn on() -> bool {
+    // Diagnostics: on and off while the title runs (`crate::ab`).
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_ASYNC_SUBMIT") {
+        return on && started();
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && started())
+}
+
+/// The line is about to be left for the way without it: everything in it is
+/// done first. (At a present, by the title's thread that submits.)
+#[cfg(feature = "diagnostics")]
+pub(super) fn leave() {
+    LANE.wait_presents(0);
+    LANE.drain();
+}
+
+/// Starts the thread, once: whether there is one.
+fn started() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") {
-            return false;
-        }
         if !crate::host::late_free_present() || !super::cuts() {
             tracing::warn!("VICTORY_ASYNC_SUBMIT=1 needs the relay and lists cut at their waits: submissions are prepared by the thread that makes them");
             return false;
@@ -528,6 +550,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
     LANE.push(queue, jobs);
     if before + runs > runs_most() as u64 {
         let began = Instant::now();
+        let _waiting = crate::timeline::span("a submission waits for room in the line");
         LANE.wait_runs(runs_most());
         STATS[ROOM].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
@@ -558,6 +581,7 @@ pub(super) fn present(this: This, texture: Option<(std::sync::Arc<crate::resourc
     STATS[PRESENTS].fetch_add(1, Relaxed);
     LANE.push(this as usize, [Job::Present(texture, shown)]);
     let began = Instant::now();
+    let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
 }

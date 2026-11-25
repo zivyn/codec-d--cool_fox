@@ -25,6 +25,7 @@ impl Coming {
     /// What was found.
     pub(crate) fn wait(&self) -> Vec<Refresh> {
         let began = std::time::Instant::now();
+        let _waiting = crate::timeline::span("a list's close waits for the heap's views");
         let mut found = self.0.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(found) = found.take() {
@@ -56,6 +57,7 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
     let told = coming.clone();
     let job: Job = Box::new(move || {
         // (However it ends, the list that waits goes on.)
+        let _aside = crate::timeline::span("beside: the heap's views");
         let found = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).unwrap_or_default();
         told.found(found);
     });

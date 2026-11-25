@@ -1358,6 +1358,14 @@ impl HostHeap {
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
 
+    /// A number that changes when a slot is written or made due anew, and
+    /// whether memory was noted since a pass last took the notes.
+    pub(crate) fn texture_news(&self) -> (u64, bool) {
+        let writes = self.textures.lock().unwrap_or_else(|e| e.into_inner()).writes;
+        let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
+        (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN))
+    }
+
     /// Every title slot of the queue that is due at `frame`, and whether
     /// it was uploaded before (in part, or whole and waiting for another
     /// look): for the card accounting line

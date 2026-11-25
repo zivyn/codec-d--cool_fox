@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -1066,6 +1066,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
+    let _busy = Busy::begin();
     let mut physical = physical();
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
@@ -1155,6 +1156,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let _costed = Costed::begin(None);
+    let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
@@ -1194,6 +1196,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let mut ok = true;
     let mut at = 0;
     while at < pages.len() {
+        let _busy = Busy::begin();
         let mut physical = physical();
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
@@ -1221,6 +1224,7 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
     let mut ok = true;
     let mut at = 0;
     while at < wanted.len() {
+        let _busy = Busy::begin();
         let mut costed = Costed::begin(None);
         let mut ops: Vec<Op> = Vec::new();
         let mut physical = physical();
@@ -1256,7 +1260,9 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
 const GROUP: usize = 64;
 
 /// How many threads map a group of pages side by side (`VICTORY_MAP_THREADS`;
-/// 1: the caller alone, a page after the other, as before).
+/// 1: the caller alone, a page after the other, as before; `auto`, which it
+/// is unless set: 1 while mapping takes little of the time, [`WIDE`] while the
+/// title streams as fast as its pages are mapped, [`Busy`]).
 ///
 /// Mapping and unmapping a view wait for a lock that every protection change
 /// of a view takes too, and our guards make 100,000 of those a second, from
@@ -1269,10 +1275,74 @@ fn side_by_side() -> usize {
     if let Some(on) = victory_gpu::switched("VICTORY_MAP_THREADS") {
         return if on { 8 } else { 1 };
     }
-    static THREADS: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("VICTORY_MAP_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 32)
+    match asked_threads() {
+        Some(n) => n,
+        None if BUSY.2.load(Ordering::Relaxed) => WIDE,
+        None => 1,
+    }
+}
+
+/// Threads while the title streams fast: they stand in the host's queue side
+/// by side, each for a millisecond or two a page in the world's first seconds.
+const WIDE: usize = 16;
+
+/// `VICTORY_MAP_THREADS` as a number; `None`: by how much there is to map.
+fn asked_threads() -> Option<usize> {
+    static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
+        std::env::var("VICTORY_MAP_THREADS").ok().and_then(|v| v.trim().parse().ok()).map(|n: usize| n.clamp(1, 32))
     });
-    *THREADS
+    *ASKED
+}
+
+/// Of the window under way: when it began, the nanoseconds spent mapping in
+/// it; and whether the last one was busy.
+static BUSY: (Mutex<Option<std::time::Instant>>, AtomicU64, std::sync::atomic::AtomicBool) =
+    (Mutex::new(None), AtomicU64::new(0), std::sync::atomic::AtomicBool::new(false));
+
+/// Counts the time a mapping call of the title's takes, as long as it lives.
+/// More than a quarter of a window, and the calls are what loading waits for
+/// (one thread of the title's makes them); less than a twentieth, they are
+/// not any more.
+struct Busy(std::time::Instant);
+
+impl Busy {
+    fn begin() -> Busy {
+        Busy(std::time::Instant::now())
+    }
+}
+
+/// Whether mapping is busy after a window of `window` with `spent` in it.
+fn busy_after(was: bool, spent: std::time::Duration, window: std::time::Duration) -> bool {
+    spent * if was { 20 } else { 4 } > window
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        let all = BUSY.1.fetch_add((now - self.0).as_nanos() as u64, Ordering::Relaxed) + (now - self.0).as_nanos() as u64;
+        let mut began = BUSY.0.lock().unwrap_or_else(|e| e.into_inner());
+        let window = now - *began.get_or_insert(self.0);
+        if window < WINDOW {
+            return;
+        }
+        *began = Some(now);
+        BUSY.1.store(0, Ordering::Relaxed);
+        let was = BUSY.2.load(Ordering::Relaxed);
+        let is = busy_after(was, std::time::Duration::from_nanos(all), window);
+        if was != is {
+            BUSY.2.store(is, Ordering::Relaxed);
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if asked_threads().is_none() && SAID.fetch_add(1, Ordering::Relaxed) < 200 {
+                tracing::info!(
+                    "title pages are mapped by {} (VICTORY_MAP_THREADS): {:.0} ms of the last {:.0} ms went into mapping calls",
+                    if is { "several threads" } else { "the caller alone" },
+                    all as f64 / 1e6,
+                    window.as_secs_f64() * 1e3
+                );
+            }
+        }
+    }
 }
 
 /// A page of address space to unmap and, with a slice, map anew.
@@ -1414,7 +1484,7 @@ mod pool {
         static STARTED: std::sync::Once = std::sync::Once::new();
         let pool = POOL.get_or_init(|| Pool { batches: Mutex::default(), more: Condvar::new() });
         STARTED.call_once(|| {
-            let started = (1..side_by_side())
+            let started = (1..super::asked_threads().unwrap_or(super::WIDE).max(side_by_side()))
                 .filter(|i| std::thread::Builder::new().name(format!("mapping {i}")).spawn(|| serve(pool)).is_ok())
                 .count();
             tracing::info!(started, "threads that map pages side by side (VICTORY_MAP_THREADS=1: none)");
@@ -2413,6 +2483,15 @@ mod tests {
         }
         assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn mapping_is_busy_from_a_quarter_of_the_time_to_a_twentieth() {
+        let ms = std::time::Duration::from_millis;
+        assert!(!busy_after(false, ms(60), ms(250)) && busy_after(false, ms(70), ms(250)));
+        assert!(busy_after(true, ms(15), ms(250)) && !busy_after(true, ms(12), ms(250)));
+        // A window without a call, then one short one.
+        assert!(!busy_after(true, ms(5), ms(4000)));
     }
 
     #[test]

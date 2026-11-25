@@ -3198,8 +3198,12 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
-                    if runs.len() > *runs_left {
+                    // Whole words go up as pairs, all of them in one
+                    // dispatch: only what is a copy of its own counts.
+                    let runs = if crate::host::words_under() { dword_runs(lo, title, held, 0) } else { changed_runs(title, held) };
+                    let own = |&&(r, m): &&(usize, usize)| !crate::host::words_under() || !crate::host::goes_as_words(at + r, m);
+                    let copies = runs.iter().filter(own).count();
+                    if copies > *runs_left {
                         note_stale(2);
                         return true;
                     }
@@ -3229,6 +3233,8 @@ impl Shadow {
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    self.card_changed_runs(runs.into_iter().map(|(r, m)| (at + r, at + r + m)));
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }

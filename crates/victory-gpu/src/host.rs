@@ -3161,6 +3161,7 @@ mod torn;
 pub(crate) mod upcheck;
 
 #[cfg(test)]
+pub(crate) use send::{goes_as_words, words_under};
 mod late_tests {
     use super::{continues, join_ranges, touches};
 

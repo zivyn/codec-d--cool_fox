@@ -109,7 +109,7 @@ impl Check {
             within.push(i);
         }
         // (The last flight's stands.)
-        for r in plans.flat_map(|plan| &plan.ranges).filter(|r| r.compared) {
+        for r in plans.flat_map(|plan| &plan.ranges).filter(|r| r.compared && !r.picked) {
             for p in 0..r.span.pieces {
                 if let Some(&i) = index.get(&(r.shadow.id(), r.span.first + p))
                     && let Some(&d) = differs.get((r.at + p) as usize)

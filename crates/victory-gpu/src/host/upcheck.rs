@@ -720,6 +720,51 @@ mod tests {
         assert_eq!((undone, found), (true, 16));
     }
 
+    /// A shader that writes through views it picks: its buffer is found when
+    /// it comes to it in turn, and what it writes from then on is landed.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_PICKED_WRITES=1 VICTORY_PICKED_MB=1 and a process of its own"]
+    fn writes_through_picked_views_come_back() {
+        let Some(host) = host() else {
+            return;
+        };
+        assert!(crate::picked::on(), "set VICTORY_PICKED_WRITES=1");
+        let (title, start, shadow) = title(0x6666, true);
+        crate::picked::shown(vec![(shadow.clone(), start as u64, (start + LEN) as u64)], true);
+        let at = (37 << 16) + 512;
+        let mut lists = Vec::new();
+        let mut back = Vec::new();
+        for round in 0..12u8 {
+            // Turns go by frames.
+            crate::frame::test_advance();
+            title[(37 << 16) + 9000] = round + 1;
+            let list = host.new_list().unwrap();
+            shadow.refresh(&list, start as u64, LEN as u64);
+            crate::picked::runs_in(&list);
+            write(host, &list, &shadow, at, &[0x40 + round; 64]);
+            list.close();
+            host.execute_own(&list);
+            settle_now(WHY_SYNC);
+            back.push(title[at..at + 64] == [0x40 + round; 64]);
+            // The title's own write beside it is on the card, and the
+            // shader's stays, once its buffer is known.
+            let next = host.new_list().unwrap();
+            shadow.refresh(&next, start as u64, LEN as u64);
+            next.close();
+            host.execute_own(&next);
+            settle_now(WHY_SYNC);
+            if *back.last().unwrap() {
+                let holds = card(host, &shadow);
+                assert_eq!((holds[(37 << 16) + 9000], holds[at]), (round + 1, 0x40 + round));
+                assert_eq!(look(host), Some(0));
+            }
+            lists.extend([list, next]);
+        }
+        eprintln!("came back, by round: {back:?}");
+        let first = back.iter().position(|b| *b).expect("it is found");
+        assert!(first <= 6 && back[first..].iter().all(|b| *b), "{back:?}");
+    }
+
     /// Declared writes beside the title's own, in the same 64 KiB pieces and
     /// dword by dword, flights landing while later ones are in the air: in
     /// the end title memory and the card hold what each wrote last. (A byte

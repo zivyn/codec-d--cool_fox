@@ -1044,6 +1044,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
+                crate::picked::runs_in(list);
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -1469,6 +1472,7 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mut unordered = Vec::new();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1501,7 +1505,13 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
+            if crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav) {
+                unordered.push((shadow.clone(), address, address + len));
+            }
             ranges.insert(index, (shadow, address, address + len));
+        }
+        if crate::picked::on() {
+            crate::picked::shown(unordered, *passes % 16 == 1);
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.

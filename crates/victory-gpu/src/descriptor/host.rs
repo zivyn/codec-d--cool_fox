@@ -1252,7 +1252,8 @@ impl HostHeap {
     /// A plain point sampler at slot `index`, for sampler slots without a
     /// view.
     fn null_sampler(&self, index: u32) {
-        null_sampler(self.cpu(index));
+        null_sampler(self.at(index));
+        self.put(index);
     }
 }
 
@@ -1662,7 +1663,8 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
-            if let Some(kept) = make(&view, self.cpu(slot)) {
+            if let Some(kept) = make(&view, self.at(slot)) {
+                self.put(slot);
                 self.keep(slot, kept);
                 remade += 1;
             }
@@ -1770,7 +1772,8 @@ impl HostHeap {
                 FLIPPED[1].fetch_add(1, Relaxed);
                 continue;
             };
-            if let Some(kept) = make(&view, self.cpu(f.index)) {
+            if let Some(kept) = make(&view, self.at(f.index)) {
+                self.put(f.index);
                 *shown = f.key;
                 self.keep(f.index, kept);
                 flipped += 1;
@@ -1799,9 +1802,10 @@ impl HostHeap {
             return;
         }
         match view_at(key as u32, (key >> 32) as u32) {
-            Some(view) => null_for(&view, self.cpu(index)),
-            None => null_view(self.cpu(index)),
+            Some(view) => null_for(&view, self.at(index)),
+            None => null_view(self.at(index)),
         }
+        self.put(index);
         self.clear_twin(index);
         self.keep(index, None);
     }
@@ -2027,10 +2031,11 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let kept = make(view, self.at(index));
         if kept.is_none() {
-            null_for(view, self.cpu(index));
+            null_for(view, self.at(index));
         }
+        self.put(index);
         self.keep(index, kept.flatten());
     }
 
@@ -2039,14 +2044,15 @@ impl HostHeap {
         if self.sampler {
             self.null_sampler(index);
         } else {
-            null_view(self.cpu(index));
+            null_view(self.at(index));
+            self.put(index);
         }
         self.keep(index, None);
     }
 
     /// Where the raw twin of title slot `index` is.
     fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
-        (index < self.twins.len() as u32).then(|| self.cpu(self.raw + index))
+        (index < self.twins.len() as u32).then(|| staged(self.sampler, 1).unwrap_or_else(|| self.cpu(self.raw + index)))
     }
 
     /// The raw twin of title slot `index` is a null view again.
@@ -2054,7 +2060,8 @@ impl HostHeap {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            null_buffer_view(self.cpu(self.raw + index));
+            null_buffer_view(self.at(self.raw + index));
+            self.put(self.raw + index);
         }
     }
 
@@ -2098,15 +2105,17 @@ impl HostHeap {
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+                .CreateShaderResourceView(buffer, Some(&desc), self.at(index))
         };
+        self.put(index);
         self.keep(index, Some(buffer.clone()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
     /// zeros.
     pub(crate) fn null_raw_at(&self, index: u32) {
-        null_buffer_view(self.cpu(index));
+        null_buffer_view(self.at(index));
+        self.put(index);
         self.keep(index, None);
     }
 
@@ -2136,9 +2145,10 @@ impl HostHeap {
                 buffer,
                 None::<&ID3D12Resource>,
                 Some(&desc),
-                self.cpu(index),
+                self.at(index),
             )
         };
+        self.put(index);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2163,9 +2173,10 @@ impl HostHeap {
                 None::<&ID3D12Resource>,
                 None::<&ID3D12Resource>,
                 Some(&desc),
-                self.cpu(index),
+                self.at(index),
             )
         };
+        self.put(index);
         self.keep(index, None);
     }
 
@@ -2198,11 +2209,45 @@ impl HostHeap {
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+                .CreateConstantBufferView(Some(&desc), self.at(index))
         };
+        self.put(index);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
+    }
+
+    /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
+    /// a slot of this thread's in a heap the card does not see
+    /// ([`staged`]), or the slot itself.
+    fn at(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        staged(self.sampler, 0).unwrap_or_else(|| self.cpu(index))
+    }
+
+    /// The descriptor this thread made last ([`HostHeap::at`]) goes to slot
+    /// `index`.
+    fn put(&self, index: u32) {
+        self.copy_to(index, 0);
+    }
+
+    /// The raw twin this thread made last goes to that of slot `index`.
+    fn put_twin(&self, index: u32) {
+        if self.twin(index).is_some() {
+            self.copy_to(self.raw + index, 1);
+        }
+    }
+
+    fn copy_to(&self, to: u32, which: u32) {
+        let (Some(from), Some(host)) = (staged(self.sampler, which), host()) else {
+            return; // made in place
+        };
+        let kind = if self.sampler {
+            D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
+        } else {
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
+        };
+        // SAFETY: a slot of our heap, and one of this thread's heap slots.
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, kind) };
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -2371,12 +2416,16 @@ impl HostHeap {
             let kept = if later {
                 None
             } else {
-                make_twinned(&view, self.cpu(index), self.twin(index))
+                make_twinned(&view, self.at(index), self.twin(index))
             };
             if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
+                null_for(&view, self.at(index));
+            }
+            if kept.is_some() || !self.sampler {
+                self.put(index);
             }
             if kept.is_some() && twinned(&view) {
+                self.put_twin(index);
                 if let Some(made) = self.twins.get(index as usize) {
                     made.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2443,6 +2492,90 @@ impl HostHeap {
         }
         Some(text)
     }
+}
+
+/// Slots of this thread's own in heaps the card does not see, two of views
+/// and two of samplers (`which` 0 or 1): descriptors are made there and
+/// copied whole into the heaps it does see. Made in place they are seen half
+/// written: an RX 7900 XTX saw a texture of no size in 4 % of its reads of
+/// slots whose views a thread made over and over (the driver clears the
+/// descriptor and fills it step by step), and none in 8,500 million with the
+/// same descriptors copied, three times as fast
+/// (`indirect::tests::descriptors_written_under_readers`). Title threads and
+/// our passes rewrite slots while submissions run whose shaders pick them;
+/// three device losses of 2026-11-25 (play-1125-0203, n02, n03) were reads of
+/// memory no view names. `VICTORY_VIEW_COPY=0`: made in place, as before.
+fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    /// Threads at a time that have slots; more make views in place.
+    const THREADS: u32 = 4096;
+    struct Stage {
+        starts: [usize; 2],
+        steps: [usize; 2],
+        _heaps: [ID3D12DescriptorHeap; 2],
+    }
+    // SAFETY: descriptor heaps are free-threaded; each thread has slots of
+    // its own.
+    unsafe impl Send for Stage {}
+    // SAFETY: as above.
+    unsafe impl Sync for Stage {}
+    static STAGE: std::sync::OnceLock<Option<Stage>> = std::sync::OnceLock::new();
+    /// Places given back, and how many were ever given out.
+    static PLACES: Mutex<(Vec<u32>, u32)> = Mutex::new((Vec::new(), 0));
+    struct Place(Option<u32>);
+    impl Drop for Place {
+        fn drop(&mut self) {
+            if let Some(place) = self.0 {
+                PLACES.lock().unwrap_or_else(|e| e.into_inner()).0.push(place);
+            }
+        }
+    }
+    thread_local! {
+        static PLACE: Place = {
+            let mut places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+            Place(places.0.pop().or_else(|| {
+                (places.1 < THREADS).then(|| {
+                    places.1 += 1;
+                    places.1 - 1
+                })
+            }))
+        };
+    }
+    let stage = STAGE
+        .get_or_init(|| {
+            if std::env::var_os("VICTORY_VIEW_COPY").is_some_and(|v| v == "0") {
+                return None;
+            }
+            let host = host()?;
+            let make = |kind: D3D12_DESCRIPTOR_HEAP_TYPE| -> Option<ID3D12DescriptorHeap> {
+                // SAFETY: plain heap creation.
+                unsafe {
+                    host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: kind,
+                        NumDescriptors: 2 * THREADS,
+                        ..Default::default()
+                    })
+                }
+                .inspect_err(|e| tracing::warn!(error = %e, "no heap to make views in: they are made in place"))
+                .ok()
+            };
+            let kinds = [D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER];
+            let heaps = [make(kinds[0])?, make(kinds[1])?];
+            // SAFETY: live heaps, plain queries.
+            let (starts, steps) = unsafe {
+                (
+                    [0, 1].map(|i: usize| heaps[i].GetCPUDescriptorHandleForHeapStart().ptr),
+                    kinds.map(|kind| host.device.GetDescriptorHandleIncrementSize(kind) as usize),
+                )
+            };
+            Some(Stage { starts, steps, _heaps: heaps })
+        })
+        .as_ref()?;
+    // (A thread that is ending has none any more.)
+    let place = PLACE.try_with(|p| p.0).ok().flatten()?;
+    let kind = usize::from(sampler);
+    Some(D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: stage.starts[kind] + (2 * place + which) as usize * stage.steps[kind],
+    })
 }
 
 /// Logs `what` the first time it happens.
@@ -2671,14 +2804,46 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
-/// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that had
-/// to be views as the title's slot has them (a raw view begins on 16 bytes).
-pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that
+/// do not begin on 16 bytes, as a raw view must ([`move_raw`]), and those of
+/// these that could not be moved there (null).
+pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Moves the raw view at `at`, a slot of our heaps the card does not see,
+/// which shows `bytes` from `start` on (GPU address), `by` bytes on: for a
+/// twin whose view begins between two multiples of 16, where the host makes
+/// no raw view. An AMD descriptor of a raw buffer is its address (48 bits),
+/// its bytes and flags; only one that says just that is changed, and only
+/// where what the handle points at is the descriptor. False: not moved.
+fn move_raw(at: D3D12_CPU_DESCRIPTOR_HANDLE, start: u64, bytes: u32, by: u32) -> bool {
+    if !by.is_multiple_of(4) || by >= bytes {
+        return false;
+    }
+    let mut words = [0u8; 16];
+    if !crate::host::read_into(at.ptr as *const u8, &mut words) {
+        return false;
+    }
+    let word = |i: usize| u32::from_le_bytes([words[4 * i], words[4 * i + 1], words[4 * i + 2], words[4 * i + 3]]);
+    let address = u64::from(word(0)) | u64::from(word(1)) << 32;
+    if address != start || word(2) != bytes || start >> 48 != 0 {
+        return false;
+    }
+    let moved = start + u64::from(by);
+    // SAFETY: this thread's own slot (it has slots of its own: the caller
+    // asks only for those), read just now.
+    unsafe {
+        let words = at.ptr as *mut u32;
+        words.write(moved as u32);
+        words.add(1).write((moved >> 32) as u32);
+        words.add(2).write(bytes - by);
+    }
+    true
+}
 
 /// The bytes a buffer view the host takes ([`buffer_view_ok`]) shows as a raw
-/// view (first dword, dwords), if it begins where one can; of a buffer of
-/// `width` bytes.
-fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> Option<(u64, u32)> {
+/// view (first dword, dwords, and the bytes past that dword it begins: a raw
+/// view begins on 16 bytes); of a buffer of `width` bytes.
+fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bool, width: u64) -> Option<(u64, u32, u32)> {
     use std::sync::atomic::Ordering::Relaxed;
     TWINS[0].fetch_add(1, Relaxed);
     let element = if raw {
@@ -2688,15 +2853,17 @@ fn twin_window(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw: bo
     } else {
         crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let start = first * element;
-    let dwords = (u64::from(count) * element).div_ceil(4).min((width - start.min(width)) / 4);
-    let window = (start % 16 == 0 && dwords > 0)
-        .then(|| u32::try_from(dwords).ok().map(|dwords| (start / 4, dwords)))
-        .flatten();
-    if window.is_none() {
+    let (start, end) = (first * element, ((first + u64::from(count)) * element).next_multiple_of(4));
+    let end = end.min(width & !3);
+    let from = start & !15;
+    if end <= start {
+        return None;
+    }
+    let dwords = u32::try_from((end - from) / 4).ok()?;
+    if from != start {
         TWINS[1].fetch_add(1, Relaxed);
     }
-    window
+    Some((from / 4, dwords, (start - from) as u32))
 }
 
 fn buffer_srv(
@@ -2776,7 +2943,8 @@ fn buffer_srv(
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
     if let Some(twin) = twin {
-        if let Some((first, count)) = twin_window(desc.Format, first, count, stride, raw, width) {
+        let window = twin_window(desc.Format, first, count, stride, raw, width);
+        if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
                 FirstElement: first,
@@ -2784,12 +2952,19 @@ fn buffer_srv(
                 StructureByteStride: 0,
                 Flags: D3D12_BUFFER_SRV_FLAG_RAW,
             };
+            // SAFETY: a live buffer and a slot of our heap.
+            let start = unsafe {
+                host.device
+                    .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin);
+                shadow.buffer.GetGPUVirtualAddress() + first * 4
+            };
+            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+                TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                null_buffer_view(twin);
+            }
+        } else {
+            null_buffer_view(twin);
         }
-        // SAFETY: a live buffer and a slot of our heap.
-        unsafe {
-            host.device
-                .CreateShaderResourceView(&shadow.buffer, Some(&desc), twin)
-        };
     }
     Some(Some(shadow.buffer.clone()))
 }
@@ -2891,7 +3066,8 @@ fn buffer_uav(
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
     if let Some(twin) = twin {
-        if let Some((first, count)) = twin_window(desc.Format, first, count, stride, raw, width) {
+        let window = twin_window(desc.Format, first, count, stride, raw, width);
+        if let Some((first, count, by)) = window {
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_UAV {
                 FirstElement: first,
@@ -2900,12 +3076,19 @@ fn buffer_uav(
                 CounterOffsetInBytes: 0,
                 Flags: D3D12_BUFFER_UAV_FLAG_RAW,
             };
+            // SAFETY: a live buffer and a slot of our heap.
+            let start = unsafe {
+                host.device
+                    .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin);
+                shadow.buffer.GetGPUVirtualAddress() + first * 4
+            };
+            if by > 0 && !(staged(false, 1).is_some_and(|s| s.ptr == twin.ptr) && move_raw(twin, start, count.saturating_mul(4), by)) {
+                TWINS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                null_buffer_view(twin);
+            }
+        } else {
+            null_buffer_view(twin);
         }
-        // SAFETY: a live buffer and a slot of our heap.
-        unsafe {
-            host.device
-                .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), twin)
-        };
     }
     Some(Some(shadow.buffer.clone()))
 }
@@ -3709,15 +3892,94 @@ mod tests {
     #[test]
     fn raw_twins_show_the_views_bytes() {
         let (u16s, u32s, none) = (DXGI_FORMAT(57), DXGI_FORMAT(42), DXGI_FORMAT_UNKNOWN);
-        assert_eq!(twin_window(u32s, 4, 10, 0, false, 4096), Some((4, 10)));
-        assert_eq!(twin_window(u16s, 8, 7, 0, false, 4096), Some((4, 4)));
+        assert_eq!(twin_window(u32s, 4, 10, 0, false, 4096), Some((4, 10, 0)));
+        assert_eq!(twin_window(u16s, 8, 7, 0, false, 4096), Some((4, 4, 0)));
         // the last dword would reach past the buffer
-        assert_eq!(twin_window(u16s, 8, 7, 0, false, 30), Some((4, 3)));
-        assert_eq!(twin_window(none, 2, 3, 24, false, 4096), Some((12, 18)));
-        assert_eq!(twin_window(DXGI_FORMAT_R32_TYPELESS, 8, 5, 0, true, 4096), Some((8, 5)));
-        // where no raw view begins: the view as it is
-        assert_eq!(twin_window(none, 1, 3, 24, false, 4096), None);
-        assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), None);
+        assert_eq!(twin_window(u16s, 8, 7, 0, false, 30), Some((4, 3, 0)));
+        assert_eq!(twin_window(none, 2, 3, 24, false, 4096), Some((12, 18, 0)));
+        assert_eq!(twin_window(DXGI_FORMAT_R32_TYPELESS, 8, 5, 0, true, 4096), Some((8, 5, 0)));
+        // where no raw view begins: from the 16 bytes below
+        assert_eq!(twin_window(none, 1, 3, 24, false, 4096), Some((4, 20, 8)));
+        assert_eq!(twin_window(u32s, 1, 10, 0, false, 4096), Some((0, 11, 4)));
+        assert_eq!(twin_window(u32s, 1, 10, 0, false, 4), None);
+    }
+
+    /// What a slot is made as is made beside the heap and copied in whole: the
+    /// slot's descriptor is the one the view has, and each thread makes its
+    /// own.
+    #[test]
+    fn views_are_made_beside_the_heap_and_copied_in() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (Some(a), Some(b)) = (staged(false, 0), staged(false, 1)) else {
+            return;
+        };
+        assert_ne!(a.ptr, b.ptr);
+        assert_ne!(Some(a.ptr), std::thread::spawn(|| staged(false, 0).map(|h| h.ptr)).join().unwrap());
+        let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
+        let index = heap.dynamic(1).unwrap();
+        let bytes = |at: D3D12_CPU_DESCRIPTOR_HANDLE| {
+            let mut bytes = [0u8; 32];
+            crate::host::read_into(at.ptr as *const u8, &mut bytes).then_some(bytes)
+        };
+        heap.raw_at(index, &buffer, 64, 1024);
+        let (slot, beside) = (bytes(heap.cpu(index)), bytes(staged(false, 0).unwrap()));
+        assert_eq!(slot, beside, "copied as it was made");
+        heap.null_raw_at(index);
+        assert_ne!(bytes(heap.cpu(index)), slot, "another view since");
+        // SAFETY: a plain query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A raw view moved on by some dwords says so in its descriptor, on a
+    /// card whose descriptors are what we take them for; on another nothing
+    /// is changed.
+    #[test]
+    fn a_raw_view_is_moved_only_where_its_descriptor_says_where_it_is() {
+        let (Some(host), Some(at)) = (host(), staged(false, 1)) else {
+            return; // no host GPU here
+        };
+        let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 8,
+                    NumElements: 100,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: this thread's slot, a live buffer.
+        let start = unsafe {
+            host.device.CreateShaderResourceView(&buffer, Some(&desc), at);
+            buffer.GetGPUVirtualAddress() + 32
+        };
+        let words = || {
+            let mut bytes = [0u8; 32];
+            assert!(crate::host::read_into(at.ptr as *const u8, &mut bytes));
+            bytes
+        };
+        let before = words();
+        assert!(!move_raw(at, start + 16, 400, 8), "another address");
+        assert!(!move_raw(at, start, 404, 8), "another size");
+        assert!(!move_raw(at, start, 400, 2), "not a dword");
+        assert_eq!(words(), before);
+        if move_raw(at, start, 400, 8) {
+            let moved = words();
+            assert_eq!(moved[..8], (start + 8).to_le_bytes());
+            assert_eq!(moved[8..12], 392u32.to_le_bytes());
+            assert_eq!(moved[12..], before[12..]);
+        } else {
+            assert_eq!(words(), before);
+        }
     }
 
     /// Views that begin where no host view can: raw ones off 16 bytes,

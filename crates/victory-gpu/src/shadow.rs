@@ -4592,14 +4592,14 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    // At most so much on the card's own memory (2 GiB unless
+    // At most so much on the card's own memory (4 GiB unless
     // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
     // that the side shaders see is in the PC's memory.
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     static USED: AtomicU64 = AtomicU64::new(0);
     let most = *MOST.get_or_init(|| {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(2048) << 20
+        mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;

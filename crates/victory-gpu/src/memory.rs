@@ -36,8 +36,9 @@
 //!   packed ("dehydrated") structure there, all of it: the title ships its
 //!   structures packed, and the builder's rehydration stages unpack each in
 //!   place once it is streamed in;
-//! - 4 MiB from each pair of root constants that is a title address and from
-//!   each root constant that is one in 256-byte units (structures built);
+//! - 4 MiB from each unordered access view outside buffers (structures built);
+//! - the page of each pair of root constants that is a title address and of
+//!   each root constant that is one in 256-byte units;
 //! - the first page of every structure a list's upload memory names
 //!   (a top-level build's instances).
 //!
@@ -58,7 +59,10 @@
 //! dispatches was given that buffer as an unordered access view (its scratch
 //! memory, its results); what else a store reaches is an arena's.
 //!
-//! shortcut: a page is kept for the rest of the run.
+//! A packed structure is gone when title memory has no header of it any more
+//! (looked at over [`SWEEP`] frames); the pages it alone has are given back.
+//!
+//! shortcut: a page held for anything else is kept for the rest of the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
@@ -80,15 +84,15 @@ const PAGE: u64 = 1 << 16;
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
 const PIECE: usize = 4096;
-/// Pages held, at most (2 GiB).
-const MOST: usize = 1 << 15;
+/// Pages held, at most (3 GiB).
+const MOST: usize = 3 << 14;
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
 /// The biggest packed structure taken for one.
 const PACKED: u64 = 64 << 20;
 /// A packed structure not named for so many frames is another one.
 const AGAIN: u64 = 8;
-/// From a root view; from an address in constants.
+/// From a root view; from one that is written (a structure being built).
 const VIEW: u64 = 256 << 10;
 const BUILT: u64 = 4 << 20;
 /// The biggest title buffer whose builder results come back.
@@ -97,7 +101,7 @@ const BACK: u64 = 256 << 10;
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
 /// pages there are in the first seconds (run light-4).
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 8192;
+const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 
@@ -119,6 +123,19 @@ struct Held {
     taken: u64,
     /// The frame it was last looked at in.
     looked: u64,
+    /// Packed structures that have bytes in it, and whether it is held for
+    /// them alone.
+    owners: u32,
+    theirs: bool,
+}
+
+/// A packed structure the builder came to.
+struct Packed {
+    /// The frame it last did.
+    frame: u64,
+    len: u64,
+    /// Its first two dwords in title memory.
+    header: u64,
 }
 
 struct Memory {
@@ -140,7 +157,12 @@ struct Memory {
     /// Windows of title memory itself ([`Memory::map`]).
     windows: usize,
     /// Packed structures the builder came to: the frame it last did.
-    packed: HashMap<u64, u64>,
+    packed: HashMap<u64, Packed>,
+    /// Their addresses in the order they came, and where the sweep is.
+    packed_order: Vec<u64>,
+    packed_sweep: usize,
+    /// Places of pages given back: the copy, the address in the arena.
+    free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
     /// Pages taken from faults.
@@ -169,6 +191,11 @@ struct Stats {
     looked: u64,
     changed: u64,
     packed: u64,
+    packed_bytes: u64,
+    gone: u64,
+    /// Pages that came for an address in constants, a written view, another
+    /// view, a structure named in upload memory.
+    came: [u64; 4],
     micros: u64,
 }
 
@@ -213,6 +240,9 @@ impl Memory {
             sweep: 0,
             windows: 0,
             packed: HashMap::new(),
+            packed_order: Vec::new(),
+            packed_sweep: 0,
+            free: Vec::new(),
             open: Default::default(),
             faulted: 0,
             heaps: HashMap::new(),
@@ -337,6 +367,10 @@ impl Memory {
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
+        if let Some((copy, at)) = self.free.pop() {
+            self.hold(page, at, copy);
+            return true;
+        }
         if self.used == ARENA / PAGE {
             let Some(at) = crate::upload::reserve(ARENA as usize) else {
                 return false;
@@ -355,10 +389,69 @@ impl Memory {
         };
         let offset = self.used * PAGE;
         self.used += 1;
-        self.pages.insert(page, Held { at: arena + offset as usize, copy, taken: 0, looked: u64::MAX });
-        self.order.push(page);
-        fill(self.entry(page), copy, offset);
+        self.hold(page, arena + offset as usize, copy);
         true
+    }
+
+    /// `page` is held at `at` in the arena that is `copy`.
+    fn hold(&mut self, page: u64, at: usize, copy: usize) {
+        self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, owners: 0, theirs: false });
+        self.order.push(page);
+        fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
+    }
+
+    /// The packed structure at `address` is gone: the pages it alone had are
+    /// given back.
+    fn gone(&mut self, address: u64) {
+        let Some(packed) = self.packed.remove(&address) else { return };
+        for page in address / PAGE..=(address + packed.len - 1) / PAGE {
+            let Some(held) = self.pages.get_mut(&page) else { continue };
+            held.owners = held.owners.saturating_sub(1);
+            if held.owners == 0 && held.theirs {
+                self.free.push((held.copy, held.at));
+                self.pages.remove(&page);
+                // SAFETY: an entry of the directory, under the mutex.
+                unsafe { self.entry(page).write_volatile(0) };
+            }
+        }
+        self.stats.gone += 1;
+    }
+
+    /// Whether the packed structure at `address` is still in title memory.
+    fn there(&self, address: u64) -> bool {
+        let mut header = [0u8; 8];
+        crate::texture::committed(address as *const u8, 8) && {
+            crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 8, false);
+            self.packed.get(&address).is_some_and(|p| p.header == u64::from_le_bytes(header))
+        }
+    }
+
+    /// Looks at some of the pages and packed structures again.
+    fn look_again(&mut self) {
+        for _ in 0..self.order.len().div_ceil(SWEEP) {
+            self.sweep = (self.sweep + 1) % self.order.len();
+            let page = self.order[self.sweep];
+            if self.pages.contains_key(&page) {
+                self.bring(page, page + 1);
+            } else {
+                self.order.swap_remove(self.sweep);
+                if self.order.is_empty() {
+                    break;
+                }
+            }
+        }
+        for _ in 0..self.packed_order.len().div_ceil(SWEEP) {
+            self.packed_sweep = (self.packed_sweep + 1) % self.packed_order.len();
+            let address = self.packed_order[self.packed_sweep];
+            if !self.packed.contains_key(&address) {
+                self.packed_order.swap_remove(self.packed_sweep);
+                if self.packed_order.is_empty() {
+                    break;
+                }
+            } else if !self.there(address) {
+                self.gone(address);
+            }
+        }
     }
 
     /// A dispatch of the builder was given `address` to write: if it is in a
@@ -453,9 +546,31 @@ impl Memory {
         let Some(len) = packed_len(u64::from_le_bytes(header)) else {
             return false;
         };
-        let last = self.packed.insert(address, self.frame);
-        if last.is_some_and(|f| f + AGAIN >= self.frame) {
-            return true;
+        let header = u64::from_le_bytes(header);
+        if let Some(known) = self.packed.get_mut(&address) {
+            let soon = known.frame + AGAIN >= self.frame;
+            known.frame = self.frame;
+            if known.header == header && soon {
+                return true;
+            }
+            if known.header != header {
+                self.gone(address);
+            }
+        }
+        if !self.packed.contains_key(&address) {
+            self.packed.insert(address, Packed { frame: self.frame, len, header });
+            self.packed_order.push(address);
+            for page in address / PAGE..=(address + len - 1) / PAGE {
+                let new = !self.pages.contains_key(&page);
+                if !self.map(page) {
+                    continue;
+                }
+                if let Some(held) = self.pages.get_mut(&page) {
+                    held.owners += 1;
+                    held.theirs |= new;
+                }
+            }
+            self.stats.packed_bytes += len;
         }
         self.ready(address, len);
         let mut title = [0u8; PIECE];
@@ -575,7 +690,8 @@ impl Memory {
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
-             {:.1} packed structures ({} seen), {:.2} ms; {} windows",
+             {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -590,7 +706,14 @@ impl Memory {
             s.packed as f64 / frames,
             self.packed.len(),
             s.micros as f64 / 1000.0 / frames,
-            self.windows
+            self.windows,
+            s.packed_bytes >> 10,
+            s.gone,
+            s.came[0],
+            s.came[1],
+            s.came[2],
+            s.came[3],
+            self.faulted
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -663,12 +786,7 @@ pub(crate) fn ready(
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
-        let n = m.order.len().div_ceil(SWEEP);
-        for _ in 0..n {
-            m.sweep = (m.sweep + 1) % m.order.len();
-            let page = m.order[m.sweep];
-            m.bring(page, page + 1);
-        }
+        m.look_again();
         m.report();
     }
     let builds = use_ != Use::Reads;
@@ -682,7 +800,8 @@ pub(crate) fn ready(
     // in one in 256-byte units (the builder's alone). A constant that only
     // looks like one names memory nothing reads; one that is not the title's
     // memory is refused.
-    let built = if builds { BUILT } else { PAGE };
+    let held = |m: &Memory| m.pages.len() as u64;
+    let before = held(m);
     for (i, &c) in constants.iter().enumerate() {
         if let Some(&high) = constants.get(i + 1)
             && (1..=0x1F).contains(&high)
@@ -690,16 +809,17 @@ pub(crate) fn ready(
         {
             let at = u64::from(c) | u64::from(high) << 32;
             if named(1, at) {
-                m.ready(at, built);
+                m.ready(at, 1);
             }
         }
         if builds && (0x0100_0000..0x2000_0000).contains(&c) {
             let at = u64::from(c) << 8;
             if named(1, at) {
-                m.ready(at, built);
+                m.ready(at, 1);
             }
         }
     }
+    let mut came = [held(m) - before, 0, 0, 0];
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let packed = builds && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize) && m.unpacks(at);
@@ -711,17 +831,30 @@ pub(crate) fn ready(
                 m.small(list, start, len);
             }
             m.opens(at);
+            if !packed && crate::shadow::in_buffer(at, 1).is_none() {
+                let before = held(m);
+                m.ready(at, BUILT);
+                came[1] += held(m).saturating_sub(before);
+            }
         }
         if packed || !named(2, at) {
             continue;
         }
+        let before = held(m);
         match crate::shadow::in_buffer(at, 1) {
             Some(_) => {
                 m.ready(at, 1);
                 m.named_in_upload(at);
+                came[3] += held(m).saturating_sub(before);
             }
-            None => m.ready(at, if builds { VIEW } else { PAGE }),
+            None => {
+                m.ready(at, if builds { VIEW } else { PAGE });
+                came[2] += held(m).saturating_sub(before);
+            }
         }
+    }
+    for (sum, n) in m.stats.came.iter_mut().zip(came) {
+        *sum += n;
     }
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {

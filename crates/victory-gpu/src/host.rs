@@ -602,6 +602,9 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Before anything is made with it (`VICTORY_RECORD`).
+        #[cfg(feature = "diagnostics")]
+        crate::replay::record::from_env(&device);
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
         // driver compiling shaders again on the "D3D Background Thread"s,
         // for minutes after pipelines were made or loaded) is switched off.
@@ -1295,8 +1298,14 @@ fn timing() -> bool {
 }
 
 /// Names a host object for the device-removed report, which names the
-/// allocations a page fault hit (only with device-removed data on).
+/// allocations a page fault hit (only with device-removed data on), or for
+/// the frame recorder (`VICTORY_RECORD`).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
+    #[cfg(feature = "diagnostics")]
+    if crate::replay::record::on() {
+        crate::replay::record::name(object, &text());
+        return;
+    }
     if dred_on()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
@@ -3126,6 +3135,8 @@ impl Host {
                 },
                 ..Default::default()
             })?;
+            #[cfg(feature = "diagnostics")]
+            name(&pso, || crate::replay::play::COMPARE.into());
             Ok(CardWork {
                 sync: vec![list()?],
                 check: vec![list()?],
@@ -6353,6 +6364,8 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            #[cfg(feature = "diagnostics")]
+            crate::replay::record::present(texture, state);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]

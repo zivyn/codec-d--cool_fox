@@ -249,6 +249,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     last = std::time::Instant::now();
                     Over
                 });
+                let _round =
+                    crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
                 let _ = std::panic::catch_unwind(sync_heaps);
             }
         });
@@ -1122,6 +1124,16 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
         PLACED => views_read().placed_of(i, generation),
         _ => None,
     }
+}
+
+/// The words of the record at `handle`, if they are a view's.
+pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (words[0] == VIEW_TAG).then_some(words)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

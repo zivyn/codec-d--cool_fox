@@ -68,10 +68,13 @@ mod shadow;
 mod tiles;
 pub mod signature;
 mod switch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod ab;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
 mod texture;
+pub mod timeline;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]
@@ -79,6 +82,13 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+
+/// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
+/// off while the title runs (`ab`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn switched(switch: &str) -> Option<bool> {
+    ab::pick(switch)
+}
 
 /// What the frame is at (`copystat::phase`), for the sampling profiler.
 #[cfg(all(windows, feature = "diagnostics"))]

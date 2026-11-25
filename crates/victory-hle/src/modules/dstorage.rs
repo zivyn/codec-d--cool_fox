@@ -774,7 +774,9 @@ fn work(scheduler: &'static Scheduler) {
         drop(lanes);
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
+        let reading = victory_gpu::timeline::span("streaming: a request");
         let result = execute(&job.request);
+        reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
@@ -1341,6 +1343,7 @@ fn queue(this: QueueRef, command: Command) {
 /// the pages are mapped just before, also those under addresses without a
 /// list (memory only the CPU sees).
 extern "system" fn submit(this: QueueRef) {
+    let _called = victory_gpu::timeline::span("the title's DirectStorage Submit");
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {

@@ -320,6 +320,7 @@ pub(crate) fn release_held(all: bool) {
     if lock(&WAITING).is_empty() {
         return;
     }
+    let _looking = crate::timeline::span("looking at what queues hold");
     let _one = lock(&RELEASING);
     loop {
         let queues = lock(&WAITING).clone();
@@ -549,6 +550,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    let _called = crate::timeline::span("the title's ExecuteCommandLists");
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::timeline::title_thread();
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
@@ -650,6 +654,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    let _called = crate::timeline::span("the title's queue Signal");
     #[cfg(windows)]
     if behind::on() && !this.is_null() {
         behind::signal(this, fence, value);
@@ -680,6 +685,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    let _called = crate::timeline::span("the title's queue Wait");
     #[cfg(windows)]
     if !this.is_null() {
         let now = crate::fence::completed(fence);
@@ -767,6 +773,8 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::timeline::told("written when its list had run", at as usize, value);
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -837,6 +845,9 @@ extern "system" fn present(
     let _ = this;
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    let called = crate::timeline::span("the title's Present");
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::timeline::title_thread();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
@@ -917,6 +928,9 @@ extern "system" fn present(
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
         behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        called.end();
+        #[cfg(feature = "diagnostics")]
+        frame_ends();
         return S_OK;
     }
     #[cfg(windows)]
@@ -939,8 +953,23 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    called.end();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    frame_ends();
     S_OK
 }
+
+/// Diagnostics: the title's present is over.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn frame_ends() {
+    crate::timeline::presented();
+    crate::ab::presented(|switch, was, will| {
+        if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
+            behind::leave();
+        }
+    });
+}
+
 /// The frame a present shows, and the title's resource it shows.
 #[cfg(windows)]
 #[derive(Clone, Copy)]
@@ -1037,6 +1066,7 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    let _called = crate::timeline::span("the title's CopyPageMappings");
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }

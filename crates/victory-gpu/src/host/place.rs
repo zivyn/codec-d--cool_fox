@@ -256,6 +256,7 @@ impl HostList {
             from: scratch.map(|s| s.2 as usize),
         }));
         deferred.refreshed.clear();
+        self.changed_something();
         true
     }
 

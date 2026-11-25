@@ -1155,6 +1155,7 @@ impl Staging {
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
+        let _texture = crate::timeline::span("a texture's refresh");
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);

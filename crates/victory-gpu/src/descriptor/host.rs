@@ -52,7 +52,11 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    ///
+    /// A lock for each slot: one for the heap was what the recording threads
+    /// waited for most (5.6 % of their time, profile waits-1: each descriptor
+    /// made for a draw takes it, and lets go of what the slot held under it).
+    kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -982,7 +986,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         if let Some(at) = host.written.get(slot as usize) {
             text.push_str(&format!(", written last at {:.1} s", f64::from(at.load(Relaxed)) / 1e3));
         }
-        let kept = host.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).cloned().flatten();
+        let kept = host.kept_in(index);
         match kept {
             None => text.push_str(", holds nothing"),
             Some(resource) => {
@@ -1249,7 +1253,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1644,12 +1648,7 @@ impl HostHeap {
         // as `mirror` takes them.
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
+            && self.kept_in(index).is_some()
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -2130,6 +2129,68 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Makes slot `index` (a dynamic one) the view the record `words` names,
+    /// from this thread's descriptor of it if the recording `recording` has
+    /// made one, else as [`HostHeap::make_at`] does, and keeps that
+    /// ([`ListViews`]). What is known of the record in this recording;
+    /// `None` (the slot is not made): not a view kept so.
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        if self.sampler {
+            return None;
+        }
+        LIST_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            if views.is_none() {
+                *views = Some(ListViews::new()?);
+            }
+            let views = views.as_mut()?;
+            if views.recording != recording {
+                views.recording = recording;
+                views.made.clear();
+            }
+            let twins = self.twins.get(index as usize).is_some();
+            if !views.made.contains_key(&words) {
+                let view = super::view_at(words[1], words[2])?;
+                let at = 2 * views.made.len() as u32;
+                // (A constant buffer's bytes are copied for each draw.)
+                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                    return None;
+                }
+                let twin = twinned(&view);
+                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let listed = Listed {
+                    kind: crate::draw::view_kind(&view),
+                    texture: is_texture_view(&view),
+                    ready: (0, 0, false),
+                    tabled: None,
+                };
+                views.made.insert(words, ListView { view, at, twin, kept, listed });
+            }
+            let made = &views.made[&words];
+            self.copy_from(index, views.slot(made.at));
+            if made.twin && twins {
+                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.clear_twin(index);
+            }
+            self.keep(index, made.kept.clone());
+            Some(made.listed)
+        })
+    }
+
+    /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
+    /// see.
+    fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(to as usize) {
+            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap, and one of this thread's heap.
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -2171,19 +2232,28 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
             use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
             }
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
-            }
+            std::mem::replace(&mut *slot, resource)
+        };
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
         }
+    }
+
+    /// What slot `index` views.
+    fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -2371,7 +2441,7 @@ impl HostHeap {
     fn copy_to(&self, to: u32, which: u32) {
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
-            written.store(crate::host::now_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
         let (Some(from), Some(host)) = (staged(self.sampler, which), host()) else {
             return; // made in place
@@ -2593,9 +2663,8 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
-        Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        let shown = self.kept_in(index)?;
+        Some(windows::core::Interface::as_raw(&shown) == windows::core::Interface::as_raw(buffer))
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -3060,8 +3129,7 @@ fn buffer_srv(
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.width();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         once!(
@@ -4657,4 +4725,101 @@ mod tests {
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
+}
+
+/// What is known of a record a list's tables hold, in that recording of the
+/// list ([`HostHeap::make_listed`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Listed {
+    pub(crate) kind: Option<victory_shader::native::ResourceType>,
+    pub(crate) texture: bool,
+    /// Read at this epoch of the list ([`crate::host::HostList::epoch`]) with
+    /// this depth target tested: up to date; and whether it is that target's.
+    pub(crate) ready: (u64, usize, bool),
+    /// The title's slot last noted for it, and whether the draw read it.
+    pub(crate) tabled: Option<(u32, bool)>,
+}
+
+struct ListView {
+    view: View,
+    /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
+    at: u32,
+    twin: bool,
+    kept: Kept,
+    listed: Listed,
+}
+
+/// The descriptors a thread made for one recording of a list, by the record
+/// they were made from, in a heap the card does not see.
+///
+/// The title's culling and lighting dispatches each bind a table of their own
+/// that differs in one constant buffer, and the same thirty views beside it:
+/// each was found, checked, made and brought up to date anew for every
+/// dispatch, some 2,500 indirect dispatches in the one recording job the
+/// frame waits for last (timeline waits-2: 24 of 65 ms). Here a list makes a
+/// view once, as it makes a table once (`crate::draw::State::tables`), and
+/// copies its descriptor.
+struct ListViews {
+    recording: u64,
+    heap: ID3D12DescriptorHeap,
+    step: usize,
+    start: usize,
+    made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+}
+
+impl ListViews {
+    const SLOTS: u32 = 8192;
+
+    fn new() -> Option<ListViews> {
+        let host = host()?;
+        // SAFETY: plain object creation.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: Self::SLOTS,
+                    ..Default::default()
+                })
+                .ok()?;
+            let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+        }
+    }
+
+    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
+    }
+}
+
+thread_local! {
+    static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The view the record `words` names, as this thread made it for `recording`.
+pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
+    LIST_VIEWS.with(|views| {
+        let views = views.borrow();
+        let views = views.as_ref().filter(|v| v.recording == recording)?;
+        views.made.get(&words).map(|m| m.view.clone())
+    })
+}
+
+/// Notes what is known of the record `words` in `recording`.
+pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
+    LIST_VIEWS.with(|views| {
+        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
+            && let Some(made) = views.made.get_mut(&words)
+        {
+            made.listed = listed;
+        }
+    });
+}
+
+/// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:
+/// for every table).
+pub(crate) fn list_views() -> bool {
+    crate::toggled!("VICTORY_LIST_VIEWS")
 }

@@ -254,8 +254,10 @@ impl Pool {
             };
             state.running += 1;
             drop(state);
+            let working = crate::timeline::span("a landing's job");
             // SAFETY: counted in `running`, so `each` has not returned.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+            working.end();
             state = self.state();
             state.running -= 1;
             state.panicked |= ran.is_err();
@@ -272,6 +274,7 @@ impl Pool {
             (0..count).for_each(f);
             return;
         }
+        let _spread = crate::timeline::span("landing: spread over threads");
         let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: the lifetime is left out only until this call returns, and
         // it does not before no helper is inside `f` and none can enter.

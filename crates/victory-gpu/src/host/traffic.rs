@@ -40,6 +40,12 @@ pub(super) fn line(frames: f64) {
     // Copies that only move one way.
     let only = |way: usize| all.iter().filter(|(_, m)| m.bytes[1 - way] == 0).map(|(_, m)| m.bytes[way]).sum::<u64>();
     tracing::info!(
+        "landings in title memory looked at by refreshes per frame (VICTORY_LAND_ECHO=0: sent up): {:.1} MB held already and left, \
+         {:.1} MB the title's too",
+        mb(crate::shadow::ECHO[0].swap(0, std::sync::atomic::Ordering::Relaxed)),
+        mb(crate::shadow::ECHO[1].swap(0, std::sync::atomic::Ordering::Relaxed)),
+    );
+    tracing::info!(
         "bytes of host copies over the bus per frame: {:.1} MB up ({:.1} of copies nothing was fetched from), {:.1} MB fetched \
          ({:.1} of copies nothing was sent up to), {} copies; the most:",
         mb(sum(UP)),

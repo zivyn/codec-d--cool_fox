@@ -71,14 +71,25 @@ pub fn log_crash(text: &str) {
 }
 
 fn append_to_log(text: &str) {
-    use std::io::Write;
     let Some(file) = LOG.get() else { return };
+    let _ = append_record(file, text);
+}
+
+fn append_record(file: &std::path::Path, text: &str) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
-    if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+    let record = format!("unix time {now}, process {}\n{text}\n", std::process::id());
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(file)?;
+    // Formatting directly into the file can append fragments separately.
+    // Use one append, with no lock to acquire from an exception handler.
+    if file.write(record.as_bytes())? == record.len() {
+        Ok(())
+    } else {
+        // Retrying a short write could put another report between its pieces.
+        Err(Error::new(ErrorKind::WriteZero, "incomplete crash record append"))
     }
 }
 
@@ -774,6 +785,49 @@ mod tests {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
     };
+
+    #[test]
+    fn concurrent_crash_records_stay_together() {
+        const THREADS: usize = 8;
+        const RECORDS: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("synthetic-crashes.txt");
+        let ready = std::sync::Barrier::new(THREADS);
+        let body = "x".repeat(8192);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (file, ready, body) = (&file, &ready, &body);
+                scope.spawn(move || {
+                    ready.wait();
+                    for record in 0..RECORDS {
+                        super::append_record(file, &format!("record {thread}:{record}\n{body}"))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let log = std::fs::read_to_string(file).unwrap();
+        let mut lines = log.lines();
+        let mut seen = std::collections::BTreeSet::new();
+        let process = std::process::id().to_string();
+        while let Some(header) = lines.next() {
+            let (time, pid) = header
+                .strip_prefix("unix time ")
+                .and_then(|line| line.split_once(", process "))
+                .expect("each record starts with a complete header");
+            assert!(time.parse::<u64>().is_ok());
+            assert_eq!(pid, process);
+            assert!(seen.insert(lines.next().expect("record identifier")));
+            assert!(lines.next().is_some_and(|line| line == body));
+        }
+        for thread in 0..THREADS {
+            for record in 0..RECORDS {
+                assert!(seen.remove(format!("record {thread}:{record}").as_str()));
+            }
+        }
+        assert!(seen.is_empty());
+    }
 
     /// What [`capture_frames`] saw: our [`unwind`], then the system's walk.
     type Captured = (Vec<u64>, Vec<usize>);

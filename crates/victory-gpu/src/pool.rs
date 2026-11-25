@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -29,6 +29,25 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
+/// The same while the card has room ([`room`]): 4 GiB of them.
+const SPARE_KEPT: usize = 64;
+/// How many are kept now.
+static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+
+/// Sets how many empty blocks stay, by the card's memory (budget and use):
+/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// Asked once a second.
+pub(crate) fn room(memory: Option<[u64; 4]>) {
+    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+}
+
+fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    match memory {
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        _ => SPARE,
+    }
+}
+
 /// Milliseconds until a piece given back is used again. (It was three
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
@@ -106,11 +125,13 @@ struct Pool<B> {
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
     resting: VecDeque<(u64, Piece)>,
+    /// The empty blocks it was last told to keep.
+    spare: usize,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new() -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new() }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -168,12 +189,15 @@ impl<B: Clone> Pool<B> {
                 any |= block.free.whole(BLOCK);
             }
         }
-        if any {
+        // (Without a piece given back too, once there is less room.)
+        let most = SPARES.load(Ordering::Relaxed);
+        if any || most < self.spare {
+            self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
-                    if spare > SPARE {
+                    if spare > most {
                         *block = None;
                     }
                 }
@@ -380,6 +404,14 @@ mod tests {
     }
 
     #[test]
+    fn empty_blocks_stay_while_the_card_has_room() {
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
         let mut pool: Pool<u32> = Pool::new();
         let made = std::cell::Cell::new(0);
@@ -408,7 +440,7 @@ mod tests {
             pool.give(p, 20);
         }
         pool.rested(20 + REST);
-        assert_eq!(pool.blocks(), blocks.min(SPARE));
+        assert_eq!(pool.blocks(), blocks.min(SPARES.load(Ordering::Relaxed)));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
         let mut none: Pool<u32> = Pool::new();

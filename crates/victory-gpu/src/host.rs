@@ -157,11 +157,37 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
     }
 }
 
+/// Whether memory the card was given stays with it while there is room (on
+/// by default; `VICTORY_KEEP_FREED=0`: it is given back as before). A shader
+/// that reads past a view (a raw load through a typed, structured or
+/// constant buffer view has no end on AMD: `indirect::tests::raw_loads_past_views`)
+/// or through a slot that shows wrong data reads whatever lies there, and
+/// nothing happens; where memory was given back it is a page fault, and the
+/// device is lost. Both losses of 2026-11-25 were reads in memory given back
+/// seconds before (a block of textures; a list's scratch and a window of
+/// title memory). Kept are: empty blocks of textures ([`crate::pool`]) below
+/// 85 % of the card's budget, windows of title memory and staging buffers
+/// for five minutes with 12 GiB of the PC's memory free, and 1 GiB of
+/// scratch chunks.
+pub(crate) fn keep_freed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
+/// With plenty of it five minutes ([`keep_freed`]).
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    ram_idle_for(avail_phys, keep_freed())
+}
+
+fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
+    const KEPT_MS: u64 = 300_000;
+    if keep && avail_phys.is_some_and(|avail| avail >= 12 * GIB) {
+        return KEPT_MS;
+    }
     const NORMAL_MS: u64 = 10_000;
     const MODERATE_MS: u64 = 5_000;
     const HIGH_MS: u64 = 2_000;
@@ -215,6 +241,7 @@ fn sweep() {
     {
         return;
     }
+    crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
@@ -1541,6 +1568,8 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
+/// The same with [`keep_freed`].
+const SPARE_KEPT: u64 = 1 << 30;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1621,7 +1650,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, SPARE_MOST)
+                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
             } else {
                 Some(chunk)
             };
@@ -8985,7 +9014,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn ram_idle_ms_scales_with_pressure() {
-        use super::ram_idle_ms;
+        let ram_idle_ms = |avail| super::ram_idle_for(avail, false);
+        assert_eq!(super::ram_idle_for(Some(12 << 30), true), 300_000);
+        assert_eq!(super::ram_idle_for(Some((12 << 30) - 1), true), 10_000);
+        assert_eq!(super::ram_idle_for(None, true), 10_000);
         let gib = 1024 * 1024 * 1024;
         // Normal (>= 4 GiB)
         assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);

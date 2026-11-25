@@ -133,6 +133,16 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
 
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
+    let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if t[0] > 0.0 {
+        tracing::info!(
+            "blocks landed in beside the guards per frame: {:.0}, {:.0} of them held by the copy they were landed through, which takes \
+             them no more (VICTORY_LAND_TAKEN={})",
+            t[0],
+            t[1],
+            u8::from(taken()),
+        );
+    }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if s[stat::PIECES] == 0.0 && s[stat::REST] == 0.0 {
         return;
@@ -416,7 +426,38 @@ pub(crate) struct Notes {
     pages: Vec<usize>,
     /// Per piece, from the first such page to the last: address, bytes.
     spans: Vec<(usize, usize)>,
+    /// Per piece put beside the guards, all of it: its 64 KiB block and the
+    /// copy it was landed through (which the job holds until the flush).
+    landed: Vec<(usize, *const crate::shadow::Shadow)>,
 }
+
+// SAFETY: the pointers are used by the job that has the notes, in `flush`.
+unsafe impl Send for Notes {}
+
+/// Whether a copy a landing went through is noted as up to date with it
+/// (`VICTORY_LAND_TAKEN=0`: it is not, and the next refresh copies the 64
+/// KiB again and sends them up to the card, as before).
+///
+/// What a landing puts into title memory the copy holds already: the card
+/// wrote it there, and a copy in the card's memory was given it on the CPU's
+/// side by the same merge. But the block counted as written, for that copy
+/// as for every other one, so the next refresh copied the whole block, sent
+/// it up and had the card hash it again: some 900 blocks a frame landed
+/// beside the guards, of the 103 MB a frame that went up (run record-1).
+///
+/// Why it may be left out ([`crate::shadow::Shadow::landed`]): the copy held
+/// title memory's bytes of the block before the landing, if it had taken it
+/// after the block's last noted write and no write was to be noted (the
+/// block's bit, `crate::watch::block_published`), and the landing put the
+/// same bytes into both. Only where one copy alone landed in the block.
+fn taken() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TAKEN").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: blocks landed in beside the guards, and
+/// those of them the copy was noted as up to date with.
+static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 impl Notes {
     /// At the end of a job: what it wrote beside the guards is noted.
@@ -425,9 +466,24 @@ impl Notes {
             return;
         }
         let noting = std::time::Instant::now();
-        crate::watch::landed_beside(&self.pages, &self.spans);
+        let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
+        TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
+        if taken() {
+            for (block, before) in blocks {
+                let mut through = self.landed.iter().filter(|l| l.0 == block).map(|l| l.1);
+                let Some(copy) = through.next() else {
+                    continue;
+                };
+                if !copy.is_null() && through.all(|other| other == copy) {
+                    // SAFETY: the job holds its copies until this is done.
+                    let copy = unsafe { &*copy };
+                    TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
+                }
+            }
+        }
         self.pages.clear();
         self.spans.clear();
+        self.landed.clear();
         spent(stat::NOTES, noting);
     }
 }
@@ -447,9 +503,10 @@ pub(crate) unsafe fn piece(
     parts: &[(usize, usize)],
     take: bool,
     notes: &mut Notes,
+    copy: *const crate::shadow::Shadow,
 ) -> u64 {
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on()) }
+    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
 }
 
 /// [`piece`], and whether a view of ours is looked for.
@@ -464,6 +521,7 @@ unsafe fn piece_at(
     take: bool,
     notes: &mut Notes,
     beside: bool,
+    copy: *const crate::shadow::Shadow,
 ) -> u64 {
     let Some(end) = parts.last().map(|p| p.1) else {
         return 0;
@@ -547,6 +605,10 @@ unsafe fn piece_at(
     });
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
+        // Not through a copy that is not to be noted, if that is asked: the
+        // block then has two.
+        let through = if missing == 0 { copy } else { std::ptr::null() };
+        notes.landed.push((title / BLOCK, through));
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);

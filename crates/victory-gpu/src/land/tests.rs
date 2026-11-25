@@ -192,7 +192,7 @@ fn a_piece_lands_what_the_card_wrote_in_its_parts() {
         let asked = crate::watch::writes(title.at, title.at + BLOCK, true).expect("a view").0;
         let mut notes = Notes::default();
         // SAFETY: vectors of `len` bytes.
-        let put = unsafe { piece(title.at + from, now.as_ptr(), held.as_mut_ptr(), &parts, true, &mut notes) };
+        let put = unsafe { piece(title.at + from, now.as_ptr(), held.as_mut_ptr(), &parts, true, &mut notes, std::ptr::null()) };
         notes.flush();
         let mut expect_held = base.clone();
         let mut expect = there.clone();
@@ -227,7 +227,7 @@ fn a_piece_waits_for_a_change_of_mapping() {
     for take in [true, false] {
         let mut held = [0u8; 100];
         // SAFETY: arrays of 100 bytes.
-        let put = unsafe { piece(at, now.as_ptr(), held.as_mut_ptr(), &[(0, 100)], take, &mut Notes::default()) };
+        let put = unsafe { piece(at, now.as_ptr(), held.as_mut_ptr(), &[(0, 100)], take, &mut Notes::default(), std::ptr::null()) };
         assert_eq!((put, held), (0, [if take { 9 } else { 0 }; 100]));
     }
     let (began, wait) = std::sync::mpsc::channel();
@@ -241,7 +241,7 @@ fn a_piece_waits_for_a_change_of_mapping() {
     wait.recv().unwrap();
     let mut held = [0u8; 100];
     // SAFETY: as above.
-    let put = unsafe { piece(at, now.as_ptr(), held.as_mut_ptr(), &[(0, 100)], true, &mut Notes::default()) };
+    let put = unsafe { piece(at, now.as_ptr(), held.as_mut_ptr(), &[(0, 100)], true, &mut Notes::default(), std::ptr::null()) };
     change.join().unwrap();
     assert_eq!((put, held), (100, now));
     // SAFETY: committed by now.
@@ -329,7 +329,7 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
                     let offset = address - at;
                     // SAFETY: each job its own pieces of the two vectors.
                     unsafe {
-                        piece(address, now.as_ptr().add(offset), (into + offset) as *mut u8, &[(0, len)], true, &mut notes);
+                        piece(address, now.as_ptr().add(offset), (into + offset) as *mut u8, &[(0, len)], true, &mut notes, std::ptr::null());
                     }
                 }
                 notes.flush();
@@ -457,7 +457,7 @@ fn what_landing_costs() {
                             let mut notes = Notes::default();
                             for &(at, now, held) in &landing[jobs[j].clone()] {
                                 // SAFETY: each its own bytes.
-                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside) };
+                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside, std::ptr::null()) };
                             }
                             notes.flush();
                         });

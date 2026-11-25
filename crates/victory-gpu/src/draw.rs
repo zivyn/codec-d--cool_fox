@@ -1164,6 +1164,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
+                crate::picked::runs_in(list);
+            }
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -1578,7 +1581,8 @@ impl State {
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, HeapRanges(Vec::new())));
         let changed = host.buffer_changes();
-        let slots = if *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread()) {
+        let all = *passes == 0 || (*passes % HEAP_ROUND == 0 && !heap_spread());
+        let slots = if all {
             ranges.0.clear();
             host.buffer_slots()
         } else if heap_spread() {
@@ -1596,6 +1600,7 @@ impl State {
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        let mut unordered = Vec::new();
         for (n, &index) in slots.iter().enumerate() {
             ranges.set(index, None);
             let Some(handle) = heap.handle(index) else {
@@ -1628,7 +1633,13 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
+            if crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav) {
+                unordered.push((shadow.clone(), address, address + len));
+            }
             ranges.set(index, Some((shadow, address, address + len)));
+        }
+        if crate::picked::on() {
+            crate::picked::shown(unordered, all);
         }
         #[cfg(feature = "diagnostics")]
         let looked = std::time::Instant::now();
@@ -1678,6 +1689,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
+        crate::watch::look_at_holes();
         self.heap_textures(list, heap, host);
         #[cfg(feature = "diagnostics")]
         for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked, refreshed.elapsed()]) {

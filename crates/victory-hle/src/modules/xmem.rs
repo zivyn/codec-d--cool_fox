@@ -162,6 +162,9 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if !at.is_null() && !placeholder {
+        victory_gpu::title_memory_allocated(at as usize, size);
+    }
     at
 }
 
@@ -721,6 +724,21 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     pages
         .get(offset / PAGE..(offset + len).div_ceil(PAGE))
         .is_some_and(|pages| pages.iter().all(|page| physical.pages.contains_key(page)))
+}
+
+/// Where the title sees the pages under bytes `[offset, offset + len)` now,
+/// in order (for the streaming trace: whether that changed while a request
+/// wrote them).
+pub(crate) fn pages_shown(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let physical = physical();
+    let numbers = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or_default();
+    let mut shown: Vec<(usize, usize)> = numbers
+        .iter()
+        .filter_map(|n| physical.pages.get(n))
+        .flat_map(|slice| physical.shown_at(slice, 1))
+        .collect();
+    shown.sort_unstable();
+    shown
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,

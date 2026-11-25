@@ -1177,7 +1177,11 @@ pub(crate) fn guarded(start: usize, end: usize) -> bool {
 /// Whether nothing of `[start, end)` can have been written since an asking
 /// noted it in the journal ([`PUBLISHED`]).
 fn published(start: usize, end: usize) -> bool {
-    light() && PUBLISHED.all(start / BLOCK, end.div_ceil(BLOCK))
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // (In this order: who puts something in beside a guard sets the one bit,
+    // then clears the other, which an asking that is publishing the block may
+    // just be setting.)
+    light() && PUBLISHED.all(first, last) && !BESIDE.any(first, last)
 }
 
 /// Since the last frame line: what asking about title memory was. Kernel
@@ -1544,7 +1548,7 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
 /// Whether every write of the title's to 64 KiB block `block` so far is in
 /// the journal ([`PUBLISHED`]).
 pub(crate) fn block_published(block: usize) -> bool {
-    light() && PUBLISHED.all(block, block + 1)
+    published(block * BLOCK, (block + 1) * BLOCK)
 }
 
 /// Whether shaders' writes went into a page of `[at, at + len)` in the last
@@ -2126,20 +2130,22 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if !view_guard() {
         return;
     }
-    let mut ranges = crate::inplace::views_of_section(section, offset, len);
+    let ranges = crate::inplace::views_of_section(section, offset, len);
     // (A block is noted in `PROTECTED` ahead of the look at its page's views
     // that did not find this one yet.)
-    ranges.retain(|&(at, n)| PROTECTED.any(at / BLOCK, (at + n).div_ceil(BLOCK)));
-    if ranges.is_empty() {
+    if !ranges.iter().any(|&(at, n)| PROTECTED.any(at / BLOCK, (at + n).div_ceil(BLOCK))) {
         return;
     }
+    // All of them, once one is guarded: another may have been made clean
+    // since that look, relying on those that are opened here. And all
+    // together: none may be writable while another is clean (who asks about
+    // that one by its bits takes no lock).
     let mut g = guards();
-    for &(at, n) in &ranges {
-        let blocks: Vec<usize> = g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect();
-        #[cfg(feature = "diagnostics")]
-        ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        unguard(&mut g, &blocks);
-    }
+    let blocks: Vec<usize> =
+        ranges.iter().flat_map(|&(at, n)| g.protected.range(at / BLOCK..(at + n).div_ceil(BLOCK)).collect::<Vec<_>>()).collect();
+    #[cfg(feature = "diagnostics")]
+    ALIASES[2].fetch_add(blocks.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    unguard(&mut g, &blocks);
 }
 
 /// The runtime is about to unmap a view of which it maps a part again at
@@ -2153,7 +2159,12 @@ pub fn title_memory_splitting(at: usize, len: usize) {
         return;
     }
     let mut g = guards();
-    // (The view itself too: the part that stays is read-only until then.)
+    // (The view itself too: the part that stays is read-only until then. And
+    // all of them told as written before the first is writable.)
+    for &other in &others {
+        g.clean.remove(other / BLOCK);
+        PUBLISHED.clear(other / BLOCK);
+    }
     open(&mut g, at, at.saturating_add(len));
     for other in others {
         open(&mut g, other, other + BLOCK);
@@ -3991,6 +4002,8 @@ mod many_askers_tests {
                         let to = page + 1 + next((PAGES - page).min(3));
                         // Written through one view, asked about at another.
                         let (through, asked) = (all[next(VIEWS)], next(VIEWS));
+                        #[allow(unused_assignments)]
+                        let mut how = 0;
                         let (at, last) = (all[asked], &mut last[asked]);
                         if next(4) != 0 {
                             // As in the test above, or after a word of ours,
@@ -4014,6 +4027,7 @@ mod many_askers_tests {
                                 continue;
                             }
                             let reading = (next(3) == 0).then(super::title_memory_reading);
+                            how = usize::from(reading.is_some());
                             let beside = reading.as_ref().and_then(|_| crate::inplace::beside(word, 8));
                             if let Some(to) = beside {
                                 unsafe { (to as *mut u64).write_volatile(2) };
@@ -4021,8 +4035,10 @@ mod many_askers_tests {
                                 past.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 assert_eq!(unsafe { (word as *const u64).read_volatile() }, 2, "put elsewhere");
                             } else {
+                                how += 2;
                                 if next(4) == 0 {
                                     super::writing(word, 8);
+                                    how += 4;
                                 }
                                 unsafe { (word as *mut u64).write_volatile(1) };
                             }
@@ -4040,7 +4056,13 @@ mod many_askers_tests {
                         }
                         let (now, written) = writes(at + from * PAGE, at + to * PAGE, true).expect("a view");
                         let number = written.iter().find(|w| w.0 == at / PAGE + page).map_or(0, |w| w.1);
-                        assert!(number > last[page], "page {page}: {number} is not after {}", last[page]);
+                        assert!(
+                            number > last[page],
+                            "{VIEWS} views, page {page}, through {:x} ({how}), asked at {:x}: {number} is not after {}",
+                            through / PAGE + page,
+                            at / PAGE + page,
+                            last[page]
+                        );
                         for l in &mut last[from..to] {
                             *l = now;
                         }

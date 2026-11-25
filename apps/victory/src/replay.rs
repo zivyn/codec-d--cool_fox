@@ -136,6 +136,26 @@ pub(crate) struct Replay {
     /// Only write the frame's buffers and the commands of these lists (`3..7`).
     #[arg(long)]
     listing: Option<String>,
+    /// Say which commands change the pixel: `<x>,<y>` of the presented
+    /// picture, or `<resource>[.<subresource>]:<x>,<y>` of a texture
+    /// (repeatable). With --lists, only those are looked into.
+    #[arg(long)]
+    pixel: Vec<String>,
+    /// With --pixel: the size of the picture the points are of (`1280x720`),
+    /// if it is another than the presented one's.
+    #[arg(long)]
+    of: Option<String>,
+    /// With --pixel: depth targets too.
+    #[arg(long)]
+    depth: bool,
+    /// With --pixel: leave out textures that shaders may write (unordered
+    /// access).
+    #[arg(long)]
+    targets_only: bool,
+    /// With --pixel: indirect calls whose draws are run one by one:
+    /// `<list>:<command>` (repeatable).
+    #[arg(long)]
+    split: Vec<String>,
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -147,6 +167,12 @@ fn range(text: &str) -> Option<(u32, u32)> {
         Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
         None => text.trim().parse().ok().map(|n| (n, n)),
     }
+}
+
+/// Two numbers with `by` between them.
+fn pair(text: &str, by: char) -> Option<(u32, u32)> {
+    let (a, b) = text.split_once(by)?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
 pub(crate) fn run(r: Replay) -> Result<()> {
@@ -200,6 +226,47 @@ pub(crate) fn run(r: Replay) -> Result<()> {
             .with_context(|| format!("--slots {text}: not <list>:<command>"))?;
         let player = play::Player::load(&r.folder, &options)?;
         return player.slots(list, command, &mut |line| println!("{line}"));
+    }
+    if !r.pixel.is_empty() {
+        let mut player = play::Player::load(&r.folder, &options)?;
+        let mut pixels = play::pixel::Pixels {
+            depth: r.depth,
+            written: !r.targets_only,
+            ..Default::default()
+        };
+        if let Some(text) = &r.lists {
+            pixels.lists = Some(range(text).with_context(|| format!("--lists {text}"))?);
+        }
+        let of = match &r.of {
+            Some(text) => Some(pair(text, 'x').with_context(|| format!("--of {text}"))?),
+            None => None,
+        };
+        for text in &r.pixel {
+            let bad = || format!("--pixel {text}");
+            match text.split_once(':') {
+                Some((what, at)) => {
+                    let (id, sub) = what.split_once('.').unwrap_or((what, "0"));
+                    let (x, y) = pair(at, ',').with_context(bad)?;
+                    let id = id.parse().with_context(bad)?;
+                    let sub = sub.parse().with_context(bad)?;
+                    pixels.texels.push((id, sub, x, y));
+                }
+                None => {
+                    let (mut x, mut y) = pair(text, ',').with_context(bad)?;
+                    if let (Some((w, h)), Some((pw, ph))) = (of, player.picture_size()) {
+                        x = x * pw / w.max(1);
+                        y = y * ph / h.max(1);
+                    }
+                    pixels.points.push((x, y));
+                }
+            }
+        }
+        for text in &r.split {
+            pixels
+                .split
+                .push(pair(text, ':').with_context(|| format!("--split {text}"))?);
+        }
+        return player.pixel(&options, &pixels, &mut |line| println!("{line}"));
     }
     if r.check_written {
         let mut player = play::Player::load(&r.folder, &options)?;
@@ -277,6 +344,8 @@ mod tests {
         assert_eq!(super::range("3..7"), Some((3, 7)));
         assert_eq!(super::range("5"), Some((5, 5)));
         assert_eq!(super::range("x"), None);
+        assert_eq!(super::pair("12,7", ','), Some((12, 7)));
+        assert_eq!(super::pair("12", ','), None);
         assert_eq!(super::range("1..x"), None);
     }
 }

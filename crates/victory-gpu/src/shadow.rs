@@ -109,6 +109,8 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// Whether something was put into `dirty` since it was last taken.
+    touched: std::sync::atomic::AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -202,11 +204,14 @@ fn card_limits() -> (u64, u64) {
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (min_bytes, max_bytes) = resolve_card_limits(
+        let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
+        if card_all() {
+            min_bytes = 0;
+        }
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_mb = min_bytes >> 20,
@@ -253,6 +258,36 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
 fn card_for(size: u64) -> Option<ID3D12Resource> {
+    let there = card_room_for(size);
+    if there.is_some() || !card_all() || size >= 1 << 30 {
+        return there;
+    }
+    // Two sides all the same, the card's in the PC's memory.
+    let host = host()?;
+    if !cards() || !host.card_ready() {
+        return None;
+    }
+    let (buffer, _) = host.shared_buffer(size)?;
+    CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    Some(buffer)
+}
+
+/// Whether every title buffer's copy has two sides, however small
+/// (`VICTORY_CARD_ALL=1`; off by default).
+///
+/// A copy with one side, in the PC's memory, is what the card reads while
+/// our refreshes write it: a submission that is prepared changes it under
+/// the ones in the air ahead of it. The title's CPU does not write what they
+/// still read, but its own buffer copies are done by us at preparing
+/// (`crate::host::send` has the order of those right for copies with two
+/// sides), and so are the bytes put in beside shaders' writes.
+fn card_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
+}
+
+/// [`card_for`] in the card's own memory.
+fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
@@ -363,6 +398,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let ranges = shadow
             .card
             .as_ref()
+            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = std::mem::take(&mut *dirty);
@@ -380,6 +416,39 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         true
     });
     out
+}
+
+/// Copies of memory (from, to, bytes: apart), on several threads if they are
+/// many.
+pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    if bytes > 4 << 20 {
+        wide(copy_jobs(copies));
+        return;
+    }
+    for (src, dst, len) in copies {
+        // SAFETY: the caller's ranges.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    }
+}
+
+/// A title buffer copy was done on the CPU into `[dst, dst + len)`: all of it
+/// goes up to the copies in the card's memory that hold it, whether their
+/// CPU side held the same before or not. Left out is what shaders in the air
+/// may be writing (such a copy waits for them, or is done on the card).
+pub(crate) fn send_copied(dst: usize, len: usize) {
+    for shadow in carded_copies() {
+        let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        let (from, to) = (dst.max(start), (dst + len).min(end));
+        if from >= to {
+            continue;
+        }
+        let busy: Vec<(usize, usize)> =
+            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        for (a, b) in outside(from, to, busy) {
+            shadow.copy(a, b);
+        }
+    }
 }
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
@@ -2690,11 +2759,15 @@ impl Shadow {
                         return true;
                     }
                     *runs_left -= runs.len();
+                    let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                    if let Some(was) = was {
+                        crate::host::upcheck::note(self.id, at, &was, held);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3066,6 +3139,13 @@ impl Shadow {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+        // (Under the lock: what takes the list sees it or finds it set.)
+        card.touched.store(true, Ordering::Release);
+    }
+
+    /// Of a copy in the card's memory: where its CPU side is.
+    pub(crate) fn card_data(&self) -> *const u8 {
+        self.data
     }
 
     /// Diagnostics: of a copy in the card's memory, what its CPU side holds
@@ -3313,6 +3393,7 @@ impl Shadow {
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                touched: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -3468,6 +3549,7 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+                touched: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -3772,7 +3854,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -3794,6 +3876,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                touched: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -4010,6 +4093,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                touched: Default::default(),
                 size: len,
             };
             (on_card, Some(card))

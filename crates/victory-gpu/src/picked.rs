@@ -1,5 +1,5 @@
 //! Buffers shaders write through views they pick from the heap by an index
-//! they compute (`VICTORY_PICKED_WRITES=1`; off by default).
+//! they compute (`VICTORY_PICKED_WRITES`; off by default, [`stage`]).
 //!
 //! Which views a draw or dispatch writes through is known from its tables
 //! and root parameters, and their ranges are declared: what is written there
@@ -49,8 +49,24 @@ use crate::host::HostList;
 use crate::shadow::Shadow;
 
 pub(crate) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PICKED_WRITES").is_some_and(|v| v == "1"))
+    stage() > 0
+}
+
+/// `VICTORY_PICKED_WRITES`: 0 (off), 1 (what is found is declared, so that
+/// no refresh sends title memory over it while a flight may write it, and
+/// not landed), 2 (landed too).
+fn stage() -> u8 {
+    static STAGE: OnceLock<u8> = OnceLock::new();
+    *STAGE.get_or_init(|| match std::env::var("VICTORY_PICKED_WRITES").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether what is found is landed.
+pub(crate) fn lands() -> bool {
+    stage() > 1
 }
 
 /// Bytes looked at in turn per frame (`VICTORY_PICKED_MB`).

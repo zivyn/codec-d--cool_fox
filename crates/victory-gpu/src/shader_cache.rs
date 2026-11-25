@@ -73,6 +73,7 @@ fn build() -> [u8; 32] {
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
+            "VICTORY_BVH_FENCES",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

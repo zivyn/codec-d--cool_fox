@@ -63,7 +63,10 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
         let (send, jobs) = std::sync::mpsc::channel::<Job>();
         std::thread::Builder::new()
             .name("victory-aside".into())
-            .spawn(move || jobs.into_iter().for_each(|job| job()))
+            .spawn(move || {
+                crate::cores::keep_on_fast_cores("victory-aside");
+                jobs.into_iter().for_each(|job| job())
+            })
             .ok()
             .map(|_| Mutex::new(send))
     });

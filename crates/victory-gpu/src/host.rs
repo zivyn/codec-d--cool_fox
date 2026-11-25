@@ -330,10 +330,14 @@ pub(crate) fn removal_context() -> String {
 /// host device removed.
 pub(crate) fn log_removal_context() {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if !trail_on() || SAID.swap(true, Ordering::Relaxed) {
+    if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
         return;
     }
     tracing::error!("when the host device went: {}", removal_context());
+    if dred_any() {
+        let data = host().map(|h| h.removal_data(&[])).unwrap_or_default();
+        tracing::error!("device-removed data{}", if data.is_empty() { "; none" } else { &data });
+    }
 }
 
 /// Time spent in submissions since the last frame-rate line, in
@@ -580,12 +584,14 @@ fn create() -> windows::core::Result<Host> {
         }
         // Diagnostics: device-removed data (the command that faulted, the
         // faulting address), read when the device is removed.
-        if dred_on() {
+        if dred_any() {
             let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
             if D3D12GetDebugInterface(&mut dred).is_ok()
                 && let Some(dred) = dred
             {
-                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                if dred_on() || dred_light() {
+                    dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                }
                 dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
@@ -705,6 +711,18 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// A list of ours is found by its name, with the debug layer's note or not.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_list_is_found_by_the_number_in_its_name() {
+        assert_eq!(super::list_number("victory host list 7"), Some(7));
+        assert_eq!(super::list_number("victory host list 158 (debug layer indirect)"), Some(158));
+        assert_eq!(super::list_number("victory host list 7x"), None);
+        assert_eq!(super::list_number("victory host list 7 x"), None);
+        assert_eq!(super::list_number("another list 7"), None);
+        assert_eq!(super::list_number(""), None);
+    }
+
     /// What is there of a range some of whose pages are not: those bytes,
     /// counted, and zeros for the rest, whatever the buffer held.
     #[test]
@@ -846,7 +864,7 @@ pub(crate) struct HostList {
     /// when the list first has such transitions ([`lazy_prelude`]).
     prelude: OnceLock<Option<Prelude>>,
     /// The pipelines the list binds, for reports of slow submissions.
-    pipelines: Mutex<std::collections::BTreeSet<String>>,
+    pipelines: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted, and after
     /// it what the clamp notes about mesh records. In memory the CPU maps.
@@ -866,7 +884,7 @@ pub(crate) struct HostList {
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
-    notes: Mutex<Vec<Note>>,
+    notes: std::sync::Arc<Mutex<Vec<Note>>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -1327,7 +1345,51 @@ fn record_twin_copy(
 /// builds).
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED"))
+    *ON.get_or_init(|| cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_DRED") && !dred_faults() && !dred_light())
+}
+
+/// Breadcrumbs and the faulting address, but no markers and no texts
+/// (`VICTORY_D3D12_DRED=light`): which list a removed device stopped in, at
+/// which of its commands, and the pipelines the list binds; formatting a text
+/// for every command is what makes the whole of it slow.
+pub(crate) fn dred_light() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v == "light")
+    })
+}
+
+/// Any of the three.
+pub(crate) fn dred_any() -> bool {
+    dred_on() || dred_light() || dred_faults()
+}
+
+/// Whether only the faulting address of a removed device is kept
+/// (`VICTORY_D3D12_DRED=faults`): no breadcrumbs, no markers and no texts, so
+/// it costs next to nothing and can stay on while the title is played.
+pub(crate) fn dred_faults() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v == "faults")
+    })
+}
+
+/// The lists alive while device-removed data is on, by the number their name
+/// ends in, with their marker texts and the pipelines they bind: a report made
+/// on another thread than the one that submits has no lists of its own.
+#[cfg(feature = "diagnostics")]
+#[allow(clippy::type_complexity)]
+static LIST_NOTES: Mutex<
+    std::collections::BTreeMap<u32, (std::sync::Weak<Mutex<Vec<Note>>>, std::sync::Weak<Mutex<std::collections::BTreeSet<String>>>)>,
+> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The number in the name of a list of ours ("victory host list 7", which the
+/// debug layer ends with a note of its own in brackets).
+#[cfg(feature = "diagnostics")]
+fn list_number(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("victory host list ")?;
+    let digits = rest.split(' ').next()?;
+    (rest.len() == digits.len() || rest[digits.len()..].starts_with(" (")).then(|| digits.parse().ok()).flatten()
 }
 
 /// Indirect mesh dispatches since the last frame line: the largest group
@@ -1362,7 +1424,7 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     if crate::replay::record::on() {
         let text = text();
         crate::replay::record::name(object, &text);
-        if dred_on()
+        if dred_any()
             && let Ok(object) = object.cast::<ID3D12Object>()
         {
             // SAFETY: a plain call on a live object.
@@ -1370,7 +1432,7 @@ pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
         }
         return;
     }
-    if dred_on()
+    if dred_any()
         && let Ok(object) = object.cast::<ID3D12Object>()
     {
         // SAFETY: a plain call on a live object.
@@ -3432,6 +3494,20 @@ impl Host {
             if !lazy_prelude() {
                 let _ = prelude.set(self.make_prelude());
             }
+            #[cfg(feature = "diagnostics")]
+            let notes = std::sync::Arc::<Mutex<Vec<Note>>>::default();
+            let pipelines = std::sync::Arc::<Mutex<std::collections::BTreeSet<String>>>::default();
+            #[cfg(feature = "diagnostics")]
+            if dred_on() || dred_light() {
+                static NUMBER: AtomicU32 = AtomicU32::new(0);
+                let number = NUMBER.fetch_add(1, Ordering::Relaxed);
+                name(&list, || format!("victory host list {number}"));
+                let mut all = LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+                if number.is_multiple_of(256) {
+                    all.retain(|_, l| l.0.strong_count() > 0);
+                }
+                all.insert(number, (std::sync::Arc::downgrade(&notes), std::sync::Arc::downgrade(&pipelines)));
+            }
             Ok(HostList {
                 allocator,
                 list,
@@ -3440,14 +3516,14 @@ impl Host {
                 states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
-                pipelines: Mutex::default(),
+                pipelines,
                 budget: OnceLock::new(),
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
-                notes: Mutex::default(),
+                notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
@@ -5123,6 +5199,9 @@ impl Host {
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
+            if dred_faults() {
+                return text;
+            }
             let crumbs = match dred.GetAutoBreadcrumbsOutput() {
                 Ok(crumbs) => crumbs,
                 Err(e) => {
@@ -5153,10 +5232,33 @@ impl Host {
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let named = [
+                        (!p.pCommandListDebugNameW.is_null()).then(|| p.pCommandListDebugNameW.to_string().unwrap_or_default()),
+                        (!p.pCommandListDebugNameA.is_null()).then(|| {
+                            std::ffi::CStr::from_ptr(p.pCommandListDebugNameA.cast()).to_string_lossy().into_owned()
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .unwrap_or_default();
+                    text.push_str(&format!(" of \"{named}\""));
+                    // Not one of the caller's: by the name.
+                    #[cfg(feature = "diagnostics")]
+                    let by_name = list_number(&named).and_then(|n| {
+                        let all = LIST_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+                        all.get(&n).map(|(notes, pipelines)| (notes.upgrade(), pipelines.upgrade()))
+                    });
+                    #[cfg(not(feature = "diagnostics"))]
+                    #[allow(clippy::type_complexity)]
+                    let by_name: Option<(Option<()>, Option<std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>>)> = None;
+                    #[cfg(feature = "diagnostics")]
+                    let noted = run.map(|r| r.notes.clone()).or_else(|| by_name.as_ref().and_then(|b| b.0.clone()));
+                    let bound = run.map(|r| r.pipelines.clone()).or_else(|| by_name.as_ref().and_then(|b| b.1.clone()));
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
-                    let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
-                        let notes = r.notes.lock().unwrap_or_else(|e| e.into_inner());
+                    let markers: Vec<(u32, String)> = noted.map_or_else(Vec::new, |notes| {
+                        let notes = notes.lock().unwrap_or_else(|e| e.into_inner());
                         history
                             .iter()
                             .enumerate()
@@ -5174,8 +5276,8 @@ impl Host {
                     let _ = fault_va;
                     if done > 0 {
                         text.push_str(&in_flight(history, &markers, done as usize));
-                    } else if let Some(r) = run {
-                        let pipelines = r.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+                    } else if let Some(bound) = bound {
+                        let pipelines = bound.lock().unwrap_or_else(|e| e.into_inner());
                         text.push_str(&format!(", its pipelines {pipelines:?}"));
                     }
                 }

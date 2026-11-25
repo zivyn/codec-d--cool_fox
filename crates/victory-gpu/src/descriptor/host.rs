@@ -2815,7 +2815,22 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                // Each texture is said once (the first 64), with how many times
+                // such a view was asked for so far: what shaders write through
+                // them is lost.
+                static SAID: Mutex<std::collections::BTreeSet<u64>> = Mutex::new(std::collections::BTreeSet::new());
+                static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let times = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                let at = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+                if (said.len() < 64 && said.insert(at)) || times.is_power_of_two() {
+                    tracing::warn!(
+                        address = format_args!("{at:#x}"),
+                        times,
+                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
+                        &desc[..10]
+                    );
+                }
                 return None;
             }
             // The resource description's width, after the alignment.

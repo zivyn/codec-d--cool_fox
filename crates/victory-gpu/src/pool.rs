@@ -374,12 +374,18 @@ pub(crate) unsafe fn texture(
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             Alignment: 0,
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | crate::host::not_resident(),
         };
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
             tracing::warn!(error = %e, "no block of texture memory");
+        }
+        if let Some(h) = &heap
+            && let Err(e) = crate::host::resident(device, h)
+        {
+            tracing::warn!(error = %e, "a block of texture memory is not resident");
+            return None;
         }
         heap
     })?;

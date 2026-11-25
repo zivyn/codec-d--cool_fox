@@ -185,6 +185,54 @@ fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
     }
 }
 
+/// Whether new memory is made resident, and waited for, before anything can
+/// name it (on by default; `VICTORY_WAIT_RESIDENT=0`: as before). A heap or
+/// resource of the default kind is resident once it is made, but its
+/// mapping into the card's address space is work of the system's that runs
+/// later: only lists sent after it wait for it. Lists sent before run on,
+/// and read our descriptor heaps as they are: a slot that shows a texture
+/// in a new block is a page fault for them until the block is mapped. The
+/// device losses of the night of 2026-11-25 were that (run n08: the fault
+/// lay in a texture made in the same tenth of a second, in a new block).
+fn wait_resident() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
+}
+
+/// The flag memory is made with that [`resident`] waits for.
+pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
+    if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// New memory (made with [`not_resident`]) is resident when this returns.
+pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if !wait_resident() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let object: ID3D12Pageable = object.cast()?;
+    // SAFETY: a live heap or resource of the device's.
+    let made = unsafe { device.MakeResident(&[Some(object)]) };
+    let us = started.elapsed().as_micros() as u64;
+    RESIDENT[0].fetch_add(1, Ordering::Relaxed);
+    RESIDENT[1].fetch_add(us, Ordering::Relaxed);
+    RESIDENT[2].fetch_max(us, Ordering::Relaxed);
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = RESIDENT[0].load(Ordering::Relaxed);
+    if n >= 1000 * (SAID.load(Ordering::Relaxed) + 1) {
+        SAID.store(n / 1000, Ordering::Relaxed);
+        tracing::info!(
+            "new memory waited for (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            RESIDENT[1].load(Ordering::Relaxed) as f64 / 1000.0,
+            RESIDENT[2].load(Ordering::Relaxed) as f64 / 1000.0
+        );
+    }
+    made
+}
+
+/// Times, microseconds and the longest of [`resident`].
+static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// Whether memory the card was given stays with it while there is room (on
 /// by default; `VICTORY_KEEP_FREED=0`: it is given back as before). A shader
 /// that reads past a view (a raw load through a typed, structured or
@@ -7615,7 +7663,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    D3D12_HEAP_FLAG_NONE,
+                    not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -7623,6 +7671,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -8316,7 +8365,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    D3D12_HEAP_FLAG_NONE,
+                    not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -8324,6 +8373,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -8403,7 +8453,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    D3D12_HEAP_FLAG_NONE,
+                    not_resident(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -8411,6 +8461,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    resident(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -8451,7 +8502,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                D3D12_HEAP_FLAG_NONE,
+                not_resident(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -8462,6 +8513,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b)));
         match made {
             Ok(()) => buffer,
             Err(e) => {

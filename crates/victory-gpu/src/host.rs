@@ -6290,7 +6290,7 @@ fn split_line(frames: f64) {
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
-    let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / (1 << 20) as f64 / frames).collect();
+    let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / frames).collect();
     tracing::info!(
         "preparing per frame, the submitting thread: {:.1} ms asking the write watch ({:.1} of them finding what to ask), {:.1} putting the title's bytes under flights' \
          writes, {:.1} in the lists' steps (refreshes {:.1} in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on \
@@ -6317,8 +6317,8 @@ fn split_line(frames: f64) {
         "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
          written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
-         waiting for the guards, {:.1} ms changing protections; pages taken again for the card: {:.1} MB compared, {:.1} MB of them \
-         as they were, {:.1} MB to go up (VICTORY_SEND_CHANGED)",
+         waiting for the guards, {:.1} ms changing protections; pages taken for the card: {:.1} MB compared, {:.1} MB of them \
+         as they were, {:.1} MB to go up in {:.0} runs (VICTORY_SEND_CHANGED)",
         a[0],
         a[1] / 1024.0,
         a[11] / 1e6,
@@ -6332,9 +6332,10 @@ fn split_line(frames: f64) {
         a[6],
         a[7] / 1e6,
         a[8] / 1e6,
-        s[0],
-        s[1],
-        s[2],
+        s[0] / 1048576.0,
+        s[1] / 1048576.0,
+        s[2] / 1048576.0,
+        s[3],
     );
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures",
@@ -8045,6 +8046,10 @@ mod refresh_tests {
     /// card's side of those that have one, hold what title memory holds, and
     /// title memory what was written last.
     ///
+    /// Into the first copy shaders write besides through a view nobody
+    /// declared, words the title does not write: nothing that goes up ever
+    /// puts an older value over those.
+    ///
     /// (It fails in the first rounds if `landed_beside` notes nothing, or
     /// only takes the block out of the guards' clean ones and leaves its bit,
     /// or if a fault leaves the bit; in some thousand rounds,
@@ -8063,6 +8068,9 @@ mod refresh_tests {
             let data = memory(len);
             (Shadow::unbacked(start as u64, data, len as u64, false), start, len, data as usize)
         };
+        // What was last written so, by offset.
+        let mut undeclared = std::collections::HashMap::new();
+        let exact = std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0");
         let stop = AtomicBool::new(false);
         // Also when an assertion fails on one of the threads.
         struct Stop<'a>(&'a AtomicBool);
@@ -8167,6 +8175,16 @@ mod refresh_tests {
             let mut value = 1u32;
             for round in 0..rounds {
                 check(round, &mut random, false);
+                if exact {
+                    let c = &carded[0];
+                    let mut card = c.card.lock().unwrap();
+                    for _ in 0..40 {
+                        value += 1;
+                        let at = random.below(LEN / 32) * 32 + 4 * 6;
+                        card.2[at..at + 4].copy_from_slice(&value.to_le_bytes());
+                        undeclared.insert(at, value);
+                    }
+                }
                 // The flight of this submission: its shaders' writes.
                 for (which, c) in carded.iter().enumerate() {
                     if c.flying.swap(true, Ordering::Acquire) {
@@ -8212,7 +8230,17 @@ mod refresh_tests {
                     let (held, there) = (bytes(c.data, c.len), bytes(c.start, c.len));
                     assert_eq!(first(held, there), None, "round {round}: a card copy's CPU side (class {})", c.class);
                     let card = c.card.lock().unwrap();
-                    assert_eq!(first(&card.2, there), None, "round {round}: a card copy's card side (class {})", c.class);
+                    let mut side = card.2.clone();
+                    if c.class == carded[0].class {
+                        // (They may have been landed meanwhile, by a flight
+                        // that declared their range, and may not.)
+                        for (&at, &value) in &undeclared {
+                            let on_card = u32::from_le_bytes(side[at..at + 4].try_into().unwrap());
+                            assert_eq!(on_card, value, "round {round}: an older value at {at:#x}");
+                            side[at..at + 4].copy_from_slice(&there[at..at + 4]);
+                        }
+                    }
+                    assert_eq!(first(&side, there), None, "round {round}: a card copy's card side (class {})", c.class);
                 }
                 assert_eq!(first(bytes(plain.3, plain.2), bytes(plain.1, plain.2)), None, "round {round}: the other copy");
             }
@@ -8296,8 +8324,9 @@ mod refresh_tests {
         }
     }
 
-    /// A part of a copy in the card's memory taken again goes up only if it
-    /// differs (with `VICTORY_SEND_CHANGED=1`), whole when never taken.
+    /// Of a copy in the card's memory only the dwords title memory changed go
+    /// up, and none beside them, not even between two in 64 bytes; a page
+    /// never taken goes up whole.
     #[test]
     fn only_what_differs_goes_up() {
         let region = title(4 * PAGE, true);
@@ -8316,18 +8345,24 @@ mod refresh_tests {
         copy.update(region, 4 * PAGE);
         let again = copy.take_dirty();
         // SAFETY: as above.
-        unsafe { ((region + 2 * PAGE + 128) as *mut u8).write_volatile(9) };
+        unsafe {
+            ((region + 2 * PAGE + 129) as *mut u8).write_volatile(9);
+            ((region + 2 * PAGE + 136) as *mut u32).write_volatile(9);
+            ((region + 2 * PAGE + 140) as *mut u32).write_volatile(9);
+            // The value that was there.
+            ((region + 2 * PAGE + 132) as *mut u32).write_volatile(0);
+        }
         copy.update(region, 4 * PAGE);
         let written = copy.take_dirty();
-        if std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v == "1") {
+        if std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0") {
             assert_eq!(again, []);
-            assert_eq!(written, [(2 * PAGE + 128, 2 * PAGE + 192)]);
+            assert_eq!(written, [(2 * PAGE + 128, 2 * PAGE + 132), (2 * PAGE + 136, 2 * PAGE + 144)]);
         } else {
             assert_eq!(again, [(PAGE, 2 * PAGE)]);
             assert_eq!(written, [(2 * PAGE, 3 * PAGE)]);
         }
         // SAFETY: as above.
-        assert_eq!(unsafe { data.add(2 * PAGE + 128).read() }, 9);
+        assert_eq!(unsafe { data.add(2 * PAGE + 129).read() }, 9);
     }
 
     /// The refreshes of a frame as run record-1 had them: 30 submissions, the

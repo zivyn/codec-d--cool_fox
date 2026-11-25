@@ -5,7 +5,10 @@
 //! - blips: blocks that one frame shows otherwise than the frames before and
 //!   after it, which agree (a texture black, grey or another one for a frame);
 //! - steps: blocks that change from one frame to the next and stay so, while
-//!   most of the picture does not move.
+//!   most of the picture does not move;
+//! - lone blocks: blocks found in neither neighbour, wherever the camera may
+//!   have moved them, while the neighbours' blocks there are found in each
+//!   other (a blip while the camera moves).
 //!
 //! `VICTORY_POP_FOLDER=<folder>`: the three pictures around a frame with
 //! blips (at most 200 times) are saved there, 640 wide; with
@@ -66,11 +69,89 @@ struct Job {
     flown: u64,
     ms: u64,
     causes: [u64; 4],
-    phase: Option<bool>,
+    phase: usize,
 }
 
 /// Read-back buffers not in use.
 static FREE: Mutex<Vec<Taken>> = Mutex::new(Vec::new());
+/// How far a block is looked for in a neighbour's picture, in pixels of half
+/// the small picture's size, and the side of a block there.
+const REACH: i32 = 14;
+const HALF_BLOCK: usize = BLOCK / 2;
+
+/// A small picture at half its size, as brightness and two colour differences.
+fn half(rgb: &[u8]) -> Vec<[i16; 3]> {
+    let (w, h) = (WIDE / 2, HIGH / 2);
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        for x in 0..w {
+            let mut s = [0i16; 3];
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let at = ((y * 2 + dy) * WIDE + x * 2 + dx) * 3;
+                for (s, v) in s.iter_mut().zip(&rgb[at..at + 3]) {
+                    *s += i16::from(*v);
+                }
+            }
+            out.push(s.map(|s| s / 4));
+        }
+    }
+    out
+}
+
+/// Per block of `a`: how much it differs from the place in `b` that is most
+/// like it, as [`differ`] says it.
+fn moved(a: &[[i16; 3]], b: &[[i16; 3]]) -> Vec<f32> {
+    let (w, h) = (WIDE / 2, HIGH / 2);
+    let (across, down) = (WIDE / BLOCK, HIGH / BLOCK);
+    let mut out = vec![f32::MAX; across * down];
+    for (n, best) in out.iter_mut().enumerate() {
+        let (bx, by) = (n % across * HALF_BLOCK, n / across * HALF_BLOCK);
+        let mut least = u32::MAX;
+        for dy in -REACH..=REACH {
+            let y0 = by as i32 + dy;
+            if y0 < 0 || y0 as usize + HALF_BLOCK > h {
+                continue;
+            }
+            for dx in -REACH..=REACH {
+                let x0 = bx as i32 + dx;
+                if x0 < 0 || x0 as usize + HALF_BLOCK > w {
+                    continue;
+                }
+                let mut sum = 0u32;
+                for row in 0..HALF_BLOCK {
+                    let ra = &a[(by + row) * w + bx..][..HALF_BLOCK];
+                    let rb = &b[(y0 as usize + row) * w + x0 as usize..][..HALF_BLOCK];
+                    sum += ra
+                        .iter()
+                        .zip(rb)
+                        .map(|(p, q)| (0..3).map(|i| p[i].abs_diff(q[i])).max().unwrap_or(0) as u32)
+                        .sum::<u32>();
+                    if sum >= least {
+                        break;
+                    }
+                }
+                least = least.min(sum);
+            }
+        }
+        *best = least as f32 / (HALF_BLOCK * HALF_BLOCK) as f32;
+    }
+    out
+}
+
+/// Blocks of `now` found in neither neighbour, where `before` is found in
+/// `after`.
+fn lone(before: &[[i16; 3]], now: &[[i16; 3]], after: &[[i16; 3]]) -> Vec<usize> {
+    let (one, two) = (moved(now, before), moved(now, after));
+    let both = moved(before, after);
+    // A cut on either side is none.
+    if one.iter().filter(|&&d| d > CHANGED).count() * 4 > one.len()
+        || two.iter().filter(|&&d| d > CHANGED).count() * 4 > two.len()
+    {
+        return Vec::new();
+    }
+    (0..one.len()).filter(|&n| one[n] > CHANGED && two[n] > CHANGED && both[n] < CHANGED / 2.0).collect()
+}
+
 /// Frames on their way.
 static WAITING: AtomicU64 = AtomicU64::new(0);
 
@@ -118,7 +199,8 @@ pub(crate) fn sent(taken: Taken, flown: u64, frame: u64) {
         flown,
         ms: crate::host::now_ms(),
         causes: crate::descriptor::host::pop_causes(),
-        phase: crate::ab::pick("VICTORY_KEEP_SHOWN"),
+        phase: usize::from(crate::ab::pick("VICTORY_KEEP_SHOWN").unwrap_or(false))
+            + 2 * usize::from(crate::ab::pick("VICTORY_UPLOAD_AHEAD").unwrap_or(false)),
     };
     let _ = to.send(job);
 }
@@ -131,14 +213,17 @@ struct Seen {
     blip_frames: u64,
     steps: u64,
     still: u64,
+    lone: u64,
+    lone_frames: u64,
 }
 
 struct Picture {
     frame: u64,
     ms: u64,
     causes: [u64; 4],
-    phase: Option<bool>,
+    phase: usize,
     rgb: Vec<u8>,
+    half: Vec<[i16; 3]>,
     /// Per block: how much it differs from the frame before.
     changed: Vec<f32>,
     saved: bool,
@@ -228,7 +313,7 @@ fn save(p: &mut Picture) {
 fn watch(from: &mpsc::Receiver<Job>) {
     let all = std::env::var_os("VICTORY_POP_ALL").is_some_and(|v| v == "1");
     let mut last: VecDeque<Picture> = VecDeque::new();
-    let mut seen: [Seen; 2] = Default::default();
+    let mut seen: [Seen; 4] = Default::default();
     let mut told = crate::host::now_ms();
     let mut sets = 0;
     while let Ok(job) = from.recv() {
@@ -257,7 +342,8 @@ fn watch(from: &mpsc::Receiver<Job>) {
         }
         let changed = last.back().map(|p| differ(&p.rgb, &rgb)).unwrap_or_default();
         let (frame, ms, causes, phase) = (job.frame, job.ms, job.causes, job.phase);
-        last.push_back(Picture { frame, ms, causes, phase, rgb, changed, saved: false });
+        let half = half(&rgb);
+        last.push_back(Picture { frame, ms, causes, phase, rgb, half, changed, saved: false });
         if all && let Some(p) = last.back_mut() {
             save(p);
         }
@@ -266,21 +352,24 @@ fn watch(from: &mpsc::Receiver<Job>) {
         }
         if let [first, before, now, after] = last.make_contiguous() {
             let (blips, steps) = judge(&before.rgb, &now.rgb, &after.rgb, &before.changed);
-            let side = &mut seen[usize::from(now.phase.unwrap_or(false))];
+            let side = &mut seen[now.phase];
             side.frames += 1;
             side.blips += blips as u64;
             side.blip_frames += u64::from(blips > 0);
             side.still += u64::from(steps.is_some());
             side.steps += steps.unwrap_or(0) as u64;
-            if blips > 0 || steps.is_some_and(|s| s > 0) {
+            let lone = lone(&before.half, &now.half, &after.half);
+            side.lone += lone.len() as u64;
+            side.lone_frames += u64::from(!lone.is_empty());
+            if blips > 0 || lone.len() > 1 || steps.is_some_and(|s| s > 0) {
                 let since: Vec<u64> = now.causes.iter().zip(&first.causes).map(|(a, b)| a.saturating_sub(*b)).collect();
                 tracing::info!(
-                    "pop watch: frame {} at {:.2} s: {blips} blips, {steps:?} steps; in the two frames before it [made null for another texture, kept, neutral, stale] {since:?}",
+                    "pop watch: frame {} at {:.2} s: {blips} blips, {steps:?} steps, lone blocks {lone:?}; in the two frames before it [made null for another texture, kept, neutral, stale] {since:?}",
                     now.frame,
                     now.ms as f64 / 1e3
                 );
             }
-            if (blips > 0 || steps.is_some_and(|s| s > 2)) && sets < 200 {
+            if (blips > 0 || lone.len() > 1 || steps.is_some_and(|s| s > 2)) && sets < 200 {
                 sets += 1;
                 save(before);
                 save(now);
@@ -291,13 +380,16 @@ fn watch(from: &mpsc::Receiver<Job>) {
             told = crate::host::now_ms();
             for (n, s) in seen.iter().enumerate().filter(|(_, s)| s.frames > 0) {
                 tracing::info!(
-                    "pop watch, since the start, VICTORY_KEEP_SHOWN {} in its A/B phases: {} frames, blips in {} of them ({} blocks of 16x16), {} frames whose picture stood still with {} blocks stepped",
-                    n,
+                    "pop watch, since the start, A/B VICTORY_KEEP_SHOWN {} VICTORY_UPLOAD_AHEAD {}: {} frames, blips in {} of them ({} blocks of 16x16), {} frames whose picture stood still with {} blocks stepped, lone blocks in {} frames ({} blocks)",
+                    n & 1,
+                    n >> 1,
                     s.frames,
                     s.blip_frames,
                     s.blips,
                     s.still,
-                    s.steps
+                    s.steps,
+                    s.lone_frames,
+                    s.lone
                 );
             }
         }
@@ -331,6 +423,21 @@ mod tests {
         assert_eq!(judge(&a, &picture(0), &picture(0), &quiet), (0, None));
         // What moved just before is no step either.
         assert_eq!(judge(&a, &b, &b, &vec![9.0; quiet.len()]), (0, Some(0)));
+    }
+
+    #[test]
+    fn a_block_one_frame_alone_shows_is_found_while_the_camera_moves() {
+        // A picture of noise, moved by 6 pixels a frame.
+        let at = |shift: usize| -> Vec<u8> {
+            (0..HIGH)
+                .flat_map(|y| (0..WIDE).map(move |x| ((x + shift) / 8 * 37 + y / 8 * 91) as u8))
+                .flat_map(|v| [v, v.wrapping_mul(3), 255 - v])
+                .collect()
+        };
+        let (a, mut b, c) = (at(0), at(8), at(16));
+        assert!(lone(&half(&a), &half(&b), &half(&c)).is_empty());
+        patch(&mut b, 20, 10, 128);
+        assert_eq!(lone(&half(&a), &half(&b), &half(&c)), vec![10 * (WIDE / BLOCK) + 20]);
     }
 
     #[test]

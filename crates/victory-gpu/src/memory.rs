@@ -823,15 +823,21 @@ pub(crate) fn ready(
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let packed = builds && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize) && m.unpacks(at);
-        if builds && written.contains(&at) && named(4, at) {
+        if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
                 && len <= BACK
                 && use_ == (Use::Builds { back: true })
+                && list.first_use(usize::MAX - (5 << 33) - (start >> 2 & 0x7FFF_FFFF) as usize)
             {
                 m.small(list, start, len);
             }
             m.opens(at);
             if !packed && crate::shadow::in_buffer(at, 1).is_none() {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let built = m.dump.built.entry(at).or_insert((frame, frame, 0));
+                    (built.1, built.2) = (frame, built.2 + 1);
+                }
                 let before = held(m);
                 m.ready(at, BUILT);
                 came[1] += held(m).saturating_sub(before);
@@ -914,6 +920,9 @@ mod dump {
     #[derive(Default)]
     pub(super) struct Dump {
         walked: std::collections::BTreeSet<u64>,
+        /// Views the builder was given to write outside buffers: the first
+        /// and the last frame, how often.
+        pub(super) built: std::collections::BTreeMap<u64, (u64, u64, u64)>,
         /// The frame it is written at, and the copies.
         due: Option<(u64, Vec<(ID3D12Resource, usize)>)>,
         done: bool,
@@ -962,6 +971,13 @@ mod dump {
                 for a in &self.dump.walked {
                     text += &format!("walked {a:#x}\n");
                 }
+                for (a, (first, last, n)) in &self.dump.built {
+                    text += &format!("built {a:#x} {first} {last} {n}\n");
+                }
+                for (a, p) in &self.packed {
+                    text += &format!("packed {a:#x} {} {}\n", p.len, p.frame);
+                }
+                text += &format!("frame {}\n", self.frame);
                 for (page, held) in &self.pages {
                     let arena = self.arenas.iter().position(|a| a.0 == held.copy).unwrap_or(usize::MAX);
                     let at = held.at - self.arenas[arena].1;

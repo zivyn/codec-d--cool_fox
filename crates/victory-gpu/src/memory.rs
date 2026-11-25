@@ -39,9 +39,12 @@
 //!
 //! shortcut: a copy that is numbered is kept for the rest of the run, and
 //! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
-//! most). Every dispatch of such a shader brings all numbered copies up to
-//! date and, if it can store, declares all of them written (the bytes are
-//! compared on the CPU afterwards, as for any unordered access view): a
+//! most). Every list with such a shader brings all numbered copies up to
+//! date. A dispatch that can store through raw addresses declares the
+//! copies it names as written (the bytes are compared afterwards, as for
+//! any unordered access view); what a stage stores through pointers it
+//! reads out of memory is declared if a stage of the same list names the
+//! copy, and otherwise stays in the host's copy until one does. A
 //! dirty-page mask written by the shader would bound both.
 
 use std::collections::HashMap;
@@ -115,8 +118,19 @@ impl Memory {
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's.
-    fn map(&mut self, address: u64) {
+    /// is the title's; the place of its copy in `copies`.
+    fn map(&mut self, address: u64) -> Option<usize> {
+        self.make(address);
+        let page = address / PAGE;
+        if page >= u64::from(MEMORY_PAGES) - 1 {
+            return None;
+        }
+        // SAFETY: inside the directory's mapping.
+        let number = unsafe { self.directory.1.add(page as usize * 2).read() };
+        (number as usize).checked_sub(1)
+    }
+
+    fn make(&mut self, address: u64) {
         let page = address / PAGE;
         // The last entry stays empty: addresses past the directory read it.
         if page >= u64::from(MEMORY_PAGES) - 1 {
@@ -226,10 +240,15 @@ impl Memory {
     }
 
     /// What a dispatch names: the copy around `address` and the 4 MiB
-    /// after it.
-    fn name(&mut self, address: u64) {
-        self.map(address);
-        self.map((address & !(CELL - 1)) + CELL);
+    /// after it; their places in `copies`.
+    fn name(&mut self, address: u64, named: &mut Vec<usize>) {
+        for at in [address, (address & !(CELL - 1)) + CELL] {
+            if let Some(n) = self.map(at)
+                && !named.contains(&n)
+            {
+                named.push(n);
+            }
+        }
     }
 }
 
@@ -237,7 +256,7 @@ impl Memory {
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
-/// submitted (and, with `writes`, copied back after). None if the host
+/// submitted (and, with `writes`, the named ones copied back after). None if the host
 /// cannot hold it; the draw is then dropped.
 pub(crate) fn ready(
     list: &HostList,
@@ -258,8 +277,9 @@ pub(crate) fn ready(
         m.take_faults();
     }
     let numbered = m.copies.len();
+    let mut named = Vec::new();
     for &address in addresses {
-        m.name(address);
+        m.name(address, &mut named);
     }
     // A title address in two constants (low dword, then bits 32 to 39), or
     // in one in 256-byte units. A constant that only looks like one names
@@ -269,10 +289,10 @@ pub(crate) fn ready(
             && (1..=0xFF).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32);
+            m.name(u64::from(c) | u64::from(high) << 32, &mut named);
         }
         if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8);
+            m.name(u64::from(c) << 8, &mut named);
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -295,15 +315,14 @@ pub(crate) fn ready(
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
     const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
+    const WRITE: usize = usize::MAX - 0x1_0000;
     let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && named.contains(&n) && list.first_use(WRITE - n) {
             #[cfg(feature = "diagnostics")]
             crate::host::wide_write(start, len, 1);
             shadow.gpu_writes(list, start, len);

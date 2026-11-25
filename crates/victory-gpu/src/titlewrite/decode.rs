@@ -382,6 +382,38 @@ unsafe fn change(at: usize, size: usize, locked: bool, f: impl Fn(u64) -> u64) -
 }
 
 impl Store {
+    /// Whether it leaves the memory as it is, and what it leaves in the flags
+    /// then; `None` for those of which that is not asked (locked ones,
+    /// exchanges).
+    ///
+    /// # Safety
+    /// [`Store::size`] bytes can be read at `at`.
+    pub(super) unsafe fn same(&self, c: &CONTEXT) -> Option<(bool, u32)> {
+        if self.locked {
+            return None;
+        }
+        let mut there = [0u8; 32];
+        // SAFETY: by the caller.
+        unsafe { std::ptr::copy_nonoverlapping(self.at as *const u8, there.as_mut_ptr(), self.size) };
+        match self.op {
+            Op::Put(bytes) => Some((there[..self.size] == bytes[..self.size], c.EFlags)),
+            Op::Alu { alu, with, keeps } => {
+                let was = u64::from_le_bytes(there[..8].try_into().expect("eight bytes")) & mask(self.size);
+                let (value, flags) = arithmetic(alu, was, with, self.size, keeps, c.EFlags);
+                Some((value == was, flags))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the loader can make it look before it writes
+    /// (`victory_loader::write_sites`): an `or` of a byte with a constant, of
+    /// the five bytes a jump needs.
+    pub(super) fn can_look(&self, code: &[u8]) -> bool {
+        let at = usize::from(code[0] & 0xf0 == 0x40);
+        self.len >= 5 && code[at] == 0x80 && matches!(self.op, Op::Alu { alu: Alu::Or, .. })
+    }
+
     /// Does it, with `to` for the address, and gives the registers what the
     /// instruction leaves in them (but the instruction pointer). `false`:
     /// nothing was done.

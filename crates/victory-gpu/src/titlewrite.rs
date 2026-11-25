@@ -32,8 +32,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 /// Diagnostics, since the start: copies of the title's that put bytes beside
 /// the guards, blocks they did so in, blocks they opened instead; stores done
 /// beside the guards, faulting stores not understood, and blocks opened
-/// because too many came.
-pub(crate) static DONE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// because too many came; stores and parts of copies that left the memory as
+/// it was, and were not made.
+pub(crate) static DONE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn add(what: usize) {
     DONE[what].fetch_add(1, Relaxed);
@@ -141,7 +142,11 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
         // SAFETY: by the caller.
         return unsafe { real(to, from, n) };
     }
-    in_pieces(to as usize, n, |at, offset, len| {
+    let same = |at: usize, offset: usize, len: usize| {
+        // SAFETY: both are the title's, the one read-only by our hand, the other read by it next.
+        unsafe { std::slice::from_raw_parts(at as *const u8, len) == std::slice::from_raw_parts(from.add(offset), len) }
+    };
+    in_pieces(to as usize, n, same, |at, offset, len| {
         // SAFETY: a part of what the title asked for; or the same bytes at
         // our view of the pages.
         unsafe { real(at as *mut u8, from.add(offset), len) };
@@ -156,7 +161,11 @@ unsafe extern "system-unwind" fn set(to: *mut u8, byte: i32, n: usize) -> *mut u
         // SAFETY: the title's, as it asked for it.
         return unsafe { real(to, byte, n) };
     }
-    in_pieces(to as usize, n, |at, _, len| {
+    let same = |at: usize, _: usize, len: usize| {
+        // SAFETY: the title's, read-only by our hand.
+        unsafe { std::slice::from_raw_parts(at as *const u8, len) }.iter().all(|&there| there == byte as u8)
+    };
+    in_pieces(to as usize, n, same, |at, _, len| {
         // SAFETY: as in `copied`.
         unsafe { real(at as *mut u8, byte, len) };
     });
@@ -173,7 +182,10 @@ fn overlap(to: usize, from: usize, n: usize) -> bool {
 
 /// Does `[to, to + n)` block by block: `put(at, offset, len)` with the
 /// address to write at, the title's or ours.
-fn in_pieces(to: usize, n: usize, put: impl Fn(usize, usize, usize)) {
+///
+/// What is there already (`same`, of a part in one guarded block) is not
+/// written.
+fn in_pieces(to: usize, n: usize, same: impl Fn(usize, usize, usize) -> bool, put: impl Fn(usize, usize, usize)) {
     const BLOCK: usize = crate::watch::PAGE;
     add(0);
     let mut offset = 0;
@@ -181,6 +193,11 @@ fn in_pieces(to: usize, n: usize, put: impl Fn(usize, usize, usize)) {
         let at = to + offset;
         let len = (BLOCK - at % BLOCK).min(n - offset);
         if crate::watch::guards_any(at, len) {
+            if same(at, offset, len) {
+                add(7);
+                offset += len;
+                continue;
+            }
             match crate::watch::put_beside(at / BLOCK, 1, |delta| put(at.wrapping_add(delta), offset, len)) {
                 Beside::Done => {
                     add(1);
@@ -212,6 +229,84 @@ fn sparse(counts: u64) -> bool {
     full < 4 || full * 12 < done
 }
 
+/// Faulting stores by their place in the title's code: the place, and how
+/// many left the memory as it was (the low half) or did not (the high one).
+static LEARNED: [(AtomicUsize, AtomicU64); 1 << 9] = [const { (AtomicUsize::new(0), AtomicU64::new(0)) }; 1 << 9];
+
+/// A store at `rip` would leave the memory as it is, or not. With
+/// `VICTORY_WRITE_SITES=<file>`, a place that can be made to look first
+/// (`can_look`) and mostly left it is written into that file, for the next
+/// start (`victory_loader::write_sites`).
+fn learn(rip: usize, same: bool, can_look: bool) {
+    let slot = &LEARNED[(rip as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize >> 55 & 511];
+    let there = slot.0.compare_exchange(0, rip, Relaxed, Relaxed).unwrap_or_else(|there| there);
+    if there != 0 && there != rip {
+        return;
+    }
+    let counts = slot.1.fetch_add(if same { 1 } else { 1 << 32 }, Relaxed);
+    let (stayed, changed) = (counts & 0xffff_ffff, counts >> 32);
+    if !same || !can_look || stayed != 256 || changed * 4 > stayed {
+        return;
+    }
+    let Some(file) = std::env::var_os("VICTORY_WRITE_SITES") else {
+        return;
+    };
+    // (Not here, under a fault of the title's.)
+    std::thread::spawn(move || {
+        let Some((image, offset)) = place(rip) else {
+            return;
+        };
+        use std::io::Write;
+        let line = format!("{image} {offset:x} or\n");
+        let known = std::fs::read_to_string(&file).unwrap_or_default();
+        if known.lines().any(|l| l == line.trim_end()) {
+            return;
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(&file) {
+            let _ = file.write_all(line.as_bytes());
+        }
+        tracing::info!(image, offset = format_args!("{offset:#x}"), stayed, changed, "a write of the title's that mostly changes nothing, noted");
+    });
+}
+
+/// The file name of the image `address` is in, and where in it.
+fn place(address: usize) -> Option<(String, usize)> {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW,
+    };
+    const FLAGS: u32 = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT;
+    let mut module = std::ptr::null_mut();
+    let mut name = [0u16; 1024];
+    // SAFETY: an address, and room for the answers.
+    let n = unsafe {
+        if GetModuleHandleExW(FLAGS, address as *const u16, &mut module) == 0 {
+            return None;
+        }
+        GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32)
+    } as usize;
+    let path = String::from_utf16_lossy(&name[..n]);
+    let file = path.rsplit(['\\', '/']).next()?.to_owned();
+    (!file.is_empty()).then(|| (file, address - module as usize))
+}
+
+/// The places with the most faulting stores, for the log: offset in its
+/// image, how many left the memory as it was, how many did not.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn busiest() -> String {
+    let mut all: Vec<(u64, u64, usize)> = LEARNED
+        .iter()
+        .map(|(rip, counts)| (counts.load(Relaxed), rip.load(Relaxed)))
+        .filter(|s| s.1 != 0)
+        .map(|(counts, rip)| (counts & 0xffff_ffff, counts >> 32, rip))
+        .collect();
+    all.sort_unstable_by_key(|s| std::cmp::Reverse(s.0 + s.1));
+    let of = |&(stayed, changed, rip): &(u64, u64, usize)| {
+        let (image, offset) = place(rip).unwrap_or_default();
+        format!("{}+{offset:x} {stayed}/{changed}", image.chars().skip(14).take(4).collect::<String>())
+    };
+    all.iter().take(16).map(of).collect::<Vec<_>>().join(", ")
+}
+
 /// Does the store that faulted at `at`, a byte of a guarded block, beside the
 /// guards; `false` if it is to open the block (and nothing was done).
 pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT, at: usize) -> bool {
@@ -221,13 +316,6 @@ pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug
     let rip = context.Rip as usize;
     let site = site(rip);
     let counts = site.load(Relaxed);
-    if !sparse(counts) {
-        // Looked at anew some time.
-        if site.fetch_add(1 << 32, Relaxed) >> 32 > 4096 {
-            site.store(0, Relaxed);
-        }
-        return false;
-    }
     let mut code = [0u8; 15];
     // (To the end of the page if the next is not there.)
     let left = 4096 - rip % 4096;
@@ -243,6 +331,23 @@ pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug
     let end = store.at.wrapping_add(store.size);
     if !(store.at..end).contains(&at) || store.at / BLOCK != (end - 1) / BLOCK {
         add(4);
+        return false;
+    }
+    // SAFETY: a guarded block's, which can be read.
+    if let Some((same, flags)) = unsafe { store.same(context) } {
+        learn(rip, same, store.can_look(&code));
+        if same && crate::watch::nothing_put(store.at / BLOCK) {
+            context.EFlags = flags;
+            context.Rip += store.len as u64;
+            add(6);
+            return true;
+        }
+    }
+    if !sparse(counts) {
+        // Looked at anew some time.
+        if site.fetch_add(1 << 32, Relaxed) >> 32 > 4096 {
+            site.store(0, Relaxed);
+        }
         return false;
     }
     let mut done = false;

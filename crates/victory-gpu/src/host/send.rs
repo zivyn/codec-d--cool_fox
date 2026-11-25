@@ -96,7 +96,10 @@ fn kept() -> u64 {
 /// Whether the memory lies in the card's memory, written by the CPU through
 /// the bus (`VICTORY_SEND_BAR=1`): the copies on the card's drawing queue, which
 /// nothing overlaps, then cross no bus. In a captured frame they took 5.4 ms of
-/// the card's 30 (342 copies).
+/// the card's 30 (342 copies), and take 0.4 this way; but filling it takes the
+/// submitting thread 8-9 ms a frame instead of 3 (73-93 MB, run card-3 against
+/// card-1), so it is a loss while the card waits for that thread: off by
+/// default.
 fn on_card() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))

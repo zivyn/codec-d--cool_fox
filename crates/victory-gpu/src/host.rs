@@ -1579,15 +1579,6 @@ impl<T> Spare<T> {
 /// Scratch chunks no list holds.
 static SPARE: Mutex<Spare<Chunk>> = Mutex::new(Spare::new());
 
-/// Whether lists' scratch memory (constants and tables, which shaders read)
-/// lies in the card's memory, written by the CPU through the bus
-/// (`VICTORY_SCRATCH_BAR=1`; the default is upload memory, which the card
-/// reads through it).
-fn scratch_on_card() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SCRATCH_BAR").is_some_and(|v| v == "1"))
-}
-
 /// A scratch chunk of `size` bytes: one kept ([`SPARE`]) or a new one.
 fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     if scratch_pool()
@@ -1598,11 +1589,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let mapped = if scratch_on_card() { host.mapped_card_buffer(size, false) } else { None };
-    let (buffer, data) = match mapped {
-        Some(made) => made,
-        None => host.upload_buffer(size)?,
-    };
+    let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);

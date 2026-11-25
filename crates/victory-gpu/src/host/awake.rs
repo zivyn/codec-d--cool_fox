@@ -202,3 +202,50 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Card memory the CPU maps holds what the CPU wrote, with the card kept
+    /// awake meanwhile; the thread ends when it is let go.
+    #[test]
+    fn mapped_card_memory_is_written_by_the_cpu_and_read_by_the_card() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let awake = start(&host.device, || true);
+        assert!(awake.is_some());
+        let Some((buffer, data)) = host.mapped_card_buffer(4096, true) else {
+            return;
+        };
+        let (seen, back) = host.shared_buffer(4096).unwrap();
+        // SAFETY: mappings of 4096 bytes; a list, a queue and a fence of the
+        // test's own, and nothing is read before the copy has run.
+        let read = unsafe {
+            for i in 0..4096 {
+                data.add(i).write((i * 7 + i / 251) as u8);
+            }
+            let device = &host.device;
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            list.CopyBufferRegion(&seen, 0, &buffer, 0, 4096);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            // No event: returns when the fence is there.
+            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            std::slice::from_raw_parts(back, 4096).to_vec()
+        };
+        assert!(read.iter().enumerate().all(|(i, &b)| b == (i * 7 + i / 251) as u8));
+        drop(awake);
+    }
+}

@@ -32,9 +32,10 @@
 //! stage, so before one of its dispatches the host makes ready what it can
 //! see the dispatch name:
 //!
-//! - 1 MiB from each root view outside buffers (structures unpacked in place:
-//!   the title ships them packed and the builder's rehydration stages unpack
-//!   each once, when it is streamed in);
+//! - 1 MiB from each root view outside buffers, and where title memory has a
+//!   packed ("dehydrated") structure there, all of it: the title ships its
+//!   structures packed, and the builder's rehydration stages unpack each in
+//!   place once it is streamed in;
 //! - 4 MiB from each pair of root constants that is a title address and from
 //!   each root constant that is one in 256-byte units (structures built);
 //! - the first page of every structure a list's upload memory names
@@ -46,8 +47,11 @@
 //! (the first whole run of the builder wrote garbage over the title's
 //! objects). So an arena's page is the only place a structure is whole, and
 //! title memory must not go over it: of a page the title wrote only the
-//! dwords that changed since they were last taken go up, unless a quarter of
-//! a 4 KiB piece changed, which is other data streamed in: then all of it.
+//! dwords that changed since they were last taken go up. A packed structure
+//! goes up whole when the builder comes to it, whatever is known of it: the
+//! same bytes streamed in again do not differ from those last taken, and the
+//! card holds them unpacked (run light-3: a quarter of the structures
+//! unpacked a second time, into garbage all over their neighbours).
 //!
 //! shortcut: a page is kept for the rest of the run.
 //! shortcut: pages a list does not name are looked at again in turn, over
@@ -69,8 +73,16 @@ const COPIES: u32 = (1 << 12) - 1;
 const PAGE: u64 = 1 << 16;
 /// An arena's bytes.
 const ARENA: u64 = 64 << 20;
-/// The kernel's page: what is sent whole when much of it changed.
+/// What is compared at a time.
 const PIECE: usize = 4096;
+/// Pages held, at most (2 GiB).
+const MOST: usize = 1 << 15;
+/// Pages of title memory with small title buffers in them, at most.
+const WINDOWS: usize = 512;
+/// The biggest packed structure taken for one.
+const PACKED: u64 = 64 << 20;
+/// A packed structure not named for so many frames is another one.
+const AGAIN: u64 = 8;
 /// From a root view; from an address in constants.
 const VIEW: u64 = 1 << 20;
 const BUILT: u64 = 4 << 20;
@@ -115,6 +127,10 @@ struct Memory {
     /// Their numbers in the order they came, and where the sweep is.
     order: Vec<u64>,
     sweep: usize,
+    /// Windows of title memory itself ([`Memory::map`]).
+    windows: usize,
+    /// Packed structures the builder came to: the frame it last did.
+    packed: HashMap<u64, u64>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -135,10 +151,10 @@ struct Stats {
     faults: u64,
     unknown: u64,
     back: u64,
-    /// Pages looked at, bytes that changed, pieces sent whole.
+    /// Pages looked at, bytes that changed, packed structures sent.
     looked: u64,
     changed: u64,
-    whole: u64,
+    packed: u64,
     micros: u64,
 }
 
@@ -181,6 +197,8 @@ impl Memory {
             pages: HashMap::new(),
             order: Vec::new(),
             sweep: 0,
+            windows: 0,
+            packed: HashMap::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -283,6 +301,23 @@ impl Memory {
             fill(self.entry(page), n, start - shadow.span().0);
             return true;
         }
+        // Small title buffers in it: what the builder stores in them comes
+        // back, so title memory itself.
+        if self.windows < WINDOWS && crate::shadow::small_buffer_in(start, PAGE, BACK) {
+            if let Some(shadow) = crate::shadow::by_address(start, PAGE)
+                && let Some(n) = self.number(shadow)
+            {
+                self.windows += 1;
+                fill(self.entry(page), n, 0);
+                return true;
+            }
+            return false;
+        }
+        if self.pages.len() >= MOST {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
+            return false;
+        }
         if self.used == ARENA / PAGE {
             let Some(at) = crate::upload::reserve(ARENA as usize) else {
                 return false;
@@ -350,15 +385,47 @@ impl Memory {
                 crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
                 // SAFETY: a page of an arena of ours, under the mutex.
                 let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
-                let (changed, whole) = merge(&title, ours, never);
-                self.stats.changed += changed as u64 * 4;
-                if whole {
-                    self.stats.whole += 1;
-                    shadow.resend(base + piece, base + piece + PIECE);
-                }
+                self.stats.changed += merge(&title, ours, never) as u64 * 4;
+            }
+            if never {
+                shadow.resend(base, base + PAGE as usize);
             }
         }
         self.stats.micros += started.elapsed().as_micros() as u64;
+    }
+
+    /// If title memory has a packed structure at `address` that the builder
+    /// comes to anew: all of it has its pages, and goes up as it is there.
+    fn unpacks(&mut self, address: u64) {
+        if address & 0xFF != 0 || !self.possible(address / PAGE) {
+            return;
+        }
+        let mut header = [0u8; 8];
+        crate::host::copy_mapped(header.as_mut_ptr(), address as *const u8, 8, false);
+        let Some(len) = packed_len(u64::from_le_bytes(header)) else {
+            return;
+        };
+        let last = self.packed.insert(address, self.frame);
+        if last.is_some_and(|f| f + AGAIN >= self.frame) {
+            return;
+        }
+        self.ready(address, len);
+        let mut title = [0u8; PIECE];
+        let mut at = address;
+        while at < address + len {
+            let n = (PAGE - at % PAGE).min(address + len - at).min(PIECE as u64) as usize;
+            if let Some(held) = self.pages.get(&(at / PAGE)) {
+                let place = held.at + (at % PAGE) as usize;
+                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: a page of an arena of ours, under the mutex.
+                unsafe { std::slice::from_raw_parts_mut(place as *mut u8, n) }.copy_from_slice(&title[..n]);
+                let shadow = &self.copies[held.copy];
+                let base = place - shadow.span().0 as usize;
+                shadow.resend(base, base + n);
+            }
+            at += n as u64;
+        }
+        self.stats.packed += 1;
     }
 
     /// The pages shaders found empty since the last frame.
@@ -427,20 +494,14 @@ impl Memory {
         }
     }
 
-    /// A title buffer too small to fill its pages, whose results come back:
-    /// windows of title memory itself around its pages, which go back.
+    /// A small title buffer whose results come back, if its pages are
+    /// windows of title memory itself (or a copy of the buffer's own).
     fn small(&mut self, list: &HostList, start: u64, len: u64) {
         let mut at = start;
         while at < start + len {
             let page = at / PAGE;
             let n = ((page + 1) * PAGE).min(start + len) - at;
-            if self.copy_of(page).is_none()
-                && self.possible(page)
-                && let Some(shadow) = crate::shadow::by_address(page * PAGE, PAGE)
-                && let Some(k) = self.number(shadow)
-            {
-                fill(self.entry(page), k, 0);
-            }
+            self.map(page);
             if let Some(k) = self.copy_of(page)
                 && !self.pages.contains_key(&page)
             {
@@ -464,7 +525,7 @@ impl Memory {
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
              {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
-             {:.1} pieces sent whole, {:.2} ms",
+             {:.1} packed structures ({} seen), {:.2} ms; {} windows",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -476,8 +537,10 @@ impl Memory {
             s.back as f64 / frames,
             s.looked as f64 / frames,
             s.changed as f64 / 1024.0 / frames,
-            s.whole as f64 / frames,
-            s.micros as f64 / 1000.0 / frames
+            s.packed as f64 / frames,
+            self.packed.len(),
+            s.micros as f64 / 1000.0 / frames,
+            self.windows
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -492,16 +555,24 @@ fn fill(entry: *mut u32, n: usize, offset: u64) {
     }
 }
 
+/// The bytes of a packed structure whose first two dwords these are: the
+/// version (6) with the marks of a bottom level and of one that is packed,
+/// and its size unpacked in 64-byte nodes.
+fn packed_len(header: u64) -> Option<u64> {
+    let (version, nodes) = (header as u32, header >> 32);
+    let marks = version >> 16;
+    (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && nodes * 64 <= PACKED).then_some(nodes * 64)
+}
+
 /// Puts what `title` holds into `ours` (what was last taken): the dwords that
-/// differ. How many, and whether the whole piece is to be sent again because
-/// so many did (or it was never taken).
-fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> (usize, bool) {
+/// differ. How many.
+fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> usize {
     if never {
         ours.copy_from_slice(title);
-        return (PIECE / 4, true);
+        return PIECE / 4;
     }
     if ours == title {
-        return (0, false);
+        return 0;
     }
     let mut changed = 0;
     for (t, o) in title.chunks_exact(4).zip(ours.chunks_exact_mut(4)) {
@@ -510,7 +581,7 @@ fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> (usize, bool) {
             changed += 1;
         }
     }
-    (changed, changed > PIECE / 16)
+    changed
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -567,6 +638,10 @@ pub(crate) fn ready(list: &HostList, heap: &HostHeap, addresses: &[u64], constan
         }
     }
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
+        // (Several structures to a page.)
+        if builds && list.first_use(usize::MAX - (3 << 33) - (at >> 8) as usize) {
+            m.unpacks(at);
+        }
         if !named(2, at) {
             continue;
         }
@@ -732,19 +807,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_piece_takes_what_changed_and_is_sent_whole_when_much_did() {
+    fn a_piece_takes_what_changed() {
         let mut title = [7u8; PIECE];
         let mut ours = vec![0u8; PIECE];
-        assert_eq!(merge(&title, &mut ours, true), (PIECE / 4, true));
+        assert_eq!(merge(&title, &mut ours, true), PIECE / 4);
         assert_eq!(ours, title);
-        assert_eq!(merge(&title, &mut ours, false), (0, false));
+        assert_eq!(merge(&title, &mut ours, false), 0);
         // A dword of it.
         title[41] = 8;
-        assert_eq!(merge(&title, &mut ours, false), (1, false));
+        assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
-        // Other data.
-        title[..PIECE / 2].fill(9);
-        assert_eq!(merge(&title, &mut ours, false), (PIECE / 8, true));
-        assert_eq!(ours, title);
+    }
+
+    #[test]
+    fn a_packed_structure_is_known_by_its_header() {
+        let header = |version: u32, nodes: u32| u64::from(version) | u64::from(nodes) << 32;
+        assert_eq!(packed_len(header(0x8102_0006, 0x9a1a)), Some(0x9a1a * 64));
+        // Unpacked, a top level, another version, no size, too big.
+        assert_eq!(packed_len(header(0x8002_0006, 0x9a1a)), None);
+        assert_eq!(packed_len(header(0x0000_0006, 5)), None);
+        assert_eq!(packed_len(header(0x8102_0007, 5)), None);
+        assert_eq!(packed_len(header(0x8102_0006, 0)), None);
+        assert_eq!(packed_len(header(0x8102_0006, 1 << 21)), None);
     }
 }

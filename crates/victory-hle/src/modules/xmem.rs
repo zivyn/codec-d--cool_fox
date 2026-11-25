@@ -1260,9 +1260,15 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
 const GROUP: usize = 64;
 
 /// How many threads map a group of pages side by side (`VICTORY_MAP_THREADS`;
-/// 1: the caller alone, a page after the other, as before; `auto`, which it
-/// is unless set: 1 while mapping takes little of the time, [`WIDE`] while the
-/// title streams as fast as its pages are mapped, [`Busy`]).
+/// 8 unless set; 1: the caller alone, a page after the other; `auto`: 1 while
+/// mapping takes little of the time, [`WIDE`] while the title streams as fast
+/// as its pages are mapped, [`Busy`]).
+///
+/// shortcut: `auto` is not the default. The intro's diner was there in time
+/// with it (one run, textures-d3), but in the dorm, where each call takes 0.3
+/// ms of something that only one at a time gets (until a step of the mission,
+/// after which it takes 0.01), 16 threads map no more pages than one, and the
+/// groups hold the mapping lock: 260 ms a frame against 125 (textures-d4, -d2).
 ///
 /// Mapping and unmapping a view wait for a lock that every protection change
 /// of a view takes too, and our guards make 100,000 of those a second, from
@@ -1289,7 +1295,10 @@ const WIDE: usize = 16;
 /// `VICTORY_MAP_THREADS` as a number; `None`: by how much there is to map.
 fn asked_threads() -> Option<usize> {
     static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
-        std::env::var("VICTORY_MAP_THREADS").ok().and_then(|v| v.trim().parse().ok()).map(|n: usize| n.clamp(1, 32))
+        match std::env::var("VICTORY_MAP_THREADS") {
+            Ok(v) if v.trim() == "auto" => None,
+            v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 32)),
+        }
     });
     *ASKED
 }

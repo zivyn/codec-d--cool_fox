@@ -1627,9 +1627,8 @@ mod many_askers_tests {
         });
         assert!(by_bits.into_inner() > 0, "the bits answered none");
         assert!(past.into_inner() > 0, "nothing was put past the guards");
-        super::title_memory_remapped(at, PAGES * PAGE);
-        // SAFETY: the view mapped above.
-        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+        // (The view stays: at its address other tests' memory would be told
+        // of these writes.)
     }
 
     /// A range's bits are all of its blocks', whatever lies beside them.

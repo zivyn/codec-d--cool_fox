@@ -2194,6 +2194,11 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// Title textures of the kinds copied back ([`crate::texback`]) that
+    /// the list's shaders write, copied when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, whose texels go to title memory once the list has run.
+    texture_backs: Vec<crate::texback::Back>,
     /// Whether the indirect-work budget is zeroed for this recording (a
     /// step on the CPU, or in the list for the card's copy).
     budget_zeroed: bool,
@@ -2532,6 +2537,8 @@ struct Sent {
     back: Vec<Declared>,
     /// What was taken off it to be done on the card.
     own: Option<card_steps::Taken>,
+    /// Title-memory ranges written when its shader textures are copied back.
+    texture_back_ranges: Vec<(usize, usize)>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
 }
@@ -2549,6 +2556,7 @@ struct Flight {
     back: Vec<Declared>,
     /// The list of ours that ran ahead of them ([`card_steps`]).
     own: Option<card_steps::Taken>,
+    texture_back_ranges: Vec<(usize, usize)>,
 }
 
 /// One thing in the line of what waits for the card, in order.
@@ -2562,8 +2570,8 @@ enum Late {
 
 struct Line {
     line: Vec<Late>,
-    /// The title memory the flights' shaders may write (address, end), in
-    /// order and joined.
+    /// The title memory the flights' shaders and texture readbacks may write
+    /// (address, end), in order and joined.
     written: Vec<(usize, usize)>,
     /// Host lists in the flights.
     lists: usize,
@@ -3725,6 +3733,11 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    // Textures shaders wrote that the title reads on the CPU
+    // ([`crate::texback`]).
+    for back in &list.deferred().texture_backs {
+        crate::texback::land(back);
+    }
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -4838,6 +4851,7 @@ impl Host {
                 if let Late::Run(flight) = item {
                     *lists += flight.order.len().max(1);
                     ranges.extend(flight.back.iter().flat_map(|(_, r)| r.iter().copied()));
+                    ranges.extend(flight.texture_back_ranges.iter().copied());
                 }
             }
             join_ranges(written, ranges);
@@ -5045,7 +5059,13 @@ impl Host {
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5056,6 +5076,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
+                texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
@@ -5093,7 +5114,13 @@ impl Host {
         {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
-            join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(
+                written,
+                sent.back
+                    .iter()
+                    .flat_map(|(_, ranges)| ranges.iter().copied())
+                    .chain(sent.texture_back_ranges.iter().copied()),
+            );
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5104,6 +5131,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
                 own: sent.own,
+                texture_back_ranges: sent.texture_back_ranges,
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
@@ -5571,6 +5599,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
+            let mut texture_back_ranges = Vec::new();
+            for list in runs {
+                texture_back_ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
+            }
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(settled).as_micros() as u64, Ordering::Relaxed);
             submitting(0, 0);
@@ -5581,6 +5613,7 @@ impl Host {
                 card,
                 back,
                 own,
+                texture_back_ranges,
                 writes,
             };
             working(was_working);
@@ -6035,6 +6068,7 @@ impl HostList {
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
+        self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
             self.indirect_common(&scratch);
@@ -6351,6 +6385,34 @@ impl HostList {
         }
     }
 
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// ([`crate::texback`]), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred.back_wanted.iter().any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Before the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            self.settle(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     /// The draw or dispatch just prepared is recorded: the twins it writes
     /// now hold what their depth textures lack.
     pub(crate) fn twins_written(&self) {
@@ -6518,7 +6580,8 @@ impl HostList {
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
-                && deferred.backs.is_empty())
+                && deferred.backs.is_empty()
+                && deferred.texture_backs.is_empty())
             {
                 return false;
             }

@@ -393,6 +393,12 @@ impl Drop for Ours {
     }
 }
 
+/// While what this returns lives, this thread's D3D12 calls are not
+/// recorded.
+pub(crate) fn unrecorded() -> impl Drop {
+    Ours::new()
+}
+
 fn ours() -> bool {
     OURS.with(|o| o.get() > 0)
 }

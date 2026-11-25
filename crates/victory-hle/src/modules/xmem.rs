@@ -101,6 +101,7 @@ pub extern "system" fn XMemVirtualAlloc(
             0
         },
     };
+    let asked = protect;
     let mut protect = match protect & HOST_PROTECTION {
         0 => PAGE_NOACCESS,
         p => p,
@@ -179,7 +180,30 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    note_protection(asked, kind, flags, at as usize, size);
     at
+}
+
+/// What the title asks its memory to be (the console's protection, with the
+/// bits that say how each processor reaches it: 0x200 uncached, 0x400
+/// write-combined, 0x800 and on the GPU's): said for the 1st, 2nd, 4th.. time of
+/// each, with how much so far. (For placing it: memory the CPU reaches
+/// uncached or write-combined is memory it does not read.)
+fn note_protection(protect: u32, kind: u32, flags: u64, at: usize, size: usize) {
+    type Seen = std::collections::HashMap<(u32, u32, u64), (u64, usize)>;
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
+    let (n, bytes) = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let e = seen.get_or_insert_with(Default::default).entry((protect, kind, flags)).or_default();
+        *e = (e.0 + 1, e.1 + size);
+        *e
+    };
+    if n.is_power_of_two() {
+        tracing::info!(
+            "title memory asked for as protection {protect:#x}, kind {kind:#x}, flags {flags:#x}: {n} times, {} MB, last {at:#x}+{size:#x}",
+            bytes >> 20
+        );
+    }
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the

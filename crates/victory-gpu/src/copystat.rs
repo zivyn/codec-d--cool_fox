@@ -161,6 +161,13 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
 }
 
+/// The counter, all sets together, as it is now (it goes back to 0 with
+/// [`log`]).
+pub(crate) fn peek(c: C) -> u64 {
+    let i = c as usize;
+    COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
+}
+
 /// Counter `i`, all sets together, from now on 0.
 fn taken(i: usize) -> u64 {
     COUNT.iter().map(|b| b.0[i].swap(0, Relaxed)).sum()
@@ -491,7 +498,7 @@ mod own_tests {
 
 /// The process's memory in bytes: in physical memory, and committed
 /// (private bytes).
-fn process_memory() -> (u64, u64) {
+pub(crate) fn process_memory() -> (u64, u64) {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };

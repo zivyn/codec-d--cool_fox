@@ -24,9 +24,15 @@ static MOVED: Mutex<Option<HashMap<(u64, u64), Moved>>> = Mutex::new(None);
 pub(super) fn moved(way: usize, span: (u64, u64), ranges: impl Iterator<Item = (usize, usize)>) {
     let mut all = MOVED.lock().unwrap_or_else(|e| e.into_inner());
     let m = all.get_or_insert_with(Default::default).entry(span).or_default();
+    // (Thousands of runs lie in one piece, one after the other.)
+    let mut last = u32::MAX;
     for (from, to) in ranges.filter(|r| r.0 < r.1) {
         m.bytes[way] += (to - from) as u64;
-        m.pieces[way].extend((from >> 16) as u32..=((to - 1) >> 16) as u32);
+        let (first, end) = ((from >> 16) as u32, ((to - 1) >> 16) as u32);
+        if (first, end) != (last, last) {
+            m.pieces[way].extend(first..=end);
+        }
+        last = end;
     }
 }
 

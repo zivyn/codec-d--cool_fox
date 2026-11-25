@@ -238,7 +238,11 @@ impl Pool {
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
-                crate::cores::keep_helper_on_fast_cores(name);
+                if name == "victory-land" {
+                    crate::cores::keep_helper_on_fast_cores(name);
+                } else {
+                    crate::cores::keep_many_on_fast_cores(name);
+                }
                 pool.help()
             });
         }
@@ -322,6 +326,17 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+}
+
+/// [`Pool::each`] on threads kept for the title's bytes under flights' writes
+/// (`VICTORY_UNDER_THREADS`, 6 with this one).
+pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        Pool::new("victory-under", threads.clamp(1, 16))
+    })
+    .each(count, f);
 }
 
 /// Calls `f` with every number below `count`, on this thread and on threads

@@ -1707,6 +1707,10 @@ fn list_number(name: &str) -> Option<u32> {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Indirect records that ran empty for want of their list's budget, and the
+/// largest cost of one (told from 2^22 on), likewise.
+static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -2210,9 +2214,18 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// The pipelines [`HostList::bind_pipeline`] kept, by address.
+    bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes): declaring them again would
+    /// change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Scratch memory [`HostList::fill_scratch`] fills since the list last
+    /// wrote title memory (source, bytes): its host address.
+    filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2246,6 +2259,14 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// The steps recorded last write title memory: what was brought up to
+    /// date before them is not any more.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
     }
 }
 
@@ -3712,6 +3733,12 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
     d.checked_add(n) == Some(dst)
         && s.checked_add(n) == Some(src)
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+}
+
+/// See [`HostList::defer_gpu_write`].
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -6636,6 +6663,21 @@ impl HostList {
         }
     }
 
+    /// The list binds a pipeline: it and its root signature are kept until
+    /// the list is reset, and its name noted, the first time only (a kept
+    /// pipeline's address names no other).
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        {
+            let mut deferred = self.deferred();
+            if !deferred.bound.insert(pso.as_raw() as usize) {
+                return;
+            }
+            deferred.kept.push(pso.clone().into());
+            deferred.kept.push(root.clone().into());
+        }
+        self.used_pipeline(name);
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -6659,7 +6701,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
         self.changed_something();
     }
 
@@ -6669,6 +6711,21 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len, None));
+    }
+
+    /// The host address of `len` bytes of scratch memory that hold the title
+    /// memory at `src` as of the list's submission: one fill for every ask
+    /// until the list next writes title memory.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let known = self.deferred().filled.get(&key).copied();
+        if known.is_some() {
+            return known;
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
@@ -6706,15 +6763,20 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Declared once until the list next writes title memory (but with
+    /// `VICTORY_DECLARE_ONCE=0`): the dispatches of a frame declared the
+    /// same ranges thousands of times, each a step of its own.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) || !declare_once() {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -6817,14 +6879,18 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all; with the card's copy, as
+            // asked for, the groups asked in all; the records refused, the
+            // largest cost; with the card's copy, as
             // the list's end copied them here): taken, then zeroed.
             let notes = Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
+                BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             });
@@ -6859,7 +6925,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -6900,7 +6966,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -7041,8 +7107,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
+        drop(deferred);
         self.changed_something();
     }
 
@@ -8485,8 +8553,10 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);

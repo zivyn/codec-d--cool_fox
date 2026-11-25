@@ -124,7 +124,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
                 if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
                 }
             }
             if (next == before) break;
@@ -134,14 +134,27 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             before = prev;
         }
         uint at = before;
+        uint refused = 0;
+        uint biggest = 0;
         for (uint k = 0; k < n; k++) {
             uint c = costs[k];
             uint fit = 1;
             if (c > 0) {
                 fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+                refused += 1 - fit;
+                biggest = max(biggest, c);
             }
             fits[k] = fit;
+        }
+        // Diagnostics: the records that run empty for want of budget, and
+        // the largest cost there was (small ones are not told).
+        uint told;
+        if (refused > 0) {
+            budget.InterlockedAdd(12, refused, told);
+        }
+        if (biggest >= (1u << 22)) {
+            budget.InterlockedMax(16, biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();

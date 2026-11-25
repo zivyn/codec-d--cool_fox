@@ -692,6 +692,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(

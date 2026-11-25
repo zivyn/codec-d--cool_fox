@@ -33,6 +33,27 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// A title-memory range whose changed pages another subsystem needs to read.
+pub(crate) struct Tracked {
+    start: usize,
+    end: usize,
+    seen: Mutex<BTreeMap<usize, u64>>,
+}
+
+/// Tracks a runtime GPU-memory range, including physical-page views when
+/// `views` is true. Other process memory is not tracked.
+pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    let end = start.checked_add(len)?;
+    if len == 0 || writes(start, end, views).is_none() {
+        return None;
+    }
+    Some(Tracked {
+        start,
+        end,
+        seen: Mutex::default(),
+    })
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -377,6 +398,42 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+impl Tracked {
+    /// Takes changed pages of `[from, to)`, cut to the tracked range. A
+    /// partial page stays changed so a later take can read its other bytes.
+    pub(crate) fn take(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to {
+            return Vec::new();
+        }
+        let Some((_, pages)) = writes(from, to, true) else {
+            return Vec::new();
+        };
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for (page, write) in pages {
+            if seen.get(&page).is_some_and(|&last| last >= write) {
+                continue;
+            }
+            let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
+            if start >= end {
+                continue;
+            }
+            // Keep partial pages dirty: the caller has not taken the rest.
+            if (page * PAGE).max(self.start) >= from
+                && ((page + 1) * PAGE).min(self.end) <= to
+            {
+                seen.insert(page, write);
+            }
+            match ranges.last_mut() {
+                Some((_, last)) if *last == start => *last = end,
+                _ => ranges.push((start, end)),
+            }
+        }
+        ranges
+    }
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
@@ -698,16 +755,22 @@ pub fn writing(at: usize, len: usize) {
 /// copies of buffers and textures read through tables take them again);
 /// 2, the placed textures picked by index that lie under it are due again;
 /// 4, both also for reads to plain addresses when they have finished.
-/// Unset or `0`: nothing, counted only. `1`: bits 1 and 2. `guards`: bit 1
-/// alone. `slots`: bit 2 alone. `all`: everything.
+/// Unset or `guards`: bit 1 alone. `0`: nothing, counted only (the default
+/// until run 199). `1`: bits 1 and 2. `slots`: bit 2 alone. `all`:
+/// everything.
+/// (Bit 1 by default: in every run 10,000 to 50,000 guarded blocks of host
+/// copies lay under such writes and kept the bytes from before; runs 197
+/// and 198 opened them, 9,766 and 10,796 blocks, with nothing worse for
+/// it. Bit 2 makes texture slots due and is the one that flooded the
+/// queue in an earlier form: still asked for by name.)
 pub(crate) fn page_writes() -> u8 {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_PAGE_WRITES").as_deref().map(str::trim) {
+        Ok("0") => 0,
         Ok("1") => 3,
-        Ok("guards") => 1,
         Ok("slots") => 2,
         Ok("all") => 7,
-        _ => 0,
+        _ => 1,
     })
 }
 

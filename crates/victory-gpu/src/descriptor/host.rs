@@ -26,6 +26,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// A fingerprint of the record each slot held when the pass over
+    /// records copied in as bytes last looked at it
+    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
+    copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -947,6 +951,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1789,6 +1794,45 @@ impl HostHeap {
         }
     }
 
+    /// For a slot on a page of the title's heap that changed with no call
+    /// (`super::sync_heaps`: the title copies records into its heap as
+    /// bytes): [`HostHeap::mirror`], if the `bytes` bytes of the record at
+    /// `handle` are not the ones this last saw there. True if it did.
+    ///
+    /// The page says only that something on it was written, and `mirror`
+    /// by itself would take every buffer or placed-texture record on it for
+    /// newly written each time (it leaves such a slot unmade until a draw
+    /// or a pass uses it): the texture queue's entry for the slot would
+    /// start again, and the buffer pass would look at 2,048 slots for one
+    /// that changed.
+    /// `record`: the record's bytes as the caller read them (through the
+    /// kernel, which fails on a page the title unmapped meanwhile where a
+    /// read in place would fault: the title unmaps heap pages too).
+    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+        if index >= self.count {
+            return false;
+        }
+        let n = record.len();
+        // Never 0, which is "never looked at".
+        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            let Some(last) = copied.get_mut(index as usize) else {
+                return false;
+            };
+            // A slot never looked at that holds nothing: as it was.
+            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
+                return false;
+            }
+            *last = print;
+        }
+        self.mirror(index, handle, false);
+        true
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1872,6 +1916,16 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Whether slot `index` is backed by a made host descriptor (tests).
+    #[cfg(test)]
+    pub(crate) fn made(&self, index: u32) -> bool {
+        self.made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|&key| key != 0)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -2041,6 +2095,18 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
+    // A view off its buffer's elements is made on a copy of its own bytes
+    // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
+    // of the copy they find, so that the copy brought up to date is the
+    // one the slot shows.
+    if let Some((base, width)) = buffer_extent(view)
+        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
+        && let Some(whole) = crate::shadow::find(base, width)
+        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+        && let Some(own) = crate::shadow::exact(start, bytes)
+    {
+        return Some((own, start, bytes));
+    }
     if view_extent()
         && let Some((base, width)) = buffer_extent(view)
         // (The console is lax: a view may begin past its buffer's end.)
@@ -2073,6 +2139,80 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
+
+/// Whether a buffer view off its buffer's elements gets a copy of its own
+/// bytes (`VICTORY_VIEW_OWN_COPY=0`: it is refused and reads zeros, as
+/// before).
+fn own_copy_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_OWN_COPY").is_none_or(|v| v != "0"))
+}
+
+/// The title memory (start, bytes) of a buffer view that cannot be made on
+/// the host copy of its buffer: `count` elements of `element` bytes from
+/// element `first` of the buffer at `base`, which lies `offset` bytes into
+/// that copy, where `offset` is not a whole number of elements and the view
+/// cannot be a raw view of the same bytes either ([`raw_window`]:
+/// `unknown`, the view has no format, and `stride` is its structure's).
+/// The host counts a view's first element from its buffer's start, so such
+/// a view has no host view there; it is made on a copy of its own bytes
+/// (`crate::shadow::exact`), where it starts at element 0. `None`: the
+/// view is made on its buffer's copy, as every other.
+fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
+    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn own_bytes_if(
+    on: bool,
+    offset: u64,
+    base: u64,
+    first: u64,
+    count: u32,
+    element: u64,
+    stride: u32,
+    unknown: bool,
+) -> Option<(u64, u64)> {
+    if !on || element == 0 || count == 0 || offset.is_multiple_of(element) {
+        return None;
+    }
+    if unknown && raw_window(offset, first, count, stride).is_some() {
+        return None;
+    }
+    let start = base.checked_add(first.checked_mul(element)?)?;
+    Some((start, u64::from(count) * element))
+}
+
+/// Of a buffer view: its first element, its elements, the bytes of one (a
+/// raw view's: 4), its structure's stride, and whether it has no format.
+/// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
+fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+    const BUFFER: u32 = 1;
+    let (words, unordered): (&[u32; 10], bool) = match view {
+        View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+        View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER => (d[..10].try_into().ok()?, *unordered),
+        _ => return None,
+    };
+    if unordered {
+        let d = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { d.Anonymous.Buffer };
+        let element = if b.StructureByteStride > 0 {
+            u64::from(b.StructureByteStride)
+        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        };
+        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+    } else {
+        let d = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { d.Anonymous.Buffer };
+        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+    }
+}
 
 /// A structured buffer view (`first`, `count` elements of `stride` bytes,
 /// `offset` bytes into its host copy) as a raw view of the same bytes:
@@ -2140,6 +2280,22 @@ fn buffer_srv(
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
     let offset = shadow.offset(address);
+    // Off the elements of that copy: on a copy of its own bytes, from its
+    // element 0 (`own_bytes`).
+    let (shadow, offset) = {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
+            .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+        {
+            Some(own) => {
+                desc.Anonymous.Buffer.FirstElement = 0;
+                (own, 0)
+            }
+            None => (shadow, offset),
+        }
+    };
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
     let structured = unsafe { desc.Anonymous.Buffer };
@@ -2211,6 +2367,29 @@ fn buffer_uav(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
     let shadow = crate::shadow::find(address, len)?;
+    // Off the elements of that copy: on a copy of its own bytes, from its
+    // element 0 (`own_bytes`).
+    let (shadow, own) = {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        let element = if b.StructureByteStride > 0 {
+            u64::from(b.StructureByteStride)
+        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        };
+        let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
+            .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+        {
+            Some(own) => {
+                desc.Anonymous.Buffer.FirstElement = 0;
+                (own, true)
+            }
+            None => (shadow, false),
+        }
+    };
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -2226,7 +2405,7 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let offset = shadow.offset(address);
+    let offset = if own { 0 } else { shadow.offset(address) };
     // A structured view as a raw view of the same bytes (see `raw_window`).
     let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
         .then(|| raw_window(offset, buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride))
@@ -3290,5 +3469,35 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+}
+
+#[cfg(test)]
+mod own_copy_tests {
+    use super::own_bytes_if;
+
+    /// A buffer view gets a copy of its own bytes only when it has no host
+    /// view on its buffer's copy: off that copy's elements, and not a
+    /// structured view that can be a raw view of the same bytes.
+    #[test]
+    fn a_view_off_its_copys_elements_gets_its_own_bytes() {
+        let base = 0xd_9000_0000u64;
+        // On an element: the buffer's copy (the two cases of every run's
+        // log are the ones below).
+        assert_eq!(own_bytes_if(true, 24, base, 3, 10, 12, 0, false), None);
+        assert_eq!(own_bytes_if(true, 0, base, 0, 10, 12, 0, false), None);
+        // A typed view of 12-byte elements, 5,222,240 bytes into its copy
+        // (8 past an element): its own bytes, from its first element.
+        assert_eq!(own_bytes_if(true, 5_222_240, base, 3, 10, 12, 0, false), Some((base + 36, 120)));
+        // A structured view of 32-byte elements 8 bytes in: not on 16, so
+        // no raw view of the copy either.
+        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 32, 32, true), Some((base + 64, 128)));
+        // The same 16 bytes in: off its elements, but a raw view of the
+        // copy's bytes does (as before).
+        assert_eq!(own_bytes_if(true, 16, base, 2, 4, 32, 32, true), None);
+        // No elements, no size, or the switch off: as before.
+        assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
+        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
+        assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
     }
 }

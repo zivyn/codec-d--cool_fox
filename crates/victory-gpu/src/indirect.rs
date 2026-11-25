@@ -74,7 +74,20 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 asked = src_args.Load3(src_at);
+        // Diagnostics, in the budget buffer's words after the mesh ones:
+        // the largest x a compute record asked for, and the records that
+        // asked for more groups in x than one dispatch runs (they are cut
+        // to 65,535 below, so the groups past it never run). Not the
+        // garbage of a slot nothing wrote.
+        if (asked.x <= (1u << 24) && asked.y <= 64u && asked.z <= 64u) {
+            uint noted;
+            budget.InterlockedMax(12, asked.x, noted);
+            if (asked.x > 65535u) {
+                budget.InterlockedAdd(16, 1u, noted);
+            }
+        }
+        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);

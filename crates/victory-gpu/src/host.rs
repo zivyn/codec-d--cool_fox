@@ -1270,6 +1270,11 @@ pub(crate) fn dred_on() -> bool {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame line: the largest group count in x an indirect
+/// compute record asked for, and the records that asked for more than the
+/// 65,535 one dispatch runs (cut to that: the groups past it do not run).
+static COMPUTE_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether each list of a submission runs and is timed on its own, slow
 /// ones logged with their commands (`VICTORY_GPU_TIMING`, diagnostics
 /// builds; the commands are noted with `VICTORY_D3D12_DRED` on).
@@ -3990,6 +3995,9 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        // Descriptors the title copied into placed heaps directly, before
+        // command lists that index those slots are submitted.
+        crate::descriptor::sync_heaps();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5116,7 +5124,12 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                // And of its indirect compute records: the largest x asked
+                // for, and how many asked for more than a dispatch runs.
+                let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
+                COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -5799,6 +5812,13 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
         );
+        let compute_widest = COMPUTE_GROUPS[0].swap(0, Ordering::Relaxed);
+        let compute_cut = COMPUTE_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        tracing::info!(
+            "indirect compute dispatches: the largest group count in x asked for {compute_widest} (run: at most 65535),              {compute_cut:.1} records per frame asked for more and were cut to that"
+        );
+        crate::shadow::exact_line(frames);
+        crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::shadow::back_line(frames);
@@ -5892,7 +5912,7 @@ impl Meter {
                 let [kept, dropped, slots, uploaded] =
                     [0, 1, 2, 3].map(|i| crate::descriptor::host::PAGE_WRITES[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset counts, 1 acts, guards, slots, all)",
+                    "writes behind the guards, since the start: {writes} DirectStorage writes into physical pages at addresses the                      title had mapped ({} MB); {guarded} guarded 64 KiB blocks of host copies lay under them ({}); {plain} reads to                      plain addresses finished ({}); {kept} ranges under texture views kept for the texture pass ({dropped} dropped);                      {slots} slots of placed textures held their bytes, {uploaded} of them uploaded before the write ({})                      (VICTORY_PAGE_WRITES: unset or guards opens the guarded blocks, 0 counts only, 1, slots, all)",
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },

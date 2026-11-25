@@ -46,6 +46,33 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 
 ### Newest (2026-11-25, later the same day)
 
+**Update, the same night: the first room now renders right on the test
+machine** (walls, textures, people, lamps), at 190 to 450 ms a frame (2 to 5
+frames a second): the picture work has caught up, the frame rate has not.
+What did it, on top of the list below:
+- Descriptor records the title copies into its heap as plain bytes are
+  mirrored before every submission (pull request #305 by Flyander, after
+  upstream VIctory 86a5ed6). Measured here: about 40,000 records a frame
+  that no call had announced; their host slots were empty or stale.
+- A buffer view that does not start on an element of its buffer's host
+  copy gets a copy of its own bytes instead of being refused (after
+  upstream 86a5ed6): 3 to 6 such views a frame.
+- Room on the card is kept for the render targets and buffer copies a
+  world makes in its first frame: 98 buffer copies are made (945 MB) where
+  the runs before made 1, and the processor no longer compares 550 to
+  710 MB a frame looking for shader writes (25 MB now).
+- Levels on demand ran on the card for the first time
+  (`VICTORY_LEVELS_ON_DEMAND=1`, still off by default; with the fixes of
+  pull request #747 by AscilCH): 3.1 GB of the card not allocated for
+  texture levels the title does not hold, no device loss.
+- Guarded blocks under storage writes are opened by default; 14 more
+  shader programs translate; a program is translated with first-half
+  interpolation pairs only if it was refused for one (with that on for
+  every program, 8,551 working pixel programs came out changed).
+- Known and counted, not fixed yet: an indirect compute pass asks for
+  about 77,500 thread groups in x where one dispatch runs 65,535 (the
+  rest is cut off).
+
 Memory sync between the title's memory and the copies on the card:
 - **A write through one view of a physical page is seen by the copies taken
   through its other views** (`VICTORY_VIEW_GUARD=0` turns it off). The title

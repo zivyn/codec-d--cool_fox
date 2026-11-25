@@ -38,6 +38,9 @@ pub struct Settings {
     pub at: At,
     /// Frames to capture.
     pub frames: u32,
+    /// Record lists from the start on, not only once a capture is near: for
+    /// a title that submits lists it recorded long before.
+    pub always: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -52,13 +55,14 @@ pub enum At {
 }
 
 impl Settings {
-    /// From `VICTORY_RECORD`, `VICTORY_RECORD_AT` (seconds, or `f<frame>`)
-    /// and `VICTORY_RECORD_FRAMES`.
+    /// From `VICTORY_RECORD`, `VICTORY_RECORD_AT` (seconds, or `f<frame>`),
+    /// `VICTORY_RECORD_FRAMES` and `VICTORY_RECORD_ALWAYS=1`.
     pub fn from_env() -> Option<Settings> {
         let folder = PathBuf::from(std::env::var_os("VICTORY_RECORD").filter(|v| !v.is_empty())?);
         let at = parse_at(&std::env::var("VICTORY_RECORD_AT").unwrap_or_default());
         let frames = std::env::var("VICTORY_RECORD_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1);
-        Some(Settings { folder, at, frames: std::cmp::max(frames, 1) })
+        let always = std::env::var_os("VICTORY_RECORD_ALWAYS").is_some_and(|v| v == "1");
+        Some(Settings { folder, at, frames: std::cmp::max(frames, 1), always })
     }
 }
 
@@ -733,6 +737,7 @@ pub fn start(settings: Settings, device: &ID3D12Device) -> std::io::Result<PathB
     }
     let r = recorder().ok_or_else(|| std::io::Error::other("no recorder"))?;
     *lock(&r.device) = Some(device.clone());
+    r.arm(r.settings.always);
     // The newer interfaces may be other pointers (they are the same one
     // without the debug layer).
     let mut all = vec![device.as_raw()];

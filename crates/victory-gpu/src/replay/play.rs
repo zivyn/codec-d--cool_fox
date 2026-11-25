@@ -345,7 +345,7 @@ impl Player {
         player.make_masters()?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps.iter().map(|(w, d)| format!("{w} {:.1} s", d.as_secs_f64())).collect();
-        tracing::info!(seconds = began.elapsed().as_secs_f64(), "capture loaded: {}", steps.join(", "));
+        player.notes.push(format!("loaded in {:.1} s: {}", began.elapsed().as_secs_f64(), steps.join(", ")));
         Ok(player)
     }
 
@@ -635,9 +635,15 @@ impl Player {
         // version of the heaps of its own: lists are sent without waiting,
         // so a heap cannot be written between them.
         let mut now: HashMap<(u32, u32), Slot> = HashMap::new();
+        let replaced: HashSet<(u32, u32)> = self.frame.submits.iter().flat_map(|s| s.views.iter().map(|v| (v.0, v.1))).collect();
         for h in &self.frame.descriptor_heaps {
-            for (first, n, s) in &h.runs {
-                now.extend((*first..first + n).map(|i| ((h.id, i), *s)));
+            for (id, i) in replaced.iter().filter(|k| k.0 == h.id) {
+                let k = h.runs.partition_point(|run| run.0 <= *i);
+                if let Some((first, n, s)) = k.checked_sub(1).and_then(|k| h.runs.get(k))
+                    && i - first < *n
+                {
+                    now.insert((*id, *i), *s);
+                }
             }
         }
         // What each version changes against the one before.
@@ -660,6 +666,7 @@ impl Player {
             self.version_of.push(versions.len() - 1);
         }
         let mut made = HashMap::new();
+        let mut full = 0;
         for h in &self.frame.descriptor_heaps {
             let sampler = h.kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0;
             let kind = D3D12_DESCRIPTOR_HEAP_TYPE(h.kind);
@@ -703,7 +710,20 @@ impl Player {
                         all.push(same);
                         continue;
                     }
-                    let heap = make(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
+                    let heap = match make(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) {
+                        Ok(heap) => heap,
+                        // Room for no more of them: the changes go into the
+                        // last one, and lists before see them too.
+                        Err(_) if !all.is_empty() => {
+                            full += 1;
+                            let Some(Version { heap, gpu }) = all.last() else { break };
+                            let same = Version { heap: ID3D12DescriptorHeap::clone(heap), gpu: *gpu };
+                            self.device.CopyDescriptorsSimple(h.count, same.heap.GetCPUDescriptorHandleForHeapStart(), start, kind);
+                            all.push(same);
+                            continue;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
                     self.device.CopyDescriptorsSimple(h.count, heap.GetCPUDescriptorHandleForHeapStart(), start, kind);
                     let gpu = heap.GetGPUDescriptorHandleForHeapStart().ptr;
                     all.push(Version { heap, gpu });
@@ -712,6 +732,12 @@ impl Player {
             }
         }
         self.descriptors = made;
+        if versions.len() > 1 {
+            self.notes.push(format!("{} versions of the descriptor heaps (views replaced during the frame)", versions.len()));
+        }
+        if full > 0 {
+            self.note(format!("{full} versions of descriptor heaps had no room: earlier lists see later views"));
+        }
         // Render target and depth views.
         let mut views: [HashSet<Slot>; 2] = Default::default();
         for c in self.commands.iter().flatten() {
@@ -839,11 +865,12 @@ impl Player {
     fn load_contents(&mut self) -> Result<()> {
         // Idle aliases first: a change of their state may write memory the
         // one in use holds.
+        let known: HashSet<u32> = self.frame.contents.iter().map(|c| c.res).collect();
         let mut early = Vec::new();
         let mut into = Vec::new();
         for r in &self.frame.resources {
             let (Some(o), Some(state)) = (self.objects.get(&r.id), self.start.get(&r.id)) else { continue };
-            let loaded = !r.idle && self.frame.contents.iter().any(|c| c.res == r.id);
+            let loaded = !r.idle && known.contains(&r.id);
             gpu::moves(&o.res, &[COMMON], if loaded { &[COPY_DEST] } else { state }, if loaded { &mut into } else { &mut early });
         }
         let textures: Vec<(Content, u64, u64)> = self
@@ -890,7 +917,7 @@ impl Player {
         let mut back = Vec::new();
         for r in &self.frame.resources {
             let (Some(o), Some(state)) = (self.objects.get(&r.id), self.start.get(&r.id)) else { continue };
-            if !r.idle && self.frame.contents.iter().any(|c| c.res == r.id) {
+            if !r.idle && known.contains(&r.id) {
                 gpu::moves(&o.res, &[COPY_DEST], state, &mut back);
             }
         }
@@ -906,7 +933,30 @@ impl Player {
         // What the CPU had put into the memory both see by the first
         // submission: part of the start of the frame.
         let file = File::open(self.folder.join("deltas.bin"))?;
-        let first: Vec<(Delta, u64, u64)> = self.frame.submits[0].deltas.iter().map(|d| (d.clone(), d.len, d.file)).collect();
+        let named = self.named_buffers();
+        let of = |s: &wire::Submit| s.deltas.iter().filter(|d| named.contains(&d.res)).cloned().collect::<Vec<Delta>>();
+        // In memory the card cannot write, bytes looked at first when a
+        // later submission read them can stand there from the start.
+        let upload: HashSet<u32> = self
+            .frame
+            .resources
+            .iter()
+            .filter(|r| matches!(&r.place, Place::Committed { props, .. } if props.kind == D3D12_HEAP_TYPE_UPLOAD.0))
+            .map(|r| r.id)
+            .collect();
+        let mut first = of(&self.frame.submits[0]);
+        let mut seen: HashSet<(u32, u64)> = HashSet::new();
+        let pages = |d: &Delta| (d.at / 4096..(d.at + d.len).div_ceil(4096)).map(|p| (d.res, p)).collect::<Vec<_>>();
+        first.iter().for_each(|d| seen.extend(pages(d)));
+        let mut rest: Vec<Vec<Delta>> = vec![Vec::new()];
+        for s in self.frame.submits.iter().skip(1) {
+            let (early, late): (Vec<Delta>, Vec<Delta>) =
+                of(s).into_iter().partition(|d| upload.contains(&d.res) && pages(d).iter().all(|p| !seen.contains(p)));
+            early.iter().for_each(|d| seen.extend(pages(d)));
+            first.extend(early);
+            rest.push(late);
+        }
+        let first: Vec<(Delta, u64, u64)> = first.into_iter().map(|d| (d.clone(), d.len, d.file)).collect();
         self.upload(&first, &file, |player, list, parts, staging| {
             for (d, len, at) in parts {
                 if let Some(o) = player.objects.get(&d.res) {
@@ -919,11 +969,11 @@ impl Player {
         let mut later: Vec<((u64, Delta), u64, u64)> = Vec::new();
         let mut total = 0u64;
         self.delta_parts = vec![Vec::new(); self.frame.submits.len()];
-        for (i, s) in self.frame.submits.iter().enumerate().skip(1) {
-            for d in &s.deltas {
+        for (i, all) in rest.into_iter().enumerate() {
+            for d in all {
                 later.push(((total, d.clone()), d.len, d.file));
-                self.delta_parts[i].push((d.clone(), total));
                 total += d.len;
+                self.delta_parts[i].push((d, total - later.last().map_or(0, |l| l.1)));
             }
         }
         if total > 0 {
@@ -937,6 +987,46 @@ impl Player {
             })?;
         }
         Ok(())
+    }
+
+    /// The buffers the frame names, in commands or descriptors: what the CPU
+    /// writes to others (buffers it has results fetched to) is of no use.
+    fn named_buffers(&self) -> HashSet<u32> {
+        let mut named = HashSet::new();
+        let mut va = |va: &Va| {
+            if let Va::At { res, .. } = va {
+                named.insert(*res);
+            }
+        };
+        for c in self.commands.iter().flatten() {
+            match c {
+                Cmd::RootView { va: v, .. } => va(v),
+                Cmd::IndexBuffer { view: Some((v, _, _)) } => va(v),
+                Cmd::VertexBuffers { views: Some(all), .. } => all.iter().for_each(|(v, _, _)| va(v)),
+                Cmd::WriteImmediate { all } => all.iter().for_each(|(v, _, _)| va(v)),
+                _ => {}
+            }
+        }
+        for c in self.commands.iter().flatten() {
+            match c {
+                Cmd::CopyBuffer { dst, src, .. } | Cmd::CopyResource { dst, src } => named.extend([*dst, *src]),
+                Cmd::CopyTexture { dst, src, .. } => {
+                    for Loc::Sub { res, .. } | Loc::Placed { res, .. } in [dst, src] {
+                        named.insert(*res);
+                    }
+                }
+                Cmd::Indirect { args, count, .. } => named.extend([*args, *count]),
+                Cmd::ResolveQuery { dst, .. } => drop(named.insert(*dst)),
+                _ => {}
+            }
+        }
+        for h in &self.frame.descriptor_heaps {
+            named.extend(h.runs.iter().flat_map(|(_, _, s)| [s.res, s.counter]));
+        }
+        for s in &self.frame.submits {
+            named.extend(s.views.iter().flat_map(|(_, _, s)| [s.res, s.counter]));
+        }
+        named
     }
 
     /// Copies of what the frame changes; and the states it leaves.
@@ -991,7 +1081,7 @@ impl Player {
             }
             states.decay();
             if i > 0 {
-                written.extend(s.deltas.iter().map(|d| d.res));
+                written.extend(self.delta_parts[i].iter().map(|(d, _)| d.res));
             }
         }
         // Buffers any unordered-access view names.
@@ -1759,8 +1849,7 @@ impl Player {
         }
         self.picture(o, &mut report)?;
         if let Some(q) = &self.info {
-            let n = debug_messages(q);
-            report.notes.push(format!("{n} errors from the debug layer"));
+            report.notes.extend(debug_messages(q));
         }
         Ok(report)
     }
@@ -1822,6 +1911,11 @@ impl Player {
     /// What a resource holds now (after a run): a buffer's bytes, or a
     /// texture's first subresource in its copyable layout.
     pub fn contents(&mut self, id: u32) -> Result<Option<Vec<u8>>> {
+        self.contents_of(id, 0)
+    }
+
+    /// As [`Player::contents`], of a texture's subresource `sub`.
+    pub fn contents_of(&mut self, id: u32, sub: u32) -> Result<Option<Vec<u8>>> {
         let Some(o) = self.objects.get(&id) else {
             return Ok(None);
         };
@@ -1830,21 +1924,21 @@ impl Player {
         let is_buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
         let states = if self.fresh { &self.start } else { &self.end };
         let state = states.get(&id).cloned().unwrap_or(vec![COMMON]);
-        let (f, total) = if is_buffer { (Vec::new(), r.desc.width) } else { gpu::footprints(&self.device, &desc, 0, 1) };
+        let (f, total) = if is_buffer { (Vec::new(), r.desc.width) } else { gpu::footprints(&self.device, &desc, sub, 1) };
         let (back, data) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_FLAG_NONE)?;
         self.worker.run(|list| {
             if is_buffer {
                 // SAFETY: an open list; live buffers.
                 unsafe { list.CopyBufferRegion(&back, 0, &res, 0, total) };
             } else if state.len() == 1 || subs == 1 {
-                read_sub(list, &res, 0, state[0], &back, f[0]);
+                read_sub(list, &res, sub, state[0], &back, f[0]);
             } else {
                 let (mut before, mut after) = (Vec::new(), Vec::new());
                 gpu::moves(&res, &state, &[COPY_SOURCE], &mut before);
                 gpu::moves(&res, &[COPY_SOURCE], &state, &mut after);
                 // SAFETY: an open list; live resources.
                 unsafe { barriers(list, &before) };
-                read_sub(list, &res, 0, COPY_SOURCE, &back, f[0]);
+                read_sub(list, &res, sub, COPY_SOURCE, &back, f[0]);
                 // SAFETY: as above.
                 unsafe { barriers(list, &after) };
             }
@@ -1969,10 +2063,9 @@ fn make_device(frame: &Frame, debug: bool) -> Result<(ID3D12Device, Option<ID3D1
     }
 }
 
-/// Logs the debug layer's messages; how many errors.
-fn debug_messages(q: &ID3D12InfoQueue) -> usize {
-    let mut errors = 0;
-    let mut seen: HashMap<i32, u32> = HashMap::new();
+/// The debug layer's errors: how many of each kind, and its first text.
+fn debug_messages(q: &ID3D12InfoQueue) -> Vec<String> {
+    let mut seen: BTreeMap<i32, (u32, String)> = BTreeMap::new();
     // SAFETY: messages read into buffers of the size asked for.
     unsafe {
         for i in 0..q.GetNumStoredMessages() {
@@ -1987,18 +2080,14 @@ fn debug_messages(q: &ID3D12InfoQueue) -> usize {
             }
             let m = &*message;
             if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
-                errors += 1;
-                let n = seen.entry(m.ID.0).or_default();
-                *n += 1;
-                if *n <= 3 {
-                    let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
-                    tracing::warn!("D3D12 {}: {}", m.ID.0, String::from_utf8_lossy(text).trim_end_matches('\0'));
-                }
+                let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                let text = || String::from_utf8_lossy(text).trim_end_matches('\0').to_owned();
+                seen.entry(m.ID.0).or_insert_with(|| (0, text())).0 += 1;
             }
         }
         q.ClearStoredMessages();
     }
-    errors
+    seen.into_iter().map(|(id, (n, text))| format!("debug layer: {n} errors {id}, first: {text}")).collect()
 }
 
 #[cfg(test)]

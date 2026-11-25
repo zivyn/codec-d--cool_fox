@@ -1303,7 +1303,14 @@ fn timing() -> bool {
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
     #[cfg(feature = "diagnostics")]
     if crate::replay::record::on() {
-        crate::replay::record::name(object, &text());
+        let text = text();
+        crate::replay::record::name(object, &text);
+        if dred_on()
+            && let Ok(object) = object.cast::<ID3D12Object>()
+        {
+            // SAFETY: a plain call on a live object.
+            let _ = unsafe { object.SetName(&windows::core::HSTRING::from(text)) };
+        }
         return;
     }
     if dred_on()

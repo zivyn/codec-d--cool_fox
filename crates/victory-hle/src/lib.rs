@@ -19,6 +19,8 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::replay;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

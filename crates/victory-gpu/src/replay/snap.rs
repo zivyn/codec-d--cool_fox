@@ -15,7 +15,7 @@ use windows::core::Interface;
 use super::gpu::{self, Seen, Worker};
 use super::record::{At, Heap, Ours, Recorder, Res, lock, not_recorded_calls, read};
 use super::states::{COMMON, COPY_SOURCE, Change, States};
-use super::wire::{self, ALL, Cmd, Content, Delta, MISSING, NONE, Place, Slot, Va, ZERO, slot};
+use super::wire::{self, ALL, Cmd, Content, Delta, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot};
 
 type Fault = Box<dyn std::error::Error + Send + Sync>;
 
@@ -94,7 +94,8 @@ fn stop(r: &Recorder, phase: &mut Phase, e: &(dyn std::error::Error + Send + Syn
     phase.stage = Stage::Done;
     r.watching.store(false, Ordering::SeqCst);
     r.arm(false);
-    lock(&r.held).clear();
+    let held = std::mem::take(&mut *lock(&r.held));
+    drop(held);
 }
 
 pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
@@ -159,6 +160,69 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
     drop(finished);
 }
 
+/// What a submission reads of buffers, by id: parts of them (copied from),
+/// or all (read some other way).
+#[derive(Default)]
+struct Reads {
+    all: HashSet<u32>,
+    parts: HashMap<u32, Vec<(u64, u64)>>,
+}
+
+impl Reads {
+    fn note(&mut self, cmds: &[Cmd]) {
+        let (all, parts) = (&mut self.all, &mut self.parts);
+        let mut whole = |va: &Va| {
+            if let Va::At { res, .. } = va {
+                all.insert(*res);
+            }
+        };
+        for c in cmds {
+            match c {
+                Cmd::RootView { va, .. } | Cmd::IndexBuffer { view: Some((va, _, _)) } => whole(va),
+                Cmd::VertexBuffers { views: Some(views), .. } => views.iter().for_each(|(va, _, _)| whole(va)),
+                Cmd::Indirect { args, count, .. } => {
+                    for res in [*args, *count] {
+                        whole(&Va::At { res, offset: 0 });
+                    }
+                }
+                Cmd::CopyResource { src, .. } => whole(&Va::At { res: *src, offset: 0 }),
+                Cmd::CopyBuffer { src, src_at, len, .. } => parts.entry(*src).or_default().push((*src_at, src_at + len)),
+                Cmd::CopyTexture { src: Loc::Placed { res, offset, size, pitch, .. }, .. } => {
+                    // At the most: compressed formats have fewer rows.
+                    let len = u64::from(*pitch) * u64::from(size[1]) * u64::from(size[2].max(1));
+                    parts.entry(*res).or_default().push((*offset, offset + len));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The whole pages read of a buffer of `size` bytes; `viewed` by a
+    /// descriptor, all of it is.
+    fn pages(&self, id: u32, size: usize, viewed: bool) -> Vec<(usize, usize)> {
+        if viewed || self.all.contains(&id) {
+            return vec![(0, size)];
+        }
+        let Some(parts) = self.parts.get(&id) else {
+            return Vec::new();
+        };
+        let mut pages: Vec<(usize, usize)> = parts
+            .iter()
+            .map(|&(from, to)| (from as usize / PAGE * PAGE, (to as usize).next_multiple_of(PAGE).min(size)))
+            .filter(|(from, to)| from < to)
+            .collect();
+        pages.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (from, to) in pages {
+            match out.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => out.push((from, to)),
+            }
+        }
+        out
+    }
+}
+
 /// A buffer the CPU sees.
 struct CpuBuffer {
     id: u32,
@@ -191,6 +255,8 @@ struct Capture {
     contents: Vec<Content>,
     buffers: Vec<CpuBuffer>,
     known: HashSet<u32>,
+    /// Resources descriptors name, or named during the frame.
+    viewed: HashSet<u32>,
     /// Read-back buffers for the slow ones: the buffer, its mapping, size,
     /// and how much of it is taken.
     blocks: Vec<(ID3D12Resource, usize, u64, u64)>,
@@ -228,6 +294,7 @@ impl Capture {
             contents: Vec::new(),
             buffers: Vec::new(),
             known: HashSet::new(),
+            viewed: HashSet::new(),
             blocks: Vec::new(),
             deltas: File::create(r.folder.join("deltas.bin"))?,
             delta_at: AtomicU64::new(0),
@@ -464,22 +531,33 @@ impl Capture {
         Ok(())
     }
 
-    /// What changed in buffers the CPU sees since the submission before.
-    fn changed(&mut self, r: &Recorder) -> Result<Vec<Delta>, Fault> {
+    /// What changed in the buffers the CPU sees, of what a submission reads
+    /// of them, since they were last looked at (the first time: what is not
+    /// zero).
+    fn changed(&mut self, r: &Recorder, reads: &Reads) -> Result<Vec<Delta>, Fault> {
         self.new_buffers(r)?;
-        if self.buffers.iter().any(|b| b.through.is_some()) {
+        let parts: Vec<(usize, usize, usize)> = self
+            .buffers
+            .iter()
+            .enumerate()
+            .flat_map(|(i, b)| reads.pages(b.id, b.size, self.viewed.contains(&b.id)).into_iter().map(move |(from, to)| (i, from, to)))
+            .collect();
+        if parts.iter().any(|p| self.buffers[p.0].through.is_some()) {
             let (buffers, blocks) = (&self.buffers, &self.blocks);
             self.worker.run(|list| {
-                for b in buffers {
-                    if let Some((i, at)) = b.through {
+                for &(i, from, to) in &parts {
+                    let b = &buffers[i];
+                    if let Some((block, at)) = b.through {
                         // SAFETY: an open list and live buffers.
-                        unsafe { list.CopyBufferRegion(&blocks[i].0, at, &b.res, 0, b.size as u64) };
+                        unsafe { list.CopyBufferRegion(&blocks[block].0, at + from as u64, &b.res, from as u64, (to - from) as u64) };
                     }
                 }
             })?;
         }
-        let chunks: Vec<(usize, usize)> =
-            self.buffers.iter().enumerate().flat_map(|(i, b)| (0..b.size).step_by(CHUNK).map(move |at| (i, at))).collect();
+        let chunks: Vec<(usize, usize, usize)> = parts
+            .iter()
+            .flat_map(|&(i, from, to)| (from..to).step_by(CHUNK).map(move |at| (i, at, CHUNK.min(to - at))))
+            .collect();
         // Each chunk is one thread's; threads share what is kept by parts.
         struct Kept(*mut u8);
         // SAFETY: parts of it are used by one thread each.
@@ -496,8 +574,7 @@ impl Capture {
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(b, at)) = chunks.get(i) else { break };
-                        let len = CHUNK.min(buffers[b].size - at);
+                        let Some(&(b, at, len)) = chunks.get(i) else { break };
                         // SAFETY: a chunk of the buffer's memory (it may
                         // change meanwhile: what is kept is what was read)
                         // and of what is kept, which no other thread has.
@@ -531,14 +608,14 @@ impl Capture {
         } else {
             self.timed("waiting for the card", |c| Ok(c.worker.idle()?))?;
         }
-        let deltas = self.timed("what the CPU changed", |c| c.changed(r))?;
-        // Descriptors last: their memory is ready now.
+        // Descriptors first: what they name is looked at below.
         let mut written = std::mem::take(&mut *lock(&r.writes));
         let mut views = Vec::new();
         if first {
             let heaps: Vec<Arc<Heap>> = read(&r.descriptors).visible().cloned().collect();
             for h in heaps {
                 let runs = runs_of(r, &h.all());
+                self.viewed.extend(runs.iter().flat_map(|(_, _, s)| [s.res, s.counter]));
                 self.heaps.push((h, runs));
             }
         } else {
@@ -556,11 +633,18 @@ impl Capture {
                 };
                 for i in at..at + n {
                     if seen.insert((heap, i)) {
-                        views.push((heap, i, resolved(r, h.get(i))));
+                        let s = resolved(r, h.get(i));
+                        self.viewed.extend([s.res, s.counter]);
+                        views.push((heap, i, s));
                     }
                 }
             }
         }
+        let mut reads = Reads::default();
+        for l in lists.iter().flatten() {
+            reads.note(&Cmd::all(l)?);
+        }
+        let deltas = self.timed("what the CPU changed", |c| c.changed(r, &reads))?;
         let mut numbers = Vec::new();
         for l in lists {
             numbers.push(match l {
@@ -810,6 +894,11 @@ pub(super) fn read_sub(
 /// A slot as it goes into the file: a constant buffer view's address as
 /// buffer and offset.
 fn resolved(r: &Recorder, mut s: Slot) -> Slot {
+    let kind = i32::from_le_bytes([s.desc[4], s.desc[5], s.desc[6], s.desc[7]]);
+    if s.kind == slot::SRV && s.described != 0 && kind == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 {
+        r.problem("views of acceleration structures are null in the capture");
+        return Slot { kind: slot::SRV, ..Slot::EMPTY };
+    }
     if s.kind == slot::CBV && s.described != 0 {
         match r.va(s.address()) {
             Va::At { res, offset } => {
@@ -908,6 +997,32 @@ mod tests {
         assert_eq!(find(&live, &mut kept), [(PAGE, 3 * PAGE), (5 * PAGE, 5 * PAGE + 100)]);
         assert_eq!(live, kept);
         assert!(find(&live, &mut kept).is_empty());
+    }
+
+    #[test]
+    fn what_a_submission_reads() {
+        let mut reads = Reads::default();
+        let part = |from, len| Cmd::CopyBuffer { dst: 9, dst_at: 0, src: 1, src_at: from, len };
+        reads.note(&[
+            part(100, 50),
+            part(4000, 200),
+            part(20_000, 1),
+            Cmd::CopyTexture {
+                dst: Loc::Sub { res: 9, sub: 0 },
+                at: [0; 3],
+                src: Loc::Placed { res: 2, offset: 4096, format: 28, size: [16, 16, 1], pitch: 256 },
+                part: None,
+            },
+            Cmd::Indirect { signature: 1, most: 1, args: 3, at: 8, count: 0, count_at: 0 },
+            Cmd::RootView { graphics: true, kind: slot::CBV, param: 0, va: Va::At { res: 4, offset: 5 } },
+        ]);
+        assert_eq!(reads.pages(1, 1 << 20, false), [(0, 8192), (16384, 20480)]);
+        assert_eq!(reads.pages(1, 20_100, false), [(0, 8192), (16384, 20_100)], "its end");
+        assert_eq!(reads.pages(2, 1 << 20, false), [(4096, 8192)]);
+        assert_eq!(reads.pages(3, 100, false), [(0, 100)]);
+        assert_eq!(reads.pages(4, 100, false), [(0, 100)]);
+        assert_eq!(reads.pages(5, 100, true), [(0, 100)], "a descriptor names it");
+        assert!(reads.pages(5, 100, false).is_empty() && reads.pages(9, 100, false).is_empty());
     }
 
     #[test]

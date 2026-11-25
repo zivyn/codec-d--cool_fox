@@ -25,7 +25,7 @@ use windows::core::{Interface, PCSTR, s, w};
 const SIZE: u32 = 128;
 
 const DRAW: &str = r#"
-#define RS "RootConstants(num32BitConstants=2, b0), CBV(b1), DescriptorTable(SRV(t0, numDescriptors=unbounded)), StaticSampler(s0, filter=FILTER_MIN_MAG_MIP_POINT)"
+#define RS "RootConstants(num32BitConstants=2, b0), CBV(b1), DescriptorTable(SRV(t0, numDescriptors=unbounded)), DescriptorTable(Sampler(s0))"
 cbuffer Pick : register(b0) { uint pick; uint pad; };
 cbuffer Place : register(b1) { float4 place; };
 Texture2D all[] : register(t0);
@@ -43,6 +43,15 @@ V vs(uint i : SV_VertexID) {
     return v;
 }
 float4 ps(V v) : SV_Target { return all[NonUniformResourceIndex(pick)].SampleLevel(point_sampler, v.uv, 0); }
+"#;
+
+/// Triangles of vertices and indices.
+const PLAIN: &str = r#"
+#define RS "RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT)"
+struct V { float4 at : SV_Position; float3 color : COLOR; };
+[RootSignature(RS)]
+V vs(float2 at : POSITION, float3 color : COLOR1) { V v; v.at = float4(at, 0.4, 1); v.color = color; return v; }
+float4 ps(V v) : SV_Target { return float4(v.color, 1); }
 "#;
 
 /// Writes the arguments of indirect draws (two records: six vertices, and
@@ -247,9 +256,18 @@ const TO: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_DEST;
 const FROM: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
 const ARGUMENTS: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
 
+/// A texture the frames do not touch: what each subresource holds, row by
+/// row, with the rows' distance in its copyable layout.
+#[derive(PartialEq, Debug, Clone)]
+struct Still {
+    name: &'static str,
+    subs: Vec<(usize, Vec<Vec<u8>>)>,
+}
+
 /// What the program ends with.
 #[derive(PartialEq, Debug)]
 struct Outcome {
+    still: Vec<Still>,
     picture: Vec<u8>,
     image: Vec<u8>,
     sum: Vec<u8>,
@@ -264,6 +282,11 @@ struct Scene {
     value: u64,
     lists: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     draw: Made,
+    plain: Made,
+    vertices: (ID3D12Resource, *mut u8),
+    samplers: ID3D12DescriptorHeap,
+    still: Vec<(&'static str, ID3D12Resource, D3D12_RESOURCE_STATES)>,
+    copies: (ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     args: Made,
     clamp: Made,
     add: Made,
@@ -339,6 +362,26 @@ impl Scene {
             let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc).unwrap();
             record::name(&pso, "a drawing pipeline");
             let draw = Made { root, pso };
+            let (vs, ps) = (compile(PLAIN, s!("vs"), s!("vs_5_1")), compile(PLAIN, s!("ps"), s!("ps_5_1")));
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &vs).unwrap();
+            let element = |name, index, format, at| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: name,
+                SemanticIndex: index,
+                Format: format,
+                InputSlot: 0,
+                AlignedByteOffset: at,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            };
+            let elements = [
+                element(s!("POSITION"), 0, DXGI_FORMAT_R32G32_FLOAT, 0),
+                element(s!("COLOR"), 1, DXGI_FORMAT_R32G32B32_FLOAT, 8),
+            ];
+            desc.pRootSignature = std::mem::transmute_copy(&root);
+            (desc.VS, desc.PS) = (code(&vs), code(&ps));
+            desc.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elements.as_ptr(), NumElements: 2 };
+            let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc).unwrap();
+            let plain = Made { root, pso };
             let clamp = compute(device, CLAMP);
             record::name(&clamp.pso, play::CLAMP);
             let argument = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, ..Default::default() };
@@ -348,6 +391,18 @@ impl Scene {
             let heap = |kind, count, flags| -> ID3D12DescriptorHeap {
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: count, Flags: flags, NodeMask: 0 }).unwrap()
             };
+            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+            let sampler = D3D12_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MaxLOD: 8.0,
+                ..Default::default()
+            };
+            let mut at = samplers.GetCPUDescriptorHandleForHeapStart();
+            at.ptr += 2 * device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
+            device.CreateSampler(&sampler, at);
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 5000, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
             let rtvs = heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
             let dsvs = heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_NONE);
@@ -395,6 +450,41 @@ impl Scene {
                 D3D12_RESOURCE_STATE_GENERIC_READ,
             );
             let back = committed(device, In::Back, &buffer_desc(1 << 20, D3D12_RESOURCE_FLAG_NONE), TO);
+            let vertices = committed(
+                device,
+                In::Upload,
+                &buffer_desc(4096, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            );
+            let still = {
+                let blocks = D3D12_RESOURCE_DESC {
+                    MipLevels: 5,
+                    DepthOrArraySize: 3,
+                    ..texture_desc(64, DXGI_FORMAT_BC7_UNORM, D3D12_RESOURCE_FLAG_NONE)
+                };
+                let volume = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                    DepthOrArraySize: 8,
+                    MipLevels: 3,
+                    ..texture_desc(16, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_NONE)
+                };
+                let stencil = texture_desc(32, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+                let (write, read) = (D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                [("blocks", blocks, TO, READ), ("volume", volume, TO, read), ("stencil", stencil, write, write)].map(|(name, d, made_in, ends)| {
+                    let (t, _) = committed(device, In::Card, &d, made_in);
+                    record::name(&t, name);
+                    (name, t, ends)
+                })
+            };
+            let copies: (ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList) = {
+                let queue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+                    .unwrap();
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).unwrap();
+                let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).unwrap();
+                list.Close().unwrap();
+                (queue, allocator, list)
+            };
             for (r, n) in [(&sum, "sum"), (&image, "image"), (&target, "target"), (&shared.0, "shared"), (&one, "one"), (&other, "other")] {
                 record::name(r, n);
             }
@@ -410,6 +500,11 @@ impl Scene {
                 value: 0,
                 lists,
                 draw,
+                plain,
+                vertices,
+                samplers,
+                still: still.to_vec(),
+                copies,
                 args: compute(device, ARGS),
                 clamp,
                 add: compute(device, ADD),
@@ -548,6 +643,9 @@ impl Scene {
             l.SetGraphicsRoot32BitConstant(0, pick, 0);
             l.SetGraphicsRootConstantBufferView(1, self.constants.0.GetGPUVirtualAddress() + at);
             l.SetGraphicsRootDescriptorTable(2, self.views.GetGPUDescriptorHandleForHeapStart());
+            let step = self.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+            let first = self.samplers.GetGPUDescriptorHandleForHeapStart().ptr;
+            l.SetGraphicsRootDescriptorTable(3, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: first + 2 * u64::from(step) });
             l.ExecuteIndirect(&self.signature, 1, &self.scratch, record * 16, None::<&ID3D12Resource>, 0);
         }
     }
@@ -595,8 +693,127 @@ impl Scene {
             let size = SIZE as f32;
             l.RSSetViewports(&[D3D12_VIEWPORT { Width: size, Height: size, MaxDepth: 1.0, ..Default::default() }]);
             l.RSSetScissorRects(&[RECT { left: 0, top: 0, right: SIZE as i32, bottom: SIZE as i32 }]);
-            l.SetDescriptorHeaps(&[Some(self.views.clone())]);
+            l.SetDescriptorHeaps(&[Some(self.views.clone()), Some(self.samplers.clone())]);
         }
+    }
+
+    /// A triangle with vertices and indices.
+    fn triangle(&self, l: &ID3D12GraphicsCommandList, n: u32) {
+        // SAFETY: an open list; live objects; inside the mapping, which the
+        // card does not use now.
+        unsafe {
+            let x = 0.5 + 0.05 * n as f32;
+            let vertices = [[x, 0.4, 1.0, 0.0, 0.0], [x + 0.3, 0.4, 0.0, 1.0, 0.0], [x, 0.9, 0.0, 0.0, 1.0f32]];
+            self.vertices.1.cast::<[[f32; 5]; 3]>().write(vertices);
+            self.vertices.1.add(1024).cast::<[u16; 4]>().write([9, 2, 0, 1]);
+            let at = self.vertices.0.GetGPUVirtualAddress();
+            l.SetGraphicsRootSignature(&self.plain.root);
+            l.SetPipelineState(&self.plain.pso);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.IASetVertexBuffers(0, Some(&[D3D12_VERTEX_BUFFER_VIEW { BufferLocation: at, SizeInBytes: 60, StrideInBytes: 20 }]));
+            let indices = D3D12_INDEX_BUFFER_VIEW { BufferLocation: at + 1024, SizeInBytes: 8, Format: DXGI_FORMAT_R16_UINT };
+            l.IASetIndexBuffer(Some(&indices));
+            l.DrawIndexedInstanced(3, 1, 1, 0, 0);
+        }
+    }
+
+    /// Fills the textures no frame touches.
+    fn fill_still(&mut self) {
+        // SAFETY: an open list; live objects; mappings written inside their
+        // bounds.
+        unsafe {
+            let (up, data) = committed(
+                &self.device,
+                In::Upload,
+                &buffer_desc(1 << 20, D3D12_RESOURCE_FLAG_NONE),
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            );
+            for i in 0..1 << 20 {
+                data.add(i).write((i * 31 + i / 251) as u8 & 0x3b);
+            }
+            let l = self.open(0);
+            let mut at = 0;
+            for (name, t, ends) in &self.still {
+                if *name == "stencil" {
+                    let view = D3D12_DEPTH_STENCIL_VIEW_DESC {
+                        Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                        ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                        ..Default::default()
+                    };
+                    let heap: ID3D12DescriptorHeap = self
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                            NumDescriptors: 1,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    let dsv = heap.GetCPUDescriptorHandleForHeapStart();
+                    self.device.CreateDepthStencilView(t, Some(&view), dsv);
+                    let both = D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL;
+                    l.ClearDepthStencilView(dsv, both, 0.75, 3, None);
+                    let part = RECT { left: 5, top: 6, right: 20, bottom: 17 };
+                    l.ClearDepthStencilView(dsv, both, 0.25, 200, Some(&[part]));
+                    continue;
+                }
+                let desc = t.GetDesc();
+                let layers = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { desc.DepthOrArraySize };
+                for sub in 0..u32::from(layers * desc.MipLevels) {
+                    let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                    let mut total = 0;
+                    self.device.GetCopyableFootprints(&desc, sub, 1, at, Some(&mut f), None, None, Some(&mut total));
+                    at = (at + total).next_multiple_of(512);
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&up),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+                    };
+                    l.CopyTextureRegion(&sub_of(t, sub), 0, 0, 0, &from, None);
+                }
+                l.ResourceBarrier(&[moved(t, TO, *ends)]);
+            }
+            l.Close().unwrap();
+            self.send(&[&l]);
+            self.wait();
+        }
+    }
+
+    /// What they hold.
+    fn read_still(&mut self) -> Vec<Still> {
+        let mut all = Vec::new();
+        for (name, t, state) in self.still.clone() {
+            // SAFETY: as above.
+            unsafe {
+                let desc = t.GetDesc();
+                let layers = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { desc.DepthOrArraySize };
+                let planes = if name == "stencil" { 2 } else { 1 };
+                let mut subs = Vec::new();
+                for sub in 0..u32::from(layers * desc.MipLevels) * planes {
+                    let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+                    let (mut rows, mut len) = (0, 0);
+                    self.device.GetCopyableFootprints(&desc, sub, 1, 0, Some(&mut f), Some(&mut rows), Some(&mut len), None);
+                    let l = self.open(0);
+                    l.ResourceBarrier(&[moved(&t, state, FROM)]);
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: std::mem::transmute_copy(&self.back.0),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+                    };
+                    l.CopyTextureRegion(&to, 0, 0, 0, &sub_of(&t, sub), None);
+                    l.ResourceBarrier(&[moved(&t, FROM, state)]);
+                    l.Close().unwrap();
+                    self.send(&[&l]);
+                    self.wait();
+                    let pitch = f.Footprint.RowPitch as usize;
+                    let rows = (0..rows as usize * f.Footprint.Depth as usize)
+                        .map(|r| std::slice::from_raw_parts(self.back.1.add(r * pitch), len as usize).to_vec())
+                        .collect();
+                    subs.push((pitch, rows));
+                }
+                all.push(Still { name, subs });
+            }
+        }
+        all
     }
 
     fn frame(&mut self, n: u32) {
@@ -605,6 +822,7 @@ impl Scene {
         unsafe {
             self.wait();
             if n == 0 {
+                self.fill_still();
                 self.fill(0, [200, 10, 30, 255]);
                 self.fill(8192, [10, 40, 220, 255]);
                 let l = self.open(0);
@@ -630,6 +848,7 @@ impl Scene {
             self.targets(&l);
             self.quad(&l, 4000, 0, 0);
             self.quad(&l, 4001, 256, 0);
+            self.triangle(&l, n);
             // Nothing: the clamp cut it to no vertices.
             self.quad(&l, 4001, 0, 1);
             l.ResourceBarrier(&[moved(&self.scratch, ARGUMENTS, COMMON)]);
@@ -680,6 +899,18 @@ impl Scene {
             l.ResourceBarrier(&[moved(&self.target, TARGET, FROM)]);
             l.Close().unwrap();
             self.send(&[&second, &l]);
+            self.wait();
+            // Another queue fetches a result, as the host layer's relay does.
+            let (queue, allocator, list) = &self.copies;
+            allocator.Reset().unwrap();
+            list.Reset(allocator, None).unwrap();
+            list.CopyBufferRegion(&self.back.0, 1 << 18, &self.sum, 0, 1024);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            self.value += 1;
+            queue.Signal(&self.fence, self.value).unwrap();
+            self.fence.SetEventOnCompletion(self.value, self.event).unwrap();
+            WaitForSingleObject(self.event, INFINITE);
             if let Some((swap, _)) = &self.swap {
                 swap.Present(0, DXGI_PRESENT(0)).unwrap();
             }
@@ -690,6 +921,7 @@ impl Scene {
     /// What everything holds now.
     fn outcome(&mut self) -> Outcome {
         self.wait();
+        let still = self.read_still();
         let l = self.open(0);
         // SAFETY: an open list; live objects.
         unsafe {
@@ -713,12 +945,22 @@ impl Scene {
             self.wait();
             let at = |from: usize, n: usize| std::slice::from_raw_parts(self.back.1.add(from), n).to_vec();
             Outcome {
+                still,
                 picture: at(0, (SIZE * 512) as usize),
                 image: rows(&at(1 << 18, 4096)),
                 sum: at(1 << 19, 1024),
                 shared: std::slice::from_raw_parts(self.shared.1, 70_000).to_vec(),
             }
         }
+    }
+}
+
+fn sub_of(t: &ID3D12Resource, sub: u32) -> D3D12_TEXTURE_COPY_LOCATION {
+    D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: a borrowed pointer never released.
+        pResource: unsafe { std::mem::transmute_copy(t) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
     }
 }
 
@@ -782,7 +1024,19 @@ fn check(player: &mut Player, options: &Options, expected: &Outcome, what: &str)
     assert_eq!(rows(&get("image")), expected.image, "{what}: image");
     assert_eq!(get("target"), expected.picture, "{what}: target");
     assert!(get("shared") == expected.shared, "{what}: memory the CPU sees");
-    assert!(!report.notes.iter().any(|n| n.contains("recorder:") && !n.contains("submissions,") && !n.contains("waits of the")), "{what}: {:?}", report.notes);
+    for still in &expected.still {
+        let id = player.named(still.name).unwrap();
+        for (sub, (pitch, rows)) in still.subs.iter().enumerate() {
+            let have = player.contents_of(id, sub as u32).unwrap().unwrap();
+            for (r, row) in rows.iter().enumerate() {
+                assert_eq!(&have[r * pitch..][..row.len()], &row[..], "{what}: {} subresource {sub} row {r}", still.name);
+            }
+        }
+    }
+    // Nothing was left out but what another queue ran.
+    let known = ["submissions,", "waits of the drawing queue", "lists sent to a queue other than"];
+    assert!(!report.notes.iter().any(|n| n.contains("recorder:") && !known.iter().any(|k| n.contains(k))), "{what}: {:?}", report.notes);
+    assert!(report.notes.iter().any(|n| n.contains(known[2])));
     report
 }
 
@@ -813,6 +1067,10 @@ fn a_frame_is_recorded_and_replayed() {
     eprintln!("ran without the recorder");
     // Something is in the picture.
     assert!(without.sum.iter().any(|&b| b != 0));
+    for s in &without.still {
+        assert!(s.subs.iter().all(|(_, rows)| rows.iter().flatten().any(|&b| b != 0)), "{}", s.name);
+    }
+    assert_eq!(without.still.iter().map(|s| s.subs.len()).collect::<Vec<_>>(), [15, 3, 2]);
     let colors: std::collections::HashSet<[u8; 4]> =
         without.picture.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect();
     assert!(colors.len() > 30, "{}", colors.len());
@@ -821,12 +1079,12 @@ fn a_frame_is_recorded_and_replayed() {
     // frame whose lists are all recorded comes first).
     assert!(!record::on());
     let dir = tempfile::tempdir().unwrap();
-    let settings = Settings { folder: dir.path().to_owned(), at: At::Frame(1), frames: 1 };
+    let settings = Settings { folder: dir.path().to_owned(), at: At::Frame(1), frames: 1, always: false };
     let folder = record::start(settings, &device).unwrap();
     assert!(record::on());
     assert_ne!(table_of(&device), own, "the device is hooked");
     assert!(
-        record::start(Settings { folder: dir.path().to_owned(), at: At::Trigger, frames: 1 }, &device).is_err(),
+        record::start(Settings { folder: dir.path().to_owned(), at: At::Trigger, frames: 1, always: false }, &device).is_err(),
         "one recorder a process"
     );
     eprintln!("recorder on");

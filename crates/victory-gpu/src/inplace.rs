@@ -462,6 +462,28 @@ pub(crate) fn shown_bytes(at: usize, len: usize) -> Option<u64> {
     any.then_some(there)
 }
 
+/// What of `[at, at + len)` views of physical pages show, in order, pieces
+/// that touch as one: (address, bytes). Empty: nothing, or memory of another
+/// kind.
+pub(crate) fn shown_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = at.saturating_add(len);
+    let v = views();
+    let first = v.views.range(..=at).next_back();
+    let rest = v.views.range(at.saturating_add(1)..end.max(at.saturating_add(1)));
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (&base, view) in first.into_iter().chain(rest) {
+        let (from, to) = (base.max(at), base.saturating_add(view.0).min(end));
+        if from >= to {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((run, bytes)) if *run + *bytes == from => *bytes += to - from,
+            _ => runs.push((from, to - from)),
+        }
+    }
+    runs
+}
+
 /// How the views cover `[at, at + len)`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum Cover {
@@ -1222,8 +1244,15 @@ mod tests {
         assert_eq!(shown(5 * K64 + 1, 10), Some(10));
         assert_eq!(shown(2 * K64, 2 * K64), None);
         assert_eq!(shown(6 * K64, 2 * K64), None);
+        // The same as runs: views that touch are one, cut to the range.
+        let runs = |from: usize, len: usize| super::shown_runs(at + from, len);
+        assert_eq!(runs(0, 8 * K64), vec![(at, 2 * K64), (at + 4 * K64, 2 * K64)]);
+        assert_eq!(runs(100, K64), vec![(at + 100, K64)]);
+        assert_eq!(runs(5 * K64 + 1, 10), vec![(at + 5 * K64 + 1, 10)]);
+        assert_eq!(runs(2 * K64, 2 * K64), vec![]);
         super::views_gone(at + K64, K64);
         assert_eq!(shown(0, 2 * K64), Some(K64 as u64));
+        assert_eq!(runs(0, 2 * K64), vec![(at, K64)]);
         super::views_gone(at, 8 * K64);
         assert_eq!(shown(0, 8 * K64), None);
     }

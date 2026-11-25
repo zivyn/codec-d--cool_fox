@@ -1596,6 +1596,22 @@ pub(crate) fn again_after_change(since: u64, mut f: impl FnMut() -> bool) -> boo
     false
 }
 
+/// Returns when the change of a mapping that is under way, if one is, is
+/// over (or has been going on for 2 ms): pages it took away for its moment
+/// are back. Another may have begun.
+pub(crate) fn change_over() {
+    let now = changes();
+    if now.is_multiple_of(2) {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while changes() == now && started.elapsed().as_millis() < 2 {
+        for _ in 0..50 {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 /// [`changes`], when no change is under way (or one has been for a second).
 fn change_done() -> u64 {
     let mut tries = 0;

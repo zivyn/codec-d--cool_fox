@@ -704,6 +704,41 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// What is there of a range some of whose pages are not: those bytes,
+    /// counted, and zeros for the rest, whatever the buffer held.
+    #[test]
+    fn what_is_there_is_read_and_the_rest_is_zeros() {
+        use windows_sys::Win32::System::Memory::*;
+        const SIZE: usize = 0x8_0000;
+        // SAFETY: a reservation of ours; only committed pages are written.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!at.is_null());
+            // 0-0x1_1000 and 0x3_0000-0x4_0000 are there.
+            for (from, len) in [(0, 0x1_1000), (0x3_0000, 0x1_0000)] {
+                assert!(!VirtualAlloc(at.add(from).cast(), len, MEM_COMMIT, PAGE_READWRITE).is_null());
+                at.add(from).write_bytes(0x5a, len);
+            }
+            // From an address inside a page, as textures are packed.
+            let mut out = vec![0x77u8; SIZE - 0x300];
+            assert_eq!(super::read_there(at.add(0x300), &mut out), 0x1_1000 - 0x300 + 0x1_0000);
+            for (i, &b) in out.iter().enumerate() {
+                let from = i + 0x300;
+                let there = from < 0x1_1000 || (0x3_0000..0x4_0000).contains(&from);
+                assert_eq!(b, if there { 0x5a } else { 0 }, "byte {from:#x}");
+            }
+            // All there: one read.
+            let mut out = vec![0x77u8; 0x1_0000];
+            assert_eq!(super::read_there(at.add(0x1000), &mut out), 0x1_0000);
+            assert!(out.iter().all(|&b| b == 0x5a));
+            // Nothing there.
+            let mut out = vec![0x77u8; 0x1_0000];
+            assert_eq!(super::read_there(at.add(0x5_0000), &mut out), 0);
+            assert!(out.iter().all(|&b| b == 0));
+            assert_ne!(VirtualFree(at.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     /// Zeros for a title destination that went meanwhile are no fault.
     #[test]
     fn zeros_where_nothing_is_are_lost() {
@@ -6761,6 +6796,47 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+/// Reads what is there of the `dst.len()` bytes of title memory at `src`,
+/// zeros for the rest; returns how many bytes were there. Safe while the
+/// runtime remaps title memory (the kernel, or a copy that takes the fault,
+/// reads). What the runtime's record says is mapped is read in one go each,
+/// and by pieces where that fails; memory it has no record of by pieces.
+pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
+    dst.fill(0);
+    let (start, len) = (src as usize, dst.len());
+    let mut got = 0;
+    let mut runs = crate::inplace::shown_runs(start, len);
+    if runs.is_empty() {
+        runs.push((start, len));
+    }
+    for (at, n) in runs {
+        let piece = &mut dst[at - start..at - start + n];
+        if read_into(at as *const u8, piece) {
+            got += n;
+            continue;
+        }
+        // (What failed may have written its first pages.)
+        piece.fill(0);
+        for_pieces(at, n, 64 << 10, |from, n| {
+            let piece = &mut dst[from - start..from - start + n];
+            if read_into(from as *const u8, piece) {
+                got += n;
+                return;
+            }
+            piece.fill(0);
+            for_pieces(from, n, 4 << 10, |from, n| {
+                let piece = &mut dst[from - start..from - start + n];
+                if read_into(from as *const u8, piece) {
+                    got += n;
+                } else {
+                    piece.fill(0);
+                }
+            });
+        });
+    }
+    got
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
@@ -7079,11 +7155,14 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if through + left > 0.0 {
+            let [through, left, filled, short] =
+                [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if through + left + filled > 0.0 {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
+                     {filled:.1} first fillings from the pages there (VICTORY_TEXTURE_FILL=0: left empty), {short:.1} of them \
+                     with less than was mapped (looked at again)"
                 );
             }
         }

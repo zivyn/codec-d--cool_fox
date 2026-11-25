@@ -31,6 +31,7 @@ use super::wire::{
 
 pub mod diverge;
 mod merge;
+pub mod pixel;
 mod upcopies;
 
 /// The name of the argument clamp's pipeline, by which its passes are
@@ -359,6 +360,12 @@ pub fn listing(folder: &Path, lists: (u32, u32), line: &mut dyn FnMut(&str)) -> 
                 other => format!("{other:?}"),
             };
             line(&format!("buffer {} {} bytes, {place}: {}", r.id, r.desc.width, r.name));
+        } else {
+            let d = &r.desc;
+            line(&format!(
+                "texture {} {}x{}x{} mips {} f{}: {}",
+                r.id, d.width, d.height, d.depth, d.mips, d.format, r.name
+            ));
         }
     }
     let mut place = 0;
@@ -464,6 +471,8 @@ pub struct Player {
     card_writes: HashSet<u32>,
     /// The results of clamp passes ([`RESULTS`]).
     results: Option<ID3D12Resource>,
+    /// Other buffers of ours that commands name.
+    extra: HashMap<u32, ID3D12Resource>,
     commands: Vec<Vec<Cmd>>,
     /// Resources in the states of the start (not those of the end).
     fresh: bool,
@@ -531,6 +540,7 @@ impl Player {
             merging: false,
             card_writes: HashSet::new(),
             results: None,
+            extra: HashMap::new(),
             commands,
             fresh: true,
             at: States::default(),
@@ -628,7 +638,10 @@ impl Player {
         if id == RESULTS {
             return self.results.as_ref();
         }
-        self.objects.get(&id).map(|o| &o.res)
+        self.objects
+            .get(&id)
+            .map(|o| &o.res)
+            .or_else(|| self.extra.get(&id))
     }
 
     fn va(&self, va: &Va) -> u64 {

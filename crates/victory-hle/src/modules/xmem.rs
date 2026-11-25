@@ -723,6 +723,21 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
         .is_some_and(|pages| pages.iter().all(|page| physical.pages.contains_key(page)))
 }
 
+/// Where the title sees the pages under bytes `[offset, offset + len)` now,
+/// in order (for the streaming trace: whether that changed while a request
+/// wrote them).
+pub(crate) fn pages_shown(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let physical = physical();
+    let numbers = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or_default();
+    let mut shown: Vec<(usize, usize)> = numbers
+        .iter()
+        .filter_map(|n| physical.pages.get(n))
+        .flat_map(|slice| physical.shown_at(slice, 1))
+        .collect();
+    shown.sort_unstable();
+    shown
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view

@@ -155,17 +155,18 @@ fn the_size_of_a_heap_texture_nothing_reads() {
     }
 }
 
-/// Without the height nothing tells a 2D texture from the others, and a
-/// volume's depth or an array's layers are no 2D texture's.
+/// Without the height nothing tells a 2D texture from the others: taken for
+/// one, as most are. A volume's depth or an array's layers are no 2D
+/// texture's.
 #[test]
-fn sizes_of_unknown_dimensions_stay_untranslated() {
+fn sizes_of_a_volume_or_an_array_stay_untranslated() {
     let width = [
         0x9004_9E09, // s_lshr_b32 s4, s9, 30
         0x8F05_820A, // s_lshl_b32 s5, s10, 2
         0x8804_0504, // s_or_b32 s4, s4, s5
     ];
     let words = [TABLE, FROM_HEAP, &width, STORE].concat();
-    assert!(build(&words, (8, 0)).is_err());
+    assert!(build(&words, (8, 0)).is_ok());
     let depth = [
         0x8805_0C05, // s_or_b32 s5, s5, s12
     ];

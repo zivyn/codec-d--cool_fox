@@ -1451,10 +1451,46 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
     match memory {
         // What is kept for card copies of title buffers not made yet
-        // counts as used (`crate::shadow::card_room_kept`; 0 by default).
-        Some([budget, used, ..]) => used + crate::shadow::card_room_kept() < budget / 100 * room_percent(),
+        // (`crate::shadow::card_room_kept`) and for the render targets a
+        // world makes in its first frame ([`targets_room_kept`]) counts as
+        // used.
+        Some([budget, used, ..]) => {
+            used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
+        }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The bytes of the card's memory the texture queue leaves free for
+/// render targets and other host copies the host itself writes that are
+/// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
+/// before) less what such copies hold now.
+///
+/// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
+/// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
+/// on, none of them idle (run 198's census). They are made with no room
+/// test, in the same frame as the card copies of title buffers (762 MB),
+/// after the texture queue has filled the card to its line with textures
+/// written while the world loaded (7.3 GB of them at the first world frame
+/// of run 193, of which 2.3 GB were let go again within 13 seconds). The
+/// card then stood at 99 to 100.5 % of its budget, buffer copies were
+/// turned down for good (31 of 95 made: the frame 355 ms where 95 give
+/// 238), and the queue was refused from the first world frame on. With
+/// their room kept, the queue stops that much earlier while the world
+/// loads and gets it back as the targets are made.
+#[cfg(windows)]
+pub(crate) fn targets_room_kept() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+    });
+    // Every host texture's bytes less those of the copies the title fills.
+    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    most.saturating_sub(targets)
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question

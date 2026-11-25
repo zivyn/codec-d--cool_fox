@@ -309,7 +309,23 @@ pub struct UserData {
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
+///
+/// A program refused because the first half of an interpolation is read as
+/// data is translated once more with first halves evaluated as the pair
+/// they start (`lower::with_first_half_pairs`), and only such a program:
+/// with that on for every program, 8,551 pixel programs of the title that
+/// already translated came out changed (an extra evaluation in each), for
+/// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_plain(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| translate_plain(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)

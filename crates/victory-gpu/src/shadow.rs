@@ -244,10 +244,26 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// used, and a copy may be made up to nine tenths of the budget: the room
 /// it takes was kept for it. After the burst what is kept is what the
 /// burst left of the limit (87 MB of 1,024 in run 189).
+///
+/// On by default from the build after run 199
+/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=0`: off, as before). Run 193 had it on and still made 31 copies of 95: the copies
+/// and the world's render targets (+1,603 MB) arrive in the same first
+/// world frame and raced for the 448 MB left under the line, and a copy
+/// turned down is not asked for again (`lookup` asks once), while its room
+/// went on being kept (616 MB to the end of the run). So now: the texture
+/// queue also keeps room for the targets (`resource::targets_room_kept`),
+/// a copy is made up to 97 hundredths of the budget (its room was kept),
+/// and the room of a copy turned down is given up ([`CARD_REFUSED`]).
 fn card_room_kept_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_BUFFERS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_BUFFERS").is_none_or(|v| v != "0"))
 }
+
+/// Title buffers big enough for a copy in the card's memory that were
+/// turned down for want of room, since the start, and their bytes: their
+/// copies stay in the PC's memory for as long as the title keeps the
+/// buffers, so no room is kept for them any more.
+static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
@@ -256,7 +272,7 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed))
+    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.
@@ -341,10 +357,30 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
-    let tenths = if card_room_kept_on() { 9 } else { 8 };
+    let hundredths = if card_room_kept_on() { 97 } else { 80 };
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * tenths
+        && used + size > budget / 100 * hundredths
     {
+        // Said, with the numbers it was decided by: run 193 made 31 copies
+        // of 95 and no line named the others. The first 64, then every
+        // 32nd.
+        let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+        if n <= 64 || n.is_multiple_of(32) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
+                 {} MB; the copies made hold {} MB of at most {} MB; {} buffers turned down so far ({} MB), frame {}",
+                size >> 10,
+                used >> 20,
+                budget >> 20,
+                (budget / 100 * hundredths) >> 20,
+                CARD_BYTES[0].load(Ordering::Relaxed) >> 20,
+                most >> 20,
+                n,
+                bytes >> 20,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
@@ -4428,55 +4464,6 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
         .min()
 }
 
-/// Copies of single views' bytes ([`own_bytes`]), by (start, length), with
-/// the use that last asked for each.
-#[allow(clippy::type_complexity)]
-static OWN: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
-
-/// Copies [`OWN`] keeps: ring positions change every frame, so the least
-/// recently asked for go (lists and heap slots using one keep its buffer
-/// alive).
-/// shortcut: a slot whose view goes unused while this many others are asked
-/// for shows the buffer of a copy that is made anew at its next use.
-const OWN_KEPT: usize = 1024;
-/// The largest of them: one this long is no parameter block.
-const OWN_MOST: u64 = 4 << 20;
-
-/// A host copy of the `len` bytes at `address` alone, for a view no host
-/// view of its buffer's copy can stand for (it would not begin where host
-/// views may; upstream 86a5ed6). What other views' shaders write there in the
-/// same submission it does not see: it is as title memory is at the
-/// submission, and what is written through it goes back there after.
-/// `None`: no view the title made on purpose (off its dwords, empty or huge).
-pub(crate) fn own_bytes(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    if len == 0 || len > OWN_MOST || !address.is_multiple_of(4) {
-        return None;
-    }
-    let mut guard = OWN.lock().unwrap_or_else(|e| e.into_inner());
-    let (tick, map) = &mut *guard;
-    *tick += 1;
-    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
-        *used = *tick;
-        return Some(shadow.clone());
-    }
-    if map.len() >= OWN_KEPT
-        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
-    {
-        map.remove(&oldest);
-    }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
-    map.insert((address, len), (shadow.clone(), *tick));
-    OWN_MADE.fetch_add(1, Ordering::Relaxed);
-    Some(shadow)
-}
-
-/// Copies of single views' bytes made since the start.
-pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
-
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
@@ -4553,6 +4540,88 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     Some(shadow)
+}
+
+/// Copies of single buffer views' own bytes ([`exact`]), by (start,
+/// bytes), each with the asking that last took it; and the askings so far.
+#[allow(clippy::type_complexity)]
+static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Since the last frame line: askings for such copies, and copies made.
+static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A copy of the title memory `[address, address + len)` that starts at
+/// `address` itself: for a buffer view whose bytes do not start on an
+/// element of the copy its buffer has (`descriptor/host.rs` `view_home`).
+/// A host view counts its first element from its buffer's start; a console
+/// view starts at any address, and the title places views at ring
+/// positions inside its big GPU heap. Such a view was refused and its slot
+/// read zeros ("buffer view not on an element of its host copy", in every
+/// run; upstream VIctory 86a5ed6 found its meshlet culling constants and
+/// colour-bake parameter blocks among them and gives each a copy of its
+/// own bytes, as here).
+///
+/// The copy is brought up to date and written back like any other (a list
+/// refreshes the copy its view's slot shows, `buffer_copy`). Kept by
+/// (start, bytes) for as long as a list or a slot holds it; of the others,
+/// those not asked for lately go once there are many (ring positions
+/// change every frame).
+pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    /// Copies kept before the idle ones are looked for, and the askings an
+    /// idle one stays for.
+    const MANY: usize = 256;
+    const LATELY: u64 = 512;
+    /// The largest, and no view the title made on purpose: off its dwords.
+    const MOST: u64 = 64 << 20;
+    if len == 0 || len > MOST || !address.is_multiple_of(4) {
+        return None;
+    }
+    EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    let now = *tick;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = now;
+        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+        return Some(shadow.clone());
+    }
+    if map.len() >= MANY {
+        // Held by the map alone (no list), its buffer by the copy alone (no
+        // slot shows it), and not asked for lately.
+        map.retain(|_, (shadow, used)| {
+            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
+        });
+    }
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    map.insert((address, len), (shadow.clone(), now));
+    EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
+    OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    Some(shadow)
+}
+
+/// Copies of single views' bytes made since the start.
+pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// With the frame line: the buffer views that got a copy of their own
+/// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
+/// Nothing while there are none.
+pub(crate) fn exact_line(frames: f64) {
+    let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    if asked == 0 {
+        return;
+    }
+    let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+    tracing::info!(
+        "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_BYTES=0 refuses them again): \
+         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
+        asked as f64 / frames,
+        made as f64 / frames
+    );
 }
 
 #[cfg(test)]

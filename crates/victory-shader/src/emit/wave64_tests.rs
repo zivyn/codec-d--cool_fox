@@ -95,10 +95,20 @@ fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgram {
 
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
 fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
+    lowered_on(native, p, wide, 32)
+}
+
+/// [`lowered`] for a host whose waves have at most `host_wave` lanes.
+fn lowered_on(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
-    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
     let lowered = lower::lower(&lower::Parts {
         native,
         p,
@@ -352,6 +362,76 @@ fn a_sum_of_halves_where_not_every_lane_runs_on_a_wave_of_64() {
             return;
         };
         assert_eq!(out, u32::from(tree[0]), "lanes from {from}");
+    }
+}
+
+/// The console's 16-bit wave sum where the lanes at or past s0 have left the program (a
+/// thread past the end of the data): on the console they add +0, and after each step of the
+/// tree they hold their run's partial sum all the same. On a host of 64-lane waves (AMD) the
+/// lanes that are here read each partner run's sum from a lane of it that is here.
+#[test]
+fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
+    let mut words = vec![
+        0x7DA8_0000, // v_cmpx_gt_u32 exec, s0, v0: the lanes below s0 stay
+        0, // s_cbranch_execz to the end (filled in below)
+        0x340C_0085, // v_lshlrev_b32 v6, 5, v0
+        0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+        0x4A0E_0F06, // v_add_nc_u32 v7, v6, v7
+        0x4A0E_0F00, // v_add_nc_u32 v7, v0, v7
+        0x4A0E_0EFF,
+        0x0000_3C00, // v_add_nc_u32 v7, 0x3c00, v7
+    ];
+    words.extend(super::wave::WAVE_OR_V7_TO_S7.iter().map(|&w| if w >> 25 == 28 { w & 0x01FF_FFFF | 50 << 25 } else { w }));
+    words.extend_from_slice(&[
+        0x7E00_0207, // v_mov_b32 v0, s7
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ]);
+    // past every word after it, to the program's end
+    words[1] = 0xBF88_0000 | (words.len() as u32 - 2);
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on(&native, &p, &HashSet::new(), 64).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let wide = |h: u16| {
+        if h == 0 {
+            0.0
+        } else {
+            f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13)
+        }
+    };
+    let narrow = |f: f32| {
+        if f == 0.0 {
+            return 0;
+        }
+        let b = f.to_bits();
+        let h = ((b >> 23) - 112) << 10 | (b >> 13 & 0x3FF);
+        let rest = b & 0x1FFF;
+        (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
+    };
+    let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = false;
+    for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
+        let terms: Vec<u16> = (0..64u32)
+            .map(|t| if t < stay { (0x3C00 + 37 * t) as u16 } else { 0 })
+            .collect();
+        let mut tree = terms.clone();
+        while tree.len() > 1 {
+            tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
+        }
+        let Some(got) = on_the_card(&shader, [stay, 0]) else {
+            return;
+        };
+        ran = true;
+        // (the high half is lane 0's term's: zero)
+        assert_eq!(got, u32::from(tree[0]), "{stay} lanes stay: got {got:#x}, the console's tree {:#x}", tree[0]);
+    }
+    if ran {
+        eprintln!("ran on the hardware device: the console's tree with lanes gone, in every case");
     }
 }
 

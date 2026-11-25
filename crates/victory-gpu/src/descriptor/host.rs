@@ -26,6 +26,10 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// A fingerprint of the record each slot held when the pass over
+    /// records copied in as bytes last looked at it
+    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
+    copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -806,14 +810,14 @@ fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
 /// the title puts parameter blocks at ring positions: a raw view of 128 bytes
 /// at 8 (the colour table bakes'), structured ones of elements that are no
 /// divisor of their place (the culling's 456-byte constants). Such a view gets
-/// a copy of its own bytes ([`crate::shadow::own_bytes`]).
+/// a copy of its own bytes ([`crate::shadow::exact`]). (A typed view of
+/// 12-byte elements at a multiple of 16 that is none of 12 is one of them: it
+/// was passed over, and stayed null.)
 fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
-    if offset.is_multiple_of(16) {
-        false
-    } else if raw {
-        true
+    if raw {
+        !offset.is_multiple_of(16)
     } else if stride > 0 {
-        !offset.is_multiple_of(u64::from(stride))
+        !offset.is_multiple_of(16) && !offset.is_multiple_of(u64::from(stride))
     } else {
         element > 0 && !offset.is_multiple_of(element)
     }
@@ -837,14 +841,14 @@ fn view_home(
     let Some(offset) = shadow.offset_in(start).map(|_| shadow.offset(start)) else {
         return shadow;
     };
-    if offset.is_multiple_of(16) || !view_bytes() {
+    if !view_bytes() {
         return shadow;
     }
     let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
     if !off_elements(offset, stride, raw, element) {
         return shadow;
     }
-    crate::shadow::own_bytes(start, len).unwrap_or(shadow)
+    crate::shadow::exact(start, len).unwrap_or(shadow)
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -1031,6 +1035,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
@@ -1908,6 +1913,45 @@ impl HostHeap {
         }
     }
 
+    /// For a slot on a page of the title's heap that changed with no call
+    /// (`super::sync_heaps`: the title copies records into its heap as
+    /// bytes): [`HostHeap::mirror`], if the `bytes` bytes of the record at
+    /// `handle` are not the ones this last saw there. True if it did.
+    ///
+    /// The page says only that something on it was written, and `mirror`
+    /// by itself would take every buffer or placed-texture record on it for
+    /// newly written each time (it leaves such a slot unmade until a draw
+    /// or a pass uses it): the texture queue's entry for the slot would
+    /// start again, and the buffer pass would look at 2,048 slots for one
+    /// that changed.
+    /// `record`: the record's bytes as the caller read them (through the
+    /// kernel, which fails on a page the title unmapped meanwhile where a
+    /// read in place would fault: the title unmaps heap pages too).
+    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
+        if index >= self.count {
+            return false;
+        }
+        let n = record.len();
+        // Never 0, which is "never looked at".
+        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            let Some(last) = copied.get_mut(index as usize) else {
+                return false;
+            };
+            // A slot never looked at that holds nothing: as it was.
+            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
+                return false;
+            }
+            *last = print;
+        }
+        self.mirror(index, handle, false);
+        true
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -1991,6 +2035,16 @@ impl HostHeap {
             self.keep(index, kept.flatten());
         }
         Some(view)
+    }
+
+    /// Whether slot `index` is backed by a made host descriptor (tests).
+    #[cfg(test)]
+    pub(crate) fn made(&self, index: u32) -> bool {
+        self.made
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|&key| key != 0)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -3157,6 +3211,9 @@ mod tests {
         assert!(!off_elements(456, 456, false, 0));
         assert!(!off_elements(32, 456, false, 0));
         assert!(off_elements(100, 456, false, 0));
+        // A typed view of 12-byte elements on 16 bytes and not on an element.
+        assert!(off_elements(23_702_896, 0, false, 12));
+        assert!(!off_elements(48, 0, false, 12));
         assert!(!off_elements(12, 0, false, 4));
         assert!(off_elements(12, 0, false, 8));
     }

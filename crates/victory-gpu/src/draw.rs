@@ -1946,7 +1946,12 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room(memory);
+        let mut room = crate::resource::room(memory);
+        // Bytes uploaded by this pass since the card was last asked
+        // whether it has room: asked again every 32 MiB (a pass may upload
+        // 192 MB and more, and one asking a pass let the queue run some
+        // 400 MB past its line while the world loaded: run 193).
+        let mut since_asked = 0u64;
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
@@ -2211,6 +2216,11 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            since_asked += bytes;
+            if room && since_asked >= 32 << 20 {
+                since_asked = 0;
+                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+            }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {

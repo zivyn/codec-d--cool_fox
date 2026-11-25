@@ -302,11 +302,9 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
-    let mut spent = [0u64; 4];
+    let mut spent = [0u64; 3];
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
-    let mut kinds = [0u64; 6];
-    let mut page_bytes: Vec<u8> = Vec::new();
-    let mut changed: Vec<u32> = Vec::new();
+    let mut kinds = [0u64; 5];
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -344,87 +342,121 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
+        let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
-                let from = page.max(range_from);
-                let to = (page + crate::watch::PAGE).min(range_end);
+                parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end)));
+                page += crate::watch::PAGE;
+            }
+        }
+        // A few pages a thread at a time: read, compared with what was last
+        // seen there and sorted out, beside one another (14 ms a frame of one
+        // thread at 160 pages, run faults-6).
+        let began = std::time::Instant::now();
+        let copied = host.copied_begin(step as usize);
+        let samplers = heap.samplers();
+        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+        crate::land::each_view(true, found.len(), &|n| {
+            let mut out = SyncPart::default();
+            let mut page_bytes: Vec<u8> = Vec::new();
+            let mut changed: Vec<u32> = Vec::new();
+            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                let began = std::time::Instant::now();
-                let there = crate::host::read_into(from as *const u8, &mut page_bytes);
-                spent[1] += since(began);
-                if there {
-                    pages += 1;
-                    views += u64::from(crate::watch::guarded(from, to));
-                    bytes += (to - from) as u64;
-                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    // A record that straddles the range's ends is left
-                    // to the range that holds its first byte.
-                    let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
-                    let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
-                        page += crate::watch::PAGE;
-                        continue;
-                    };
-                    let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
-                    looked += count;
-                    // Only the records that are not the ones last seen
-                    // there (`HostHeap::copied_changes`).
-                    changed.clear();
-                    let began = std::time::Instant::now();
-                    host.copied_changes(first as u32, &records[..(count * step) as usize], step as usize, &mut changed);
-                    spent[2] += since(began);
-                    for &index in &changed {
-                        let at = (u64::from(index) - first) as usize * step as usize;
-                        let word = |n: usize| {
-                            records
-                                .get(at + 4 * n..at + 4 * n + 4)
-                                .and_then(|b| b.try_into().ok())
-                                .map_or(0, u32::from_le_bytes)
-                        };
-                        if !heap.samplers() && word(0) == VIEW_TAG {
-                            // A draw's own table: the draw makes what it
-                            // reads of it (`draw.rs` `tables`).
-                            if host.copied_tabled(index, frame) {
-                                tabled += 1;
-                                continue;
-                            }
-                            // Buffer views and placed textures get no host
-                            // slot from this anyway, they wait for a draw
-                            // or a pass: noted some frames on, unless a
-                            // draw's table turns out to hold them.
-                            if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
-                                wait.push(index);
-                                later += 1;
-                                continue;
-                            }
-                        }
-                        make.push(index);
-                        mirrored += 1;
-                        kinds[if heap.samplers() {
-                            3
-                        } else if word(0) != VIEW_TAG {
-                            0
-                        } else if word(2) >> KIND_SHIFT == 0 {
-                            1
-                        } else {
-                            2
-                        }] += 1;
-                        kinds[5] += u64::from(!heap.samplers() && host.near_tabled(index, frame));
-                    }
+                if !crate::host::read_into(from as *const u8, &mut page_bytes) {
+                    continue;
                 }
-                page += crate::watch::PAGE;
+                out.pages += 1;
+                out.views += u64::from(crate::watch::guarded(from, to));
+                out.bytes += (to - from) as u64;
+                let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                // A record that straddles the range's ends is left
+                // to the range that holds its first byte.
+                let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
+                let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
+                    continue;
+                };
+                let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
+                out.looked += count;
+                // Only the records that are not the ones last seen
+                // there (`host::Copied::changes`).
+                changed.clear();
+                // SAFETY: the parts are ranges of the heap apart from one
+                // another, and only records that lie whole in one are its.
+                unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                for &index in &changed {
+                    let at = (u64::from(index) - first) as usize * step as usize;
+                    let word = |n: usize| {
+                        records
+                            .get(at + 4 * n..at + 4 * n + 4)
+                            .and_then(|b| b.try_into().ok())
+                            .map_or(0, u32::from_le_bytes)
+                    };
+                    if !samplers && word(0) == VIEW_TAG {
+                        // A draw's own table: the draw makes what it
+                        // reads of it (`draw.rs` `tables`).
+                        if host.copied_tabled(index, frame) {
+                            out.tabled += 1;
+                            continue;
+                        }
+                        // Buffer views and placed textures get no host
+                        // slot from this anyway, they wait for a draw
+                        // or a pass: noted some frames on, unless a
+                        // draw's table turns out to hold them.
+                        if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                            out.wait.push(index);
+                            continue;
+                        }
+                    }
+                    // No view, in a slot that shows none: nothing to make or
+                    // unmake (32,000 of 41,000 a frame on the water, run
+                    // b2-water).
+                    if word(0) != VIEW_TAG && host.shows_none(index) {
+                        out.nothing += 1;
+                        continue;
+                    }
+                    out.make.push(index);
+                    out.kinds[if samplers {
+                        3
+                    } else if word(0) != VIEW_TAG {
+                        0
+                    } else if word(2) >> KIND_SHIFT == 0 {
+                        1
+                    } else {
+                        2
+                    }] += 1;
+                }
+            }
+            *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
+        });
+        drop(copied);
+        for part in found {
+            let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
+            pages += part.pages;
+            views += part.views;
+            bytes += part.bytes;
+            looked += part.looked;
+            tabled += part.tabled;
+            kinds[0] += part.nothing;
+            later += part.wait.len() as u64;
+            mirrored += part.make.len() as u64;
+            wait.append(&mut part.wait);
+            make.append(&mut part.make);
+            for (kind, n) in kinds.iter_mut().zip(part.kinds) {
+                *kind += n;
             }
         }
+        spent[1] += since(began);
         let began = std::time::Instant::now();
         crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
             for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
         });
-        spent[3] += since(began);
+        spent[2] += since(began);
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
         }
@@ -434,8 +466,8 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
         count.fetch_add(n, Relaxed);
     }
-    let [taking, reading, comparing, making] = spent;
-    for (count, n) in SYNC_SPLIT.iter().zip([views, bytes, taking, reading, comparing, making]) {
+    let [taking, reading, making] = spent;
+    for (count, n) in SYNC_SPLIT.iter().zip([views, bytes, taking, reading, making]) {
         count.fetch_add(n, Relaxed);
     }
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
@@ -444,9 +476,28 @@ pub(crate) fn sync_heaps() {
 }
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,
-/// another, a sampler; waited and no draw came; next to a slot of a table's.
+/// another, a sampler; waited and no draw came.
 #[cfg(windows)]
-static SYNCED_KINDS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static SYNCED_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// What a thread found on its pages of a heap, for [`sync_heaps`].
+#[cfg(windows)]
+#[derive(Default)]
+struct SyncPart {
+    pages: u64,
+    views: u64,
+    bytes: u64,
+    looked: u64,
+    tabled: u64,
+    nothing: u64,
+    make: Vec<u32>,
+    wait: Vec<u32>,
+    kinds: [u64; 5],
+}
+
+/// Pages [`sync_heaps`] gives a thread at a time.
+#[cfg(windows)]
+const SYNC_PAGES: usize = 8;
 
 /// Records [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]
@@ -462,10 +513,10 @@ const SYNC_AT_A_TIME: usize = 256;
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// The same, of [`SYNCED`]'s pages: those in view memory that was guarded;
-/// bytes read; nanoseconds asking what was written, reading it, comparing it
-/// with what was last seen, making views.
+/// bytes read; nanoseconds asking what was written, reading it and comparing
+/// it with what was last seen, making views.
 #[cfg(windows)]
-static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
@@ -481,8 +532,8 @@ pub(crate) fn sync_line(frames: f64) {
         );
     }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    let split = [0, 1, 2, 3, 4, 5].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
-    let kinds = [0, 1, 2, 3, 4, 5].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if pages == 0 {
         return;
     }
@@ -490,8 +541,8 @@ pub(crate) fn sync_line(frames: f64) {
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \
          draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for); of the mirrored \
-         {:.0} no views, {:.0} of objects, {:.0} others, {:.0} samplers, {:.0} that waited and no draw came, {:.0} near a table's slot; \
-         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading, {:.2} comparing, {:.2} making",
+         {:.0} no views (with those of slots that show none), {:.0} of objects, {:.0} others, {:.0} samplers, {:.0} that waited and no draw came; \
+         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading and comparing, {:.2} making",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
@@ -504,13 +555,11 @@ pub(crate) fn sync_line(frames: f64) {
         kinds[2],
         kinds[3],
         kinds[4],
-        kinds[5],
         split[0] / frames,
         split[1] / (1 << 20) as f64 / frames,
         split[2] / 1e6 / frames,
         split[3] / 1e6 / frames,
-        split[4] / 1e6 / frames,
-        split[5] / 1e6 / frames
+        split[4] / 1e6 / frames
     );
 }
 

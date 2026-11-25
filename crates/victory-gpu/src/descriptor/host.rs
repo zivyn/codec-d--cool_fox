@@ -136,7 +136,7 @@ pub(crate) struct HostHeap {
     /// [`HostHeap::mirror`] asks first, without the lock. Changed under it.
     quick: Vec<std::sync::atomic::AtomicU64>,
     /// The records of the title's heap as the pass over records copied in
-    /// as bytes last saw them ([`HostHeap::copied_changes`]). Made on first
+    /// as bytes last saw them ([`Copied::changes`]). Made on first
     /// use.
     copied: Mutex<Vec<u8>>,
     /// New ones of them that wait for a draw ([`HostHeap::copied_wait`]),
@@ -2885,10 +2885,10 @@ impl HostHeap {
         }
     }
 
-    /// For a run of records of the title's heap from slot `first`, `step`
-    /// bytes each, on a page that changed with no call
-    /// (`super::sync_heaps`: the title copies records into its heap as
-    /// bytes): the slots whose record is not the one this last saw there.
+    /// The records last seen of the title's heap, `step` bytes each, held for
+    /// threads that compare what they read of its changed pages beside one
+    /// another ([`Copied::changes`]; `super::sync_heaps`: the title copies
+    /// records into its heap as bytes).
     ///
     /// The page says only that something on it was written, and `mirror`
     /// by itself would take every buffer or placed-texture record on it for
@@ -2896,23 +2896,15 @@ impl HostHeap {
     /// or a pass uses it): the texture queue's entry for the slot would
     /// start again, and the buffer pass would look at 2,048 slots for one
     /// that changed.
-    /// `records`: their bytes as the caller read them (through the
-    /// kernel, which fails on a page the title unmapped meanwhile where a
-    /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn copied_changes(&self, first: u32, records: &[u8], step: usize, out: &mut Vec<u32>) {
+    pub(crate) fn copied_begin(&self, step: usize) -> Copied<'_> {
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         if copied.is_empty() {
             // Nothing there: a slot never looked at that holds nothing is
             // as it was.
             copied.resize(self.count as usize * step, 0);
         }
-        let at = first as usize * step;
-        let end = (at + records.len()).min(copied.len());
-        let Some(last) = copied.get_mut(at..end) else {
-            return;
-        };
-        let records = &records[..last.len()];
-        changed_records(last, records, step, first, out);
+        let (at, len) = (copied.as_mut_ptr(), copied.len());
+        Copied { at, len, step, _held: copied }
     }
 
     /// Whether new records of draws' tables are left to the draws
@@ -2939,13 +2931,6 @@ impl HostHeap {
         let stamp = self.tabled_stamp(index) & !TABLED_READ;
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= COPIED_FRAMES
-    }
-
-    /// Whether a slot within 64 of `index` is a table's lately (counted for
-    /// the log: such a slot is likely one of a table not read yet).
-    pub(crate) fn near_tabled(&self, index: u32, frame: u64) -> bool {
-        let first = index & !63;
-        (first..first + 64).any(|i| i < self.count && self.copied_tabled(i, frame))
     }
 
     /// New records the title copied into slots `slots` in `frame` wait for
@@ -3089,6 +3074,12 @@ impl HostHeap {
             self.unmake_stale(index, stale);
         }
         Some(view)
+    }
+
+    /// Whether slot `index` was made from no record: what [`HostHeap::mirror`]
+    /// would find before it did nothing for one that holds no view.
+    pub(crate) fn shows_none(&self, index: u32) -> bool {
+        self.made.get(index).unwrap_or(0) == 0
     }
 
     /// Slot `index` is made from record `key` and stays so (0: not). Under
@@ -4316,6 +4307,39 @@ pub(crate) fn pop_causes() -> [u64; 4] {
 fn quick_mirror() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_MIRROR").is_none_or(|v| v != "0"))
+}
+
+/// The records last seen of a heap, held ([`HostHeap::copied_begin`]).
+pub(crate) struct Copied<'a> {
+    at: *mut u8,
+    len: usize,
+    step: usize,
+    _held: std::sync::MutexGuard<'a, Vec<u8>>,
+}
+
+// SAFETY: the bytes are reached through `changes` alone, whose callers take
+// parts apart from one another; the guard stays with the thread that has it.
+unsafe impl Sync for Copied<'_> {}
+
+impl Copied<'_> {
+    /// The slots of `records` (as the title has them now, from slot `first`
+    /// on) that are not the ones last seen, which they are from here on.
+    /// (`records`: as the caller read them, through the kernel, which fails on
+    /// a page the title unmapped meanwhile where a read in place would fault:
+    /// the title unmaps heap pages too.)
+    ///
+    /// # Safety
+    /// No other call beside this one has any of these slots.
+    pub(crate) unsafe fn changes(&self, first: u32, records: &[u8], out: &mut Vec<u32>) {
+        let at = first as usize * self.step;
+        let end = (at + records.len()).min(self.len);
+        if at >= end {
+            return;
+        }
+        // SAFETY: within the records held; the caller's slots alone.
+        let last = unsafe { std::slice::from_raw_parts_mut(self.at.add(at), end - at) };
+        changed_records(last, &records[..end - at], self.step, first, out);
+    }
 }
 
 /// The records (`step` bytes each, the first is slot `first`) that differ

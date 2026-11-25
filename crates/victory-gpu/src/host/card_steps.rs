@@ -484,12 +484,19 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
 /// asking Windows walks the page tables, milliseconds in the title's heap).
-/// `room`: for what is read.
-fn mapped(from: usize, to: usize, room: &mut Vec<u8>) -> bool {
-    if room.len() < to - from {
-        room.resize(to - from, 0);
-    }
-    read_into(from as *const u8, &mut room[..to - from])
+/// `known`: pages that could be, of the same submission: its fills' places
+/// lie eight to a page, and each was read whole to find out.
+fn mapped(from: usize, to: usize, known: &mut HashMap<usize, ()>) -> bool {
+    const PAGE: usize = 4096;
+    (from / PAGE..to.div_ceil(PAGE)).all(|page| {
+        known.contains_key(&page) || {
+            let there = read_into((page * PAGE).max(from) as *const u8, &mut [0]);
+            if there {
+                known.insert(page, ());
+            }
+            there
+        }
+    })
 }
 
 /// A table by addresses and numbers of ours.
@@ -697,7 +704,7 @@ impl Host {
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
         let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = Vec::new();
+        let mut room = HashMap::default();
         let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {

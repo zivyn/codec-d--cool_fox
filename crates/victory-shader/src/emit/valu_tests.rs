@@ -29,6 +29,11 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
+/// SOPK `op sdst, simm16`; the compares read `sdst` as their operand.
+const fn sopk(op: u8, sdst: u8, simm16: u16) -> u32 {
+    0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | simm16 as u32
+}
+
 /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
 const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
@@ -1181,6 +1186,61 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
                 cases[i].0,
             );
         });
+    }
+}
+
+#[test]
+fn s_cmpk_compares_against_the_extended_immediate() {
+    // s_cmpk_<cond>_<type> s0, imm; s_cselect_b32 s6, 1, 0 (SOP2 0x0a, on SCC);
+    // v_mov_b32 v0, s6. The signed forms sign-extend the 16-bit immediate, the
+    // unsigned forms zero-extend it.
+    type Cond = fn(i64, i64) -> bool;
+    let conds: [(&str, Cond); 6] = [
+        ("eq", |a, b| a == b),
+        ("lg", |a, b| a != b),
+        ("gt", |a, b| a > b),
+        ("ge", |a, b| a >= b),
+        ("lt", |a, b| a < b),
+        ("le", |a, b| a <= b),
+    ];
+    // An immediate below and one at the sign bit; operands around each extension.
+    let imms: [u16; 2] = [0x0005, 0x8000];
+    let operands: [u32; 9] = [
+        0,
+        4,
+        5,
+        6,
+        0x7FFF,
+        0x8000,
+        0xFFFF_8000,
+        0xFFFF_FFFF,
+        0x8000_0000,
+    ];
+    for (signed, first_op) in [(true, 0x003u8), (false, 0x009)] {
+        for (k, (cond, holds)) in conds.iter().enumerate() {
+            for imm in imms {
+                let shader = build_valu_cs(&[
+                    sopk(first_op + k as u8, 0, imm),
+                    sop2(0x0a, 6, 129, 128),
+                    vop1(0x001, 0, sgpr(6)),
+                ]);
+                let name = format!("s_cmpk_{cond}_{}32", if signed { "i" } else { "u" });
+                let inputs: Vec<[u32; 4]> = operands.iter().map(|&v| [v, 0, 0, 0]).collect();
+                run_cases(&shader, &inputs, |backend, i, _, got| {
+                    let (a, b) = if signed {
+                        (i64::from(operands[i] as i32), i64::from(imm as i16))
+                    } else {
+                        (i64::from(operands[i]), i64::from(imm))
+                    };
+                    let want = u32::from(holds(a, b));
+                    assert_eq!(
+                        got, want,
+                        "{backend}: {name}({:#010x}, {imm:#06x}) = {got}, want {want}",
+                        operands[i],
+                    );
+                });
+            }
+        }
     }
 }
 

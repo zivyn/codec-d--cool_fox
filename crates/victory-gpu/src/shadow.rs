@@ -274,7 +274,13 @@ pub(crate) fn card_room_kept() -> u64 {
     if !card_room_kept_on() || !cards() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    // Not more than such copies came to in any session, whatever they may
+    // come to: on a card of 24 GB a quarter of its budget was kept for them,
+    // 5 GB that never came (941 MB in 97 copies after fifteen minutes), and
+    // no texture was made any more with 5 GB of the card free (session
+    // play-1125-0127: 1,453 passes refused, the ground and people black).
+    const SEEN: u64 = 1 << 30;
+    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory.

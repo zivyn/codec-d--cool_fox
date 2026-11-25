@@ -178,8 +178,11 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+    let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
+    let mut changed: Vec<u32> = Vec::new();
+    let mut wait: Vec<u32> = Vec::new();
+    let frame = crate::frame::current();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -193,6 +196,16 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // The records of some frames ago that no draw read through a table
+        // since: a shader may pick them by index.
+        for index in host.copied_before(frame) {
+            if host.copied_tabled(index, frame) {
+                tabled += 1;
+            } else {
+                host.mirror(index, start + u64::from(index) * step, false);
+                mirrored += 1;
+            }
+        }
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -205,54 +218,87 @@ pub(crate) fn sync_heaps() {
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    for index in slots {
-                        let handle = start + index * step;
-                        // A record that straddles the range's ends is left
-                        // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
+                    // A record that straddles the range's ends is left
+                    // to the range that holds its first byte.
+                    let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
+                    let Some(records) = page_bytes.get((start + first * step) as usize - from..) else {
+                        page += crate::watch::PAGE;
+                        continue;
+                    };
+                    let count = (records.len() as u64 / step).min(slots.end.saturating_sub(first));
+                    looked += count;
+                    // Only the records that are not the ones last seen
+                    // there (`HostHeap::copied_changes`).
+                    changed.clear();
+                    host.copied_changes(first as u32, &records[..(count * step) as usize], step as usize, &mut changed);
+                    for &index in &changed {
+                        let at = (u64::from(index) - first) as usize * step as usize;
+                        let word = |n: usize| {
+                            records
+                                .get(at + 4 * n..at + 4 * n + 4)
+                                .and_then(|b| b.try_into().ok())
+                                .map_or(0, u32::from_le_bytes)
                         };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
+                        if !heap.samplers() && word(0) == VIEW_TAG {
+                            // A draw's own table: the draw makes what it
+                            // reads of it (`draw.rs` `tables`).
+                            if host.copied_tabled(index, frame) {
+                                tabled += 1;
+                                continue;
+                            }
+                            // Buffer views and placed textures get no host
+                            // slot from this anyway, they wait for a draw
+                            // or a pass: noted some frames on, unless a
+                            // draw's table turns out to hold them.
+                            if matches!(word(2) >> KIND_SHIFT, CONSTANT | PLACED) && host.copied_waits() {
+                                wait.push(index);
+                                later += 1;
+                                continue;
+                            }
                         }
+                        host.mirror(index, start + u64::from(index) * step, false);
+                        mirrored += 1;
                     }
                 }
                 page += crate::watch::PAGE;
             }
         }
+        if !wait.is_empty() {
+            host.copied_wait(frame, std::mem::take(&mut wait));
+        }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
+    let micros = started.elapsed().as_micros() as u64;
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
         count.fetch_add(n, Relaxed);
     }
 }
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
+/// not the one last seen and was mirrored, the microseconds it took; then
+/// new records left to the draws that read them through a table, and new
+/// records that waited for one ([`host::HostHeap::copied_wait`]).
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [pages, looked, mirrored, micros, tabled, later] = [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \
+         draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
+        tabled as f64 / frames,
+        later as f64 / frames,
         micros as f64 / 1000.0 / frames
     );
 }

@@ -120,7 +120,20 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
+///
+/// With room on the card nothing has to go: in session play-1125-0127 88,000
+/// of them (31 GB) went after 5 s with 7 GB of the card free, and 24,700
+/// (12 GB) had to be made and uploaded again.
+/// `VICTORY_TEXTURE_KEEP=0`: 5 s there too, as before.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+    static KEEP: OnceLock<bool> = OnceLock::new();
+    let keep = *KEEP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_KEEP").is_none_or(|v| v != "0"));
+    vram_idle_for(video_memory, keep)
+}
+
+fn vram_idle_for(video_memory: Option<[u64; 4]>, keep: bool) -> u64 {
+    const KEPT_MS: u64 = 600_000;
+    const LONG_MS: u64 = 30_000;
     const NORMAL_MS: u64 = 5_000;
     const MODERATE_MS: u64 = 2_500;
     const HIGH_MS: u64 = 1_000;
@@ -135,8 +148,12 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
         HIGH_MS
     } else if used_pct >= 75 {
         MODERATE_MS
-    } else {
+    } else if !keep {
         NORMAL_MS
+    } else if used_pct >= 68 {
+        LONG_MS
+    } else {
+        KEPT_MS
     }
 }
 
@@ -8852,8 +8869,14 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn vram_idle_ms_scales_with_pressure() {
-        use super::vram_idle_ms;
+        let vram_idle_ms = |memory| super::vram_idle_for(memory, false);
+        let keeps = |memory| super::vram_idle_for(memory, true);
         let gib = 1024 * 1024 * 1024;
+        assert_eq!(keeps(Some([100, 67, 0, 0])), 600_000);
+        assert_eq!(keeps(Some([100, 68, 0, 0])), 30_000);
+        assert_eq!(keeps(Some([100, 75, 0, 0])), 2_500);
+        assert_eq!(keeps(Some([100, 85, 0, 0])), 1_000);
+        assert_eq!(keeps(None), 5_000);
         // Normal (< 75%)
         assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
         assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);

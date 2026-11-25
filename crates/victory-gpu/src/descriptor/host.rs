@@ -26,10 +26,17 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
-    /// A fingerprint of the record each slot held when the pass over
-    /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
-    copied: Mutex<Vec<u64>>,
+    /// The records of the title's heap as the pass over records copied in
+    /// as bytes last saw them ([`HostHeap::copied_changes`]). Made on first
+    /// use.
+    copied: Mutex<Vec<u8>>,
+    /// New ones of them that wait for a draw ([`HostHeap::copied_wait`]),
+    /// by the frame they were found in.
+    waiting: Mutex<std::collections::VecDeque<(u64, Vec<u32>)>>,
+    /// The slots made from a texture whose memory was found away, with what
+    /// they were made from and when that was
+    /// ([`HostHeap::texture_slot_gone`]).
+    away: Mutex<std::collections::HashMap<u32, (u64, u64)>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -513,6 +520,14 @@ const TABLED_FRAMES: u64 = 240;
 /// (435 begun in the 353 s of run 52's, for some 140 presented).
 const TABLED_GRACE: u64 = 8;
 
+/// Frames for which a record copied into a slot a draw read through a
+/// table is left to such a draw ([`HostHeap::copied_tabled`]).
+const COPIED_FRAMES: u32 = 8;
+
+/// Frames a record copied into any other slot waits for one, before it is
+/// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
+const COPIED_GRACE: u64 = 4;
+
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
@@ -940,6 +955,26 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
+/// (0: none): up to four times as many where the host heap has the room (a
+/// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
+/// sets the most). 2^18 ran out in the title's bigger places (session
+/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
+/// refused, with 2,639 indirect draws and dispatches).
+fn dynamic_slots(count: u32, null: u32) -> u32 {
+    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let most = *MOST.get_or_init(|| {
+        std::env::var("VICTORY_DYNAMIC_SLOTS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DYNAMIC << 2)
+    });
+    if null < PORTABLE_VIEWS {
+        return DYNAMIC;
+    }
+    null.saturating_sub(count).min(most).max(DYNAMIC)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -960,7 +995,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -972,6 +1006,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1036,9 +1071,11 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
+            waiting: Mutex::default(),
+            away: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1186,7 +1223,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
     }
 
@@ -1520,14 +1557,50 @@ impl HostHeap {
     /// (any more): a host slot made from it becomes null again, so that
     /// the host copy can be let go (`crate::resource::let_go_idle`; a slot
     /// keeps what it views). True if the slot was made.
+    ///
+    /// Not at the first look: a title that moves a texture in its streaming
+    /// memory unmaps it before it maps it again, and what was shown went
+    /// black for the pictures in between (session play-1125-0127: faces,
+    /// books, posters and sleeves for 0.3 to 2 s). Only when it is still
+    /// away `AWAY_MS` after it was first found away
+    /// (`VICTORY_TEXTURE_AWAY_MS`; 0: at once, as before).
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
+        const AWAY_MS: u64 = 3000;
+        static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let wait = *WAIT.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AWAY_MS)
+        });
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        if made.get(index as usize).is_none_or(|&key| key == 0) {
+        let Some(key) = made.get(index as usize).copied().filter(|&key| key != 0) else {
             return false;
+        };
+        let now = crate::host::now_ms();
+        {
+            let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+            match away.get(&index) {
+                Some(&(was, since)) if was == key && now.saturating_sub(since) < wait => return false,
+                Some(&(was, _)) if was == key => {
+                    away.remove(&index);
+                }
+                _ if wait == 0 => {}
+                _ => {
+                    away.insert(index, (key, now));
+                    return false;
+                }
+            }
         }
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
+    }
+
+    /// The memory of the texture title slot `index` views is there (again):
+    /// see [`HostHeap::texture_slot_gone`].
+    pub(crate) fn texture_slot_here(&self, index: u32) {
+        let mut away = self.away.lock().unwrap_or_else(|e| e.into_inner());
+        if !away.is_empty() {
+            away.remove(&index);
+        }
     }
 
     /// Makes host slot `index` null again, as it is before its view is
@@ -1621,6 +1694,12 @@ impl HostHeap {
         } else {
             textures.remove(index);
         }
+    }
+
+    /// Title slot `index` lies in a table a draw reads or had made afresh:
+    /// what it holds is the draw's to make ([`HostHeap::copied_tabled`]).
+    pub(crate) fn slot_tabled(&self, index: u32) {
+        self.tabled_in(index, false, crate::frame::current());
     }
 
     /// The title slots that hold buffer views.
@@ -1913,10 +1992,10 @@ impl HostHeap {
         }
     }
 
-    /// For a slot on a page of the title's heap that changed with no call
+    /// For a run of records of the title's heap from slot `first`, `step`
+    /// bytes each, on a page that changed with no call
     /// (`super::sync_heaps`: the title copies records into its heap as
-    /// bytes): [`HostHeap::mirror`], if the `bytes` bytes of the record at
-    /// `handle` are not the ones this last saw there. True if it did.
+    /// bytes): the slots whose record is not the one this last saw there.
     ///
     /// The page says only that something on it was written, and `mirror`
     /// by itself would take every buffer or placed-texture record on it for
@@ -1924,32 +2003,77 @@ impl HostHeap {
     /// or a pass uses it): the texture queue's entry for the slot would
     /// start again, and the buffer pass would look at 2,048 slots for one
     /// that changed.
-    /// `record`: the record's bytes as the caller read them (through the
+    /// `records`: their bytes as the caller read them (through the
     /// kernel, which fails on a page the title unmapped meanwhile where a
     /// read in place would fault: the title unmaps heap pages too).
-    pub(crate) fn mirror_copied(&self, index: u32, handle: u64, record: &[u8]) -> bool {
-        if index >= self.count {
+    pub(crate) fn copied_changes(&self, first: u32, records: &[u8], step: usize, out: &mut Vec<u32>) {
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if copied.is_empty() {
+            // Nothing there: a slot never looked at that holds nothing is
+            // as it was.
+            copied.resize(self.count as usize * step, 0);
+        }
+        let at = first as usize * step;
+        let end = (at + records.len()).min(copied.len());
+        let Some(last) = copied.get_mut(at..end) else {
+            return;
+        };
+        let records = &records[..last.len()];
+        if last == records {
+            return;
+        }
+        for (n, (old, new)) in last.chunks_exact_mut(step).zip(records.chunks_exact(step)).enumerate() {
+            if old != new {
+                old.copy_from_slice(new);
+                out.push(first + n as u32);
+            }
+        }
+    }
+
+    /// Whether new records of draws' tables are left to the draws
+    /// (`VICTORY_HEAP_SYNC=all`: every new record is mirrored at once, as
+    /// it first was).
+    ///
+    /// The title builds each draw's tables in its heap by copying records
+    /// there as bytes: 60,000 to 210,000 a frame in its world (session
+    /// play-1125-0127), 0.9 microseconds each on the submitting thread and
+    /// 1.4 more in the buffer pass they were all handed to, 120 to 600 ms
+    /// of every frame, and the draws make what they read of them anyway.
+    pub(crate) fn copied_waits(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "all"))
+    }
+
+    /// Whether a draw read title slot `index` through a table within the
+    /// last few frames before `frame` ([`HostHeap::tabled`]): what it holds
+    /// is such a draw's to make.
+    pub(crate) fn copied_tabled(&self, index: u32, frame: u64) -> bool {
+        if !self.copied_waits() {
             return false;
         }
-        let n = record.len();
-        // Never 0, which is "never looked at".
-        let print = u64::from_le_bytes(blake3::hash(record).as_bytes()[..8].try_into().unwrap_or([1; 8])) | 1;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
-            }
-            *last = print;
+        let stamp = self.tabled_stamp(index) & !TABLED_READ;
+        let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+        stamp != 0 && now.wrapping_sub(stamp) & !TABLED_READ <= COPIED_FRAMES
+    }
+
+    /// New records the title copied into slots `slots` in `frame` wait for
+    /// the draw that may read them through a table.
+    pub(crate) fn copied_wait(&self, frame: u64, slots: Vec<u32>) {
+        self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_back((frame, slots));
+    }
+
+    /// The slots that have waited long enough at `frame`
+    /// ([`HostHeap::copied_wait`]), each once.
+    pub(crate) fn copied_before(&self, frame: u64) -> Vec<u32> {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        while waiting.front().is_some_and(|(written, _)| written + COPIED_GRACE <= frame) {
+            out.extend(waiting.pop_front().into_iter().flat_map(|(_, slots)| slots));
         }
-        self.mirror(index, handle, false);
-        true
+        drop(waiting);
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Makes host slot `index` from the record the title has at `handle`

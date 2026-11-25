@@ -1646,6 +1646,10 @@ impl State {
         let mut unordered = Vec::new();
         for (n, &index) in slots.iter().enumerate() {
             ranges.set(index, None);
+            // A draw's table's: the draw brings what it reads up to date.
+            if host.copied_tabled(index, frame) {
+                continue;
+            }
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
@@ -2087,6 +2091,7 @@ impl State {
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
+                host.texture_slot_here(index);
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
@@ -2697,6 +2702,8 @@ impl State {
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
+            } else {
+                host.slot_tabled(index);
             }
         }
     }
@@ -2847,6 +2854,14 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // They are such a table's, whatever they hold. (Of a big one,
+            // which may lie over slots shaders pick by index, only the ones
+            // the shader names.)
+            if let Some(title) = title_first {
+                for k in (0..n).filter(|&k| n <= 64 || entries.iter().any(|u| u.table_offset_dwords / 8 == k)) {
+                    host.slot_tabled(title + k);
+                }
+            }
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {

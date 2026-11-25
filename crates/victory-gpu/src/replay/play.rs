@@ -97,7 +97,7 @@ pub struct Options {
     /// these in it.
     pub skip_shaders: Vec<String>,
     /// Shaders taken from this folder where it has them: `<hash>.dxil`, by
-    /// the hash the runtime names the title's shader by.
+    /// the hash the runtime names the title's shader by (ours: by their own).
     pub shaders: Option<PathBuf>,
     /// With `compare`: the folder the shaders of the second are from.
     pub shaders_b: Option<PathBuf>,
@@ -948,7 +948,8 @@ impl Player {
                         let taken = std::cell::Cell::new(false);
                         let mut m = super::pso::make(&device, &p.parts, root, |i| {
                             let other = shaders.and_then(|dir| {
-                                let hash = title_hash(p, i)?;
+                                let own = || frame.codes.get(i as usize).map(|c| c.hash[..8].iter().map(|b| format!("{b:02x}")).collect());
+                                let hash = title_hash(p, i).map(str::to_owned).or_else(own)?;
                                 std::fs::read(dir.join(format!("{hash}.dxil"))).ok()
                             });
                             taken.set(taken.get() || other.is_some());

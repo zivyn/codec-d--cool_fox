@@ -452,19 +452,22 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 10_000;
     const IDLE_FRAMES: u64 = 4;
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
     };
+    if map.is_empty() {
+        return;
+    }
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, IDLE_FRAMES);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);
@@ -883,6 +886,46 @@ pub(crate) fn unstage(resource: This) {
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
     }
+}
+
+/// Where a staged title texture's memory is: address and bytes.
+pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, len) = map.as_ref()?.get(&(resource as usize))?.memory();
+    Some((at as u64, len as u64))
+}
+
+/// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
+/// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
+/// (a texture streams in whole mips; the small ones lie first). Read
+/// through the kernel, so pages not there count as zeros.
+pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    const WINDOW: usize = 16 << 10;
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let len = len as usize;
+    let mut hasher = blake3::Hasher::new();
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(3 * WINDOW, 0);
+        let mut take = |from: usize, bytes: usize| {
+            read[..bytes].fill(0);
+            crate::host::copy_mapped(read.as_mut_ptr(), (at as usize + from) as *const u8, bytes, false);
+            hasher.update(&read[..bytes]);
+        };
+        if len <= 3 * WINDOW {
+            take(0, len);
+        } else {
+            take(0, WINDOW);
+            take((len / 2) & !0xfff, WINDOW);
+            take(len - WINDOW, WINDOW);
+        }
+    });
+    let hash = hasher.finalize();
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_le_bytes(first) | 1
 }
 
 /// Whether a title texture has a staging buffer: a list recorded its

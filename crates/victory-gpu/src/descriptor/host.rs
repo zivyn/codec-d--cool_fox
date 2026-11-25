@@ -289,6 +289,11 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
+    /// For a slot uploaded whole and looked at again
+    /// ([`TextureQueue::recheck`]): where its memory is (address, bytes),
+    /// the fingerprint it had at the upload, how many looks found it
+    /// unchanged, and the frame of the upload. A fingerprint of 0: none.
+    checked: (u64, u64, u64, u8, u64),
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -311,7 +316,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     fn remove(&mut self, index: u32) {
@@ -382,6 +387,24 @@ impl TextureQueue {
         }
     }
 
+    /// Slot `index` was uploaded whole from memory `at` (address, bytes)
+    /// with fingerprint `print`: looked at again from frame `due`, for a
+    /// title that fills a texture's memory after it wrote the view (the
+    /// `looks`-th such look; `uploaded` is the upload's frame).
+    #[allow(clippy::too_many_arguments)]
+    fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
+        if let Some(w) = self.same(index, write) {
+            (w.due, w.looks, w.mapped) = (due, 1, 0);
+            w.checked = (at.0, at.1, print, looks, uploaded);
+        }
+    }
+
+    /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
+    /// waiting for such a look.
+    fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+        self.slots.get(&index).map(|w| w.checked).filter(|c| c.2 != 0)
+    }
+
     /// The memory slot `index`'s texture lies in was mapped, unmapped or
     /// written in `frame`: the slot is looked at from frame `due` as one
     /// written now, whatever was known of it (a pass at work on it does
@@ -390,7 +413,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -509,34 +532,52 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
-/// Asks the host, once, whether it caps view heaps at [`PORTABLE_VIEWS`],
-/// and if so tells the translator now (`set_view_heap_limit`) instead of
-/// when the title's heap is made: a shader keeps the limit it was
-/// translated with, and the title makes 25 pipelines (their
-/// shaders translated at once) before it makes its view heap. Those would
-/// read a view index past the heap unclamped, the read that hangs NVIDIA.
-/// Called before a shader is translated.
-/// shortcut: the limit is the capped heap's last slot whatever size the
-/// title's heap turns out to have; a heap that fits is not capped and
-/// keeps no null slot there (an index past it is as undefined as before).
+/// The size of every host view heap on a host that takes more than
+/// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
+/// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
+/// the last slot is the null slot every view index at or past it reads.
+const UNCAPPED_VIEWS: u32 = 1 << 21;
+
+/// Picks, once, the null slot at the end of every host view heap and tells
+/// the translator now (`set_view_heap_limit`) instead of when the title's
+/// heap is made: a shader keeps the limit it was translated with, and the
+/// title makes 25 pipelines (their shaders translated at once) before it
+/// makes its view heap. Called before a shader is translated and before a
+/// view heap is made.
+///
+/// Every host clamps. A host that caps view heaps at [`PORTABLE_VIEWS`]
+/// (NVIDIA) hung on a view index past the heap; one that does not (AMD
+/// RDNA3, RX 7900 XT) took a page fault and removed the device on entering
+/// the world: a compute program read view slot 16,777,088 (0xffff80) of a
+/// heap of 1,507,328, past its end. Unclamped, that index is undefined on
+/// any host.
 pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        // SAFETY: plain heap creation; the heap is released at once.
-        let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-            host.device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: PORTABLE_VIEWS + 1,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
+        let fits = |count: u32| {
+            // SAFETY: plain heap creation; the heap is released at once.
+            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: count,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+            };
+            made.is_ok()
         };
-        if made.is_err() {
-            tracing::info!("the host caps view heaps at {PORTABLE_VIEWS}: view indices are clamped from the first shader on");
-            victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
-        }
+        let views = if fits(UNCAPPED_VIEWS) {
+            UNCAPPED_VIEWS
+        } else {
+            PORTABLE_VIEWS
+        };
+        tracing::info!(
+            views,
+            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
+        );
+        victory_shader::emit::set_view_heap_limit(views - 1);
     });
 }
 
@@ -574,20 +615,41 @@ impl HostHeap {
             }
         };
         let extra = if sampler { 0 } else { DYNAMIC };
-        let (heap, count, size) = match make(count + extra) {
-            Ok(heap) => (heap, count, count + extra),
-            Err(e) if !sampler && count + extra > PORTABLE_VIEWS => {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. The heap's last slot stays null, and shaders read it for
-                // any view index from there on (`set_view_heap_limit`): a read past the heap's
-                // end hung NVIDIA's GPU (the title's heap is a little over 1 000 000 views).
-                tracing::warn!(error = %e, count, "host view heap capped at {PORTABLE_VIEWS}; views past it read a null slot");
-                victory_shader::emit::set_view_heap_limit(PORTABLE_VIEWS - 1);
-                (make(PORTABLE_VIEWS).ok()?, PORTABLE_VIEWS - extra - 1, PORTABLE_VIEWS)
+        // A view heap ends at the null slot shaders clamp view indices to
+        // (`probe_view_limit`), whatever the title's own count: the title's
+        // slots, then the dynamic ones, then null up to and with that slot.
+        if !sampler {
+            probe_view_limit();
+        }
+        let null = if sampler {
+            0
+        } else {
+            victory_shader::emit::view_heap_limit()
+        };
+        let (heap, count, size) = if null == 0 {
+            match make(count + extra) {
+                Ok(heap) => (heap, count, count + extra),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
-                return None;
+        } else {
+            let size = null + 1;
+            let fitted = if count + extra <= null {
+                count
+            } else {
+                // shortcut: descriptors past the host's limit are left out; a title that reaches
+                // them needs remapping. They read the null slot instead.
+                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                null - extra
+            };
+            match make(size) {
+                Ok(heap) => (heap, fitted, size),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, size, "no host view heap");
+                    return None;
+                }
             }
         };
         // SAFETY: a live heap.
@@ -602,7 +664,7 @@ impl HostHeap {
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(size) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -804,6 +866,27 @@ impl HostHeap {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
             None => textures.done(index, write),
         }
+    }
+
+    /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn texture_slot_recheck(
+        &self,
+        index: u32,
+        write: u64,
+        due: u64,
+        at: (u64, u64),
+        print: u64,
+        looks: u8,
+        uploaded: u64,
+    ) {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        textures.recheck(index, write, due, at, print, looks, uploaded);
+    }
+
+    /// See [`TextureQueue::checked`].
+    pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not

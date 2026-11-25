@@ -333,6 +333,21 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Frames after a whole upload of a texture picked by index at which its
+/// memory is looked at again, each counted from the look before.
+const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
+
+/// Looks at uploaded textures picked by index that found the memory as it
+/// was, and that found it changed (uploaded again), since the start.
+pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Whether textures picked by index are looked at again after their upload
+/// (`VICTORY_HEAP_RECHECK=0`: no).
+fn heap_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
+}
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1446,7 +1461,16 @@ impl State {
             return;
         }
         let memory = crate::host::host().and_then(|h| h.video_memory());
-        let per_frame = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
+        // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
+        // textures (a scene's first minutes) then drains in fewer frames.
+        static PER_FRAME_MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        let asked = *PER_FRAME_MB.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_STAGE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok())
+        });
+        let per_frame = match asked {
+            Some(mb) => mb << 20,
+            None => staging_budget_per_frame(memory.map(|[budget, ..]| budget)),
+        };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1499,10 +1523,19 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
+            std::env::var("VICTORY_TEXTURE_STAGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+        }));
+        // A backlog (a scene's first minutes: 22,000 slots due, 2-3 minutes of black
+        // surfaces at 192 MB a frame) gets three times the bytes and the time until it
+        // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+        static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
@@ -1516,6 +1549,38 @@ impl State {
             // every 120 frames, changed or not; and asked by its first
             // page alone, one whose first page is the one missing counted
             // as not there.)
+            // A slot uploaded whole is looked at again a few times
+            // (`RECHECK_FRAMES`): the title writes a texture's view, and
+            // may fill the texture's memory itself only afterwards, with
+            // no descriptor write and nothing from the runtime to tell of
+            // it. The host copy then kept what the memory held at the
+            // first look for the rest of the run. The look reads 48 KiB;
+            // only a changed texture is uploaded again.
+            // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
+                if crate::texture::fingerprint(at, len) == print {
+                    HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
+                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
+                        Some(wait) => {
+                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
+                        }
+                        None => host.texture_slot_done(index, write, None),
+                    }
+                    continue;
+                }
+                let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                if n < 200 || n.is_multiple_of(1000) {
+                    tracing::warn!(
+                        slot = index,
+                        address = format_args!("{at:#x}"),
+                        bytes = len,
+                        frames_after_upload = frame.saturating_sub(uploaded),
+                        looks,
+                        changed = n + 1,
+                        "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
+                    );
+                }
+            }
             let mut partly = None;
             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
@@ -1619,11 +1684,23 @@ impl State {
             // yet, makes it anew. (Kept for those until now: every partly
             // streamed texture of the heap held a staging buffer of its full
             // size for good.)
+            let memory = if again.is_none() && heap_recheck() {
+                crate::texture::staged_memory(resource)
+            } else {
+                None
+            };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
-            host.texture_slot_done(index, write, again);
+            match memory {
+                // Whole and uploaded: looked at again (see above).
+                Some((at, len)) => {
+                    let print = crate::texture::fingerprint(at, len);
+                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                }
+                None => host.texture_slot_done(index, write, again),
+            }
         }
     }
 

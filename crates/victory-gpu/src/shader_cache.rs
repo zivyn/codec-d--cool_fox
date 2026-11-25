@@ -42,6 +42,9 @@ pub(crate) fn counts() -> (u64, u64) {
 /// what it was told of the host. Not our executable: a rebuild of anything
 /// else used to translate every shader again.
 fn build() -> [u8; 32] {
+    // The view heap's null slot differs by host GPU: a translation cached
+    // without the clamp must not be served (`host_settings` below).
+    crate::descriptor::host::probe_view_limit();
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
@@ -66,6 +69,8 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
+            "VICTORY_FIRSTLANE_OWN",
+            "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
         ] {

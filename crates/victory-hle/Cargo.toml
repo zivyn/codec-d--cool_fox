@@ -13,7 +13,7 @@ victory-loader.workspace = true
 victory-pe.workspace = true
 victory-formats.workspace = true
 opus-pure.workspace = true
-miniz_oxide.workspace = true
+zlib-rs.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]

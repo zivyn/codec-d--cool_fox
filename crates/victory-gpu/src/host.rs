@@ -4835,11 +4835,17 @@ impl Host {
         // what they write.
         // Or the reads are done on the card, behind the flights.
         let own = if late { self.card_steps(runs) } else { None };
+        #[cfg(feature = "diagnostics")]
+        let ahead = Split::begin();
+        #[cfg(feature = "diagnostics")]
+        SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+        #[cfg(feature = "diagnostics")]
+        ahead.part(12);
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -4855,6 +4861,8 @@ impl Host {
         let heaps_synced = crate::descriptor::begin_sync_heaps();
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
+        #[cfg(feature = "diagnostics")]
+        ahead.part(13);
         let runs = match &own {
             Some(own) => {
                 with = std::iter::once(own.list()).chain(runs.iter().copied()).collect();
@@ -4895,6 +4903,8 @@ impl Host {
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
+        ahead.part(14);
+        #[cfg(feature = "diagnostics")]
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
@@ -6489,9 +6499,12 @@ impl std::hash::Hasher for AddressHash {
 /// of the steps: the refreshes, and the copies and fills (those with the
 /// refreshes a copy of title memory flushes). Of the asking, which ranges it
 /// is of. Of the refreshes, those before ranges are given to shaders, one
-/// copy at a time: nanoseconds, and how many.
+/// copy at a time: nanoseconds, and how many. Ahead of all that: the wait for
+/// the submission lock, the steps done on the card planned ([`card_steps`]),
+/// the flights waited for, the heaps' records and what is swept; and, at the
+/// end, the wait for the heaps' records.
 #[cfg(feature = "diagnostics")]
-static SPLIT: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
@@ -6532,7 +6545,9 @@ fn split_line(frames: f64) {
         "preparing per frame, the submitting thread: {:.1} ms asking the write watch ({:.1} of them finding what to ask), {:.1} putting the title's bytes under flights' \
          writes, {:.1} in the lists' steps (refreshes {:.1} in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on \
          several threads, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
-         card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {})",
+         card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {}); ahead of these {:.1} waiting for the submission lock, {:.1} \
+         planning steps done on the card, {:.1} waiting for flights, {:.1} the heaps' records and what is swept; at the end {:.1} waiting \
+         for the heaps' records; asked early by a thread of its own {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
         ms[0],
         ms[8],
         ms[1],
@@ -6563,6 +6578,7 @@ fn split_line(frames: f64) {
         a[10],
         a[9],
         a[2],
+    let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
         a[3],
         a[4],
         a[5],
@@ -6587,6 +6603,13 @@ fn split_line(frames: f64) {
 ///
 /// A submission brings some sixty copies up to date, one after the other
 /// on the submitting thread: for each, the pages the title wrote are asked
+        ms[11],
+        ms[12],
+        ms[13],
+        ms[14],
+        ms[15],
+        e[0],
+        e[1] / 1e3,
 /// for and read through the kernel into the copy. That is the frame line's
 /// "copies", 45-50 ms a frame, and the copies have nothing to do with one
 /// another: each refresh writes its own copy and its own notes, and reads

@@ -797,8 +797,14 @@ impl Memory {
 const SIZES: usize = usize::MAX - (9 << 33);
 
 /// Whether a submission that asks for the sizes of structures is waited for,
-/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=0`: it is
-/// not).
+/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
+///
+/// Off: it does not help. In run light-15, with it, 33 of 154 copies had the
+/// slot's old size still (all of them recorded one frame after the size was
+/// asked for) against 53 of 230 in light-11, 48 of 275 dynamic structures
+/// were good, and the title asks in every frame, so every frame waits (109 ms
+/// against 90). The title reads the slot before our submission of the asking
+/// list is through, or reads it for another purpose; not known.
 ///
 /// The title asks for a new structure's compacted size (a program of one
 /// thread stores it into a small buffer), reads it a frame or two later
@@ -810,7 +816,7 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// the right size.
 fn sizes_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Whether a dispatch of the builder is its program of a structure's size:

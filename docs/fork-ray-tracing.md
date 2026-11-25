@@ -93,7 +93,8 @@ after it was given them as an unordered access view.
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
-| `VICTORY_BVH_SIZES_WAIT=0` | submissions that ask for structures' sizes are not waited for |
+| `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
@@ -105,17 +106,24 @@ dispatches, faults and what came.
 
 ## Known gaps
 
-- Dynamic structures overlap each other (8 of 65 good in run light-10). Cause,
-  run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
+- Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
+  275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
   structure's compacted size, reads it one or two frames later without looking
   whether it is there, takes memory of that size and has the structure copied
   into it. Our submissions land up to two frames late; the title read what the
   slot held before, another structure's size, and the copy wrote over the
-  neighbours. A submission that asks is waited for now
-  (`VICTORY_BVH_SIZES_WAIT=0`: not).
-- Some 2,500 pages a frame that are not there are still touched (the notes'
-  limit): rays in structures that were written over.
-- A capture of a frame with the builder on cannot be replayed: the card hangs
+  neighbours. Waiting for a submission that asks (`VICTORY_BVH_SIZES_WAIT=1`)
+  did not mend it and costs some 20 ms a frame (light-15): the title asks in
+  every frame, and what it read was as old as before. Open.
+- What a structure that was written over says of its size sent the builder's
+  copy of it through gigabytes of other structures; bounded now
+  (`VICTORY_BVH_BOUNDS`). Pages touched that are not there: 2,500 a frame
+  before, 90 after (the dorm).
+- The card's time in the dorm with the builder (timing run light-13, title's
+  commands 84 ms): `CopyForBVHUpdate` 13.3 ms in 63 dispatches (before the
+  bound), traces 24 ms (`RaytraceVBuffer` 7.9, screen probes 6.4, irradiance
+  cache 3.5, primary probes 2.3, shadows 1.6).
+- Captures made on 2026-11-25 (builder on or off) hang the card in a replay
   (cause unknown; do not try).
 - Five shadow-mask trace programs do not translate (a structure's address out
   of a descriptor picked from the heap by a computed index: the host would have
@@ -150,7 +158,7 @@ fork's constant.
 | `VICTORY_AMBIENT=<share>` | the estimate, 1 all of it (unset: the title's own) |
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
-| `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off) |
+| `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
 
 It is off while the builder runs.
 

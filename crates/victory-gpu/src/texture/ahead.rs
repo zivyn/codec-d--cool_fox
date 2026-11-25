@@ -103,7 +103,9 @@ fn claim(resource: This, first: u32, there: u64) -> Option<Taken> {
         let way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
         return way.iter().find(|(serial, _)| *serial == copy.serial).map(|(_, job)| Taken::Known(job.clone()));
     }
-    if BYTES.load(Relaxed) >= MOST
+    let most = if crate::residency::limited_host_ram() { 32 << 20 } else { MOST };
+    if crate::residency::pressured()
+        || BYTES.load(Relaxed) >= most
         || copy.flags() & 0x7 != 0
         || copy.state.load(Relaxed) != 0
         || copy.grown.load(Relaxed)

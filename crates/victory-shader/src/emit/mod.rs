@@ -511,7 +511,24 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        let wide_option = std::env::var_os("VICTORY_WAVE_WIDE");
+        // Both archived kernels use one logical wave per group and have
+        // validated wave32 PSOs on RTX. Explicit policy wins.
+        let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+            && matches!(
+                c.digest,
+                [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
+                    | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
+            );
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // A single guest wave can iterate an active-lane loop until both host
+        // halves have finished. The precise latch and convergence conditions
+        // for the driver compute route are checked by widen().
+        let driver_loop = wide_option.is_none()
+            && c.part(FourCC::DXIL).is_none()
+            && c.part(FourCC::ACCC).is_some()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. })
+                if *what == lower::DIVERGENT_MASK_EXCHANGE);
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -533,7 +550,7 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
+                if wide_on || driver_loop {
                     let bases = [
                         deep.as_ref().map(|f| &f.0),
                         forms[1].1.as_ref().map(|f| &f.0),
@@ -541,7 +558,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, driver_loop);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -603,7 +620,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -611,7 +628,17 @@ pub fn emit(
         }
         other => other,
     };
-    let original = original.map(|(shader, _)| shader);
+    let supported = |(shader, wave): (HostShader, Option<u32>)| {
+        if wave == Some(64) && lower::host_max_wave() == 32 {
+            Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "no wave32 lowering for this wave64 program",
+            })
+        } else {
+            Ok(shader)
+        }
+    };
+    let original = original.and_then(supported);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -625,7 +652,7 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+    emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -640,6 +667,7 @@ fn widen(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -686,6 +714,30 @@ fn widen(
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
             }
             return r;
+        }
+        if active_loop_only {
+            // Only a single backward branch on the SCC just set by
+            // s_andn2_wrexec_b64. This instruction restricts EXEC to the
+            // unfinished lanes. The guest repeats the loop if *either*
+            // half still has work, while individual vector writes retain
+            // their EXEC predicates.
+            let [latch] = more.as_slice() else {
+                return r;
+            };
+            let block = &p.blocks[*latch];
+            let [.., update, branch] = block.insts.as_slice() else {
+                return r;
+            };
+            if !wide.is_empty()
+                || update.name() != "s_andn2_wrexec_b64"
+                || branch.name() != "s_cbranch_scc1"
+                || !matches!(
+                    block.exit,
+                    ir::Exit::Branch { taken, not_taken } if taken <= *latch && not_taken > *latch
+                )
+            {
+                return r;
+            }
         }
         wide.extend(more);
     }

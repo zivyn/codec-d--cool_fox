@@ -221,7 +221,7 @@ static BAKE_SERVED: AtomicU64 = AtomicU64::new(0);
 /// `PS_BakeDecorations_*`), by the first 16 hex digits of their hash as the
 /// frame listings print it. They draw into a 256x256 corner of 2048x2048
 /// targets and name no texture in a table.
-const BAKE_PIXEL_SHADERS: [&str; 4] =
+pub(crate) const BAKE_PIXEL_SHADERS: [&str; 4] =
     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
 
 /// Since the start: early runs of the texture pass, and those of them
@@ -2239,7 +2239,15 @@ impl State {
         });
         let per_frame = match asked {
             Some(mb) => mb << 20,
-            None => staging_budget_per_frame(memory.map(|[budget, ..]| budget)),
+            None => {
+                let base = staging_budget_per_frame(memory.map(|[budget, ..]| budget));
+                let capped = if crate::residency::limited_host_ram() {
+                    base.min(128 << 20)
+                } else {
+                    base
+                };
+                crate::residency::prefetch_limit(capped, crate::residency::pressured())
+            }
         };
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);

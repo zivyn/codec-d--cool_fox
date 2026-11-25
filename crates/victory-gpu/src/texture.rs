@@ -519,7 +519,7 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle_ms = crate::host::ram_idle_ms(crate::residency::headroom());
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -788,6 +788,25 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
             }
         }
     }
+    // The video decoder cycles CPU-written linear plane buffers. Keep a
+    // dedicated per-list upload buffer through the list's GPU fence so
+    // concurrent frames never overwrite each other or stall on staging hashes.
+    if staging.movie_plane() {
+        let (at, len) = staging.memory();
+        let footprint = staging.footprints[0].Footprint;
+        let pitch = footprint.RowPitch as usize;
+        let bytes = pitch * staging.rows[0] as usize;
+        let plane = staging.clone();
+        let Some(source) = list.plane_upload(bytes as u64, (at, len), move |dst| {
+            fill_plane(&plane.layout, at, len, dst, bytes, pitch);
+        }) else {
+            once!("no upload buffer for a CPU-written movie plane");
+            return;
+        };
+        record_upload(list, resource, texture, &staging, &source, 0);
+        staging.uploaded.store(true, Relaxed);
+        return;
+    }
     // The host texture has the staging buffer's contents: only the check
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
@@ -807,77 +826,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
-    const COPY_DEST: u32 = 0x400;
-    // A texture cut from a block may lie where another did: what the card
-    // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
-        let aliasing = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
-                    pResourceBefore: std::mem::ManuallyDrop::new(None),
-                    // SAFETY: a borrowed pointer the barrier never releases.
-                    pResourceAfter: unsafe { std::mem::transmute_copy(texture) },
-                }),
-            },
-        };
-        // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[aliasing]) };
-    }
-    crate::list::ensure_state(list, resource, COPY_DEST);
-    // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
-    for (i, footprint) in staging.footprints.iter().enumerate() {
-        #[cfg(feature = "diagnostics")]
-        {
-            let f = footprint.Footprint;
-            // SAFETY: live resources.
-            let (gpu, d) = unsafe { (staging.buffer.GetGPUVirtualAddress(), texture.GetDesc()) };
-            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
-            list.note_read(
-                || {
-                    format!(
-                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        d.Width,
-                        d.Height,
-                        d.DepthOrArraySize,
-                        d.Format.0,
-                        d.MipLevels,
-                        staging.footprints.len(),
-                        staging.size,
-                        staging.base + footprint.Offset,
-                        f.Width,
-                        f.Height,
-                        f.Depth,
-                        f.RowPitch
-                    )
-                },
-                (gpu + staging.base + footprint.Offset, len),
-            );
-        }
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: a borrowed pointer the location never releases.
-            pResource: unsafe { std::mem::transmute_copy(texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: staging.first - staging.level0 + i as u32,
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&staging.buffer) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: staging.base + footprint.Offset,
-                    ..*footprint
-                },
-            },
-        };
-        // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    }
+    record_upload(list, resource, texture, &staging, &staging.buffer, staging.base);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
@@ -917,6 +866,115 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // upload: its slots are made due again by the texture pass.
         if waiting {
             crate::descriptor::host::levels_waiting(staging.memory as u64);
+        }
+    });
+}
+
+fn record_upload(
+    list: &HostList,
+    resource: This,
+    texture: &ID3D12Resource,
+    staging: &Staging,
+    source: &ID3D12Resource,
+    base: u64,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    const COPY_DEST: u32 = 0x400;
+    // A texture cut from a block may lie where another did: what the card
+    // holds of that one is done with before the first upload into this one.
+    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+        let aliasing = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: std::mem::ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: std::mem::ManuallyDrop::new(None),
+                    // SAFETY: a borrowed pointer the barrier never releases.
+                    pResourceAfter: unsafe { std::mem::transmute_copy(texture) },
+                }),
+            },
+        };
+        // SAFETY: an open list and a live texture.
+        unsafe { list.list.ResourceBarrier(&[aliasing]) };
+    }
+    crate::list::ensure_state(list, resource, COPY_DEST);
+    // The staging/plane upload buffer lives until the list is reset.
+    for (i, footprint) in staging.footprints.iter().enumerate() {
+        #[cfg(feature = "diagnostics")]
+        {
+            let f = footprint.Footprint;
+            // SAFETY: live resources.
+            let (gpu, d) = unsafe { (source.GetGPUVirtualAddress(), texture.GetDesc()) };
+            let len = u64::from(f.RowPitch) * u64::from(staging.rows[i]) * u64::from(f.Depth);
+            list.note_read(
+                || {
+                    format!(
+                        "texture upload {resource:?} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
+                        d.Width,
+                        d.Height,
+                        d.DepthOrArraySize,
+                        d.Format.0,
+                        d.MipLevels,
+                        staging.footprints.len(),
+                        staging.size,
+                        base + footprint.Offset,
+                        f.Width,
+                        f.Height,
+                        f.Depth,
+                        f.RowPitch
+                    )
+                },
+                (gpu + base + footprint.Offset, len),
+            );
+        }
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: staging.first - staging.level0 + i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(source) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: base + footprint.Offset,
+                    ..*footprint
+                },
+            },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+}
+
+fn fill_plane(
+    layout: &victory_formats::texture::Layout,
+    at: usize,
+    len: usize,
+    dst: usize,
+    bytes: usize,
+    pitch: usize,
+) {
+    let _pin = crate::watch::title_memory_reading();
+    // SAFETY: the list owns this full upload allocation until its GPU work completes.
+    let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
+    let mip = &layout.mips[0];
+    if mip.offset == 0
+        && mip.pitch as usize * layout.desc.element_bytes as usize == pitch
+        && bytes <= len
+        && crate::host::read_into(at as *const _, out)
+    {
+        return;
+    }
+    with_read(len, |read| {
+        crate::host::copy_mapped(read.as_mut_ptr(), at as *const u8, len, false);
+        if let Err(error) = layout.detile(read, 0, 0, out, pitch, bytes) {
+            out.fill(0);
+            once!("could not copy the linear plane into the list's upload buffer: {error:?}");
         }
     });
 }
@@ -1167,6 +1225,20 @@ impl Staging {
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
+    }
+
+    fn movie_plane(&self) -> bool {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
+        let desc = &self.layout.desc;
+        !self.on_demand
+            && desc.dimension == victory_formats::texture::Dimension::Tex2d
+            && desc.swizzle.0 == 0
+            && desc.depth == 1
+            && desc.mips == 1
+            && desc.samples == 1
+            && self.footprints.len() == 1
+            && self.footprints[0].Offset == 0
+            && self.footprints[0].Footprint.Format == DXGI_FORMAT_R8_UNORM
     }
 
     /// Returns the bytes of title memory read.

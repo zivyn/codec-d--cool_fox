@@ -376,7 +376,7 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
         (Some(a), Some(b)) => Some(a.min(b)),
         (a, b) => a.or(b),
     };
-    ram_idle_for(effective, keep_freed())
+    ram_idle_for(effective, keep_freed() && !crate::residency::limited_host_ram())
 }
 
 fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
@@ -2236,6 +2236,8 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// Reads a CPU-written linear movie plane into a per-list upload buffer.
+    Plane((usize, usize), Box<dyn Fn() + Send>),
     /// A title buffer copy that the list does on the card ([`place`]): what
     /// is done on the CPU for it.
     Placed(place::Placed),
@@ -2249,6 +2251,8 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Standalone upload footprints kept through this list's fence (movie planes).
+    plane_uploads: Vec<(Chunk, u64)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -2313,6 +2317,7 @@ impl Deferred {
 
 impl Drop for Deferred {
     fn drop(&mut self) {
+        give_chunks(std::mem::take(&mut self.plane_uploads));
         ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
@@ -2987,6 +2992,16 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
                             blame("a texture", written, at, len);
+                        }
+                        return Some(WHY_READ);
+                    }
+                }
+                &Step::Plane((at, len), _) => {
+                    if touches(written, at, at.saturating_add(len)) {
+                        if count {
+                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a movie plane", written, at, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -7242,6 +7257,23 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// A copy source owned exclusively by this list until reset after its
+    /// last execution. A different list can prepare its movie plane concurrently.
+    pub(crate) fn plane_upload(
+        &self,
+        size: u64,
+        read: (usize, usize),
+        fill: impl Fn(usize) + Send + 'static,
+    ) -> Option<ID3D12Resource> {
+        let chunk = take_chunk(host()?, size)?;
+        let source = chunk.buffer.clone();
+        let destination = chunk.data;
+        let mut deferred = self.deferred();
+        deferred.plane_uploads.push((chunk, size));
+        deferred.copies.push(Step::Plane(read, Box::new(move || fill(destination))));
+        Some(source)
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -7358,6 +7390,13 @@ impl HostList {
                             batch.refresh_textures();
                         }
                     }
+                    continue;
+                }
+                Step::Plane((_, len), fill) => {
+                    let started = std::time::Instant::now();
+                    fill();
+                    PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    PREPARING[3].fetch_add(*len as u64, Ordering::Relaxed);
                     continue;
                 }
             };

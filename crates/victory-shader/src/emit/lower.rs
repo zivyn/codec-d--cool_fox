@@ -423,6 +423,7 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 pub(super) const LANE_MASK: Why = "a lane mask read as data";
+pub(super) const DIVERGENT_MASK_EXCHANGE: Why = "a lane mask exchanged where not every lane runs";
 /// A mask with lanes outside EXEC where it is written, read as a number where the lanes that
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
@@ -546,7 +547,7 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
@@ -559,6 +560,9 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            if st.guards[b][i].is_some() {
+                continue; // lanes outside EXEC keep another value
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
@@ -569,11 +573,18 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
                 {
                     v.src.clone()
                 }
+                Fields::Ds {
+                    addr: Some(Operand::Vector { reg, dwords: 1 }),
+                    gds: false,
+                    ..
+                } if ordered_lds && name == "ds_read_b32" => {
+                    if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a)) {
+                        same.extend(inst.writes.iter().map(|w| w.1));
+                    }
+                    continue;
+                }
                 _ => continue,
             };
-            if st.guards[b][i].is_some() {
-                continue; // lanes outside EXEC keep another value
-            }
             let alike = ops.iter().all(|op| match *op {
                 Operand::Vector { reg, .. } => {
                     // every dword of the operand the instruction reads from that register on
@@ -1175,6 +1186,13 @@ thread_local! {
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
+    // A scalar select uses the condition of the whole guest wave, even
+    // when the preceding mask operation has no scalar-dword consumers.
+    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
+        && i.read(Reg::Scc).is_some_and(|s| st.scc_some.contains_key(&s))
+    {
+        return true;
+    }
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let ops: Vec<&Operand> = match &i.fields {
         // A mask operation (its result a mask) is no data use.
@@ -1678,7 +1696,9 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all),
+                Some((_, false, all)) if !LOCAL_WAVES.get() => {
+                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0)
+                }
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {
@@ -3526,7 +3546,7 @@ impl<'a> Lower<'a> {
                     } else if !self.exchange.as_ref().is_some_and(|e| e.1) && !b.is_none_or(|b| self.all_lanes(b)) {
                         // (a group of 32 or fewer has no other half to exchange with)
                         need(b.unwrap_or(0));
-                        return Err("a lane mask exchanged where not every lane runs");
+                        return Err(DIVERGENT_MASK_EXCHANGE);
                     }
                     xy = self.exchange_halves(at, xy.0);
                 }
@@ -4227,7 +4247,7 @@ impl<'a> Lower<'a> {
         }
         if !made.is_none_or(|b| self.all_lanes(b)) {
             need(made.unwrap_or(0));
-            return Err("a lane mask exchanged where not every lane runs");
+            return Err(DIVERGENT_MASK_EXCHANGE);
         }
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(at, some);
@@ -6026,6 +6046,13 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        if self.x.st.scc_some.contains_key(&v)
+            && matches!(self.vals.get(&v), None | Some(Val::Missing(_)))
+        {
+            let x = self.scc_some(v)?;
+            self.vals.insert(v, Val::Bit(x));
+            return Ok(x);
+        }
         match self.get(v) {
             Ok(Val::Bit(x)) => Ok(x),
             Ok(_) => Err("SCC without a value"),
@@ -7694,6 +7721,15 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(&source) = self.x.res.restored_lanes.get(&(b, i)) {
+            // This lane was overwritten by a uniform scalar. The previous
+            // contents of other lanes can be unknown (a reduction scratch).
+            let word = match source {
+                crate::resource::Moved::Value(v) => self.i32_of(v)?,
+                crate::resource::Moved::Const(k) => self.s.m.i32(k),
+            };
+            return self.write_i(inst, word, None);
+        }
         if self.x.res.waterfall.compares.contains(&(b, i)) {
             // The first lane's dwords of a waterfall loop are each lane's
             // own (see `resource::Waterfall`).

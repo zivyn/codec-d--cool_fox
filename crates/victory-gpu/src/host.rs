@@ -3167,6 +3167,7 @@ fn late_line(frames: f64) {
     }
 }
 
+pub(crate) mod awake;
 mod card_steps;
 mod place;
 mod send;
@@ -5030,6 +5031,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            awake::sent(&self.device);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));

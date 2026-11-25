@@ -87,6 +87,8 @@ pub struct Options {
     /// Milliseconds the sender waits after each submission, as a title does
     /// that prepares the next one meanwhile: the card stands idle.
     pub pace: f64,
+    /// The card kept awake meanwhile (`crate::host::awake`).
+    pub awake: bool,
     /// Run only these lists (by their place in the frame).
     pub only: Option<(u32, u32)>,
     /// The last command that runs (list, command); after it only barriers.
@@ -123,6 +125,7 @@ impl Default for Options {
             wait_all: false,
             wait_lists: false,
             pace: 0.0,
+            awake: false,
             only: None,
             until: None,
             skip_shaders: Vec::new(),
@@ -158,6 +161,7 @@ impl Options {
             one_submit: false,
             wait_all: false,
             wait_lists: false,
+            awake: false,
             only: None,
             skip_shaders: Vec::new(),
             ..self.clone()
@@ -582,7 +586,7 @@ impl Player {
         step("descriptors", &mut at);
         player.load_contents()?;
         step("contents", &mut at);
-        player.make_masters(options.buffers)?;
+        player.make_masters(options.buffers, options.restore)?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -1566,7 +1570,7 @@ impl Player {
     }
 
     /// Copies of what the frame changes; and the states it leaves.
-    fn make_masters(&mut self, buffers: Buffers) -> Result<()> {
+    fn make_masters(&mut self, buffers: Buffers, wanted: bool) -> Result<()> {
         let mut states = States::default();
         for r in &self.frame.resources {
             if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
@@ -1699,6 +1703,11 @@ impl Player {
             })
             .collect();
         ids.sort_unstable();
+        // Without restoring they are of no use, and their room may be what
+        // the frame itself lacks.
+        if !wanted {
+            ids.clear();
+        }
         let mut total = 0u64;
         let mut in_pc = 0u64;
         for id in ids {
@@ -2962,6 +2971,7 @@ impl Player {
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
         let mut made = self.prepare(o)?;
+        let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
         for _ in 0..o.loops.max(1) {
             stamps = self.once(o, &mut made)?;

@@ -85,6 +85,9 @@ pub(crate) struct Replay {
     /// idle between them, as it does while the title prepares the next.
     #[arg(long, default_value_t = 0.0)]
     pace: f64,
+    /// Keep the card's clocks up meanwhile (VICTORY_CARD_AWAKE=1).
+    #[arg(long)]
+    awake: bool,
     /// The system's breadcrumbs after every command (VICTORY_D3D12_DRED=light).
     #[arg(long)]
     breadcrumbs: bool,
@@ -263,6 +266,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         wait_all: r.wait_all,
         wait_lists: r.wait_lists,
         pace: r.pace,
+        awake: r.awake,
         only,
         until,
         skip_shaders: r.skip_shader,

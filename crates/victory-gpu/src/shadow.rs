@@ -1197,20 +1197,40 @@ fn pooled(n: usize) -> Vec<u8> {
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// How many snapshot buffers are kept (`VICTORY_SNAPSHOT_POOL`; `8`: as
+/// before).
+///
+/// A frame gives some 330 ranges of copies in the PC's memory to shaders, and
+/// most are of copies of their own; with two or three frames in the air eight
+/// buffers were the eight largest, and every other snapshot was memory fresh
+/// from the kernel and given back to it: 11 % of the submitting thread in the
+/// opening (profile cpu-1: `NtAllocateVirtualMemory` under
+/// [`Shadow::writing`]), and the page faults of filling it.
+fn snapshots_kept() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
+}
+
+/// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
+/// the largest, and of those the largest one and the next ones up to `KEPT`
+/// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
-    pool.retain(|v| {
-        seen += 1;
+    let (mut kept, mut total) = (0, 0usize);
+    for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
-    });
+        if kept > 0 && total > KEPT {
+            break;
+        }
+        kept += 1;
+    }
+    // (Given back to the kernel without the lock: milliseconds.)
+    let gone = pool.split_off(kept);
+    drop(pool);
+    drop(gone);
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3207,14 +3227,14 @@ impl Shadow {
                         note_stale(2);
                         return true;
                     }
-                    *runs_left -= runs.len();
+                    *runs_left -= copies;
                     let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
-                    for (r, m) in runs {
+                    for &(r, m) in &runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    self.card_changed_runs(runs.into_iter().map(|(r, m)| (at + r, at + r + m)));
                     if let Some(was) = was {
                         crate::host::upcheck::note(self.id, at, &was, held);
                     }
@@ -3233,8 +3253,6 @@ impl Shadow {
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                    self.card_changed_runs(runs.into_iter().map(|(r, m)| (at + r, at + r + m)));
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }

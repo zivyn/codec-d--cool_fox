@@ -129,7 +129,9 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
             return Some(spare.swap_remove(i));
         }
     }
-    let size = size.next_multiple_of(8 << 20);
+    // By doubles, so that the next of about this size finds it: what
+    // submissions send differs from frame to frame.
+    let size = size.max(8 << 20).next_power_of_two();
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "bytes a submission sends up".into());
     Some(Memory {

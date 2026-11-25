@@ -722,6 +722,20 @@ pub(crate) fn remapped(at: usize, len: usize) {
     ranges.push((start, end));
 }
 
+/// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
+/// several threads map and write, some 5,000 ranges a frame, the same
+/// textures' over and over, and each was looked up).
+fn join(ranges: &mut Vec<(u64, u64)>) {
+    ranges.sort_unstable();
+    ranges.dedup_by(|next, last| {
+        if next.0 > last.1 {
+            return false;
+        }
+        last.1 = last.1.max(next.1);
+        true
+    });
+}
+
 /// Frames for which a slot a draw read through a table counts as a table's
 /// slot ([`HostHeap::tabled`]).
 const TABLED_FRAMES: u64 = 240;
@@ -1711,10 +1725,11 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
         }
+        join(&mut ranges);
         let mut slots: Vec<u32> = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
@@ -4590,6 +4605,15 @@ mod tests {
         let View::Placed(_, resource, desc) = low.clone() else { unreachable!() };
         assert!(!same_placed_texture(&low, &View::Placed(true, resource, desc)));
         assert!(!same_placed_texture(&low, &View::Shader(0, None)));
+    }
+
+    #[test]
+    fn ranges_that_touch_are_one() {
+        let mut ranges = vec![(40, 50), (30, 40), (35, 40), (10, 20), (45, 60), (60, 61), (1, 1)];
+        join(&mut ranges);
+        assert_eq!(ranges, [(1, 1), (10, 20), (30, 61)]);
+        join(&mut ranges);
+        assert_eq!(ranges.len(), 3);
     }
 
     /// Typed buffer views of integer formats are marked in the table of

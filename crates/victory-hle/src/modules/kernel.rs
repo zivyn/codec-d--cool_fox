@@ -406,6 +406,34 @@ pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
     argv().list.get()
 }
 
+/// The title's thread priorities, but for the lowest two, which become
+/// "below normal". Six of the title's threads run at "idle", the streaming
+/// pager's among them; on the console they have what the rest of the title
+/// leaves of its cores. A PC's processors are also wanted by other programs
+/// and by our own workers (sixteen when pipelines are made): with every
+/// one of them busy such a thread ran once in four seconds or so, when the
+/// host's scheduler took pity, and the loading that waits for it with it
+/// (run stream-3: loads seen to be done 1.1 s late on average, 4.8 s at
+/// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them.
+fn title_priority(asked: i32) -> i32 {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    const BELOW_NORMAL: i32 = -1;
+    match asked {
+        IDLE..=LOWEST => BELOW_NORMAL,
+        other => other,
+    }
+}
+
+/// [`title_priority`].
+pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
+    static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
+    let priority = if as_set { priority } else { title_priority(priority) };
+    // SAFETY: the title passes a thread handle.
+    unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -440,6 +468,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(SetThreadPriority),
         ],
     }
 }
@@ -653,6 +682,24 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's idle and lowest threads run below normal; the others as
+    /// it sets them.
+    #[test]
+    fn no_title_thread_waits_for_idle_processors() {
+        let given: Vec<i32> = [-15, -2, -1, 0, 1, 2, 15].into_iter().map(title_priority).collect();
+        assert_eq!(given, [-1, -1, -1, 0, 1, 2, 15]);
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        std::thread::spawn(|| {
+            // SAFETY: plain calls on this thread.
+            let thread = unsafe { GetCurrentThread() };
+            assert_eq!(SetThreadPriority(thread, -15), 1);
+            // SAFETY: as above.
+            assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn title_images_report_their_original_path() {

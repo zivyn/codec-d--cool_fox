@@ -715,7 +715,10 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
+                let now = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                #[cfg(all(windows, feature = "diagnostics"))]
+                crate::host::spans::stamped(at as usize, now);
+                as_loaded(now, at as usize, gpu_load())
             }
             Written::SystemTimestamp => system_timestamp(),
         };
@@ -727,6 +730,31 @@ impl Written {
                 at.cast::<u64>().write_unaligned(value);
             }
         }
+    }
+}
+
+/// What the title's GPU time is made to look like, in ticks
+/// (`VICTORY_GPU_LOAD_MS`; unset: as it is).
+///
+/// The title asks for four GPU timestamps a frame, in pairs of 16 bytes, the
+/// start in the second eight and the end in the first. All of them are written
+/// when the frame's last submissions land, within microseconds, so every pair
+/// says the card did nothing.
+fn gpu_load() -> u64 {
+    static LOAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LOAD.get_or_init(|| {
+        let ms = std::env::var("VICTORY_GPU_LOAD_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+        ms * (TIMESTAMP_FREQUENCY / 1000)
+    })
+}
+
+/// The timestamp written at `at` when the clock says `now`, if a pair's start
+/// is to lie `load` ticks before its end.
+fn as_loaded(now: u64, at: usize, load: u64) -> u64 {
+    if at & 8 != 0 {
+        now.saturating_sub(load).max(1)
+    } else {
+        now
     }
 }
 
@@ -919,6 +947,15 @@ extern "system" fn copy_page_mappings(
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
     let mut ok = true;
+    let many = crate::resource::many_page_mapper();
+    let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
+    let mut map = |to: u64, from: u64, len: u64| match many {
+        Some(_) => {
+            gathered.push((to, from, len));
+            true
+        }
+        None => map(to, from, len),
+    };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -939,6 +976,9 @@ extern "system" fn copy_page_mappings(
             };
             at += len;
         }
+    }
+    if let Some(many) = many {
+        ok &= many(&gathered);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1070,6 +1110,14 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    #[test]
+    fn a_pair_of_timestamps_shows_the_load_it_is_given() {
+        let (start, end) = (0xd0419_6698, 0xd0419_6690);
+        assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
+        assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
+        assert_eq!(as_loaded(5, start, 100), 1);
     }
 
     #[test]

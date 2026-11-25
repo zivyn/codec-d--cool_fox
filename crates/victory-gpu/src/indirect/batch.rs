@@ -77,7 +77,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[w] = load(job.x & 3, job.y + w * 4);
         }
         if (kind <= 1) {
-            record[0] = min(record[0], 1u << 24);
+            if (record[0] >= 1u << 23) {
+                record[0] = 0;
+                record[1] = 0;
+            }
             record[1] = min(record[1], (1u << 26) / max(record[0], 1u));
             cost = record[0] * record[1];
         } else if (kind == 2) {
@@ -91,8 +94,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[1] = g.y;
             record[2] = g.z;
         } else {
+            if (record[0] > 65535u) {
+                record[0] = 0;
+                record[1] = 0;
+                record[2] = 0;
+            }
             asked = record[0];
-            record[0] = min(record[0], 65535u);
             record[1] = min(record[1], 1u);
             record[2] = min(record[2], 1u);
             cost = record[0] * record[1] * record[2] * 128u;

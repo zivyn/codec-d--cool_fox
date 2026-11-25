@@ -88,8 +88,22 @@ unsafe impl Send for Memory {}
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
-/// At most this much is kept.
-const KEPT: u64 = 768 << 20;
+/// At most this much is kept (of the card's memory, with [`on_card`]).
+fn kept() -> u64 {
+    if on_card() { 256 << 20 } else { 768 << 20 }
+}
+
+/// Whether the memory lies in the card's memory, written by the CPU through
+/// the bus (`VICTORY_SEND_BAR=1`): the copies on the card's drawing queue, which
+/// nothing overlaps, then cross no bus. In a captured frame they took 5.4 ms of
+/// the card's 30 (342 copies), and take 0.4 this way; but filling it takes the
+/// submitting thread 8-9 ms a frame instead of 3 (73-93 MB, run card-3 against
+/// card-1), so it is a loss while the card waits for that thread: off by
+/// default.
+fn on_card() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
+}
 
 fn memory(host: &Host, size: u64) -> Option<Memory> {
     {
@@ -100,7 +114,11 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         }
     }
     let size = size.next_multiple_of(8 << 20);
-    let (buffer, data) = host.upload_buffer(size)?;
+    let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
+    let (buffer, data) = match mapped {
+        Some(made) => made,
+        None => host.upload_buffer(size)?,
+    };
     name(&buffer, || "bytes a submission sends up".into());
     Some(Memory {
         buffer,
@@ -114,7 +132,7 @@ pub(super) fn give_back(memory: Memory) {
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
-    while spare.iter().map(|m| m.size).sum::<u64>() > KEPT {
+    while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
         spare.remove(0);
     }
 }

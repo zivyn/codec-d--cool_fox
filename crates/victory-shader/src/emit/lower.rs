@@ -6890,11 +6890,17 @@ impl<'a> Lower<'a> {
     }
 
     /// The heap index to read descriptor `src` at, `index` being the title's:
-    /// for a buffer picked from the heap itself and read as raw bytes (or as
-    /// a constant buffer), the host's raw twin of that slot
-    /// ([`super::shader::raw_views`]), whose reads end where the view does.
-    /// Everything else (tables, textures, typed buffers) stays in place.
-    /// And whether it is a twin's (inside the host's heap).
+    /// for a buffer read as raw bytes, through a table or picked from the
+    /// heap itself (or picked and read as a constant buffer), the host's raw
+    /// twin of that slot ([`super::shader::raw_views`]), whose reads end where
+    /// the view does. Everything else (textures, typed buffers, tables'
+    /// constant buffers) stays in place. And whether it is a twin's (inside
+    /// the host's heap).
+    ///
+    /// Tables too: a view that does not begin on 16 bytes cannot be raw, and
+    /// a pixel program of the main pass (3711fdad456538a1, stopped at in the
+    /// device losses of runs n03 and n04) reads a structured one of 8 byte
+    /// elements at 8 as raw bytes per lane.
     fn raw_twin(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> (V, bool) {
         // Raw and constant buffers (DXIL resource kinds 11 and 13).
         const RAW: u32 = 11;
@@ -6907,7 +6913,9 @@ impl<'a> Lower<'a> {
             self.scalar
                 .get(load)
                 .and_then(|a| self.x.native.layout.get(a.param))
-                .is_some_and(|p| p.root == RootType::ResourceHeap)
+                .is_some_and(|p| {
+                    p.root == RootType::ResourceHeap || (p.root == RootType::Table && props.0 & 0xFF == RAW)
+                })
         };
         if first == 0 || sampler || !matches!(props.0 & 0xFF, RAW | CONSTANT) || !src.leaves().iter().all(picked) {
             return (index, false);

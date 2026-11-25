@@ -1,10 +1,10 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25, 06:00: **with `VICTORY_BVH_BUILDER=1` the builder runs on
-the RX 7900 XTX and rooms get their indirect light** (run light-6, the dorm:
-bunk, locker, window frame, posters; 100-116 ms a frame against 84-95 without).
-Some structures are still wrong; one run of four with it lost the device early,
-in a list without a builder stage. Off by default.
+Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
+indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
+card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
+default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
+for next to nothing (below).
 
 ## What the title does
 
@@ -92,6 +92,9 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
+| `VICTORY_BVH_SIZES_WAIT=0` | submissions that ask for structures' sizes are not waited for |
+| `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
 | `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
 | `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
@@ -102,10 +105,18 @@ dispatches, faults and what came.
 
 ## Known gaps
 
-- About 4,000 pages a frame that are not there are still touched (the notes'
-  limit): some structures are wrong and rays go anywhere in them. Guess: sizes
-  that came back late or not (fixed after light-6, not seen working), so places
-  overlap.
+- Dynamic structures overlap each other (8 of 65 good in run light-10). Cause,
+  run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
+  structure's compacted size, reads it one or two frames later without looking
+  whether it is there, takes memory of that size and has the structure copied
+  into it. Our submissions land up to two frames late; the title read what the
+  slot held before, another structure's size, and the copy wrote over the
+  neighbours. A submission that asks is waited for now
+  (`VICTORY_BVH_SIZES_WAIT=0`: not).
+- Some 2,500 pages a frame that are not there are still touched (the notes'
+  limit): rays in structures that were written over.
+- A capture of a frame with the builder on cannot be replayed: the card hangs
+  (cause unknown; do not try).
 - Five shadow-mask trace programs do not translate (a structure's address out
   of a descriptor picked from the heap by a computed index: the host would have
   to give a table of addresses by slot). The title did not create them in any
@@ -115,6 +126,33 @@ dispatches, faults and what came.
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
+
+## Without rays: the stand-in (`crates/victory-gpu/src/ambient.rs`)
+
+Without structures every ray misses. The title's program that resolves the
+diffuse light of its screen probes (`CS_ScreenProbes_TemporalResolve_*`, list
+184 of a frame) then leaves the sky's light outdoors, nothing indoors, and in
+blocks of tiles what the probes' memory held. `VICTORY_AMBIENT=<share>` raises
+it to an estimate right after that program: the title keeps, for its own screen
+traces, the light visible surfaces send out (`CS_CacheScreenSpaceRadiance`,
+1280x720, the frame before); its mean in 64x36 cells is gathered at 160x90
+points, each cell weighted by the share of the surroundings it covers, as a
+directional value; each pixel takes it between the points by depth, with its
+normal and a shade in creases. So level and tint follow the hour, the room and
+its lamps. What the program left counts up to four times the estimate.
+
+Where it can be put, and the crease shade, are beloooo's (VIctory-Belobug-AMD
+06031237, 4f45ab88, cd9f78ce); `VICTORY_AMBIENT=constant:<level>` is that
+fork's constant.
+
+| variable | does |
+|---|---|
+| `VICTORY_AMBIENT=<share>` | the estimate, 1 all of it (unset: the title's own) |
+| `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
+| `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
+| `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off) |
+
+It is off while the builder runs.
 
 ## Where to look
 

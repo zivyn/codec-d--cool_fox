@@ -843,6 +843,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -855,6 +856,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -1154,6 +1156,56 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn half_classifies_special_and_finite_values() {
+        use super::half;
+
+        assert!(half(0x7c01).is_nan());
+        assert!(half(0xfe00).is_nan());
+        assert_eq!(half(0x7c00), f32::INFINITY);
+        assert_eq!(half(0xfc00), f32::NEG_INFINITY);
+        assert_eq!(half(0x0000).to_bits(), 0.0f32.to_bits());
+        assert_eq!(half(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(half(0x0001), 2f32.powi(-24));
+        assert_eq!(half(0xbe00), -1.5);
+    }
+
+    #[test]
+    fn packed_float_classifies_special_and_finite_values() {
+        use super::small_float;
+
+        for mantissa_bits in [5, 6] {
+            let special = 31 << mantissa_bits;
+            assert!(small_float(special | 1, mantissa_bits).is_nan());
+            assert!(small_float(special | (1 << (mantissa_bits - 1)), mantissa_bits).is_nan());
+            assert_eq!(small_float(special, mantissa_bits), f32::INFINITY);
+            assert_eq!(small_float(0, mantissa_bits).to_bits(), 0.0f32.to_bits());
+            assert_eq!(small_float(1, mantissa_bits), 2f32.powi(-14 - mantissa_bits as i32));
+            assert_eq!(small_float(15 << mantissa_bits, mantissa_bits), 1.0);
+        }
+    }
+
+    #[test]
+    fn hdr_targets_render_nan_and_infinity_as_distinct_channel_values() {
+        // R16G16B16A16_FLOAT: [NaN, +Inf, NaN], [1, 0.5, 0].
+        let half = [0x7c01u16, 0x7c00, 0xfe00, 0, 0x3c00, 0x3800, 0, 0];
+        let half: Vec<_> = half.into_iter().flat_map(u16::to_le_bytes).collect();
+        // R11G11B10_FLOAT: the same values with 6-bit and 5-bit mantissas.
+        let packed = [
+            0x7c1u32 | (0x7c0 << 11) | (0x3e1 << 22),
+            0x3c0 | (0x380 << 11),
+        ];
+        let packed: Vec<_> = packed.into_iter().flat_map(u32::to_le_bytes).collect();
+        let expected = [0, 255, 0, 255, 255, 127, 0, 255];
+        for (format, row) in [(10, half), (26, packed)] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, row.len(), &row).as_deref(),
+                Some(&expected[..]),
+                "format {format}"
+            );
+        }
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

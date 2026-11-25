@@ -870,7 +870,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { usize::MAX } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -2841,23 +2841,30 @@ mod tests {
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
 
-    /// Contiguous free dynamic slot ranges that cross the search cursor are found.
     #[test]
-    fn dynamic_allocation_finds_contiguous_range_crossing_search_cursor() {
+    fn dynamic_search_can_find_a_run_across_the_cursor() {
         let Some(heap) = HostHeap::new(false, 4) else {
-            return; // no host GPU
+            eprintln!("no host descriptor heap; skipped");
+            return;
         };
-        // Allocate slots 0..8, advancing cursor to 8.
-        let a = heap.dynamic(8).unwrap();
-        // Allocate slots 8..16, advancing cursor to 16.
-        let b = heap.dynamic(8).unwrap();
-        assert_eq!((a, b), (4, 12));
+        let first = heap.dynamic(1).unwrap();
+        let left = heap.dynamic(2).unwrap();
+        let right = heap.dynamic(2).unwrap();
+        let rest = heap.dynamic(heap.dynamic - 5).unwrap();
+        assert_eq!((first, left, right, rest), (4, 5, 7, 9));
 
-        // Release slots 10..14 (crossing cursor at 12).
-        // Before the fix, a request of 4 slots starting search at 12 scanned 12..end then 0..12,
-        // missing the contiguous run at 10..14.
-        heap.release(14, 4);
-        let c = heap.dynamic(4);
-        assert_eq!(c, Some(14));
+        // Reallocating the left half puts the cursor back in the middle.
+        heap.release(left, 2);
+        assert_eq!(heap.dynamic(2), Some(left));
+        heap.release(left, 2);
+        heap.release(right, 2);
+        assert_eq!(heap.dynamic(4), Some(left));
+        assert_eq!(heap.dynamic(1), None);
+
+        // A free slot at each physical end does not form a two-slot range.
+        heap.release(first, 1);
+        let last = first + heap.dynamic - 1;
+        heap.release(last, 1);
+        assert_eq!(heap.dynamic(2), None);
     }
 }

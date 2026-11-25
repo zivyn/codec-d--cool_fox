@@ -1689,6 +1689,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         let refreshed = std::time::Instant::now();
+        crate::watch::look_at_holes();
         self.heap_textures(list, heap, host);
         #[cfg(feature = "diagnostics")]
         for (sum, time) in HEAP_SPLIT.iter().zip([looked - started, refreshed - looked, refreshed.elapsed()]) {

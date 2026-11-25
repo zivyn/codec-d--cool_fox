@@ -939,6 +939,8 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+/// Watched, not by the kernel but by the guards, when last asked about.
+const GUARDED: u8 = 3;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -2017,6 +2019,14 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether a submission asks the kernel about the copy's ranges ahead:
+    /// not of memory that is not watched, nor of view memory, which the
+    /// kernel would refuse (and with it the ranges asked about together).
+    pub(crate) fn asked_ahead(&self) -> bool {
+        let watched = self.watched.load(Ordering::Relaxed);
+        watched != NOT_WATCHED && (watched != GUARDED || !crate::watch::light())
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -2774,7 +2784,7 @@ impl Shadow {
         if from >= to {
             return true;
         }
-        if self.watched.load(Ordering::Relaxed) != 1 {
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
@@ -2804,7 +2814,8 @@ impl Shadow {
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+                let guarded = crate::watch::guarded(from, to);
+                self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
@@ -3379,7 +3390,7 @@ impl Shadow {
             // Where title memory is not mapped the CPU's side keeps what
             // the card wrote, as before.
             let merged =
-                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes) };
+                unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
             put += merged;
         }
@@ -3409,7 +3420,33 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes) }
+        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+    }
+
+    /// What shaders wrote in 64 KiB block `block` (of title memory) of this
+    /// copy was put into title memory beside the guard, which was noted as a
+    /// write with number `now`, `before` the number of the block's last write
+    /// before. If the copy held title memory's bytes of the block ahead of
+    /// that it holds them still, and is noted to ([`crate::land`] says why);
+    /// whether it was.
+    ///
+    /// That it did: it took the whole block after that write, and no other
+    /// came that is not noted yet. Looked at after the note, whatever comes
+    /// later has a number above it: a write of the title's takes the block's
+    /// bit, until an asking has noted it.
+    pub(crate) fn landed(&self, block: usize, before: u64, now: u64) -> bool {
+        let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
+            return false;
+        };
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(at) = copied.get_mut(page) else {
+            return false;
+        };
+        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        if held {
+            *at = (*at).max(now);
+        }
+        held
     }
 }
 

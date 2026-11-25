@@ -28,7 +28,7 @@
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
 //!
-//! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
+//! shortcut: the bounds (below 2^23 vertices an instance, 2^26 vertex instances, 65,535
 //! groups per dimension, in x 2^20 ([`widest`]), and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
@@ -62,6 +62,8 @@ RWByteAddressBuffer dst_args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// The vertices or indices an instance from which a draw record runs empty.
+static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 // Each group charges the budget once: the costs of its records go here,
@@ -102,7 +104,14 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
             want = uint2(0, 0);
         }
-        uint count = min(want.x, 1u << 24);
+        // A record of MOST_DRAW vertices or indices an instance, or more, is
+        // no draw of the title's (a slot it has not filled): it runs empty
+        // and charges nothing (victory-fork f85101b6, its window checker
+        // found 90 of 2^24 vertices in one list).
+        if (want.x >= MOST_DRAW) {
+            want = uint2(0, 0);
+        }
+        uint count = want.x;
         uint instances = min(want.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
         draw_counts = uint2(count, instances);
@@ -119,10 +128,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
-        // Ahead of its draw, a record over the most a dispatch runs is a
-        // slot the title has not filled (the title leaves all
-        // ones there): empty, and not counted below either.
-        if (ahead && g.x > 65535u) {
+        // A record over the most a dispatch runs is a slot the title has
+        // not filled (the title leaves all ones there): empty,
+        // and not counted below either. (65,535 groups of meshlets read
+        // through the garbage beside it read past every buffer.)
+        if (g.x > 65535u) {
             g = uint3(0, 0, 0);
         }
         asked = g.x;
@@ -1832,18 +1842,13 @@ void main(uint3 t : SV_DispatchThreadID) {
                 assert_eq!(rec, [groups, u32::from(groups > 0).max(1).min(1), 1, 0xAB00 + i as u32], "filled record {i}, ahead {ahead}");
             }
             let charged_filled = (5 + 519) * 128;
-            if ahead {
-                for i in filled.len()..RECORDS as usize {
-                    assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
-                    assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
-                }
-                assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
-                assert_eq!(largest, 519, "and are not counted as asked for");
-            } else {
-                // Thirteen slots at 65,535 groups: sixteen would be all of it.
-                assert_eq!(spent, charged_filled + 13 * 65535 * 128, "clamped one by one, each slot is charged the most");
-                assert_eq!(largest, u32::MAX);
+            // As one window ahead of its draws and one by one alike.
+            for i in filled.len()..RECORDS as usize {
+                assert_eq!(out[i * 8..i * 8 + 3], [0, 0, 0], "unfilled slot {i} must come out empty");
+                assert_eq!(out[i * 8 + 3], u32::MAX, "the words after the record are copied as they are");
             }
+            assert_eq!(spent, charged_filled, "unfilled slots charge nothing");
+            assert_eq!(largest, 519, "and are not counted as asked for");
         }
     }
 
@@ -1866,8 +1871,9 @@ void main(uint3 t : SV_DispatchThreadID) {
         let mut initial_src = vec![0u8; total_bytes];
         for i in 0..RECORDS as usize {
             let words: [u32; 6] = [
-                u32::MAX,                    // IndexCount -> clamps to 1 << 24
-                u32::MAX,                    // InstanceCount -> clamps to 4 (cost = 1 << 26)
+                // The last is no draw: empty, and free.
+                if i + 1 < RECORDS as usize { 1 << 22 } else { 1 << 23 }, // IndexCount
+                u32::MAX,                    // InstanceCount -> clamps to 16 (cost = 1 << 26)
                 1000 + i as u32,             // StartIndexLocation
                 (-200i32 + i as i32) as u32, // BaseVertexLocation
                 5000 + i as u32,             // StartInstanceLocation
@@ -1932,7 +1938,7 @@ void main(uint3 t : SV_DispatchThreadID) {
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
-            if rec[0] == (1 << 24) && rec[1] == 4 {
+            if rec[0] == (1 << 22) && rec[1] == 16 {
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -2519,7 +2525,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         };
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         let kinds = [0u32, 1, 2, 10];
-        let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, 1 << 24, (1 << 26) + 1, u32::MAX];
+        let values = [0u32, 1, 3, 100, 65_535, 65_536, 1 << 20, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 26) + 1, u32::MAX];
         // Every kind with many records, in two sources.
         let mut records: Vec<(u32, [u32; 5])> = Vec::new();
         for kind in kinds {
@@ -2612,7 +2618,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             let mut table = unsafe {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
                 for r in 0..records {
-                    for (w, word) in [1u32 << 24, 4, 5, 6].into_iter().enumerate() {
+                    for (w, word) in [1u32 << 22, 16, 5, 6].into_iter().enumerate() {
                         src_ptr.cast::<u32>().add(r as usize * 4 + w).write_volatile(word);
                     }
                 }
@@ -2636,8 +2642,8 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
                 )
             };
-            assert_eq!(out.iter().filter(|&&v| v == 1 << 24).count(), filled, "{times} times {records}: {out:?}");
-            assert!(out.iter().all(|&v| v == 0 || v == 1 << 24));
+            assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
+            assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
             assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
         }
     }

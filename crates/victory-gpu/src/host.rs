@@ -921,6 +921,9 @@ fn create() -> windows::core::Result<Host> {
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
+            let amd = crate::indirect::amd(&device);
+            victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -965,6 +968,15 @@ fn create() -> windows::core::Result<Host> {
             presenter: Mutex::new(None),
             adapter,
         })
+    }
+}
+
+impl Host {
+    /// The driver's version, as the system counts it (0: not known).
+    pub(crate) fn driver(&self) -> i64 {
+        let adapter = self.adapter.as_ref();
+        // SAFETY: a plain query.
+        adapter.map_or(0, |a| unsafe { a.CheckInterfaceSupport(&IDXGIDevice::IID) }.unwrap_or(0))
     }
 }
 

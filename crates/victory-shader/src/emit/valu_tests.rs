@@ -1912,3 +1912,88 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         }
     }
 }
+
+/// Whether the hardware adapter is an AMD RDNA card's: what the translator
+/// writes for one ([`super::rdna`]) holds there.
+fn rdna_card() -> bool {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::*;
+    let Ok(host) = Host::new(false) else { return false };
+    let mut waves = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: plain queries.
+    unsafe {
+        let amd = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002);
+        amd && host
+            .device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS1,
+                (&raw mut waves).cast(),
+                size_of_val(&waves) as u32,
+            )
+            .is_ok()
+            && waves.WaveLaneCountMin == 32
+            && waves.WaveLaneCountMax == 64
+    }
+}
+
+/// The forms written for the console's own kind of hardware give, on such a
+/// card, what the ones spelled out for every host give; a legacy product's
+/// zero may have the other sign.
+#[test]
+fn rdna_forms_give_what_the_spelled_out_ones_give() {
+    if !rdna_card() {
+        eprintln!("no RDNA card; skipped");
+        return;
+    }
+    const ONE: u16 = 242;
+    const MINUS_ONE: u16 = 243;
+    let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
+    let saturated = vop3_mod(0x110, 5, vgpr(1), vgpr(1), 0, 0, 0, 0, true);
+    let two = |x: [u32; 2], y: [u32; 2]| [x, y].concat();
+    let bodies: [(&str, Vec<u32>, bool); 14] = [
+        ("max", vop3(0x110, 0, a, b, 0).to_vec(), true),
+        ("min", vop3(0x10F, 0, a, b, 0).to_vec(), true),
+        ("max3", vop3(0x154, 0, a, b, c).to_vec(), true),
+        ("min3", vop3(0x151, 0, a, b, c).to_vec(), true),
+        ("med3 0 1", vop3(0x157, 0, a, 128, ONE).to_vec(), true),
+        ("med3 1 0", vop3(0x157, 0, ONE, a, 128).to_vec(), true),
+        ("med3 1 -1", vop3(0x157, 0, ONE, MINUS_ONE, a).to_vec(), true),
+        ("fract", vec![vop1(0x020, 0, a)], true),
+        ("mul_legacy", vop3(0x107, 0, a, b, 0).to_vec(), false),
+        ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec(), false),
+        ("mul_legacy by a constant", vop3(0x107, 0, a, MINUS_ONE, 0).to_vec(), false),
+        ("mul_legacy of a saturated", two(saturated, vop3(0x107, 0, vgpr(5), b, 0)), false),
+        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec(), false),
+        ("max of a mul_legacy", two(vop3(0x107, 5, a, b, 0), vop3(0x110, 0, vgpr(5), c, 0)), false),
+    ];
+    let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    let mut cases = Vec::new();
+    for (i, x) in numbers.iter().enumerate() {
+        for (j, y) in numbers.iter().enumerate() {
+            let z = numbers[(3 * i + j) % numbers.len()];
+            cases.push([x.to_bits(), y.to_bits(), z.to_bits(), 0]);
+        }
+    }
+    for (name, body, exact) in bodies {
+        let mut got: Vec<Vec<u32>> = Vec::new();
+        let mut written = Vec::new();
+        for bits in [0, super::rdna::ALL] {
+            lower::TEST_RDNA.set(Some(bits));
+            let shader = build_valu_cs(&body);
+            lower::TEST_RDNA.set(None);
+            written.push(shader.dxil.clone());
+            let mut all = Vec::new();
+            run_cases_on(&shader, &cases, &[("hardware", false)], |_, _, _, r| all.push(r));
+            got.push(all);
+        }
+        assert_ne!(written[0], written[1], "{name}: written alike");
+        for (case, (&was, &is)) in cases.iter().zip(got[0].iter().zip(&got[1])) {
+            let (x, y) = (f32::from_bits(was), f32::from_bits(is));
+            let same = was == is || x.is_nan() && y.is_nan() || !exact && x == 0.0 && y == 0.0;
+            assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
+        }
+    }
+}

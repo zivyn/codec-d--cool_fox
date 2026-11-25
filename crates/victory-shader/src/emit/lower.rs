@@ -1111,9 +1111,33 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit and where the raw twins of its views start.
-pub fn host_settings() -> [u32; 3] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views()]
+/// wave, the view heap's limit, where the raw twins of its views start, and
+/// what it writes for the console's own hardware.
+pub fn host_settings() -> [u32; 4] {
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+}
+
+static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tells the translator that the host's shaders run on AMD RDNA hardware
+/// ([`super::rdna_float`]).
+pub fn set_host_rdna(on: bool) {
+    HOST_RDNA.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_rdna`], for its thread only.
+    pub(super) static TEST_RDNA: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The bits of [`super::rdna`] that count on this host.
+pub(super) fn host_rdna() -> u32 {
+    #[cfg(test)]
+    if let Some(bits) = TEST_RDNA.get() {
+        return bits;
+    }
+    if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -3674,6 +3698,9 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        if host_rdna() & super::rdna::MAX_MIN != 0 {
+            return r;
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -3807,6 +3834,25 @@ impl<'a> Lower<'a> {
     /// is the smallest number among them).
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
+        // Between two constants in order: the lower one for a NaN either way.
+        if host_rdna() & super::rdna::MED3 != 0 {
+            let k = [a, b, third].map(|x| self.s.m.float_k(x));
+            let ordered = match k {
+                [None, Some(x), Some(y)] => Some((a, b, third, x, y)),
+                [Some(x), None, Some(y)] => Some((b, a, third, x, y)),
+                [Some(x), Some(y), None] => Some((third, a, b, x, y)),
+                _ => None,
+            };
+            if let Some((v, p, q, x, y)) = ordered
+                && !x.is_nan()
+                && !y.is_nan()
+                && x != y
+            {
+                let (low, high) = if x < y { (p, q) } else { (q, p) };
+                let t = self.binary(35, v, low);
+                return self.binary(36, t, high);
+            }
+        }
         let lo = self.binary(36, a, b);
         let hi = self.binary(35, a, b);
         let t = self.binary(36, hi, third);
@@ -3829,6 +3875,9 @@ impl<'a> Lower<'a> {
     fn fract(&mut self, a: V, threshold: f32, below_one: f32) -> V {
         let c = self.cur;
         let r = self.unary(22, a);
+        if host_rdna() & super::rdna::FRACT != 0 && below_one == f32::from_bits(0x3F7F_FFFF) {
+            return r;
+        }
         let limit = self.s.m.f32(threshold.to_bits());
         let k = self.s.m.f32(below_one.to_bits());
         let over = self.s.m.cmp(c, pred::OGE, r, limit);
@@ -3878,6 +3927,28 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if host_rdna() & super::rdna::LEGACY != 0 {
+            let m = self.s.m.bin(c, Bin::Mul, a, b);
+            let zero = self.s.m.f32(0);
+            // A product is not 0 only where one factor is 0 and the other an
+            // infinity or no number: never of a value with itself, nor of two
+            // finite ones, and only where the finite one of two is 0.
+            let (fa, fb) = (self.s.m.bounded(a, 12).is_some(), self.s.m.bounded(b, 12).is_some());
+            let not_zero = |l: &Self, x: V| l.s.m.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite());
+            if a == b || fa && fb || not_zero(self, a) || not_zero(self, b) {
+                return m;
+            }
+            let asked = match (fa, fb) {
+                (true, _) => a,
+                (_, true) => b,
+                _ => {
+                    let (a, b) = (self.unary(6, a), self.unary(6, b));
+                    self.binary(36, a, b)
+                }
+            };
+            let z = self.s.m.cmp(c, pred::OEQ, asked, zero);
+            return self.s.m.select(c, z, zero, m);
+        }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);

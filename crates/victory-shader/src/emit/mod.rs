@@ -99,6 +99,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod probe_tests;
+#[cfg(all(test, windows))]
 mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
@@ -114,7 +116,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave};
+pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -200,6 +202,57 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// On a host whose shaders run on the console's own kind of hardware (AMD
+/// RDNA, [`set_host_rdna`]): which of the console's float instructions are
+/// written as the one host operation the driver makes the same instruction
+/// of, instead of spelled out in operations every host agrees on.
+/// `VICTORY_RDNA_FLOAT`: a set of [`rdna`]'s bits (decimal or `0x` hex); all
+/// of them when it is unset, `0` none. Nothing on other hosts.
+///
+/// Measured on an RX 7900 XTX (a frame of the yard, replayed turn by turn with
+/// and without): the title's dispatches and draws 18.4 -> 17.6 ms, 0.4 of it
+/// without [`rdna::LEGACY`]. Tried and worth nothing there: `v_mad_f32` as one
+/// multiply-add, a fast reciprocal, scalar buffer loads of four dwords at once,
+/// a wave size for every compute program (32, 64, the console's).
+///
+/// Part of the translation: the shader cache keys on it ([`host_settings`]).
+pub fn rdna_float() -> u32 {
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_RDNA_FLOAT").ok();
+        parse_set(value.as_deref(), rdna::ALL, rdna::ALL)
+    })
+}
+
+/// The bits of [`rdna_float`].
+pub mod rdna {
+    /// `v_max_f32` and the like: the host's FMax and FMin, without the code
+    /// that orders -0 below +0.
+    pub const MAX_MIN: u32 = 1;
+    /// `v_mul_legacy_f32` and the like (0 times anything is 0): a plain product
+    /// where no factor can be an infinity or no number where the other is 0,
+    /// and one comparison where it can. A zero may have the other sign.
+    pub const LEGACY: u32 = 2;
+    /// `v_med3_f32` of a value between two ordered constants: a minimum of a
+    /// maximum.
+    pub const MED3: u32 = 4;
+    /// `v_fract_f32`: the host's Frc as it is.
+    pub const FRACT: u32 = 8;
+    pub const ALL: u32 = 15;
+}
+
+/// A switch's set of bits; `unset` when it is unset or unreadable. Pure, for
+/// testing.
+fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
+    let parsed = value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        });
+    parsed.map_or(unset, |n| n & all)
+}
+
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
@@ -220,6 +273,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&lower::host_rdna().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&shader::raw_views().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());

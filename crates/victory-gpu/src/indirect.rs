@@ -268,7 +268,7 @@ fn widest(amd: bool) -> u32 {
 }
 
 /// Whether `device` is an AMD card's.
-fn amd(device: &ID3D12Device) -> bool {
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
     // SAFETY: plain queries.
     unsafe {

@@ -136,6 +136,35 @@ pub(crate) struct Replay {
     /// Only write the frame's buffers and the commands of these lists (`3..7`).
     #[arg(long)]
     listing: Option<String>,
+    /// Only write what the dispatches of these lists have bound (`3..7`).
+    #[arg(long)]
+    flow: Option<String>,
+    /// With --flow: draws too.
+    #[arg(long)]
+    flow_draws: bool,
+    /// With --flow: heap slots shown from each place named.
+    #[arg(long, default_value_t = 40)]
+    flow_slots: u32,
+    /// Run the frame once and save textures as pictures in this folder, with
+    /// what values they hold (see --texture, --until).
+    #[arg(long)]
+    images: Option<PathBuf>,
+    /// With --images: `<resource>[.<subresource>]` (repeatable); none: all
+    /// that the frame's shaders write.
+    #[arg(long)]
+    texture: Vec<String>,
+    /// With --images and no --texture: from this many texels on.
+    #[arg(long, default_value_t = 4096)]
+    least: u64,
+    /// With --images: the widest picture.
+    #[arg(long, default_value_t = 960)]
+    width: u32,
+    /// With --images: the values too.
+    #[arg(long)]
+    raw: bool,
+    /// The last command that runs, `<list>:<command>`; after it only barriers.
+    #[arg(long)]
+    until: Option<String>,
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -160,6 +189,18 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         let lists = range(text).with_context(|| format!("--listing {text}"))?;
         return play::listing(&r.folder, lists, &mut |line| println!("{line}"));
     }
+    if let Some(text) = &r.flow {
+        let lists = range(text).with_context(|| format!("--flow {text}"))?;
+        return play::look::flow(&r.folder, lists, r.flow_draws, r.flow_slots, &mut |line| println!("{line}"));
+    }
+    let until = match &r.until {
+        Some(text) => Some(
+            text.split_once(':')
+                .and_then(|(l, c)| Some((l.parse().ok()?, c.parse().ok()?)))
+                .with_context(|| format!("--until {text}: not <list>:<command>"))?,
+        ),
+        None => None,
+    };
     let only = match &r.only {
         Some(text) => Some(
             range(text)
@@ -189,6 +230,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         wait_all: r.wait_all,
         wait_lists: r.wait_lists,
         only,
+        until,
         skip_shaders: r.skip_shader,
         compare: r.compare,
         debug: r.debug_layer,
@@ -200,6 +242,23 @@ pub(crate) fn run(r: Replay) -> Result<()> {
             .with_context(|| format!("--slots {text}: not <list>:<command>"))?;
         let player = play::Player::load(&r.folder, &options)?;
         return player.slots(list, command, &mut |line| println!("{line}"));
+    }
+    if let Some(folder) = &r.images {
+        let mut which = Vec::new();
+        for text in &r.texture {
+            let (id, sub) = text.split_once('.').unwrap_or((text, "0"));
+            let bad = || format!("--texture {text}");
+            which.push((id.parse().with_context(bad)?, sub.parse().with_context(bad)?));
+        }
+        let images = play::look::Images {
+            which,
+            least: r.least,
+            folder: folder.clone(),
+            width: r.width,
+            raw: r.raw,
+        };
+        let mut player = play::Player::load(&r.folder, &options)?;
+        return player.images(&options, &images, &mut |line| println!("{line}"));
     }
     if r.check_written {
         let mut player = play::Player::load(&r.folder, &options)?;

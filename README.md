@@ -1,5 +1,85 @@
 # VIctory on NVIDIA
 
+## What this fork changes, and how it gets its frame rate
+
+Everything below is what `scripts\play-nvidia.ps1` turns on. Measured on an
+RTX 5070 12 GB with a Ryzen 7 9800X3D, in the prologue:
+
+| Setup | fps | GPU time a frame |
+|---|---|---|
+| The 7900 XTX fork's own settings, Series X | high, but thousands of draws a frame skipped (the picture jumps) | - |
+| With the descriptor fix, Series X, full scale | 6.0 | 110 ms |
+| The same, half render scale | 7.2 | 82-88 ms |
+| Series S, half scale, own upscaler, ray walks skipped | 11.0 | 33 ms |
+| Plus memory compares on the card | 21.8 | about 6 ms |
+
+### Settings that lower the picture a bit
+
+1. **Series S profile** (`--console series-s`). The title believes it runs on
+   the smaller console and picks that console's settings. The biggest change
+   is resolution: the game image is 1920x1080 instead of the Series X's
+   4K-class target. Menus, the HUD and subtitles are still drawn at 4K on a
+   separate plane, so they stay sharp.
+2. **Half render scale** (`VICTORY_RENDER_SCALE=0.5`). A patch to the title's
+   1.0.2.1 executable pins its internal render scale: the 3D world is drawn at
+   half width and half height (960x540 on Series S), a quarter of the pixels,
+   then stretched back to 1080p. This is why the world is softer than the menus.
+3. **The title's own upscaler** (`VICTORY_OWN_UPSCALER=1`). On Series S the
+   title upscales with AMD FidelityFX (FSR), whose compute programs cannot be
+   translated here, so that step drew nothing. A patch makes the title use its
+   own temporal upscaler on every profile. It is not a quality setting in
+   itself, but Series S needs it for a scale below 1.
+4. **Ray walks end at the root** (`VICTORY_BVH_MISS=1`). The part of the title
+   that builds its ray-tracing structures is off, so their nodes are stale.
+   Instead of walking stale nodes, every box and triangle test is a miss. That
+   avoids a hang and saves about 10 ms a frame, but light bounced off nearby
+   surfaces is lost, so some dim rooms look darker.
+
+### Settings that make it faster without changing the picture
+
+5. **Memory compares on the card** (`VICTORY_CARD_BUFFERS_MIN_MB=1`,
+   `VICTORY_CARD_BUFFERS_MB=1536`). Once the settings above had cut the GPU's
+   work, the CPU was the limit: every frame it compared about 190 MB of title
+   memory to find what the title had changed. These move the compares of copies
+   of 1 MiB or more to the graphics card. Copying back fell from about 27 to
+   10 ms a frame, and the frame rate doubled (11 to 21.8 fps).
+6. **Wait for new shaders** (`VICTORY_PIPELINE_WAIT_MS=10000`). Draws wait for
+   a pipeline still being made instead of being skipped: nothing is missing,
+   with a short hitch the first time a place is seen.
+7. **NVIDIA Smooth Motion** (by default in `play-nvidia.ps1`). The script
+   starts a copy of the build named `victory_sm.exe`; with Smooth Motion turned
+   on for that exe in the NVIDIA App, the driver inserts a generated frame
+   between real ones, so motion looks about twice as smooth. The title still
+   runs at the real rate underneath, so controls respond at about 20 fps.
+
+### Code changes (what makes it work on NVIDIA at all)
+
+8. **No more skipped draws on NVIDIA** (`VICTORY_DYNAMIC_SLOTS=524288`,
+   `crates/victory-gpu/src/descriptor/host.rs`). NVIDIA caps the shader-visible
+   view heap at 1,000,000 views, below the 1,245,184 the title asks for. The
+   pool of dynamic descriptor slots (2^18) then ran out, and 1,100-4,800
+   descriptor tables a frame were refused, each one a dropped draw: the screen
+   rarely updated and the character jumped from place to place. The pool can
+   now take up to half the heap: 0-33 refused a frame.
+9. **Series S interface plane** (`VICTORY_COMPOSE=1`,
+   `crates/victory-gpu/src/compose.rs`, `host.rs`, `queue.rs`). A Series S
+   title presents two planes: the game (1080p) and the interface (4K). Only the
+   first was shown, so menus, loading screens and subtitles were black until
+   gameplay. One compute pass now lays the interface over the game before it
+   is shown. Ported from fxceless/victory-fork pull request 1189 (Tissma95),
+   without its FSR stand-in (the own upscaler is used instead).
+10. **Title patches** (`crates/victory-loader/src/hooks.rs`, `lib.rs`,
+    `windows.rs`): render scale, own upscaler, and `VICTORY_NO_WATCHDOG`
+    (keeps the title's watchdog from ending a slow frame), taken from the
+    victory-perf patches.
+11. **Ray walks end at the root** (`crates/victory-shader/src/emit/intersect.rs`,
+    `crates/victory-gpu/src/shader_cache.rs`): the `VICTORY_BVH_MISS` switch, made
+    part of the shader cache key so translated shaders with and without it are
+    kept apart.
+12. **`scripts/play-nvidia.ps1`**: the launcher with all of the above.
+
+---
+
 A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
 itself a fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility
 layer that runs an Xbox Series title natively on Windows from files the user
@@ -70,28 +150,8 @@ described in a comment where it is read.
 
 ## What is different here
 
-- **No more skipped draws on NVIDIA** (`VICTORY_DYNAMIC_SLOTS=524288`): NVIDIA
-  caps the shader-visible view heap at 1,000,000 views, below the 1,245,184 the
-  title asks for. The pool of dynamic descriptor slots then ran out and
-  1,100-4,800 descriptor tables a frame were refused, each one a dropped draw.
-  The pool can now take up to half the heap: 0-33 refused a frame.
-- **Series S interface plane** (`VICTORY_COMPOSE=1`): a Series S title presents
-  the game (1080p) and the interface (4K) as two planes. Only the first was
-  shown, so menus, loading screens and subtitles were black. The interface is
-  now laid over the game. Ported from fxceless/victory-fork pull request 1189,
-  without its FSR stand-in.
-- **Render scale and upscaler** (`VICTORY_RENDER_SCALE`, `VICTORY_OWN_UPSCALER`,
-  `VICTORY_NO_WATCHDOG`): patches to the 1.0.2.1 executable, from the
-  victory-perf patches. Series S needs the title's own upscaler at a scale
-  below 1.
-- **Ray walks end at the root** (`VICTORY_BVH_MISS=1`) while the structure
-  builder is off. Its nodes are stale, so this avoids a hang and saves about
-  10 ms a frame.
-- **Memory compares on the card** (`VICTORY_CARD_BUFFERS_MIN_MB=1`,
-  `VICTORY_CARD_BUFFERS_MB=1536`): this took the Series S profile from 11 to
-  about 22 fps.
-
-Everything the 7900 XTX fork added is kept: translation of list calls on threads
+This fork's own changes are listed at the top of this README. Everything the
+7900 XTX fork added is kept: translation of list calls on threads
 of ours, submissions prepared and joined on a thread of ours, the write relay,
 fills done on the card, textures on their own copy queue, texture read-back
 (boats float), and frame record and replay. Its

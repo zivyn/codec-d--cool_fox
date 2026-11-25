@@ -674,11 +674,13 @@ impl Host {
     }
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+        let mut spent = crate::timeline::span("steps on the card: chosen");
         let (does, steps) = does_of(written, runs);
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
         }
+        spent.next("steps on the card: what holds their bytes");
         let mut writers = {
             let line = line();
             let mut all = writers(&line.line);
@@ -765,6 +767,7 @@ impl Host {
                 to,
             });
         }
+        spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
@@ -817,24 +820,28 @@ impl Host {
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
-        for op in &ops {
-            DONE[2].fetch_add(op.len as u64, Ordering::Relaxed);
-            match &op.to {
-                To::Slot(heap, index) => {
-                    DONE[0].fetch_add(1, Ordering::Relaxed);
+        spent.next("steps on the card: the slots");
+        // (11,000 slots a frame in a street, two descriptors each: on
+        // several threads, a slot always on the same one, in the steps'
+        // order.)
+        let parts = if ops.len() < 256 { 1 } else { 8 };
+        crate::land::each_under(parts, &|part| {
+            for op in &ops {
+                if let To::Slot(heap, index) = &op.to
+                    && *index as usize / 4 % parts == part
+                {
                     // (A heap that is gone: nothing can read the slot.)
                     crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
                 }
-                To::Buffer(_) => {
-                    DONE[0].fetch_add(1, Ordering::Relaxed);
-                }
-                To::Copy(..) => {
-                    DONE[1].fetch_add(1, Ordering::Relaxed);
-                }
             }
-            #[cfg(feature = "diagnostics")]
-            noted(op);
-        }
+        });
+        let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
+        DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
+        DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
+        DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        noted(&ops);
+        spent.end();
         Ok(Some(Taken {
             own,
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
@@ -865,14 +872,17 @@ type Noted = std::collections::HashMap<(usize, (u64, u64), (u64, u64)), (u64, us
 static NOTED: Mutex<Option<Noted>> = Mutex::new(None);
 
 #[cfg(feature = "diagnostics")]
-fn noted(op: &Op) {
-    let (to, dst) = match &op.to {
-        To::Copy(to, dst) => (to.span(), *dst),
-        To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
-    };
+fn noted(ops: &[Op]) {
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
-    let e = noted.get_or_insert_with(Default::default).entry((op.len, op.from.0.span(), to)).or_default();
-    *e = (e.0 + 1, op.from.1, dst);
+    let noted = noted.get_or_insert_with(Default::default);
+    for op in ops {
+        let (to, dst) = match &op.to {
+            To::Copy(to, dst) => (to.span(), *dst),
+            To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
+        };
+        let e = noted.entry((op.len, op.from.0.span(), to)).or_default();
+        *e = (e.0 + 1, op.from.1, dst);
+    }
 }
 
 /// For the frame-rate line.

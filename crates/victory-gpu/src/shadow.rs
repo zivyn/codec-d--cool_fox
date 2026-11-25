@@ -549,11 +549,16 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
 struct SentRuns(Vec<(u64, Vec<(usize, usize)>)>);
 
 impl SentRuns {
+    #[cfg(test)]
     fn note(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
+        self.note_joined(number, joined(ranges));
+    }
+
+    /// `ranges` are in order and joined.
+    fn note_joined(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
         if ranges.is_empty() {
             return;
         }
-        let ranges = joined(ranges);
         match self.0.iter_mut().find(|s| s.0 == number) {
             Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
             None => self.0.push((number, ranges)),
@@ -608,17 +613,17 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
+                let ranges = joined(std::mem::take(&mut *dirty));
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.forget(fetched);
-                    sent.note(sent_as, ranges.clone());
+                    sent.note_joined(sent_as, ranges.clone());
                 }
                 ranges
             })
             .unwrap_or_default();
         if !ranges.is_empty() {
-            out.push((shadow, joined(ranges)));
+            out.push((shadow, ranges));
         }
         true
     });
@@ -724,7 +729,9 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
 
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
-    ranges.sort_unstable();
+    // (The sort that finds what is in order already: they come as a few
+    // stretches of tens of thousands in order, put behind one another.)
+    ranges.sort();
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (from, to) in ranges {
         match out.last_mut() {

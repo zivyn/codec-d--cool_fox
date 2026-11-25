@@ -2579,6 +2579,11 @@ impl Shadow {
             note_stale(0);
             return true;
         }
+        // The declared ranges overlap (views of the title's whole heap from
+        // dozens of offsets): as one range each page is asked about and
+        // compared once. Every byte of it is in a declared range, and of a
+        // copy in the PC's memory in the snapshot.
+        let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
         for (a, e) in busy {

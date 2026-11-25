@@ -138,9 +138,10 @@ pub fn view_heap_limit() -> u32 {
 /// entry nothing wrote. On AMD a raw load through a view that is not raw (typed, structured, a
 /// constant buffer's) has no end: it reads whatever lies there, up to 4 GiB on, and loses the
 /// device where nothing does; and a texture's descriptor read as a buffer's is a wild address.
-/// So the host keeps, for title slot `i`, a raw view of the same bytes at this place + `i`
-/// (a constant buffer view of a constant buffer, a null raw view of everything else and of every
-/// slot past the title's), and shaders translated while this is set read picked buffers there.
+/// So the host keeps, for slot `i`, a raw view of the same bytes at this place + `i` (a constant
+/// buffer view of a constant buffer in a title slot, a null raw view of everything else), and
+/// shaders translated while this is set read picked buffers there, and tables' buffers that they
+/// read as raw bytes.
 /// A power of two above every slot index.
 static RAW_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 

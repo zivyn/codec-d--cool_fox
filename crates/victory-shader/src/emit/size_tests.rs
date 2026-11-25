@@ -322,15 +322,17 @@ fn a_picked_buffer_is_read_at_its_raw_twin() {
     };
     let (title, twin, last, texel) = ([1u32, 2, 3, 4], [5u32, 6, 7, 8], [9u32, 10, 11, 12], [[0.0; 4]; 1]);
     let raw = |data| View::Buffer { data, stride: Stride::Raw };
-    let views = || {
+    // (The store goes through the table's third entry: its twin, too.)
+    let views = |twins: bool| {
+        let uav = |here: bool| if here { View::RawUav(2) } else { View::Texture(1, 1, &texel) };
         [
             View::Texture(1, 1, &texel),
             raw(&title),
-            View::RawUav(2),
+            uav(!twins),
             View::Texture(1, 1, &texel),
             View::Texture(1, 1, &texel),
             raw(&twin),
-            View::Texture(1, 1, &texel),
+            uav(twins),
             raw(&last),
         ]
     };
@@ -338,8 +340,32 @@ fn a_picked_buffer_is_read_at_its_raw_twin() {
         super::shader::RAW_VIEWS_HERE.set(Some(first));
         let shader = build(&program(at), (8, 0)).expect("translates");
         super::shader::RAW_VIEWS_HERE.set(None);
-        for (label, got) in run(&shader, &views()) {
+        for (label, got) in run(&shader, &views(first != 0)) {
             assert_eq!(got[..2], [0, expected], "{label}: twins from {first}, byte {at}");
         }
+    }
+}
+
+/// A table's buffer read as raw bytes is read at its raw twin too.
+#[test]
+fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
+    let load = [
+        0xF408_0201u32, // s_load_dwordx4 s[8:11], s[2:3], 0
+        0xFA00_0000,
+        0xE030_0004, // buffer_load_dword v5, off, s[8:11], 0 offset:4
+        0x8002_0500,
+        0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+        0xBE84_0380, // s_mov_b32 s4, 0
+    ];
+    let words = [TABLE, &load, STORE].concat();
+    let (title, twin, texel) = ([1u32, 2, 3, 4], [5u32, 6, 7, 8], [[0.0; 4]; 1]);
+    let raw = |data| View::Buffer { data, stride: Stride::Raw };
+    super::shader::RAW_VIEWS_HERE.set(Some(4));
+    let shader = build(&words, (4, 0)).expect("translates");
+    super::shader::RAW_VIEWS_HERE.set(None);
+    let other = || View::Texture(1, 1, &texel);
+    let views = [raw(&title), other(), other(), other(), raw(&twin), other(), View::RawUav(2)];
+    for (label, got) in run(&shader, &views) {
+        assert_eq!(got[..2], [0, 6], "{label}");
     }
 }

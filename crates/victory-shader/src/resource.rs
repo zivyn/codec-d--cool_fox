@@ -2611,6 +2611,94 @@ pub(crate) mod tests {
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
     }
 
+    /// A VGPR a wave reduction used is free again after it: from the first
+    /// save on it holds parked scalars alone (an upscaler program parks a
+    /// constant buffer's descriptor that way).
+    #[test]
+    fn a_vgpr_used_before_holds_spilled_sgprs_from_its_first_save() {
+        let before = [
+            0x7E00_0281, // v_mov_b32 v0, 1
+            0x7E02_0300, // v_mov_b32 v1, v0
+        ];
+        let park = [
+            0xD761_0000,
+            0x0001_0609, // v_writelane_b32 v0, s9, 3
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            0xBE83_0380, // s_mov_b32 s3, 0
+        ];
+        let load = [
+            0xF40C_0001,
+            0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+            S_ENDPGM,
+        ];
+        let words = [&before[..], &park, &load].concat();
+        let r = track_words(&words, &[param(Table, 9, 1)], HwStage::Ps);
+        assert_eq!(r.scalar, [((0, 5), at(0, 0x20))]);
+        // Still lane reads: a lane restored before it is saved, and a
+        // register with an ordinary use after the first save.
+        let restored_first = [&before[..], &park[2..4], &park[..2], &load].concat();
+        let used_after = [&before[..], &park, &before[1..], &load].concat();
+        for words in [restored_first, used_after] {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 8).unwrap();
+            let insts = p.blocks.iter().flat_map(|b| &b.insts);
+            assert_eq!(insts.filter(|i| i.name() == "v_readlane_b32").count(), 1);
+        }
+    }
+
+    /// Two lanes hold a pair (a lane mask, say) and later one of them a
+    /// scalar, as in a water volume program that parks more than the lanes
+    /// of one VGPR hold: the pair still moves as one.
+    #[test]
+    fn a_lane_spilled_to_again_later_does_not_split_an_earlier_pair() {
+        let pair = [
+            0xD761_0000u32,
+            0x0001_0004, // v_writelane_b32 v0, s4, 0
+            0xD761_0000,
+            0x0001_0205, // v_writelane_b32 v0, s5, 1
+            0xBE84_0380, // s_mov_b32 s4, 0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xD760_0004,
+            0x0001_0100, // v_readlane_b32 s4, v0, 0
+            0xD760_0005,
+            0x0001_0300, // v_readlane_b32 s5, v0, 1
+        ];
+        let scalar = [
+            0xD761_0000u32,
+            0x0001_0006, // v_writelane_b32 v0, s6, 0
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xD760_0006,
+            0x0001_0100, // v_readlane_b32 s6, v0, 0
+            S_ENDPGM,
+        ];
+        let moves = |words: &[u32]| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 8).unwrap();
+            let names: Vec<_> = p.blocks[0].insts.iter().map(|i| i.name()).collect();
+            assert!(!names.iter().any(|n| n.contains("lane")));
+            names.iter().filter(|n| **n == "s_mov_b64").count()
+        };
+        assert_eq!(moves(&[&pair[..], &scalar].concat()), 2);
+        // A restore both saves reach keeps the lane one scalar.
+        let joined = [
+            &pair[..4],
+            &[0xBF84_0002], // s_cbranch_scc0 past the second save
+            &scalar[..2],
+            &pair[4..],
+            &scalar[2..],
+        ]
+        .concat();
+        assert_eq!(moves_anywhere(&joined), 0);
+    }
+
+    fn moves_anywhere(words: &[u32]) -> usize {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 8).unwrap();
+        let insts = p.blocks.iter().flat_map(|b| &b.insts);
+        insts.filter(|i| i.name() == "s_mov_b64").count()
+    }
+
     #[test]
     fn descriptors_joined_by_control_flow_are_traced_per_edge() {
         let r = track_words(

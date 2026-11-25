@@ -66,9 +66,13 @@ pub struct Options {
     /// Where the picture goes (default: `replay.png` in the capture).
     pub image: Option<PathBuf>,
     pub buffers: Buffers,
+    /// Of those, only the ones all of these match ([`chosen`]).
+    pub only_buffers: Vec<String>,
     pub no_barriers: bool,
     pub merge_barriers: bool,
     pub skip_clamps: bool,
+    /// The clamps in batches (`edit::batch_clamps`); 2: carefully.
+    pub batch_clamps: u32,
     pub skip_hash_passes: bool,
     pub one_submit: bool,
     /// Copies of what the CPU wrote leave alone what the card wrote in this
@@ -98,9 +102,11 @@ impl Default for Options {
             top: 20,
             image: None,
             buffers: Buffers::AsRecorded,
+            only_buffers: Vec::new(),
             no_barriers: false,
             merge_barriers: false,
             skip_clamps: false,
+            batch_clamps: 0,
             skip_hash_passes: false,
             one_submit: false,
             merge: true,
@@ -119,6 +125,7 @@ impl Options {
         self.no_barriers
             || self.merge_barriers
             || self.skip_clamps
+            || self.batch_clamps > 0
             || self.skip_hash_passes
             || self.one_submit
             || self.wait_all
@@ -133,6 +140,7 @@ impl Options {
             no_barriers: false,
             merge_barriers: false,
             skip_clamps: false,
+            batch_clamps: 0,
             skip_hash_passes: false,
             one_submit: false,
             wait_all: false,
@@ -246,6 +254,32 @@ impl Report {
     }
 }
 
+/// Whether `--only-buffers` means a buffer: all of `only` match it.
+/// `name=<text in its name>`, `min=<bytes>`, `max=<bytes>`,
+/// `seen=<how the CPU saw it>`, `id=<a>..<b>`; with `!` in front: that does not.
+fn chosen(r: &wire::Resource, only: &[String]) -> bool {
+    only.iter().all(|f| {
+        let (no, f) = match f.strip_prefix('!') {
+            Some(f) => (true, f),
+            None => (false, f.as_str()),
+        };
+        let (key, value) = f.split_once('=').unwrap_or(("name", f));
+        let number = value.parse().unwrap_or(0u64);
+        let is = match key {
+            "min" => r.desc.width >= number,
+            "max" => r.desc.width <= number,
+            "seen" => {
+                matches!(&r.place, Place::Committed { props, .. } if format!("{:?}", gpu::seen(props)).eq_ignore_ascii_case(value))
+            }
+            "id" => value.split_once("..").is_some_and(|(a, b)| {
+                (a.parse().unwrap_or(0)..b.parse().unwrap_or(u32::MAX)).contains(&r.id)
+            }),
+            _ => r.name.contains(value),
+        };
+        is != no
+    })
+}
+
 fn median(v: &[f64]) -> f64 {
     let mut v = v.to_vec();
     v.sort_by(f64::total_cmp);
@@ -312,20 +346,65 @@ pub fn dump(folder: &Path, text: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Writes, one line each, the commands of lists (by their place in the
+/// frame), and before them the frame's buffers: `--listing`.
+pub fn listing(folder: &Path, lists: (u32, u32), line: &mut dyn FnMut(&str)) -> Result<()> {
+    let frame = Frame::read(&find(folder)?.join("frame.bin"))?;
+    let pipelines: HashMap<u32, &str> =
+        frame.pipelines.iter().map(|p| (p.id, p.name.as_str())).collect();
+    for r in &frame.resources {
+        if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+            let place = match &r.place {
+                Place::Committed { props, .. } => format!("{:?}", gpu::seen(props)),
+                other => format!("{other:?}"),
+            };
+            line(&format!("buffer {} {} bytes, {place}: {}", r.id, r.desc.width, r.name));
+        }
+    }
+    let mut place = 0;
+    for (i, s) in frame.submits.iter().enumerate() {
+        for &l in s.lists.iter().filter(|&&l| l != MISSING) {
+            let here = place;
+            place += 1;
+            if here < lists.0 || here > lists.1 {
+                continue;
+            }
+            line(&format!("list {here} of submission {i}"));
+            for (n, c) in Cmd::all(&frame.lists[l as usize].commands.0)?.iter().enumerate() {
+                match c {
+                    Cmd::Pipeline { pso } => {
+                        line(&format!("{n} Pipeline {pso} {}", pipelines.get(pso).copied().unwrap_or_default()));
+                    }
+                    c => line(&format!("{n} {c:?}")),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Loads a capture and runs it: the whole of `victory replay`. The reports,
 /// with what each is of.
 pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>> {
     let mut player = Player::load(folder, options)?;
     let mut out = Vec::new();
     if options.compare && options.edited() {
+        // Turn by turn: what else the machine does falls on both.
         let image = Some(player.folder.join("replay-unchanged.png"));
-        out.push((
-            "unchanged".into(),
-            player.run(&Options {
-                image,
-                ..options.plain()
-            })?,
-        ));
+        let plain = Options {
+            image,
+            ..options.plain()
+        };
+        let mut a = player.prepare(&plain)?;
+        let mut b = player.prepare(options)?;
+        let (mut stamps_a, mut stamps_b) = (Vec::new(), Vec::new());
+        for _ in 0..options.loops.max(1) {
+            stamps_a = player.once(&plain, &mut a)?;
+            stamps_b = player.once(options, &mut b)?;
+        }
+        out.push(("unchanged".into(), player.finish(&plain, a, &stamps_a)?));
+        out.push(("with the experiments".into(), player.finish(options, b, &stamps_b)?));
+        return Ok(out);
     }
     let what = if options.edited() {
         "with the experiments"
@@ -469,7 +548,7 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers)?;
+        player.make_resources(options.buffers, &options.only_buffers)?;
         step("resources", &mut at);
         player.make_pipelines()?;
         step("pipelines", &mut at);
@@ -559,7 +638,7 @@ impl Player {
         }
     }
 
-    fn make_resources(&mut self, buffers: Buffers) -> Result<()> {
+    fn make_resources(&mut self, buffers: Buffers, only: &[String]) -> Result<()> {
         // A heap of memory the CPU sees becomes one the card may write too:
         // what the CPU wrote is put back by the card.
         let props = |p: &wire::HeapProps, buffer: bool| -> D3D12_HEAP_PROPERTIES {
@@ -603,7 +682,7 @@ impl Player {
         for h in &self.frame.heaps {
             let desc = D3D12_HEAP_DESC {
                 SizeInBytes: h.size,
-                Properties: props(&h.props, used_by_buffers_only.contains(&h.id)),
+                Properties: props(&h.props, only.is_empty() && used_by_buffers_only.contains(&h.id)),
                 Alignment: h.alignment,
                 Flags: D3D12_HEAP_FLAGS(h.flags & !DROP),
             };
@@ -614,8 +693,15 @@ impl Player {
             self._heaps.extend(heap.map(|heap| (h.id, heap)));
         }
         let mut failed = 0;
+        let mut moves: BTreeMap<String, (u32, u64)> = BTreeMap::new();
         for (index, r) in self.frame.resources.iter().enumerate() {
             let is_buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
+            let moved = is_buffer && chosen(r, only);
+            if moved && let Place::Committed { props, .. } = &r.place {
+                let seen = gpu::seen(props);
+                let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
+                *m = (m.0 + 1, m.1 + r.desc.width);
+            }
             let desc = gpu::to_desc(&r.desc);
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
@@ -638,7 +724,7 @@ impl Player {
                         None => Err(windows::core::Error::empty()),
                     },
                     Place::Committed { props: p, flags } => {
-                        let p = props(p, is_buffer);
+                        let p = props(p, moved);
                         let state = if p.Type == D3D12_HEAP_TYPE_READBACK {
                             D3D12_RESOURCE_STATE_COPY_DEST
                         } else {
@@ -700,6 +786,11 @@ impl Player {
         }
         if failed > 0 {
             self.note(format!("{failed} resources could not be made again"));
+        }
+        if buffers != Buffers::AsRecorded {
+            self.notes.push(format!(
+                "--buffers is of, by how the CPU saw them (buffers, bytes): {moves:?}"
+            ));
         }
         Ok(())
     }
@@ -1801,6 +1892,17 @@ impl Player {
                 .push(format!("{} pipelines match --skip-shader", skip.len()));
         }
         let hash = self.pipelines_named(COMPARE);
+        let clamp = self.pipelines_named(CLAMP);
+        let compute: HashSet<u32> = self
+            .frame
+            .pipelines
+            .iter()
+            .filter(|p| p.parts.iter().any(|part| matches!(part, wire::Part::Code { kind, .. } if *kind == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS.0)))
+            .map(|p| p.id)
+            .collect();
+        let mut batched = edit::Batched::default();
+        let mut jobs = Vec::new();
+        let mut scratches = Vec::new();
         let (mut skipped, mut hashed, mut uavs, mut merged) = (0, 0, 0, 0);
         let mut place = 0;
         let mut out = Vec::new();
@@ -1818,6 +1920,24 @@ impl Player {
                     && let Some(c) = clamps.get(here as usize)
                 {
                     cmds = edit::skip_clamps(cmds, c);
+                }
+                if o.batch_clamps > 0 {
+                    let scratch = edit::BATCH_SCRATCH - here;
+                    let done;
+                    (cmds, done) = edit::batch_clamps(
+                        cmds,
+                        &clamp,
+                        &compute,
+                        scratch,
+                        o.batch_clamps > 1,
+                        &mut jobs,
+                    );
+                    batched.clamps += done.clamps;
+                    batched.batches += done.batches;
+                    batched.jobs += done.jobs;
+                    if done.scratch > 0 {
+                        scratches.push((scratch, done.scratch));
+                    }
                 }
                 let mut n;
                 if !skip.is_empty() {
@@ -1840,6 +1960,15 @@ impl Player {
             }
             out.push(lists);
         }
+        if o.batch_clamps > 0 {
+            report.notes.push(format!(
+                "--batch-clamps: {} clamp passes became {}, of {} records",
+                batched.clamps, batched.batches, batched.jobs
+            ));
+            if let Err(e) = self.make_batches(&jobs, &scratches) {
+                report.notes.push(format!("--batch-clamps failed: {e:#}"));
+            }
+        }
         if !skip.is_empty() {
             report
                 .notes
@@ -1861,6 +1990,44 @@ impl Player {
             ));
         }
         out
+    }
+
+    /// What lists edited by [`edit::batch_clamps`] name: the pass, its
+    /// tables and scratch buffers.
+    fn make_batches(&mut self, jobs: &[u8], scratches: &[(u32, u64)]) -> Result<()> {
+        let (root, pso) = crate::indirect::batch_for(&self.device)?;
+        self.roots.insert(edit::BATCH_ROOT, root);
+        self.pipelines.insert(edit::BATCH, pso);
+        let (table, data) = gpu::buffer(
+            &self.device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            jobs.len().max(4) as u64,
+            D3D12_RESOURCE_FLAG_NONE,
+        )?;
+        // SAFETY: a mapping of as many bytes.
+        unsafe { std::ptr::copy_nonoverlapping(jobs.as_ptr(), data.cast(), jobs.len()) };
+        let mut all = vec![(edit::BATCH_JOBS, table)];
+        for &(id, bytes) in scratches {
+            let (scratch, _) = gpu::buffer(
+                &self.device,
+                D3D12_HEAP_TYPE_DEFAULT,
+                bytes.next_multiple_of(64 << 10),
+                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            )?;
+            all.push((id, scratch));
+        }
+        for (id, res) in all {
+            // SAFETY: a live buffer.
+            let va = unsafe { res.GetGPUVirtualAddress() };
+            let object = Object {
+                res,
+                va,
+                index: 0,
+                subs: 1,
+            };
+            self.objects.insert(id, object);
+        }
+        Ok(())
     }
 
     /// The clamp passes of each list of the frame, in order, and their
@@ -2127,7 +2294,8 @@ impl Player {
         wait: bool,
     ) -> Vec<Stamp> {
         let version = self.version_of.get(submit).copied().unwrap_or(0);
-        let clamps = self.pipelines_named(CLAMP);
+        let mut clamps = self.pipelines_named(CLAMP);
+        clamps.insert(edit::BATCH);
         let compares = self.pipelines_named(COMPARE);
         let mesh: HashSet<u32> = self
             .frame
@@ -2714,6 +2882,16 @@ impl Player {
 
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
+        let mut made = self.prepare(o)?;
+        let mut stamps = Vec::new();
+        for _ in 0..o.loops.max(1) {
+            stamps = self.once(o, &mut made)?;
+        }
+        self.finish(o, made, &stamps)
+    }
+
+    /// The lists for a run as the options say.
+    fn prepare(&mut self, o: &Options) -> Result<(Sends, Report)> {
         let mut report = Report {
             notes: self.notes.clone(),
             ..Default::default()
@@ -2725,45 +2903,51 @@ impl Player {
             Vec::new()
         };
         let submits = self.edited(o, &mut report, &clamps);
-        let built = self.build(&submits, o)?;
-        let mut stamps = Vec::new();
-        for _ in 0..o.loops.max(1) {
-            self.restore(o.restore)?;
-            self.fresh = false;
-            stamps = self.send(&built, o)?;
-            if let Some((db, _, hash, _)) = self.picture_now()? {
-                report.pictures.push((db, hash));
-            }
-            let ms = |a: u32, b: u32| {
-                stamps[b as usize].saturating_sub(stamps[a as usize]) as f64 * 1e3 / self.frequency
-            };
-            let lists: Vec<&Built> = built.steps.iter().flat_map(|(_, l)| l).collect();
-            let (Some(first), Some(last)) = (lists.first(), lists.last()) else {
-                bail!("no lists to run");
-            };
-            let delta = built.steps.iter().filter_map(|(d, _)| d.as_ref());
-            report.delta_ms.push(
-                delta
-                    .filter(|d| d.first > first.first)
-                    .map(|d| ms(d.first, d.last))
-                    .sum(),
-            );
-            report.frame_ms.push(ms(first.first, last.last));
-            let each = |l: &[Built]| match (l.first(), l.last()) {
-                (Some(a), Some(b)) => ms(a.first, b.last),
-                _ => 0.0,
-            };
-            report.submits = built
-                .steps
-                .iter()
-                .map(|(_, l)| (l.len(), each(l)))
-                .collect();
-            report
-                .busy_ms
-                .push(report.submits.iter().map(|s| s.1).sum());
+        Ok((self.build(&submits, o)?, report))
+    }
+
+    /// One run of the frame, noted in the report; its timestamps.
+    fn once(&mut self, o: &Options, (built, report): &mut (Sends, Report)) -> Result<Vec<u64>> {
+        self.restore(o.restore)?;
+        self.fresh = false;
+        let stamps = self.send(built, o)?;
+        if let Some((db, _, hash, _)) = self.picture_now()? {
+            report.pictures.push((db, hash));
         }
+        let ms = |a: u32, b: u32| {
+            stamps[b as usize].saturating_sub(stamps[a as usize]) as f64 * 1e3 / self.frequency
+        };
+        let lists: Vec<&Built> = built.steps.iter().flat_map(|(_, l)| l).collect();
+        let (Some(first), Some(last)) = (lists.first(), lists.last()) else {
+            bail!("no lists to run");
+        };
+        let delta = built.steps.iter().filter_map(|(d, _)| d.as_ref());
+        report.delta_ms.push(
+            delta
+                .filter(|d| d.first > first.first)
+                .map(|d| ms(d.first, d.last))
+                .sum(),
+        );
+        report.frame_ms.push(ms(first.first, last.last));
+        let each = |l: &[Built]| match (l.first(), l.last()) {
+            (Some(a), Some(b)) => ms(a.first, b.last),
+            _ => 0.0,
+        };
+        report.submits = built
+            .steps
+            .iter()
+            .map(|(_, l)| (l.len(), each(l)))
+            .collect();
+        report
+            .busy_ms
+            .push(report.submits.iter().map(|s| s.1).sum());
+        Ok(stamps)
+    }
+
+    /// The report after the last run.
+    fn finish(&mut self, o: &Options, (built, mut report): (Sends, Report), stamps: &[u64]) -> Result<Report> {
         if o.detailed {
-            self.detail(&built, &stamps, o, &mut report);
+            self.detail(&built, stamps, o, &mut report);
         }
         if self.merging {
             let notes = self.merge_notes(o.loops)?;

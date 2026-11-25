@@ -20,15 +20,16 @@
 //!
 //! What it costs: pieces are fetched whole where a flight declared a part
 //! of one, and 64 KiB of what came down are hashed (some 4 us) just before
-//! they are merged, which reads them again.
+//! they are merged, on the thread that merges them (`crate::land`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicU8;
 
 use super::*;
 
 /// `VICTORY_FETCH_CHECK=1`; off by default until a run has shown how often a
 /// piece is caught (the frame-rate line says so) and what the hashes cost
-/// (3-4 ms of the landing thread's time for 96 MB, beside the merge).
+/// (3-4 ms for 96 MB beside the merge, spread over the threads that land).
 pub(super) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_CHECK").is_some_and(|v| v == "1"))
@@ -49,7 +50,7 @@ impl Suspects {
     /// Whether a flight that may write `piece` fetches it, its compare
     /// having flagged it or not.
     pub(super) fn wanted(&self, piece: Piece, flagged: bool) -> bool {
-        flagged || self.0.contains(&piece)
+        flagged || (!self.0.is_empty() && self.0.contains(&piece))
     }
 
     /// `piece` was fetched; `same`: it was what the last of the flights
@@ -67,104 +68,90 @@ impl Suspects {
     }
 }
 
-/// A piece to fetch.
-pub(super) struct Fetch {
-    pub(super) shadow: std::sync::Arc<crate::shadow::Shadow>,
-    /// The offsets fetched, and where they come down.
-    pub(super) from: usize,
-    pub(super) to: usize,
-    pub(super) at: u64,
-    /// The offsets merged: what flights declared of it.
-    pub(super) merged: Vec<(usize, usize)>,
-    /// With the check: the piece, and the hash the last flight that may
-    /// have written it ended with.
-    pub(super) check: Option<(u32, Option<u32>)>,
+/// What is landed: its copy, its offsets from and to, and where it comes
+/// down.
+pub(super) type Landed = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64);
+
+/// The pieces of a landing's fetch, whole, and what is known of them.
+pub(super) struct Check {
+    /// What is copied down: whole pieces, as the compare hashes them.
+    pub(super) copies: Vec<Landed>,
+    /// The bytes of them.
+    pub(super) total: u64,
+    /// Of each: the piece, and the hash the last flight that may have
+    /// written it ended with.
+    of: Vec<(Piece, Option<u32>)>,
+    /// Of what is landed, the piece (in `copies`) it is of.
+    within: Vec<usize>,
+    /// Of each piece: 0 not looked at yet, 1 as that flight ended with, 2
+    /// not so.
+    found: Vec<AtomicU8>,
 }
 
-/// What is fetched for `plans`, whose compares' results are in `differs`.
-/// With `suspects`, pieces are fetched whole, with the hash to compare.
-pub(super) fn fetches(plans: &[&CardPlan], differs: &[u32], suspects: Option<&Suspects>) -> Vec<Fetch> {
-    let mut out: Vec<Fetch> = Vec::new();
-    let mut total = 0u64;
-    let mut seen = HashSet::new();
-    // With `suspects`: where each piece is in `out`.
-    let mut index: HashMap<Piece, usize> = HashMap::new();
-    for plan in plans {
-        let flags: Vec<(usize, u32, bool)> = plan
-            .ranges
-            .iter()
-            .flat_map(|r| {
-                (0..r.span.pieces).map(move |p| {
-                    let piece = r.span.first + p;
-                    let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| flagged(d));
-                    let wanted = suspects.map_or(flagged, |s| s.wanted((r.shadow.id(), piece), flagged));
-                    (std::sync::Arc::as_ptr(&r.shadow) as usize, piece, wanted)
-                })
-            })
-            .collect();
-        let fetched = flagged_pieces(&flags);
-        for r in &plan.ranges {
-            let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
-            if upcheck::on() {
-                upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
-            }
+impl Check {
+    /// For `landed`, parts of pieces that `plans` may have written, whose
+    /// compares' results are in `differs`: the parts are given their places
+    /// in the pieces that come down.
+    pub(super) fn new<'a>(plans: impl Iterator<Item = &'a CardPlan>, differs: &[u32], landed: &mut [Landed]) -> Check {
+        let mut index: HashMap<Piece, usize> = HashMap::new();
+        let (mut copies, mut of, mut within, mut total) = (Vec::new(), Vec::new(), Vec::new(), 0u64);
+        for (shadow, lo, _, at) in landed {
+            let number = shadow.card_piece_of(*lo);
+            let piece = (shadow.id(), number);
+            let i = *index.entry(piece).or_insert_with(|| {
+                let (from, to) = shadow.card_hashed(number);
+                copies.push((shadow.clone(), from, to, total));
+                of.push((piece, None));
+                total += (to - from) as u64;
+                copies.len() - 1
+            });
+            *at = copies[i].3 + (*lo - copies[i].1) as u64;
+            within.push(i);
+        }
+        // (The last flight's stands.)
+        for r in plans.flat_map(|plan| &plan.ranges).filter(|r| r.compared) {
             for p in 0..r.span.pieces {
-                let piece = r.span.first + p;
-                if !fetched.contains(&(copy, piece)) {
-                    continue;
-                }
-                let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                if lo >= hi || !seen.insert((copy, lo, hi)) {
-                    continue;
-                }
-                if upcheck::on() {
-                    upcheck::fetched(r.shadow.id(), lo);
-                }
-                if suspects.is_none() {
-                    out.push(Fetch {
-                        shadow: r.shadow.clone(),
-                        from: lo,
-                        to: hi,
-                        at: total,
-                        merged: vec![(lo, hi)],
-                        check: None,
-                    });
-                    total += (hi - lo) as u64;
-                    continue;
-                }
-                let i = *index.entry((r.shadow.id(), piece)).or_insert_with(|| {
-                    let (from, to) = r.shadow.card_hashed(piece);
-                    out.push(Fetch {
-                        shadow: r.shadow.clone(),
-                        from,
-                        to,
-                        at: total,
-                        merged: Vec::new(),
-                        check: Some((piece, None)),
-                    });
-                    total += (to - from) as u64;
-                    out.len() - 1
-                });
-                out[i].merged.push((lo, hi));
-            }
-        }
-    }
-    if suspects.is_some() {
-        // The hash of the last flight that may have written the piece.
-        for plan in plans {
-            for r in plan.ranges.iter().filter(|r| r.compared) {
-                for p in 0..r.span.pieces {
-                    if let Some(&i) = index.get(&(r.shadow.id(), r.span.first + p))
-                        && let Some(&d) = differs.get((r.at + p) as usize)
-                        && let Some((_, hash)) = &mut out[i].check
-                    {
-                        *hash = Some(folded(d));
-                    }
+                if let Some(&i) = index.get(&(r.shadow.id(), r.span.first + p))
+                    && let Some(&d) = differs.get((r.at + p) as usize)
+                {
+                    of[i].1 = Some(folded(d));
                 }
             }
         }
+        let found = of.iter().map(|_| AtomicU8::new(0)).collect();
+        Check { copies, total, of, within, found }
     }
-    out
+
+    /// Looks at the piece that part `i` of what is landed is of, if none of
+    /// its parts was looked at: on the thread that lands it, just before, so
+    /// that its bytes are near.
+    ///
+    /// # Safety
+    /// What was fetched is at `data`, and stays as it is during the call.
+    pub(super) unsafe fn look(&self, i: usize, data: usize) {
+        let i = self.within[i];
+        if self.found[i].load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let Some(hash) = self.of[i].1 else {
+            return;
+        };
+        let (_, from, to, at) = &self.copies[i];
+        // SAFETY: the caller's.
+        let bytes = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, to - from) };
+        self.found[i].store(if self::hash(bytes) == hash { 1 } else { 2 }, Ordering::Relaxed);
+    }
+
+    /// All is landed: what was found is kept for later flights.
+    pub(super) fn done(&self, suspects: &mut Suspects) {
+        for ((piece, _), found) in self.of.iter().zip(&self.found) {
+            match found.load(Ordering::Relaxed) {
+                // Not compared on the card: fetched by every flight.
+                0 => {}
+                found => suspects.fetched(*piece, found == 1),
+            }
+        }
+    }
 }
 
 /// Of a result of the compare: whether the piece differs.

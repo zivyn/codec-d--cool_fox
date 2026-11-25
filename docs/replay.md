@@ -56,12 +56,15 @@ with the presented one.
 
 | switch | does |
 |---|---|
-| `--compare` | runs the frame unchanged first and prints the difference |
+| `--compare` | runs the frame unchanged and with the experiments turn by turn, and prints the difference |
 | `--skip-clamps` | no argument clamps and no barriers of their scratch buffers; draws read arguments kept from a first run |
+| `--batch-clamps` / `--batch-clamps 2` | argument clamps in batches, as `VICTORY_INDIRECT_BATCH=2` / `=1` does |
 | `--skip-hash-passes` | no compare/rehash passes over card buffers |
 | `--no-barriers` | no unordered-access barriers |
 | `--merge-barriers` | joins barrier calls with no work between them |
 | `--buffers vram` / `sysmem` | all buffers in the card's / the PC's memory |
+| `--only-buffers <what>` | with `--buffers`: only the buffers all of these match: `name=<text>`, `min=<bytes>`, `max=<bytes>`, `seen=No`, `Cached` or `Combined`, `id=<a>..<b>`, or `!` and one of them (repeatable) |
+| `--listing 3..7` | only writes the frame's buffers and those lists' commands |
 | `--one-submit` | one `ExecuteCommandLists`, with a full wait between the former ones |
 | `--only 3..7` | runs these lists; of the others only barriers |
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |

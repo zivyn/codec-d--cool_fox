@@ -53,12 +53,21 @@ pub(crate) struct Replay {
     /// Leave out the argument clamps: what they bound is kept from a first run.
     #[arg(long)]
     skip_clamps: bool,
+    /// The argument clamps in batches, as VICTORY_INDIRECT_BATCH does (2:
+    /// a wait before every indirect dispatch).
+    #[arg(long, num_args = 0..=1, default_missing_value = "1", default_value_t = 0)]
+    batch_clamps: u32,
     /// Leave out the hash and compare passes over card buffers.
     #[arg(long)]
     skip_hash_passes: bool,
     /// Where buffers lie.
     #[arg(long, value_enum, default_value_t = Buffers::AsRecorded)]
     buffers: Buffers,
+    /// With --buffers, only the buffers all of these match: `name=<text>`,
+    /// `min=<bytes>`, `max=<bytes>`, `seen=<No, Cached, Combined>`,
+    /// `id=<a>..<b>`, or `!` and one of those (may be given several times).
+    #[arg(long)]
+    only_buffers: Vec<String>,
     /// One ExecuteCommandLists for the whole frame.
     #[arg(long)]
     one_submit: bool,
@@ -124,6 +133,9 @@ pub(crate) struct Replay {
     /// capture's `shaders` folder.
     #[arg(long)]
     dump: Option<String>,
+    /// Only write the frame's buffers and the commands of these lists (`3..7`).
+    #[arg(long)]
+    listing: Option<String>,
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -144,6 +156,10 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         }
         return Ok(());
     }
+    if let Some(text) = &r.listing {
+        let lists = range(text).with_context(|| format!("--listing {text}"))?;
+        return play::listing(&r.folder, lists, &mut |line| println!("{line}"));
+    }
     let only = match &r.only {
         Some(text) => Some(
             range(text)
@@ -162,9 +178,11 @@ pub(crate) fn run(r: Replay) -> Result<()> {
             Buffers::Vram => play::Buffers::Card,
             Buffers::Sysmem => play::Buffers::Pc,
         },
+        only_buffers: r.only_buffers,
         no_barriers: r.no_barriers,
         merge_barriers: r.merge_barriers,
         skip_clamps: r.skip_clamps,
+        batch_clamps: r.batch_clamps,
         skip_hash_passes: r.skip_hash_passes,
         one_submit: r.one_submit,
         merge: !r.no_merge,

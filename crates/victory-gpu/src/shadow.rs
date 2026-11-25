@@ -1409,9 +1409,114 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// Whether what shaders wrote goes into title memory run by run
+/// ([`put_changed`]; on by default, `VICTORY_EXACT_BACK=0` writes the whole
+/// stretch from the first changed byte to the last, as before).
+fn exact_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_BACK").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame-rate line: pieces put back by [`put_changed`], the
+/// writes they took, the bytes written, and the pieces whose runs were
+/// joined over bytes that had not changed.
+pub(crate) static PUT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// The dwords (of title memory from `at` on) where `merged` differs from
+/// `title`, as (offset, bytes) in order, joined where at most `gap` bytes
+/// lie between.
+fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (from, n) in changed_runs(merged, title) {
+        // Shaders write dwords: the whole of each.
+        let lo = ((at + from) & !3).max(at) - at;
+        let hi = ((at + from + n + 3) & !3).min(at + title.len()) - at;
+        match runs.last_mut() {
+            Some((a, len)) if lo <= *a + *len + gap => *len = (*len).max(hi - *a),
+            _ => runs.push((lo, hi - lo)),
+        }
+    }
+    runs
+}
+
+/// What shaders wrote goes into title memory from `at` on: `title` is what
+/// was read there, `merged` the same with their bytes put in. Only the
+/// dwords that differ are written. The whole stretch from the first changed
+/// byte to the last was: between the read and the write the title's own
+/// threads, or data streamed in, may have written the bytes between (a heap
+/// holds what shaders write beside what the CPU does), and those writes were
+/// undone. Beside running title threads (the relay) that is a piece of
+/// memory going back in time now and then: runs pool1, blame1 and seriess2
+/// ended in the title decoding garbage.
+///
+/// shortcut: a piece with very many runs has them joined over small gaps,
+/// where the old race is left.
+fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    crate::watch::landing(at, title.len());
+    if !exact_back() {
+        crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
+        return merged.len();
+    }
+    if crate::safecopy::on() {
+        PUT[0].fetch_add(1, Ordering::Relaxed);
+        PUT[2].fetch_add(merged.len() as u64, Ordering::Relaxed);
+        // SAFETY: title memory; a page of it that is not there fails the
+        // put, and the rest is put page by page.
+        if unsafe { crate::safecopy::put_changed(at as *mut u8, title, merged) } {
+            return merged.len();
+        }
+        let mut from = 0;
+        while from < merged.len() {
+            let n = (4096 - (at + from) % 4096).min(merged.len() - from);
+            // SAFETY: as above.
+            unsafe { crate::safecopy::put_changed((at + from) as *mut u8, &title[from..from + n], &merged[from..from + n]) };
+            from += n;
+        }
+        return merged.len();
+    }
+    let mut runs = dword_runs(at, title, merged, 0);
+    if runs.len() > 64 {
+        runs = dword_runs(at, title, merged, 32);
+        PUT[3].fetch_add(1, Ordering::Relaxed);
+    }
+    let mut written = 0;
+    for &(from, n) in &runs {
+        crate::host::write_mapped((at + from) as *mut u8, merged[from..].as_ptr(), n);
+        written += n;
+    }
+    PUT[0].fetch_add(1, Ordering::Relaxed);
+    PUT[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+    PUT[2].fetch_add(written as u64, Ordering::Relaxed);
+    written
+}
+
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{changed_runs, dword_runs};
+
+    /// Whole dwords around every changed byte and no other, whatever the
+    /// alignment; small gaps joined only when asked.
+    #[test]
+    fn dword_runs_hold_the_dwords_that_changed() {
+        let title: Vec<u8> = (0..200u32).map(|i| (i * 7 + 3) as u8).collect();
+        for at in [0x1000usize, 0x1001, 0x1002, 0x1003] {
+            for changes in [vec![0], vec![199], vec![5, 6], vec![8, 12, 40, 41, 43, 120]] {
+                let mut merged = title.clone();
+                for &c in &changes {
+                    merged[c] ^= 0x55;
+                }
+                let runs = dword_runs(at, &title, &merged, 0);
+                let held: Vec<usize> = runs.iter().flat_map(|&(a, n)| a..a + n).collect();
+                let mut expect: Vec<usize> = (0..200).filter(|i| changes.iter().any(|c| (at + c) / 4 == (at + i) / 4)).collect();
+                expect.dedup();
+                assert_eq!(held, expect, "{at:#x} {changes:?}");
+                let joined = dword_runs(at, &title, &merged, 32);
+                assert!(joined.len() <= runs.len());
+                assert!(runs.iter().all(|r| joined.iter().any(|j| j.0 <= r.0 && r.0 + r.1 <= j.0 + j.1)));
+            }
+        }
+        assert!(dword_runs(0, &title, &title, 0).is_empty());
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -2002,6 +2107,7 @@ impl Shadow {
                 // before the submission, else the title's. (With the two
                 // searches above this was 44 ms a frame for 970 pieces.)
                 let mut differs = 0u8;
+                let was = title.to_vec();
                 for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
                     let gpu = if *h != *o { 0xffu8 } else { 0 };
                     let merged = (*t & !gpu) | (*h & gpu);
@@ -2010,9 +2116,7 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::watch::landing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
+                    written += put_changed(start + at, &was, title);
                 }
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -2096,12 +2200,11 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
+        let was = title.clone();
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::watch::landing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        put_changed(start + at, &was, title)
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -2619,6 +2722,7 @@ impl Shadow {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
+            let was = title.clone();
             for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
                 let wrote = if *g != *o { 0xffu8 } else { 0 };
                 let merged = (*t & !wrote) | (*g & wrote);
@@ -2627,9 +2731,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::watch::landing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
+                written = put_changed(start + at, &was, title);
             }
         } else {
             // Title memory is not mapped there: the copy keeps what the
@@ -2692,6 +2794,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
+        let was = title.clone();
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -2702,9 +2805,7 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::watch::landing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        put_changed(start + at, &was, title)
     }
 }
 

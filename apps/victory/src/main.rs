@@ -179,8 +179,11 @@ fn main() -> Result<()> {
             strict,
             execute,
             console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+            title_args,
+        } => {
+            victory_hle::runtime::set_title_args(title_args);
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
         Command::Config => show_config(),
     }
 }

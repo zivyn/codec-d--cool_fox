@@ -7,7 +7,7 @@
 // API would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, c_char, c_void};
 
 use crate::{HleModule, HostPolicy, hle_export, registry, runtime};
 
@@ -350,6 +350,57 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// The title's argument list: the program, then what was given after `--`.
+/// The host's own would be ours (`victory run <exe> ...`), and the title
+/// looks at fixed places in it (`-skipToIIS` only as the first argument).
+struct TitleArgv {
+    count: std::cell::UnsafeCell<i32>,
+    list: std::cell::UnsafeCell<*mut *mut c_char>,
+}
+
+// SAFETY: never written here after it was made; the title's C runtime start
+// reads it once, on one thread.
+unsafe impl Send for TitleArgv {}
+// SAFETY: as above.
+unsafe impl Sync for TitleArgv {}
+
+/// Kept for the whole run: the title holds on to the pointers.
+fn title_argv(program: &str, args: &[String]) -> TitleArgv {
+    let list: Vec<*mut c_char> = std::iter::once(program)
+        .chain(args.iter().map(String::as_str))
+        .filter_map(|a| std::ffi::CString::new(a).ok())
+        .map(std::ffi::CString::into_raw)
+        .collect();
+    let count = list.len() as i32;
+    // `argv[argc]` is null.
+    let list: Box<[*mut c_char]> = list.into_iter().chain(Some(std::ptr::null_mut())).collect();
+    TitleArgv {
+        count: count.into(),
+        list: Box::leak(list).as_mut_ptr().into(),
+    }
+}
+
+fn argv() -> &'static TitleArgv {
+    static ARGV: std::sync::OnceLock<TitleArgv> = std::sync::OnceLock::new();
+    ARGV.get_or_init(|| {
+        // The program's name stays what the host says (as it was before).
+        let program = std::env::args_os().next().unwrap_or_default();
+        let args = runtime::title_args();
+        tracing::info!(?args, "the title's arguments");
+        title_argv(&program.to_string_lossy(), args)
+    })
+}
+
+/// See [`TitleArgv`].
+pub extern "C" fn __p___argc() -> *mut i32 {
+    argv().count.get()
+}
+
+/// See [`TitleArgv`].
+pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
+    argv().list.get()
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -363,6 +414,8 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-crt-runtime-*",
         ],
         exports: vec![
+            hle_export!(__p___argc),
+            hle_export!(__p___argv),
             hle_export!(GetModuleHandleW),
             hle_export!(GetModuleHandleA),
             hle_export!(GetModuleFileNameW),
@@ -613,6 +666,29 @@ mod tests {
         let mut small = [0u8; 4];
         assert_eq!(GetModuleFileNameA(module, small.as_mut_ptr(), 4), 4);
         assert_eq!(&small, &[b'C', b':', b'\\', 0]);
+    }
+
+    /// The title's arguments come right after the program, and the list ends
+    /// in a null pointer; without any there is only the program.
+    #[test]
+    fn the_title_gets_its_own_arguments() {
+        let read = |made: &TitleArgv| {
+            // SAFETY: made above, kept for the whole run.
+            unsafe {
+                let (count, list) = (*made.count.get() as usize, *made.list.get());
+                assert!((*list.add(count)).is_null());
+                (0..count)
+                    .map(|i| CStr::from_ptr(*list.add(i)).to_str().unwrap().to_owned())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let some = title_argv("victory.exe", &["-skipToIIS".into(), "-x=1".into()]);
+        assert_eq!(read(&some), ["victory.exe", "-skipToIIS", "-x=1"]);
+        assert_eq!(read(&title_argv("victory.exe", &[])), ["victory.exe"]);
+        // What the title is given: the same list every time.
+        assert_eq!(__p___argc(), __p___argc());
+        // SAFETY: as above.
+        unsafe { assert_eq!((*__p___argc(), (**__p___argv()).is_null()), (1, false)) };
     }
 
     fn w(text: &str) -> Vec<u16> {

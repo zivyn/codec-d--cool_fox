@@ -55,6 +55,18 @@ pub fn image_named(file: &str) -> Option<usize> {
         .map(|(b, _)| *b)
 }
 
+static TITLE_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The arguments the title's `main` gets (those after `--`). Set once, before
+/// the title starts; later calls are ignored.
+pub fn set_title_args(args: Vec<String>) {
+    let _ = TITLE_ARGS.set(args);
+}
+
+pub fn title_args() -> &'static [String] {
+    TITLE_ARGS.get().map_or(&[], Vec::as_slice)
+}
+
 /// Maps a title DLL the title loads itself (`LoadLibrary`) and returns its
 /// base; `Ok(None)` if `file` is not one of the title's DLLs.
 pub type TitleDllLoader = Box<dyn Fn(&str) -> Result<Option<usize>, String> + Send + Sync>;

@@ -758,7 +758,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
-fn install() {
+pub(crate) fn install() {
     use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
@@ -768,11 +768,22 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;
+        // A fault of our own copies (`crate::safecopy`): whatever it is, if
+        // it is not a block we guard, the copy fails and goes on from there.
+        let ours = crate::safecopy::failing_exit(r.ExceptionAddress as usize);
+        let fail = |exit: usize| {
+            // SAFETY: the context the system passes, to go on from.
+            unsafe { (*(*info).ContextRecord).Rip = exit as u64 };
+            EXCEPTION_CONTINUE_EXECUTION
+        };
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
         {
-            return EXCEPTION_CONTINUE_SEARCH;
+            return match ours {
+                Some(exit) => fail(exit),
+                None => EXCEPTION_CONTINUE_SEARCH,
+            };
         }
         let at = r.ExceptionInformation[1];
         // Held across both checks: another thread may have opened the block
@@ -785,9 +796,11 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
-            EXCEPTION_CONTINUE_EXECUTION
-        } else {
-            EXCEPTION_CONTINUE_SEARCH
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        match ours {
+            Some(exit) => fail(exit),
+            None => EXCEPTION_CONTINUE_SEARCH,
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();

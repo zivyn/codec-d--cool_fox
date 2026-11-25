@@ -1,8 +1,10 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25: **nothing is lit by ray tracing yet.** Most of the
-machinery translates and is unit-tested; it has not yet run end to end in the
-game. Everything here is off by default.
+Status, 2026-11-25, 06:00: **with `VICTORY_BVH_BUILDER=1` the builder runs on
+the RX 7900 XTX and rooms get their indirect light** (run light-6, the dorm:
+bunk, locker, window frame, posters; 100-116 ms a frame against 84-95 without).
+Some structures are still wrong; one run of four with it lost the device early,
+in a list without a builder stage. Off by default.
 
 ## What the title does
 
@@ -35,8 +37,8 @@ shaders and emulates the one instruction.
 
 ## What this fork adds
 
-1. **The builder programs translate** (49 of 52; all that the title creates in
-   the scenes tested). They pass buffer addresses in a spilled parameter table
+1. **The builder programs translate** (all 52, with host pipelines on the RX
+   7900 XTX; the title creates 53 such pipelines). They pass buffer addresses in a spilled parameter table
    rather than in descriptors. Added: the spilled user-data table, root
    unordered-access views (translator and host binding), byte and 16-bit buffer
    accesses, and several control-flow shapes.
@@ -61,18 +63,58 @@ shaders and emulates the one instruction.
    partly working builder wrote garbage bounds into title memory and crashed
    the title.
 
+## The structures (from dumps of the arenas, `VICTORY_MEMORY_DUMP`)
+
+- Header, 64 bytes: dword 0 the version 6 in the low half and marks in the high
+  (0x8000 bottom level, 0x4 compacted, 0x2 rehydrated, 0x100 still packed),
+  dword 1 the size in 64-byte nodes, 3 the number of elements, 4-9 the bounds,
+  10 the offset of the box nodes, 12 the root's node pointer, 13 the offset of
+  the elements, 14 the offset of the parent table (from the header; the static
+  ones' index counts the leaves too, so it is negative).
+- An instance is 128 bytes at the top level's offset 13: a 3x4 matrix in dwords
+  0-11, id and mask, flags, the root pointer (bit 30 set for static ones), the
+  bottom level's address in 256-byte units.
+- The static world's structures are shipped **packed ("dehydrated")** and
+  unpacked in place, once, by DecompressHeader, Box32/Box16Rehydration and
+  LeafRehydration when they have been streamed in (3,000 in the opening).
+- Dynamic ones are built, their compacted size read back by the title from a
+  small buffer, and copied to a place of that size.
+
+## How title memory by address is held (`memory.rs`)
+
+Pages of 64 KiB in arenas on the card, whole title buffers in their own copies,
+pages with small title buffers as windows of title memory. The module's
+comment has the rules. In short: what the builder stores stays on the card
+(only small title buffers it was given to write come back); a packed structure
+goes up whole when the builder comes to it; title buffers take its stores only
+after it was given them as an unordered access view.
+
+| variable | does |
+|---|---|
+| `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
+| `VICTORY_MEMORY_CARD_MB` | the most of it on the card (4096) |
+| `VICTORY_MEMORY_DUMP=<folder>` | a file `go` there writes the arenas out (diagnostics) |
+| `VICTORY_UPLOAD_LOW=0`, `VICTORY_LENT_HEAP=0` | lists' upload memory above 2^40, no view heap for lists without one, as before |
+
+Every ten seconds the log has a line "title memory by address: ..." with pages,
+dispatches, faults and what came.
+
 ## Known gaps
 
-- With `VICTORY_BVH_BUILDER=1` the builder still stays off in a real run: a few
-  of its pipelines are refused by the host (they still ask for 64-lane waves on
-  a 32-lane GPU) or do not translate.
-- Five shadow-mask trace programs do not translate yet.
-- An access to a title page that has no host copy is lost (a read gives zero, a
-  store is dropped).
+- About 4,000 pages a frame that are not there are still touched (the notes'
+  limit): some structures are wrong and rays go anywhere in them. Guess: sizes
+  that came back late or not (fixed after light-6, not seen working), so places
+  overlap.
+- Five shadow-mask trace programs do not translate (a structure's address out
+  of a descriptor picked from the heap by a computed index: the host would have
+  to give a table of addresses by slot). The title did not create them in any
+  run so far.
+- An access to a page that is not there is lost (a read gives zero, a store is
+  dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
   of two boxes entered at the same distance, and the result for a ray exactly
   through an edge.
-- Cost on the GPU is unmeasured.
 
 ## Where to look
 

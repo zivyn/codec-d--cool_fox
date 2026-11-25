@@ -30,6 +30,7 @@ use super::wire::{
 };
 
 pub mod diverge;
+pub mod look;
 mod merge;
 pub mod pixel;
 mod upcopies;
@@ -85,6 +86,8 @@ pub struct Options {
     pub wait_lists: bool,
     /// Run only these lists (by their place in the frame).
     pub only: Option<(u32, u32)>,
+    /// The last command that runs (list, command); after it only barriers.
+    pub until: Option<(u32, usize)>,
     /// Skip what runs a pipeline whose name or shader hash has one of
     /// these in it.
     pub skip_shaders: Vec<String>,
@@ -114,6 +117,7 @@ impl Default for Options {
             wait_all: false,
             wait_lists: false,
             only: None,
+            until: None,
             skip_shaders: Vec::new(),
             compare: false,
             debug: false,
@@ -1928,6 +1932,13 @@ impl Player {
                 if o.only.is_some_and(|(from, to)| here < from || here > to) {
                     lists.push(edit::barriers_only(cmds));
                     continue;
+                }
+                if let Some((list, command)) = o.until
+                    && here >= list
+                {
+                    let from = if here > list { 0 } else { (command + 1).min(cmds.len()) };
+                    let rest = cmds.split_off(from);
+                    cmds.extend(edit::barriers_only(rest));
                 }
                 if o.skip_clamps
                     && let Some(c) = clamps.get(here as usize)

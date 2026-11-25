@@ -37,7 +37,6 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
@@ -281,7 +280,9 @@ struct Views {
     whole: Vec<(usize, usize)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views {
+/// Read by many threads at once (write faults, landings), changed when the
+/// runtime maps or unmaps.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     views: BTreeMap::new(),
     pages: BTreeMap::new(),
     pages_twice: 0,
@@ -289,14 +290,18 @@ static VIEWS: Mutex<Views> = Mutex::new(Views {
     whole: Vec::new(),
 });
 
-fn views() -> std::sync::MutexGuard<'static, Views> {
-    VIEWS.lock().unwrap_or_else(|e| e.into_inner())
+fn views() -> std::sync::RwLockReadGuard<'static, Views> {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
+    VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
+    let mut v = views_mut();
     v.sections.retain(|s| s.0 != section);
     // A handle's number given out again: the view was of the section that
     // had it before (it stays mapped: someone may be writing through it).
@@ -308,7 +313,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
     let whole = {
-        let mut v = views();
+        let mut v = views_mut();
         let at = v.whole.iter().position(|w| w.0 == section);
         at.map(|i| v.whole.swap_remove(i).1)
     };
@@ -324,7 +329,7 @@ pub fn title_memory_section_gone(section: usize) {
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
-        let mut v = views();
+        let mut v = views_mut();
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
             let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
@@ -343,7 +348,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
-    let mut v = views();
+    let mut v = views_mut();
     if v.views.is_empty() {
         return;
     }
@@ -529,7 +534,17 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
 /// `crate::watch::title_memory_reading`: until it lets go the title sees
 /// the same pages at `at`.
 pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
-    let mut v = views();
+    let known = {
+        let v = views();
+        let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
+            return None;
+        };
+        v.whole.iter().find(|w| w.0 == section).map(|w| (w.1, offset))
+    };
+    if let Some((base, offset)) = known {
+        return (base != 0).then(|| base + offset as usize);
+    }
+    let mut v = views_mut();
     let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
         return None;
     };
@@ -548,6 +563,34 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         }
     };
     (base != 0).then(|| base + offset as usize)
+}
+
+/// Our own address of the 64 KiB page the title sees at `page` ([`beside`]),
+/// and every address the title sees it at (0: no more); `None` if the page is
+/// in no view of a section, or in very many. While the caller holds
+/// `crate::watch::title_memory_reading`.
+pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
+    for asked in [false, true] {
+        {
+            let v = views();
+            let (&base, &(bytes, section, offset)) = v.views.range(..=page).next_back()?;
+            let within = page.wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                return None;
+            }
+            let offset = offset + within as u64;
+            if let Some(whole) = v.whole.iter().find(|w| w.0 == section) {
+                let mut shown = [0; 8];
+                let all = v.pages.get(&(section, offset))?;
+                shown.get_mut(..all.len())?.copy_from_slice(all);
+                return (whole.1 != 0).then(|| (whole.1 + offset as usize, shown));
+            }
+        }
+        if asked || beside(page, K64).is_none() {
+            return None;
+        }
+    }
+    None
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and

@@ -39,6 +39,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod picked;
+#[cfg(windows)]
 mod pool;
 #[cfg(windows)]
 mod primitive;

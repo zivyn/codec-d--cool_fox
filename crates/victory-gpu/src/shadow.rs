@@ -73,6 +73,8 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// Whether shaders were ever declared to write it.
+    written: std::sync::atomic::AtomicBool,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -425,6 +427,32 @@ static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
+    let there = window_room_for(size);
+    if there.is_some() || !windows_own() || !cards() {
+        return there;
+    }
+    // Two sides all the same, the card's in the PC's memory.
+    let host = host()?;
+    if !host.card_ready() {
+        return None;
+    }
+    let (buffer, _) = host.shared_buffer(size)?;
+    WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
+    Some(buffer)
+}
+
+/// Whether windows outside buffers have two sides too, so that submissions
+/// in the air read the bytes they were prepared with (`VICTORY_WINDOWS_OWN=1`;
+/// off by default: it takes the windows' bytes again, 3.3 GB in capture
+/// replay2, and what changes in them under submissions in the air is what the
+/// title's CPU writes, which it does not while they read it).
+fn windows_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
+}
+
+/// [`window_card_for`] in the card's own memory.
+fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
     if most == 0 || !cards() {
         return None;
@@ -2590,6 +2618,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            written: Default::default(),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2625,6 +2654,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
@@ -3573,6 +3603,35 @@ impl Shadow {
         card.touched.store(true, Ordering::Release);
     }
 
+    /// Whether shaders were ever declared to write it.
+    pub(crate) fn written(&self) -> bool {
+        self.written.load(Ordering::Relaxed)
+    }
+
+    /// `bytes` were put into title memory at `address`, and the submission
+    /// being prepared copies the same to the copy at that copy's place in its
+    /// list: the reference (the CPU's side of a copy in the card's memory, the
+    /// snapshot) takes them and nothing is sent. What the card makes of them
+    /// is then what differs from them when the submission has run. The range
+    /// is declared written by it, and its sends are taken.
+    pub(crate) fn placed_copy(&self, address: usize, bytes: &[u8]) {
+        let (from, to) = self.inside(address, bytes.len());
+        if from >= to || self.place.is_some() {
+            return;
+        }
+        let bytes = &bytes[self.start as usize + from - address..][..to - from];
+        let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+        if self.card.is_some() {
+            // SAFETY: inside the mapping of the CPU's side, in a range no
+            // refresh writes; the lock keeps the landing out.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(from), bytes.len()) };
+        } else if let Some(snapshot) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            // SAFETY: the snapshot's allocation holds the copy's length.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), snapshot.as_mut_ptr().add(from), bytes.len()) };
+        }
+        self.changed(from, to);
+    }
+
     /// Of a copy in the card's memory: where its CPU side is.
     pub(crate) fn card_data(&self) -> *const u8 {
         self.data
@@ -4252,6 +4311,12 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return find(address, len);
     }
     lookup(address, len, true)
+}
+
+/// The copy [`find`] gives for a range inside a title buffer, if it was made.
+pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    buffers().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {

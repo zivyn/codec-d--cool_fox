@@ -1410,11 +1410,10 @@ impl Drop for Counted {
 }
 
 /// A chunk of upload memory for lists' scratch data: the buffer, its
-/// mapping and its host GPU address.
+/// mapping.
 struct Chunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
-    gpu: u64,
 }
 
 // SAFETY: a D3D12 resource (free-threaded) and its persistent mapping,
@@ -1506,14 +1505,11 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     }
     let (buffer, data) = host.upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        buffer,
         data: data as usize,
-        gpu,
     })
 }
 
@@ -1780,6 +1776,9 @@ enum Step {
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
+    /// A title buffer copy that the list does on the card ([`place`]): what
+    /// is done on the CPU for it.
+    Placed(place::Placed),
 }
 
 /// What a list does on the CPU when it is submitted: copies between host
@@ -2467,6 +2466,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     if written.is_empty() {
         return None;
     }
+    // Destinations of copies at their place, if a step reads them.
+    let mut placed: Vec<(usize, usize)> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
             match step {
@@ -2506,11 +2507,23 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
+                Step::Placed(p) => match p.waits(written) {
+                    place::Waits::No => {}
+                    place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
+                    place::Waits::Yes => {
+                        if count {
+                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a buffer copy at its place", written, p.src, p.len);
+                        }
+                        return Some(WHY_READ);
+                    }
+                },
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
-    None
+    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -3031,6 +3044,16 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    if place::on() {
+        let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            t[0],
+            t[1] / 1024.0,
+            t[2],
+            t[3],
+        );
+    }
     card_steps::log(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -3046,6 +3069,7 @@ fn late_line(frames: f64) {
 }
 
 mod card_steps;
+mod place;
 mod send;
 mod torn;
 pub(crate) mod upcheck;
@@ -4826,8 +4850,10 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(1);
+        // What flights in the air may write.
+        let air = line().written.clone();
         for list in runs {
-            list.run_deferred(&mut batch, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -4866,6 +4892,11 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let card = self.card_before(runs, &picked, flown);
+        // The sends are taken: from here on the references hold what the
+        // copies in the lists put.
+        for (shadow, at, bytes) in batch.placed.drain(..) {
+            shadow.placed_copy(at, &bytes);
+        }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -5858,16 +5889,22 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        let (buffer, at, data) = self.scratch_at(len)?;
+        // SAFETY: a live buffer.
+        Some((unsafe { buffer.GetGPUVirtualAddress() } + at, data))
+    }
+
+    /// [`HostList::scratch`]: the buffer, the offset in it and the CPU
+    /// pointer.
+    fn scratch_at(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            self.deferred().hold_upload(buffer.clone(), len);
+            return Some((buffer, 0, data));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -5884,10 +5921,10 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
+        let (data, buffer) = (s.chunks[s.current].0.data, s.chunks[s.current].0.buffer.clone());
         let at = s.used;
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some((buffer, at, (data + at as usize) as *mut u8))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -6165,7 +6202,7 @@ impl HostList {
     /// lists of a submission, through many ranges). Copies and fills that
     /// `taken` names (by their place) are left out: they are done on the
     /// card ([`card_steps`]).
-    fn run_deferred(&self, batch: &mut Batch, taken: impl Fn(usize) -> bool) {
+    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -6203,6 +6240,17 @@ impl HostList {
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     (started, len)
+                }
+                Step::Placed(p) => {
+                    let started = std::time::Instant::now();
+                    let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
+                    if free {
+                        batch.title_written();
+                    }
+                    if let Some(bytes) = p.prepare(free) {
+                        batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                    }
+                    (started, p.len)
                 }
                 Step::Refresh(shadow, address, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -6466,6 +6514,9 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
     /// Those due ([`Batch::refresh_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// What copies at their place in the submission's lists put into title
+    /// memory ([`place`]): the host copy, the title address, the bytes.
+    placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
 }
 
 /// Whether a submission's textures are brought up to date on several

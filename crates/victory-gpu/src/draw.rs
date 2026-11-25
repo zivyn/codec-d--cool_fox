@@ -3124,6 +3124,12 @@ impl State {
         }
     }
 
+    /// A buffer was copied to: what was clamped of it ahead is clamped anew.
+    pub(crate) fn copied(&mut self) {
+        self.window = None;
+        self.batch = None;
+    }
+
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
         if self.batch.as_ref().is_some_and(|b| b.wrote) {

@@ -3627,9 +3627,9 @@ mod tests {
             unsafe { ((p + at) as *mut u8).write_volatile(1) }
         };
         let tracked = track(p, 4 * PAGE, false).expect("watched");
-        write(5);
-        write(PAGE + 5000);
-        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 2 * PAGE)], "never taken");
+        // (Other tests' memory was here.)
+        (0..4).for_each(|page| write(page * PAGE + 5));
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 4 * PAGE)], "never taken");
         assert!(tracked.take(p, p + 4 * PAGE).is_empty());
         write(PAGE + 5000);
         write(PAGE + 8192);
@@ -3637,8 +3637,7 @@ mod tests {
         write(2 * PAGE);
         assert_eq!(
             tracked.take(p, p + 4 * PAGE),
-            [(p + PAGE + 4096, p + PAGE + 3 * 4096), (p + 2 * PAGE - 4096, p + 3 * PAGE)],
-            "page 2 was never taken"
+            [(p + PAGE + 4096, p + PAGE + 3 * 4096), (p + 2 * PAGE - 4096, p + 2 * PAGE + 4096)]
         );
         write(2 * PAGE + 70);
         // Two askings' writes are in what is taken after both.

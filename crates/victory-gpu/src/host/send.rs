@@ -186,6 +186,9 @@ pub(super) struct Own {
     copies: Vec<Copy>,
 }
 
+/// Runs whose pairs are one piece of work.
+const RUNS_AT_A_TIME: usize = 4096;
+
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
     let began = std::time::Instant::now();
@@ -210,15 +213,29 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
+    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
-        let mut to = (memory.data + copy.pairs.0 as usize) as *mut [u32; 2];
+        // (80,000 runs of some words a frame: in pieces of work.)
+        let mut to = memory.data + copy.pairs.0 as usize;
+        for ranges in ranges.chunks(RUNS_AT_A_TIME) {
+            let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
+            if words > 0 {
+                work.push((from, ranges, to));
+                to += words * 8;
+            }
+        }
+    }
+    let one = |i: usize| {
+        let (from, ranges, to) = work[i];
+        let mut to = to as *mut [u32; 2];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
-                // this thread alone writes in these ranges) and inside the
-                // memory, which has room for every pair.
+                // the thread that asked, and waits, alone writes in these
+                // ranges) and inside the memory, which has room for every
+                // pair, a piece of work's behind the last one's.
                 unsafe {
                     let word = ((from + offset) as *const u32).read_unaligned();
                     to.write([offset as u32, word]);
@@ -226,7 +243,8 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
                 }
             }
         }
-    }
+    };
+    crate::land::each_under(work.len(), &one);
     STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
     STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);

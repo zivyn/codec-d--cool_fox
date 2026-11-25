@@ -321,6 +321,10 @@ pub(crate) struct State {
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
     user: Vec<u32>,
+    /// The tables the last bind made afresh for a program the stand-in for
+    /// the indirect light follows (`crate::ambient`): root parameter, bytes
+    /// into the view heap.
+    ambient_tables: Vec<(u8, u32)>,
     /// What the host list has: pipeline, root signature, heaps.
     host_pipeline: usize,
     /// Graphics, compute.
@@ -450,6 +454,12 @@ static FRAME: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 #[cfg(feature = "diagnostics")]
 pub(crate) fn take_frame() -> Vec<String> {
     std::mem::take(&mut *FRAME.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// The draws dropped since [`take_dropped`].
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn dropped_now() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
@@ -761,48 +771,66 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // Whether the device was there before the pass: a view that removes
     // it is named below.
     static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+    let alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
     let mut unordered = Vec::new();
-    for (n, &index) in slots.iter().enumerate() {
-        ranges.set(index, None);
+    /// The title's heap, for the threads that look.
+    struct Shared<'a>(&'a crate::descriptor::Heap);
+    // SAFETY: a heap is free-threaded (its methods are called by any thread of
+    // the title's), and it lives until all of them have looked.
+    unsafe impl Sync for Shared<'_> {}
+    impl Shared<'_> {
+        fn handle(&self, index: u32) -> Option<u64> {
+            self.0.handle(index)
+        }
+    }
+    let heap = Shared(heap);
+    // What a slot of the title's shows: its copy and range, and whether it is
+    // an unordered view.
+    let look = |index: u32| {
         // A draw's table's: the draw brings what it reads up to date.
         if host.copied_tabled(index, frame) {
-            continue;
+            return None;
         }
-        let Some(handle) = heap.handle(index) else {
-            continue;
-        };
-        let Some(view) = host.mirror(index, handle, true) else {
-            continue;
-        };
-        // Every 64 views while the device lives (a cheap query).
-        if alive
-            && n % 64 == 63
-            && let Some(why) = crate::descriptor::host::device_removed()
-        {
-            alive = false;
-            GONE.store(true, Ordering::Relaxed);
-            let last: Vec<String> = slots[n - 63..=n]
-                .iter()
-                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                .map(|s| s.chars().take(200).collect())
-                .collect();
-            tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
-            crate::host::log_removal_context();
-        }
+        let view = host.mirror(index, heap.handle(index)?, true)?;
         // The copy the slot shows (`buffer_copy`), not the one the
         // view's range alone would find.
-        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-            continue;
-        };
+        let (shadow, address, len) = crate::descriptor::host::buffer_copy(&view)?;
         #[cfg(feature = "diagnostics")]
         if host.shows(index, &shadow.buffer) == Some(false) {
             HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
         }
-        if crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav) {
-            unordered.push((shadow.clone(), address, address + len));
+        let written = crate::picked::on() && view_kind(&view) == Some(ResourceType::Uav);
+        Some(((shadow, address, address + len), written))
+    };
+    // Some slots at a time, on several threads.
+    const AT_A_TIME: usize = 256;
+    let parts: Vec<&[u32]> = slots.chunks(AT_A_TIME).collect();
+    let found: Vec<std::sync::OnceLock<Vec<_>>> = parts.iter().map(|_| Default::default()).collect();
+    crate::land::each_view(false, parts.len(), &|n| {
+        let looked: Vec<_> = parts[n].iter().map(|&index| (index, look(index))).collect();
+        // (After each piece while the device lives: a cheap query.)
+        if alive
+            && let Some(why) = crate::descriptor::host::device_removed()
+            && !GONE.swap(true, Ordering::Relaxed)
+        {
+            let last: Vec<String> = parts[n]
+                .iter()
+                .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                .map(|s| s.chars().take(200).collect())
+                .collect();
+            tracing::error!(why, "the host device went while buffer views of the heap were made; perhaps one of: {last:#?}");
+            crate::host::log_removal_context();
         }
-        ranges.set(index, Some((shadow, address, address + len)));
+        let _ = found[n].set(looked);
+    });
+    for (index, shows) in found.into_iter().filter_map(std::sync::OnceLock::into_inner).flatten() {
+        let range = shows.map(|(range, written)| {
+            if written {
+                unordered.push(range.clone());
+            }
+            range
+        });
+        ranges.set(index, range);
     }
     if crate::picked::on() {
         crate::picked::shown(unordered, all);
@@ -1260,7 +1288,7 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_)
+        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
     }
 
     /// The bound heap holding `handle`.
@@ -1448,6 +1476,10 @@ impl State {
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
+            }
+            if stage.shader.ambient.is_some() {
+                self.ambient_tables.clear();
+                self.ambient_tables.extend(made.iter().copied());
             }
             // What the shader stores through root views and raw addresses is
             // copied back into title memory afterwards.
@@ -2380,7 +2412,7 @@ impl State {
                     let _ = host.mirror(index, handle, true);
                 }
                 // Its bytes are in, or on the way there in a list before.
-                if late && texture.is_some_and(crate::pool::fresh) {
+                if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
                     if let Some(handle) = heap.handle(index) {
                         host.texture_slot_show_after(list, index, handle);
                     }
@@ -2398,7 +2430,27 @@ impl State {
                 }
                 continue;
             }
-            if let Some(view) = &view {
+            // The first upload of a texture no list has used: on a queue of
+            // its own, and the slot shows it as soon as that has run.
+            let ahead = if late && !tabled && texture.is_some_and(crate::pool::fresh) {
+                crate::texture::ahead::take(resource, first, there.filter(|_| partly.is_none()).unwrap_or(u64::MAX))
+            } else {
+                None
+            };
+            if let Some(ahead) = &ahead {
+                use crate::texture::ahead::Taken;
+                let (Taken::New(job) | Taken::Known(job)) = ahead;
+                if let Some(handle) = heap.handle(index) {
+                    host.texture_slot_show_ahead(job, index, handle);
+                }
+                if let Taken::New(job) = ahead {
+                    crate::texture::ahead::send(job);
+                }
+            }
+            let late = late && ahead.is_none();
+            if let Some(view) = &view
+                && ahead.is_none()
+            {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
@@ -2603,6 +2655,73 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+            && crate::ambient::on()
+            && self.ambient(list, p, role)
+        {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+    }
+
+    /// The stand-in for the indirect light after a dispatch of `p`
+    /// (`crate::ambient`). Whether it recorded anything.
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        let Some(t) = p.stages.first().map(|s| s.translated()) else {
+            return false;
+        };
+        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
+        else {
+            return false;
+        };
+        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            t.used.iter().find(|u| {
+                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
+                View::Shader(r, _) | View::Unordered(r, ..) => r,
+                _ => return None,
+            };
+            let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
+                Some(m) => m.1,
+                None => self.user_value(true, slot, RootType::Table, 0),
+            };
+            let host = crate::resource::host_resource(resource as This)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { host.GetDesc() };
+            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+        };
+        let at = match role {
+            Role::Resolve => LIGHT,
+            Role::Radiance => RADIANCE,
+            Role::Air => AIR,
+        };
+        let image = entry(ResourceType::Uav, at);
+        let depth = match role {
+            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Radiance | Role::Air => image,
+        };
+        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
+            once!(?role, "no stand-in for the indirect light: other tables");
+            return false;
+        };
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
+        let format = if role == Role::Resolve { 42 } else { 26 };
+        let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
+            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            return false;
+        }
+        crate::ambient::after(list, role, &Views {
+            image,
+            depth,
+            size: [of.Width as u32, of.Height],
+            slices: u32::from(of.DepthOrArraySize),
+        })
     }
 
     /// What a draw or dispatch runs, for the device-removed report

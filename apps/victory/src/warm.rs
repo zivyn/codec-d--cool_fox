@@ -50,14 +50,14 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
     let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
     let early: HashSet<&str> = early.lines().collect();
-    // Those earlier runs drew with first.
+    // Those earlier runs drew with first, the others in no order (by key).
     let mut all: Vec<usize> = (0..keys.len())
         .filter(|&n| {
             let key = keys[n].as_str();
             (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
         })
         .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), n));
+    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
     all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);

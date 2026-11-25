@@ -15,6 +15,8 @@
 //! (directly indexed views are not known per draw); plane 0 is uploaded
 //! (every mip and array slice), depth and stencil planes are not.
 
+pub(crate) mod ahead;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -745,6 +747,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         return;
     };
     let texture = &copy.texture;
+    ahead::listed(&copy);
     let Some(staging) = staging(resource, &copy, first) else {
         return;
     };

@@ -83,6 +83,8 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod cube_lod_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -120,7 +122,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -180,6 +182,23 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether buffer atomics of the ray-tracing structure builder stand between
+/// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
+/// translation: the shader cache keys on it.
+pub fn builder_fences() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// Whether the structure builder's accesses through its root views stay near
+/// them, and a size in a structure's header that cannot be one counts as none
+/// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
+/// cache keys on it.
+pub fn builder_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
 /// The clean-up passes that run over a translated program before it is

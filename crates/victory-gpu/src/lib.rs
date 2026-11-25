@@ -15,11 +15,15 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod faultbook;
 #[cfg(windows)]
 mod cores;
 pub mod descriptor;
@@ -46,6 +50,8 @@ pub mod pipeline;
 mod picked;
 #[cfg(windows)]
 mod pool;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod popwatch;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
@@ -75,6 +81,8 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 pub mod timeline;
+#[cfg(windows)]
+pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]

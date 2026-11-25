@@ -1177,6 +1177,8 @@ pub(crate) struct HostTexture {
     pub(crate) grown: std::sync::atomic::AtomicBool,
     /// What the last submitted upload put in it.
     pub(crate) holds: std::sync::Arc<Holds>,
+    /// Who makes its first upload (`crate::texture::ahead`).
+    pub(crate) ahead: std::sync::atomic::AtomicU8,
     /// The texture's flags (asked once: the runtime takes 100 ns to say, and
     /// every texture of every draw is asked about).
     flags: u32,
@@ -2295,6 +2297,7 @@ impl HostTexture {
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
+            ahead: crate::texture::ahead::fresh(),
             flags,
         }
     }
@@ -2319,6 +2322,7 @@ impl HostTexture {
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
+            ahead: crate::texture::ahead::fresh(),
             flags,
         }
     }
@@ -2966,6 +2970,13 @@ pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
     let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
     Some(*found as This)
+}
+
+/// From which level on the title texture's host copy was filled, and from
+/// which bytes (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_held(resource: This) -> Option<(u32, crate::texture::Digest)> {
+    *made_copy(resource)?.holds.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The resource for a texture placed at `address` with the resource

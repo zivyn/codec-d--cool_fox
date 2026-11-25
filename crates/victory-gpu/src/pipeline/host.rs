@@ -151,6 +151,17 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
 }
 
 impl GraphicsState {
+    /// Whether the draws are a pass over the screen: no vertex input, no
+    /// depth or stencil, a target. Such passes fill tables once; their shaders
+    /// are few. (After Belobug/VIctory-Belobug-AMD 18e57db8.)
+    pub(crate) fn screen_pass(&self) -> bool {
+        self.inputs.is_empty()
+            && (self.depth_format == DXGI_FORMAT_UNKNOWN
+                || !self.depth.DepthEnable.as_bool() && !self.depth.StencilEnable.as_bool())
+            && self.targets.NumRenderTargets > 0
+            && self.topology == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///

@@ -181,6 +181,8 @@ struct Memory {
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
+    #[cfg(feature = "diagnostics")]
+    trace: trace::Trace,
 }
 
 /// Since the last report.
@@ -254,6 +256,8 @@ impl Memory {
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
+            #[cfg(feature = "diagnostics")]
+            trace: Default::default(),
         })
     }
 
@@ -789,6 +793,55 @@ impl Memory {
     }
 }
 
+/// A list with this key ([`HostList::used`]) asks the builder for sizes.
+const SIZES: usize = usize::MAX - (9 << 33);
+
+/// Whether a submission that asks for the sizes of structures is waited for,
+/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
+///
+/// Off: it does not help. In run light-15, with it, 33 of 154 copies had the
+/// slot's old size still (all of them recorded one frame after the size was
+/// asked for) against 53 of 230 in light-11, 48 of 275 dynamic structures
+/// were good, and the title asks in every frame, so every frame waits (109 ms
+/// against 90). The title reads the slot before our submission of the asking
+/// list is through, or reads it for another purpose; not known.
+///
+/// The title asks for a new structure's compacted size (a program of one
+/// thread stores it into a small buffer), reads it a frame or two later
+/// without looking whether it is there, takes memory of that size and copies
+/// the structure into it. With submissions that land up to two frames late it
+/// read what the slot held before, some other structure's size, and the copy
+/// wrote over its neighbours: of 230 such copies of run light-11, 99 were
+/// asked for two frames earlier and landed in that frame, none of those with
+/// the right size.
+fn sizes_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// Whether a dispatch of the builder is its program of a structure's size:
+/// one thread, the structure's address and what to store (1: the compacted
+/// size) as constants, a small title buffer to store into.
+fn asks_size(written: &[u64], constants: &[u32], threads: Option<[u32; 3]>) -> bool {
+    threads == Some([1, 1, 1])
+        && matches!(*constants, [_, hi, 1..=3, ..] if (1..0x20).contains(&hi))
+        && written.first().is_some_and(|&at| crate::shadow::in_buffer(at, 1).is_some_and(|b| b.1 <= BACK))
+}
+
+/// Whether one of `lists` asks for sizes.
+pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool {
+    let mut lists = lists;
+    let asked = sizes_wait() && lists.any(|l| l.used(SIZES));
+    if asked {
+        static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = TIMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() || n.is_multiple_of(100) {
+            tracing::info!(n, frame = crate::frame::current(), "submissions that ask for structures' sizes, waited for");
+        }
+    }
+    asked
+}
+
 /// [`fill`] of a page stores by address do not reach.
 fn close(entry: *mut u32, n: usize, offset: u64) {
     fill(entry, n | MEMORY_READ_ONLY as usize, offset);
@@ -809,7 +862,10 @@ fn fill(entry: *mut u32, n: usize, offset: u64) {
 fn packed_len(header: u64) -> Option<u64> {
     let (version, nodes) = (header as u32, header >> 32);
     let marks = version >> 16;
-    (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && nodes * 64 <= PACKED).then_some(nodes * 64)
+    // The header counts its nodes of 64 bytes without the last one: the
+    // builder's own program of a structure's size stores one more.
+    let len = (nodes + 1) * 64;
+    (version & 0xFFFF == 6 && marks & 0x8100 == 0x8100 && nodes > 0 && len <= PACKED).then_some(len)
 }
 
 /// Puts what `title` holds into `ours` (what was last taken): the dwords that
@@ -845,6 +901,7 @@ pub(crate) fn ready(
     written: &[u64],
     constants: &[u32],
     use_: Use,
+    threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -858,8 +915,17 @@ pub(crate) fn ready(
         m.take_faults();
         m.look_again();
         m.report();
+        #[cfg(feature = "diagnostics")]
+        m.trace.look(frame);
+    }
+    #[cfg(feature = "diagnostics")]
+    if use_ != Use::Reads {
+        m.trace.dispatch(frame, list, addresses, written, constants, threads);
     }
     let builds = use_ != Use::Reads;
+    if builds && sizes_wait() && asks_size(written, constants, threads) {
+        list.first_use(SIZES);
+    }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
@@ -1004,6 +1070,101 @@ pub(crate) fn ready(
     })
 }
 
+/// `VICTORY_BVH_TRACE=1`: the sizes the builder is asked for (its program of
+/// one thread that stores a structure's compacted size) and when title memory
+/// has them, and the copies to a place of that size.
+#[cfg(feature = "diagnostics")]
+mod trace {
+    use super::*;
+
+    #[derive(Default)]
+    pub(super) struct Trace {
+        /// Frame, where the size goes, the structure, what title memory had.
+        asked: Vec<(u64, u64, u64, u64)>,
+        /// By structure, what its size was when last seen to change.
+        sizes: HashMap<u64, (u64, u64)>,
+        said: u32,
+    }
+
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TRACE").is_some_and(|v| v == "1"))
+    }
+
+    fn value(at: u64) -> u64 {
+        let mut b = [0u8; 8];
+        crate::host::copy_mapped(b.as_mut_ptr(), at as *const u8, 8, false);
+        u64::from_le_bytes(b)
+    }
+
+    impl Trace {
+        fn say(&mut self, text: String) {
+            self.said += 1;
+            if self.said < 6000 {
+                tracing::info!("bvh trace: {text}");
+            }
+        }
+
+        pub(super) fn look(&mut self, frame: u64) {
+            if !on() {
+                return;
+            }
+            let mut gone = Vec::new();
+            for i in 0..self.asked.len() {
+                let (then, at, structure, was) = self.asked[i];
+                let now = value(at);
+                if now != was {
+                    self.sizes.insert(structure, (now, frame));
+                    gone.push(i);
+                    self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: {was:#x} -> {now:#x}"));
+                } else if frame > then + 60 {
+                    gone.push(i);
+                    self.say(format!("frame {frame}: size of {structure:#x} at {at:#x} asked in {then}: still {was:#x}"));
+                }
+            }
+            for i in gone.into_iter().rev() {
+                self.asked.swap_remove(i);
+            }
+        }
+
+        pub(super) fn dispatch(
+            &mut self,
+            frame: u64,
+            list: &HostList,
+            addresses: &[u64],
+            written: &[u64],
+            constants: &[u32],
+            threads: Option<[u32; 3]>,
+        ) {
+            if !on() {
+                return;
+            }
+            let _ = addresses;
+            let list = std::ptr::from_ref(list) as usize & 0xFFFF_FFFF;
+            if threads == Some([1, 1, 1])
+                && let [lo, hi, mode, ..] = *constants
+                && (1..=3).contains(&mode)
+                && hi < 0x20
+                && let Some(&at) = written.first()
+                && crate::shadow::in_buffer(at, 1).is_some_and(|b| b.1 <= BACK)
+            {
+                let structure = u64::from(lo) | u64::from(hi) << 32;
+                let was = value(at);
+                self.say(format!("frame {frame} list {list:x}: asks mode {mode} of {structure:#x} to {at:#x}, there {was:#x}"));
+                if mode == 1 {
+                    self.asked.push((frame, at, structure, was));
+                }
+            } else if threads == Some([32, 1, 1])
+                && let [from, to] = *written
+                && [from, to].iter().all(|&a| a >= 1 << 32 && crate::shadow::in_buffer(a, 1).is_none())
+            {
+                let known = self.sizes.get(&from).copied();
+                self.say(format!("frame {frame} list {list:x}: copies {from:#x} to {to:#x} constants {:x?}, its size was {known:x?}", &constants[..constants.len().min(4)]));
+            }
+        }
+    }
+}
+
 /// `VICTORY_MEMORY_DUMP=<folder>`: when a file `go` appears there, the arenas
 /// as the card holds them are copied out and written (`arena-<n>.bin`), with
 /// `pages.txt` (title page, arena, offset) and the structures the walking
@@ -1132,7 +1293,7 @@ mod tests {
     #[test]
     fn a_packed_structure_is_known_by_its_header() {
         let header = |version: u32, nodes: u32| u64::from(version) | u64::from(nodes) << 32;
-        assert_eq!(packed_len(header(0x8102_0006, 0x9a1a)), Some(0x9a1a * 64));
+        assert_eq!(packed_len(header(0x8102_0006, 0x9a1a)), Some(0x9a1b * 64));
         // Unpacked, a top level, another version, no size, too big.
         assert_eq!(packed_len(header(0x8002_0006, 0x9a1a)), None);
         assert_eq!(packed_len(header(0x0000_0006, 5)), None);

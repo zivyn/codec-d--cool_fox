@@ -39,7 +39,10 @@ fn fast_of(sets: &[(u32, u8)]) -> Vec<u32> {
 }
 
 /// `VICTORY_FAST_CORES`: 0: no thread asks; 1: the threads a frame waits for
-/// one by one; 2 (the default): the threads they share their work with too.
+/// one by one; 2 (the default): the threads they share their work with too;
+/// 3: those that work beside the rest as well (lists translated, descriptors
+/// made): more threads by then than the fast cores run at a time, while the
+/// slow ones stood idle.
 fn stage() -> u32 {
     static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *STAGE.get_or_init(|| std::env::var("VICTORY_FAST_CORES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
@@ -58,6 +61,12 @@ pub(crate) fn keep_on_fast_cores(what: &str) {
 /// a landing shares its work with.
 pub(crate) fn keep_helper_on_fast_cores(what: &str) {
     ask(what, 2);
+}
+
+/// [`keep_on_fast_cores`] for one of many threads whose work is ahead of what
+/// a frame waits for.
+pub(crate) fn keep_many_on_fast_cores(what: &str) {
+    ask(what, 3);
 }
 
 fn ask(what: &str, from: u32) {

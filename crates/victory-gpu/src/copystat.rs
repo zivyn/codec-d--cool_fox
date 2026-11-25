@@ -161,6 +161,13 @@ pub(crate) fn add(c: C, n: u64) {
     COUNT[bank()].0[c as usize].fetch_add(n, Relaxed);
 }
 
+/// The counter, all sets together, as it is now (it goes back to 0 with
+/// [`log`]).
+pub(crate) fn peek(c: C) -> u64 {
+    let i = c as usize;
+    COUNT.iter().map(|b| b.0[i].load(Relaxed)).sum()
+}
+
 /// Counter `i`, all sets together, from now on 0.
 fn taken(i: usize) -> u64 {
     COUNT.iter().map(|b| b.0[i].swap(0, Relaxed)).sum()
@@ -491,7 +498,7 @@ mod own_tests {
 
 /// The process's memory in bytes: in physical memory, and committed
 /// (private bytes).
-fn process_memory() -> (u64, u64) {
+pub(crate) fn process_memory() -> (u64, u64) {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -1202,6 +1209,14 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+    );
+    let [copies, blocks, opened, stores, unknown, full, stayed, copied_same] =
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "the title's writes beside the guards, since the start: {copies} copies (VICTORY_COPY_BESIDE=1), {blocks} blocks, {opened} opened; \
+         {stores} stores (VICTORY_STORE_BESIDE=1), {unknown} not understood, {full} blocks opened for too many; left out for changing nothing: {stayed} stores, {copied_same} parts of copies; \
+         the busiest stores (left out/changed): {}",
+        crate::titlewrite::busiest()
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and

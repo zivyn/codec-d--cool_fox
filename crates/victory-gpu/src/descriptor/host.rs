@@ -545,6 +545,19 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
 fn view_stride(view: &View) -> Option<u32> {
+    let (stride, raw, format) = view_elements(view)?;
+    Some(if stride > 0 {
+        stride
+    } else if raw {
+        1
+    } else {
+        crate::resource::element(format).map_or(0, |(bytes, _)| bytes as u32)
+    })
+}
+
+/// A buffer view's structure stride, whether it is raw, and its format;
+/// `None` if `view` is not a buffer view.
+fn view_elements(view: &View) -> Option<(u32, bool, u32)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -555,24 +568,65 @@ fn view_stride(view: &View) -> Option<u32> {
         _ => return None,
     };
     // SAFETY: buffer views' union members.
-    let (stride, raw, format) = unsafe {
+    Some(unsafe {
         if unordered {
             let d = uav_desc(words);
             let b = d.Anonymous.Buffer;
-            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format)
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, d.Format.0 as u32)
         } else {
             let d = srv_desc(words);
             let b = d.Anonymous.Buffer;
-            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format)
+            (b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, d.Format.0 as u32)
         }
-    };
-    Some(if stride > 0 {
-        stride
-    } else if raw {
-        1
-    } else {
-        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
     })
+}
+
+/// Whether a buffer view that begins `offset` bytes into its host copy begins
+/// where no host view can: raw views begin on 16 bytes, others on a multiple
+/// of their elements (`stride` of a structured one, which is made raw where it
+/// can be, `element` of a typed one). The console's begin on any dword, and
+/// the title puts parameter blocks at ring positions: a raw view of 128 bytes
+/// at 8 (the colour table bakes'), structured ones of elements that are no
+/// divisor of their place (the culling's 456-byte constants). Such a view gets
+/// a copy of its own bytes ([`crate::shadow::own_bytes`]).
+fn off_elements(offset: u64, stride: u32, raw: bool, element: u64) -> bool {
+    if offset.is_multiple_of(16) {
+        false
+    } else if raw {
+        true
+    } else if stride > 0 {
+        !offset.is_multiple_of(u64::from(stride))
+    } else {
+        element > 0 && !offset.is_multiple_of(element)
+    }
+}
+
+/// Whether views off their copy's elements get a copy of their own bytes. On by
+/// default; `VICTORY_VIEW_BYTES=0` leaves them null, as before.
+fn view_bytes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BYTES").is_none_or(|v| v != "0"))
+}
+
+/// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
+/// its buffer has, or one of the view's own bytes ([`off_elements`]).
+fn view_home(
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    start: u64,
+    len: u64,
+    (stride, raw, format): (u32, bool, u32),
+) -> std::sync::Arc<crate::shadow::Shadow> {
+    let Some(offset) = shadow.offset_in(start).map(|_| shadow.offset(start)) else {
+        return shadow;
+    };
+    if offset.is_multiple_of(16) || !view_bytes() {
+        return shadow;
+    }
+    let element = crate::resource::element(format).map_or(0, |(bytes, _)| bytes);
+    if !off_elements(offset, stride, raw, element) {
+        return shadow;
+    }
+    crate::shadow::own_bytes(start, len).unwrap_or(shadow)
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -1716,9 +1770,10 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
         && address - base < width.max(1)
         && let Some(shadow) = crate::shadow::find(base, width)
     {
-        return Some((shadow, address, len));
+        return Some((view_home(shadow, address, len, view_elements(view)?), address, len));
     }
-    crate::shadow::find(address, len).map(|shadow| (shadow, address, len))
+    let shadow = crate::shadow::find(address, len)?;
+    Some((view_home(shadow, address, len, view_elements(view)?), address, len))
 }
 
 /// [`buffer_range`] of an unordered access view of memory at `base`.
@@ -1806,8 +1861,19 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
-    let offset = shadow.offset(address);
+    let mut shadow = crate::shadow::find(address, len)?;
+    let mut offset = shadow.offset(address);
+    let unit = element_size(&desc);
+    // SAFETY: a buffer view's union member.
+    let own = unsafe { &mut desc.Anonymous.Buffer };
+    let start = address + own.FirstElement * unit;
+    let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
+    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    if !std::sync::Arc::ptr_eq(&home, &shadow) {
+        // Its own bytes: it begins where they do.
+        (shadow, offset) = (home, 0);
+        own.FirstElement = 0;
+    }
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
     let structured = unsafe { desc.Anonymous.Buffer };
@@ -1878,7 +1944,29 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let mut shadow = crate::shadow::find(address, len)?;
+    let unit = {
+        // SAFETY: a buffer view's union member.
+        let b = unsafe { desc.Anonymous.Buffer };
+        if b.StructureByteStride > 0 {
+            u64::from(b.StructureByteStride)
+        } else if b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            4
+        } else {
+            crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        }
+    };
+    // SAFETY: a buffer view's union member.
+    let own = unsafe { &mut desc.Anonymous.Buffer };
+    let start = address + own.FirstElement * unit;
+    let kind = (own.StructureByteStride, own.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, desc.Format.0 as u32);
+    let home = view_home(shadow.clone(), start, u64::from(own.NumElements) * unit, kind);
+    let mut address = address;
+    if !std::sync::Arc::ptr_eq(&home, &shadow) {
+        // Its own bytes: it begins where they do.
+        (shadow, address) = (home, start);
+        own.FirstElement = 0;
+    }
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -2569,6 +2657,77 @@ mod tests {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    /// Views that begin where no host view can: raw ones off 16 bytes,
+    /// structured ones off their elements (and off 16 bytes, where they are
+    /// made raw), typed ones off theirs.
+    #[test]
+    fn views_off_their_elements_are_told() {
+        // the colour table bakes' parameter block: raw, 8 bytes into its window
+        assert!(off_elements(8, 0, true, 4));
+        assert!(!off_elements(0, 0, true, 4));
+        assert!(!off_elements(48, 0, true, 4));
+        // 456-byte elements: at one of them, on 16 bytes, at neither
+        assert!(!off_elements(456, 456, false, 0));
+        assert!(!off_elements(32, 456, false, 0));
+        assert!(off_elements(100, 456, false, 0));
+        assert!(!off_elements(12, 0, false, 4));
+        assert!(off_elements(12, 0, false, 8));
+    }
+
+    /// Such a view is made on a copy of its own bytes, and that copy is the one
+    /// brought up to date for it; another's is its buffer's.
+    #[test]
+    fn views_off_their_elements_get_a_copy_of_their_bytes() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let memory = vec![0u64; 1 << 13];
+        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // SAFETY: a plain CPU-side heap of one view.
+        let cpu: ID3D12DescriptorHeap = unsafe {
+            host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+        }
+        .unwrap();
+        // SAFETY: a live heap.
+        let at = unsafe { cpu.GetCPUDescriptorHandleForHeapStart() };
+        // Memory placed at `address`, seen as the title passes it: raw, 32
+        // dwords, or four 456-byte elements.
+        let view = |address: u64, raw: bool| {
+            let resource: [u32; 14] = [1, 0, 0, 0, 4 * 456, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+            let mut desc = [0u32; 16];
+            let words = if raw {
+                [39, 1, 5768, 0, 0, 0, 32, 0, 1, 0]
+            } else {
+                [0, 1, 5768, 0, 0, 0, 4, 456, 0, 0]
+            };
+            desc[..10].copy_from_slice(&words);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        let width = |v: &View| {
+            let made = make(v, at).expect("a view").expect("a buffer");
+            // SAFETY: a live buffer.
+            unsafe { made.GetDesc() }.Width
+        };
+        for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
+            let v = view(start + off, raw);
+            assert_eq!(width(&v), len.next_multiple_of(256));
+            let (copy, address, bytes) = buffer_copy(&v).unwrap();
+            assert_eq!((copy.span(), address, bytes), ((start + off, len), start + off, len));
+        }
+        for (off, raw) in [(16, true), (32, false)] {
+            let v = view(start + off, raw);
+            let (copy, ..) = buffer_copy(&v).unwrap();
+            assert_ne!(copy.span().0, start + off, "its buffer's copy");
+            // SAFETY: a live buffer.
+            assert_eq!(width(&v), unsafe { copy.buffer.GetDesc() }.Width);
+        }
     }
 
     /// The queue of textures picked by index serves the slots looked at

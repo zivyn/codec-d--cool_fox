@@ -4191,6 +4191,55 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
         .min()
 }
 
+/// Copies of single views' bytes ([`own_bytes`]), by (start, length), with
+/// the use that last asked for each.
+#[allow(clippy::type_complexity)]
+static OWN: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
+
+/// Copies [`OWN`] keeps: ring positions change every frame, so the least
+/// recently asked for go (lists and heap slots using one keep its buffer
+/// alive).
+/// shortcut: a slot whose view goes unused while this many others are asked
+/// for shows the buffer of a copy that is made anew at its next use.
+const OWN_KEPT: usize = 1024;
+/// The largest of them: one this long is no parameter block.
+const OWN_MOST: u64 = 4 << 20;
+
+/// A host copy of the `len` bytes at `address` alone, for a view no host
+/// view of its buffer's copy can stand for (it would not begin where host
+/// views may; upstream 86a5ed6). What other views' shaders write there in the
+/// same submission it does not see: it is as title memory is at the
+/// submission, and what is written through it goes back there after.
+/// `None`: no view the title made on purpose (off its dwords, empty or huge).
+pub(crate) fn own_bytes(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if len == 0 || len > OWN_MOST || !address.is_multiple_of(4) {
+        return None;
+    }
+    let mut guard = OWN.lock().unwrap_or_else(|e| e.into_inner());
+    let (tick, map) = &mut *guard;
+    *tick += 1;
+    if let Some((shadow, used)) = map.get_mut(&(address, len)) {
+        *used = *tick;
+        return Some(shadow.clone());
+    }
+    if map.len() >= OWN_KEPT
+        && let Some(&oldest) = map.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k)
+    {
+        map.remove(&oldest);
+    }
+    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    map.insert((address, len), (shadow.clone(), *tick));
+    OWN_MADE.fetch_add(1, Ordering::Relaxed);
+    Some(shadow)
+}
+
+/// Copies of single views' bytes made since the start.
+pub(crate) static OWN_MADE: AtomicU64 = AtomicU64::new(0);
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 

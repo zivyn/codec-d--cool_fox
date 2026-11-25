@@ -419,6 +419,7 @@ impl Drop for Section {
                 })
             };
         }
+        victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };
     }

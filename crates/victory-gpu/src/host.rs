@@ -8116,7 +8116,7 @@ mod refresh_tests {
         };
         // What was last written so, by offset.
         let mut undeclared = std::collections::HashMap::new();
-        let exact = std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0");
+        let exact = std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v != "0");
         let stop = AtomicBool::new(false);
         // Also when an assertion fails on one of the threads.
         struct Stop<'a>(&'a AtomicBool);
@@ -8400,7 +8400,7 @@ mod refresh_tests {
         }
         copy.update(region, 4 * PAGE);
         let written = copy.take_dirty();
-        if std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0") {
+        if std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v != "0") {
             assert_eq!(again, []);
             assert_eq!(written, [(2 * PAGE + 128, 2 * PAGE + 132), (2 * PAGE + 136, 2 * PAGE + 144)]);
         } else {

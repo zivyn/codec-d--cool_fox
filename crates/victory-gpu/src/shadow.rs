@@ -1677,8 +1677,9 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
-/// (`VICTORY_SEND_CHANGED=0`: the 64 KiB pages written since it last took
-/// them, whole, as before).
+/// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
+/// took them, whole). Off since run tile1-0: the room lost its indirect light
+/// and geometry exploded; run bis1-0, the same but for this, was right.
 ///
 /// A page that counts as written is mostly not the title's doing, or not all
 /// of it: a word the title wrote, and around it what shaders wrote and the
@@ -1710,7 +1711,7 @@ fn send_changed() -> bool {
         if crate::copystat::mode() != 0 {
             return false;
         }
-        std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0")
+        std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v != "0")
     })
 }
 

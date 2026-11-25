@@ -30,6 +30,36 @@ pub(super) fn own() -> bool {
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
+/// Whether a run of `len` bytes at offset `at` of a copy goes as pairs.
+fn short(at: usize, len: usize) -> bool {
+    len <= SHORT && at % 4 == 0 && len % 4 == 0
+}
+
+/// Whether a run of `len` bytes at offset `at` of a copy in the card's memory
+/// is no copy command of its own, but pairs of one dispatch.
+pub(crate) fn goes_as_words(at: usize, len: usize) -> bool {
+    own() && short(at, len)
+}
+
+/// Whether the title's bytes that go in under flights' writes
+/// (`Shadow::merge_under_writes`) go in by whole words
+/// (`VICTORY_UNDER_WORDS=0`: by the bytes that changed, as before).
+///
+/// By bytes nearly every run (a float's three low bytes) was a copy command
+/// of its own, and a submission with more than 4,096 of them stood until the
+/// flights had landed: 4 to 14 ms of a steady frame (session play-1125-0203:
+/// "more changed runs than a submission sends up"), for some 20 KB. Whole
+/// words are pairs of one dispatch, and are not counted.
+///
+/// A word is taken to be the title's or the shaders', not shared: where the
+/// title changed a byte of a word of which a flight's shader writes another
+/// byte, that byte is as it was before the flight. The landing rests on the
+/// same ([`crate::shadow::exact_back`]).
+pub(crate) fn words_under() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| own() && std::env::var_os("VICTORY_UNDER_WORDS").is_none_or(|v| v != "0"))
+}
+
 const SCATTER: &str = r#"
 #define RS "RootConstants(num32BitConstants=2, b0), SRV(t0), UAV(u0)"
 cbuffer Part : register(b0) { uint at; uint count; };
@@ -113,7 +143,9 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
             return Some(spare.swap_remove(i));
         }
     }
-    let size = size.next_multiple_of(8 << 20);
+    // By doubles, so that the next of about this size finds it: what
+    // submissions send differs from frame to frame.
+    let size = size.max(8 << 20).next_power_of_two();
     let mapped = if on_card() { host.mapped_card_buffer(size, false) } else { None };
     let (buffer, data) = match mapped {
         Some(made) => made,
@@ -160,7 +192,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     pass(host)?;
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
-    let short = |&(a, b): &(usize, usize)| b - a <= SHORT && a % 4 == 0 && b % 4 == 0;
+    let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
     for (_, ranges) in dirty {

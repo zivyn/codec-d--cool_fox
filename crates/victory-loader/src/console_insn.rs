@@ -46,6 +46,154 @@ static EMULATED: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 static ZEROED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether `monitorx` and `mwaitx` are replaced in the title's code the first time they fault
+/// (`monitorx` by a 3-byte no-op, `mwaitx` by `pause` and a no-op), so that they never fault
+/// again. Emulated, each pass of such a wait loop is two trips into Windows and back, through
+/// every vectored handler, and no lighter a wait for it: the emulation does no more than
+/// `pause` either, and the loop looks at its value again after it. On by default;
+/// `VICTORY_PATCH_WAITS=0` emulates each time, as before.
+fn patches_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_WAITS").is_none_or(|v| v != "0"))
+}
+
+/// What replaces the 3 bytes of a wait instruction.
+fn wait_patch(what: ConsoleOnly) -> Option<[u8; 3]> {
+    match what {
+        ConsoleOnly::Monitorx => Some([0x0f, 0x1f, 0x00]),
+        ConsoleOnly::Mwaitx => Some([0xf3, 0x90, 0x90]),
+        _ => None,
+    }
+}
+
+/// The aligned 8 bytes `word` around address `at` with the 3 bytes at `at` replaced; `None`
+/// where they do not all lie in those 8.
+fn with_patch(word: u64, at: usize, patch: [u8; 3]) -> Option<u64> {
+    let offset = at & 7;
+    if offset + patch.len() > 8 {
+        return None;
+    }
+    let mut bytes = word.to_le_bytes();
+    bytes[offset..offset + patch.len()].copy_from_slice(&patch);
+    Some(u64::from_le_bytes(bytes))
+}
+
+/// One thread at a time changes code: a second one would take the first one's loosened
+/// protection for the page's own.
+static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Replaces the 3 bytes at `at`, which are `was`, by `patch`, in one store that other threads
+/// see whole: whether they are replaced now (not where they cross 8 aligned bytes, or the page
+/// cannot be written).
+///
+/// # Safety
+/// `at` is in code that stays mapped, and `patch` does for it what `was` does.
+unsafe fn patch(at: usize, was: [u8; 3], patch: [u8; 3]) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if (at & 7) + 3 > 8 {
+        return false;
+    }
+    let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
+    let word = (at & !7) as *mut u64;
+    let here = (at & 7)..(at & 7) + 3;
+    let mut old = 0u32;
+    // SAFETY: the aligned 8 bytes around the instruction lie in one page of mapped code, made
+    // writable for the store and put back.
+    unsafe {
+        if VirtualProtect(word.cast(), 8, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+            return false;
+        }
+        let done = AtomicU64::from_ptr(word)
+            .fetch_update(SeqCst, SeqCst, |now| if now.to_le_bytes()[here.clone()] == was { with_patch(now, at, patch) } else { None })
+            // (Another thread's fault at the same place: done already.)
+            .map_or_else(|now| now.to_le_bytes()[here.clone()] == patch, |_| true);
+        VirtualProtect(word.cast(), 8, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), word.cast(), 8);
+        done
+    }
+}
+
+/// Diagnostics: how often each place in the title's code raises one of these exceptions, the
+/// busiest logged every five seconds.
+#[cfg(feature = "diagnostics")]
+mod sites {
+    use super::{AtomicU64, Relaxed};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Address, what is there (an index into [`NAMES`]), exceptions since the last line.
+    static SITES: [(AtomicUsize, AtomicUsize, AtomicU64); 512] =
+        [const { (AtomicUsize::new(0), AtomicUsize::new(0), AtomicU64::new(0)) }; 512];
+    const NAMES: [&str; 8] = ["other", "clwb", "monitorx", "mwaitx", "clzero", "clzero loop", "rdpru", "extrq/insertq"];
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    static PATCHED: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn patched() {
+        PATCHED.fetch_add(1, Relaxed);
+    }
+
+    pub(super) fn count(at: usize, what: super::ConsoleOnly) {
+        use super::ConsoleOnly as C;
+        let kind = match what {
+            C::Clwb => 1,
+            C::Monitorx => 2,
+            C::Mwaitx => 3,
+            C::Clzero => 4,
+            C::ClzeroLoop { .. } => 5,
+            C::Rdpru => 6,
+            C::Extrq { .. } | C::Insertq { .. } => 7,
+            _ => 0,
+        };
+        let mut i = (at ^ at >> 9) % SITES.len();
+        for _ in 0..8 {
+            let s = &SITES[i];
+            let there = s.0.compare_exchange(0, at, Relaxed, Relaxed).unwrap_or_else(|there| there);
+            if there == 0 || there == at {
+                s.1.store(kind, Relaxed);
+                s.2.fetch_add(1, Relaxed);
+                break;
+            }
+            i = (i + 1) % SITES.len();
+        }
+        // Now and then: is a line due? Never waited for.
+        if let Ok(mut last) = LAST.try_lock() {
+            let since = *last.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed().as_secs() >= 5 {
+                let s = since.elapsed().as_secs_f64();
+                *last = Some(std::time::Instant::now());
+                drop(last);
+                line(s);
+            }
+        }
+    }
+
+    fn line(seconds: f64) {
+        let mut all: Vec<(u64, usize, usize)> =
+            SITES.iter().map(|s| (s.2.swap(0, Relaxed), s.0.load(Relaxed), s.1.load(Relaxed))).filter(|s| s.0 > 0).collect();
+        all.sort_unstable_by_key(|s| std::cmp::Reverse(s.0));
+        let mut kinds = [0u64; NAMES.len()];
+        for s in &all {
+            kinds[s.2] += s.0;
+        }
+        let kinds: Vec<String> = NAMES
+            .iter()
+            .zip(kinds)
+            .filter(|(_, n)| *n > 0)
+            .map(|(name, n)| format!("{name} {:.0}", n as f64 / seconds))
+            .collect();
+        let top: Vec<String> =
+            all.iter().take(8).map(|s| format!("{:#x} {} {:.0}", s.1, NAMES[s.2], s.0 as f64 / seconds)).collect();
+        tracing::info!(
+            "console CPU instructions that fault, a second: {}; wait instructions replaced in place so far: {}; the busiest places: {}",
+            kinds.join(", "),
+            PATCHED.load(Relaxed),
+            top.join(", ")
+        );
+    }
+}
+
 fn readable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
     // SAFETY: plain data filled in by the query.
@@ -135,12 +283,17 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             tracing::warn!(instruction = ?what, at = format_args!("{rip:#x}"), "a console CPU instruction this CPU lacks: emulated (logged once)");
         }
     }
+    #[cfg(feature = "diagnostics")]
+    if what != ConsoleOnly::Ud2 {
+        sites::count(rip, what);
+    }
     match what {
         ConsoleOnly::Ud2 => return 0,
         ConsoleOnly::Clwb => {
             // nothing to write back on the PC: patched to NOPs, no exception next time
             use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
             let mut old = 0u32;
+            let _one = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
             // SAFETY: the instruction's own bytes, made writable for the patch and restored.
             unsafe {
                 if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
@@ -149,8 +302,20 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+        ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
+            // Without a prefix, so 3 bytes: replaced, the next pass does not fault.
+            if len == 3
+                && patches_waits()
+                && let Some(new) = wait_patch(what)
+                // SAFETY: the title's code, where the instruction just faulted; both
+                // replacements are waits that wait for nothing, as the emulation is.
+                && unsafe { patch(rip, [code[0], code[1], code[2]], new) }
+            {
+                #[cfg(feature = "diagnostics")]
+                sites::patched();
+            }
+            std::hint::spin_loop();
+        }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
@@ -254,4 +419,62 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         );
     }
     CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_instructions_are_replaced_inside_eight_aligned_bytes() {
+        let word = u64::from_le_bytes([1, 2, 0x0f, 0x01, 0xfb, 6, 7, 8]);
+        let new = with_patch(word, 0x1002, [0xf3, 0x90, 0x90]).unwrap();
+        assert_eq!(new.to_le_bytes(), [1, 2, 0xf3, 0x90, 0x90, 6, 7, 8]);
+        assert!(with_patch(word, 0x1005, [0; 3]).is_some());
+        assert!(with_patch(word, 0x1006, [0; 3]).is_none(), "crosses into the next eight");
+    }
+
+    /// `monitorx; mwaitx; ret` in a page of its own: each is replaced at its first fault,
+    /// and the page is protected as before.
+    #[test]
+    fn a_wait_faults_once_and_the_page_keeps_its_protection() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+            VirtualProtect, VirtualQuery,
+        };
+        // SAFETY: memory of our own, read, written and run within its page.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!page.is_null());
+            let code = [0x0f, 0x01, 0xfa, 0x0f, 0x01, 0xfb, 0xc3];
+            // Both within the aligned eight bytes at 8; and one over the end of its eight
+            // (at 22), which is left alone.
+            std::ptr::copy_nonoverlapping(code.as_ptr(), page.add(8), code.len());
+            std::ptr::copy_nonoverlapping(code.as_ptr(), page.add(22), code.len());
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page.cast(), 4096, PAGE_EXECUTE_READ, &mut old), 0);
+            let at = page as usize;
+            let mut context: CONTEXT = std::mem::zeroed();
+            for rip in [at + 8, at + 11, at + 22] {
+                context.Rip = rip as u64;
+                assert_eq!(emulate(&mut context), CONTINUE_EXECUTION);
+                assert_eq!(context.Rip, rip as u64 + 3);
+            }
+            if patches_waits() {
+                let now = std::slice::from_raw_parts(page.add(8), 7);
+                assert_eq!(now, [0x0f, 0x1f, 0x00, 0xf3, 0x90, 0x90, 0xc3]);
+                // They run now.
+                let run: extern "system" fn() = std::mem::transmute(page.add(8));
+                run();
+                // A second thread that faulted at the same place meanwhile.
+                assert!(patch(at + 8, [0x0f, 0x01, 0xfa], [0x0f, 0x1f, 0x00]));
+                assert!(!patch(at + 22, [0x0f, 0x01, 0xfa], [0x0f, 0x1f, 0x00]), "crosses its eight bytes");
+            }
+            assert_eq!(std::slice::from_raw_parts(page.add(22), 3), [0x0f, 0x01, 0xfa]);
+            let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(page.cast(), &mut m, size_of_val(&m));
+            assert_eq!(m.Protect, PAGE_EXECUTE_READ);
+            VirtualFree(page.cast(), 0, MEM_RELEASE);
+        }
+    }
 }

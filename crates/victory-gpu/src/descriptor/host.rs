@@ -1163,7 +1163,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             raw,
-            twins: (0..if raw == 0 { 0 } else { count }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+            twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
@@ -2031,11 +2031,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.at(index));
+        let kept = make_twinned(view, self.at(index), self.twin(index));
         if kept.is_none() {
             null_for(view, self.at(index));
         }
         self.put(index);
+        self.twin_made(index, kept.is_some() && twinned(view));
         self.keep(index, kept.flatten());
     }
 
@@ -2047,15 +2048,28 @@ impl HostHeap {
             null_view(self.at(index));
             self.put(index);
         }
+        self.clear_twin(index);
         self.keep(index, None);
     }
 
-    /// Where the raw twin of title slot `index` is.
+    /// Where the raw twin of slot `index` is made.
     fn twin(&self, index: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
         (index < self.twins.len() as u32).then(|| staged(self.sampler, 1).unwrap_or_else(|| self.cpu(self.raw + index)))
     }
 
-    /// The raw twin of title slot `index` is a null view again.
+    /// The raw twin of slot `index` was made by this thread ([`make_twinned`]),
+    /// or is a null view if it was not.
+    fn twin_made(&self, index: u32, made: bool) {
+        if !made {
+            return self.clear_twin(index);
+        }
+        if let Some(shown) = self.twins.get(index as usize) {
+            self.put_twin(index);
+            shown.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The raw twin of slot `index` is a null view again.
     fn clear_twin(&self, index: u32) {
         if let Some(made) = self.twins.get(index as usize)
             && made.swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -2108,6 +2122,8 @@ impl HostHeap {
                 .CreateShaderResourceView(buffer, Some(&desc), self.at(index))
         };
         self.put(index);
+        // (Bound by its handle, not read by index.)
+        self.clear_twin(index);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2116,6 +2132,7 @@ impl HostHeap {
     pub(crate) fn null_raw_at(&self, index: u32) {
         null_buffer_view(self.at(index));
         self.put(index);
+        self.clear_twin(index);
         self.keep(index, None);
     }
 
@@ -2149,6 +2166,7 @@ impl HostHeap {
             )
         };
         self.put(index);
+        self.clear_twin(index);
         self.keep(index, Some(buffer.clone()));
     }
 
@@ -2177,6 +2195,7 @@ impl HostHeap {
             )
         };
         self.put(index);
+        self.clear_twin(index);
         self.keep(index, None);
     }
 
@@ -2212,6 +2231,28 @@ impl HostHeap {
                 .CreateConstantBufferView(Some(&desc), self.at(index))
         };
         self.put(index);
+        // A program that reads it as raw bytes reads its twin.
+        let twin = self.twin(index).filter(|_| desc.SizeInBytes > 0);
+        if let Some(twin) = twin {
+            // SAFETY: a live buffer that holds the range.
+            let first = (gpu - unsafe { buffer.GetGPUVirtualAddress() }) / 4;
+            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: first,
+                        NumElements: desc.SizeInBytes / 4,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            // SAFETY: as above, and a slot of our heaps.
+            unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
+        }
+        self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
@@ -2370,7 +2411,6 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
-                self.clear_twin(index);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -2424,14 +2464,7 @@ impl HostHeap {
             if kept.is_some() || !self.sampler {
                 self.put(index);
             }
-            if kept.is_some() && twinned(&view) {
-                self.put_twin(index);
-                if let Some(made) = self.twins.get(index as usize) {
-                    made.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            } else {
-                self.clear_twin(index);
-            }
+            self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
         }
         Some(view)

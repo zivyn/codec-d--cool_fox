@@ -1006,6 +1006,7 @@ RWByteAddressBuffer o : register(u0);
 void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
     if (step == 0) { if (id.x == 0) o.Store(at, v[which].Load(first)); }
     else if (step == 1) { if (id.x == 0) o.Store(at, c[which].d[first / 16][(first / 4) & 3]); }
+    else if (step == 16) { o.Store(at + id.x * 4, c[which].d[first / 16 + id.x][(first / 4) & 3]); }
     else { o.Store(at + id.x * 4, v[which].Load(first + id.x * step)); }
 }
 "#;
@@ -1071,7 +1072,7 @@ void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
         }
         let table2 = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: table.ptr + 8 * step as u64 };
         let offsets = [0u32, 4092, 4096, 4104, 8192, 65536, 524_288, (1 << 20) - 4];
-        for mode in ["one load (uniform)", "a load a thread", "constant buffer load"] {
+        for mode in ["one load (uniform)", "a load a thread", "constant buffer load", "Constant buffer load a thread"] {
             println!("{mode}:");
             for (which, name) in names.iter().enumerate() {
                 // SAFETY: our open list, live buffers.
@@ -1087,6 +1088,7 @@ void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
                         let step = match mode.as_bytes()[0] {
                             b'o' => 0u32,
                             b'c' => 1,
+                            b'C' => 16,
                             _ => 4,
                         };
                         // (A thread's loads end at the offset.)

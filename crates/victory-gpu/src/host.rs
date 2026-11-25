@@ -1508,7 +1508,7 @@ struct CardWork {
     fetch: Prelude,
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
-    /// One dword per piece compared, set where the piece differs: PC
+    /// One dword per piece compared, odd where the piece differs: PC
     /// memory, mapped (buffer, mapping, bytes).
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
@@ -1529,7 +1529,7 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// The compare of a declared range of a copy in the card's memory with
 /// its bytes from before, one group per 64 KiB piece (cut at multiples of
 /// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
+/// gets a dword per piece, odd where a byte differs. The offsets are widened
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
 ///
@@ -1579,7 +1579,9 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
         h = h.yzwx ^ (h >> 15);
     }
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        // The flag, and above it 31 bits of the hash (`torn`).
+        uint folded = h.x ^ (h.y * 3u) ^ (h.z * 5u) ^ (h.w * 7u);
+        differs.Store(out_at + id.x * 4u, (folded << 1u) | (any(h != hashes.Load4(piece * 16u)) ? 1u : 0u));
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
         if (compare == 2u) hashes.Store4(piece * 16u, h);
@@ -1588,6 +1590,12 @@ void main(uint3 id : SV_GroupID, uint thread : SV_GroupIndex) {
     }
 }
 "#;
+
+/// The hash [`CARD_COMPARE`] gives of a piece with its flag.
+#[cfg(test)]
+pub(crate) fn piece_hash(bytes: &[u8]) -> u32 {
+    torn::hash(bytes)
+}
 
 /// One pass of [`CARD_COMPARE`] over a span's pieces, into `differs` from
 /// dword `at` on (`mode` as the shader's `compare`): a group per piece, in
@@ -1670,6 +1678,8 @@ struct CardPlan {
     /// With [`relay`]: the number of the send to copies in the card's memory
     /// that the submission ran behind ([`QUEUE_ORDER`]).
     sent_as: u64,
+    /// With [`upcheck`]: the look at what it sent up.
+    looks: Option<upcheck::Looks>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2660,6 +2670,8 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// Pieces caught while a later flight was writing them.
+    suspects: torn::Suspects,
 }
 
 /// The thread that lands flights ([`relay`]): as soon as the card has run
@@ -2840,6 +2852,15 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if t[0] > 0.0 {
+            tracing::info!(
+                "fetched pieces checked per frame (VICTORY_FETCH_CHECK): {:.1}, of which {:.2} were not what their flight ended                  with (caught while a later flight was at them, or title bytes went up meanwhile); {:.2} were found whole when                  fetched again",
+                t[0],
+                t[1],
+                t[2],
+            );
+        }
     }
     card_steps::log(frames);
     #[cfg(feature = "diagnostics")]
@@ -2855,6 +2876,8 @@ fn late_line(frames: f64) {
 }
 
 mod card_steps;
+mod torn;
+pub(crate) mod upcheck;
 
 #[cfg(test)]
 mod late_tests {
@@ -3412,6 +3435,7 @@ impl Host {
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        let mut looks = None;
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -3424,6 +3448,9 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    if upcheck::on() {
+                        looks = upcheck::record(self, list, &dirty);
+                    }
                     // Every copy first, then one barrier call, then every
                     // pass: a wait between each copy and its pass had the
                     // card do them one after the other.
@@ -3493,6 +3520,7 @@ impl Host {
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
             sent_as,
+            looks,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3590,6 +3618,9 @@ impl Host {
     /// when nothing of ours is on the card, so the compare's results start
     /// from the beginning again.
     fn card_done(&self, plan: CardPlan) {
+        if let Some(looks) = plan.looks {
+            looks.read();
+        }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;
@@ -3641,6 +3672,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                suspects: torn::Suspects::default(),
             })
         }
     }
@@ -3660,45 +3692,24 @@ impl Host {
             let work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
             work.as_ref().map(|work| (work.differs.1, (work.differs.2 / 4) as usize))
         };
-        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64)> = Vec::new();
-        let mut total = 0u64;
+        if fetch.is_none() {
+            *fetch = self.make_relay_fetch();
+        }
+        // On the copy queue a later flight may be at a piece while it is
+        // fetched (`torn`).
+        let mut suspects = fetch.as_mut().filter(|f| f.queue.is_some() && torn::on()).map(|f| std::mem::take(&mut f.suspects));
+        let mut pieces = Vec::new();
         if let Some((differs, dwords)) = differs {
             // SAFETY: the mapping of the results. The compares of these
             // plans have run, and their dwords are given to no other plan
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
-            let mut seen = std::collections::HashSet::new();
-            for plan in plans {
-                let flags: Vec<(usize, u32, bool)> = plan
-                    .ranges
-                    .iter()
-                    .flat_map(|r| {
-                        (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
-                            (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
-                        })
-                    })
-                    .collect();
-                let fetched = flagged_pieces(&flags);
-                for r in &plan.ranges {
-                    let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
-                    for p in 0..r.span.pieces {
-                        if !fetched.contains(&(copy, r.span.first + p)) {
-                            continue;
-                        }
-                        let (lo, hi) = r.shadow.card_piece(&r.span, p);
-                        if lo < hi && seen.insert((copy, lo, hi)) {
-                            pieces.push((r.shadow.clone(), lo, hi, total));
-                            total += (hi - lo) as u64;
-                        }
-                    }
-                    crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
-                }
+            pieces = torn::fetches(plans, differs, suspects.as_ref());
+            for r in plans.iter().flat_map(|plan| &plan.ranges) {
+                crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
             }
         }
-        if fetch.is_none() {
-            *fetch = self.make_relay_fetch();
-        }
+        let total = pieces.last().map_or(0, |p| p.at + (p.to - p.from) as u64);
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
         let behind = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
@@ -3710,6 +3721,9 @@ impl Host {
                 false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
             };
             crate::shadow::relay_fetched(after);
+            if let (Some(f), Some(suspects)) = (fetch.as_mut(), suspects) {
+                f.suspects = suspects;
+            }
             return;
         }
         let Some(f) = fetch.as_mut() else {
@@ -3733,8 +3747,8 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in &pieces {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                for p in &pieces {
+                    list.CopyBufferRegion(&buffer, p.at, &p.shadow.buffer, p.from as u64, (p.to - p.from) as u64);
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
@@ -3773,13 +3787,22 @@ impl Host {
         }
         let mut title = Vec::new();
         let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
+        for p in &pieces {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
+            let gpu = unsafe { std::slice::from_raw_parts((data + p.at as usize) as *const u8, p.to - p.from) };
+            if let (Some((piece, Some(hash))), Some(suspects)) = (p.check, &mut suspects) {
+                suspects.fetched((p.shadow.id(), piece), torn::hash(gpu) == hash);
+            }
+            for &(lo, hi) in &p.merged {
+                let gpu = &gpu[lo - p.from..hi - p.from];
+                let merged = p.shadow.card_merge_relay(lo, gpu, after, &mut title);
+                p.shadow.walls_merged(gpu.len(), merged);
+                written += merged;
+            }
+        }
+        if let (Some(f), Some(suspects)) = (fetch.as_mut(), suspects) {
+            f.suspects = suspects;
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
@@ -3939,7 +3962,7 @@ impl Host {
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
-                if r.compared && differs[(r.at + p) as usize] == 0 {
+                if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
@@ -4345,12 +4368,18 @@ impl Host {
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
+            if upcheck::on() {
+                upcheck::at_rest(self);
+            }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
+            if upcheck::on() {
+                upcheck::at_rest(self);
+            }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
@@ -4396,6 +4425,9 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
+            if behind && upcheck::on() {
+                upcheck::reads(runs);
+            }
             if behind && stale_under_flights(runs) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);

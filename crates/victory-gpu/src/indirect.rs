@@ -773,7 +773,17 @@ void main() {
             }
             warp.submit_and_wait();
             // SAFETY: as above.
-            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+            let found = [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() });
+            if mode == 0 {
+                return found;
+            }
+            // Above the flag, the hash: as `host::torn` makes it of the bytes.
+            for (piece, d) in found.iter().enumerate() {
+                // SAFETY: inside the mapping, which the card has read.
+                let bytes = unsafe { std::slice::from_raw_parts(now_ptr.add(piece * PIECE).cast_const(), PIECE) };
+                assert_eq!(d >> 1, crate::host::piece_hash(bytes), "piece {piece}");
+            }
+            found.map(|d| d & 1)
         };
         let at = PIECE + 1234;
         // SAFETY (each): inside the mapping.

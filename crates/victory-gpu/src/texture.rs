@@ -937,6 +937,46 @@ impl Drop for Claimed {
     }
 }
 
+/// Records copies of zeros into every subresource of `texture`, which is in
+/// the copy destination state.
+pub(crate) fn zeros(list: &HostList, host: &crate::host::Host, texture: &ID3D12Resource) {
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    let layers = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(d.DepthOrArraySize) };
+    let count = u32::from(d.MipLevels) * layers;
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut bytes = 0u64;
+    // SAFETY: outputs for `count` subresources.
+    unsafe {
+        host.device
+            .GetCopyableFootprints(&d, 0, count, 0, Some(footprints.as_mut_ptr()), None, None, Some(&mut bytes));
+    }
+    if bytes == 0 || bytes == u64::MAX {
+        return;
+    }
+    let Some((buffer, data)) = list.upload(host, bytes) else {
+        return;
+    };
+    // SAFETY: a mapped buffer of `bytes` bytes, just made.
+    unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+    for (i, footprint) in footprints.iter().enumerate() {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above; the list holds the buffer until it is reset.
+            pResource: unsafe { std::mem::transmute_copy(&buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *footprint },
+        };
+        // SAFETY: an open list; both locations name live resources.
+        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+    }
+}
+
 /// Levels on demand (`crate::tiles`): the card itself is about to write
 /// title texture `resource` in `list` (a copy or a resolve into level
 /// `level`, or into every level). If its host copy `texture` was made

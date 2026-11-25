@@ -4906,6 +4906,7 @@ impl Host {
             return;
         };
         let told = !sent.writes.is_empty();
+        let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
@@ -4928,6 +4929,8 @@ impl Host {
         RELAY_MOVED.notify_one();
         if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
+        } else if sizes {
+            self.settle(&mut submitted, WHY_READ);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
             relay_wait(WHY_MOST, |line| line.lists < late_most());

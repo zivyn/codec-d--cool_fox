@@ -1260,7 +1260,7 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &written, &constants, use_)
+        crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
     }
 
     /// The bound heap holding `handle`.

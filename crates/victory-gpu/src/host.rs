@@ -117,6 +117,34 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// How long host copies of textures the title fills must have been idle to
+/// be let go, in milliseconds, and how many bytes of them go at most (the
+/// longest idle first): none but those of ten minutes while what is in use
+/// of the card (`used`: without what our own blocks have free, with what is
+/// kept free for others) is under 88 % of its budget, else enough to come
+/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
+/// all that are idle; `=1`: that rule with its two longer times.
+///
+/// (By those times everything idle for 2.5 s went from 75 % of the budget
+/// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
+/// 80 %, of which 13,000 were made and uploaded again.)
+pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
+    const KEPT_MS: u64 = 600_000;
+    const IDLE_MS: u64 = 5_000;
+    const SHORT_MS: u64 = 1_500;
+    if budget == 0 {
+        return (IDLE_MS, u64::MAX);
+    }
+    let share = |percent: u64| budget / 100 * percent;
+    if used < share(88) {
+        (KEPT_MS, u64::MAX)
+    } else if used < share(95) {
+        (IDLE_MS, used - share(85))
+    } else {
+        (SHORT_MS, used - share(85))
+    }
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
@@ -219,6 +247,12 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+}
+
+/// The number of the newest submission begun, and of the newest of which all
+/// before it have finished too.
+pub(crate) fn submissions() -> (u64, u64) {
+    (STARTED.load(Ordering::Acquire), FINISHED.load(Ordering::Acquire))
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -5530,8 +5564,10 @@ impl HostList {
         resource: crate::object::This,
         wanted: u32,
     ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
+        // SAFETY: as in `crate::resource::host_resource`; the list's states
+        // hold the copy from here on.
+        let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
         let wanted = legal_state(texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
@@ -7408,6 +7444,20 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
             }
+            if crate::resource::held_only() {
+                let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
+                let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "textures from the first level viewed (VICTORY_HELD_LEVELS=0: whole), since the start: {copies} host copies of the \
+                     levels viewed alone ({} MB on the card, {} MB of title memory whole), {grown} replaced by one with more levels, \
+                     {flipped} slots made from their new view after its upload had run ({missed} written again first); {} uploads left \
+                     out as the host copy held those bytes (VICTORY_TEXTURE_SAME=0: made); {} MB of texture blocks free",
+                    bytes >> 20,
+                    whole >> 20,
+                    crate::draw::HEAP_TEXTURES_SAME.load(Ordering::Relaxed),
+                    crate::pool::texture_room() >> 20
+                );
+            }
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));
@@ -8902,6 +8952,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing or zero budget falls back to normal
         assert_eq!(vram_idle_ms(None), 5_000);
         assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+    }
+
+    #[test]
+    fn textures_are_kept_while_the_card_has_room() {
+        use super::vram_keep;
+        let gib = 1 << 30;
+        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
+        // Past it: the longest idle ones, enough to come down to 85 %.
+        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
+        assert_eq!((ms, bytes), (5_000, 5 * gib));
+        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
+        assert_eq!(vram_keep(0, 7).0, 5_000);
     }
 
     #[test]

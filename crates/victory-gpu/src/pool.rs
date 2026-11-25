@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -199,6 +199,15 @@ fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Bytes of the pieces textures hold now.
+static HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of the texture blocks no texture holds: the card's memory in use
+/// by us that new textures take first.
+pub(crate) fn texture_room() -> u64 {
+    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
@@ -282,6 +291,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
+            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -351,6 +361,7 @@ pub(crate) unsafe fn texture(
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
     match (result, made) {
         (Ok(()), Some(made)) => {
+            HELD.fetch_add(piece.len, Ordering::Relaxed);
             give_back_with(&made, piece);
             Some(made)
         }

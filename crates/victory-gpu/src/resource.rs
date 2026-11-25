@@ -585,7 +585,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (44, 47),
         (48, 52),
         (53, 59),
-        (60, 65),
+        (60, 64),
         (70, 72),
         (73, 75),
         (76, 78),
@@ -695,8 +695,7 @@ const NO_FOOTPRINT: PlacedFootprint = PlacedFootprint {
     row_pitch: 0,
 };
 
-/// One subresource's size in an upload buffer: footprint (offset 0), rows
-/// and bytes per row. Planes of depth-stencil formats are not told apart.
+/// One subresource's upload footprint (offset 0), row count and unpadded row size.
 fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32, u64)> {
     const PITCH: u64 = 256;
     if desc.dimension == BUFFER {
@@ -716,11 +715,18 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     } else {
         u32::from(desc.depth_or_array_size).max(1)
     };
-    let (mip, slice) = (index % mips, index / mips);
-    if slice >= slices {
-        return None;
-    }
-    let (element, block) = element(desc.format)?;
+    let mip = index % mips;
+    let plane = index / mips / slices;
+    let depth_stencil = matches!(desc.format, 19..=22 | 44..=47);
+    // Each plane contains all the mip levels and array slices. Depth and
+    // stencil copies use separate formats and 512-byte row alignment.
+    let (format, pitch_alignment) = match (depth_stencil, plane) {
+        (true, 0) => (39, 512), // DXGI_FORMAT_R32_TYPELESS
+        (true, 1) => (60, 512), // DXGI_FORMAT_R8_TYPELESS
+        (false, 0) => (desc.format, PITCH),
+        _ => return None,
+    };
+    let (element, block) = element(format)?;
     let width = (desc.width >> mip).max(1).next_multiple_of(block);
     let height = (u64::from(desc.height) >> mip)
         .max(1)
@@ -733,18 +739,18 @@ fn subresource(desc: &ResourceDesc, index: u32) -> Option<(PlacedFootprint, u32,
     let row_size = width / block * element;
     let footprint = PlacedFootprint {
         offset: 0,
-        format: desc.format,
+        format,
         width: u32::try_from(width).ok()?,
         height: u32::try_from(height).ok()?,
         depth,
-        row_pitch: u32::try_from(row_size.next_multiple_of(PITCH)).ok()?,
+        row_pitch: u32::try_from(row_size.next_multiple_of(pitch_alignment)).ok()?,
     };
     Some((footprint, u32::try_from(height / block).ok()?, row_size))
 }
 
-/// Device method: where each subresource goes in an upload buffer, rows
-/// 256-byte and subresources 512-byte aligned, as on PC. Unknown sizes give
-/// the documented all-ones values.
+/// Places subresources at 512-byte boundaries in an upload buffer.
+/// Row pitch is aligned to 512 bytes for depth/stencil planes and 256 bytes
+/// otherwise. Unknown sizes give the documented all-ones values.
 pub(crate) extern "system" fn copyable_footprints(
     _: This,
     desc: *const ResourceDesc,
@@ -2559,6 +2565,22 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    #[test]
+    fn a8_unorm_is_not_in_the_r8_typeless_family() {
+        // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
+        // 63 R8_SNORM, 64 R8_SINT, 65 A8_UNORM. The R8 typeless family is
+        // 60..=64; A8_UNORM has no typeless family and cannot be cast to R8,
+        // so it must stand alone rather than fold into R8_TYPELESS.
+        assert_eq!(family(60), 60);
+        for f in 61..=64 {
+            assert_eq!(family(f), 60);
+        }
+        assert_eq!(family(65), 65);
+        // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
+        assert_eq!(family(59), 53);
+        assert_eq!(family(66), 66);
+    }
+
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;
     type Address = extern "system" fn(This) -> u64;
@@ -2788,6 +2810,55 @@ mod tests {
         assert_eq!((r[0], s[0]), (16, 128));
         let (_, _, _, t) = footprints(&texture(64, 64, 71, 1), 1, 1);
         assert_eq!(t, u64::MAX, "no second subresource");
+    }
+
+    #[test]
+    fn depth_stencil_footprints_follow_the_pc_plane_order() {
+        // Native D3D12 reports the same layout for both depth/stencil families
+        // and their view formats. Mips vary fastest, then array slices, then planes.
+        let expected = [
+            (512, 39, 16, 8),
+            (4_608, 39, 8, 4),
+            (6_656, 39, 16, 8),
+            (10_752, 39, 8, 4),
+            (12_800, 60, 16, 8),
+            (16_896, 60, 8, 4),
+            (18_944, 60, 16, 8),
+            (23_040, 60, 8, 4),
+        ];
+        for format in (19..=22).chain(44..=47) {
+            let desc = ResourceDesc {
+                depth_or_array_size: 2,
+                ..texture(16, 8, format, 2)
+            };
+            let mut layouts = [NO_FOOTPRINT; 8];
+            let (mut rows, mut sizes, mut total) = ([0; 8], [0; 8], 0);
+            copyable_footprints(
+                std::ptr::null(),
+                &desc,
+                0,
+                8,
+                512,
+                layouts.as_mut_ptr(),
+                rows.as_mut_ptr(),
+                sizes.as_mut_ptr(),
+                &mut total,
+            );
+
+            assert_eq!(
+                layouts.map(|l| (l.offset, l.format, l.width, l.height)),
+                expected,
+                "format {format}"
+            );
+            assert!(
+                layouts.iter().all(|l| l.depth == 1 && l.row_pitch == 512),
+                "format {format}"
+            );
+            assert_eq!(rows, [8, 4, 8, 4, 8, 4, 8, 4], "format {format}");
+            assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
+            assert_eq!(total, 24_072, "format {format}");
+            assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,

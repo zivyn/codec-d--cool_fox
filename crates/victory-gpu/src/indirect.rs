@@ -1752,12 +1752,16 @@ void main(uint3 t : SV_DispatchThreadID) {
             return new_blocks(&way);
         }
         let times: u32 = std::env::var("VICTORY_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
-        // "never": never resident, what must lose the device.
-        for way in ["made", "waited", "enqueued", "never"] {
-            for n in 0..if way == "never" { 1 } else { times } {
+        let seconds = std::env::var("VICTORY_BENCH_S").unwrap_or_else(|_| "30".into());
+        // "never": never resident, what must lose the device. "fresh-": no
+        // block goes (280 of them, 18 GB), so each has addresses no block had.
+        for way in ["fresh-made", "fresh-waited", "fresh-enqueued", "made", "waited", "enqueued", "never"] {
+            let fresh = way.starts_with("fresh-");
+            for n in 0..if way == "never" { 1 } else if fresh { times * 5 } else { times } {
                 let out = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["indirect::tests::new_blocks_under_readers", "--exact", "--ignored", "--nocapture"])
                     .env("VICTORY_BLOCK_WAY", way)
+                    .env("VICTORY_BENCH_S", if fresh { "3" } else { &seconds })
                     .output()
                     .unwrap();
                 let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -1768,9 +1772,13 @@ void main(uint3 t : SV_DispatchThreadID) {
     }
 
     fn new_blocks(way: &str) {
-        let Some(mut gpu) = WarpHarness::on(false) else {
+        let Some(gpu) = WarpHarness::on(false) else {
             println!("no card: 0 blocks,");
             return;
+        };
+        let (way, fresh) = match way.strip_prefix("fresh-") {
+            Some(way) => (way, true),
+            None => (way, false),
         };
         const SLOTS: usize = 64;
         const BLOCK: u64 = 64 << 20;
@@ -1957,7 +1965,11 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                             alive.push((block, texture));
                             n += 1;
                             counts[0].fetch_add(1, SeqCst);
-                            if alive.len() >= 24 {
+                            if fresh {
+                                if alive.len() >= 280 / threads {
+                                    break;
+                                }
+                            } else if alive.len() >= 24 {
                                 // Nothing shows or reads them any more when they go.
                                 for i in 0..mine {
                                     device.CopyDescriptorsSimple(1, slot(i), own(0), kind);

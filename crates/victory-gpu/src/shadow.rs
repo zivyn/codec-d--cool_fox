@@ -1831,6 +1831,11 @@ impl Shadow {
         self.id
     }
 
+    /// Whether it is no copy but title memory in place (`crate::inplace`).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)

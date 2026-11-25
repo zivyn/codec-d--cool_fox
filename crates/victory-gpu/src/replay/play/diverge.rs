@@ -12,19 +12,19 @@ const PIECE: usize = 64 << 10;
 
 /// Where a run's contents come down: for each resource (and subresource) the
 /// frame writes, its place in read-back memory.
-struct Reader {
+pub(super) struct Reader {
     blocks: Vec<(ID3D12Resource, usize)>,
-    parts: Vec<Part>,
+    pub(super) parts: Vec<Part>,
 }
 
 #[derive(Clone)]
-struct Part {
-    id: u32,
+pub(super) struct Part {
+    pub(super) id: u32,
     /// `None` for a buffer.
     sub: Option<(u32, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>,
     block: usize,
     at: u64,
-    len: u64,
+    pub(super) len: u64,
 }
 
 /// One way to run commands `from..to` of a list.
@@ -275,7 +275,7 @@ impl Player {
     }
 
     /// The states of textures at the frame's start.
-    fn start_states(&self) -> States {
+    pub(super) fn start_states(&self) -> States {
         let mut states = States::default();
         for (id, all) in &self.start {
             let Some(o) = self.objects.get(id) else {
@@ -412,7 +412,7 @@ impl Player {
         Ok(())
     }
 
-    fn reader(&self, ids: &[u32]) -> Result<Reader> {
+    pub(super) fn reader(&self, ids: &[u32]) -> Result<Reader> {
         const BLOCK: u64 = 512 << 20;
         let mut parts = Vec::new();
         let mut sizes: Vec<u64> = vec![0];
@@ -514,7 +514,7 @@ impl Player {
     }
 
     /// Hashes of all parts' pieces, as memory is now (in `states`).
-    fn hashes_now(&mut self, reader: &Reader, states: &States) -> Result<Vec<Vec<u64>>> {
+    pub(super) fn hashes_now(&mut self, reader: &Reader, states: &States) -> Result<Vec<Vec<u64>>> {
         let objects = &self.objects;
         for block in 0..reader.blocks.len() {
             let parts: Vec<&Part> = reader.parts.iter().filter(|p| p.block == block).collect();

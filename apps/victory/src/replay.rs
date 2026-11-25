@@ -120,6 +120,11 @@ pub(crate) struct Replay {
     /// Name resources the frame changes that the replay does not put back.
     #[arg(long)]
     check_written: bool,
+    /// Run the frame twice and say which words the copies of the CPU's sides
+    /// of card buffers bring that the card holds another value of, and what
+    /// shaders wrote that was not declared as written.
+    #[arg(long)]
+    upcopies: bool,
     /// Name what the heap slots hold that a command's constants name:
     /// `<list>:<command>`.
     #[arg(long)]
@@ -199,6 +204,10 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     if r.check_written {
         let mut player = play::Player::load(&r.folder, &options)?;
         return player.check_written(&mut |line| println!("{line}"));
+    }
+    if r.upcopies {
+        let mut player = play::Player::load(&r.folder, &options)?;
+        return player.upcopies(&options, &mut |line| println!("{line}"));
     }
     let mut watched = Vec::new();
     for text in &r.watch {

@@ -96,6 +96,7 @@ report counts them). `--no-merge` runs the copies as recorded.
 | `--watch <id>:<offset>:<bytes>` | which lists (with `--lists`: commands) change those words |
 | `--slots <list>:<command>` | the heap slots its constants name |
 | `--check-written` | that everything the frame changes is put back |
+| `--upcopies` | runs the frame twice: which words the copies of the CPU's sides of card buffers bring that the card holds another value of (those the card wrote alike in both runs are the ones to look at), and which pieces shaders wrote that were not declared as written. The live check is `VICTORY_UPCOPY_CHECK=1` (`host/upcheck.rs`) |
 | `--dump <text>` | the DXIL of the pipelines named, in `shaders` |
 
 The `--diverge` family runs the recorded copies without the merge.

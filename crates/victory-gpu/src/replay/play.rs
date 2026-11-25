@@ -31,6 +31,7 @@ use super::wire::{
 
 pub mod diverge;
 mod merge;
+mod upcopies;
 
 /// The name of the argument clamp's pipeline, by which its passes are
 /// recognised.

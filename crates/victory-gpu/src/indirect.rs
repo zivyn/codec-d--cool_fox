@@ -1568,6 +1568,176 @@ void main(uint3 t : SV_DispatchThreadID) {
         println!("device: {:?}", unsafe { gpu.device.GetDeviceRemovedReason() });
     }
 
+    /// Loads far outside their views (ignored: it may lose the device, and
+    /// says which way did): raw, typed, constant and texture loads at the
+    /// ends of 32 bits, uniform and per lane, and samples at coordinates,
+    /// levels and gradients that are no numbers. Each way is a submission of
+    /// its own.
+    #[test]
+    #[ignore]
+    fn loads_far_outside_views() {
+        let Some(mut gpu) = WarpHarness::on(std::env::var_os("VICTORY_BENCH_WARP").is_some()) else {
+            return;
+        };
+        const SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4,b0), DescriptorTable(SRV(t0,numDescriptors=4),CBV(b1)), UAV(u0), StaticSampler(s0,filter=FILTER_MIN_MAG_MIP_LINEAR,addressU=TEXTURE_ADDRESS_WRAP,addressV=TEXTURE_ADDRESS_WRAP)"
+cbuffer C : register(b0) { uint how; uint far; uint lane; uint out_at; }
+ByteAddressBuffer raw : register(t0);
+Buffer<float4> typed : register(t1);
+Texture2D<float4> tex : register(t2);
+struct Block { uint4 d[4096]; };
+ConstantBuffer<Block> block : register(b1);
+SamplerState s : register(s0);
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 t : SV_DispatchThreadID) {
+    uint at = far + t.x * lane * 4;
+    float4 c = 0;
+    if (how == 0) c = asfloat(raw.Load4(at));
+    if (how == 1) c = asfloat(raw.Load(at + 4092));
+    if (how == 2) c = typed.Load(at);
+    if (how == 3) c = asfloat(block.d[at]);
+    if (how == 4) c = tex.Load(int3(at, 0, 0));
+    if (how == 5) c = tex.Load(int3(0, 0, at));
+    if (how == 6) c = tex.SampleLevel(s, asfloat(uint2(at, at)), 0);
+    if (how == 7) c = tex.SampleLevel(s, float2(0.5, 0.5), asfloat(at));
+    if (how == 8) c = tex.SampleGrad(s, float2(0.5, 0.5), asfloat(at).xx, asfloat(at).xx);
+    uint was;
+    o.InterlockedAdd(any(asuint(c) != 0) ? 4 : 0, 1, was);
+}
+"#;
+        let pass = compile_cs(&gpu.device, SOURCE).expect("the pass must compile");
+        let (buffer, data, gpu_at) = gpu.shared_buffer(1 << 16);
+        // SAFETY: the mapping.
+        unsafe { std::ptr::write_bytes(data, 0x3f, 1 << 16) };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 7,
+            Format: DXGI_FORMAT(28),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        // SAFETY: plain creation; slots of our heap, live objects.
+        let (_texture, heap) = unsafe {
+            let mut made: Option<ID3D12Resource> = None;
+            gpu.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    None,
+                    &mut made,
+                )
+                .unwrap();
+            let texture = made.unwrap();
+            let heap: ID3D12DescriptorHeap = gpu
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 5,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let at = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap.GetCPUDescriptorHandleForHeapStart().ptr + i * step };
+            for (i, format, count, flags) in
+                [(0, 39, 1024, D3D12_BUFFER_SRV_FLAG_RAW), (1, 2, 256, D3D12_BUFFER_SRV_FLAG_NONE)]
+            {
+                let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT(format),
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV { FirstElement: 0, NumElements: count, StructureByteStride: 0, Flags: flags },
+                    },
+                };
+                gpu.device.CreateShaderResourceView(&buffer, Some(&view), at(i));
+            }
+            gpu.device.CreateShaderResourceView(&texture, None, at(2));
+            gpu.device.CreateShaderResourceView(&texture, None, at(3));
+            gpu.device.CreateConstantBufferView(
+                Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu_at, SizeInBytes: 4096 }),
+                at(4),
+            );
+            (texture, heap)
+        };
+        let names = [
+            "raw, 4 dwords",
+            "raw, offset added",
+            "typed",
+            "constant buffer",
+            "texel",
+            "level of a texel",
+            "sample",
+            "level of a sample",
+            "gradients of a sample",
+        ];
+        for (how, name) in names.iter().enumerate() {
+            for far in [
+                0u32,
+                0x1000,
+                0x7fff_fff0,
+                0x8000_0000,
+                0xffff_f000,
+                0xffff_fff0,
+                0xffff_fffc,
+                0x7fc0_0000,
+                0x7f80_0000,
+                0xff80_0000,
+                0x7f7f_ffff,
+            ] {
+                for lane in [0u32, 1] {
+                    let (_out, out_ptr, out_gpu) = gpu.shared_buffer(1 << 12);
+                    // SAFETY: the mapping; our open list, live objects.
+                    unsafe {
+                        std::ptr::write_bytes(out_ptr, 0, 1 << 12);
+                        gpu.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                        gpu.list.SetComputeRootSignature(&pass.root);
+                        gpu.list.SetPipelineState(&pass.pso);
+                        gpu.list.SetComputeRoot32BitConstants(0, 4, [how as u32, far, lane, 0].as_ptr().cast(), 0);
+                        gpu.list.SetComputeRootDescriptorTable(1, heap.GetGPUDescriptorHandleForHeapStart());
+                        gpu.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+                        gpu.list.Dispatch(1, 1, 1);
+                        // (Not `submit_and_wait`, which expects to go on.)
+                        gpu.list.Close().unwrap();
+                        gpu.submitted += 1;
+                        let cmd: ID3D12CommandList = gpu.list.cast().unwrap();
+                        gpu.queue.ExecuteCommandLists(&[Some(cmd)]);
+                        let _ = gpu.queue.Signal(&gpu.fence, gpu.submitted);
+                        let _ = gpu.fence.SetEventOnCompletion(gpu.submitted, gpu.event);
+                        WaitForSingleObject(gpu.event, 8_000);
+                    }
+                    // SAFETY: the mapping; plain queries.
+                    let (zeros, others, device) = unsafe {
+                        (
+                            out_ptr.cast::<u32>().read_volatile(),
+                            out_ptr.cast::<u32>().add(1).read_volatile(),
+                            gpu.device.GetDeviceRemovedReason(),
+                        )
+                    };
+                    println!(
+                        "{name} at {far:#x}, lanes {lane}: zeros {zeros}, others {others}{}",
+                        if device.is_ok() { "" } else { " DEVICE LOST" }
+                    );
+                    if device.is_err() {
+                        return;
+                    }
+                    // SAFETY: the card is done with them.
+                    unsafe {
+                        gpu.allocator.Reset().unwrap();
+                        gpu.list.Reset(&gpu.allocator, None).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {

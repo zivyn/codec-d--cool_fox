@@ -8,8 +8,9 @@
 //!
 //! One group of 64 threads counts on a compute queue, over and
 //! over: it takes one or two of the card's few thousand wave slots, and the
-//! card is never idle. Nothing is sent once no submission has gone out for a
-//! while (a menu at 30 fps, a minimized window).
+//! card is never idle. Nothing is sent once no submission has gone out for
+//! a quarter of a second (a title that stands still; not a menu, which goes on
+//! drawing: the system's counter shows the compute queue at 100 % there too).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

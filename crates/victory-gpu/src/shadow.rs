@@ -26,6 +26,12 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
+    /// each, that what shaders wrote was put into since a refresh last looked
+    /// at them ([`Shadow::take_landed`]); empty until then.
+    landings: Mutex<Vec<u64>>,
+    /// Whether any is.
+    landing: std::sync::atomic::AtomicBool,
     /// The bytes of `buffer`, once asked.
     width: std::sync::OnceLock<u64>,
     pub(crate) buffer: ID3D12Resource,
@@ -1949,6 +1955,29 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
+/// The kernel's page.
+const KERNEL_PAGE: usize = 4096;
+
+/// Whether a refresh looks if what counts as written is only what a landing
+/// put there, and then sends nothing of it up (`VICTORY_LAND_ECHO=0`: it copies
+/// and sends it, as before).
+///
+/// What shaders wrote comes down, goes into title memory and into the CPU's
+/// side of the copy alike. In memory the kernel watches that is a write like
+/// any other (it cannot be told as the guards' blocks can, `crate::land`), and
+/// the next refresh of it copied the pages and sent them up again: in the dorm
+/// 14.4 MB a frame of one copy of 90 MB whose 263 pieces were all fetched and
+/// all sent, 28 of 72 MB over the bus in all (run submit-2). Only pages a
+/// landing was noted in are compared, 4 KiB at a time: a page that is not the
+/// same goes up whole, as before, and so does every other.
+fn land_echo() -> bool {
+    crate::toggled!("VICTORY_LAND_ECHO")
+}
+
+/// Since the last frame-rate line: bytes found to be a landing's alone, and
+/// bytes a landing was noted in that were the title's too.
+pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
@@ -2480,6 +2509,49 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
 }
 
 #[cfg(test)]
+mod landing_tests {
+    use super::{KERNEL_PAGE, Shadow};
+
+    /// A page that only a landing wrote is not sent up again; one the title
+    /// wrote too is, and so is every page no landing was noted in.
+    #[test]
+    fn what_a_landing_wrote_is_not_sent_up_again() {
+        const PAGES: usize = 6;
+        let room = vec![7u8; (PAGES + 1) * KERNEL_PAGE];
+        let title = room.as_ptr() as usize;
+        let title = title.next_multiple_of(KERNEL_PAGE);
+        let mut side = vec![7u8; PAGES * KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        let write = |page: usize| {
+            // SAFETY: in `room`.
+            unsafe { ((title + page * KERNEL_PAGE + 9) as *mut u8).write_volatile(8) }
+        };
+        let page = |from: usize, to: usize| (title + from * KERNEL_PAGE, title + to * KERNEL_PAGE);
+        copy.note_landing(KERNEL_PAGE, 4 * KERNEL_PAGE);
+        // Page 2: the title's too.
+        write(2);
+        let (from, to) = page(0, 6);
+        copy.take_landed(from, to);
+        let mut dirty = copy.take_dirty();
+        dirty.sort_unstable();
+        let part = |a: usize, b: usize| (a * KERNEL_PAGE, b * KERNEL_PAGE);
+        assert_eq!(super::joined(dirty), [part(0, 1), part(2, 3), part(4, 6)]);
+        assert_eq!(side[2 * KERNEL_PAGE + 9], 8);
+        // Looked at: from here on as any other.
+        let (from, to) = page(1, 2);
+        copy.take_landed(from, to);
+        assert_eq!(copy.take_dirty(), [part(1, 2)]);
+        // In part: looked at again when the rest is.
+        copy.note_landing(3 * KERNEL_PAGE, 3 * KERNEL_PAGE + 1);
+        let (from, to) = page(3, 4);
+        copy.take_landed(from, from + 100);
+        copy.take_landed(from, to);
+        assert_eq!(copy.take_dirty(), []);
+        drop(room);
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -2754,6 +2826,8 @@ impl Shadow {
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
+            landings: Mutex::default(),
+            landing: Default::default(),
             width: Default::default(),
             buffer,
             data,
@@ -3667,6 +3741,83 @@ impl Shadow {
         bytes
     }
 
+    /// What shaders wrote in `[from, to)` (offsets) was put into title memory.
+    fn note_landing(&self, from: usize, to: usize) {
+        let first = self.start as usize / KERNEL_PAGE;
+        let pages = (self.start as usize + from) / KERNEL_PAGE - first..(self.start as usize + to).div_ceil(KERNEL_PAGE) - first;
+        let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+        if bits.is_empty() {
+            let all = (self.start + self.len).div_ceil(KERNEL_PAGE as u64) as usize - first;
+            bits.resize(all.div_ceil(64), 0);
+        }
+        for page in pages {
+            bits[page / 64] |= 1 << (page % 64);
+        }
+        self.landing.store(true, Ordering::Release);
+    }
+
+    /// [`Shadow::take`] of `[from, to)`, which the copy held before and which
+    /// is written since: where it may be only the landing that wrote it, the
+    /// 4 KiB that title memory and the CPU's side have alike are left as they
+    /// are, and nothing of them is sent ([`land_echo`]).
+    fn take_landed(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let first = start / KERNEL_PAGE;
+        // Runs of pages noted, and not noted (any more).
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        {
+            let mut bits = self.landings.lock().unwrap_or_else(|e| e.into_inner());
+            let mut at = from;
+            while at < to {
+                let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+                let page = at / KERNEL_PAGE - first;
+                let noted = bits.get(page / 64).is_some_and(|word| word >> (page % 64) & 1 != 0);
+                // (A page looked at in part is looked at again.)
+                if noted && next - at == KERNEL_PAGE {
+                    bits[page / 64] &= !(1 << (page % 64));
+                }
+                match runs.last_mut() {
+                    Some(last) if last.2 == noted && next - last.0 <= PAGE => last.1 = next,
+                    _ => runs.push((at, next, noted)),
+                }
+                at = next;
+            }
+        }
+        TITLE.with_borrow_mut(|title| {
+            for (from, to, noted) in runs {
+                if !noted {
+                    self.copy(from, to);
+                    continue;
+                }
+                title.resize(to - from, 0);
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+                let mut at = from;
+                while at < to {
+                    let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+                    let title = &title[at - from..next - from];
+                    // SAFETY: inside the mapping of the copy's CPU side, which
+                    // nothing else reads or writes there: no shader's range
+                    // holds it, and the parts of a refresh lie apart.
+                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), next - at) };
+                    if title == held {
+                        ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
+                    } else {
+                        ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
+                        held.copy_from_slice(title);
+                        self.changed(at - start, next - start);
+                        self.card_changed(at - start, next - start);
+                    }
+                    at = next;
+                }
+            }
+        });
+        to - from
+    }
+
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
@@ -3675,6 +3826,9 @@ impl Shadow {
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
+            if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
+                return self.take_landed(from, to);
+            }
             return self.copy(from, to);
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
@@ -4134,6 +4288,9 @@ impl Shadow {
             let merged =
                 unsafe { crate::land::piece(self.start as usize + lo, now as *const u8, self.data.add(lo), &parts, true, notes, self) };
             self.walls_merged(hi - lo, merged as usize);
+            if merged > 0 {
+                self.note_landing(lo, hi);
+            }
             put += merged;
         }
         put

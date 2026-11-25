@@ -84,6 +84,13 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache and nothing else is done. Set `VICTORY_HOST_WAVE` and
+        /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
+        #[arg(long)]
+        warm: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -152,6 +159,7 @@ fn main() -> Result<()> {
             pipelines,
             list,
             jobs,
+            warm,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -160,6 +168,9 @@ fn main() -> Result<()> {
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
+            }
+            if let Some(file) = warm {
+                return translate::warm(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }

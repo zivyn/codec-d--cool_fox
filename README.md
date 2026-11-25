@@ -20,6 +20,12 @@ developer or publisher.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
   (GPL-2.0-only) was used as a reference for how the same title behaves under
   another layer. Fixes inspired by it were written anew in VIctory's code.
+- The guard over every view of a memory page is code by **myokex**
+  ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`), which
+  adapts pull request #115 here by Spexivus, its correction by joroyt and a part of
+  VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
+  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
+  are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
 ## Status of this fork (2026-11-25)
@@ -37,6 +43,48 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
 | Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
+
+### Newest (2026-11-25, later the same day)
+
+Memory sync between the title's memory and the copies on the card:
+- **A write through one view of a physical page is seen by the copies taken
+  through its other views** (`VICTORY_VIEW_GUARD=0` turns it off). The title
+  shows one page at several addresses and a copy was guarded at one of them
+  only. Measured on the test machine: 0.8 to 1.0 million such writes in a
+  five-minute run, every one of which used to leave a copy stale. Since it
+  went in, the first room had its walls in the later frames of 4 runs out of
+  4 (2 of 5 before); the room's very first shot still comes up without walls
+  in some runs.
+- Kernel reads into title memory are read beside and copied in, so a block
+  guarded again in between no longer fails the read.
+- Writes of the storage layer into physical pages are counted where the title
+  has those pages mapped (10,000 to 50,000 guarded blocks of copies lay under
+  them in every run) and can open the guards there:
+  `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
+- Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
+
+Card memory (the test card is full from the first frame of the world: 85 to
+99 % of its budget for a whole run, about 26,000 texture copies let go and
+3,400 made again in five minutes, 2.8 GB of render targets that are all in
+use):
+- Levels on demand, **off by default** (`VICTORY_LEVELS_ON_DEMAND=1`): a
+  texture the title fills takes card memory only for the levels the title
+  holds (2.2 to 3.0 GB of the copies were levels it does not hold). Its test
+  runs on the software adapter; it has not run on a card yet.
+- Refused texture slots are held back for a few seconds so that a pass
+  reaches the slots behind them (`VICTORY_FULL_CARD_PASS=0` = as before);
+  room can be kept for the card copies of title buffers
+  (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`, off).
+
+Tools and diagnostics:
+- `victory translate <shader file> --warm all --jobs N` translates every
+  shader ahead of a run, on the processor only (about 4.5 to 6.5 minutes
+  here); the shader cache is keyed on the translator's source, so a new
+  build that does not touch the translator starts warm.
+- Counters, all off or diagnostics-only: `VICTORY_MERGE_RACE=1` (title bytes
+  a copy-back is about to put back to older values: none found in 138,000
+  copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
+  of the copies the texture sweep never lets go.
 
 ### What this fork changed (summary)
 

@@ -42,6 +42,8 @@ struct Entry {
     size: u64,
     what: String,
     made: u64,
+    /// What was told of it since ([`note`]).
+    notes: String,
 }
 
 #[derive(Default)]
@@ -96,7 +98,7 @@ impl Book {
         if size > LONG {
             self.long.push(id);
         }
-        self.live.insert(id, Entry { start, size, what, made: now });
+        self.live.insert(id, Entry { start, size, what, made: now, notes: String::new() });
         if object != 0 {
             self.by_object.insert(object, id);
         }
@@ -358,6 +360,22 @@ pub(crate) fn block(heap: &ID3D12Heap, resource: &ID3D12Resource, offset: u64, b
     }
 }
 
+/// Something to say of the object at `raw` if it is in the book.
+pub(crate) fn note(raw: usize, what: impl FnOnce() -> String) {
+    if !on() {
+        return;
+    }
+    let what = what();
+    with(|b| {
+        if let Some(id) = b.by_object.get(&raw).copied()
+            && let Some(e) = b.live.get_mut(&id)
+            && e.notes.len() < 600
+        {
+            e.notes.push_str(&what);
+        }
+    });
+}
+
 /// A name for something made before.
 pub(crate) fn named(object: &ID3D12Object, what: impl FnOnce() -> String) {
     let raw = object.as_raw() as usize;
@@ -558,7 +576,8 @@ pub(crate) fn at_loss(va: u64) -> String {
         return String::new();
     }
     let mut text = with(|b| {
-        let one = |e: &Entry| format!("{} {:#x}+{:#x} made at {:.1} s", e.what, e.start, e.size, e.made as f64 / 1e3);
+        let one =
+            |e: &Entry| format!("{} {:#x}+{:#x} made at {:.3} s{}", e.what, e.start, e.size, e.made as f64 / 1e3, e.notes);
         let mut text = String::from("; BOOK: alive there:");
         for e in b.holders(va) {
             text.push_str(&format!(" [{}]", one(e)));
@@ -570,9 +589,9 @@ pub(crate) fn at_loss(va: u64) -> String {
         }
         text.push_str("; gone there, newest first:");
         for (e, gone) in b.gone_at(va, 12) {
-            text.push_str(&format!(" [{} gone at {:.1} s]", one(e), *gone as f64 / 1e3));
+            text.push_str(&format!(" [{} gone at {:.3} s]", one(e), *gone as f64 / 1e3));
         }
-        text.push_str(&format!("; now {:.1} s, {} alive, {} gone", crate::host::now_ms() as f64 / 1e3, b.live.len(), b.gone.len()));
+        text.push_str(&format!("; now {:.3} s, submissions (begun, finished) {:?}, {} alive, {} gone", crate::host::now_ms() as f64 / 1e3, crate::host::submissions(), b.live.len(), b.gone.len()));
         text
     });
     {

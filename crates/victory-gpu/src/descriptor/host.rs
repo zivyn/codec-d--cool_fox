@@ -176,6 +176,152 @@ struct Flip {
     index: u32,
     handle: u64,
     key: u64,
+    /// The frame it was asked in, of a slot that shows nothing of the
+    /// texture until then ([`HostHeap::texture_slot_show_after`]).
+    late: Option<u64>,
+}
+
+/// Whether a title slot shows a texture that is new to it only once the
+/// submission with its upload has finished (`VICTORY_SHOW_AFTER=1`; off).
+/// Shown at once, the lists already on the card read it by index while it is
+/// made: all three losses whose report had the address book (n08, n11, n15)
+/// were page faults in a texture made and shown in the last tenth of a
+/// second.
+pub(crate) fn show_after() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v != "0"))
+}
+
+/// Slots shown late ([`show_after`]), the frames they waited, the longest;
+/// those that were given the neutral texture meanwhile; those not shown any
+/// more when their time came.
+static LATE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// What a texture slot showed before its last write: its record (0: null or
+/// the neutral texture), when (ms), and the submissions begun and finished.
+#[cfg(feature = "diagnostics")]
+static BEFORE: Mutex<std::collections::BTreeMap<u32, (u64, u64, (u64, u64), &'static str)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(feature = "diagnostics")]
+fn note_before(index: u32, was: u64, by: &'static str) {
+    if crate::book::on() {
+        let entry = (was, crate::host::now_ms(), crate::host::submissions(), by);
+        BEFORE.lock().unwrap_or_else(|e| e.into_inner()).insert(index, entry);
+    }
+}
+
+/// A 1x1 gray texture, in the place of one that is not there yet.
+fn neutral() -> Option<&'static ID3D12Resource> {
+    static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    TEXTURE
+        .get_or_init(|| {
+            let host = host()?;
+            let device = &host.device;
+            let (from, data) = host.upload_buffer(256)?;
+            // SAFETY: the buffer's mapping; plain creation and recording,
+            // waited for before what it names goes.
+            unsafe {
+                std::ptr::write_bytes(data, 0x80, 256);
+                let mut made: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                            Width: 1,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            ..Default::default()
+                        },
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut made,
+                    )
+                    .ok()?;
+                let made = made?;
+                let queue: ID3D12CommandQueue = device
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
+                    .ok()?;
+                let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY).ok()?;
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None).ok()?;
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&made),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: 0,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 1,
+                        Height: 1,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                };
+                let source = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&from),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                list.CopyTextureRegion(&to, 0, 0, 0, &source, None);
+                list.Close().ok()?;
+                let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+                queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).ok()?)]);
+                queue.Signal(&fence, 1).ok()?;
+                // (Without an event: this waits.)
+                fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).ok()?;
+                Some(made)
+            }
+        })
+        .as_ref()
+}
+
+/// Makes the descriptor of [`neutral`] for a slot of `view` at `at`, if the
+/// view is a 2D texture's or an array's; else a null one of its kind.
+fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    const TEXTURE2D: u32 = 4;
+    const TEXTURE2D_ARRAY: u32 = 5;
+    let dimension = match view {
+        View::Shader(_, Some(desc)) => desc[1],
+        View::Placed(false, resource, desc) if resource[0] != 1 => desc[1],
+        _ => 0,
+    };
+    let desc = match dimension {
+        TEXTURE2D => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() },
+            },
+        },
+        TEXTURE2D_ARRAY => D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
+            },
+        },
+        _ => {
+            null_for(view, at);
+            return None;
+        }
+    };
+    let (Some(texture), Some(host)) = (neutral(), host()) else {
+        null_for(view, at);
+        return None;
+    };
+    // SAFETY: a slot of our heap, a live texture.
+    unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
+    Some(texture.clone())
 }
 
 static FLIPS: Mutex<Vec<Flip>> = Mutex::new(Vec::new());
@@ -985,6 +1131,18 @@ pub(crate) fn slot_story(slot: u32) -> String {
         }
         if let Some(at) = host.written.get(slot as usize) {
             text.push_str(&format!(", written last at {:.1} s", f64::from(at.load(Relaxed)) / 1e3));
+        }
+        let before = BEFORE.lock().unwrap_or_else(|e| e.into_inner()).get(&index).copied();
+        if let Some((was, at, (started, finished), by)) = before {
+            let what = match view_at(was as u32, (was >> 32) as u32) {
+                _ if was == 0 => "nothing (or the neutral texture)".into(),
+                None => "a view that is gone".into(),
+                Some(view) => format!("{view:?}").chars().take(160).collect::<String>(),
+            };
+            text.push_str(&format!(
+                ", changed ({by}) at {:.3} s with submissions {started} begun and {finished} finished, showed before: {what}",
+                at as f64 / 1e3
+            ));
         }
         let kept = host.kept_in(index);
         match kept {
@@ -1821,10 +1979,71 @@ impl HostHeap {
     /// until then it shows what it showed. (Made at once, the frames on the
     /// card read the new view before its levels were filled.)
     pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64) {
+        self.flip(list, index, handle, None);
+    }
+
+    /// The same of a slot that shows nothing of the texture the record at
+    /// `handle` views, or something else: until then it shows the neutral
+    /// texture ([`show_after`]).
+    pub(crate) fn texture_slot_show_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let key = record_key(handle);
+        let view = view_at(key as u32, (key >> 32) as u32);
+        let (true, Some(view)) = (key != 0, view) else {
+            return;
+        };
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(&shown) = made.get(index as usize) else {
+                return;
+            };
+            if shown == key {
+                return;
+            }
+            // (As `mirror`.)
+            for stale in self.note_buffer(index, Some(&view), true) {
+                if stale != index {
+                    self.unmake(&mut made, stale);
+                }
+            }
+            let old = view_at(shown as u32, (shown >> 32) as u32);
+            if shown == 0 || !old.is_some_and(|old| same_placed_texture(&old, &view)) {
+                #[cfg(feature = "diagnostics")]
+                note_before(index, shown, "neutral");
+                self.quick_is(index, 0);
+                made[index as usize] = 0;
+                let kept = neutral_for(&view, self.at(index));
+                self.put(index);
+                self.clear_twin(index);
+                LATE[3].fetch_add(u64::from(kept.is_some()), Relaxed);
+                self.keep(index, kept);
+            }
+        }
+        self.flip(list, index, handle, Some(crate::frame::current()));
+    }
+
+    /// [`HostHeap::mirror`] of a slot whose table a draw read: a texture made
+    /// a moment ago is shown after the draw's list ([`show_after`]; the draw
+    /// reads the table's dynamic slots).
+    pub(crate) fn mirror_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
+        if show_after()
+            && index < self.count
+            && !self.texture_slot_made_from(index, handle)
+            && let Some(view) = super::view(handle)
+            && let Some(View::Shader(resource, _)) = placed_texture(&view).or(Some(view))
+            && crate::resource::buffer_bytes(resource as crate::object::This).is_none()
+            && crate::resource::host_resource(resource as crate::object::This).is_some_and(crate::pool::fresh)
+        {
+            return self.texture_slot_show_after(list, index, handle);
+        }
+        self.mirror(index, handle, true);
+    }
+
+    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
         let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
         list.defer_host(move || {
             let after = crate::host::submissions().0;
-            let flip = Flip { after, heap, index, handle, key };
+            let flip = Flip { after, heap, index, handle, key, late };
             FLIPS.lock().unwrap_or_else(|e| e.into_inner()).push(flip);
         });
     }
@@ -1855,16 +2074,47 @@ impl HostHeap {
                 continue;
             }
             // Written again since, or made null: that write is in the queue.
+            // (A slot shown late is null until now.)
             let view = view_at(f.key as u32, (f.key >> 32) as u32);
-            let (true, true, Some(view)) = (f.key != 0 && record_key(f.handle) == f.key, *shown != 0, view) else {
+            let there = *shown != 0 || f.late.is_some();
+            let (true, true, Some(view)) = (f.key != 0 && record_key(f.handle) == f.key, there, view) else {
                 FLIPPED[1].fetch_add(1, Relaxed);
+                LATE[4].fetch_add(u64::from(f.late.is_some()), Relaxed);
                 continue;
             };
+            // Its memory went meanwhile: the texture pass finds that.
+            if f.late.is_some()
+                && let View::Placed(_, resource, desc) = &view
+            {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                let len = crate::resource::placed_bytes(resource).unwrap_or(1);
+                if crate::texture::mapped_bytes(address as *const u8, len as usize) == 0 {
+                    LATE[4].fetch_add(1, Relaxed);
+                    continue;
+                }
+            }
             if let Some(kept) = make(&view, self.at(f.index)) {
+                #[cfg(feature = "diagnostics")]
+                note_before(f.index, *shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
                 *shown = f.key;
                 self.keep(f.index, kept);
-                flipped += 1;
+                if let Some(since) = f.late {
+                    let frames = crate::frame::current().saturating_sub(since);
+                    let n = LATE[0].fetch_add(1, Relaxed) + 1;
+                    let all = LATE[1].fetch_add(frames, Relaxed) + frames;
+                    let most = LATE[2].fetch_max(frames, Relaxed).max(frames);
+                    if n == 1 || n.is_multiple_of(5000) {
+                        tracing::info!(
+                            "slots shown after their texture's upload (VICTORY_SHOW_AFTER=1), since the start: {n}, {:.2} frames after they were asked for, the longest {most}; the neutral texture meanwhile in {}; {} not shown any more by then",
+                            all as f64 / n as f64,
+                            LATE[3].load(Relaxed),
+                            LATE[4].load(Relaxed)
+                        );
+                    }
+                } else {
+                    flipped += 1;
+                }
             }
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
@@ -2619,6 +2869,10 @@ impl HostHeap {
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
+            }
+            #[cfg(feature = "diagnostics")]
+            if !self.sampler && is_texture_view(&view) {
+                note_before(index, made[index as usize], if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
             made[index as usize] = if later { 0 } else { key };
@@ -3988,6 +4242,30 @@ mod tests {
         assert_eq!(view(5, u32::MAX, 5.5), (2, u32::MAX, 2.5));
         // (Two levels the copy has not.)
         assert_eq!(view(1, 4, 0.0), (0, 2, 0.0));
+    }
+
+    /// 2D textures and arrays have a neutral stand-in, others a null view.
+    #[test]
+    fn a_texture_not_there_yet_has_a_neutral_stand_in() {
+        let Some(host) = host() else { return };
+        // SAFETY: plain heap creation and queries.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let at = heap.GetCPUDescriptorHandleForHeapStart();
+            let view = |dimension| View::Shader(0, Some([98, dimension, 5768, 0, 0, 1, 0, 1, 0, 0]));
+            assert!(neutral_for(&view(4), at).is_some());
+            assert!(neutral_for(&view(5), at).is_some());
+            assert!(neutral_for(&view(9), at).is_none());
+            assert!(neutral_for(&view(8), at).is_none());
+            assert!(host.device.GetDeviceRemovedReason().is_ok());
+        }
     }
 
     /// Memory past the levels a slot's view shows is not its texture's.

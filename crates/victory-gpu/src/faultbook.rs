@@ -32,8 +32,11 @@ pub(crate) enum What {
     Alias = 6,
     /// A fault on block `a` that someone else had opened; b: nanoseconds.
     Open = 7,
-    /// Blocks `[a, b)` were opened ahead of the title's writes.
-    Ahead = 8,
+    /// The instruction at `a` made the fault before (block `b`).
+    Site = 9,
+    /// A store (the instruction at `a`) was done beside the guard of block
+    /// `b`.
+    Stored = 10,
 }
 
 #[repr(C)]

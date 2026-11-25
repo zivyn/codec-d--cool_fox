@@ -1,7 +1,8 @@
 //! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
 //! default; F3 shows and hides it while our window has the focus): white
 //! text on a black box in the upper left corner of what is shown, so that a
-//! screenshot carries them. Made again twice a second from the counters of
+//! screenshot carries them, with what it costs itself on the submitting
+//! thread. Made again twice a second from the counters of
 //! the frame-rate line, memory and textures; a frame itself only copies the
 //! box out of a buffer in the card's memory. Copied onto the swap chain's
 //! buffer, behind the title's picture: saved frames and the frame recorder
@@ -25,8 +26,8 @@ const EVERY: Duration = Duration::from_millis(500);
 const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
-const COLUMNS: u32 = 43;
-const LINES: u32 = 14;
+const COLUMNS: u32 = 40;
+const LINES: u32 = 9;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -171,29 +172,24 @@ fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> V
 #[derive(Clone, Copy, Default)]
 struct Counters([u64; COUNTERS]);
 
-const COUNTERS: usize = 16;
+const COUNTERS: usize = 11;
 
 impl Counters {
     fn now() -> Counters {
-        use super::{CARD_CLOCK_US, COPY_BACK, PREPARING, SUBMISSION_US};
+        use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
         use crate::copystat::{C, peek};
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         Counters([
-            get(&SUBMISSION_US[0]),
-            get(&PREPARING[0]),
-            get(&PREPARING[1]),
-            get(&PREPARING[2]),
-            get(&PREPARING[3]),
-            get(&COPY_BACK[0]),
-            get(&COPY_BACK[1]),
+            super::worked(),
             get(&CARD_CLOCK_US[0]),
             get(&CARD_CLOCK_US[1]),
             get(&CARD_CLOCK_US[2]),
+            get(&PREPARING[3]),
+            get(&COPY_BACK[0]),
+            get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
             peek(C::RecordNs),
-            peek(C::RecordCalls),
-            peek(C::Submissions),
             crate::draw::drawn(),
         ])
     }
@@ -210,43 +206,22 @@ impl Counters {
 }
 
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
-/// longest frame's.
-fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, host: &Host) -> Vec<String> {
-    use crate::draw::{
-        HEAP_TEXTURE_BYTES, HEAP_TEXTURES, HEAP_TEXTURES_AWAY, HEAP_TEXTURES_FULL, HEAP_TEXTURES_WAITING,
-    };
+/// longest frame's, `cost` what this takes of a frame, in microseconds.
+fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
     let (working, private) = crate::copystat::process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
-    let (hits, misses) = crate::shader_cache::counts();
-    let failed = get(&crate::pipeline::FAILED);
-    let idle = (c[7] / 1e3).min(ms);
+    let idle = (c[1] / 1e3).min(ms);
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
-        format!("DRAWS {:.0}  DROPPED {:.1}  SUBMITS {:.1}", c[15], c[11], c[14]),
-        format!("CPU PREP {:.1} MS  COPY {:.1}  TEXTURES {:.1}", c[0] / 1e3, c[1] / 1e3, c[3] / 1e3),
-        format!("RECORDING {:.0} MS IN {:.0} CALLS", c[12] / 1e6, c[13]),
-        format!("GPU BUSY {:.1} MS  IDLE {idle:.1}  BEHIND US {:.1}", ms - idle, c[8] / 1e3),
-        format!("WAIT FOR GPU {:.1} MS  COPY BACK {:.1} MS", c[9] / 1e3, c[5] / 1e3),
-        format!("MB UP {:.1}  ON CARD {:.1}  TEX {:.1}  BACK {:.1}", c[2] / 1e6, c[10] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        format!("RAM PRIVATE {:.1} GB  IN MEMORY {:.1} GB", gb(private), gb(working)),
-        format!("VRAM {:.1}/{:.1} GB  SHARED {:.1} GB", gb(used), gb(budget), gb(shared)),
-        format!(
-            "TEXTURES {}  {:.1} GB  WAITING {}",
-            get(&HEAP_TEXTURES),
-            gb(get(&HEAP_TEXTURE_BYTES)),
-            get(&HEAP_TEXTURES_WAITING)
-        ),
-        format!(
-            "UNMAPPED {}  NO ROOM {}  VIEWS {}",
-            get(&HEAP_TEXTURES_AWAY),
-            get(&HEAP_TEXTURES_FULL),
-            get(&crate::descriptor::host::REFUSED_VIEWS)
-        ),
-        format!("SHADERS CACHED {hits}  NEW {misses}  FAILED {failed}"),
-        format!("PIPELINES QUEUED {}", crate::pipeline::making()),
-        format!("FRAME NO {}", crate::queue::presented()),
+        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
+        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
+        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
+        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
+        format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
+        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
+        format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
+        format!("THIS PANEL {:.0} US A FRAME", cost),
     ]
 }
 
@@ -312,6 +287,8 @@ pub(super) struct Panel {
     frames: u32,
     last: Instant,
     worst: f64,
+    /// What this took since the last text.
+    cost: Duration,
     before: Counters,
     lines: Vec<String>,
     changed: bool,
@@ -327,6 +304,7 @@ impl Panel {
             frames: 0,
             last: now,
             worst: 0.0,
+            cost: Duration::ZERO,
             before: Counters::default(),
             lines: Vec::new(),
             changed: false,
@@ -336,12 +314,21 @@ impl Panel {
     }
 
     /// A frame was presented; `line`: the counters go back to 0 right behind
-    /// this call.
+    /// this call. (Not shown it asks for the key's state and no more.)
     pub(super) fn frame(&mut self, line: bool) {
         if pressed() {
             shown().fetch_xor(true, Ordering::Relaxed);
         }
+        if !shown().load(Ordering::Relaxed) {
+            self.frames = 0;
+            return;
+        }
         let now = Instant::now();
+        if self.frames == 0 && now - self.last > 2 * EVERY {
+            // (Shown from here on.)
+            (self.since, self.last, self.worst, self.before) = (now, now, 0.0, Counters::now());
+            self.frames = 0;
+        }
         self.frames += 1;
         self.worst = self.worst.max((now - self.last).as_secs_f64() * 1e3);
         self.last = now;
@@ -349,17 +336,16 @@ impl Panel {
         if elapsed < EVERY && !(line && elapsed * 2 >= EVERY) {
             return;
         }
-        let (frames, worst) = (f64::from(self.frames), self.worst);
-        (self.since, self.frames, self.worst) = (now, 0, 0.0);
-        if !shown().load(Ordering::Relaxed) {
-            return;
-        }
         let Some(host) = super::host() else { return };
+        let frames = f64::from(self.frames);
         let counters = Counters::now();
         let c = counters.since(self.before, frames);
         self.before = counters;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, worst, host);
+        let cost = self.cost.as_secs_f64() * 1e6 / frames;
+        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
         self.changed = true;
+        (self.since, self.frames, self.worst) = (now, 0, 0.0);
+        self.cost = now.elapsed();
     }
 
     /// Records the copy of the box onto `back`, a buffer of the swap chain of
@@ -375,6 +361,7 @@ impl Panel {
         if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
             return;
         }
+        let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
@@ -432,6 +419,7 @@ impl Panel {
             };
             list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
         }
+        self.cost += began.elapsed();
     }
 }
 

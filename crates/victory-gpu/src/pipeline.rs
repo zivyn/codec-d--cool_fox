@@ -78,9 +78,6 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// kept and the bytes of their host code. None of them is ever let go.
 static KEPT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-/// Shaders that did not translate.
-pub(crate) static FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// What the shader table and the pipeline library keep in memory:
 /// containers and their bytes, translations and their bytes, the bytes of
 /// the library's file (kept whole while the library lives) and what its
@@ -160,9 +157,6 @@ impl Shader {
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                }
-                if done.is_err() {
-                    FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
                     Ok(t) => tracing::info!(

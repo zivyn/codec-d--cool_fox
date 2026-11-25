@@ -93,8 +93,7 @@ pub(super) fn stage() -> u32 {
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
+    crate::toggled!("VICTORY_PLACED_ORDER")
 }
 
 /// Why [`plan`] refuses for [`place`].

@@ -1045,7 +1045,7 @@ void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
                 gpu.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize,
             )
         };
-        let names = ["raw", "structured 24 at 24", "structured 16", "typed u32", "typed u16", "typed 4 x u32", "constant buffer", "null raw"];
+        let names = ["raw", "structured 24 at 24", "structured 16", "typed u32", "typed u16", "typed 4 x u32", "constant buffer", "raw, moved to 8"];
         let view = |i: usize, format: i32, first: u64, count: u32, stride: u32, raw: bool, null: bool| {
             let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                 Format: DXGI_FORMAT(format),
@@ -1071,7 +1071,42 @@ void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
             view(base + 3, 42, 0, 1024, 0, false, false);
             view(base + 4, 57, 0, 2048, 0, false, false);
             view(base + 5, 3, 0, 256, 0, false, false);
-            view(base + 7, 39, 0, 1, 0, true, true);
+            // 1,024 dwords from 0 made in a heap the card does not see, moved
+            // on by 8 bytes (`descriptor::host::move_raw`), copied in.
+            // SAFETY: plain heap creation, slots of live heaps.
+            unsafe {
+                let beside: ID3D12DescriptorHeap = gpu
+                    .device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let at = beside.GetCPUDescriptorHandleForHeapStart();
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT(39),
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: 0,
+                            NumElements: 1024,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                gpu.device.CreateShaderResourceView(&buffer, Some(&desc), at);
+                let moved = crate::descriptor::host::move_raw(at, buffer.GetGPUVirtualAddress(), 4096, 8);
+                println!("the raw view was moved: {moved}");
+                gpu.device.CopyDescriptorsSimple(
+                    1,
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + (base + 7) * step },
+                    at,
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 // SAFETY: a live buffer.
                 BufferLocation: unsafe { buffer.GetGPUVirtualAddress() },

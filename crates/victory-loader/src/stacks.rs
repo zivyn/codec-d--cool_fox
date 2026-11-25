@@ -66,10 +66,8 @@ struct BasicInfo {
 #[repr(C, align(16))]
 struct Aligned(CONTEXT);
 
-/// Prints every other thread's stack to stderr. Each thread is suspended
-/// only while its context is read and unwound into a buffer allocated
-/// beforehand (it may hold the heap lock).
-pub fn dump_stacks() {
+/// The ids of this process's threads but the caller's.
+pub(crate) fn other_threads() -> Vec<u32> {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
         (
@@ -79,7 +77,7 @@ pub fn dump_stacks() {
         )
     };
     if snapshot == INVALID_HANDLE_VALUE {
-        return;
+        return Vec::new();
     }
     let mut ids = Vec::new();
     // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
@@ -96,6 +94,14 @@ pub fn dump_stacks() {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    ids
+}
+
+/// Prints every other thread's stack to stderr. Each thread is suspended
+/// only while its context is read and unwound into a buffer allocated
+/// beforehand (it may hold the heap lock).
+pub fn dump_stacks() {
+    let ids = other_threads();
     eprintln!("VIctory: stacks of {} threads", ids.len());
     for id in ids {
         // SAFETY: opens a thread of our own process.
@@ -109,9 +115,9 @@ pub fn dump_stacks() {
         if thread.is_null() {
             continue;
         }
-        let (frames, (priority, base)) = frames_of(thread);
+        let (frames, (priority, base, affinity)) = frames_of(thread);
         eprintln!(
-            "  thread {id} \"{}\" start {} priority {priority} (base {base})",
+            "  thread {id} \"{}\" start {} priority {priority} (base {base}) affinity {affinity:#x}",
             name_of(thread),
             locate(start_of(thread))
         );
@@ -124,7 +130,7 @@ pub fn dump_stacks() {
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
+pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -138,7 +144,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     // the query and the read below.
     // SAFETY: a thread of this process that is not this one.
     if unsafe { SuspendThread(thread) } == u32::MAX {
-        return (frames, (0, 0));
+        return (frames, (0, 0, 0));
     }
     // SAFETY: writes `info`, whose layout and size are the system's.
     let status = unsafe {
@@ -153,7 +159,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
     if status != 0 || info.teb.is_null() {
         // SAFETY: suspended above.
         unsafe { ResumeThread(thread) };
-        return (frames, (0, 0));
+        return (frames, (0, 0, 0));
     }
     // SAFETY: the TEB of a suspended thread of this process: its NT_TIB
     // holds the stack base at +8 and the stack limit at +0x10.
@@ -170,10 +176,10 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32)) {
         }
         ResumeThread(thread);
     }
-    (frames, (info.priority, info.base_priority))
+    (frames, (info.priority, info.base_priority, info.affinity))
 }
 
-fn start_of(thread: HANDLE) -> usize {
+pub(crate) fn start_of(thread: HANDLE) -> usize {
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.
     unsafe {
@@ -188,7 +194,7 @@ fn start_of(thread: HANDLE) -> usize {
     start
 }
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {

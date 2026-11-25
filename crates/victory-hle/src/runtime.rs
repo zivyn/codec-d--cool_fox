@@ -258,6 +258,25 @@ pub fn use_console_timers() {
         );
         timeBeginPeriod(1);
     }
+    ahead_of_other_programs();
+}
+
+/// The title's streaming thread runs below normal priority (on the console
+/// nobody else wants its core) and does all of the title's loading: a
+/// program that keeps the processors busy at normal priority (a build, a
+/// virus scan) starved it, loading took 40 to 60 s instead of 28 to 33, and
+/// the opening ran without the models that were to be there (runs cpu-1,
+/// play-1125-0203). The process runs above normal, as long as it runs.
+/// `VICTORY_PROCESS_PRIORITY=normal`: as it was started.
+#[cfg(windows)]
+fn ahead_of_other_programs() {
+    use windows_sys::Win32::System::Threading::{ABOVE_NORMAL_PRIORITY_CLASS, GetCurrentProcess, SetPriorityClass};
+    if std::env::var_os("VICTORY_PROCESS_PRIORITY").is_some_and(|v| v == "normal" || v == "0") {
+        return;
+    }
+    // SAFETY: a plain process setting.
+    let set = unsafe { SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    tracing::info!(set, "the process runs above normal priority (VICTORY_PROCESS_PRIORITY=normal: not)");
 }
 
 #[cfg(test)]

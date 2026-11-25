@@ -1085,9 +1085,9 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave and the view heap's limit.
-pub fn host_settings() -> [u32; 2] {
-    [host_max_wave(), super::shader::view_heap_limit()]
+/// wave, the view heap's limit and where the raw twins of its views start.
+pub fn host_settings() -> [u32; 3] {
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views()]
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -6793,12 +6793,13 @@ impl<'a> Lower<'a> {
                     return Ok(h);
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
+                let (index, bounded) = self.raw_twin(src, index, sampler, props);
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
                 let h = self
                     .s
-                    .heap_handle(self.cur, index, sampler, per_lane, props);
+                    .heap_handle_at(self.cur, index, sampler, per_lane, props, bounded);
                 self.handles.insert(key, h);
                 Ok(h)
             }
@@ -6845,7 +6846,8 @@ impl<'a> Lower<'a> {
             Source::Phi { block, args } => {
                 let _ = site;
                 let phi = self.descriptor_phi(*block, args, sampler, 8)?;
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                let (index, bounded) = self.raw_twin(src, phi, sampler, props);
+                Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -6863,16 +6865,50 @@ impl<'a> Lower<'a> {
                 let set = self.heap_index(a, fa, sampler)?;
                 let clear = self.heap_index(b, fb, sampler)?;
                 let index = self.s.m.select(self.cur, cond, set, clear);
-                Ok(self.s.heap_handle(self.cur, index, sampler, false, props))
+                let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                Ok(self.s.heap_handle_at(self.cur, index, sampler, false, props, bounded))
             }
             Source::Fetched { .. } | Source::Lanes { .. } | Source::LanePhi { .. } => {
                 // A descriptor each lane has its own of (a waterfall loop
                 // reads it from the first active lane): each lane's heap
                 // index, non-uniform.
                 let index = self.lane_heap_index(src, sampler)?;
-                Ok(self.s.heap_handle(self.cur, index, sampler, true, props))
+                let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                Ok(self.s.heap_handle_at(self.cur, index, sampler, true, props, bounded))
             }
         }
+    }
+
+    /// The heap index to read descriptor `src` at, `index` being the title's:
+    /// for a buffer picked from the heap itself and read as raw bytes (or as
+    /// a constant buffer), the host's raw twin of that slot
+    /// ([`super::shader::raw_views`]), whose reads end where the view does.
+    /// Everything else (tables, textures, typed buffers) stays in place.
+    /// And whether it is a twin's (inside the host's heap).
+    fn raw_twin(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> (V, bool) {
+        // Raw and constant buffers (DXIL resource kinds 11 and 13).
+        const RAW: u32 = 11;
+        const CONSTANT: u32 = 13;
+        let first = super::shader::raw_views();
+        let picked = |leaf: &&Source| {
+            let (Source::Loaded { load, .. } | Source::Fetched { load, .. }) = leaf else {
+                return false;
+            };
+            self.scalar
+                .get(load)
+                .and_then(|a| self.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap)
+        };
+        if first == 0 || sampler || !matches!(props.0 & 0xFF, RAW | CONSTANT) || !src.leaves().iter().all(picked) {
+            return (index, false);
+        }
+        let c = self.cur;
+        let (last, first) = (self.s.m.i32(first - 1), self.s.m.i32(first));
+        let i32t = self.s.t.i32;
+        // (As `dx.op.binary` UMin, see `heap_handle`.)
+        let index = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last]);
+        self.s.m.tag(index, Tag::Clamp);
+        (self.s.m.bin(c, Bin::Or, index, first), true)
     }
 
     /// The heap index a descriptor phi picks. Each predecessor computes its

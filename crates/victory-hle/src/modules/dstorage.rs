@@ -151,6 +151,9 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
     let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    if stream_log::on() {
+        stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
+    }
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -170,9 +173,10 @@ extern "system" fn create_status_array(
         "dstorage: status array"
     );
     let entries = (0..capacity).map(|_| AtomicI32::new(S_OK)).collect();
+    let written = (0..capacity).map(|_| AtomicU64::new(0)).collect();
     let array = Instance::create(
         Object::new("dstorage status array", &STATUS_VTABLE),
-        StatusArray { entries },
+        StatusArray { entries, written },
     );
     put(out, array)
 }
@@ -459,6 +463,9 @@ static FILE_VTABLE: Methods<8> = Methods([
 
 struct StatusArray {
     entries: Box<[AtomicI32]>,
+    /// For the log: when each entry was written ([`stream_log::now`]); 0
+    /// once the title has seen it.
+    written: Box<[AtomicU64]>,
 }
 
 type Array = *mut Instance<StatusArray>;
@@ -476,7 +483,15 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
-    status_result(this, index) != E_PENDING
+    let done = status_result(this, index) != E_PENDING;
+    if done && stream_log::on() {
+        // SAFETY: as above.
+        let written = &unsafe { &*this }.state.written;
+        if let Some(at) = written.get(index as usize).map(|w| w.swap(0, Ordering::Relaxed)).filter(|&at| at != 0) {
+            stream_log::line(format_args!("P\t{:x}\t{at}\t{}", this as usize, stream_log::now()));
+        }
+    }
+    done
 }
 
 static STATUS_VTABLE: Methods<5> = Methods([
@@ -671,6 +686,83 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
     );
 }
 
+/// The streaming log (`VICTORY_DSTORAGE_LOG=<file>`): a line for every
+/// request (`R`: queue, number, file, offset, source bytes, destination
+/// bytes, options, when enqueued, submitted, started, done, result), every
+/// status entry written (`S`: array, number, when enqueued, when written),
+/// the title's first look at it after (`P`: array, when written, when
+/// seen), every file opened (`F`), and each second what the title's mapping
+/// calls cost (`M`, `xmem::map_costs`). Times are milliseconds since the
+/// Unix epoch.
+pub(crate) mod stream_log {
+    use super::*;
+    use std::io::Write;
+
+    type Log = Mutex<std::io::BufWriter<std::fs::File>>;
+
+    fn log() -> Option<&'static Log> {
+        static LOG: OnceLock<Option<Log>> = OnceLock::new();
+        LOG.get_or_init(|| {
+            let path = std::env::var_os("VICTORY_DSTORAGE_LOG")?;
+            let file = std::fs::File::create(&path).ok()?;
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if let Some(costs) = super::super::xmem::map_costs() {
+                        line(format_args!("M\t{}\t{costs}", now()));
+                    }
+                    if let Some(log) = log() {
+                        let _ = log.lock().unwrap_or_else(|e| e.into_inner()).flush();
+                    }
+                }
+            });
+            Some(Mutex::new(std::io::BufWriter::with_capacity(1 << 20, file)))
+        })
+        .as_ref()
+    }
+
+    pub(crate) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_LOG").is_some())
+    }
+
+    /// Milliseconds since the Unix epoch.
+    pub(super) fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.as_millis() as u64)
+    }
+
+    pub(super) fn line(text: std::fmt::Arguments) {
+        if let Some(log) = log() {
+            let _ = writeln!(log.lock().unwrap_or_else(|e| e.into_inner()), "{text}");
+        }
+    }
+
+    pub(super) fn request(job: &Job, started: std::time::Instant, result: &Result<(), HRESULT>) {
+        if !on() {
+            return;
+        }
+        let now = now();
+        let ago = |t: Option<std::time::Instant>| now - t.map_or(0, |t| t.elapsed().as_millis() as u64);
+        let r = &job.request;
+        line(format_args!(
+            "R\t{}\t{}\t{:x}\t{}\t{}\t{}\t{:x}\t{}\t{}\t{}\t{now}\t{:x}",
+            job.lane,
+            job.seq,
+            r.source as usize,
+            r.offset,
+            r.source_size,
+            r.destination_size,
+            r.options,
+            ago(job.note.enqueued),
+            ago(job.note.submitted),
+            ago(Some(started)),
+            result.err().unwrap_or(0)
+        ));
+    }
+}
+
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
@@ -684,6 +776,7 @@ fn work(scheduler: &'static Scheduler) {
         let traced = Traced::start(&job);
         let result = execute(&job.request);
         walls_request(&job.request, &result, started);
+        stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
@@ -848,6 +941,11 @@ impl Lane {
             let first = std::mem::replace(&mut self.failures, later)
                 .into_values()
                 .next();
+            if stream_log::on() {
+                let at = stream_log::now();
+                stream_log::line(format_args!("S\t{:x}\t{seq}\t{}\t{at}", status.array as usize, status.enqueued));
+                status.written().store(at, Ordering::Relaxed);
+            }
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
@@ -965,6 +1063,7 @@ struct Note {
 impl Note {
     fn enqueued(request: &Request) -> Note {
         match trace() {
+            0 if stream_log::on() => Note { enqueued: Some(std::time::Instant::now()), ..Note::default() },
             0 => Note::default(),
             _ => Note {
                 enqueued: Some(std::time::Instant::now()),
@@ -976,8 +1075,10 @@ impl Note {
 
     fn submitted(&mut self, request: &Request, early: bool) {
         self.early = early;
-        if trace() > 0 {
+        if trace() > 0 || stream_log::on() {
             self.submitted = Some(std::time::Instant::now());
+        }
+        if trace() > 0 {
             self.at_submit = list_hash(request);
         }
     }
@@ -1131,6 +1232,8 @@ impl Traced {
 struct Status {
     array: Array,
     index: u32,
+    /// For the log.
+    enqueued: u64,
 }
 
 impl Drop for Status {
@@ -1143,6 +1246,11 @@ impl Status {
     fn entry(&self) -> &AtomicI32 {
         // SAFETY: we hold a reference; the index was checked when enqueued.
         &unsafe { &*self.array }.state.entries[self.index as usize]
+    }
+
+    fn written(&self) -> &AtomicU64 {
+        // SAFETY: as above.
+        &unsafe { &*self.array }.state.written[self.index as usize]
     }
 }
 
@@ -1166,7 +1274,8 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     };
     entry.store(E_PENDING, Ordering::Release);
     add_ref_instance(array);
-    queue(this, Command::Status(Status { array, index }));
+    let enqueued = stream_log::now();
+    queue(this, Command::Status(Status { array, index, enqueued }));
 }
 
 /// Whether a queue submits itself once half of it is enqueued
@@ -2162,7 +2271,7 @@ mod tests {
         let array = status_array(2).cast::<Instance<StatusArray>>();
         let status = |index| {
             add_ref_instance(array);
-            Command::Status(Status { array, index })
+            Command::Status(Status { array, index, enqueued: 0 })
         };
         read(&mut l, 0, 0, 16);
         read(&mut l, 0, 0, 16);

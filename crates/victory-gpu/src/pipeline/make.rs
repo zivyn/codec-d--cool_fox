@@ -324,11 +324,15 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
-                    // Below the title's own threads (loading, recording).
+                    // Below the title's own threads (loading, recording),
+                    // and the streaming one, which is below normal itself
+                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+                    let lowest = std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
+                        let _ = SetThreadPriority(GetCurrentThread(), priority);
                     }
                     loop {
                         next().make();

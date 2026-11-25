@@ -299,3 +299,47 @@ fn a_buffer_loaded_past_the_cache_is_coherent() {
         }
     }
 }
+
+/// A buffer picked from the view heap and read as raw bytes is read at the
+/// host's raw twin of its slot, when the host keeps some; an index past the
+/// title's slots reads the last twin, not a slot of something else.
+#[test]
+fn a_picked_buffer_is_read_at_its_raw_twin() {
+    let program = |at: u32| {
+        let words = [
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xBE8C_03FF, // s_mov_b32 s12, at
+            at,
+            0xF408_0203, // s_load_dwordx4 s[8:11], s[6:7], s12
+            0x1800_0000,
+            0xE030_0004, // buffer_load_dword v5, off, s[8:11], 0 offset:4
+            0x8002_0500,
+            0x7E0A_0505, // v_readfirstlane_b32 s5, v5
+            0xBE84_0380, // s_mov_b32 s4, 0
+        ];
+        [TABLE, &words, STORE].concat()
+    };
+    let (title, twin, last, texel) = ([1u32, 2, 3, 4], [5u32, 6, 7, 8], [9u32, 10, 11, 12], [[0.0; 4]; 1]);
+    let raw = |data| View::Buffer { data, stride: Stride::Raw };
+    let views = || {
+        [
+            View::Texture(1, 1, &texel),
+            raw(&title),
+            View::RawUav(2),
+            View::Texture(1, 1, &texel),
+            View::Texture(1, 1, &texel),
+            raw(&twin),
+            View::Texture(1, 1, &texel),
+            raw(&last),
+        ]
+    };
+    for (first, at, expected) in [(0, 32, 2), (4, 32, 6), (4, 32 * 1000, 10)] {
+        super::shader::RAW_VIEWS_HERE.set(Some(first));
+        let shader = build(&program(at), (8, 0)).expect("translates");
+        super::shader::RAW_VIEWS_HERE.set(None);
+        for (label, got) in run(&shader, &views()) {
+            assert_eq!(got[..2], [0, expected], "{label}: twins from {first}, byte {at}");
+        }
+    }
+}

@@ -468,7 +468,7 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
-            && let Err(e) = crate::host::resident(device, h)
+            && let Err(e) = crate::host::resident(device, h).and_then(|()| crate::host::mapped(device))
         {
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;

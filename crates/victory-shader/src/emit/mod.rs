@@ -190,6 +190,15 @@ pub fn builder_fences() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_FENCES").is_none_or(|v| v != "0"))
 }
 
+/// Whether the structure builder's accesses through its root views stay near
+/// them, and a size in a structure's header that cannot be one counts as none
+/// (`VICTORY_BVH_BOUNDS=0`: neither). Part of the translation: the shader
+/// cache keys on it.
+pub fn builder_bounds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a

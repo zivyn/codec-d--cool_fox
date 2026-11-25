@@ -61,6 +61,14 @@ pub(super) trait Work: Send {
     fn shows(&self) -> bool;
     /// Whether it is a submission.
     fn runs(&self) -> bool;
+    /// Takes `next`, what its queue was given behind it, along to be done with
+    /// it; or gives it back. Whether it is a submission that was taken.
+    fn take_along(&mut self, next: Self) -> Result<bool, Self>
+    where
+        Self: Sized,
+    {
+        Err(next)
+    }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
 }
@@ -263,7 +271,7 @@ impl<W: Work> Lane<W> {
                 (first, true)
             }
         };
-        let entry = {
+        let mut entry = {
             let mut state = self.lock();
             let Some(at) = state.items.iter().position(|e| e.number == number) else {
                 return false;
@@ -274,13 +282,34 @@ impl<W: Work> Lane<W> {
             state.running = Some(entry.queue);
             entry
         };
-        let (shows, runs) = (entry.what.shows(), entry.what.runs());
+        let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
+        // What follows it in its queue, if that can go with it. (Nobody else
+        // takes anything out, and what comes in goes to the end.)
+        while runs > 0 && !forced {
+            let next = {
+                let mut state = self.lock();
+                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                at.and_then(|at| state.items.remove(at))
+            };
+            let Some(Entry { number, queue, what }) = next else {
+                break;
+            };
+            match entry.what.take_along(what) {
+                Ok(run) => runs += usize::from(run),
+                Err(what) => {
+                    let mut state = self.lock();
+                    let at = state.items.iter().position(|e| e.number > number).unwrap_or(state.items.len());
+                    state.items.insert(at, Entry { number, queue, what });
+                    break;
+                }
+            }
+        }
         entry.what.go(forced);
         {
             let mut state = self.lock();
             state.running = None;
             state.presents -= usize::from(shows);
-            state.runs -= usize::from(runs);
+            state.runs -= runs;
         }
         self.moved.notify_all();
         true
@@ -296,6 +325,9 @@ enum Job {
     /// A submission, or a part of one: the lists' host sides and the order
     /// they run in.
     Run(usize, Vec<crate::list::Detached>, Vec<usize>),
+    /// Parts taken along with a submission ([`crate::host::joins`]): where they
+    /// begin in the order, and the signals given behind them.
+    Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
     /// A signal of the queue's.
     Signal(usize, u64),
     /// A frame is shown: the texture and the state its lists leave it in.
@@ -335,13 +367,73 @@ impl Work for Job {
     }
 
     fn runs(&self) -> bool {
-        matches!(self, Job::Run(..))
+        matches!(self, Job::Run(..) | Job::Joined(..))
+    }
+
+    fn take_along(&mut self, next: Job) -> Result<bool, Job> {
+        let (most, most_lists) = crate::host::joins();
+        if most < 2 {
+            return Err(next);
+        }
+        // Nothing but waits and signals that a submission may follow.
+        let (count, lists, signals) = match self {
+            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
+            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+            _ => return Err(next),
+        };
+        let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
+        match &next {
+            Job::Value(wait) => {
+                let met = wait.met()
+                    || crate::host::late_met_known(wait) == Some(true)
+                    || hosts().any(|list| crate::host::will_meet(list, wait));
+                if !met {
+                    return Err(next);
+                }
+            }
+            &Job::Wait(fence, value) => {
+                if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    return Err(next);
+                }
+            }
+            Job::Signal(..) => {}
+            Job::Run(_, more, order) => {
+                let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
+                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                    return Err(next);
+                }
+            }
+            Job::Joined(..) | Job::Present(..) => return Err(next),
+        }
+        let taken = std::mem::replace(self, Job::Wait(0, 0));
+        let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
+            Job::Run(queue, lists, order) => (queue, lists, order, Vec::new(), Vec::new()),
+            Job::Joined(queue, lists, order, parts, signals) => (queue, lists, order, parts, signals),
+            other => {
+                *self = other;
+                return Err(next);
+            }
+        };
+        let run = matches!(next, Job::Run(..));
+        match next {
+            Job::Run(_, more, then) => {
+                parts.push(order.len());
+                order.extend(then.into_iter().map(|i| i + lists.len()));
+                lists.extend(more);
+                STATS[JOINED].fetch_add(1, Relaxed);
+            }
+            Job::Signal(fence, value) => signals.push((fence, value)),
+            _ => {}
+        }
+        *self = Job::Joined(queue, lists, order, parts, signals);
+        Ok(run)
     }
 
     fn go(self, forced: bool) {
         let began = Instant::now();
         let _doing = crate::timeline::span(match self {
             Job::Run(..) => "the line: a submission",
+            Job::Joined(..) => "the line: submissions joined",
             Job::Present(..) => "the line: a present",
             Job::Signal(..) => "the line: a signal",
             _ => "the line: a wait that is met",
@@ -364,6 +456,24 @@ impl Work for Job {
                     None => drop(lists),
                 }
                 QUEUED.fetch_sub(1, Relaxed);
+            }
+            Job::Joined(queue, lists, order, parts, signals) => {
+                let _ = queue;
+                #[cfg(feature = "diagnostics")]
+                crate::capture::op(queue, || {
+                    format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
+                });
+                match crate::host::host() {
+                    Some(host) => host.execute_parts(lists, order, &parts),
+                    None => drop(lists),
+                }
+                // (A part that had no list is one all the same.)
+                QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
+                for (fence, value) in signals {
+                    if !crate::host::late_signal(fence, value) {
+                        crate::fence::set(fence as This, value);
+                    }
+                }
             }
             Job::Signal(fence, value) => {
                 if !crate::host::late_signal(fence, value) {
@@ -392,7 +502,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
-static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -403,6 +513,8 @@ const DRAINING: usize = 6;
 const DRAINS: usize = 7;
 const BUSY: usize = 8;
 const FORCED: usize = 9;
+/// Parts prepared together with the one before them.
+const JOINED: usize = 10;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -593,7 +705,8 @@ pub(super) fn line(frames: f64) {
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \
-         line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}",
+         line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
+         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
         s[RUNS] / frames,
         s[PRESENTS] / frames,
         s[DEPTH] / s[RUNS].max(1.0),
@@ -603,7 +716,8 @@ pub(super) fn line(frames: f64) {
         ms(AT_PRESENT),
         ms(DRAINING),
         s[DRAINS] / frames,
-        s[FORCED] / frames
+        s[FORCED] / frames,
+        s[JOINED] / frames
     );
 }
 
@@ -623,6 +737,8 @@ mod tests {
         Slow(&'static str, Log, Arc<(Mutex<bool>, Condvar)>),
         Signal(usize, u64, Log),
         Present(&'static str, Log),
+        /// Takes others of its kind, waits that are met, and signals along.
+        Group(Vec<&'static str>, Log, Vec<(usize, u64)>),
     }
 
     impl Work for T {
@@ -640,7 +756,24 @@ mod tests {
             matches!(self, T::Present(..))
         }
         fn runs(&self) -> bool {
-            matches!(self, T::Run(..) | T::Slow(..))
+            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..))
+        }
+        fn take_along(&mut self, next: T) -> Result<bool, T> {
+            let T::Group(names, _, signals) = self else {
+                return Err(next);
+            };
+            match next {
+                T::Group(more, ..) if names.len() < 3 => {
+                    names.extend(more);
+                    Ok(true)
+                }
+                T::Wait(f, v) if crate::fence::completed(f as This) >= v || signals.contains(&(f, v)) => Ok(false),
+                T::Signal(f, v, _) => {
+                    signals.push((f, v));
+                    Ok(false)
+                }
+                other => Err(other),
+            }
         }
         fn go(self, forced: bool) {
             match self {
@@ -660,6 +793,12 @@ mod tests {
                 T::Signal(fence, value, log) => {
                     log.lock().unwrap().push(format!("signal {value}"));
                     crate::fence::set(fence as This, value);
+                }
+                T::Group(names, log, signals) => {
+                    log.lock().unwrap().push(names.join("+"));
+                    for (fence, value) in signals {
+                        crate::fence::set(fence as This, value);
+                    }
                 }
             }
         }
@@ -704,6 +843,34 @@ mod tests {
         let mut done = false;
         lane.push_behind(1, false, T::Signal(f, 2, log.clone()), || done = true);
         assert!(done);
+    }
+
+    /// A submission takes what follows it in its queue along, up to what it
+    /// cannot take, which stays at its place; the counts come out even.
+    #[test]
+    fn submissions_take_those_behind_them_along() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        lane.push(1, [part("a"), T::Wait(f, 0), part("b")]);
+        lane.push(2, [part("other queue"), T::Wait(f, 1), part("behind a's signal")]);
+        lane.push(1, [T::Signal(f, 1, log.clone()), T::Wait(f, 1), part("c"), part("d")]);
+        lane.push(1, [T::Wait(f, 9), part("held"), T::Present("present", log.clone()), part("next frame")]);
+        // What came after the look was asked for is not touched.
+        let limit = lane.lock().next;
+        lane.push(1, [part("later")]);
+        lane.look(limit);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["a+b+c", "other queue+behind a's signal", "d", "held", "present", "next frame"],
+            "{:?}",
+            lane.lock().items.len()
+        );
+        look(&lane);
+        assert_eq!(log.lock().unwrap().last().unwrap(), "later");
+        let state = lane.lock();
+        assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
     }
 
     /// A wait that nothing meets holds its queue until a present, which

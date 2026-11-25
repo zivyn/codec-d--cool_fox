@@ -83,6 +83,23 @@ pub(super) fn stage() -> u32 {
     })
 }
 
+/// Whether a copy at its place in a list ([`place`]) is only in the way of
+/// what is done on the card in front of the lists if that stands behind it in
+/// them (`VICTORY_PLACED_ORDER=0`: wherever it stands, as before), and a
+/// submission where it does is cut behind the copy's list ([`cut_for`]).
+///
+/// The fills of constant buffers read the title's ring (7,500 a frame in the
+/// opening), and one copy of a few hundred bytes a frame writes into it at its
+/// place in a list. The whole submission was refused for it, and stood 40 to
+/// 60 ms until the flights had landed (run n19).
+fn placed_order() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_ORDER").is_none_or(|v| v != "0"))
+}
+
+/// Why [`plan`] refuses for [`place`].
+const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
+
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
 const BETWEEN: u64 = 4 << 20;
@@ -226,10 +243,13 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// only what a taken copy has not been told to write yet: bytes a step
 /// ahead of it reads, in title memory as it is.
 ///
+/// `behind`: for [`BEHIND_PLACED`], the copy at its place and the first step
+/// behind it that is in its way.
+///
 /// Steps of a level are done together, every read before every write; a
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
-fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
+fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
         Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
@@ -281,12 +301,21 @@ fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
         }
     }
     // A copy at its place in a list comes after what is done in front of all
-    // of them.
-    for d in does {
+    // of them: as it should after the steps ahead of it, but not after those
+    // behind it that read or write its bytes.
+    for (p, d) in does.iter().enumerate() {
         if let Does::Placed { dst, src, len } = *d
             && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
         {
-            return Err("a copy at its place in a list writes what it reads, or reads or writes what it writes");
+            let (to, from) = ((dst, dst + len), (src, src + len));
+            let in_the_way = |i: usize| {
+                reads_writes(&does[i]).is_some_and(|(r, w)| meet(r, to) || w.0 < w.1 && (meet(w, to) || meet(w, from)))
+            };
+            let found = (p + 1..does.len()).find(|&i| taken[i] && in_the_way(i));
+            *behind = found.map(|i| (p, i));
+            if !by_order || found.is_some() {
+                return Err(BEHIND_PLACED);
+            }
         }
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
@@ -373,6 +402,78 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
+}
+
+/// What the steps of `runs` do, and which step each is (its list by address,
+/// its place in it). `written`: what flights may write.
+fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+    let mut does = Vec::new();
+    // Which step each is. One list's lock at a time: a submission may
+    // name a list twice.
+    let mut steps = Vec::new();
+    for list in runs {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            does.push(match step {
+                &Step::Copy(dst, src, len) => Does::Copy {
+                    dst,
+                    src,
+                    len,
+                    asked: copy_blocked(written, dst, src, len).is_some(),
+                },
+                Step::Fill(_, src, len, to) => Does::Fill {
+                    src: *src,
+                    len: *len,
+                    asked: read_blocked(written, *src, *len),
+                    to: to.is_some(),
+                },
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    Does::Read {
+                        from: at,
+                        to: at + len,
+                        asked: touches(written, at, at + len),
+                    }
+                }
+                &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
+                Step::Refresh(shadow, at, len) => Does::Refresh {
+                    shadow: Arc::as_ptr(shadow) as usize,
+                    from: *at,
+                    to: *at + *len,
+                },
+                Step::Run(_) => Does::Run,
+                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
+                Step::GpuWrite(..) | Step::Host(..) => continue,
+            });
+            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+        }
+    }
+    (does, steps)
+}
+
+/// With flights in the air: before which of `runs` the submission is cut so
+/// that what reads or writes the bytes of a copy at its place in an earlier
+/// list ([`BEHIND_PLACED`]) is done on the card in front of a submission of
+/// its own, behind that copy.
+pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
+    if stage() == 0 || !relay_exact() || !placed_order() || runs.len() < 2 {
+        return None;
+    }
+    // (Most submissions have none.)
+    let first = runs.iter().position(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Placed(_))))?;
+    if first + 1 == runs.len() {
+        return None;
+    }
+    let written = line().written.clone();
+    blocked_by(&written, runs, false)?;
+    let (does, steps) = does_of(&written, runs);
+    let mut behind = None;
+    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+        return None;
+    }
+    let (placed, reader) = behind?;
+    let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
+    let cut = place(placed)? + 1;
+    (place(reader)? >= cut).then_some(cut)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -567,47 +668,8 @@ impl Host {
     }
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
-        let mut does = Vec::new();
-        // Which step each is. One list's lock at a time: a submission may
-        // name a list twice.
-        let mut steps = Vec::new();
-        for list in runs {
-            for (i, step) in list.deferred().copies.iter().enumerate() {
-                does.push(match step {
-                    &Step::Copy(dst, src, len) => Does::Copy {
-                        dst,
-                        src,
-                        len,
-                        asked: copy_blocked(written, dst, src, len).is_some(),
-                    },
-                    Step::Fill(_, src, len, to) => Does::Fill {
-                        src: *src,
-                        len: *len,
-                        asked: read_blocked(written, *src, *len),
-                        to: to.is_some(),
-                    },
-                    Step::Texture(staging) => {
-                        let (at, len) = staging.memory();
-                        Does::Read {
-                            from: at,
-                            to: at + len,
-                            asked: touches(written, at, at + len),
-                        }
-                    }
-                    &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
-                    Step::Refresh(shadow, at, len) => Does::Refresh {
-                        shadow: Arc::as_ptr(shadow) as usize,
-                        from: *at,
-                        to: *at + *len,
-                    },
-                    Step::Run(_) => Does::Run,
-                    Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                    Step::GpuWrite(..) | Step::Host(..) => continue,
-                });
-                steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
-            }
-        }
-        let chosen = plan(&does, stage())?;
+        let (does, steps) = does_of(written, runs);
+        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -863,7 +925,7 @@ mod tests {
 
     /// What is done on the card, as (place, level), in stage 2.
     fn planned(does: &[Does]) -> Vec<(usize, u32)> {
-        plan(does, 2).unwrap()
+        plan(does, 2, true, &mut None).unwrap()
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
@@ -881,8 +943,8 @@ mod tests {
         ];
         assert_eq!(planned(&does), [(1, 0), (3, 0)]);
         // Two fills of the same bytes.
-        assert_eq!(plan(&[fill(0, 64, true), fill(32, 64, true)], 1), Ok(vec![(0, 0), (1, 0)]));
-        assert_eq!(plan(&[fill(0, 64, false)], 1), Ok(vec![]));
+        assert_eq!(plan(&[fill(0, 64, true), fill(32, 64, true)], 1, true, &mut None), Ok(vec![(0, 0), (1, 0)]));
+        assert_eq!(plan(&[fill(0, 64, false)], 1, true, &mut None), Ok(vec![]));
         // Ends that touch are apart.
         let does = [
             copy(1000, 5000, 100, true),
@@ -927,6 +989,29 @@ mod tests {
         assert_eq!(planned(&[copy(7000, 5000, 10, false), taken]), [(1, 0)]);
     }
 
+    /// A copy at its place in a list is in the way of what reads or writes its
+    /// bytes behind it, not of what did ahead of it.
+    #[test]
+    fn copies_at_their_place_stand_in_the_way_of_what_is_behind_them() {
+        let placed = Does::Placed { dst: 2000, src: 3000, len: 64 };
+        let behind = |does: &[Does]| {
+            let mut found = None;
+            let refused = plan(does, 2, true, &mut found);
+            assert!(refused.is_ok() || found.is_some() && refused == Err(BEHIND_PLACED));
+            assert_eq!(plan(does, 2, false, &mut None).is_err(), does.len() > 1 && !matches!(does, [_, Does::Fill { src: 5000, .. }]));
+            found
+        };
+        assert_eq!(behind(&[fill(2032, 64, true), placed]), None);
+        assert_eq!(behind(&[placed, fill(2032, 64, true)]), Some((0, 1)));
+        assert_eq!(behind(&[placed, fill(5000, 64, true)]), None);
+        assert_eq!(behind(&[fill(2000, 8, true), placed, fill(2000, 8, true)]), Some((1, 2)));
+        // One that writes what it copies from, and one that writes over it.
+        assert_eq!(behind(&[copy(3000, 5000, 8, true), placed]), None);
+        assert_eq!(behind(&[placed, copy(3000, 5000, 8, true)]), Some((0, 1)));
+        assert_eq!(behind(&[copy(2060, 5000, 8, true), placed]), None);
+        assert_eq!(behind(&[placed, copy(2060, 5000, 8, true)]), Some((0, 1)));
+    }
+
     /// Whatever the steps, done level by level (in a level every read
     /// before every write) they read and leave what they read and leave one
     /// after the other, the CPU's steps ahead of all of them.
@@ -951,7 +1036,7 @@ mod tests {
                     }
                 })
                 .collect();
-            let Ok(chosen) = plan(&does, 2) else {
+            let Ok(chosen) = plan(&does, 2, true, &mut None) else {
                 refused += 1;
                 continue;
             };
@@ -1005,22 +1090,22 @@ mod tests {
     #[test]
     fn steps_in_the_way_are_refused() {
         let taken = copy(1000, 5000, 100, true);
-        assert!(plan(&[taken, Does::Run], 2).is_err());
+        assert!(plan(&[taken, Does::Run], 2, true, &mut None).is_err());
         // A texture that itself waits for flights; a fill that cannot be
         // taken but waits.
-        assert!(plan(&[taken, Does::Read { from: 1, to: 2, asked: true }], 2).is_err());
-        assert!(plan(&[Does::Fill { src: 1, len: 1, asked: true, to: false }], 2).is_err());
+        assert!(plan(&[taken, Does::Read { from: 1, to: 2, asked: true }], 2, true, &mut None).is_err());
+        assert!(plan(&[Does::Fill { src: 1, len: 1, asked: true, to: false }], 2, true, &mut None).is_err());
         // Reads on the CPU of what it writes: behind it, not ahead of it.
         for read in [Does::Read { from: 900, to: 1001, asked: false }, stuck(1050, 3)] {
-            assert!(plan(&[taken, read], 2).is_err(), "{read:?} behind");
+            assert!(plan(&[taken, read], 2, true, &mut None).is_err(), "{read:?} behind");
             assert_eq!(planned(&[read, taken]), [(1, 0)], "{read:?} ahead");
         }
         // Also of what is taken along.
-        assert!(plan(&[taken, copy(3000, 1000, 10, false), stuck(3005, 1)], 2).is_err());
+        assert!(plan(&[taken, copy(3000, 1000, 10, false), stuck(3005, 1)], 2, true, &mut None).is_err());
         // Into itself, and copies without stage 2.
-        assert!(plan(&[copy(1000, 1050, 100, true)], 2).is_err());
-        assert!(plan(&[taken], 1).is_err());
-        assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1).is_err());
+        assert!(plan(&[copy(1000, 1050, 100, true)], 2, true, &mut None).is_err());
+        assert!(plan(&[taken], 1, true, &mut None).is_err());
+        assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1, true, &mut None).is_err());
     }
 
     #[test]

@@ -71,7 +71,7 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<Vec<(u64, Retired)>> = Mutex::new(Vec::new());
+static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -290,7 +290,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     // (Those the title made and the host has not begun get the next numbers.)
     let queued = crate::queue::queued();
     let started = STARTED.load(Ordering::Acquire) + queued;
-    if started <= FINISHED.load(Ordering::Acquire) {
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
         drop(object);
         return;
@@ -299,21 +299,32 @@ pub(crate) fn retire<T: 'static>(object: T) {
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+        .push_back((started, Retired(Box::new(object))));
 }
 
-/// Drops what waited for submissions up to `finished`.
+/// How many submissions later than it could (the last one that may use it
+/// has finished) an object let go is dropped, and a host list that has run
+/// is reset, about two frames: the device losses of the night of 2026-11-25
+/// were page faults in memory nothing of ours named any more, at no command
+/// in particular. Objects let go while nothing runs wait as well: lists
+/// recorded and not yet sent may name them. `VICTORY_BURY_LAG=0`: not.
+fn bury_lag() -> u64 {
+    static LAG: OnceLock<u64> = OnceLock::new();
+    *LAG.get_or_init(|| std::env::var("VICTORY_BURY_LAG").ok().and_then(|v| v.parse().ok()).unwrap_or(64))
+}
+
+/// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
+/// numbers come in order, but for threads that overtake each other: one of
+/// those is dropped a little later than it could be.
 fn bury(finished: u64) {
+    let finished = finished.saturating_sub(bury_lag());
     let done: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if retired.is_empty() {
+        let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
+        if n == 0 {
             return;
         }
-        let (done, keep) = std::mem::take(&mut *retired)
-            .into_iter()
-            .partition(|(at, _)| *at <= finished);
-        *retired = keep;
-        done
+        retired.drain(..n).collect()
     };
     drop(done);
 }
@@ -2842,7 +2853,11 @@ pub(crate) fn settle_for_fence() {
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
-    let landed = std::mem::take(&mut line().landed);
+    let landed: Vec<_> = {
+        let mut line = line();
+        let n = line.landed.len().saturating_sub(bury_lag() as usize);
+        line.landed.drain(..n).collect()
+    };
     for (lists, order) in landed {
         crate::list::recycle(lists, &order);
     }

@@ -194,6 +194,8 @@ enum Does {
     Read { from: usize, to: usize, asked: bool },
     /// A refresh of a host copy (named by its address).
     Refresh { shadow: usize, from: usize, to: usize },
+    /// A copy that its list does on the card ([`place`]).
+    Placed { dst: usize, src: usize, len: usize },
     /// Anything, anywhere.
     Run,
 }
@@ -269,6 +271,15 @@ fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
             {
                 more.push(i);
             }
+        }
+    }
+    // A copy at its place in a list comes after what is done in front of all
+    // of them.
+    for d in does {
+        if let Does::Placed { dst, src, len } = *d
+            && (touched(&read, (dst, dst + len)) || touched(&written, (dst, dst + len)) || touched(&written, (src, src + len)))
+        {
+            return Err("a copy at its place in a list writes what it reads, or reads or writes what it writes");
         }
     }
     let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
@@ -572,6 +583,7 @@ impl Host {
                         to: *at + *len,
                     },
                     Step::Run(_) => Does::Run,
+                    Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                     Step::GpuWrite(..) | Step::Host(..) => continue,
                 });
                 steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));

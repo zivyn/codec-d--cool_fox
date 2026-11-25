@@ -279,6 +279,8 @@ fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp
             },
             ..Default::default()
         })?;
+        #[cfg(feature = "diagnostics")]
+        crate::host::name(&pso, || crate::replay::play::CLAMP.into());
         Ok(Clamp { root, pso })
     }
 }

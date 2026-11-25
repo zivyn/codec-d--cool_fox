@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod replay;
 mod run;
 mod shader;
 mod translate;
@@ -114,6 +116,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again (diagnostics builds; see
+    /// docs/replay.md).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -184,6 +190,8 @@ fn main() -> Result<()> {
             victory_hle::runtime::set_title_args(title_args);
             run::run(&exe, unimplemented, strict, execute, console)
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
 }

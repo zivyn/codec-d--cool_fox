@@ -96,6 +96,11 @@ pub struct Options {
     /// Skip what runs a pipeline whose name or shader hash has one of
     /// these in it.
     pub skip_shaders: Vec<String>,
+    /// Shaders taken from this folder where it has them: `<hash>.dxil`, by
+    /// the hash the runtime names the title's shader by.
+    pub shaders: Option<PathBuf>,
+    /// With `compare`: the folder the shaders of the second are from.
+    pub shaders_b: Option<PathBuf>,
     /// Run the frame unchanged first, and compare.
     pub compare: bool,
     /// The debug layer, if it is installed.
@@ -129,6 +134,8 @@ impl Default for Options {
             only: None,
             until: None,
             skip_shaders: Vec::new(),
+            shaders: None,
+            shaders_b: None,
             compare: false,
             debug: false,
             breadcrumbs: false,
@@ -180,7 +187,7 @@ pub struct Report {
     pub delta_ms: Vec<f64>,
     /// Of the last loop, by submission: lists, ms.
     pub submits: Vec<(usize, f64)>,
-    /// With detailed timing, of the last loop: ms and count by category.
+    /// With detailed timing: ms (median of the loops) and count by category.
     pub categories: Vec<(String, f64, u32)>,
     /// With detailed timing: ms, count and name of the costliest pipelines.
     pub shaders: Vec<(f64, u32, String)>,
@@ -326,6 +333,43 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
 }
 
+/// The stage and hash by which the runtime names each of the title's shaders
+/// in a capture.
+pub fn title_shaders(folder: &Path) -> Result<std::collections::BTreeSet<(String, String)>> {
+    let frame = Frame::read(&find(folder)?.join("frame.bin"))?;
+    let mut all = std::collections::BTreeSet::new();
+    for p in &frame.pipelines {
+        for part in &p.parts {
+            if let wire::Part::Code { blob, .. } = part
+                && let Some(hash) = title_hash(p, *blob)
+            {
+                let at = p.name.find(hash).unwrap_or(0);
+                let stage = p.name[..at].trim_end().rsplit(['[', ' ']).next().unwrap_or("");
+                all.insert((stage.to_owned(), hash.to_owned()));
+            }
+        }
+    }
+    Ok(all)
+}
+
+/// The hash by which the runtime names the title's shader that code blob
+/// `blob` of pipeline `p` is the translation of.
+fn title_hash(p: &wire::Pipeline, blob: u32) -> Option<&str> {
+    let kind = p.parts.iter().find_map(|part| match part {
+        wire::Part::Code { kind, blob: b } if *b == blob => Some(*kind),
+        _ => None,
+    })?;
+    let stage = match D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(kind) {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS => "vertex ",
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS => "pixel ",
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS => "mesh ",
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS => "compute ",
+        _ => return None,
+    };
+    let at = p.name.find(stage)? + stage.len();
+    p.name.get(at..at + 16)
+}
+
 /// Writes the DXIL of the pipelines whose name has `text` in it to `shaders`
 /// in the capture, and the pipelines' descriptions; what was written.
 pub fn dump(folder: &Path, text: &str) -> Result<Vec<String>> {
@@ -411,7 +455,7 @@ pub fn listing(folder: &Path, lists: (u32, u32), line: &mut dyn FnMut(&str)) -> 
 pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>> {
     let mut player = Player::load(folder, options)?;
     let mut out = Vec::new();
-    if options.compare && options.edited() {
+    if options.compare && (options.edited() || options.shaders_b.is_some()) {
         // Turn by turn: what else the machine does falls on both.
         let image = Some(player.folder.join("replay-unchanged.png"));
         let plain = Options {
@@ -419,11 +463,20 @@ pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>>
             ..options.plain()
         };
         let mut a = player.prepare(&plain)?;
+        // The lists of the first hold its pipelines by name alone: kept.
+        let _pipelines = match &options.shaders_b {
+            Some(folder) => {
+                let kept = std::mem::take(&mut player.pipelines);
+                player.make_pipelines(Some(folder))?;
+                kept
+            }
+            None => HashMap::new(),
+        };
         let mut b = player.prepare(options)?;
         let (mut stamps_a, mut stamps_b) = (Vec::new(), Vec::new());
         for _ in 0..options.loops.max(1) {
-            stamps_a = player.once(&plain, &mut a)?;
-            stamps_b = player.once(options, &mut b)?;
+            stamps_a.push(player.once(&plain, &mut a)?);
+            stamps_b.push(player.once(options, &mut b)?);
         }
         out.push(("unchanged".into(), player.finish(&plain, a, &stamps_a)?));
         out.push(("with the experiments".into(), player.finish(options, b, &stamps_b)?));
@@ -580,7 +633,7 @@ impl Player {
         let mut at = Instant::now();
         player.make_resources(options.buffers, &options.only_buffers)?;
         step("resources", &mut at);
-        player.make_pipelines()?;
+        player.make_pipelines(options.shaders.as_deref())?;
         step("pipelines", &mut at);
         player.make_descriptors()?;
         step("descriptors", &mut at);
@@ -828,14 +881,21 @@ impl Player {
         Ok(())
     }
 
-    fn make_pipelines(&mut self) -> Result<()> {
+    fn make_pipelines(&mut self, shaders: Option<&Path>) -> Result<()> {
         for (id, blob) in &self.frame.roots {
+            if self.roots.contains_key(id) {
+                // (Made for another set of shaders: the root signatures are the same.)
+                continue;
+            }
             // SAFETY: a blob the host took.
             let root = unsafe { self.device.CreateRootSignature(0, &blob.0) }
                 .with_context(|| format!("root signature {id}"))?;
             self.roots.insert(*id, root);
         }
         for s in &self.frame.signatures {
+            if self.signatures.contains_key(&s.id) {
+                continue;
+            }
             let desc = D3D12_COMMAND_SIGNATURE_DESC {
                 ByteStride: s.stride,
                 NumArgumentDescs: s.args.len() as u32,
@@ -851,6 +911,9 @@ impl Player {
             self.signatures.extend(made.map(|m| (s.id, m)));
         }
         for q in &self.frame.query_heaps {
+            if self.queries.contains_key(&q.id) {
+                continue;
+            }
             let desc = D3D12_QUERY_HEAP_DESC {
                 Type: D3D12_QUERY_HEAP_TYPE(q.kind),
                 Count: q.count,
@@ -870,18 +933,34 @@ impl Player {
             .map_or(4, |n| n.get() / 2)
             .max(1);
         let (frame, roots) = (&self.frame, &self.roots);
+        let (swapped, kept) = (AtomicUsize::new(0), AtomicUsize::new(0));
         std::thread::scope(|scope| {
             for _ in 0..threads {
                 scope.spawn(|| {
                     while let Some(p) = frame.pipelines.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let code = |i: u32| {
+                        let recorded = |i: u32| {
                             let c = frame.codes.get(i as usize)?;
                             let mut bytes = vec![0; c.len as usize];
                             read_at(&file, &mut bytes, c.at).ok()?;
                             Some(bytes)
                         };
-                        let m =
-                            super::pso::make(&device, &p.parts, |id| roots.get(&id).cloned(), code);
+                        let root = |id: u32| roots.get(&id).cloned();
+                        let taken = std::cell::Cell::new(false);
+                        let mut m = super::pso::make(&device, &p.parts, root, |i| {
+                            let other = shaders.and_then(|dir| {
+                                let hash = title_hash(p, i)?;
+                                std::fs::read(dir.join(format!("{hash}.dxil"))).ok()
+                            });
+                            taken.set(taken.get() || other.is_some());
+                            other.or_else(|| recorded(i))
+                        });
+                        if taken.get() && m.is_err() {
+                            // Not for the root signature or the other stage recorded.
+                            kept.fetch_add(1, Ordering::Relaxed);
+                            m = super::pso::make(&device, &p.parts, root, recorded);
+                        } else if taken.get() {
+                            swapped.fetch_add(1, Ordering::Relaxed);
+                        }
                         made.lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .push((p.id, m));
@@ -895,6 +974,15 @@ impl Player {
                 Ok(p) => drop(self.pipelines.insert(id, p)),
                 Err(e) => refused.push((id, e)),
             }
+        }
+        if shaders.is_some() {
+            let n = format!(
+                "{} of {} pipelines made with shaders of the folder given, {} refused with them (as recorded)",
+                swapped.into_inner(),
+                self.frame.pipelines.len(),
+                kept.into_inner()
+            );
+            self.note(n);
         }
         if let Some((id, e)) = refused.first() {
             let n = format!(
@@ -2974,7 +3062,7 @@ impl Player {
         let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
         for _ in 0..o.loops.max(1) {
-            stamps = self.once(o, &mut made)?;
+            stamps.push(self.once(o, &mut made)?);
         }
         self.finish(o, made, &stamps)
     }
@@ -3034,7 +3122,7 @@ impl Player {
     }
 
     /// The report after the last run.
-    fn finish(&mut self, o: &Options, (built, mut report): (Sends, Report), stamps: &[u64]) -> Result<Report> {
+    fn finish(&mut self, o: &Options, (built, mut report): (Sends, Report), stamps: &[Vec<u64>]) -> Result<Report> {
         if o.detailed {
             self.detail(&built, stamps, o, &mut report);
         }
@@ -3049,23 +3137,41 @@ impl Player {
         Ok(report)
     }
 
-    /// The last loop's time by command.
-    fn detail(&self, built: &Sends, stamps: &[u64], o: &Options, report: &mut Report) {
-        let mut kinds: BTreeMap<&str, (f64, u32)> = BTreeMap::new();
-        let mut shaders: HashMap<u32, (f64, u32)> = HashMap::new();
-        for l in built.steps.iter().flat_map(|(_, l)| l) {
-            let mut before = stamps[l.first as usize];
-            for &(at, kind, pso) in &l.stamps {
-                let ms = stamps[at].saturating_sub(before) as f64 * 1e3 / self.frequency;
-                before = before.max(stamps[at]);
-                let k = kinds.entry(kind).or_default();
-                *k = (k.0 + ms, k.1 + 1);
-                if pso != NONE {
-                    let s = shaders.entry(pso).or_default();
-                    *s = (s.0 + ms, s.1 + 1);
+    /// The time by command: the median of the loops, without the first (which
+    /// is slower) where there are others.
+    fn detail(&self, built: &Sends, stamps: &[Vec<u64>], o: &Options, report: &mut Report) {
+        let mut kinds: BTreeMap<&str, (Vec<f64>, u32)> = BTreeMap::new();
+        let mut shaders: HashMap<u32, (Vec<f64>, u32)> = HashMap::new();
+        let loops = if stamps.len() > 2 { &stamps[1..] } else { stamps };
+        for stamps in loops {
+            let mut of_kind: BTreeMap<&str, (f64, u32)> = BTreeMap::new();
+            let mut of_shader: HashMap<u32, (f64, u32)> = HashMap::new();
+            for l in built.steps.iter().flat_map(|(_, l)| l) {
+                let mut before = stamps[l.first as usize];
+                for &(at, kind, pso) in &l.stamps {
+                    let ms = stamps[at].saturating_sub(before) as f64 * 1e3 / self.frequency;
+                    before = before.max(stamps[at]);
+                    let k = of_kind.entry(kind).or_default();
+                    *k = (k.0 + ms, k.1 + 1);
+                    if pso != NONE {
+                        let s = of_shader.entry(pso).or_default();
+                        *s = (s.0 + ms, s.1 + 1);
+                    }
                 }
             }
+            for (k, (ms, n)) in of_kind {
+                let all = kinds.entry(k).or_default();
+                all.0.push(ms);
+                all.1 = n;
+            }
+            for (k, (ms, n)) in of_shader {
+                let all = shaders.entry(k).or_default();
+                all.0.push(ms);
+                all.1 = n;
+            }
         }
+        let kinds = kinds.into_iter().map(|(k, (ms, n))| (k, (median(&ms), n)));
+        let shaders = shaders.into_iter().map(|(k, (ms, n))| (k, (median(&ms), n)));
         report.categories = kinds
             .into_iter()
             .map(|(k, (ms, n))| (k.to_owned(), ms, n))

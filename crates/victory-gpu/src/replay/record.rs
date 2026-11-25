@@ -351,7 +351,10 @@ pub(super) struct Recorder {
     /// made are kept alive.
     pub(super) watching: AtomicBool,
     pub(super) writes: Mutex<Vec<(u32, u32, u32)>>,
-    pub(super) held: Mutex<Vec<ID3D12Resource>>,
+    /// Resources kept alive for a capture, by id. One that dies all the same
+    /// (its last reference was going when ours was taken) is taken out: see
+    /// `Recorder::gone`.
+    pub(super) held: Mutex<HashMap<u32, ID3D12Resource>>,
     /// What could not be recorded, with how often.
     problems: Mutex<BTreeMap<String, u64>>,
     /// Submissions and presents, one at a time.
@@ -586,7 +589,7 @@ impl Recorder {
         write(&self.resources).insert(id, res);
         self.ids.set(p as usize, id);
         if late {
-            lock(&self.held).push(ID3D12Resource::clone(&object));
+            lock(&self.held).insert(id, ID3D12Resource::clone(&object));
         }
         self.tell_gone(
             &*object,
@@ -602,6 +605,12 @@ impl Recorder {
     fn gone(&self, what: &Gone) {
         match *what {
             Gone::Resource { id, ptr, va } => {
+                // The memory goes whatever we hold: letting go of it later
+                // would be a call into what is there then.
+                if let Some(dead) = lock(&self.held).remove(&id) {
+                    std::mem::forget(dead);
+                    self.problem("a resource died as the frame started: its contents may be missing");
+                }
                 self.ids.remove(ptr, id);
                 write(&self.resources).remove(&id);
                 if va != 0 {

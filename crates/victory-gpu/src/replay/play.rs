@@ -29,6 +29,8 @@ use super::wire::{
     self, ALL, Barrier, Cmd, Content, Delta, Frame, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot,
 };
 
+pub mod diverge;
+
 /// The name of the argument clamp's pipeline, by which its passes are
 /// recognised.
 pub const CLAMP: &str = "victory: argument clamp";
@@ -67,6 +69,10 @@ pub struct Options {
     pub skip_clamps: bool,
     pub skip_hash_passes: bool,
     pub one_submit: bool,
+    /// A full wait after every command that works.
+    pub wait_all: bool,
+    /// Each list sent on its own, and waited for.
+    pub wait_lists: bool,
     /// Run only these lists (by their place in the frame).
     pub only: Option<(u32, u32)>,
     /// Skip what runs a pipeline whose name or shader hash has one of
@@ -92,6 +98,8 @@ impl Default for Options {
             skip_clamps: false,
             skip_hash_passes: false,
             one_submit: false,
+            wait_all: false,
+            wait_lists: false,
             only: None,
             skip_shaders: Vec::new(),
             compare: false,
@@ -107,6 +115,8 @@ impl Options {
             || self.skip_clamps
             || self.skip_hash_passes
             || self.one_submit
+            || self.wait_all
+            || self.wait_lists
             || self.only.is_some()
             || !self.skip_shaders.is_empty()
     }
@@ -119,6 +129,8 @@ impl Options {
             skip_clamps: false,
             skip_hash_passes: false,
             one_submit: false,
+            wait_all: false,
+            wait_lists: false,
             only: None,
             skip_shaders: Vec::new(),
             ..self.clone()
@@ -144,6 +156,8 @@ pub struct Report {
     /// Against the presented picture: dB (infinite: the same), and whether
     /// its bytes are the same.
     pub picture: Option<(f64, bool)>,
+    /// Of each loop's picture: dB against the presented one, and its hash.
+    pub pictures: Vec<(f64, String)>,
     /// Things to know: from the capture and the replay.
     pub notes: Vec<String>,
 }
@@ -205,6 +219,20 @@ impl Report {
             }
             None => {}
         }
+        if self.pictures.len() > 1 {
+            let all: Vec<String> = self
+                .pictures
+                .iter()
+                .map(|(db, hash)| format!("{db:.1} dB {}", &hash[..8]))
+                .collect();
+            let kinds: HashSet<&String> = self.pictures.iter().map(|p| &p.1).collect();
+            let _ = writeln!(
+                t,
+                "  pictures of the loops: {} different: {}",
+                kinds.len(),
+                all.join(", ")
+            );
+        }
         for n in &self.notes {
             let _ = writeln!(t, "  note: {n}");
         }
@@ -239,6 +267,43 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
     }
     best.map(|b| b.1)
         .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
+}
+
+/// Writes the DXIL of the pipelines whose name has `text` in it to `shaders`
+/// in the capture, and the pipelines' descriptions; what was written.
+pub fn dump(folder: &Path, text: &str) -> Result<Vec<String>> {
+    let folder = find(folder)?;
+    let frame = Frame::read(&folder.join("frame.bin"))?;
+    let file = File::open(folder.join("shaders.bin"))?;
+    let to = folder.join("shaders");
+    std::fs::create_dir_all(&to)?;
+    let mut out = Vec::new();
+    for p in frame.pipelines.iter().filter(|p| p.name.contains(text)) {
+        let mut line = format!("pipeline {} {}:", p.id, p.name);
+        for part in &p.parts {
+            match part {
+                wire::Part::Code { kind, blob } => {
+                    let c = &frame.codes[*blob as usize];
+                    let mut bytes = vec![0; c.len as usize];
+                    read_at(&file, &mut bytes, c.at)?;
+                    let name: String = c.hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+                    std::fs::write(to.join(format!("{name}.dxil")), bytes)?;
+                    let _ = write!(line, " {kind}={name}.dxil");
+                }
+                wire::Part::Root { root } => {
+                    if let Some((_, blob)) = frame.roots.iter().find(|r| r.0 == *root) {
+                        std::fs::write(to.join(format!("root-{root}.bin")), &blob.0)?;
+                    }
+                    let _ = write!(line, " root-{root}.bin");
+                }
+                other => {
+                    let _ = write!(line, " {other:?}");
+                }
+            }
+        }
+        out.push(line);
+    }
+    Ok(out)
 }
 
 /// Loads a capture and runs it: the whole of `victory replay`. The reports,
@@ -312,6 +377,8 @@ pub struct Player {
     commands: Vec<Vec<Cmd>>,
     /// Resources in the states of the start (not those of the end).
     fresh: bool,
+    /// States as the last run left them (`diverge`).
+    at: States,
     notes: Vec<String>,
 }
 
@@ -373,6 +440,7 @@ impl Player {
             results: None,
             commands,
             fresh: true,
+            at: States::default(),
             notes: frame
                 .notes
                 .iter()
@@ -1769,7 +1837,7 @@ impl Player {
         );
         let built = self.build(&submits, &Options::default())?;
         self.restore(true)?;
-        self.send(&built, false)?;
+        self.send(&built, &Options::default())?;
         self.fresh = false;
         Ok(clamps)
     }
@@ -1838,8 +1906,13 @@ impl Player {
             let mut built = Vec::new();
             for cmds in lists {
                 let open = self.open(&heap, &mut next)?;
-                let stamps =
-                    self.translate(&open.1, cmds, i, o.detailed.then_some((&heap, &mut next)));
+                let stamps = self.translate(
+                    &open.1,
+                    cmds,
+                    i,
+                    o.detailed.then_some((&heap, &mut next)),
+                    o.wait_all,
+                );
                 built.push(self.close(open, &heap, &mut next, stamps)?);
             }
             steps.push((delta, built));
@@ -1979,6 +2052,7 @@ impl Player {
         cmds: &[Cmd],
         submit: usize,
         mut stamp: Option<(&ID3D12QueryHeap, &mut u32)>,
+        wait: bool,
     ) -> Vec<Stamp> {
         let version = self.version_of.get(submit).copied().unwrap_or(0);
         let clamps = self.pipelines_named(CLAMP);
@@ -2010,6 +2084,10 @@ impl Player {
             // SAFETY: an open list; the objects are the frame's, alive with
             // the player; commands the host recorded the same way.
             unsafe { self.command(list, c, version) };
+            if wait && c.works() {
+                // SAFETY: an open list.
+                unsafe { self.wait_for_all(list) };
+            }
             let timed = c.works() || matches!(c, Cmd::Barriers { .. });
             if timed && let Some((heap, next)) = &mut stamp {
                 // SAFETY: as above.
@@ -2474,7 +2552,7 @@ impl Player {
     }
 
     /// Sends the frame, waits for it, and reads the timestamps.
-    fn send(&mut self, s: &Sends, one: bool) -> Result<Vec<u64>> {
+    fn send(&mut self, s: &Sends, o: &Options) -> Result<Vec<u64>> {
         let cast = |l: &ID3D12GraphicsCommandList| l.cast::<ID3D12CommandList>().map(Some);
         let mut submissions: Vec<Vec<Option<ID3D12CommandList>>> = Vec::new();
         for (delta, lists) in &s.steps {
@@ -2489,7 +2567,7 @@ impl Player {
                 submissions.push(all);
             }
         }
-        if one {
+        if o.one_submit {
             let mut all = Vec::new();
             for (i, lists) in submissions.into_iter().enumerate() {
                 if i > 0
@@ -2504,7 +2582,14 @@ impl Player {
         // SAFETY: closed lists whose last run has finished.
         unsafe {
             for all in &submissions {
-                self.worker.queue.ExecuteCommandLists(all);
+                if !o.wait_lists {
+                    self.worker.queue.ExecuteCommandLists(all);
+                    continue;
+                }
+                for l in all {
+                    self.worker.queue.ExecuteCommandLists(&[l.clone()]);
+                    self.worker.idle()?;
+                }
             }
             self.worker
                 .queue
@@ -2534,7 +2619,10 @@ impl Player {
         for _ in 0..o.loops.max(1) {
             self.restore(o.restore)?;
             self.fresh = false;
-            stamps = self.send(&built, o.one_submit)?;
+            stamps = self.send(&built, o)?;
+            if let Some((db, _, hash, _)) = self.picture_now()? {
+                report.pictures.push((db, hash));
+            }
             let ms = |a: u32, b: u32| {
                 stamps[b as usize].saturating_sub(stamps[a as usize]) as f64 * 1e3 / self.frequency
             };
@@ -2605,6 +2693,34 @@ impl Player {
             .into_iter()
             .map(|(ms, n, pso)| (ms, n, self.pipeline_name(pso)))
             .collect();
+    }
+
+    /// The presented picture as it is now: dB against the recorded one,
+    /// whether its bytes are the same, its hash, and its pixels.
+    fn picture_now(&mut self) -> Result<Option<(f64, bool, String, Vec<u8>)>> {
+        let Some(p) = self.frame.presents.last().cloned() else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.contents(p.res)? else {
+            return Ok(None);
+        };
+        let Some(rgb) = gpu::rgb(p.width, p.height, p.pitch, p.format, &bytes) else {
+            return Ok(None);
+        };
+        let mut recorded = vec![0; bytes.len()];
+        read_at(
+            &File::open(self.folder.join("present.bin"))?,
+            &mut recorded,
+            p.file,
+        )?;
+        let was = gpu::rgb(p.width, p.height, p.pitch, p.format, &recorded).unwrap_or_default();
+        let hash = blake3::hash(&rgb).to_hex().to_string();
+        Ok(Some((
+            gpu::psnr(&rgb, &was),
+            rows_equal(&p, &bytes, &recorded),
+            hash,
+            rgb,
+        )))
     }
 
     /// Saves the presented picture and compares it with the recorded one.
@@ -2796,7 +2912,15 @@ fn make_device(frame: &Frame, debug: bool) -> Result<(ID3D12Device, Option<ID3D1
         if debug {
             let mut layer: Option<ID3D12Debug> = None;
             match D3D12GetDebugInterface(&mut layer) {
-                Ok(()) => layer.iter().for_each(|l| l.EnableDebugLayer()),
+                Ok(()) => layer.iter().for_each(|l| {
+                    l.EnableDebugLayer();
+                    // Every shader access checked on the card: very slow.
+                    if std::env::var_os("VICTORY_REPLAY_GBV").is_some()
+                        && let Ok(l) = l.cast::<ID3D12Debug1>()
+                    {
+                        l.SetEnableGPUBasedValidation(true);
+                    }
+                }),
                 Err(e) => tracing::warn!("no debug layer: {e}"),
             }
         }

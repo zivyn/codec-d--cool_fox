@@ -279,7 +279,8 @@ impl Reads {
 /// A buffer the CPU sees.
 struct CpuBuffer {
     id: u32,
-    res: ID3D12Resource,
+    /// Held by the recorder, not by this.
+    res: std::mem::ManuallyDrop<ID3D12Resource>,
     /// Where it is read: its mapping, or the read-back copy of it.
     live: *const u8,
     /// The read-back buffer and the offset in it, for one that is slow to
@@ -298,8 +299,6 @@ unsafe impl Sync for CpuBuffer {}
 struct Capture {
     worker: Worker,
     others: Vec<Worker>,
-    /// Resources the frame can use, kept alive.
-    held: Vec<ID3D12Resource>,
     started: bool,
     frame: u32,
     states: States,
@@ -341,7 +340,6 @@ impl Capture {
         Ok(Capture {
             worker: Worker::new(&device, &direct.0)?,
             others,
-            held: Vec::new(),
             started: false,
             frame: 0,
             states: States::default(),
@@ -388,7 +386,8 @@ impl Capture {
         let mut all: Vec<Arc<Res>> = Vec::new();
         {
             let live = read(&r.resources);
-            for res in live.values() {
+            let mut held = lock(&r.held);
+            for res in live.values().filter(|res| !res.late) {
                 let object = res.object();
                 // SAFETY: a live resource, or one whose end waits for the
                 // lock held here (`Recorder::gone`): the count tells which.
@@ -405,9 +404,9 @@ impl Capture {
                     // giving it back would end it a second time.
                     continue;
                 }
-                // SAFETY: the reference just taken.
-                self.held
-                    .push(unsafe { ID3D12Resource::from_raw(object.as_raw()) });
+                // SAFETY: the reference just taken. (The count does not tell
+                // all that are dying: `Recorder::gone` takes those out.)
+                held.insert(res.id, unsafe { ID3D12Resource::from_raw(object.as_raw()) });
                 all.push(res.clone());
             }
         }
@@ -594,7 +593,11 @@ impl Capture {
             }
             // Moved in: the writers end when it goes.
             let todo = todo;
-            for pieces in batches {
+            for mut pieces in batches {
+                {
+                    let held = lock(&r.held);
+                    pieces.retain(|p| held.contains_key(&p.res.id));
+                }
                 if pieces.is_empty() {
                     continue;
                 }
@@ -629,8 +632,12 @@ impl Capture {
                 r.problem("contents of textures in memory the CPU sees are not in the capture");
                 continue;
             }
-            // Those alive at the start are held, those made since too.
-            let object = ID3D12Resource::clone(&res.object());
+            // Those alive at the start are held, those made since too; what
+            // is not is dying.
+            if !lock(&r.held).contains_key(&res.id) {
+                continue;
+            }
+            let object = res.object();
             let size = res.desc.width as usize;
             let (live, through) = if res.seen == Seen::Cached {
                 let mut data = std::ptr::null_mut();
@@ -675,6 +682,10 @@ impl Capture {
     /// zero).
     fn changed(&mut self, r: &Recorder, reads: &Reads) -> Result<Vec<Delta>, Fault> {
         self.new_buffers(r)?;
+        {
+            let held = lock(&r.held);
+            self.buffers.retain(|b| held.contains_key(&b.id));
+        }
         let parts: Vec<(usize, usize, usize)> = self
             .buffers
             .iter()
@@ -697,7 +708,7 @@ impl Capture {
                             list.CopyBufferRegion(
                                 &blocks[block].0,
                                 at + from as u64,
-                                &b.res,
+                                &*b.res,
                                 from as u64,
                                 (to - from) as u64,
                             )

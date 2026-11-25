@@ -75,6 +75,105 @@ std::arch::global_asm!(
     "vzeroupper",
     "xor eax, eax",
     "ret",
+    ".globl victory_safe_update",
+    ".globl victory_safe_update_at",
+    ".globl victory_safe_update_after",
+    ".globl victory_safe_update_failed",
+    // rcx destination, rdx source, r8 bytes (whole 64s, not none), r9 where
+    // the offset of the first 64 bytes that differed goes (-1: none did) and
+    // behind it the offset of the end of the last: stores the 64s that
+    // differ. eax: whether all could be read.
+    "victory_safe_update:",
+    "xor r10d, r10d",
+    "mov r11, -1",
+    "xor eax, eax",
+    "2:",
+    "victory_safe_update_at:",
+    "vmovdqu ymm0, ymmword ptr [rdx + r10]",
+    "vmovdqu ymm1, ymmword ptr [rdx + r10 + 32]",
+    "victory_safe_update_after:",
+    "vpxor ymm2, ymm0, ymmword ptr [rcx + r10]",
+    "vpxor ymm3, ymm1, ymmword ptr [rcx + r10 + 32]",
+    "vpor ymm2, ymm2, ymm3",
+    "vptest ymm2, ymm2",
+    "jz 3f",
+    "vmovdqu ymmword ptr [rcx + r10], ymm0",
+    "vmovdqu ymmword ptr [rcx + r10 + 32], ymm1",
+    "cmp r11, -1",
+    "cmove r11, r10",
+    "lea rax, [r10 + 64]",
+    "3:",
+    "add r10, 64",
+    "cmp r10, r8",
+    "jb 2b",
+    "mov qword ptr [r9], r11",
+    "mov qword ptr [r9 + 8], rax",
+    "vzeroupper",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_update_failed:",
+    "vzeroupper",
+    "xor eax, eax",
+    "ret",
+    ".globl victory_safe_merge",
+    ".globl victory_safe_merge_at",
+    ".globl victory_safe_merge_after",
+    ".globl victory_safe_merge_failed",
+    // rcx title memory, rdx what the card holds, r8 what it held when last
+    // looked at, r9 blocks of 32 bytes, fifth where the two counts go. Where
+    // a byte of the second differs from the third, it goes into title memory
+    // (as whole dwords, and only dwords that then differ from what is there)
+    // and into the third; each block of title memory is read just before it
+    // is written. rax: the blocks left when a page of title memory could not
+    // be read or written (0: all done). The counts: blocks in which the
+    // second and third differed, dwords stored in title memory.
+    "victory_safe_merge:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "vpcmpeqd ymm5, ymm5, ymm5",
+    "2:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "victory_safe_merge_at:",
+    "vmovdqu ymm2, ymmword ptr [rcx]",
+    "vpblendvb ymm3, ymm0, ymm2, ymm1",
+    "vpcmpeqd ymm4, ymm3, ymm2",
+    "vmovmskps eax, ymm4",
+    "xor eax, 255",
+    "jz 4f",
+    "cmp eax, 255",
+    "je 3f",
+    "vpxor ymm4, ymm4, ymm5",
+    "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3",
+    "jmp 7f",
+    "3:",
+    "vmovdqu ymmword ptr [rcx], ymm3",
+    "victory_safe_merge_after:",
+    "7:",
+    "popcnt eax, eax",
+    "add r11, rax",
+    "4:",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "victory_safe_merge_failed:",
+    "vzeroupper",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], r10",
+    "mov qword ptr [rax + 8], r11",
+    "mov rax, r9",
+    "ret",
 );
 
 unsafe extern "system" {
@@ -86,6 +185,189 @@ unsafe extern "system" {
     fn victory_safe_put_at();
     fn victory_safe_put_after();
     fn victory_safe_put_failed();
+    fn victory_safe_update(dst: *mut u8, src: *const u8, len: usize, changed: *mut [usize; 2]) -> u32;
+    fn victory_safe_update_at();
+    fn victory_safe_update_after();
+    fn victory_safe_update_failed();
+    fn victory_safe_merge(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_at();
+    fn victory_safe_merge_after();
+    fn victory_safe_merge_failed();
+}
+
+/// What [`update`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Updated {
+    /// Every byte was the same already; nothing was stored.
+    Same,
+    /// The bytes that changed lie in these offsets.
+    Changed(usize, usize),
+    /// Not all of the source could be read; some may have been copied.
+    Failed,
+}
+
+/// Makes `dst` hold what `src` holds, storing only what differs. The source
+/// may change meanwhile: what is compared is what is stored, read once.
+///
+/// # Safety
+/// As [`copy`]'s, and the destination is memory of ours that nothing else
+/// writes.
+pub(crate) unsafe fn update(dst: *mut u8, src: *const u8, len: usize) -> Updated {
+    let whole = len / 64 * 64;
+    let (mut from, mut to) = (usize::MAX, 0);
+    if whole > 0 {
+        let mut changed = [usize::MAX, 0];
+        // SAFETY: the source's faults leave through the failing exit; the
+        // rest is the caller's.
+        if unsafe { victory_safe_update(dst, src, whole, &mut changed) } == 0 {
+            return Updated::Failed;
+        }
+        [from, to] = changed;
+    }
+    if whole < len {
+        let mut rest = [0u8; 64];
+        let rest = &mut rest[..len - whole];
+        // SAFETY: as above; `rest` is ours.
+        unsafe {
+            if !copy(rest.as_mut_ptr(), src.add(whole), rest.len()) {
+                return Updated::Failed;
+            }
+            let held = std::slice::from_raw_parts_mut(dst.add(whole), rest.len());
+            if held != rest {
+                held.copy_from_slice(rest);
+                (from, to) = (from.min(whole), len);
+            }
+        }
+    }
+    if from >= to { Updated::Same } else { Updated::Changed(from, to) }
+}
+
+/// What [`merge`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Merged {
+    /// Blocks of 32 bytes in which the card's bytes were new.
+    pub(crate) new: u64,
+    /// Dwords stored in title memory.
+    pub(crate) dwords: u64,
+    /// Whether title memory could be read and written wherever it had to be.
+    pub(crate) there: bool,
+}
+
+/// What shaders wrote goes into title memory: every byte of `now` that
+/// differs from the one in `held` goes to `title` and into `held`, every
+/// other byte of both stays as it is. Title memory is read 32 bytes at a
+/// time, each just before what changes of them is stored, and only the
+/// dwords that change are stored (at ends that are no dword's, bytes): the
+/// title's own threads may be writing those beside them.
+///
+/// Where title memory cannot be read or written, the rest of `held` takes
+/// `now` if `take` says so (the caller has the card's bytes nowhere else),
+/// else it stays.
+///
+/// # Safety
+/// `now` and `held` are `len` bytes of ours, not overlapping, that nothing
+/// else writes (but for `now` the card: it is read once); `title` is as
+/// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
+/// must have been asked.
+pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    let mut out = Merged { there: true, ..Merged::default() };
+    let mut at = 0;
+    while at < len {
+        let address = title.addr() + at;
+        let left = len - at;
+        if !address.is_multiple_of(4) || left < 4 {
+            // A dword only partly in the stretch: its bytes one by one.
+            // SAFETY: inside the stretch.
+            unsafe {
+                let byte = now.add(at).read_volatile();
+                let mut there = 0u8;
+                if byte != held.add(at).read() {
+                    out.new += 1;
+                    let mut ok = copy(&mut there, title.add(at), 1);
+                    if ok && there != byte {
+                        ok = copy(title.add(at), &byte, 1);
+                        out.dwords += u64::from(ok);
+                    }
+                    out.there &= ok;
+                    if ok || take {
+                        held.add(at).write(byte);
+                    }
+                }
+            }
+            at += 1;
+            continue;
+        }
+        let into = address % 32;
+        let mut counts = [0u64; 2];
+        if into != 0 || left < 32 {
+            // Part of a block: in a block of its own, equal beside the part.
+            let n = (32 - into).min(left) & !3;
+            let (mut new, mut old) = ([0u8; 32], [0u8; 32]);
+            // SAFETY: inside the stretch; the block of title memory around
+            // it lies in the same page, and nothing of it outside the part
+            // is stored (the two arrays are equal there).
+            unsafe {
+                std::ptr::copy_nonoverlapping(now.add(at), new.as_mut_ptr().add(into), n);
+                std::ptr::copy_nonoverlapping(held.add(at), old.as_mut_ptr().add(into), n);
+                let stuck = victory_safe_merge(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
+                out.there &= stuck == 0;
+                let from = if stuck != 0 && take { new.as_ptr() } else { old.as_ptr() };
+                std::ptr::copy_nonoverlapping(from.add(into), held.add(at), n);
+            }
+            at += n;
+        } else {
+            let blocks = left / 32;
+            // SAFETY: whole blocks of the stretch.
+            let stuck = unsafe { victory_safe_merge(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
+            if stuck != 0 {
+                out.there = false;
+                if take {
+                    let from = at + (blocks - stuck) * 32;
+                    // SAFETY: the blocks that were not done.
+                    unsafe { std::ptr::copy_nonoverlapping(now.add(from), held.add(from), stuck * 32) };
+                }
+            }
+            at += blocks * 32;
+        }
+        out.new += counts[0];
+        out.dwords += counts[1];
+    }
+    out
+}
+
+/// Whether the `len` bytes at `a` and `b` differ.
+///
+/// # Safety
+/// Both are `len` bytes that can be read; the card may be writing them.
+pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_or_si256, _mm256_setzero_si256, _mm256_testz_si256, _mm256_xor_si256};
+    /// # Safety
+    /// [`differ`]'s; the processor has AVX2 (as the code above assumes).
+    #[target_feature(enable = "avx2")]
+    unsafe fn blocks(a: *const u8, b: *const u8, n: usize) -> bool {
+        let mut at = 0;
+        while at < n {
+            let mut any = _mm256_setzero_si256();
+            for k in at..n.min(at + 4) {
+                // SAFETY: block `k`, inside both.
+                let (x, y) = unsafe {
+                    (_mm256_loadu_si256(a.add(k * 32).cast::<__m256i>()), _mm256_loadu_si256(b.add(k * 32).cast::<__m256i>()))
+                };
+                any = _mm256_or_si256(any, _mm256_xor_si256(x, y));
+            }
+            if _mm256_testz_si256(any, any) == 0 {
+                return true;
+            }
+            at += 4;
+        }
+        false
+    }
+    // SAFETY: the caller's.
+    if unsafe { blocks(a, b, len / 32) } {
+        return true;
+    }
+    // SAFETY: the bytes behind the blocks.
+    (len / 32 * 32..len).any(|i| unsafe { a.add(i).read_volatile() != b.add(i).read_volatile() })
 }
 
 /// Puts `now` at `dst` where it differs from `was`, whole dwords (as `dst`
@@ -160,7 +442,15 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
         return Some(victory_safe_copy_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
-    (from..to).contains(&at).then_some(victory_safe_put_failed as *const () as usize)
+    if (from..to).contains(&at) {
+        return Some(victory_safe_put_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_update_at as *const () as usize, victory_safe_update_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_update_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
+    (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
 }
 
 #[cfg(test)]
@@ -214,6 +504,52 @@ mod tests {
         }
     }
 
+    /// An update makes the two the same, says where they differed (to 64
+    /// bytes), stores nothing where they did not, and fails at a page that
+    /// is not there.
+    #[test]
+    fn updates_store_what_differs() {
+        assert!(on());
+        let (src, dst) = (Pages::new(1 << 14), Pages::new(1 << 14));
+        for len in [0usize, 1, 63, 64, 65, 200, 4096, 5000] {
+            for (da, sa) in [(0usize, 0usize), (3, 0), (0, 5)] {
+                for changed in [vec![], vec![0usize], vec![len / 2], vec![len.saturating_sub(1)], vec![1, len / 3, len / 2]] {
+                    src.fill();
+                    // SAFETY: inside the two allocations.
+                    unsafe {
+                        std::ptr::write_bytes(dst.0, 0xEE, dst.1);
+                        std::ptr::copy_nonoverlapping(src.0.add(sa), dst.0.add(da), len);
+                        let at: std::collections::BTreeSet<usize> = changed.iter().copied().filter(|&i| i < len).collect();
+                        for &i in &at {
+                            *src.0.add(sa + i) ^= 0x40;
+                        }
+                        let found = update(dst.0.add(da), src.0.add(sa), len);
+                        match (at.iter().min(), at.iter().max()) {
+                            (Some(&first), Some(&last)) => {
+                                let Updated::Changed(from, to) = found else {
+                                    panic!("{len} {at:?}: {found:?}")
+                                };
+                                assert_eq!(from, first / 64 * 64);
+                                assert_eq!(to, ((last / 64 + 1) * 64).min(len));
+                            }
+                            _ => assert_eq!(found, Updated::Same),
+                        }
+                        let (to, from) = (std::slice::from_raw_parts(dst.0, dst.1), std::slice::from_raw_parts(src.0, src.1));
+                        assert_eq!(to[da..da + len], from[sa..sa + len]);
+                        assert!(to[..da].iter().chain(&to[da + len..]).all(|&x| x == 0xEE));
+                    }
+                }
+            }
+        }
+        // SAFETY: our allocation.
+        unsafe {
+            VirtualFree(src.0.add(4096).cast(), 4096, MEM_DECOMMIT);
+            assert_eq!(update(dst.0, src.0, 8192), Updated::Failed);
+            assert_eq!(update(dst.0, src.0.add(4096), 10), Updated::Failed);
+            assert_ne!(update(dst.0, src.0, 4096), Updated::Failed);
+        }
+    }
+
     /// The dwords that changed are stored, and no byte of any other, at
     /// every alignment and length; a page that is not there fails.
     #[test]
@@ -263,6 +599,173 @@ mod tests {
             let mut now = was.clone();
             now[0] = 1;
             assert!(put_changed(pages.0, &was, &now));
+        }
+    }
+
+    /// [`merge`] against what it is to do, byte by byte, for every kind of
+    /// start, end and change: the bytes the card changed arrive in title
+    /// memory and in what it held, no dword without one is stored.
+    #[test]
+    fn a_merge_puts_what_the_card_changed_and_nothing_else() {
+        assert!(on());
+        let pages = Pages::new(1 << 12);
+        let mut seed = 1u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        for round in 0..4000u32 {
+            let at = random() as usize % 100;
+            let len = random() as usize % 300;
+            let (from, to) = (at, (at + len).min(400));
+            let n = to - from;
+            let base: Vec<u8> = (0..512).map(|_| random() as u8).collect();
+            let was: Vec<u8> = base[from..to].to_vec();
+            let mut held = was.clone();
+            let mut now = was.clone();
+            let mut title = base.clone();
+            // The card's writes: dwords and single bytes; the title's: some
+            // in the same dwords, some the same values.
+            for _ in 0..random() % 12 {
+                if n > 0 {
+                    let i = random() as usize % n;
+                    now[i] = random() as u8;
+                }
+                let i = random() as usize % 512;
+                title[i] = if (from..to).contains(&i) && round % 3 == 0 { now[i - from] } else { random() as u8 };
+            }
+            if round % 7 == 0 {
+                now.iter_mut().for_each(|b| *b = b.wrapping_add(1));
+            }
+            // SAFETY: inside the allocation and the vectors.
+            let done = unsafe {
+                std::ptr::copy_nonoverlapping(title.as_ptr(), pages.0, 512);
+                merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, round % 2 == 0)
+            };
+            assert!(done.there);
+            // SAFETY: inside the allocation.
+            let there = unsafe { std::slice::from_raw_parts(pages.0, 512) };
+            for i in 0..512 {
+                let wrote = (from..to).contains(&i) && now[i - from] != was[i - from];
+                let expect = if wrote { now[i - from] } else { title[i] };
+                assert_eq!(there[i], expect, "round {round} byte {i} of {from}..{to}");
+            }
+            assert_eq!(held, now, "round {round}");
+            assert_eq!(done.new == 0, was == now);
+            // Found merged already.
+            // SAFETY: as above.
+            let again = unsafe { merge(pages.0.add(from), now.as_ptr(), held.as_mut_ptr(), n, false) };
+            assert_eq!(again, Merged { new: 0, dwords: 0, there: true });
+        }
+    }
+
+    /// Title memory that is not there: what the card wrote stays to be
+    /// looked at again, or is taken, as asked; a page that only cannot be
+    /// written counts the same.
+    #[test]
+    fn a_merge_into_missing_memory_fails() {
+        assert!(on());
+        let pages = Pages::new(1 << 13);
+        let mut old = 0;
+        for (missing, take) in [(true, false), (true, true), (false, false), (false, true)] {
+            for (at, len) in [(0usize, 4096usize), (4, 64), (7, 1), (40, 100)] {
+                let was = vec![1u8; len];
+                let mut now = was.clone();
+                now[len - 1] = 9;
+                let mut held = was.clone();
+                // SAFETY: our allocation.
+                let done = unsafe {
+                    if missing {
+                        VirtualFree(pages.0.cast(), 4096, MEM_DECOMMIT);
+                    } else {
+                        VirtualProtect(pages.0.cast(), 4096, PAGE_READONLY, &mut old);
+                    }
+                    let done = merge(pages.0.add(at), now.as_ptr(), held.as_mut_ptr(), len, take);
+                    VirtualAlloc(pages.0.cast(), 4096, MEM_COMMIT, PAGE_READWRITE);
+                    VirtualProtect(pages.0.cast(), 4096, PAGE_READWRITE, &mut old);
+                    done
+                };
+                assert!(!done.there);
+                assert_eq!(held, if take { now.clone() } else { was.clone() }, "{missing} {take} {at} {len}");
+                // Nothing to put: nothing fails.
+                let mut held = now.clone();
+                // SAFETY: as above; the addresses are no one's.
+                let done = unsafe { merge(std::ptr::without_provenance_mut(0x1000 + at), now.as_ptr(), held.as_mut_ptr(), len, take) };
+                assert!(done.there && done.new == 0);
+            }
+        }
+    }
+
+    /// [`merge`] beside threads that write other dwords of the same memory:
+    /// none of their writes is lost or undone.
+    #[test]
+    fn merges_undo_no_write_of_other_threads() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        assert!(on());
+        let pages = Pages::new(1 << 12);
+        let base = pages.0 as usize;
+        // SAFETY: committed, aligned memory, only touched as atomics or by
+        // the merge's stores of whole dwords.
+        let dword = |i: usize| unsafe { &*((base + i * 4) as *const AtomicU32) };
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let writers: Vec<_> = (0..2usize)
+                .map(|w| {
+                    let stop = &stop;
+                    s.spawn(move || {
+                        let mut value = 1u32;
+                        while !stop.load(Ordering::Relaxed) {
+                            for i in (w..1024).step_by(4) {
+                                // This thread's own dword: nobody else's value.
+                                assert_eq!(dword(i).load(Ordering::Relaxed), value - 1, "dword {i}");
+                                dword(i).store(value, Ordering::Relaxed);
+                            }
+                            value += 1;
+                        }
+                    })
+                })
+                .collect();
+            // The card's dwords: every fourth, from the third on.
+            let mut held = vec![0u8; 4096];
+            for round in 1..3000u32 {
+                let mut now = held.clone();
+                for i in (2..1024).step_by(4) {
+                    if i * 7 % 5 != round as usize % 5 {
+                        now[i * 4..i * 4 + 4].copy_from_slice(&(round + i as u32).to_le_bytes());
+                    }
+                }
+                // SAFETY: the allocation, whole.
+                let done = unsafe { merge(base as *mut u8, now.as_ptr(), held.as_mut_ptr(), 4096, false) };
+                assert!(done.there);
+                for i in (2..1024).step_by(4) {
+                    let expect = u32::from_le_bytes(now[i * 4..i * 4 + 4].try_into().unwrap());
+                    assert_eq!(dword(i).load(Ordering::Relaxed), expect);
+                }
+                for i in (3..1024).step_by(4) {
+                    assert_eq!(dword(i).load(Ordering::Relaxed), 0);
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            for w in writers {
+                w.join().expect("no write was undone");
+            }
+        });
+    }
+
+    #[test]
+    fn differences_are_seen_wherever_they_are() {
+        for len in [0usize, 1, 31, 32, 33, 127, 128, 129, 200] {
+            let a = vec![7u8; len];
+            // SAFETY: the vectors' bytes.
+            assert!(!unsafe { differ(a.as_ptr(), a.clone().as_ptr(), len) });
+            for at in 0..len {
+                let mut b = a.clone();
+                b[at] = 8;
+                // SAFETY: as above.
+                assert!(unsafe { differ(a.as_ptr(), b.as_ptr(), len) }, "{len} {at}");
+            }
         }
     }
 

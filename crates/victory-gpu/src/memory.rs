@@ -304,6 +304,8 @@ pub(crate) fn ready(
             shadow.refresh(list, start, len);
         }
         if writes && (first_write || n >= numbered) {
+            #[cfg(feature = "diagnostics")]
+            crate::host::wide_write(start, len, 1);
             shadow.gpu_writes(list, start, len);
         }
     }

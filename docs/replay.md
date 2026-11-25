@@ -56,14 +56,18 @@ with the presented one.
 
 | switch | does |
 |---|---|
-| `--compare` | runs the frame unchanged first and prints the difference |
+| `--compare` | runs the frame unchanged and with the experiments turn by turn, and prints the difference |
 | `--skip-clamps` | no argument clamps and no barriers of their scratch buffers; draws read arguments kept from a first run |
+| `--batch-clamps` / `--batch-clamps 2` | argument clamps in batches, as `VICTORY_INDIRECT_BATCH=2` / `=1` does |
 | `--skip-hash-passes` | no compare/rehash passes over card buffers |
 | `--no-barriers` | no unordered-access barriers |
 | `--merge-barriers` | joins barrier calls with no work between them |
 | `--buffers vram` / `sysmem` | all buffers in the card's / the PC's memory |
+| `--only-buffers <what>` | with `--buffers`: only the buffers all of these match: `name=<text>`, `min=<bytes>`, `max=<bytes>`, `seen=No`, `Cached` or `Combined`, `id=<a>..<b>`, or `!` and one of them (repeatable) |
+| `--listing 3..7` | only writes the frame's buffers and those lists' commands |
 | `--one-submit` | one `ExecuteCommandLists`, with a full wait between the former ones |
 | `--only 3..7` | runs these lists; of the others only barriers |
+| `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
 | `--skip-shader <text>` | leaves out what runs pipelines with the text in their name or DXIL hash (repeatable) |
 | `--no-restore` | leaves what a loop changed |
 | `--debug-layer` | D3D12's debug layer; its errors in the report |
@@ -72,6 +76,29 @@ Use the median of several loops; the first is slower. An experiment that
 leaves out waits or work can draw another picture and, with wild data, lose
 the device: save work in other programs first. Do not run the title at the
 same time.
+
+## Runs that differ
+
+Shaders that give out places with atomics (the title's culling) give other
+ones in every run. The host layer brings such results to title memory and
+sends 64 KiB pieces of it up again, so the recorded copies hold the recorded
+run's results. Put over a replay's own, lists and what points into them are of
+two runs, and things are drawn from other things' lists. So copies of what the
+CPU wrote leave alone words the card has written in this run (`merge.rs`; the
+report counts them). `--no-merge` runs the copies as recorded.
+
+| switch | does |
+|---|---|
+| `--wait-all` / `--wait-lists` | a full wait after every command / each list sent alone and waited for: if pictures still differ, waits are not what is missing |
+| `--diverge [runs]` | runs each list this often from the very same memory, finds the first commands that make different memory of it, and says what differs (same values in another order: places given out); contents go to `diverge` in the capture |
+| `--diverge-picture [runs]` | from each list on, runs the rest this often from the same memory: where the pictures start to agree, what lies before decides. `--lists 76 --commands 0..900 --step 8` goes into one list |
+| `--diverge 10 --lists 76 --draws <text>` | each draw of the pipelines named, alone, this often: how many outcomes, and what it reads |
+| `--watch <id>:<offset>:<bytes>` | which lists (with `--lists`: commands) change those words |
+| `--slots <list>:<command>` | the heap slots its constants name |
+| `--check-written` | that everything the frame changes is put back |
+| `--dump <text>` | the DXIL of the pipelines named, in `shaders` |
+
+The `--diverge` family runs the recorded copies without the merge.
 
 ## Limits
 

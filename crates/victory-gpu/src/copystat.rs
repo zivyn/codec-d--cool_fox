@@ -740,6 +740,10 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    {
+        let [textures, staging] = crate::pool::memory();
+        tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \

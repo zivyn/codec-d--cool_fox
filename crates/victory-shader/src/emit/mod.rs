@@ -112,7 +112,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{host_settings, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -141,6 +141,14 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// Whether a pixel shader's helper lane reads its own value where the console reads the first
+/// lane's (`lower.rs` `first_lane`); on unless `VICTORY_HELPER_OWN=0`. Part of the translation:
+/// the shader cache keys on it.
+pub fn helper_own() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -1544,6 +1552,32 @@ mod barycentric_tests {
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
         emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    /// A pixel program's first-lane loop (no table entry in it, so not a waterfall the tracker
+    /// knows) asks for helper lanes, which is valid DXIL (upstream #946's program).
+    #[test]
+    fn a_pixel_first_lane_loop_serves_helper_lanes() {
+        let shader = pixel(
+            &[
+                0xD765_0000, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+                0x7E02_0280, // v_mov_b32 v1, 0
+                0xBE97_037E, // s_mov_b32 s23, exec_lo
+                0x7E18_0500, // v_readfirstlane_b32 s12, v0
+                0x7D84_000C, // v_cmp_eq_u32 vcc, s12, v0
+                0xBE95_3C6A, // s_and_saveexec_b32 s21, vcc_lo
+                0xBF80_0000, // s_nop 0
+                0x7E02_02FF, 0x3F80_0000, // v_mov_b32 v1, 1.0
+                0x897E_157E, // s_xor_b32 exec_lo, exec_lo, s21
+                0xBF89_FFF8, // s_cbranch_execnz loop
+                0xBEFE_0317, // s_mov_b32 exec_lo, s23
+                0xF800_180F, 0x0101_0101, // exp mrt0 v1 v1 v1 v1 done vm
+                0xBF81_0000, // s_endpgm
+            ],
+            0,
+        )
+        .unwrap();
+        validate(&shader);
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.

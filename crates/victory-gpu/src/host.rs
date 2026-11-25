@@ -1547,6 +1547,9 @@ struct CardPlan {
     /// The lists of ours the plan recorded (whether the compare, the
     /// list), given back by `Host::card_done`.
     lists: Vec<(bool, Prelude)>,
+    /// With [`relay`]: the number of the send to copies in the card's memory
+    /// that the submission ran behind ([`QUEUE_ORDER`]).
+    sent_as: u64,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -1776,6 +1779,27 @@ pub(crate) fn relay() -> bool {
 fn relay_exact() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_some_and(|v| v == "2"))
+}
+
+/// Whether the pieces the relay fetches from the card's memory come over the
+/// card's copy queue (`VICTORY_RELAY_COPY=1`) and not over the queue that
+/// draws.
+///
+/// On the drawing queue a fetch runs behind whatever was sent meanwhile,
+/// and with the relay that is most of a frame: the thread that lands flights
+/// stood 48 ms of a 120 ms frame waiting for seven fetches of 94 MB in all,
+/// a few milliseconds of copying, and everything that waits for a landing
+/// (the title's fences, reads of memory flights may write) waited with it.
+///
+/// What changes: the fetch runs when its flights are done and beside later
+/// submissions, so of the sends of title bytes it is only known to have run
+/// behind those its own flights ran behind (`CardPlan::sent_as`). Bytes sent
+/// later are left out of the merge (`Shadow::card_merge_relay`): they are
+/// the title's, newer than what the flights wrote. A later flight's bytes
+/// may be in what is fetched, as before.
+fn relay_copy() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -2041,6 +2065,74 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, true)
 }
 
+/// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
+/// flights when the title itself wrote the memory since they were given it
+/// (`VICTORY_FILL_TITLE=1`; off by default).
+///
+/// The title's 174 MB heap is declared written as a whole (a root view has
+/// no size), and the title keeps a ring of constants in it: one fill of 480
+/// bytes a frame, at a new place each time, waited for every flight's
+/// copy-back, some 30 ms of a 130 ms frame (run blame1: 38 of the 40 waits
+/// named). The title writes those bytes just before the draw that reads
+/// them, which takes the block's guard off ([`crate::watch::written_since_taken`]).
+///
+/// Or no shader's write went into that page in the last 600 frames
+/// ([`crate::watch::landed_lately`]): the first alone left two thirds of
+/// the wait, for constants at the end of a 64 KiB page that the title wrote
+/// before the page was taken.
+///
+/// What can go wrong: a constant a flight's shader really writes, in a
+/// block that the title (or an earlier flight's copy-back) also wrote, or
+/// for the first time, is read as it was before that flight.
+fn fill_is_titles(src: usize, len: usize) -> bool {
+    const SMALL: usize = 64 << 10;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_TITLE").is_some_and(|v| v == "1"));
+    on && len <= SMALL && (crate::watch::written_since_taken(src, len) || !crate::watch::landed_lately(src, len, 600))
+}
+
+/// Diagnostics: the reads that made a submission wait for flights: what
+/// kind, where, how much, and the declared write it lies in; how often and
+/// how long the wait was.
+#[cfg(feature = "diagnostics")]
+type Blame = std::collections::HashMap<(&'static str, usize, usize, usize, usize), (u64, u64)>;
+#[cfg(feature = "diagnostics")]
+static BLAME: Mutex<Option<Blame>> = Mutex::new(None);
+#[cfg(feature = "diagnostics")]
+static BLAMED: Mutex<Option<(&'static str, usize, usize, usize, usize)>> = Mutex::new(None);
+
+#[cfg(feature = "diagnostics")]
+fn blame(kind: &'static str, written: &[(usize, usize)], at: usize, len: usize) {
+    let i = written.partition_point(|r| r.1 <= at);
+    let (from, to) = written.get(i).copied().unwrap_or((0, 0));
+    *BLAMED.lock().unwrap_or_else(|e| e.into_inner()) = Some((kind, at, len, from, to - from));
+}
+
+/// The wait for what [`blame`] last named took `us`.
+#[cfg(feature = "diagnostics")]
+fn blamed(us: u64) {
+    if let Some(key) = BLAMED.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let mut all = BLAME.lock().unwrap_or_else(|e| e.into_inner());
+        let e = all.get_or_insert_with(Default::default).entry(key).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += us;
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_blame(frames: f64) {
+    let all = BLAME.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let mut all: Vec<_> = all.into_iter().collect();
+    all.sort_unstable_by_key(|(_, (_, us))| std::cmp::Reverse(*us));
+    for ((kind, at, len, from, size), (n, us)) in all.into_iter().take(8) {
+        tracing::info!(
+            "waited for flights, per frame: {:.1} ms in {:.2} waits for {kind} {at:#x}+{len:#x}, in shader writes declared over {from:#x}+{size:#x}",
+            us as f64 / 1e3 / frames,
+            n as f64 / frames
+        );
+    }
+}
+
 /// [`late_blocked`] against `written`, the title memory flights' shaders
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
@@ -2052,17 +2144,26 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
         for step in &list.deferred().copies {
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if touches(written, src, src + len) || touches(written, dst, dst + len) {
+                    let read = touches(written, src, src + len) && !fill_is_titles(src, len);
+                    if read || touches(written, dst, dst + len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            if read {
+                                blame("a buffer copy's source", written, src, len);
+                            } else {
+                                blame("a buffer copy's destination", written, dst, len);
+                            }
                         }
                         return Some(WHY_READ);
                     }
                 }
                 &Step::Fill(_, src, len) => {
-                    if touches(written, src, src + len) {
+                    if touches(written, src, src + len) && !fill_is_titles(src, len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a fill of upload memory", written, src, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2072,6 +2173,8 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, at, at + len) {
                         if count {
                             LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                            #[cfg(feature = "diagnostics")]
+                            blame("a texture", written, at, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -2316,6 +2419,8 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    blamed(us);
 }
 
 /// What the thread that lands flights fetches card copies' pieces with
@@ -2323,6 +2428,8 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
 /// behind the submission lock), and the memory the pieces come down to.
 struct RelayFetch {
     list: Prelude,
+    /// With [`relay_copy`]: the card's copy queue, which `list` is for.
+    queue: Option<ID3D12CommandQueue>,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -3096,6 +3203,7 @@ impl Host {
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
+            sent_as,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3212,13 +3320,36 @@ impl Host {
 
     /// The relay's own list, fence, event for [`Host::relay_card_back`].
     fn make_relay_fetch(&self) -> Option<RelayFetch> {
-        let list = self.make_prelude()?;
+        // SAFETY: plain object creation.
+        let copying = relay_copy().then(|| unsafe {
+            (|| -> windows::core::Result<(Prelude, ID3D12CommandQueue)> {
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                let list: ID3D12GraphicsCommandList =
+                    self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                list.Close()?;
+                let queue: ID3D12CommandQueue = self.device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_COPY,
+                    Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
+                    ..Default::default()
+                })?;
+                Ok(((allocator, list), queue))
+            })()
+        });
+        let (list, queue) = match copying {
+            Some(Ok((list, queue))) => (list, Some(queue)),
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "no copy queue: what shaders wrote to the card's memory is fetched on the drawing queue");
+                (self.make_prelude()?, None)
+            }
+            None => (self.make_prelude()?, None),
+        };
         // SAFETY: plain objects of our own.
         unsafe {
             let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
+                queue,
                 fence,
                 event,
                 sent: 0,
@@ -3278,13 +3409,21 @@ impl Host {
                 }
             }
         }
-        if pieces.is_empty() {
-            // Nothing to fetch: every send so far is older than the next fetch.
-            crate::shadow::relay_fetched(*QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
-            return;
-        }
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
+        }
+        // The sends these flights ran behind, all a fetch on the copy queue
+        // is known to have run behind.
+        let behind = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
+        if pieces.is_empty() {
+            // Nothing to fetch: every send so far is older than the next
+            // fetch, if that goes to the queue the sends went to.
+            let after = match fetch.as_ref().is_some_and(|f| f.queue.is_some()) {
+                true => behind,
+                false => *QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()),
+            };
+            crate::shadow::relay_fetched(after);
+            return;
         }
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
@@ -3298,6 +3437,7 @@ impl Host {
         };
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
+        let copy_queue = f.queue.clone();
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -3311,6 +3451,13 @@ impl Host {
                 }
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
+                if let Some(queue) = &copy_queue {
+                    queue.ExecuteCommandLists(&lists);
+                    queue.Signal(&fence, sent)?;
+                    fence.SetEventOnCompletion(sent, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                    return Ok(behind);
+                }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -5848,6 +5995,7 @@ impl Meter {
             );
             #[cfg(feature = "diagnostics")]
             {
+                log_blame(frames);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

@@ -85,6 +85,15 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
     },
+    /// Translate every shader found (as `translate` finds them) into the
+    /// shader cache, so that no run has to: a few minutes, once per change
+    /// of the translator.
+    Shaders {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -163,6 +172,7 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
+        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         Command::Run {
             exe,
             unimplemented,

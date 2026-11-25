@@ -37,6 +37,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod pool;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;

@@ -16,6 +16,9 @@ victory-formats.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
 
+[build-dependencies]
+blake3.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 

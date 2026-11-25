@@ -955,25 +955,27 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let filled = fill(out).map(drop);
+        // Again now that the bytes are there: a texture looked at in between
+        // was uploaded without them (`xmem::pages_written`).
+        if super::xmem::stream_notice() {
+            victory_gpu::kernel_will_write(request.destination as usize, len);
+        }
+        return filled;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let pages = &page_list(request.destination.cast(), offset, len)[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let filled = fill(window.bytes()).map(drop);
+        super::xmem::pages_written(pages, offset, len);
+        return filled;
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
+        super::xmem::pages_written(pages, offset, n);
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result
@@ -988,6 +990,38 @@ fn into_destination(
         );
         Err(E_INVALIDARG)
     }
+}
+
+/// The request's page numbers, one per 64 KiB of destination. The title
+/// queues a request before it has filled its page list in, and a worker that
+/// reads the list at once finds page 0 in it (pages of models and textures
+/// that were then never written: walls missing for the whole run). So a list
+/// with a page the title does not own is read again for a while, up to
+/// 1.5 s; what it holds then is used as it is.
+fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
+    let read = || -> Vec<usize> {
+        (0..(offset + len).div_ceil(PAGE))
+            // SAFETY: the title passes a page number per 64 KiB of
+            // destination, which holds at least `len` bytes from `offset`;
+            // it may be writing them.
+            .map(|i| unsafe { list.add(i).read_volatile() })
+            .collect()
+    };
+    let started = std::time::Instant::now();
+    let mut pages = read();
+    while !super::xmem::pages_known(&pages, offset, len) && started.elapsed().as_millis() < 1500 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        pages = read();
+    }
+    let waited = started.elapsed();
+    if waited.as_millis() >= 1 {
+        tracing::info!(
+            ms = waited.as_millis() as u64,
+            known = super::xmem::pages_known(&pages, offset, len),
+            "dstorage: a destination's page list was not filled in yet"
+        );
+    }
+    pages
 }
 
 /// Slots by the 2020 order, which the argument shapes at

@@ -72,7 +72,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), then name offset.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +90,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -418,6 +418,60 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_vertex_outputs_preserve_name_order_and_declared_interpolation() {
+        let integer = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
+            kind: 0,
+            comp: 5,
+            interp: 1,
+            row: Some(0),
+            col: 2,
+            cols: 2,
+            usage: 3,
+            half: false,
+        };
+        let flat_float = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            comp: 9,
+            col: 0,
+            ..integer.clone()
+        };
+        let smooth_float = SigElement {
+            index: 2,
+            row: Some(1),
+            interp: 2,
+            comp: 9,
+            ..integer.clone()
+        };
+        let outputs = [integer, flat_float, smooth_float];
+        let mut recovered = super::super::signature(&signature(&outputs, false)).unwrap();
+        // DXC orders the row by semantic-name offset even though TEXCOORD
+        // occupies z/w and COLOR occupies x/y.
+        assert_eq!(recovered[0].name, "TEXCOORD");
+        assert_eq!(recovered[1].name, "COLOR");
+        // PSV records can be in a different order again.
+        let psv = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &[],
+            outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        recovered[1].interp = 2;
+        super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
+        assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
+        assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
+            .is_err());
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

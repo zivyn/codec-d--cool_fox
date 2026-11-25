@@ -105,11 +105,21 @@ fn lowered_on(
     wide: &HashSet<usize>,
     host_wave: u32,
 ) -> Result<HostShader, ShaderError> {
+    lowered_counted(native, p, wide, host_wave, false)
+}
+
+fn lowered_counted(
+    native: &NativeProgram,
+    p: &ir::Program,
+    wide: &HashSet<usize>,
+    host_wave: u32,
+    counted: bool,
+) -> Result<HostShader, ShaderError> {
     let st = structure::structure_wide(p, wide).expect("structure");
     let res = resource::track(p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
-    let lowered = lower::lower(&lower::Parts {
+    let lowered = lower::lower_counted(&lower::Parts {
         native,
         p,
         st: &st,
@@ -119,7 +129,7 @@ fn lowered_on(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    });
+    }, counted);
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
     Ok(HostShader {
@@ -685,4 +695,44 @@ fn scc_of_a_mask_operation_joined_with_a_scalar_test_needs_the_skip_wave_wide() 
         assert_eq!(got, expected, "{below} lanes inside, s1 = {s1}");
     }
     eprintln!("ran on the hardware device: the inner test's SCC for every lane once some lane is inside");
+}
+
+/// A dispatch counted in threads: of the last group only the lanes below the
+/// count store (after DexNom/VIctory bc3cd4b0).
+#[test]
+fn the_lanes_past_a_count_of_threads_do_not_run() {
+    // Each lane that runs adds 1 to counter[local x].
+    let native = native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7e04_0281, // v_mov_b32 v2, 1
+        0xe0c8_1000, 0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+    ]);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+    let shader = lowered_counted(&native, &p, &HashSet::new(), 64, true).unwrap();
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .unwrap();
+    assert_eq!((limit.slot, limit.dword), (0, 64));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(true) else { return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+    for count in [0u32, 1, 7, 63, 64, 65, 74, 77, 127, 128] {
+        let mut constants = vec![0; shader.user_data_dwords() as usize];
+        constants[limit.index as usize] = count;
+        let result = host
+            .dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants))],
+                views: &[View::RawUav(68)],
+                samplers: &[],
+                groups: [2, 1, 1],
+            })
+            .unwrap();
+        let active = if count == 0 { 128 } else { count };
+        for (i, &word) in result[0].iter().enumerate().take(64) {
+            let i = i as u32;
+            assert_eq!(word, u32::from(i < active) + u32::from(i + 64 < active), "count {count}, word {i}");
+        }
+    }
 }

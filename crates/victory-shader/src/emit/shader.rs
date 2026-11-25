@@ -80,6 +80,12 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// has no size, and the host's copy of what it names may end in the middle of
 /// it (a structure of megabytes crosses the 4 MiB windows).
 pub const USER_ROOT_ADDRESS: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host sets at a dispatch
+/// counted in threads (the console's `DispatchX`): how many of the threads
+/// numbered along X run (0: all of every group). The metadata's `dword` is
+/// the group's width. Asked for by the structure builder's programs
+/// ([`crate::spill::is_spilled`]).
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -507,6 +513,27 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.pixel {
+            // Reading a per-vertex value with attributeAtVertex needs a
+            // constant input, even when the source declaration was smooth.
+            // D3D requires all components packed into the same register to
+            // share a mode, including the ones the shader never reads.
+            for index in 0..self.inputs.len() {
+                let unused = &self.inputs[index];
+                if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
+                    continue;
+                }
+                let mut modes = self.inputs.iter()
+                    .filter(|e| e.row == unused.row && e.usage != 0)
+                    .map(|e| e.interp);
+                if let Some(mode) = modes.next()
+                    && (mode == 1 || unused.comp == 9)
+                    && modes.all(|other| other == mode)
+                {
+                    self.inputs[index].interp = mode;
+                }
+            }
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a

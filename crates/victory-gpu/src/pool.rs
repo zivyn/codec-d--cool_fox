@@ -31,6 +31,9 @@ const BLOCK: u64 = 64 << 20;
 const SPARE: usize = 2;
 /// The same while the card has room ([`room`]): 4 GiB of them.
 const SPARE_KEPT: usize = 64;
+/// The same of blocks of staging buffers, which are the PC's memory: run
+/// crash-1 held 5.2 GB of them.
+const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
@@ -125,13 +128,14 @@ struct Pool<B> {
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
     resting: VecDeque<(u64, Piece)>,
-    /// The empty blocks it was last told to keep.
+    /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
+    most: usize,
 }
 
 impl<B: Clone> Pool<B> {
-    const fn new() -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0 }
+    const fn new(most: usize) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -190,7 +194,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed);
+        let most = SPARES.load(Ordering::Relaxed).min(self.most);
         if any || most < self.spare {
             self.spare = most;
             let mut spare = 0;
@@ -216,8 +220,8 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new());
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new());
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -424,7 +428,7 @@ mod tests {
 
     #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
-        let mut pool: Pool<u32> = Pool::new();
+        let mut pool: Pool<u32> = Pool::new(SPARE);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -451,10 +455,10 @@ mod tests {
             pool.give(p, 20);
         }
         pool.rested(20 + REST);
-        assert_eq!(pool.blocks(), blocks.min(SPARES.load(Ordering::Relaxed)));
+        assert_eq!(pool.blocks(), blocks.min(SPARE));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
-        let mut none: Pool<u32> = Pool::new();
+        let mut none: Pool<u32> = Pool::new(SPARE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 

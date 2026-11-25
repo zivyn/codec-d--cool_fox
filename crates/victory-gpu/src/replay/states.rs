@@ -51,7 +51,15 @@ pub struct States {
 impl States {
     /// A texture of `subs` subresources starts in `state`.
     pub fn add(&mut self, res: u32, subs: u32, state: u32, decays: bool) {
-        self.map.insert(res, One { subs: subs.max(1), decays, all: state, each: Vec::new() });
+        self.map.insert(
+            res,
+            One {
+                subs: subs.max(1),
+                decays,
+                all: state,
+                each: Vec::new(),
+            },
+        );
     }
 
     /// A placed resource is the one in use now.
@@ -68,7 +76,11 @@ impl States {
     /// One state, or one for each subresource.
     pub fn get(&self, res: u32) -> Option<Vec<u32>> {
         let one = self.map.get(&res)?;
-        Some(if one.each.is_empty() { vec![one.all] } else { one.each.clone() })
+        Some(if one.each.is_empty() {
+            vec![one.all]
+        } else {
+            one.each.clone()
+        })
     }
 
     pub fn change(&mut self, c: &Change) {
@@ -120,23 +132,50 @@ impl States {
 
 /// The changes a command makes.
 pub fn changes(cmd: &Cmd, out: &mut Vec<Change>) {
-    let promoted = |res, sub| Change { res, sub, after: COPY_DEST, promoted: true, alias: false };
+    let promoted = |res, sub| Change {
+        res,
+        sub,
+        after: COPY_DEST,
+        promoted: true,
+        alias: false,
+    };
     match cmd {
         Cmd::Barriers { all } => {
             for b in all {
                 match *b {
                     // The first half of a split barrier changes nothing yet.
-                    Barrier::Transition { flags, res, sub, after, .. } if flags & 1 == 0 => {
-                        out.push(Change { res, sub, after: after as u32, promoted: false, alias: false });
+                    Barrier::Transition {
+                        flags,
+                        res,
+                        sub,
+                        after,
+                        ..
+                    } if flags & 1 == 0 => {
+                        out.push(Change {
+                            res,
+                            sub,
+                            after: after as u32,
+                            promoted: false,
+                            alias: false,
+                        });
                     }
                     Barrier::Alias { after, .. } if after != 0 => {
-                        out.push(Change { res: after, sub: ALL, after: 0, promoted: false, alias: true });
+                        out.push(Change {
+                            res: after,
+                            sub: ALL,
+                            after: 0,
+                            promoted: false,
+                            alias: true,
+                        });
                     }
                     _ => {}
                 }
             }
         }
-        Cmd::CopyTexture { dst: Loc::Sub { res, sub }, .. } => out.push(promoted(*res, *sub)),
+        Cmd::CopyTexture {
+            dst: Loc::Sub { res, sub },
+            ..
+        } => out.push(promoted(*res, *sub)),
         Cmd::CopyResource { dst, .. } => out.push(promoted(*dst, ALL)),
         _ => {}
     }
@@ -147,7 +186,13 @@ mod tests {
     use super::*;
 
     fn set(res: u32, sub: u32, after: u32) -> Change {
-        Change { res, sub, after, promoted: false, alias: false }
+        Change {
+            res,
+            sub,
+            after,
+            promoted: false,
+            alias: false,
+        }
     }
 
     #[test]
@@ -165,7 +210,13 @@ mod tests {
         assert_eq!(s.get(1), Some(vec![0x80]), "equal states are one again");
         // A copy into a texture in the common state leaves it a copy
         // destination; one into a texture in another state changes nothing.
-        let copy = |res| Change { res, sub: ALL, after: COPY_DEST, promoted: true, alias: false };
+        let copy = |res| Change {
+            res,
+            sub: ALL,
+            after: COPY_DEST,
+            promoted: true,
+            alias: false,
+        };
         s.change(&copy(2));
         s.change(&copy(1));
         s.decay();
@@ -183,8 +234,28 @@ mod tests {
     #[test]
     fn commands_change_states() {
         let mut out = Vec::new();
-        let t = |flags| Barrier::Transition { flags, res: 1, sub: 0, before: 4, after: 8 };
-        changes(&Cmd::Barriers { all: vec![t(1), t(2), Barrier::Alias { flags: 0, before: 3, after: 4 }, Barrier::Uav { flags: 0, res: 1 }] }, &mut out);
+        let t = |flags| Barrier::Transition {
+            flags,
+            res: 1,
+            sub: 0,
+            before: 4,
+            after: 8,
+        };
+        changes(
+            &Cmd::Barriers {
+                all: vec![
+                    t(1),
+                    t(2),
+                    Barrier::Alias {
+                        flags: 0,
+                        before: 3,
+                        after: 4,
+                    },
+                    Barrier::Uav { flags: 0, res: 1 },
+                ],
+            },
+            &mut out,
+        );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], set(1, 0, 8));
         assert!(out[1].alias && out[1].res == 4);

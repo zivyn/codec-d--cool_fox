@@ -85,7 +85,10 @@ fn range(text: &str) -> Option<(u32, u32)> {
 
 pub(crate) fn run(r: Replay) -> Result<()> {
     let only = match &r.only {
-        Some(text) => Some(range(text).with_context(|| format!("--only {text}: not a list or a range of lists (3..7)"))?),
+        Some(text) => Some(
+            range(text)
+                .with_context(|| format!("--only {text}: not a list or a range of lists (3..7)"))?,
+        ),
         None => None,
     };
     let options = Options {

@@ -52,7 +52,9 @@ pub fn no_uav_barriers(cmds: Vec<Cmd>) -> (Vec<Cmd>, u32) {
 /// Barriers only: what a list left out still does to the states of
 /// resources.
 pub fn barriers_only(cmds: Vec<Cmd>) -> Vec<Cmd> {
-    cmds.into_iter().filter(|c| matches!(c, Cmd::Barriers { .. })).collect()
+    cmds.into_iter()
+        .filter(|c| matches!(c, Cmd::Barriers { .. }))
+        .collect()
 }
 
 /// Joins the barrier calls with no work between them into one; how many
@@ -96,7 +98,9 @@ pub fn merge_barriers(cmds: Vec<Cmd>) -> (Vec<Cmd>, u32) {
 fn join(have: &mut Vec<Barrier>, b: Barrier) {
     match b {
         Barrier::Uav { res, .. } => {
-            let covered = have.iter().any(|h| matches!(h, Barrier::Uav { res: r, .. } if *r == res || *r == NONE));
+            let covered = have
+                .iter()
+                .any(|h| matches!(h, Barrier::Uav { res: r, .. } if *r == res || *r == NONE));
             if covered {
                 return;
             }
@@ -105,16 +109,36 @@ fn join(have: &mut Vec<Barrier>, b: Barrier) {
             }
             have.push(b);
         }
-        Barrier::Transition { flags: 0, res, sub, before, after } => {
+        Barrier::Transition {
+            flags: 0,
+            res,
+            sub,
+            before,
+            after,
+        } => {
             // The last one of this resource, if it is of the same part of it.
-            let last = have.iter().rposition(|h| matches!(h, Barrier::Transition { res: r, .. } if *r == res));
+            let last = have
+                .iter()
+                .rposition(|h| matches!(h, Barrier::Transition { res: r, .. } if *r == res));
             if let Some(i) = last
-                && let Barrier::Transition { flags: 0, sub: s, before: first, after: until, .. } = have[i]
+                && let Barrier::Transition {
+                    flags: 0,
+                    sub: s,
+                    before: first,
+                    after: until,
+                    ..
+                } = have[i]
                 && s == sub
                 && until == before
             {
                 if first != after {
-                    have[i] = Barrier::Transition { flags: 0, res, sub, before: first, after };
+                    have[i] = Barrier::Transition {
+                        flags: 0,
+                        res,
+                        sub,
+                        before: first,
+                        after,
+                    };
                 } else {
                     have.remove(i);
                     if after == UNORDERED_ACCESS {
@@ -150,7 +174,12 @@ pub fn find_clamps(cmds: &[Cmd], psos: &HashSet<u32>, next: &mut u64) -> Vec<Cla
     for (at, c) in cmds.iter().enumerate() {
         match c {
             Cmd::Pipeline { pso } => bound = *pso,
-            Cmd::Constants { graphics: false, param: 0, offset, values } => {
+            Cmd::Constants {
+                graphics: false,
+                param: 0,
+                offset,
+                values,
+            } => {
                 for (i, v) in values.iter().enumerate() {
                     if let Some(c) = constants.get_mut(*offset as usize + i) {
                         *c = *v;
@@ -159,11 +188,21 @@ pub fn find_clamps(cmds: &[Cmd], psos: &HashSet<u32>, next: &mut u64) -> Vec<Cla
             }
             // The clamp's parameters: constants (kind, stride, records,
             // ...), arguments, count, then where it writes.
-            Cmd::RootView { graphics: false, param: 3, va: Va::At { res, offset: 0 }, .. } => to = Some(*res),
+            Cmd::RootView {
+                graphics: false,
+                param: 3,
+                va: Va::At { res, offset: 0 },
+                ..
+            } => to = Some(*res),
             Cmd::Dispatch { .. } if psos.contains(&bound) => {
                 if let Some(scratch) = to {
                     let bytes = u64::from(constants[1]) * u64::from(constants[2]);
-                    found.push(Clamp { at, scratch, bytes, result: *next });
+                    found.push(Clamp {
+                        at,
+                        scratch,
+                        bytes,
+                        result: *next,
+                    });
                     *next += bytes.next_multiple_of(256);
                 }
             }
@@ -189,10 +228,22 @@ pub fn keep_clamped(cmds: Vec<Cmd>, clamps: &[Clamp]) -> Vec<Cmd> {
         out.push(c);
         if done && let Some(clamp) = open.take() {
             let moved = |before, after| Cmd::Barriers {
-                all: vec![Barrier::Transition { flags: 0, res: clamp.scratch, sub: ALL, before, after }],
+                all: vec![Barrier::Transition {
+                    flags: 0,
+                    res: clamp.scratch,
+                    sub: ALL,
+                    before,
+                    after,
+                }],
             };
             out.push(moved(INDIRECT_ARGUMENT, COPY_SOURCE));
-            out.push(Cmd::CopyBuffer { dst: RESULTS, dst_at: clamp.result, src: clamp.scratch, src_at: 0, len: clamp.bytes });
+            out.push(Cmd::CopyBuffer {
+                dst: RESULTS,
+                dst_at: clamp.result,
+                src: clamp.scratch,
+                src_at: 0,
+                len: clamp.bytes,
+            });
             out.push(moved(COPY_SOURCE, INDIRECT_ARGUMENT));
         }
     }
@@ -223,9 +274,23 @@ pub fn skip_clamps(cmds: Vec<Cmd>, clamps: &[Clamp]) -> Vec<Cmd> {
                     out.push(Cmd::Barriers { all });
                 }
             }
-            Cmd::Indirect { signature, most, args, at, count, count_at } if last.contains_key(&args) => {
+            Cmd::Indirect {
+                signature,
+                most,
+                args,
+                at,
+                count,
+                count_at,
+            } if last.contains_key(&args) => {
                 let result = last.get(&args).copied().unwrap_or(0);
-                out.push(Cmd::Indirect { signature, most, args: RESULTS, at: result + at, count, count_at });
+                out.push(Cmd::Indirect {
+                    signature,
+                    most,
+                    args: RESULTS,
+                    at: result + at,
+                    count,
+                    count_at,
+                });
             }
             c => out.push(c),
         }
@@ -247,7 +312,13 @@ mod tests {
         Barrier::Uav { flags: 0, res }
     }
     fn moved(res: u32, before: i32, after: i32) -> Barrier {
-        Barrier::Transition { flags: 0, res, sub: ALL, before, after }
+        Barrier::Transition {
+            flags: 0,
+            res,
+            sub: ALL,
+            before,
+            after,
+        }
     }
     fn barriers(all: &[Barrier]) -> Cmd {
         Cmd::Barriers { all: all.to_vec() }
@@ -255,18 +326,47 @@ mod tests {
 
     #[test]
     fn pipelines_are_skipped() {
-        let list = vec![pso(1), go(), pso(2), go(), go(), Cmd::CopyResource { dst: 1, src: 2 }, pso(1), go()];
+        let list = vec![
+            pso(1),
+            go(),
+            pso(2),
+            go(),
+            go(),
+            Cmd::CopyResource { dst: 1, src: 2 },
+            pso(1),
+            go(),
+        ];
         let (out, n) = skip_pipelines(list.clone(), &HashSet::from([2]));
         assert_eq!(n, 2);
-        assert_eq!(out, vec![pso(1), go(), pso(2), Cmd::CopyResource { dst: 1, src: 2 }, pso(1), go()]);
+        assert_eq!(
+            out,
+            vec![
+                pso(1),
+                go(),
+                pso(2),
+                Cmd::CopyResource { dst: 1, src: 2 },
+                pso(1),
+                go()
+            ]
+        );
         assert_eq!(skip_pipelines(list.clone(), &HashSet::new()), (list, 0));
     }
 
     #[test]
     fn uav_barriers_are_dropped() {
-        let list = vec![barriers(&[uav(0)]), go(), barriers(&[uav(1), moved(1, 8, 4)])];
-        assert_eq!(no_uav_barriers(list.clone()), (vec![go(), barriers(&[moved(1, 8, 4)])], 2));
-        assert_eq!(barriers_only(list.clone()), vec![list[0].clone(), list[2].clone()]);
+        let list = vec![
+            barriers(&[uav(0)]),
+            go(),
+            barriers(&[uav(1), moved(1, 8, 4)]),
+        ];
+        assert_eq!(
+            no_uav_barriers(list.clone()),
+            (vec![go(), barriers(&[moved(1, 8, 4)])], 2)
+        );
+        assert_eq!(
+            barriers_only(list.clone()),
+            vec![list[0].clone(), list[2].clone()]
+        );
     }
 
     #[test]
@@ -286,11 +386,33 @@ mod tests {
         ];
         let (out, saved) = merge_barriers(list);
         assert_eq!(saved, 4);
-        assert_eq!(out, vec![barriers(&[moved(1, 0, 64), uav(0)]), pso(1), go(), barriers(&[uav(1)]), go()]);
+        assert_eq!(
+            out,
+            vec![
+                barriers(&[moved(1, 0, 64), uav(0)]),
+                pso(1),
+                go(),
+                barriers(&[uav(1)]),
+                go()
+            ]
+        );
         // Parts of a resource are not mixed up.
-        let part = |sub, before, after| Barrier::Transition { flags: 0, res: 1, sub, before, after };
-        let list = vec![barriers(&[part(0, 4, 8)]), barriers(&[part(1, 4, 8)]), barriers(&[part(ALL, 8, 64)])];
-        assert_eq!(merge_barriers(list).0, vec![barriers(&[part(0, 4, 8), part(1, 4, 8), part(ALL, 8, 64)])]);
+        let part = |sub, before, after| Barrier::Transition {
+            flags: 0,
+            res: 1,
+            sub,
+            before,
+            after,
+        };
+        let list = vec![
+            barriers(&[part(0, 4, 8)]),
+            barriers(&[part(1, 4, 8)]),
+            barriers(&[part(ALL, 8, 64)]),
+        ];
+        assert_eq!(
+            merge_barriers(list).0,
+            vec![barriers(&[part(0, 4, 8), part(1, 4, 8), part(ALL, 8, 64)])]
+        );
     }
 
     #[test]
@@ -299,29 +421,84 @@ mod tests {
             vec![
                 barriers(&[uav(0), moved(scratch, 0, 8)]),
                 pso(9),
-                Cmd::Constants { graphics: false, param: 0, offset: 0, values: vec![10, stride, records, 0, 0, 0] },
-                Cmd::RootView { graphics: false, kind: 3, param: 3, va: Va::At { res: scratch, offset: 0 } },
+                Cmd::Constants {
+                    graphics: false,
+                    param: 0,
+                    offset: 0,
+                    values: vec![10, stride, records, 0, 0, 0],
+                },
+                Cmd::RootView {
+                    graphics: false,
+                    kind: 3,
+                    param: 3,
+                    va: Va::At {
+                        res: scratch,
+                        offset: 0,
+                    },
+                },
                 go(),
                 barriers(&[uav(0), moved(scratch, 8, 0x200)]),
             ]
         };
-        let run = |args, at| Cmd::Indirect { signature: 1, most: 1, args, at, count: 0, count_at: 0 };
+        let run = |args, at| Cmd::Indirect {
+            signature: 1,
+            most: 1,
+            args,
+            at,
+            count: 0,
+            count_at: 0,
+        };
         let mut list = clamp(5, 12, 2);
         list.extend([pso(1), run(5, 12), run(5, 0), run(6, 0)]);
         list.extend(clamp(5, 12, 100));
         list.extend([pso(1), run(5, 24), barriers(&[moved(5, 0x200, 0)])]);
         let mut next = 0;
         let found = find_clamps(&list, &HashSet::from([9]), &mut next);
-        assert_eq!(found.iter().map(|c| (c.scratch, c.bytes, c.result)).collect::<Vec<_>>(), [(5, 24, 0), (5, 1200, 256)]);
+        assert_eq!(
+            found
+                .iter()
+                .map(|c| (c.scratch, c.bytes, c.result))
+                .collect::<Vec<_>>(),
+            [(5, 24, 0), (5, 1200, 256)]
+        );
         assert_eq!(next, 256 + 1280);
         let kept = keep_clamped(list.clone(), &found);
         assert_eq!(kept.len(), list.len() + 6);
-        assert_eq!(kept[7], Cmd::CopyBuffer { dst: RESULTS, dst_at: 0, src: 5, src_at: 0, len: 24 });
-        assert_eq!(kept.iter().filter(|c| matches!(c, Cmd::CopyBuffer { .. })).count(), 2);
+        assert_eq!(
+            kept[7],
+            Cmd::CopyBuffer {
+                dst: RESULTS,
+                dst_at: 0,
+                src: 5,
+                src_at: 0,
+                len: 24
+            }
+        );
+        assert_eq!(
+            kept.iter()
+                .filter(|c| matches!(c, Cmd::CopyBuffer { .. }))
+                .count(),
+            2
+        );
         let skipped = skip_clamps(list, &found);
-        assert!(!skipped.iter().any(|c| matches!(c, Cmd::Dispatch { .. } | Cmd::Barriers { .. })));
-        let runs: Vec<(u32, u64)> =
-            skipped.iter().filter_map(|c| if let Cmd::Indirect { args, at, .. } = c { Some((*args, *at)) } else { None }).collect();
-        assert_eq!(runs, [(RESULTS, 12), (RESULTS, 0), (6, 0), (RESULTS, 256 + 24)]);
+        assert!(
+            !skipped
+                .iter()
+                .any(|c| matches!(c, Cmd::Dispatch { .. } | Cmd::Barriers { .. }))
+        );
+        let runs: Vec<(u32, u64)> = skipped
+            .iter()
+            .filter_map(|c| {
+                if let Cmd::Indirect { args, at, .. } = c {
+                    Some((*args, *at))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            runs,
+            [(RESULTS, 12), (RESULTS, 0), (6, 0), (RESULTS, 256 + 24)]
+        );
     }
 }

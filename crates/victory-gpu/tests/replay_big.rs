@@ -3,7 +3,8 @@
 //! thousands of textures and buffers, a view heap of 1.5 million slots, 30
 //! submissions of 40,000 calls.
 //!
-//! `BIG_TEXTURES` (17000) and `BIG_FOLDER` (a temporary one) change it.
+//! `BIG_TEXTURES` (17000), `BIG_CARD` (600 buffers of 1 MB in the card's
+//! memory) and `BIG_FOLDER` (a temporary one) change it.
 #![cfg(all(windows, feature = "diagnostics"))]
 
 use std::mem::ManuallyDrop;
@@ -24,12 +25,18 @@ const VIEWS: u32 = 1_500_000;
 fn buffer(device: &ID3D12Device, kind: u32, size: u64) -> (ID3D12Resource, *mut u8) {
     let (heap, state, flags) = match kind {
         0 => (
-            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            },
             D3D12_RESOURCE_STATE_COMMON,
             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         ),
         1 => (
-            D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+            D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_UPLOAD,
+                ..Default::default()
+            },
             D3D12_RESOURCE_STATE_GENERIC_READ,
             D3D12_RESOURCE_FLAG_NONE,
         ),
@@ -50,7 +57,10 @@ fn buffer(device: &ID3D12Device, kind: u32, size: u64) -> (ID3D12Resource, *mut 
         Height: 1,
         DepthOrArraySize: 1,
         MipLevels: 1,
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         Flags: flags,
         ..Default::default()
@@ -59,7 +69,9 @@ fn buffer(device: &ID3D12Device, kind: u32, size: u64) -> (ID3D12Resource, *mut 
     let mut data = std::ptr::null_mut();
     // SAFETY: plain creation and mapping.
     unsafe {
-        device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made).unwrap();
+        device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)
+            .unwrap();
         let made = made.unwrap();
         if kind > 0 {
             made.Map(0, None, Some(&mut data)).unwrap();
@@ -72,7 +84,11 @@ fn buffer(device: &ID3D12Device, kind: u32, size: u64) -> (ID3D12Resource, *mut 
     }
 }
 
-fn barrier(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+fn barrier(
+    res: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -86,6 +102,14 @@ fn barrier(res: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RES
         },
         ..Default::default()
     }
+}
+
+/// A number from the environment.
+fn number(name: &str, otherwise: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(otherwise)
 }
 
 struct Big {
@@ -105,7 +129,10 @@ struct Big {
 impl Big {
     fn new(device: &ID3D12Device, textures: usize) -> Big {
         let texture = |size: u32, flags, state| {
-            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
             let desc = D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
                 Width: u64::from(size),
@@ -113,24 +140,45 @@ impl Big {
                 DepthOrArraySize: 1,
                 MipLevels: if size == 256 { 9 } else { 1 },
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Flags: flags,
                 ..Default::default()
             };
             let mut made: Option<ID3D12Resource> = None;
             // SAFETY: plain creation.
-            unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made).unwrap() };
+            unsafe {
+                device
+                    .CreateCommittedResource(
+                        &heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap()
+            };
             made.unwrap()
         };
         // SAFETY: plain creation; slots of the heap just made.
         unsafe {
             let queue: ID3D12CommandQueue = device
-                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
                 .unwrap();
             let lists = (0..SUBMITS)
                 .map(|_| {
-                    let a: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-                    let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None).unwrap();
+                    let a: ID3D12CommandAllocator = device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        .unwrap();
+                    let l: ID3D12GraphicsCommandList = device
+                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &a, None)
+                        .unwrap();
                     l.Close().unwrap();
                     (a, l)
                 })
@@ -143,26 +191,47 @@ impl Big {
                     NodeMask: 0,
                 })
                 .unwrap();
-            let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let step = device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
             let start = views.GetCPUDescriptorHandleForHeapStart().ptr;
             let textures: Vec<ID3D12Resource> = (0..textures)
-                .map(|_| texture(256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE))
+                .map(|_| {
+                    texture(
+                        256,
+                        D3D12_RESOURCE_FLAG_NONE,
+                        D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+                    )
+                })
                 .collect();
             for i in 0..VIEWS as usize {
-                let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i * step };
+                let at = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: start + i * step,
+                };
                 device.CreateShaderResourceView(&textures[i % textures.len()], None, at);
             }
-            let shared: Vec<(ID3D12Resource, *mut u8)> = (0..1000).map(|_| buffer(device, 2, 1 << 20)).collect();
+            let shared: Vec<(ID3D12Resource, *mut u8)> =
+                (0..1000).map(|_| buffer(device, 2, 1 << 20)).collect();
             for (i, (b, _)) in shared.iter().enumerate() {
                 let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                     Format: DXGI_FORMAT_R32_TYPELESS,
                     ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
                     Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                     Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                        Buffer: D3D12_BUFFER_SRV { NumElements: 1 << 18, Flags: D3D12_BUFFER_SRV_FLAG_RAW, ..Default::default() },
+                        Buffer: D3D12_BUFFER_SRV {
+                            NumElements: 1 << 18,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                            ..Default::default()
+                        },
                     },
                 };
-                device.CreateShaderResourceView(b, Some(&desc), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i * step });
+                device.CreateShaderResourceView(
+                    b,
+                    Some(&desc),
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: start + i * step,
+                    },
+                );
             }
             Big {
                 device: device.clone(),
@@ -171,11 +240,17 @@ impl Big {
                 value: 0,
                 lists,
                 _textures: textures,
-                card: (0..600).map(|_| buffer(device, 0, 1 << 20).0).collect(),
+                card: (0..number("BIG_CARD", 600))
+                    .map(|_| buffer(device, 0, 1 << 20).0)
+                    .collect(),
                 shared,
                 upload: (0..1000).map(|_| buffer(device, 1, 1 << 20)).collect(),
                 views,
-                target: texture(1024, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                target: texture(
+                    1024,
+                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                ),
             }
         }
     }
@@ -194,6 +269,21 @@ impl Big {
     }
 
     fn frame(&mut self, n: usize) {
+        if n == 0 {
+            // Nothing in the card's buffers is all zero, as in a title's.
+            // SAFETY: a list whose last run has finished; live buffers.
+            unsafe {
+                let (a, l) = &self.lists[0];
+                a.Reset().unwrap();
+                l.Reset(a, None).unwrap();
+                for (i, card) in self.card.iter().enumerate() {
+                    l.CopyBufferRegion(card, 0, &self.upload[i % self.upload.len()].0, 0, 1 << 20);
+                }
+                l.Close().unwrap();
+                self.queue.ExecuteCommandLists(&[Some(l.cast().unwrap())]);
+            }
+            self.wait();
+        }
         for s in 0..SUBMITS {
             // SAFETY: lists whose last run has finished; mappings written
             // inside their bounds.
@@ -206,8 +296,16 @@ impl Big {
                     let card = &self.card[(i * 7 + s) % self.card.len()];
                     let from = &self.upload[(i + s * 31) % self.upload.len()].0;
                     l.CopyBufferRegion(card, (i % 1000 * 1000) as u64 & !3, from, 0, 256);
-                    l.ResourceBarrier(&[barrier(card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
-                    l.ResourceBarrier(&[barrier(card, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                    l.ResourceBarrier(&[barrier(
+                        card,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    )]);
+                    l.ResourceBarrier(&[barrier(
+                        card,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
                     l.SetMarker(1, None, 0);
                 }
                 l.Close().unwrap();
@@ -231,8 +329,10 @@ fn a_frame_of_a_titles_size() {
     // SAFETY: plain creation.
     unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap() };
     let device = device.unwrap();
-    let textures = std::env::var("BIG_TEXTURES").ok().and_then(|v| v.parse().ok()).unwrap_or(17_000);
-    let timed = |what: &str, began: Instant| println!("{what}: {:.1} ms", began.elapsed().as_secs_f64() * 1e3);
+    let textures = number("BIG_TEXTURES", 17_000);
+    let timed = |what: &str, began: Instant| {
+        println!("{what}: {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
+    };
     let began = Instant::now();
     {
         let mut big = Big::new(&device, textures);
@@ -245,7 +345,12 @@ fn a_frame_of_a_titles_size() {
     }
     let dir = tempfile::tempdir().unwrap();
     let folder = std::env::var_os("BIG_FOLDER").map_or(dir.path().to_owned(), Into::into);
-    let settings = Settings { folder, at: At::Frame(4), frames: 1, always: false };
+    let settings = Settings {
+        folder,
+        at: At::Frame(4),
+        frames: 1,
+        always: false,
+    };
     let folder = record::start(settings, &device).unwrap();
     let began = Instant::now();
     let mut big = Big::new(&device, textures);
@@ -253,17 +358,39 @@ fn a_frame_of_a_titles_size() {
     for n in 0..8 {
         let began = Instant::now();
         big.frame(n);
-        timed(["frame", "frame, lists recorded", "frame, captured", "frame, after"][[0, 0, 0, 0, 1, 1, 2, 3][n]], began);
+        timed(
+            [
+                "frame",
+                "frame, lists recorded",
+                "frame, captured",
+                "frame, after",
+            ][[0, 0, 0, 0, 1, 1, 2, 3][n]],
+            began,
+        );
     }
     assert_eq!(record::finished(), Some(folder.clone()));
     drop(big);
     record::unhook(&device);
-    println!("{}", std::fs::read_to_string(folder.join("notes.txt")).unwrap());
+    println!(
+        "{}",
+        std::fs::read_to_string(folder.join("notes.txt")).unwrap()
+    );
     for f in std::fs::read_dir(&folder).unwrap().flatten() {
-        println!("{:>8} MB {}", f.metadata().unwrap().len() >> 20, f.file_name().to_string_lossy());
+        println!(
+            "{:>8} MB {}",
+            f.metadata().unwrap().len() >> 20,
+            f.file_name().to_string_lossy()
+        );
     }
     let began = Instant::now();
-    let reports = play::replay(&folder, &Options { loops: 3, ..Default::default() }).unwrap();
+    let reports = play::replay(
+        &folder,
+        &Options {
+            loops: 3,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     timed("loaded and replayed", began);
     for (what, r) in &reports {
         println!("{}", r.text(what));

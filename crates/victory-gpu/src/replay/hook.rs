@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Methods in a copied table: more than any D3D12 interface has (an
 /// interface's private methods may follow its public ones).
-pub(super) const SLOTS: usize = 192;
+pub(super) const SLOTS: usize = 512;
 /// Entries copied from before the table (type information).
 const PRE: usize = 4;
 
@@ -64,9 +64,24 @@ fn readable(at: usize, most: usize) -> usize {
         // SAFETY: a plain query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: as above.
-        let n = unsafe { VirtualQuery(end as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
-        const READ: u32 = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
-        if n == 0 || info.State != MEM_COMMIT || info.Protect & READ == 0 || info.Protect & PAGE_GUARD != 0 {
+        let n = unsafe {
+            VirtualQuery(
+                end as *const c_void,
+                &mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        const READ: u32 = PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY;
+        if n == 0
+            || info.State != MEM_COMMIT
+            || info.Protect & READ == 0
+            || info.Protect & PAGE_GUARD != 0
+        {
             break;
         }
         end = info.BaseAddress as usize + info.RegionSize;
@@ -81,21 +96,32 @@ fn readable(at: usize, most: usize) -> usize {
 /// # Safety
 /// `this` is a live COM object no other thread uses yet; what `patch` puts
 /// into the table are functions of the methods' types.
-pub(super) unsafe fn install(this: *mut c_void, state: *const c_void, patch: impl FnOnce(&mut [usize; SLOTS])) -> bool {
+pub(super) unsafe fn install(
+    this: *mut c_void,
+    state: *const c_void,
+    patch: impl FnOnce(&mut [usize; SLOTS]),
+) -> bool {
     let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: a live COM object starts with its table's address.
     let at = unsafe { *this.cast::<usize>() };
     if made.contains(&at) {
         return false;
     }
-    let mut new = Box::new(Shim { state, orig: at as *const usize, pre: [0; PRE], table: [0; SLOTS] });
+    let mut new = Box::new(Shim {
+        state,
+        orig: at as *const usize,
+        pre: [0; PRE],
+        table: [0; SLOTS],
+    });
     let have = readable(at, SLOTS * 8) / 8;
     // SAFETY: `have` entries are readable; the object's table is at least
     // as long as its interface, and what lies behind it is only copied.
     unsafe { std::ptr::copy_nonoverlapping(at as *const usize, new.table.as_mut_ptr(), have) };
     if readable(at - PRE * 8, PRE * 8) == PRE * 8 {
         // SAFETY: as above.
-        unsafe { std::ptr::copy_nonoverlapping((at as *const usize).sub(PRE), new.pre.as_mut_ptr(), PRE) };
+        unsafe {
+            std::ptr::copy_nonoverlapping((at as *const usize).sub(PRE), new.pre.as_mut_ptr(), PRE)
+        };
     }
     patch(&mut new.table);
     let new: &'static Shim = Box::leak(new);
@@ -130,14 +156,20 @@ pub(super) unsafe fn ours(this: *mut c_void) -> bool {
 ///
 /// # Safety
 /// As [`install`]; `before` is a shim's table.
-pub(super) unsafe fn again(this: *mut c_void, before: usize, patch: impl FnOnce(&mut [usize; SLOTS])) {
+pub(super) unsafe fn again(
+    this: *mut c_void,
+    before: usize,
+    patch: impl FnOnce(&mut [usize; SLOTS]),
+) {
     // SAFETY: the caller's.
     unsafe {
         let now = table(this);
         if now == before {
             return;
         }
-        let shim = (before as *const u8).sub(std::mem::offset_of!(Shim, table)).cast::<Shim>();
+        let shim = (before as *const u8)
+            .sub(std::mem::offset_of!(Shim, table))
+            .cast::<Shim>();
         if (*shim).orig as usize == now {
             this.cast::<usize>().write(before);
         } else {
@@ -223,14 +255,28 @@ mod tests {
         value: u64,
     }
 
-    unsafe extern "system" fn add(this: *mut c_void, a: u64, b: u64, c: u64, d: u64, e: f64) -> u64 {
+    unsafe extern "system" fn add(
+        this: *mut c_void,
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+        e: f64,
+    ) -> u64 {
         // SAFETY: one of the test's objects.
         unsafe { (*this.cast::<Object>()).value + a + b + c + d + e as u64 }
     }
 
     type Add = unsafe extern "system" fn(*mut c_void, u64, u64, u64, u64, f64) -> u64;
 
-    unsafe extern "system" fn double(this: *mut c_void, a: u64, b: u64, c: u64, d: u64, e: f64) -> u64 {
+    unsafe extern "system" fn double(
+        this: *mut c_void,
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+        e: f64,
+    ) -> u64 {
         // SAFETY: an object with a shim whose first method is `add`.
         unsafe {
             let first = orig::<[Add; 1]>(this)[0];
@@ -249,9 +295,17 @@ mod tests {
     #[test]
     fn one_object_is_changed_and_changed_back() {
         static STATE: u64 = 1000;
-        let vtbl = Vtbl { methods: [add as *const () as usize; 8] };
-        let mut a = Object { vtbl: &vtbl, value: 100 };
-        let mut b = Object { vtbl: &vtbl, value: 200 };
+        let vtbl = Vtbl {
+            methods: [add as *const () as usize; 8],
+        };
+        let mut a = Object {
+            vtbl: &vtbl,
+            value: 100,
+        };
+        let mut b = Object {
+            vtbl: &vtbl,
+            value: 200,
+        };
         // SAFETY: the test's objects; entries of `Add`'s type.
         unsafe {
             let this: *mut c_void = (&raw mut a).cast();
@@ -260,7 +314,10 @@ mod tests {
                 t[2] = noted_entry::<{ QUEUE * SLOTS + 2 }>();
             };
             assert!(install(this, (&raw const STATE).cast(), patch));
-            assert!(!install(this, (&raw const STATE).cast(), patch), "only once");
+            assert!(
+                !install(this, (&raw const STATE).cast(), patch),
+                "only once"
+            );
             assert_eq!(call(&mut a, 0), 230 + 1000);
             assert_eq!(call(&mut a, 1), 115);
             assert_eq!(call(&mut b, 0), 215, "other objects are untouched");
@@ -277,7 +334,9 @@ mod tests {
             again(this, shim, patch);
             assert_eq!(table(this), shim);
             // Or to another table.
-            let other = Vtbl { methods: [add as *const () as usize; 8] };
+            let other = Vtbl {
+                methods: [add as *const () as usize; 8],
+            };
             a.vtbl = &other;
             again(this, shim, patch);
             assert!(ours(this) && table(this) != shim);

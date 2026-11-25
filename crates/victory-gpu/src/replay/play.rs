@@ -21,8 +21,13 @@ use windows::core::Interface;
 use super::edit::{self, Clamp, RESULTS};
 use super::gpu::{self, Seen, Worker};
 use super::snap::read_sub;
-use super::states::{self, COMMON, COPY_DEST, COPY_SOURCE, DEPTH_WRITE, RENDER_TARGET, RESOLVE_DEST, States, UNORDERED_ACCESS};
-use super::wire::{self, ALL, Barrier, Cmd, Content, Delta, Frame, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot};
+use super::states::{
+    self, COMMON, COPY_DEST, COPY_SOURCE, DEPTH_WRITE, RENDER_TARGET, RESOLVE_DEST, States,
+    UNORDERED_ACCESS,
+};
+use super::wire::{
+    self, ALL, Barrier, Cmd, Content, Delta, Frame, Loc, MISSING, NONE, Place, Slot, Va, ZERO, slot,
+};
 
 /// The name of the argument clamp's pipeline, by which its passes are
 /// recognised.
@@ -151,14 +156,32 @@ impl Report {
     /// The report as text.
     pub fn text(&self, what: &str) -> String {
         let mut t = String::new();
-        let ms = |v: &[f64]| v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" ");
-        let _ = writeln!(t, "{what}: {:.2} ms on the card (median of {})", self.median_ms(), self.frame_ms.len());
+        let ms = |v: &[f64]| {
+            v.iter()
+                .map(|x| format!("{x:.2}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let _ = writeln!(
+            t,
+            "{what}: {:.2} ms on the card (median of {})",
+            self.median_ms(),
+            self.frame_ms.len()
+        );
         let _ = writeln!(t, "  loops, ms: {}", ms(&self.frame_ms));
         let (busy, delta) = (median(&self.busy_ms), median(&self.delta_ms));
         let idle = (self.median_ms() - busy - delta).max(0.0);
-        let _ = writeln!(t, "  submissions busy {busy:.2} ms, copies standing for CPU writes {delta:.2} ms, between submissions {idle:.2} ms");
+        let _ = writeln!(
+            t,
+            "  submissions busy {busy:.2} ms, copies standing for CPU writes {delta:.2} ms, between submissions {idle:.2} ms"
+        );
         let _ = writeln!(t, "  by submission (lists: ms): {}", {
-            self.submits.iter().enumerate().map(|(i, (n, ms))| format!("{i} ({n}): {ms:.2}")).collect::<Vec<_>>().join(", ")
+            self.submits
+                .iter()
+                .enumerate()
+                .map(|(i, (n, ms))| format!("{i} ({n}): {ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         });
         if !self.categories.is_empty() {
             let _ = writeln!(t, "  by kind of command, ms (commands):");
@@ -173,8 +196,13 @@ impl Report {
             }
         }
         match self.picture {
-            Some((_, true)) => drop(writeln!(t, "  picture: the same bytes as presented")),
-            Some((db, false)) => drop(writeln!(t, "  picture: differs from the presented one, PSNR {db:.1} dB")),
+            Some((_, true)) => _ = writeln!(t, "  picture: the same bytes as presented"),
+            Some((db, false)) => {
+                _ = writeln!(
+                    t,
+                    "  picture: differs from the presented one, PSNR {db:.1} dB"
+                )
+            }
             None => {}
         }
         for n in &self.notes {
@@ -197,14 +225,20 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
         return Ok(folder.to_owned());
     }
     let mut best: Option<(u32, PathBuf)> = None;
-    for entry in std::fs::read_dir(folder).with_context(|| format!("{}", folder.display()))?.flatten() {
+    for entry in std::fs::read_dir(folder)
+        .with_context(|| format!("{}", folder.display()))?
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(n) = name.strip_prefix("capture-").and_then(|n| n.parse().ok()) else { continue };
+        let Some(n) = name.strip_prefix("capture-").and_then(|n| n.parse().ok()) else {
+            continue;
+        };
         if entry.path().join("frame.bin").exists() && best.as_ref().is_none_or(|b| b.0 < n) {
             best = Some((n, entry.path()));
         }
     }
-    best.map(|b| b.1).ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
+    best.map(|b| b.1)
+        .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
 }
 
 /// Loads a capture and runs it: the whole of `victory replay`. The reports,
@@ -214,9 +248,19 @@ pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>>
     let mut out = Vec::new();
     if options.compare && options.edited() {
         let image = Some(player.folder.join("replay-unchanged.png"));
-        out.push(("unchanged".into(), player.run(&Options { image, ..options.plain() })?));
+        out.push((
+            "unchanged".into(),
+            player.run(&Options {
+                image,
+                ..options.plain()
+            })?,
+        ));
     }
-    let what = if options.edited() { "with the experiments" } else { "unchanged" };
+    let what = if options.edited() {
+        "with the experiments"
+    } else {
+        "unchanged"
+    };
     out.push((what.into(), player.run(options)?));
     Ok(out)
 }
@@ -292,14 +336,19 @@ impl Player {
         let (device, info) = make_device(&frame, options.debug)?;
         // SAFETY: plain creation and queries.
         let (queue, frequency) = unsafe {
-            let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            })?;
+            let queue: ID3D12CommandQueue =
+                device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })?;
             let frequency = queue.GetTimestampFrequency()? as f64;
             (queue, frequency)
         };
-        let commands: Vec<Vec<Cmd>> = frame.lists.iter().map(|l| Cmd::all(&l.commands.0)).collect::<std::result::Result<_, _>>()?;
+        let commands: Vec<Vec<Cmd>> = frame
+            .lists
+            .iter()
+            .map(|l| Cmd::all(&l.commands.0))
+            .collect::<std::result::Result<_, _>>()?;
         let mut player = Player {
             folder,
             worker: Worker::new(&device, &queue)?,
@@ -324,7 +373,11 @@ impl Player {
             results: None,
             commands,
             fresh: true,
-            notes: frame.notes.iter().map(|n| format!("recorder: {n}")).collect(),
+            notes: frame
+                .notes
+                .iter()
+                .map(|n| format!("recorder: {n}"))
+                .collect(),
             frame,
         };
         player.check()?;
@@ -344,8 +397,15 @@ impl Player {
         step("contents", &mut at);
         player.make_masters()?;
         step("copies to restore from", &mut at);
-        let steps: Vec<String> = steps.iter().map(|(w, d)| format!("{w} {:.1} s", d.as_secs_f64())).collect();
-        player.notes.push(format!("loaded in {:.1} s: {}", began.elapsed().as_secs_f64(), steps.join(", ")));
+        let steps: Vec<String> = steps
+            .iter()
+            .map(|(w, d)| format!("{w} {:.1} s", d.as_secs_f64()))
+            .collect();
+        player.notes.push(format!(
+            "loaded in {:.1} s: {}",
+            began.elapsed().as_secs_f64(),
+            steps.join(", ")
+        ));
         Ok(player)
     }
 
@@ -356,16 +416,39 @@ impl Player {
 
     /// Says what of the frame is not there.
     fn check(&mut self) -> Result<()> {
-        let missing = self.frame.submits.iter().flat_map(|s| &s.lists).filter(|&&l| l == MISSING).count();
+        let missing = self
+            .frame
+            .submits
+            .iter()
+            .flat_map(|s| &s.lists)
+            .filter(|&&l| l == MISSING)
+            .count();
         if missing > 0 {
-            self.note(format!("{missing} lists of the frame were not recorded: the frame is incomplete"));
+            self.note(format!(
+                "{missing} lists of the frame were not recorded: the frame is incomplete"
+            ));
         }
         if self.frame.submits.is_empty() {
             bail!("the capture has no submission");
         }
-        let unknown = self.commands.iter().flatten().filter(|c| matches!(c, Cmd::RootView { va: Va::Unknown { .. }, .. })).count();
+        let unknown = self
+            .commands
+            .iter()
+            .flatten()
+            .filter(|c| {
+                matches!(
+                    c,
+                    Cmd::RootView {
+                        va: Va::Unknown { .. },
+                        ..
+                    }
+                )
+            })
+            .count();
         if unknown > 0 {
-            self.note(format!("{unknown} root views name memory in no known buffer: they are null in the replay"));
+            self.note(format!(
+                "{unknown} root views name memory in no known buffer: they are null in the replay"
+            ));
         }
         Ok(())
     }
@@ -394,7 +477,10 @@ impl Player {
                 MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
                 ..Default::default()
             };
-            let card = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let card = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
             match (gpu::seen(p), buffers) {
                 (Seen::ReadBack, _) => gpu::to_props(p),
                 (_, Buffers::Card) if buffer => card,
@@ -415,7 +501,12 @@ impl Player {
                     textures.insert(heap);
                 }
             }
-            self.frame.heaps.iter().map(|h| h.id).filter(|id| !textures.contains(id)).collect()
+            self.frame
+                .heaps
+                .iter()
+                .map(|h| h.id)
+                .filter(|id| !textures.contains(id))
+                .collect()
         };
         for h in &self.frame.heaps {
             let desc = D3D12_HEAP_DESC {
@@ -426,7 +517,8 @@ impl Player {
             };
             let mut heap: Option<ID3D12Heap> = None;
             // SAFETY: plain creation.
-            unsafe { self.device.CreateHeap(&desc, &mut heap) }.with_context(|| format!("heap {}", h.id))?;
+            unsafe { self.device.CreateHeap(&desc, &mut heap) }
+                .with_context(|| format!("heap {}", h.id))?;
             self._heaps.extend(heap.map(|heap| (h.id, heap)));
         }
         let mut failed = 0;
@@ -443,25 +535,65 @@ impl Player {
             let result = unsafe {
                 match &r.place {
                     Place::Placed { heap, offset } => match self._heaps.get(heap) {
-                        Some(h) => self.device.CreatePlacedResource(h, *offset, &desc, D3D12_RESOURCE_STATE_COMMON, clear, &mut made),
+                        Some(h) => self.device.CreatePlacedResource(
+                            h,
+                            *offset,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            clear,
+                            &mut made,
+                        ),
                         None => Err(windows::core::Error::empty()),
                     },
                     Place::Committed { props: p, flags } => {
                         let p = props(p, is_buffer);
-                        let state = if p.Type == D3D12_HEAP_TYPE_READBACK { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON };
-                        self.device.CreateCommittedResource(&p, D3D12_HEAP_FLAGS(flags & !DROP), &desc, state, clear, &mut made)
+                        let state = if p.Type == D3D12_HEAP_TYPE_READBACK {
+                            D3D12_RESOURCE_STATE_COPY_DEST
+                        } else {
+                            D3D12_RESOURCE_STATE_COMMON
+                        };
+                        self.device.CreateCommittedResource(
+                            &p,
+                            D3D12_HEAP_FLAGS(flags & !DROP),
+                            &desc,
+                            state,
+                            clear,
+                            &mut made,
+                        )
                     }
                     Place::BackBuffer {} => {
-                        let p = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-                        self.device.CreateCommittedResource(&p, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+                        let p = D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        };
+                        self.device.CreateCommittedResource(
+                            &p,
+                            D3D12_HEAP_FLAG_NONE,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COMMON,
+                            None,
+                            &mut made,
+                        )
                     }
                 }
             };
             match (result, made) {
                 (Ok(()), Some(res)) => {
                     // SAFETY: a live resource.
-                    let va = if is_buffer { unsafe { res.GetGPUVirtualAddress() } } else { 0 };
-                    self.objects.insert(r.id, Object { res, va, index, subs: gpu::subresources(&r.desc) });
+                    let va = if is_buffer {
+                        unsafe { res.GetGPUVirtualAddress() }
+                    } else {
+                        0
+                    };
+                    self.objects.insert(
+                        r.id,
+                        Object {
+                            res,
+                            va,
+                            index,
+                            subs: gpu::subresources(&r.desc),
+                        },
+                    );
                 }
                 (e, _) => {
                     if failed == 0 {
@@ -483,7 +615,8 @@ impl Player {
     fn make_pipelines(&mut self) -> Result<()> {
         for (id, blob) in &self.frame.roots {
             // SAFETY: a blob the host took.
-            let root = unsafe { self.device.CreateRootSignature(0, &blob.0) }.with_context(|| format!("root signature {id}"))?;
+            let root = unsafe { self.device.CreateRootSignature(0, &blob.0) }
+                .with_context(|| format!("root signature {id}"))?;
             self.roots.insert(*id, root);
         }
         for s in &self.frame.signatures {
@@ -495,11 +628,18 @@ impl Player {
             };
             let mut made: Option<ID3D12CommandSignature> = None;
             // SAFETY: a description the host took.
-            unsafe { self.device.CreateCommandSignature(&desc, self.roots.get(&s.root), &mut made)? };
+            unsafe {
+                self.device
+                    .CreateCommandSignature(&desc, self.roots.get(&s.root), &mut made)?
+            };
             self.signatures.extend(made.map(|m| (s.id, m)));
         }
         for q in &self.frame.query_heaps {
-            let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE(q.kind), Count: q.count, NodeMask: 0 };
+            let desc = D3D12_QUERY_HEAP_DESC {
+                Type: D3D12_QUERY_HEAP_TYPE(q.kind),
+                Count: q.count,
+                NodeMask: 0,
+            };
             let mut made: Option<ID3D12QueryHeap> = None;
             // SAFETY: plain creation.
             unsafe { self.device.CreateQueryHeap(&desc, &mut made)? };
@@ -510,7 +650,9 @@ impl Player {
         let next = AtomicUsize::new(0);
         type Made = std::result::Result<ID3D12PipelineState, String>;
         let made: std::sync::Mutex<Vec<(u32, Made)>> = std::sync::Mutex::default();
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 2).max(1);
+        let threads = std::thread::available_parallelism()
+            .map_or(4, |n| n.get() / 2)
+            .max(1);
         let (frame, roots) = (&self.frame, &self.roots);
         std::thread::scope(|scope| {
             for _ in 0..threads {
@@ -522,8 +664,11 @@ impl Player {
                             read_at(&file, &mut bytes, c.at).ok()?;
                             Some(bytes)
                         };
-                        let m = super::pso::make(&device, &p.parts, |id| roots.get(&id).cloned(), code);
-                        made.lock().unwrap_or_else(|e| e.into_inner()).push((p.id, m));
+                        let m =
+                            super::pso::make(&device, &p.parts, |id| roots.get(&id).cloned(), code);
+                        made.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((p.id, m));
                     }
                 });
             }
@@ -536,7 +681,11 @@ impl Player {
             }
         }
         if let Some((id, e)) = refused.first() {
-            let n = format!("{} pipelines could not be made again, first {}: {e}", refused.len(), self.pipeline_name(*id));
+            let n = format!(
+                "{} pipelines could not be made again, first {}: {e}",
+                refused.len(),
+                self.pipeline_name(*id)
+            );
             self.note(n);
         }
         Ok(())
@@ -549,7 +698,15 @@ impl Player {
             return format!("pipeline {id}");
         };
         let code: Vec<String> = self.hashes(p);
-        format!("{} (DXIL {})", if p.name.is_empty() { "unnamed" } else { &p.name }, code.join(" "))
+        format!(
+            "{} (DXIL {})",
+            if p.name.is_empty() {
+                "unnamed"
+            } else {
+                &p.name
+            },
+            code.join(" ")
+        )
     }
 
     fn hashes(&self, p: &wire::Pipeline) -> Vec<String> {
@@ -580,23 +737,45 @@ impl Player {
                 (slot::CBV, described) => {
                     let mut d: D3D12_CONSTANT_BUFFER_VIEW_DESC = Default::default();
                     if described && let Some(o) = self.objects.get(&s.res) {
-                        d = s.desc.as_ptr().cast::<D3D12_CONSTANT_BUFFER_VIEW_DESC>().read_unaligned();
+                        d = s
+                            .desc
+                            .as_ptr()
+                            .cast::<D3D12_CONSTANT_BUFFER_VIEW_DESC>()
+                            .read_unaligned();
                         d.BufferLocation = o.va + s.address();
                     }
                     self.device.CreateConstantBufferView(Some(&d), at);
                 }
                 (slot::SRV, true) => {
-                    let d = s.desc.as_ptr().cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>().read_unaligned();
+                    let d = s
+                        .desc
+                        .as_ptr()
+                        .cast::<D3D12_SHADER_RESOURCE_VIEW_DESC>()
+                        .read_unaligned();
                     self.device.CreateShaderResourceView(res, Some(&d), at);
                 }
-                (slot::SRV, false) if res.is_some() => self.device.CreateShaderResourceView(res, None, at),
-                (slot::UAV, true) => {
-                    let d = s.desc.as_ptr().cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>().read_unaligned();
-                    self.device.CreateUnorderedAccessView(res, counter, Some(&d), at);
+                (slot::SRV, false) if res.is_some() => {
+                    self.device.CreateShaderResourceView(res, None, at)
                 }
-                (slot::UAV, false) if res.is_some() => self.device.CreateUnorderedAccessView(res, None::<&ID3D12Resource>, None, at),
+                (slot::UAV, true) => {
+                    let d = s
+                        .desc
+                        .as_ptr()
+                        .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
+                        .read_unaligned();
+                    self.device
+                        .CreateUnorderedAccessView(res, counter, Some(&d), at);
+                }
+                (slot::UAV, false) if res.is_some() => {
+                    self.device
+                        .CreateUnorderedAccessView(res, None::<&ID3D12Resource>, None, at)
+                }
                 (slot::SAMPLER, true) => {
-                    let d = s.desc.as_ptr().cast::<D3D12_SAMPLER_DESC>().read_unaligned();
+                    let d = s
+                        .desc
+                        .as_ptr()
+                        .cast::<D3D12_SAMPLER_DESC>()
+                        .read_unaligned();
                     self.device.CreateSampler(&d, at);
                 }
                 _ if sampler => {
@@ -615,7 +794,12 @@ impl Player {
                         ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
                         ..Default::default()
                     };
-                    self.device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&d), at);
+                    self.device.CreateUnorderedAccessView(
+                        None::<&ID3D12Resource>,
+                        None::<&ID3D12Resource>,
+                        Some(&d),
+                        at,
+                    );
                 }
                 _ => {
                     let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -624,7 +808,8 @@ impl Player {
                         Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                         ..Default::default()
                     };
-                    self.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&d), at);
+                    self.device
+                        .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&d), at);
                 }
             }
         }
@@ -635,7 +820,12 @@ impl Player {
         // version of the heaps of its own: lists are sent without waiting,
         // so a heap cannot be written between them.
         let mut now: HashMap<(u32, u32), Slot> = HashMap::new();
-        let replaced: HashSet<(u32, u32)> = self.frame.submits.iter().flat_map(|s| s.views.iter().map(|v| (v.0, v.1))).collect();
+        let replaced: HashSet<(u32, u32)> = self
+            .frame
+            .submits
+            .iter()
+            .flat_map(|s| s.views.iter().map(|v| (v.0, v.1)))
+            .collect();
         for h in &self.frame.descriptor_heaps {
             for (id, i) in replaced.iter().filter(|k| k.0 == h.id) {
                 let k = h.runs.partition_point(|run| run.0 <= *i);
@@ -650,9 +840,17 @@ impl Player {
         let mut versions: Vec<Vec<(u32, u32, Slot)>> = vec![Vec::new()];
         let mut touched: HashSet<(u32, u32)> = HashSet::new();
         for s in &self.frame.submits {
-            let live = |old: Option<&Slot>| old.is_some_and(|o| o.kind == slot::SAMPLER || o.res != NONE);
-            let news: Vec<&(u32, u32, Slot)> = s.views.iter().filter(|(h, i, v)| now.get(&(*h, *i)) != Some(v)).collect();
-            if news.iter().any(|(h, i, _)| live(now.get(&(*h, *i))) || touched.contains(&(*h, *i))) {
+            let live =
+                |old: Option<&Slot>| old.is_some_and(|o| o.kind == slot::SAMPLER || o.res != NONE);
+            let news: Vec<&(u32, u32, Slot)> = s
+                .views
+                .iter()
+                .filter(|(h, i, v)| now.get(&(*h, *i)) != Some(v))
+                .collect();
+            if news
+                .iter()
+                .any(|(h, i, _)| live(now.get(&(*h, *i))) || touched.contains(&(*h, *i)))
+            {
                 versions.push(Vec::new());
                 touched.clear();
             }
@@ -671,7 +869,12 @@ impl Player {
             let sampler = h.kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER.0;
             let kind = D3D12_DESCRIPTOR_HEAP_TYPE(h.kind);
             let make = |flags| -> windows::core::Result<ID3D12DescriptorHeap> {
-                let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: h.count, Flags: flags, NodeMask: 0 };
+                let d = D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: h.count,
+                    Flags: flags,
+                    NodeMask: 0,
+                };
                 // SAFETY: plain creation.
                 unsafe { self.device.CreateDescriptorHeap(&d) }
             };
@@ -680,24 +883,29 @@ impl Player {
             unsafe {
                 let step = self.device.GetDescriptorHandleIncrementSize(kind) as usize;
                 let start = cpu.GetCPUDescriptorHandleForHeapStart();
-                let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + i as usize * step };
+                let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: start.ptr + i as usize * step,
+                };
                 self.view(&Slot::EMPTY, start, sampler);
                 let mut filled = 1;
                 while filled < h.count {
                     let n = filled.min(h.count - filled).min(1 << 16);
                     // Sources and destinations do not overlap.
-                    self.device.CopyDescriptorsSimple(n, at(filled), start, kind);
+                    self.device
+                        .CopyDescriptorsSimple(n, at(filled), start, kind);
                     filled += n;
                 }
                 for (first, n, s) in &h.runs {
                     self.view(s, at(*first), sampler);
                     for i in 1..*n {
-                        self.device.CopyDescriptorsSimple(1, at(first + i), at(*first), kind);
+                        self.device
+                            .CopyDescriptorsSimple(1, at(first + i), at(*first), kind);
                     }
                 }
                 let mut all = Vec::new();
                 for changes in &versions {
-                    let mine: Vec<&(u32, u32, Slot)> = changes.iter().filter(|(id, _, _)| *id == h.id).collect();
+                    let mine: Vec<&(u32, u32, Slot)> =
+                        changes.iter().filter(|(id, _, _)| *id == h.id).collect();
                     for (_, i, s) in &mine {
                         if *i < h.count {
                             self.view(s, at(*i), sampler);
@@ -706,7 +914,10 @@ impl Player {
                     if mine.is_empty()
                         && let Some(Version { heap, gpu }) = all.last()
                     {
-                        let same = Version { heap: ID3D12DescriptorHeap::clone(heap), gpu: *gpu };
+                        let same = Version {
+                            heap: ID3D12DescriptorHeap::clone(heap),
+                            gpu: *gpu,
+                        };
                         all.push(same);
                         continue;
                     }
@@ -716,15 +927,30 @@ impl Player {
                         // last one, and lists before see them too.
                         Err(_) if !all.is_empty() => {
                             full += 1;
-                            let Some(Version { heap, gpu }) = all.last() else { break };
-                            let same = Version { heap: ID3D12DescriptorHeap::clone(heap), gpu: *gpu };
-                            self.device.CopyDescriptorsSimple(h.count, same.heap.GetCPUDescriptorHandleForHeapStart(), start, kind);
+                            let Some(Version { heap, gpu }) = all.last() else {
+                                break;
+                            };
+                            let same = Version {
+                                heap: ID3D12DescriptorHeap::clone(heap),
+                                gpu: *gpu,
+                            };
+                            self.device.CopyDescriptorsSimple(
+                                h.count,
+                                same.heap.GetCPUDescriptorHandleForHeapStart(),
+                                start,
+                                kind,
+                            );
                             all.push(same);
                             continue;
                         }
                         Err(e) => return Err(e.into()),
                     };
-                    self.device.CopyDescriptorsSimple(h.count, heap.GetCPUDescriptorHandleForHeapStart(), start, kind);
+                    self.device.CopyDescriptorsSimple(
+                        h.count,
+                        heap.GetCPUDescriptorHandleForHeapStart(),
+                        start,
+                        kind,
+                    );
                     let gpu = heap.GetGPUDescriptorHandleForHeapStart().ptr;
                     all.push(Version { heap, gpu });
                 }
@@ -733,10 +959,15 @@ impl Player {
         }
         self.descriptors = made;
         if versions.len() > 1 {
-            self.notes.push(format!("{} versions of the descriptor heaps (views replaced during the frame)", versions.len()));
+            self.notes.push(format!(
+                "{} versions of the descriptor heaps (views replaced during the frame)",
+                versions.len()
+            ));
         }
         if full > 0 {
-            self.note(format!("{full} versions of descriptor heaps had no room: earlier lists see later views"));
+            self.note(format!(
+                "{full} versions of descriptor heaps had no room: earlier lists see later views"
+            ));
         }
         // Render target and depth views.
         let mut views: [HashSet<Slot>; 2] = Default::default();
@@ -746,8 +977,8 @@ impl Player {
                     views[0].extend(colors);
                     views[1].extend(depth);
                 }
-                Cmd::ClearTarget { view, .. } => drop(views[0].insert(*view)),
-                Cmd::ClearDepth { view, .. } => drop(views[1].insert(*view)),
+                Cmd::ClearTarget { view, .. } => _ = views[0].insert(*view),
+                Cmd::ClearDepth { view, .. } => _ = views[1].insert(*view),
                 _ => {}
             }
         }
@@ -755,8 +986,15 @@ impl Player {
             if all.is_empty() {
                 continue;
             }
-            let kind = [D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_DSV][i];
-            let d = D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: all.len() as u32, ..Default::default() };
+            let kind = [
+                D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+            ][i];
+            let d = D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: all.len() as u32,
+                ..Default::default()
+            };
             // SAFETY: plain creation; slots of the heap just made.
             unsafe {
                 let heap: ID3D12DescriptorHeap = self.device.CreateDescriptorHeap(&d)?;
@@ -765,23 +1003,43 @@ impl Player {
                 for s in all {
                     let res = self.objects.get(&s.res).map(|o| &o.res);
                     if i == 0 {
-                        let d = s.desc.as_ptr().cast::<D3D12_RENDER_TARGET_VIEW_DESC>().read_unaligned();
+                        let d = s
+                            .desc
+                            .as_ptr()
+                            .cast::<D3D12_RENDER_TARGET_VIEW_DESC>()
+                            .read_unaligned();
                         // Without either there is nothing to make a view of.
                         let null = D3D12_RENDER_TARGET_VIEW_DESC {
                             Format: DXGI_FORMAT(28),
                             ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
                             ..Default::default()
                         };
-                        let d = if s.described != 0 { Some(&d as *const _) } else if res.is_none() { Some(&null as *const _) } else { None };
+                        let d = if s.described != 0 {
+                            Some(&d as *const _)
+                        } else if res.is_none() {
+                            Some(&null as *const _)
+                        } else {
+                            None
+                        };
                         self.device.CreateRenderTargetView(res, d, at);
                     } else {
-                        let d = s.desc.as_ptr().cast::<D3D12_DEPTH_STENCIL_VIEW_DESC>().read_unaligned();
+                        let d = s
+                            .desc
+                            .as_ptr()
+                            .cast::<D3D12_DEPTH_STENCIL_VIEW_DESC>()
+                            .read_unaligned();
                         let null = D3D12_DEPTH_STENCIL_VIEW_DESC {
                             Format: DXGI_FORMAT(40),
                             ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
                             ..Default::default()
                         };
-                        let d = if s.described != 0 { Some(&d as *const _) } else if res.is_none() { Some(&null as *const _) } else { None };
+                        let d = if s.described != 0 {
+                            Some(&d as *const _)
+                        } else if res.is_none() {
+                            Some(&null as *const _)
+                        } else {
+                            None
+                        };
                         self.device.CreateDepthStencilView(res, d, at);
                     }
                     self.targets.insert(*s, at);
@@ -821,7 +1079,12 @@ impl Player {
         }
         let mut stagings: Vec<(ID3D12Resource, usize, u64)> = Vec::new();
         for _ in 0..batches.len().min(2) {
-            let (b, data) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_UPLOAD, most, D3D12_RESOURCE_FLAG_NONE)?;
+            let (b, data) = gpu::buffer(
+                &self.device,
+                D3D12_HEAP_TYPE_UPLOAD,
+                most,
+                D3D12_RESOURCE_FLAG_NONE,
+            )?;
             stagings.push((b, data as usize, 0));
         }
         for (n, batch) in batches.iter().enumerate() {
@@ -836,11 +1099,19 @@ impl Player {
                         while let Some(&(i, at)) = batch.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let (_, len, from) = &parts[i];
                             // SAFETY: this part's own bytes of the mapping.
-                            let to = unsafe { std::slice::from_raw_parts_mut((map + at as usize) as *mut u8, *len as usize) };
+                            let to = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    (map + at as usize) as *mut u8,
+                                    *len as usize,
+                                )
+                            };
                             if *from == ZERO {
                                 to.fill(0);
                             } else if let Err(e) = read_at(file, to, *from) {
-                                failed.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
+                                failed
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get_or_insert(e);
                             }
                         }
                     });
@@ -849,7 +1120,10 @@ impl Player {
             if let Some(e) = failed.into_inner().unwrap_or_else(|e| e.into_inner()) {
                 return Err(e).context("the capture's contents");
             }
-            let list: Vec<(&T, u64, u64)> = batch.iter().map(|&(i, at)| (&parts[i].0, parts[i].1, at)).collect();
+            let list: Vec<(&T, u64, u64)> = batch
+                .iter()
+                .map(|&(i, at)| (&parts[i].0, parts[i].1, at))
+                .collect();
             let buffer = stagings[k].0.clone();
             // The worker is another part of the player than `copy` uses.
             let other = Worker::new(&self.device, &self.worker.queue)?;
@@ -869,9 +1143,16 @@ impl Player {
         let mut early = Vec::new();
         let mut into = Vec::new();
         for r in &self.frame.resources {
-            let (Some(o), Some(state)) = (self.objects.get(&r.id), self.start.get(&r.id)) else { continue };
+            let (Some(o), Some(state)) = (self.objects.get(&r.id), self.start.get(&r.id)) else {
+                continue;
+            };
             let loaded = !r.idle && known.contains(&r.id);
-            gpu::moves(&o.res, &[COMMON], if loaded { &[COPY_DEST] } else { state }, if loaded { &mut into } else { &mut early });
+            gpu::moves(
+                &o.res,
+                &[COMMON],
+                if loaded { &[COPY_DEST] } else { state },
+                if loaded { &mut into } else { &mut early },
+            );
         }
         let textures: Vec<(Content, u64, u64)> = self
             .frame
@@ -896,7 +1177,9 @@ impl Player {
         let file = File::open(self.folder.join("contents.bin"))?;
         self.upload(&textures, &file, |player, list, parts, staging| {
             for (c, len, at) in parts {
-                let Some(o) = player.objects.get(&c.res) else { continue };
+                let Some(o) = player.objects.get(&c.res) else {
+                    continue;
+                };
                 let r = &player.frame.resources[o.index];
                 // SAFETY: an open list; live resources.
                 unsafe {
@@ -904,11 +1187,23 @@ impl Player {
                         list.CopyBufferRegion(&o.res, c.first, staging, *at, *len);
                         continue;
                     }
-                    let (all, _) = gpu::footprints(&player.device, &gpu::to_desc(&r.desc), c.first as u32, c.count);
+                    let (all, _) = gpu::footprints(
+                        &player.device,
+                        &gpu::to_desc(&r.desc),
+                        c.first as u32,
+                        c.count,
+                    );
                     for (i, mut f) in all.into_iter().enumerate() {
                         f.Offset += at;
                         let to = gpu::sub_location(&o.res, c.first as u32 + i as u32);
-                        list.CopyTextureRegion(&to, 0, 0, 0, &gpu::placed_location(staging, f), None);
+                        list.CopyTextureRegion(
+                            &to,
+                            0,
+                            0,
+                            0,
+                            &gpu::placed_location(staging, f),
+                            None,
+                        );
                     }
                 }
             }
@@ -916,7 +1211,9 @@ impl Player {
         // To the states of the frame's start.
         let mut back = Vec::new();
         for r in &self.frame.resources {
-            let (Some(o), Some(state)) = (self.objects.get(&r.id), self.start.get(&r.id)) else { continue };
+            let (Some(o), Some(state)) = (self.objects.get(&r.id), self.start.get(&r.id)) else {
+                continue;
+            };
             if !r.idle && known.contains(&r.id) {
                 gpu::moves(&o.res, &[COPY_DEST], state, &mut back);
             }
@@ -928,13 +1225,21 @@ impl Player {
             }
         })?;
         if missing > 0 {
-            self.note(format!("contents of {missing} parts of resources that could not be made are left out"));
+            self.note(format!(
+                "contents of {missing} parts of resources that could not be made are left out"
+            ));
         }
         // What the CPU had put into the memory both see by the first
         // submission: part of the start of the frame.
         let file = File::open(self.folder.join("deltas.bin"))?;
         let named = self.named_buffers();
-        let of = |s: &wire::Submit| s.deltas.iter().filter(|d| named.contains(&d.res)).cloned().collect::<Vec<Delta>>();
+        let of = |s: &wire::Submit| {
+            s.deltas
+                .iter()
+                .filter(|d| named.contains(&d.res))
+                .cloned()
+                .collect::<Vec<Delta>>()
+        };
         // In memory the card cannot write, bytes looked at first when a
         // later submission read them can stand there from the start.
         let upload: HashSet<u32> = self
@@ -946,17 +1251,25 @@ impl Player {
             .collect();
         let mut first = of(&self.frame.submits[0]);
         let mut seen: HashSet<(u32, u64)> = HashSet::new();
-        let pages = |d: &Delta| (d.at / 4096..(d.at + d.len).div_ceil(4096)).map(|p| (d.res, p)).collect::<Vec<_>>();
+        let pages = |d: &Delta| {
+            (d.at / 4096..(d.at + d.len).div_ceil(4096))
+                .map(|p| (d.res, p))
+                .collect::<Vec<_>>()
+        };
         first.iter().for_each(|d| seen.extend(pages(d)));
         let mut rest: Vec<Vec<Delta>> = vec![Vec::new()];
         for s in self.frame.submits.iter().skip(1) {
-            let (early, late): (Vec<Delta>, Vec<Delta>) =
-                of(s).into_iter().partition(|d| upload.contains(&d.res) && pages(d).iter().all(|p| !seen.contains(p)));
+            let (early, late): (Vec<Delta>, Vec<Delta>) = of(s).into_iter().partition(|d| {
+                upload.contains(&d.res) && pages(d).iter().all(|p| !seen.contains(p))
+            });
             early.iter().for_each(|d| seen.extend(pages(d)));
             first.extend(early);
             rest.push(late);
         }
-        let first: Vec<(Delta, u64, u64)> = first.into_iter().map(|d| (d.clone(), d.len, d.file)).collect();
+        let first: Vec<(Delta, u64, u64)> = first
+            .into_iter()
+            .map(|d| (d.clone(), d.len, d.file))
+            .collect();
         self.upload(&first, &file, |player, list, parts, staging| {
             for (d, len, at) in parts {
                 if let Some(o) = player.objects.get(&d.res) {
@@ -977,7 +1290,12 @@ impl Player {
             }
         }
         if total > 0 {
-            let (buffer, _) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_DEFAULT, total, D3D12_RESOURCE_FLAG_NONE)?;
+            let (buffer, _) = gpu::buffer(
+                &self.device,
+                D3D12_HEAP_TYPE_DEFAULT,
+                total,
+                D3D12_RESOURCE_FLAG_NONE,
+            )?;
             self.deltas = Some(buffer.clone());
             self.upload(&later, &file, |_, list, parts, staging| {
                 for ((to, _), len, at) in parts {
@@ -1001,22 +1319,28 @@ impl Player {
         for c in self.commands.iter().flatten() {
             match c {
                 Cmd::RootView { va: v, .. } => va(v),
-                Cmd::IndexBuffer { view: Some((v, _, _)) } => va(v),
-                Cmd::VertexBuffers { views: Some(all), .. } => all.iter().for_each(|(v, _, _)| va(v)),
+                Cmd::IndexBuffer {
+                    view: Some((v, _, _)),
+                } => va(v),
+                Cmd::VertexBuffers {
+                    views: Some(all), ..
+                } => all.iter().for_each(|(v, _, _)| va(v)),
                 Cmd::WriteImmediate { all } => all.iter().for_each(|(v, _, _)| va(v)),
                 _ => {}
             }
         }
         for c in self.commands.iter().flatten() {
             match c {
-                Cmd::CopyBuffer { dst, src, .. } | Cmd::CopyResource { dst, src } => named.extend([*dst, *src]),
+                Cmd::CopyBuffer { dst, src, .. } | Cmd::CopyResource { dst, src } => {
+                    named.extend([*dst, *src])
+                }
                 Cmd::CopyTexture { dst, src, .. } => {
                     for Loc::Sub { res, .. } | Loc::Placed { res, .. } in [dst, src] {
                         named.insert(*res);
                     }
                 }
                 Cmd::Indirect { args, count, .. } => named.extend([*args, *count]),
-                Cmd::ResolveQuery { dst, .. } => drop(named.insert(*dst)),
+                Cmd::ResolveQuery { dst, .. } => _ = named.insert(*dst),
                 _ => {}
             }
         }
@@ -1041,15 +1365,27 @@ impl Player {
             states.add(r.id, subs, r.state[0], decays);
             if r.state.len() > 1 {
                 for (i, s) in r.state.iter().enumerate() {
-                    states.change(&states::Change { res: r.id, sub: i as u32, after: *s, promoted: false, alias: false });
+                    states.change(&states::Change {
+                        res: r.id,
+                        sub: i as u32,
+                        after: *s,
+                        promoted: false,
+                        alias: false,
+                    });
                 }
             }
         }
         // Resources in a state they are written in at some time, or written
         // some other way.
-        const WRITE: u32 = RENDER_TARGET | UNORDERED_ACCESS | DEPTH_WRITE | COPY_DEST | RESOLVE_DEST;
-        let mut written: HashSet<u32> =
-            self.frame.resources.iter().filter(|r| r.state.iter().any(|s| s & WRITE != 0)).map(|r| r.id).collect();
+        const WRITE: u32 =
+            RENDER_TARGET | UNORDERED_ACCESS | DEPTH_WRITE | COPY_DEST | RESOLVE_DEST;
+        let mut written: HashSet<u32> = self
+            .frame
+            .resources
+            .iter()
+            .filter(|r| r.state.iter().any(|s| s & WRITE != 0))
+            .map(|r| r.id)
+            .collect();
         for (i, s) in self.frame.submits.iter().enumerate() {
             for &l in s.lists.iter().filter(|&&l| l != MISSING) {
                 for c in &self.commands[l as usize] {
@@ -1061,19 +1397,38 @@ impl Player {
                     match c {
                         Cmd::Barriers { all } => {
                             for b in all {
-                                if let Barrier::Transition { res, before, after, .. } = b
+                                if let Barrier::Transition {
+                                    res, before, after, ..
+                                } = b
                                     && (*before | *after) as u32 & WRITE != 0
                                 {
                                     written.insert(*res);
                                 }
                             }
                         }
-                        Cmd::CopyBuffer { dst, .. } | Cmd::CopyResource { dst, .. } | Cmd::ResolveQuery { dst, .. } => drop(written.insert(*dst)),
-                        Cmd::CopyTexture { dst: Loc::Sub { res, .. } | Loc::Placed { res, .. }, .. } => drop(written.insert(*res)),
-                        Cmd::Resolve { dst, .. } | Cmd::ResolveRegion { dst, .. } => drop(written.insert(*dst)),
-                        Cmd::RootView { kind: slot::UAV, va: Va::At { res, .. }, .. } => drop(written.insert(*res)),
+                        Cmd::CopyBuffer { dst, .. }
+                        | Cmd::CopyResource { dst, .. }
+                        | Cmd::ResolveQuery { dst, .. } => _ = written.insert(*dst),
+                        Cmd::CopyTexture {
+                            dst: Loc::Sub { res, .. } | Loc::Placed { res, .. },
+                            ..
+                        } => _ = written.insert(*res),
+                        Cmd::Resolve { dst, .. } | Cmd::ResolveRegion { dst, .. } => {
+                            _ = written.insert(*dst)
+                        }
+                        Cmd::RootView {
+                            kind: slot::UAV,
+                            va: Va::At { res, .. },
+                            ..
+                        } => _ = written.insert(*res),
                         Cmd::WriteImmediate { all } => {
-                            written.extend(all.iter().filter_map(|(va, _, _)| if let Va::At { res, .. } = va { Some(*res) } else { None }));
+                            written.extend(all.iter().filter_map(|(va, _, _)| {
+                                if let Va::At { res, .. } = va {
+                                    Some(*res)
+                                } else {
+                                    None
+                                }
+                            }));
                         }
                         _ => {}
                     }
@@ -1085,15 +1440,28 @@ impl Player {
             }
         }
         // Buffers any unordered-access view names.
-        let is_buffer =
-            |id: u32| self.objects.get(&id).is_some_and(|o| self.frame.resources[o.index].desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0);
-        let simultaneous = |id: u32| {
+        let is_buffer = |id: u32| {
             self.objects.get(&id).is_some_and(|o| {
-                self.frame.resources[o.index].desc.flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0 != 0
+                self.frame.resources[o.index].desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0
             })
         };
-        let views = self.frame.descriptor_heaps.iter().flat_map(|h| h.runs.iter().map(|(_, _, s)| s));
-        let late = self.frame.submits.iter().flat_map(|s| s.views.iter().map(|(_, _, s)| s));
+        let simultaneous = |id: u32| {
+            self.objects.get(&id).is_some_and(|o| {
+                self.frame.resources[o.index].desc.flags
+                    & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS.0
+                    != 0
+            })
+        };
+        let views = self
+            .frame
+            .descriptor_heaps
+            .iter()
+            .flat_map(|h| h.runs.iter().map(|(_, _, s)| s));
+        let late = self
+            .frame
+            .submits
+            .iter()
+            .flat_map(|s| s.views.iter().map(|(_, _, s)| s));
         for s in views.chain(late).filter(|s| s.kind == slot::UAV) {
             for id in [s.res, s.counter] {
                 if is_buffer(id) || simultaneous(id) {
@@ -1102,7 +1470,8 @@ impl Player {
             }
         }
         for id in self.start.keys() {
-            self.end.insert(*id, states.get(*id).unwrap_or(vec![COMMON]));
+            self.end
+                .insert(*id, states.get(*id).unwrap_or(vec![COMMON]));
         }
         let mut ids: Vec<u32> = written
             .into_iter()
@@ -1140,12 +1509,22 @@ impl Player {
                     ..Default::default()
                 }
             } else {
-                D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                }
             };
             let mut made: Option<ID3D12Resource> = None;
             // SAFETY: plain creation.
             let result = unsafe {
-                self.device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+                self.device.CreateCommittedResource(
+                    &props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut made,
+                )
             };
             match (result, made) {
                 (Ok(()), Some(m)) => {
@@ -1153,10 +1532,17 @@ impl Player {
                     in_pc += if pc { size } else { 0 };
                     self.masters.push((id, m));
                 }
-                (e, _) => self.note(format!("no copy of resource {id} to restore it from ({e:?})")),
+                (e, _) => self.note(format!(
+                    "no copy of resource {id} to restore it from ({e:?})"
+                )),
             }
         }
-        tracing::info!(resources = self.masters.len(), mb = total >> 20, in_pc_memory_mb = in_pc >> 20, "copies of what the frame changes");
+        tracing::info!(
+            resources = self.masters.len(),
+            mb = total >> 20,
+            in_pc_memory_mb = in_pc >> 20,
+            "copies of what the frame changes"
+        );
         // Filled now: the resources are as at the frame's start. Masters
         // stay in the copy-source state (buffers decay).
         let (masters, objects, start) = (&self.masters, &self.objects, &self.start);
@@ -1165,7 +1551,10 @@ impl Player {
             for (id, m) in some {
                 let Some(state) = start.get(id) else { continue };
                 let o = &objects[id];
-                let to: Vec<u32> = state.iter().map(|&s| if s & COPY_SOURCE != 0 { s } else { COPY_SOURCE }).collect();
+                let to: Vec<u32> = state
+                    .iter()
+                    .map(|&s| if s & COPY_SOURCE != 0 { s } else { COPY_SOURCE })
+                    .collect();
                 gpu::moves(&o.res, state, &to, &mut before);
                 gpu::moves(&o.res, &to, state, &mut after);
                 before.push(gpu::transition(m, ALL, COMMON, COPY_DEST));
@@ -1191,8 +1580,12 @@ impl Player {
         // SAFETY: plain queries.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
-            let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(self.device.GetAdapterLuid()).ok()?;
-            adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own).ok()?;
+            let adapter: IDXGIAdapter3 = factory
+                .EnumAdapterByLuid(self.device.GetAdapterLuid())
+                .ok()?;
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
+                .ok()?;
         }
         Some(own.Budget.saturating_sub(own.CurrentUsage))
     }
@@ -1202,10 +1595,17 @@ impl Player {
         if self.fresh {
             return Ok(());
         }
-        let restored: HashMap<u32, &ID3D12Resource> = if contents { self.masters.iter().map(|(id, m)| (*id, m)).collect() } else { HashMap::new() };
-        let (mut idle, mut into, mut back, mut plain) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let restored: HashMap<u32, &ID3D12Resource> = if contents {
+            self.masters.iter().map(|(id, m)| (*id, m)).collect()
+        } else {
+            HashMap::new()
+        };
+        let (mut idle, mut into, mut back, mut plain) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for (id, start) in &self.start {
-            let Some(o) = self.objects.get(id) else { continue };
+            let Some(o) = self.objects.get(id) else {
+                continue;
+            };
             let end = self.end.get(id).unwrap_or(start);
             if restored.contains_key(id) {
                 gpu::moves(&o.res, end, &[COPY_DEST], &mut into);
@@ -1236,23 +1636,39 @@ impl Player {
     }
 
     fn pipelines_named(&self, name: &str) -> HashSet<u32> {
-        self.frame.pipelines.iter().filter(|p| p.name == name).map(|p| p.id).collect()
+        self.frame
+            .pipelines
+            .iter()
+            .filter(|p| p.name == name)
+            .map(|p| p.id)
+            .collect()
     }
 
     /// The frame's lists, edited: for each submission, its lists' commands.
-    fn edited(&mut self, o: &Options, report: &mut Report, clamps: &[Vec<Clamp>]) -> Vec<Vec<Vec<Cmd>>> {
+    fn edited(
+        &mut self,
+        o: &Options,
+        report: &mut Report,
+        clamps: &[Vec<Clamp>],
+    ) -> Vec<Vec<Vec<Cmd>>> {
         let skip: HashSet<u32> = self
             .frame
             .pipelines
             .iter()
             .filter(|p| {
                 let hashes = self.hashes(p);
-                o.skip_shaders.iter().any(|s| !s.is_empty() && (p.name.contains(s.as_str()) || hashes.iter().any(|h| h.contains(s.as_str()))))
+                o.skip_shaders.iter().any(|s| {
+                    !s.is_empty()
+                        && (p.name.contains(s.as_str())
+                            || hashes.iter().any(|h| h.contains(s.as_str())))
+                })
             })
             .map(|p| p.id)
             .collect();
         if !o.skip_shaders.is_empty() {
-            report.notes.push(format!("{} pipelines match --skip-shader", skip.len()));
+            report
+                .notes
+                .push(format!("{} pipelines match --skip-shader", skip.len()));
         }
         let hash = self.pipelines_named(COMPARE);
         let (mut skipped, mut hashed, mut uavs, mut merged) = (0, 0, 0, 0);
@@ -1268,7 +1684,9 @@ impl Player {
                     lists.push(edit::barriers_only(cmds));
                     continue;
                 }
-                if o.skip_clamps && let Some(c) = clamps.get(here as usize) {
+                if o.skip_clamps
+                    && let Some(c) = clamps.get(here as usize)
+                {
                     cmds = edit::skip_clamps(cmds, c);
                 }
                 let mut n;
@@ -1293,16 +1711,24 @@ impl Player {
             out.push(lists);
         }
         if !skip.is_empty() {
-            report.notes.push(format!("--skip-shader left out {skipped} commands"));
+            report
+                .notes
+                .push(format!("--skip-shader left out {skipped} commands"));
         }
         if o.skip_hash_passes {
-            report.notes.push(format!("--skip-hash-passes left out {hashed} dispatches"));
+            report
+                .notes
+                .push(format!("--skip-hash-passes left out {hashed} dispatches"));
         }
         if o.no_barriers {
-            report.notes.push(format!("--no-barriers left out {uavs} unordered-access barriers"));
+            report.notes.push(format!(
+                "--no-barriers left out {uavs} unordered-access barriers"
+            ));
         }
         if o.merge_barriers {
-            report.notes.push(format!("--merge-barriers joined {merged} barrier calls to ones before them"));
+            report.notes.push(format!(
+                "--merge-barriers joined {merged} barrier calls to ones before them"
+            ));
         }
         out
     }
@@ -1325,11 +1751,22 @@ impl Player {
             submits.push(lists);
         }
         let n: usize = clamps.iter().map(Vec::len).sum();
-        report.notes.push(format!("--skip-clamps: {n} clamp passes, {} KB of arguments kept from a first run", next >> 10));
+        report.notes.push(format!(
+            "--skip-clamps: {n} clamp passes, {} KB of arguments kept from a first run",
+            next >> 10
+        ));
         if n == 0 {
             return Ok(clamps);
         }
-        self.results = Some(gpu::buffer(&self.device, D3D12_HEAP_TYPE_DEFAULT, next, D3D12_RESOURCE_FLAG_NONE)?.0);
+        self.results = Some(
+            gpu::buffer(
+                &self.device,
+                D3D12_HEAP_TYPE_DEFAULT,
+                next,
+                D3D12_RESOURCE_FLAG_NONE,
+            )?
+            .0,
+        );
         let built = self.build(&submits, &Options::default())?;
         self.restore(true)?;
         self.send(&built, false)?;
@@ -1344,15 +1781,32 @@ impl Player {
         let count: usize = submits
             .iter()
             .flatten()
-            .map(|c| 2 + if o.detailed { c.iter().filter(|c| c.works() || matches!(c, Cmd::Barriers { .. })).count() } else { 0 })
+            .map(|c| {
+                2 + if o.detailed {
+                    c.iter()
+                        .filter(|c| c.works() || matches!(c, Cmd::Barriers { .. }))
+                        .count()
+                } else {
+                    0
+                }
+            })
             .sum::<usize>()
             + 2 * submits.len();
         let mut heap: Option<ID3D12QueryHeap> = None;
-        let desc = D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: count.max(1) as u32, NodeMask: 0 };
+        let desc = D3D12_QUERY_HEAP_DESC {
+            Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+            Count: count.max(1) as u32,
+            NodeMask: 0,
+        };
         // SAFETY: plain creation.
         unsafe { self.device.CreateQueryHeap(&desc, &mut heap)? };
         let heap = heap.context("no timestamps")?;
-        let (back, data) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_READBACK, count.max(1) as u64 * 8, D3D12_RESOURCE_FLAG_NONE)?;
+        let (back, data) = gpu::buffer(
+            &self.device,
+            D3D12_HEAP_TYPE_READBACK,
+            count.max(1) as u64 * 8,
+            D3D12_RESOURCE_FLAG_NONE,
+        )?;
         let mut next = 0u32;
         let mut steps = Vec::new();
         for (i, lists) in submits.iter().enumerate() {
@@ -1365,7 +1819,9 @@ impl Player {
                         let mut seen = HashSet::new();
                         let mut after = Vec::new();
                         for (d, at) in parts {
-                            let Some(ob) = self.objects.get(&d.res) else { continue };
+                            let Some(ob) = self.objects.get(&d.res) else {
+                                continue;
+                            };
                             open.1.CopyBufferRegion(&ob.res, d.at, from, *at, d.len);
                             if seen.insert(d.res) {
                                 // Back to the common state by itself, for
@@ -1382,7 +1838,8 @@ impl Player {
             let mut built = Vec::new();
             for cmds in lists {
                 let open = self.open(&heap, &mut next)?;
-                let stamps = self.translate(&open.1, cmds, i, o.detailed.then_some((&heap, &mut next)));
+                let stamps =
+                    self.translate(&open.1, cmds, i, o.detailed.then_some((&heap, &mut next)));
                 built.push(self.close(open, &heap, &mut next, stamps)?);
             }
             steps.push((delta, built));
@@ -1405,12 +1862,27 @@ impl Player {
             let open = self.plain_list()?;
             // SAFETY: an open list; `next` queries were written.
             unsafe {
-                open.1.ResolveQueryData(&heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, next.max(1), &back, 0);
+                open.1.ResolveQueryData(
+                    &heap,
+                    D3D12_QUERY_TYPE_TIMESTAMP,
+                    0,
+                    next.max(1),
+                    &back,
+                    0,
+                );
                 open.1.Close()?;
             }
             open
         };
-        Ok(Sends { steps, joints, resolve, _heap: heap, _back: back, data: data as usize, count: next })
+        Ok(Sends {
+            steps,
+            joints,
+            resolve,
+            _heap: heap,
+            _back: back,
+            data: data as usize,
+            count: next,
+        })
     }
 
     /// Records a wait for everything before, with all caches written out.
@@ -1422,7 +1894,10 @@ impl Player {
         unsafe {
             let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
             let size = size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32;
-            let known = self.device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, (&raw mut o).cast(), size).is_ok();
+            let known = self
+                .device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, (&raw mut o).cast(), size)
+                .is_ok();
             if known
                 && o.EnhancedBarriersSupported.as_bool()
                 && let Ok(list) = list.cast::<ID3D12GraphicsCommandList7>()
@@ -1436,7 +1911,9 @@ impl Player {
                 list.Barrier(&[D3D12_BARRIER_GROUP {
                     Type: D3D12_BARRIER_TYPE_GLOBAL,
                     NumBarriers: 1,
-                    Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: all.as_ptr() },
+                    Anonymous: D3D12_BARRIER_GROUP_0 {
+                        pGlobalBarriers: all.as_ptr(),
+                    },
                 }]);
             } else {
                 list.ResourceBarrier(&[alias(), uav_barrier(None)]);
@@ -1447,13 +1924,24 @@ impl Player {
     fn plain_list(&self) -> Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
         // SAFETY: plain creation.
         unsafe {
-            let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-            let list = self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+            let allocator: ID3D12CommandAllocator = self
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list = self.device.CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &allocator,
+                None,
+            )?;
             Ok((allocator, list))
         }
     }
 
-    fn open(&self, heap: &ID3D12QueryHeap, next: &mut u32) -> Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u32)> {
+    fn open(
+        &self,
+        heap: &ID3D12QueryHeap,
+        next: &mut u32,
+    ) -> Result<(ID3D12CommandAllocator, ID3D12GraphicsCommandList, u32)> {
         let (allocator, list) = self.plain_list()?;
         // SAFETY: an open list; a query of the heap.
         unsafe { list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, *next) };
@@ -1471,10 +1959,17 @@ impl Player {
         // SAFETY: as above.
         unsafe {
             list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, *next);
-            list.Close().context("a list of the frame could not be recorded again")?;
+            list.Close()
+                .context("a list of the frame could not be recorded again")?;
         }
         *next += 1;
-        Ok(Built { _allocator: allocator, list, first, last: *next - 1, stamps })
+        Ok(Built {
+            _allocator: allocator,
+            list,
+            first,
+            last: *next - 1,
+            stamps,
+        })
     }
 
     /// Records commands into a list, in submission `submit`.
@@ -1499,7 +1994,11 @@ impl Player {
             .frame
             .signatures
             .iter()
-            .filter(|s| s.args.iter().any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32))
+            .filter(|s| {
+                s.args
+                    .iter()
+                    .any(|a| a[0] == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32)
+            })
             .map(|s| s.id)
             .collect();
         let mut stamps = Vec::new();
@@ -1518,13 +2017,21 @@ impl Player {
                 let category = match c {
                     Cmd::Barriers { .. } => "barriers",
                     Cmd::Dispatch { .. } if clamps.contains(&bound) => "argument clamps (ours)",
-                    Cmd::Dispatch { .. } if compares.contains(&bound) => "hash and compare passes (ours)",
+                    Cmd::Dispatch { .. } if compares.contains(&bound) => {
+                        "hash and compare passes (ours)"
+                    }
                     Cmd::Dispatch { .. } => "dispatches",
-                    Cmd::Indirect { signature, .. } if dispatches.contains(signature) => "indirect dispatches",
+                    Cmd::Indirect { signature, .. } if dispatches.contains(signature) => {
+                        "indirect dispatches"
+                    }
                     Cmd::Indirect { .. } if mesh.contains(&bound) => "indirect mesh draws",
                     Cmd::Indirect { .. } => "indirect draws",
-                    Cmd::Draw { .. } | Cmd::DrawIndexed { .. } | Cmd::DispatchMesh { .. } => "draws",
-                    Cmd::ClearDepth { .. } | Cmd::ClearTarget { .. } | Cmd::Discard { .. } => "clears",
+                    Cmd::Draw { .. } | Cmd::DrawIndexed { .. } | Cmd::DispatchMesh { .. } => {
+                        "draws"
+                    }
+                    Cmd::ClearDepth { .. } | Cmd::ClearTarget { .. } | Cmd::Discard { .. } => {
+                        "clears"
+                    }
                     Cmd::Resolve { .. } | Cmd::ResolveRegion { .. } => "resolves",
                     _ => "copies",
                 };
@@ -1542,8 +2049,19 @@ impl Player {
         // SAFETY: the caller's.
         unsafe {
             match c {
-                Cmd::Draw { vertices, instances, first, first_instance } => l.DrawInstanced(*vertices, *instances, *first, *first_instance),
-                Cmd::DrawIndexed { indices, instances, first, base, first_instance } => {
+                Cmd::Draw {
+                    vertices,
+                    instances,
+                    first,
+                    first_instance,
+                } => l.DrawInstanced(*vertices, *instances, *first, *first_instance),
+                Cmd::DrawIndexed {
+                    indices,
+                    instances,
+                    first,
+                    base,
+                    first_instance,
+                } => {
                     l.DrawIndexedInstanced(*indices, *instances, *first, *base, *first_instance);
                 }
                 Cmd::Dispatch { groups } => l.Dispatch(groups[0], groups[1], groups[2]),
@@ -1552,7 +2070,13 @@ impl Player {
                         l.DispatchMesh(groups[0], groups[1], groups[2]);
                     }
                 }
-                Cmd::CopyBuffer { dst, dst_at, src, src_at, len } => {
+                Cmd::CopyBuffer {
+                    dst,
+                    dst_at,
+                    src,
+                    src_at,
+                    len,
+                } => {
                     if let (Some(dst), Some(src)) = (res(*dst), res(*src)) {
                         l.CopyBufferRegion(dst, *dst_at, src, *src_at, *len);
                     }
@@ -1560,7 +2084,13 @@ impl Player {
                 Cmd::CopyTexture { dst, at, src, part } => {
                     let side = |loc: &Loc| match loc {
                         Loc::Sub { res: id, sub } => Some(gpu::sub_location(res(*id)?, *sub)),
-                        Loc::Placed { res: id, offset, format, size, pitch } => {
+                        Loc::Placed {
+                            res: id,
+                            offset,
+                            format,
+                            size,
+                            pitch,
+                        } => {
                             let f = D3D12_SUBRESOURCE_FOOTPRINT {
                                 Format: DXGI_FORMAT(*format),
                                 Width: size[0],
@@ -1568,12 +2098,32 @@ impl Player {
                                 Depth: size[2],
                                 RowPitch: *pitch,
                             };
-                            Some(gpu::placed_location(res(*id)?, D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: *offset, Footprint: f }))
+                            Some(gpu::placed_location(
+                                res(*id)?,
+                                D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                    Offset: *offset,
+                                    Footprint: f,
+                                },
+                            ))
                         }
                     };
                     if let (Some(dst), Some(src)) = (side(dst), side(src)) {
-                        let part = part.map(|p| D3D12_BOX { left: p[0], top: p[1], front: p[2], right: p[3], bottom: p[4], back: p[5] });
-                        l.CopyTextureRegion(&dst, at[0], at[1], at[2], &src, part.as_ref().map(|p| p as *const _));
+                        let part = part.map(|p| D3D12_BOX {
+                            left: p[0],
+                            top: p[1],
+                            front: p[2],
+                            right: p[3],
+                            bottom: p[4],
+                            back: p[5],
+                        });
+                        l.CopyTextureRegion(
+                            &dst,
+                            at[0],
+                            at[1],
+                            at[2],
+                            &src,
+                            part.as_ref().map(|p| p as *const _),
+                        );
                     }
                 }
                 Cmd::CopyResource { dst, src } => {
@@ -1581,27 +2131,63 @@ impl Player {
                         l.CopyResource(dst, src);
                     }
                 }
-                Cmd::Resolve { dst, dst_sub, src, src_sub, format } => {
+                Cmd::Resolve {
+                    dst,
+                    dst_sub,
+                    src,
+                    src_sub,
+                    format,
+                } => {
                     if let (Some(dst), Some(src)) = (res(*dst), res(*src)) {
                         l.ResolveSubresource(dst, *dst_sub, src, *src_sub, DXGI_FORMAT(*format));
                     }
                 }
-                Cmd::ResolveRegion { dst, dst_sub, at, src, src_sub, part, format, mode } => {
-                    if let (Some(dst), Some(src), Ok(l)) = (res(*dst), res(*src), l.cast::<ID3D12GraphicsCommandList1>()) {
+                Cmd::ResolveRegion {
+                    dst,
+                    dst_sub,
+                    at,
+                    src,
+                    src_sub,
+                    part,
+                    format,
+                    mode,
+                } => {
+                    if let (Some(dst), Some(src), Ok(l)) =
+                        (res(*dst), res(*src), l.cast::<ID3D12GraphicsCommandList1>())
+                    {
                         let part = part.map(to_rect);
                         let part = part.as_ref().map(|r| r as *const _);
-                        l.ResolveSubresourceRegion(dst, *dst_sub, at[0], at[1], src, *src_sub, part, DXGI_FORMAT(*format), D3D12_RESOLVE_MODE(*mode));
+                        l.ResolveSubresourceRegion(
+                            dst,
+                            *dst_sub,
+                            at[0],
+                            at[1],
+                            src,
+                            *src_sub,
+                            part,
+                            DXGI_FORMAT(*format),
+                            D3D12_RESOLVE_MODE(*mode),
+                        );
                     }
                 }
                 Cmd::Topology { kind } => l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(*kind)),
                 Cmd::Viewports { all } => {
                     let all: Vec<D3D12_VIEWPORT> = all
                         .iter()
-                        .map(|v| D3D12_VIEWPORT { TopLeftX: v[0], TopLeftY: v[1], Width: v[2], Height: v[3], MinDepth: v[4], MaxDepth: v[5] })
+                        .map(|v| D3D12_VIEWPORT {
+                            TopLeftX: v[0],
+                            TopLeftY: v[1],
+                            Width: v[2],
+                            Height: v[3],
+                            MinDepth: v[4],
+                            MaxDepth: v[5],
+                        })
                         .collect();
                     l.RSSetViewports(&all);
                 }
-                Cmd::Scissors { all } => l.RSSetScissorRects(&all.iter().map(|r| to_rect(*r)).collect::<Vec<_>>()),
+                Cmd::Scissors { all } => {
+                    l.RSSetScissorRects(&all.iter().map(|r| to_rect(*r)).collect::<Vec<_>>())
+                }
                 Cmd::BlendFactor { factor } => l.OMSetBlendFactor(factor.as_ref()),
                 Cmd::StencilRef { value } => l.OMSetStencilRef(*value),
                 Cmd::DepthBounds { min, max } => {
@@ -1615,27 +2201,52 @@ impl Player {
                     }
                 }
                 Cmd::Barriers { all } => {
-                    let all: Vec<D3D12_RESOURCE_BARRIER> = all.iter().filter_map(|b| self.barrier(b)).collect();
+                    let all: Vec<D3D12_RESOURCE_BARRIER> =
+                        all.iter().filter_map(|b| self.barrier(b)).collect();
                     barriers(l, &all);
                 }
                 Cmd::Heaps { heaps } => {
-                    let all: Vec<Option<ID3D12DescriptorHeap>> =
-                        heaps.iter().filter_map(|id| Some(Some(self.descriptors.get(id)?.0.get(version)?.heap.clone()))).collect();
+                    let all: Vec<Option<ID3D12DescriptorHeap>> = heaps
+                        .iter()
+                        .filter_map(|id| {
+                            Some(Some(self.descriptors.get(id)?.0.get(version)?.heap.clone()))
+                        })
+                        .collect();
                     l.SetDescriptorHeaps(&all);
                 }
                 Cmd::RootSignature { graphics, root } => {
                     let root = self.roots.get(root);
-                    if *graphics { l.SetGraphicsRootSignature(root) } else { l.SetComputeRootSignature(root) }
+                    if *graphics {
+                        l.SetGraphicsRootSignature(root)
+                    } else {
+                        l.SetComputeRootSignature(root)
+                    }
                 }
-                Cmd::Table { graphics, param, heap, slot } => {
+                Cmd::Table {
+                    graphics,
+                    param,
+                    heap,
+                    slot,
+                } => {
                     if let Some((versions, step)) = self.descriptors.get(heap)
                         && let Some(v) = versions.get(version)
                     {
-                        let at = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: v.gpu + u64::from(*slot) * step };
-                        if *graphics { l.SetGraphicsRootDescriptorTable(*param, at) } else { l.SetComputeRootDescriptorTable(*param, at) }
+                        let at = D3D12_GPU_DESCRIPTOR_HANDLE {
+                            ptr: v.gpu + u64::from(*slot) * step,
+                        };
+                        if *graphics {
+                            l.SetGraphicsRootDescriptorTable(*param, at)
+                        } else {
+                            l.SetComputeRootDescriptorTable(*param, at)
+                        }
                     }
                 }
-                Cmd::Constants { graphics, param, offset, values } => {
+                Cmd::Constants {
+                    graphics,
+                    param,
+                    offset,
+                    values,
+                } => {
                     let (n, data) = (values.len() as u32, values.as_ptr().cast());
                     if *graphics {
                         l.SetGraphicsRoot32BitConstants(*param, n, data, *offset);
@@ -1643,7 +2254,12 @@ impl Player {
                         l.SetComputeRoot32BitConstants(*param, n, data, *offset);
                     }
                 }
-                Cmd::RootView { graphics, kind, param, va } => {
+                Cmd::RootView {
+                    graphics,
+                    kind,
+                    param,
+                    va,
+                } => {
                     let va = self.va(va);
                     match (*kind, *graphics) {
                         (slot::CBV, true) => l.SetGraphicsRootConstantBufferView(*param, va),
@@ -1655,14 +2271,20 @@ impl Player {
                     }
                 }
                 Cmd::IndexBuffer { view } => {
-                    let v = view.as_ref().map(|(va, size, format)| D3D12_INDEX_BUFFER_VIEW {
-                        BufferLocation: self.va(va),
-                        SizeInBytes: *size,
-                        Format: DXGI_FORMAT(*format),
-                    });
+                    let v = view
+                        .as_ref()
+                        .map(|(va, size, format)| D3D12_INDEX_BUFFER_VIEW {
+                            BufferLocation: self.va(va),
+                            SizeInBytes: *size,
+                            Format: DXGI_FORMAT(*format),
+                        });
                     l.IASetIndexBuffer(v.as_ref().map(|v| v as *const _));
                 }
-                Cmd::VertexBuffers { start, views, count } => match views {
+                Cmd::VertexBuffers {
+                    start,
+                    views,
+                    count,
+                } => match views {
                     Some(views) => {
                         let all: Vec<D3D12_VERTEX_BUFFER_VIEW> = views
                             .iter()
@@ -1674,10 +2296,14 @@ impl Player {
                             .collect();
                         l.IASetVertexBuffers(*start, Some(&all));
                     }
-                    None => l.IASetVertexBuffers(*start, Some(&vec![D3D12_VERTEX_BUFFER_VIEW::default(); *count as usize])),
+                    None => l.IASetVertexBuffers(
+                        *start,
+                        Some(&vec![D3D12_VERTEX_BUFFER_VIEW::default(); *count as usize]),
+                    ),
                 },
                 Cmd::Targets { colors, depth } => {
-                    let colors: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = colors.iter().map(view).collect();
+                    let colors: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> =
+                        colors.iter().map(view).collect();
                     let depth = depth.as_ref().map(view);
                     l.OMSetRenderTargets(
                         colors.len() as u32,
@@ -1686,26 +2312,50 @@ impl Player {
                         depth.as_ref().map(|d| d as *const _),
                     );
                 }
-                Cmd::ClearDepth { view: v, flags, depth, stencil, rects } => {
+                Cmd::ClearDepth {
+                    view: v,
+                    flags,
+                    depth,
+                    stencil,
+                    rects,
+                } => {
                     let rects: Vec<RECT> = rects.iter().map(|r| to_rect(*r)).collect();
                     let rects = (!rects.is_empty()).then_some(&rects[..]);
                     if self.objects.contains_key(&v.res) {
-                        l.ClearDepthStencilView(view(v), D3D12_CLEAR_FLAGS(*flags), *depth, *stencil, rects);
+                        l.ClearDepthStencilView(
+                            view(v),
+                            D3D12_CLEAR_FLAGS(*flags),
+                            *depth,
+                            *stencil,
+                            rects,
+                        );
                     }
                 }
-                Cmd::ClearTarget { view: v, color, rects } => {
+                Cmd::ClearTarget {
+                    view: v,
+                    color,
+                    rects,
+                } => {
                     let rects: Vec<RECT> = rects.iter().map(|r| to_rect(*r)).collect();
                     let rects = (!rects.is_empty()).then_some(&rects[..]);
                     if self.objects.contains_key(&v.res) {
                         l.ClearRenderTargetView(view(v), color, rects);
                     }
                 }
-                Cmd::Discard { res: id, rects, subs } => {
+                Cmd::Discard {
+                    res: id,
+                    rects,
+                    subs,
+                } => {
                     if let Some(r) = res(*id) {
                         let rects: Vec<RECT> = rects.iter().map(|r| to_rect(*r)).collect();
                         let region = subs.map(|s| D3D12_DISCARD_REGION {
                             NumRects: rects.len() as u32,
-                            pRects: if rects.is_empty() { std::ptr::null() } else { rects.as_ptr() },
+                            pRects: if rects.is_empty() {
+                                std::ptr::null()
+                            } else {
+                                rects.as_ptr()
+                            },
                             FirstSubresource: s[0],
                             NumSubresources: s[1],
                         });
@@ -1722,24 +2372,51 @@ impl Player {
                         l.EndQuery(h, D3D12_QUERY_TYPE(*kind), *index);
                     }
                 }
-                Cmd::ResolveQuery { heap, kind, first, count, dst, at } => {
+                Cmd::ResolveQuery {
+                    heap,
+                    kind,
+                    first,
+                    count,
+                    dst,
+                    at,
+                } => {
                     if let (Some(h), Some(dst)) = (self.queries.get(heap), res(*dst)) {
                         l.ResolveQueryData(h, D3D12_QUERY_TYPE(*kind), *first, *count, dst, *at);
                     }
                 }
-                Cmd::Indirect { signature, most, args, at, count, count_at } => {
+                Cmd::Indirect {
+                    signature,
+                    most,
+                    args,
+                    at,
+                    count,
+                    count_at,
+                } => {
                     if let (Some(s), Some(a)) = (self.signatures.get(signature), res(*args)) {
                         l.ExecuteIndirect(s, *most, a, *at, res(*count), *count_at);
                     }
                 }
                 Cmd::WriteImmediate { all } => {
                     if let Ok(l) = l.cast::<ID3D12GraphicsCommandList2>() {
-                        let all: Vec<&(Va, u32, i32)> = all.iter().filter(|(va, _, _)| self.va(va) != 0).collect();
-                        let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> =
-                            all.iter().map(|(va, v, _)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: self.va(va), Value: *v }).collect();
-                        let modes: Vec<D3D12_WRITEBUFFERIMMEDIATE_MODE> = all.iter().map(|(_, _, m)| D3D12_WRITEBUFFERIMMEDIATE_MODE(*m)).collect();
+                        let all: Vec<&(Va, u32, i32)> =
+                            all.iter().filter(|(va, _, _)| self.va(va) != 0).collect();
+                        let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = all
+                            .iter()
+                            .map(|(va, v, _)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                                Dest: self.va(va),
+                                Value: *v,
+                            })
+                            .collect();
+                        let modes: Vec<D3D12_WRITEBUFFERIMMEDIATE_MODE> = all
+                            .iter()
+                            .map(|(_, _, m)| D3D12_WRITEBUFFERIMMEDIATE_MODE(*m))
+                            .collect();
                         if !params.is_empty() {
-                            l.WriteBufferImmediate(params.len() as u32, params.as_ptr(), Some(modes.as_ptr()));
+                            l.WriteBufferImmediate(
+                                params.len() as u32,
+                                params.as_ptr(),
+                                Some(modes.as_ptr()),
+                            );
                         }
                     }
                 }
@@ -1749,20 +2426,38 @@ impl Player {
 
     fn barrier(&self, b: &Barrier) -> Option<D3D12_RESOURCE_BARRIER> {
         Some(match b {
-            Barrier::Transition { flags, res, sub, before, after } => {
-                let mut t = gpu::transition(self.resource(*res)?, *sub, *before as u32, *after as u32);
+            Barrier::Transition {
+                flags,
+                res,
+                sub,
+                before,
+                after,
+            } => {
+                let mut t =
+                    gpu::transition(self.resource(*res)?, *sub, *before as u32, *after as u32);
                 t.Flags = D3D12_RESOURCE_BARRIER_FLAGS(*flags);
                 t
             }
             Barrier::Uav { flags, res } => {
-                let mut u = uav_barrier(if *res == NONE { None } else { Some(self.resource(*res)?) });
+                let mut u = uav_barrier(if *res == NONE {
+                    None
+                } else {
+                    Some(self.resource(*res)?)
+                });
                 u.Flags = D3D12_RESOURCE_BARRIER_FLAGS(*flags);
                 u
             }
-            Barrier::Alias { flags, before, after } => {
+            Barrier::Alias {
+                flags,
+                before,
+                after,
+            } => {
                 let side = |id: &u32| -> std::mem::ManuallyDrop<Option<ID3D12Resource>> {
                     // SAFETY: a borrowed pointer (or none) never released.
-                    self.resource(*id).map_or(std::mem::ManuallyDrop::new(None), |r| unsafe { std::mem::transmute_copy(r) })
+                    self.resource(*id)
+                        .map_or(std::mem::ManuallyDrop::new(None), |r| unsafe {
+                            std::mem::transmute_copy(r)
+                        })
                 };
                 D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
@@ -1811,17 +2506,28 @@ impl Player {
             for all in &submissions {
                 self.worker.queue.ExecuteCommandLists(all);
             }
-            self.worker.queue.ExecuteCommandLists(&[cast(&s.resolve.1)?]);
+            self.worker
+                .queue
+                .ExecuteCommandLists(&[cast(&s.resolve.1)?]);
         }
-        self.worker.idle().context("the card was lost running the frame")?;
+        self.worker
+            .idle()
+            .context("the card was lost running the frame")?;
         // SAFETY: the mapping of `count` resolved timestamps.
         Ok(unsafe { std::slice::from_raw_parts(s.data as *const u64, s.count as usize) }.to_vec())
     }
 
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
-        let mut report = Report { notes: self.notes.clone(), ..Default::default() };
-        let clamps = if o.skip_clamps { self.clamp_results(&mut report)? } else { Vec::new() };
+        let mut report = Report {
+            notes: self.notes.clone(),
+            ..Default::default()
+        };
+        let clamps = if o.skip_clamps {
+            self.clamp_results(&mut report)?
+        } else {
+            Vec::new()
+        };
         let submits = self.edited(o, &mut report, &clamps);
         let built = self.build(&submits, o)?;
         let mut stamps = Vec::new();
@@ -1829,20 +2535,33 @@ impl Player {
             self.restore(o.restore)?;
             self.fresh = false;
             stamps = self.send(&built, o.one_submit)?;
-            let ms = |a: u32, b: u32| stamps[b as usize].saturating_sub(stamps[a as usize]) as f64 * 1e3 / self.frequency;
+            let ms = |a: u32, b: u32| {
+                stamps[b as usize].saturating_sub(stamps[a as usize]) as f64 * 1e3 / self.frequency
+            };
             let lists: Vec<&Built> = built.steps.iter().flat_map(|(_, l)| l).collect();
             let (Some(first), Some(last)) = (lists.first(), lists.last()) else {
                 bail!("no lists to run");
             };
             let delta = built.steps.iter().filter_map(|(d, _)| d.as_ref());
-            report.delta_ms.push(delta.filter(|d| d.first > first.first).map(|d| ms(d.first, d.last)).sum());
+            report.delta_ms.push(
+                delta
+                    .filter(|d| d.first > first.first)
+                    .map(|d| ms(d.first, d.last))
+                    .sum(),
+            );
             report.frame_ms.push(ms(first.first, last.last));
             let each = |l: &[Built]| match (l.first(), l.last()) {
                 (Some(a), Some(b)) => ms(a.first, b.last),
                 _ => 0.0,
             };
-            report.submits = built.steps.iter().map(|(_, l)| (l.len(), each(l))).collect();
-            report.busy_ms.push(report.submits.iter().map(|s| s.1).sum());
+            report.submits = built
+                .steps
+                .iter()
+                .map(|(_, l)| (l.len(), each(l)))
+                .collect();
+            report
+                .busy_ms
+                .push(report.submits.iter().map(|s| s.1).sum());
         }
         if o.detailed {
             self.detail(&built, &stamps, o, &mut report);
@@ -1871,12 +2590,21 @@ impl Player {
                 }
             }
         }
-        report.categories = kinds.into_iter().map(|(k, (ms, n))| (k.to_owned(), ms, n)).collect();
+        report.categories = kinds
+            .into_iter()
+            .map(|(k, (ms, n))| (k.to_owned(), ms, n))
+            .collect();
         report.categories.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let mut all: Vec<(f64, u32, u32)> = shaders.into_iter().map(|(pso, (ms, n))| (ms, n, pso)).collect();
+        let mut all: Vec<(f64, u32, u32)> = shaders
+            .into_iter()
+            .map(|(pso, (ms, n))| (ms, n, pso))
+            .collect();
         all.sort_by(|a, b| b.0.total_cmp(&a.0));
         all.truncate(o.top);
-        report.shaders = all.into_iter().map(|(ms, n, pso)| (ms, n, self.pipeline_name(pso))).collect();
+        report.shaders = all
+            .into_iter()
+            .map(|(ms, n, pso)| (ms, n, self.pipeline_name(pso)))
+            .collect();
     }
 
     /// Saves the presented picture and compares it with the recorded one.
@@ -1886,17 +2614,28 @@ impl Player {
             return Ok(());
         };
         let Some(bytes) = self.contents(p.res)? else {
-            report.notes.push("the presented texture is not there".into());
+            report
+                .notes
+                .push("the presented texture is not there".into());
             return Ok(());
         };
         let Some(rgb) = gpu::rgb(p.width, p.height, p.pitch, p.format, &bytes) else {
-            report.notes.push("the presented format is not shown".into());
+            report
+                .notes
+                .push("the presented format is not shown".into());
             return Ok(());
         };
-        let path = o.image.clone().unwrap_or_else(|| self.folder.join("replay.png"));
+        let path = o
+            .image
+            .clone()
+            .unwrap_or_else(|| self.folder.join("replay.png"));
         std::fs::write(&path, crate::capture::png(p.width, p.height, &rgb))?;
         let mut recorded = vec![0; bytes.len()];
-        read_at(&File::open(self.folder.join("present.bin"))?, &mut recorded, p.file)?;
+        read_at(
+            &File::open(self.folder.join("present.bin"))?,
+            &mut recorded,
+            p.file,
+        )?;
         let was = gpu::rgb(p.width, p.height, p.pitch, p.format, &recorded).unwrap_or_default();
         report.picture = Some((gpu::psnr(&rgb, &was), rows_equal(&p, &bytes, &recorded)));
         report.notes.push(format!(
@@ -1924,8 +2663,17 @@ impl Player {
         let is_buffer = r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
         let states = if self.fresh { &self.start } else { &self.end };
         let state = states.get(&id).cloned().unwrap_or(vec![COMMON]);
-        let (f, total) = if is_buffer { (Vec::new(), r.desc.width) } else { gpu::footprints(&self.device, &desc, sub, 1) };
-        let (back, data) = gpu::buffer(&self.device, D3D12_HEAP_TYPE_READBACK, total, D3D12_RESOURCE_FLAG_NONE)?;
+        let (f, total) = if is_buffer {
+            (Vec::new(), r.desc.width)
+        } else {
+            gpu::footprints(&self.device, &desc, sub, 1)
+        };
+        let (back, data) = gpu::buffer(
+            &self.device,
+            D3D12_HEAP_TYPE_READBACK,
+            total,
+            D3D12_RESOURCE_FLAG_NONE,
+        )?;
         self.worker.run(|list| {
             if is_buffer {
                 // SAFETY: an open list; live buffers.
@@ -1944,12 +2692,18 @@ impl Player {
             }
         })?;
         // SAFETY: the buffer's mapping; the copy into it has run.
-        Ok(Some(unsafe { std::slice::from_raw_parts(data, total as usize) }.to_vec()))
+        Ok(Some(
+            unsafe { std::slice::from_raw_parts(data, total as usize) }.to_vec(),
+        ))
     }
 
     /// The id of the resource of a name (tests).
     pub fn named(&self, name: &str) -> Option<u32> {
-        self.frame.resources.iter().find(|r| r.name == name).map(|r| r.id)
+        self.frame
+            .resources
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.id)
     }
 }
 
@@ -1978,7 +2732,12 @@ fn rows_equal(p: &wire::Present, a: &[u8], b: &[u8]) -> bool {
 }
 
 fn to_rect(r: [i32; 4]) -> RECT {
-    RECT { left: r[0], top: r[1], right: r[2], bottom: r[3] }
+    RECT {
+        left: r[0],
+        top: r[1],
+        right: r[2],
+        bottom: r[3],
+    }
 }
 
 /// # Safety
@@ -1997,7 +2756,9 @@ fn uav_barrier(res: Option<&ID3D12Resource>) -> D3D12_RESOURCE_BARRIER {
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
             UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
                 // SAFETY: a borrowed pointer (or none) never released.
-                pResource: res.map_or(std::mem::ManuallyDrop::new(None), |r| unsafe { std::mem::transmute_copy(r) }),
+                pResource: res.map_or(std::mem::ManuallyDrop::new(None), |r| unsafe {
+                    std::mem::transmute_copy(r)
+                }),
             }),
         },
     }
@@ -2042,7 +2803,9 @@ fn make_device(frame: &Frame, debug: bool) -> Result<(ID3D12Device, Option<ID3D1
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
         let mut adapter = None;
         for i in 0.. {
-            let Ok(a) = factory.EnumAdapters1(i) else { break };
+            let Ok(a) = factory.EnumAdapters1(i) else {
+                break;
+            };
             let d = a.GetDesc1()?;
             if (d.VendorId, d.DeviceId) == (frame.vendor, frame.device) {
                 adapter = Some(a);
@@ -2050,7 +2813,10 @@ fn make_device(frame: &Frame, debug: bool) -> Result<(ID3D12Device, Option<ID3D1
             }
         }
         if adapter.is_none() {
-            tracing::warn!("the adapter recorded on ({}) is not here: the default one is used", frame.adapter);
+            tracing::warn!(
+                "the adapter recorded on ({}) is not here: the default one is used",
+                frame.adapter
+            );
         }
         let mut device: Option<ID3D12Device> = None;
         match &adapter {
@@ -2081,13 +2847,19 @@ fn debug_messages(q: &ID3D12InfoQueue) -> Vec<String> {
             let m = &*message;
             if m.Severity.0 <= D3D12_MESSAGE_SEVERITY_ERROR.0 {
                 let text = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
-                let text = || String::from_utf8_lossy(text).trim_end_matches('\0').to_owned();
+                let text = || {
+                    String::from_utf8_lossy(text)
+                        .trim_end_matches('\0')
+                        .to_owned()
+                };
                 seen.entry(m.ID.0).or_insert_with(|| (0, text())).0 += 1;
             }
         }
         q.ClearStoredMessages();
     }
-    seen.into_iter().map(|(id, (n, text))| format!("debug layer: {n} errors {id}, first: {text}")).collect()
+    seen.into_iter()
+        .map(|(id, (n, text))| format!("debug layer: {n} errors {id}, first: {text}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -2106,7 +2878,10 @@ mod tests {
         }
         // The last complete one; itself when named.
         assert_eq!(find(dir.path()).unwrap(), dir.path().join("capture-10"));
-        assert_eq!(find(&dir.path().join("capture-2")).unwrap(), dir.path().join("capture-2"));
+        assert_eq!(
+            find(&dir.path().join("capture-2")).unwrap(),
+            dir.path().join("capture-2")
+        );
     }
 
     #[test]
@@ -2125,7 +2900,11 @@ mod tests {
         assert!(t.contains("a frame: 11.00 ms"), "{t}");
         assert!(t.contains("between submissions 1.50 ms"), "{t}");
         assert!(t.contains("PSNR 40.0 dB"), "{t}");
-        let o = Options { skip_clamps: true, buffers: Buffers::Card, ..Default::default() };
+        let o = Options {
+            skip_clamps: true,
+            buffers: Buffers::Card,
+            ..Default::default()
+        };
         assert!(o.edited() && !o.plain().edited() && o.plain().buffers == Buffers::Card);
     }
 }

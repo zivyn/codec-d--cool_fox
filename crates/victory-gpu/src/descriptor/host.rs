@@ -85,7 +85,66 @@ pub(crate) struct HostHeap {
     /// by slot and by address ([`Spans`]): which slots a newer view of
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
-    placed: Mutex<Spans>,
+    placed: std::sync::Arc<Mutex<Spans>>,
+}
+
+/// The spans of every view heap made ([`HostHeap::placed`]), for the
+/// texture code, which has no heap at hand ([`next_start`],
+/// [`first_viewed`]).
+static PLACED_SPANS: Mutex<Vec<std::sync::Weak<Mutex<Spans>>>> = Mutex::new(Vec::new());
+
+/// Where the next texture placed inside `[start, end)` starts, past the
+/// first bytes of the one at `start` ([`HEAD`]): what is there of the
+/// texture at `start` ends there, whatever its full size. `None`: no view
+/// in a slot shaders pick by index describes memory in that range.
+pub(crate) fn next_start(start: u64, end: u64) -> Option<u64> {
+    let heaps = PLACED_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter_map(|spans| spans.lock().unwrap_or_else(|e| e.into_inner()).next_start(start, end))
+        .min()
+}
+
+/// The lowest level that a view of the placed texture at `start` shows,
+/// over the slots shaders pick by index that hold one now. The title
+/// views a texture from the first level it holds. `None`: no such slot.
+pub(crate) fn first_viewed(start: u64) -> Option<u32> {
+    let heaps = PLACED_SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    heaps
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter_map(|spans| spans.lock().unwrap_or_else(|e| e.into_inner()).first_viewed(start))
+        .min()
+}
+
+/// Levels on demand (`crate::tiles`): where the placed textures start
+/// whose first level with memory changed since a texture pass last took
+/// them ([`HostHeap::texture_views_remade`]).
+static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The first level with memory of the placed texture at `start` changed:
+/// its slots are made again at the next texture pass.
+pub(crate) fn levels_changed(start: u64) {
+    RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
+}
+
+/// Levels on demand (`crate::tiles`): where the placed textures start
+/// whose last upload left a held level without tiles (the card had no
+/// room, or no heap could be had), and when (`crate::host::moment`). A
+/// texture pass makes their slots due again once the card has room
+/// ([`HostHeap::texture_slots_waiting`]).
+static WAITING: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// The last upload of the placed texture at `start` left a held level
+/// without tiles. A texture picked by index is uploaded once and then
+/// only when its memory is found changed, and its staging buffer goes
+/// with the upload: without this the level stayed empty (the texture
+/// blurred, or black if no level had tiles) for as long as the title left
+/// its memory alone, where a texture refused for want of room is tried
+/// again.
+pub(crate) fn levels_waiting(start: u64) {
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, crate::host::moment());
 }
 
 /// Title memory by the placed texture views that describe it: per span of
@@ -110,6 +169,8 @@ pub(crate) struct Spans {
     rule: Rule,
     by_start: std::collections::BTreeMap<u64, (u64, std::collections::BTreeSet<u32>)>,
     by_slot: std::collections::HashMap<u32, u64>,
+    /// The level each slot's view starts at ([`Spans::shows`]).
+    first: std::collections::HashMap<u32, u32>,
     /// The bytes a placed texture takes, by resource description: worked
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
@@ -227,8 +288,30 @@ impl Spans {
         stale
     }
 
+    /// The view in slot `index` starts at level `first` of its texture.
+    fn shows(&mut self, index: u32, first: u32) {
+        self.first.insert(index, first);
+    }
+
+    /// The lowest level a view of the texture at `start` starts at.
+    fn first_viewed(&self, start: u64) -> Option<u32> {
+        self.by_start.get(&start)?.1.iter().filter_map(|slot| self.first.get(slot)).min().copied()
+    }
+
+    /// The first span that starts inside `[start, end)` past the first
+    /// [`HEAD`] bytes of it.
+    fn next_start(&self, start: u64, end: u64) -> Option<u64> {
+        self.by_start.range(start.saturating_add(HEAD)..end).next().map(|(at, _)| *at)
+    }
+
+    /// The slots that hold a view of the texture at `start`.
+    fn slots_at(&self, start: u64) -> Vec<u32> {
+        self.by_start.get(&start).map(|span| span.1.iter().copied().collect()).unwrap_or_default()
+    }
+
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
+        self.first.remove(&index);
         let Some(start) = self.by_slot.remove(&index) else {
             return;
         };
@@ -248,6 +331,76 @@ impl Spans {
             .flat_map(|span| span.1.iter().copied())
             .collect()
     }
+
+    /// The slots of the textures that hold bytes of `[start, end)`, for a
+    /// write there: as [`Spans::slots_in`], but when a texture starts at
+    /// `start` itself the one before it is left out (it ends where that
+    /// one starts, and a request that fills a texture begins at its first
+    /// byte: `slots_in` would name its neighbour with every such write).
+    fn slots_holding(&self, start: u64, end: u64) -> Vec<u32> {
+        if end <= start {
+            return Vec::new();
+        }
+        let before = if self.by_start.contains_key(&start) {
+            None
+        } else {
+            self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start).map(|(_, span)| span)
+        };
+        before
+            .into_iter()
+            .chain(self.by_start.range(start..end).map(|(_, span)| span))
+            .flat_map(|span| span.1.iter().copied())
+            .collect()
+    }
+}
+
+/// Title memory written behind the guards' back whose bytes are there
+/// (DirectStorage's reads into physical pages, at the addresses the title
+/// has them mapped; `crate::watch::title_memory_written`), since a texture
+/// pass last took the ranges ([`page_written`]). Kept apart from
+/// [`REMAPPED`] so that what such writes do is counted by itself.
+static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Since the start: such ranges kept for a pass; ranges dropped because no
+/// pass took them; slots of placed textures that held bytes of them when a
+/// pass took them; of those, the slots whose texture had been uploaded
+/// before the write (out of the queue, or in it after an upload): they are
+/// the ones that kept the bytes from before, and the ones made due when
+/// `VICTORY_PAGE_WRITES` asks for it.
+pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Frames from the pass that takes a written range to the look at its
+/// slots: the levels of one texture arrive in a few requests, and a look
+/// two frames on takes those of the next frame with it.
+const PAGE_WRITE_AFTER: u64 = 2;
+
+/// The bytes of a write the guards do not see are in title memory `[at,
+/// at + len)`: the placed textures there changed with no descriptor
+/// written and nothing mapped. Kept for the next texture pass
+/// ([`HostHeap::texture_slots_page_written`]), as [`remapped`] keeps its
+/// ranges; locks one mutex and calls nothing.
+pub(crate) fn page_written(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    /// Ranges kept until a pass takes them.
+    const MOST: usize = 1 << 15;
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+        return;
+    }
+    let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    PAGE_WRITES[0].fetch_add(1, Relaxed);
+    if let Some(last) = ranges.last_mut()
+        && last.1 == start
+    {
+        last.1 = end;
+        return;
+    }
+    if ranges.len() >= MOST {
+        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
+        ranges.clear();
+    }
+    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -373,6 +526,10 @@ struct Waiting {
 pub(crate) struct TextureQueue {
     slots: std::collections::BTreeMap<u32, Waiting>,
     writes: u64,
+    /// Slots held back because the card had no room for the host copy
+    /// they need ([`TextureQueue::hold`]), each with the write it was
+    /// held as.
+    held: std::collections::BTreeMap<u32, u64>,
 }
 
 impl TextureQueue {
@@ -447,6 +604,37 @@ impl TextureQueue {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
         }
+    }
+
+    /// The card has no room for the host copy slot `index` needs: it is
+    /// not handed out again before frame `due`, or before the card has
+    /// room again ([`TextureQueue::room`]). Nothing else of it changes: it
+    /// is not a slot "waiting for its memory", and when it is due it has
+    /// its old place among the slots never looked at. (It stayed due, so
+    /// every pass on a full card looked at the same few hundred slots
+    /// again and stopped there, and the slots behind them were never
+    /// reached: the ones whose host copy exists and only wants bringing up
+    /// to date, and the ones whose memory went, which is what lets host
+    /// copies go and makes room.)
+    fn hold(&mut self, index: u32, write: u64, due: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.due = w.due.max(due);
+            self.held.insert(index, write);
+        }
+    }
+
+    /// The card has room again at `frame`: the slots held back for lack of
+    /// it are due now, as if they had never been held. Returns how many.
+    fn room(&mut self, frame: u64) -> usize {
+        let held = std::mem::take(&mut self.held);
+        let mut back = 0;
+        for (index, write) in held {
+            if let Some(w) = self.same(index, write) {
+                w.due = w.due.min(frame);
+                back += 1;
+            }
+        }
+        back
     }
 
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
@@ -770,7 +958,16 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
-            placed: Mutex::default(),
+            placed: {
+                let spans = std::sync::Arc::<Mutex<Spans>>::default();
+                if !sampler {
+                    PLACED_SPANS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(std::sync::Arc::downgrade(&spans));
+                }
+                spans
+            },
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -985,6 +1182,16 @@ impl HostHeap {
         textures.later(index, write, frame, most);
     }
 
+    /// See [`TextureQueue::hold`].
+    pub(crate) fn texture_slot_held(&self, index: u32, write: u64, due: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).hold(index, write, due);
+    }
+
+    /// See [`TextureQueue::room`].
+    pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).room(frame)
+    }
+
     /// Bytes of title slot `index`'s memory that were mapped when it was
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
@@ -1003,6 +1210,7 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        self.texture_slots_page_written(frame);
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -1020,6 +1228,54 @@ impl HostHeap {
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
+    }
+
+    /// Takes the ranges of title memory written behind the guards' back
+    /// since the last call ([`page_written`]) and finds the slots whose
+    /// placed texture holds bytes of them ([`Spans::slots_holding`]). A
+    /// slot whose texture was uploaded before the write shows the bytes
+    /// from before: with `VICTORY_PAGE_WRITES` (`crate::watch::page_writes`,
+    /// bit 2) it is due again [`PAGE_WRITE_AFTER`] frames on, as memory
+    /// mapped under it would make it ([`HostHeap::texture_slots_remapped`]);
+    /// its host copy exists, so the upload needs no room on the card. A
+    /// slot still waiting for its first upload is left as it is: that
+    /// upload takes the bytes that are there by then. Slots tables read
+    /// are left to their draws. Counted either way; returns how many slots
+    /// it made due.
+    fn texture_slots_page_written(&self, frame: u64) -> usize {
+        let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return 0;
+        }
+        self.slots_written_under(&ranges, frame, crate::watch::page_writes() & 2 != 0)[2]
+    }
+
+    /// [`HostHeap::texture_slots_page_written`] for `ranges` (start, end):
+    /// the slots that held bytes of them, those of them uploaded before,
+    /// and those made due (the latter, if `due`).
+    fn slots_written_under(&self, ranges: &[(u64, u64)], frame: u64, due: bool) -> [usize; 3] {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let held = slots.len();
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        // Uploaded before: out of the queue, or in it after an upload (in
+        // part, or whole and being looked at again).
+        slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
+        PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
+        PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
+        if !due {
+            return [held, slots.len(), 0];
+        }
+        for &slot in &slots {
+            textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+        }
+        [held, slots.len(), slots.len()]
     }
 
     /// Whether host slot `index` is made from the very record the title
@@ -1050,6 +1306,101 @@ impl HostHeap {
                 .unwrap_or_else(|e| e.into_inner())
                 .get(index as usize)
                 .is_some_and(Option::is_some)
+    }
+
+    /// Levels on demand (`crate::tiles`): makes again the host slots of the
+    /// placed textures whose first level with memory changed since the
+    /// last call ([`levels_changed`]), each from the view it was made
+    /// from, so that it shows the texture from that level ([`make`]). Only
+    /// slots that are made; a slot draws read through a table is made by
+    /// its draw. Returns how many it made.
+    /// shortcut: the starts are kept in one place for all heaps; the heap
+    /// whose pass runs first takes them (a title has one view heap).
+    /// Levels on demand (`crate::tiles`): the card has room, so the slots
+    /// of up to [`Self::WAITING_A_PASS`] placed textures whose upload left
+    /// a held level without tiles at least a second ago
+    /// ([`levels_waiting`]) are due again from the next frame, as memory
+    /// mapped under them would make them
+    /// ([`HostHeap::texture_slots_remapped`]): the upload then gives the
+    /// level its tiles. To be called only while the card has room: without
+    /// it the upload would give nothing again. Slots tables read are left
+    /// to their draws (`texture.rs` `upload` asks again for those). Returns
+    /// how many slots it made due.
+    /// shortcut: kept in one place for all heaps, as the starts below.
+    pub(crate) fn texture_slots_waiting(&self, frame: u64) -> usize {
+        if self.sampler {
+            return 0;
+        }
+        let starts: Vec<u64> = {
+            let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+            if waiting.is_empty() {
+                return 0;
+            }
+            let starts: Vec<u64> = waiting
+                .iter()
+                .filter(|&(_, &since)| crate::host::long_ago(since, 1000, 2))
+                .map(|(&start, _)| start)
+                .take(Self::WAITING_A_PASS)
+                .collect();
+            for start in &starts {
+                waiting.remove(start);
+            }
+            starts
+        };
+        if starts.is_empty() {
+            return 0;
+        }
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        for &slot in &slots {
+            textures.changed(slot, frame, frame + 1);
+        }
+        crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        slots.len()
+    }
+
+    /// Textures a pass asks again for their levels
+    /// ([`HostHeap::texture_slots_waiting`]): the first ones given tiles
+    /// may take the room the others were asked for, and an upload that
+    /// gives nothing is a whole texture staged and copied for nothing.
+    const WAITING_A_PASS: usize = 128;
+
+    pub(crate) fn texture_views_remade(&self) -> usize {
+        if self.sampler {
+            return 0;
+        }
+        let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
+        if starts.is_empty() {
+            return 0;
+        }
+        let slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+        };
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut remade = 0;
+        for slot in slots {
+            let Some(&key) = made.get(slot as usize) else {
+                continue;
+            };
+            if key == 0 {
+                continue;
+            }
+            let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
+                continue;
+            };
+            if let Some(kept) = make(&view, self.cpu(slot)) {
+                self.keep(slot, kept);
+                remade += 1;
+            }
+        }
+        remade
     }
 
     /// The memory of the texture title slot `index` views is not mapped
@@ -1215,21 +1566,27 @@ impl HostHeap {
             Some(View::Placed(false, resource, desc))
                 if resource[0] != 1 && !self.tabled_lately(index, crate::frame::current()) =>
             {
-                Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32))
+                // (And the level the view starts at: word 4 of a texture
+                // view's description, after format, dimension, mapping
+                // and a pad.)
+                Some((resource, u64::from(desc[10]) | u64::from(desc[11]) << 32, desc[4]))
             }
             _ => None,
         };
         let stale = {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            let span = placed_view
-                .and_then(|(resource, start)| Some((start, start.saturating_add(placed.bytes(resource)?))));
+            let span = placed_view.and_then(|(resource, start, first)| {
+                Some((start, start.saturating_add(placed.bytes(resource)?), first))
+            });
             match span {
-                Some((start, end)) => {
+                Some((start, end, first)) => {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
-                    placed.note(index, start, end, !seen)
+                    let stale = placed.note(index, start, end, !seen);
+                    placed.shows(index, first);
+                    stale
                 }
                 None => {
                     placed.forget(index);
@@ -2124,6 +2481,32 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                // Levels on demand (`crate::tiles`): a texture made level by
+                // level is shown from the first level that is the title's
+                // and has memory, if the title's view starts before it (a
+                // level without memory reads zeros: a black texture). The
+                // title's own view mostly starts there already.
+                if let Some(first) = crate::resource::first_shown(resource)
+                    && first > 0
+                {
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    // The texture's own view (the title gave none): all of it.
+                    let whole = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: own.Format,
+                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                        Shader4ComponentMapping: 5768,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_SRV {
+                                MostDetailedMip: 0,
+                                MipLevels: u32::MAX,
+                                PlaneSlice: 0,
+                                ResourceMinLODClamp: 0.0,
+                            },
+                        },
+                    };
+                    crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -2229,6 +2612,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
+            // An empty title buffer: nothing to view, and no host copy to
+            // look for (#70: such views were in flight at device removals).
+            if len == 0 {
+                return None;
+            }
             if *unordered {
                 buffer_uav(address, len, uav_desc(words), at)
             } else {
@@ -2469,6 +2857,29 @@ mod tests {
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
     }
 
+    /// What the texture code asks of the spans (levels on demand): where
+    /// the next texture starts inside a span, the lowest level a view of a
+    /// texture shows, and a texture's slots.
+    #[test]
+    fn spans_say_the_next_start_and_the_lowest_level_viewed() {
+        let mut spans = Spans::default();
+        // A 512x512 texture of 0x56000 bytes viewed from levels 3 and 1,
+        // and the next one 0x6000 after it (run 188).
+        spans.note(1, 0x1_0000, 0x1_0000 + 0x5_6000, true);
+        spans.shows(1, 3);
+        spans.note(2, 0x1_0000, 0x1_0000 + 0x5_6000, true);
+        spans.shows(2, 1);
+        spans.note(3, 0x1_6000, 0x1_6000 + 0x5_6000, true);
+        assert_eq!(spans.next_start(0x1_0000, 0x1_0000 + 0x5_6000), Some(0x1_6000));
+        assert_eq!(spans.next_start(0x1_6000, 0x1_6000 + 0x5_6000), None);
+        assert_eq!(spans.first_viewed(0x1_0000), Some(1));
+        assert_eq!(spans.first_viewed(0x1_6000), None);
+        assert_eq!(spans.slots_at(0x1_0000), vec![1, 2]);
+        // The view from level 1 goes: the texture is viewed from level 3.
+        spans.forget(2);
+        assert_eq!(spans.first_viewed(0x1_0000), Some(3));
+    }
+
     /// Views of one placed texture are told from views of others by the
     /// address and the resource description, not by what they show.
     #[test]
@@ -2615,6 +3026,38 @@ mod tests {
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
     }
 
+    /// Slots held back for lack of room on the card are not handed out
+    /// until their frame, keep their place, are not counted as waiting
+    /// for their memory, and all come back at once when the card has room;
+    /// a slot written again meanwhile is the title's new write.
+    #[test]
+    fn slots_held_for_lack_of_room_come_back_when_there_is_room() {
+        let mut q = TextureQueue::default();
+        for i in 0..4u32 {
+            q.written(20 + i, 1, 0, false);
+        }
+        let due = q.due(1, 100);
+        assert_eq!(due.len(), 4);
+        // The card is full: slots 20 and 21 are held back until frame 101.
+        for &(index, write) in due.iter().filter(|d| d.0 < 22) {
+            q.hold(index, write, 101);
+        }
+        let now: Vec<u32> = q.due(2, 100).into_iter().map(|d| d.0).collect();
+        assert!(!now.contains(&20) && !now.contains(&21));
+        assert!(now.contains(&22) && now.contains(&23));
+        assert_eq!(q.census(2)[2], 0, "held slots do not wait for their memory");
+        // Due again at their frame, in the order they had.
+        assert_eq!(q.due(101, 100), due);
+        // Slot 21 is written again while held: due as written.
+        q.written(21, 3, 0, false);
+        assert!(q.due(3, 100).iter().any(|d| d.0 == 21));
+        // Room again at frame 5: slot 20 is due at once, and only it was
+        // still held as it was.
+        assert_eq!(q.room(5), 1);
+        assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
+        assert_eq!(q.room(6), 0);
+    }
+
     /// Textures of which only the smallest levels are held, packed into
     /// one another's address range (the three of run 188: 0x2c000 bytes
     /// each at full size, their starts 0x2000 and 0x4000 apart): writing
@@ -2706,6 +3149,63 @@ mod tests {
         assert_eq!(spans.slots_in(at, at + 0x8000), [1, 2, 3]);
         // Past the end of all: none.
         assert_eq!(spans.slots_in(at + 0x32000, at + 0x33000), [] as [u32; 0]);
+    }
+
+    /// A write names the textures that hold its bytes: the one that
+    /// starts where the write starts, not the neighbour before it, whose
+    /// held levels end there.
+    #[test]
+    fn a_write_at_the_start_of_a_packed_texture_names_it_alone() {
+        let mut spans = Spans::default();
+        let at = 0x7_0000_0000u64;
+        assert!(spans.note(1, at, at + 0x2c000, true).is_empty());
+        assert!(spans.note(2, at + 0x2000, at + 0x2e000, true).is_empty());
+        assert!(spans.note(3, at + 0x6000, at + 0x32000, true).is_empty());
+        // A request that fills the second texture's held levels.
+        assert_eq!(spans.slots_in(at + 0x2000, at + 0x6000), [1, 2]);
+        assert_eq!(spans.slots_holding(at + 0x2000, at + 0x6000), [2]);
+        // From inside the first one's held levels on: both.
+        assert_eq!(spans.slots_holding(at + 0x1000, at + 0x3000), [1, 2]);
+        // A whole 64 KiB page: every texture that starts in it.
+        assert_eq!(spans.slots_holding(at, at + 0x10000), [1, 2, 3]);
+        // Past the last start, the last one; past all, or no bytes, none.
+        assert_eq!(spans.slots_holding(at + 0x20000, at + 0x21000), [3]);
+        assert_eq!(spans.slots_holding(at + 0x32000, at + 0x33000), [] as [u32; 0]);
+        assert_eq!(spans.slots_holding(at + 0x2000, at + 0x2000), [] as [u32; 0]);
+    }
+
+    /// A write behind the guards' back under a placed texture: a slot
+    /// waiting for its first upload is left alone, one uploaded before is
+    /// counted, and made due two frames on when that is asked for. (The
+    /// ranges are handed over here, not through the list all heaps share.)
+    #[test]
+    fn a_page_write_makes_an_uploaded_texture_slot_due_when_asked() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let slots = |at: u64| -> Vec<u32> { heap.texture_slots_due(at, 8).0.into_iter().map(|d| d.0).collect() };
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let at = 0x7fed_0000_0000u64;
+        let mut desc = [0u32; 16];
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc);
+        assert!(heap.note_buffer(1, Some(&view), false).is_empty());
+        let written = [(at, at + 0x1000)];
+        // Waiting for its first upload: held, not uploaded, nothing done.
+        assert_eq!(heap.slots_written_under(&written, 50, true), [1, 0, 0]);
+        let (queued, write) = heap.texture_slots_due(u64::MAX, 8).0[0];
+        assert_eq!(queued, 1);
+        heap.texture_slot_done(1, write, None);
+        assert_eq!(slots(u64::MAX), []);
+        // Uploaded and out of the queue. Memory elsewhere: nothing.
+        assert_eq!(heap.slots_written_under(&[(at + 0x10_0000, at + 0x10_1000)], 60, true), [0, 0, 0]);
+        // Under it, counted only: it stays out of the queue.
+        assert_eq!(heap.slots_written_under(&written, 60, false), [1, 1, 0]);
+        assert_eq!(slots(u64::MAX), []);
+        // Under it, asked for: due two frames on, not before.
+        assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
+        assert_eq!(slots(61), []);
+        assert_eq!(slots(62), [1]);
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that

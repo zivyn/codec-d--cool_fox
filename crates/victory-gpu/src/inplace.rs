@@ -267,6 +267,13 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    /// By section and byte offset of a 64 KiB page: the address of that
+    /// page in every view that shows it. A write through one view of a
+    /// page is a write of the bytes every other view shows
+    /// (`crate::watch` guards them all).
+    pages: BTreeMap<(usize, u64), Vec<usize>>,
+    /// Of those, how many are shown more than once.
+    pages_twice: usize,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
     /// Our own view of a whole section, by its handle (0: the host gave
@@ -274,7 +281,13 @@ struct Views {
     whole: Vec<(usize, usize)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new(), whole: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views {
+    views: BTreeMap::new(),
+    pages: BTreeMap::new(),
+    pages_twice: 0,
+    sections: Vec::new(),
+    whole: Vec::new(),
+});
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -310,7 +323,20 @@ pub fn title_memory_section_gone(section: usize) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    {
+        let mut v = views();
+        v.views.insert(at, (len, section, offset));
+        for k in 0..len.div_ceil(K64) {
+            let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
+            shown.push(at + k * K64);
+            let twice = shown.len() == 2;
+            v.pages_twice += usize::from(twice);
+        }
+    }
+    // This view is writable from now on: a guard over the same bytes at
+    // another view must look at them again, and the pages are noted written
+    // there (`crate::watch`).
+    crate::watch::views_mapped(section, offset, len);
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -325,8 +351,95 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        let Some((bytes, section, offset)) = v.views.remove(&base) else {
+            continue;
+        };
+        for k in 0..bytes.div_ceil(K64) {
+            let key = (section, offset + (k * K64) as u64);
+            if let Some(pages) = v.pages.get_mut(&key) {
+                let page = base + k * K64;
+                let before = pages.len();
+                pages.retain(|&shown| shown != page);
+                let after = pages.len();
+                if after == 0 {
+                    v.pages.remove(&key);
+                }
+                v.pages_twice = v.pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
+            }
+        }
     }
+}
+
+/// The 64 KiB pages of `[start, end)` that the title shows at other
+/// addresses too, in address order, each with those; not the ones it shows
+/// in very many views (`crate::watch::MANY_VIEWS`).
+pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize>)> {
+    let v = views();
+    let mut out = Vec::new();
+    if start >= end || v.pages_twice == 0 {
+        return out;
+    }
+    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
+        let from = start.max(base) & !(K64 - 1);
+        for page in (from..end.min(base + bytes)).step_by(K64) {
+            let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
+                continue;
+            };
+            if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
+                out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
+            }
+        }
+    }
+    out
+}
+
+/// The address of the 64 KiB page shown at `page` in every title view that
+/// shows it, `page`'s own address included; empty if `page` is not a view.
+pub(crate) fn pages_of(page: usize) -> Vec<usize> {
+    let v = views();
+    let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
+        return Vec::new();
+    };
+    let within = page.wrapping_sub(base);
+    if within >= bytes || !within.is_multiple_of(K64) {
+        return Vec::new();
+    }
+    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+}
+
+/// The title views that show any of the physical bytes `[offset, offset +
+/// len)` of `section`, as `(address, bytes)` ranges in address order; not
+/// those of a page shown in very many views (`MANY_VIEWS`).
+pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let v = views();
+    let end = offset.saturating_add(len as u64);
+    let mut pages: Vec<usize> = Vec::new();
+    let mut at = offset - offset % K64 as u64;
+    while at < end {
+        if let Some(shown) = v.pages.get(&(section, at))
+            && shown.len() <= crate::watch::MANY_VIEWS
+        {
+            pages.extend(shown.iter().copied());
+        }
+        match at.checked_add(K64 as u64) {
+            Some(next) => at = next,
+            None => break,
+        }
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let mut runs: Vec<(usize, usize)> = Vec::with_capacity(pages.len());
+    for page in pages {
+        match runs.last_mut() {
+            Some((first, bytes)) if *first + *bytes == page => *bytes += K64,
+            _ => runs.push((page, K64)),
+        }
+    }
+    runs
 }
 
 /// How many bytes of `[at, at + len)` views of physical pages show; `None`

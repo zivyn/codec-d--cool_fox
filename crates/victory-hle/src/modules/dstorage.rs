@@ -1490,6 +1490,8 @@ fn into_destination(
         // was uploaded without them (`xmem::pages_written`).
         if super::xmem::stream_notice() {
             victory_gpu::kernel_will_write(request.destination as usize, len);
+        } else {
+            victory_gpu::title_memory_written(request.destination as usize, len, false);
         }
         return filled;
     }

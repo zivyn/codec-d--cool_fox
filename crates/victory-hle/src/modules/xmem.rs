@@ -512,37 +512,6 @@ impl Shown {
     }
 }
 
-/// DirectStorage has put bytes `[offset, offset + len)` of `pages` into
-/// memory: the GPU side is told where the title sees them, so that what it
-/// copied there before they arrived (a texture uploaded when its view was
-/// written holds whatever the pages held then) is copied again.
-/// `VICTORY_STREAM_NOTICE=0`: not told, as before.
-pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
-    if !stream_notice() || len == 0 {
-        return;
-    }
-    let mut seen: Vec<(usize, usize)> = {
-        let numbers = pages.get(offset / PAGE..(offset + len).div_ceil(PAGE)).unwrap_or_default();
-        let slices: Vec<Slice> = {
-            let table = page_table();
-            numbers.iter().filter_map(|n| table.pages.get(n)).cloned().collect()
-        };
-        let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
-        slices.iter().flat_map(|slice| shown.at(slice)).collect()
-    };
-    seen.sort_unstable();
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for (at, len) in seen {
-        match runs.last_mut() {
-            Some(last) if last.0 + last.1 == at => last.1 += len,
-            _ => runs.push((at, len)),
-        }
-    }
-    for (at, len) in runs {
-        victory_gpu::kernel_will_write(at, len);
-    }
-}
-
 /// See [`pages_written`].
 pub(crate) fn stream_notice() -> bool {
     static ON: LazyLock<bool> =
@@ -848,6 +817,67 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     })
 }
 
+/// The title addresses that show bytes `[offset, offset + len)` of `pages`
+/// now, byte for byte, as runs (address, bytes) in address order: a write
+/// to the pages through a view of our own ([`page_window`],
+/// [`write_physical`]) lands there too, and nothing that watches those
+/// addresses sees it. Empty if no view shows them. Byte for byte, not by
+/// whole pages: the title packs several small textures into one page and
+/// fills each with a request of its own.
+pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let Some(end) = offset.checked_add(len) else {
+        return Vec::new();
+    };
+    let first = offset / PAGE;
+    let Some(touched) = pages.get(first..end.div_ceil(PAGE)) else {
+        return Vec::new();
+    };
+    let slices: Vec<Option<Slice>> = {
+        let table = page_table();
+        touched.iter().map(|page| table.pages.get(page).cloned()).collect()
+    };
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    {
+        let shown = SHOWN.read().unwrap_or_else(|e| e.into_inner());
+        for (i, slice) in slices.iter().enumerate() {
+            let Some(slice) = slice else { continue };
+            // The bytes of this page that the write covers.
+            let lo = if i == 0 { offset % PAGE } else { 0 };
+            let hi = (end - (first + i) * PAGE).min(PAGE);
+            pieces.extend(shown.at(slice).into_iter().map(|(at, _)| (at + lo, hi - lo)));
+        }
+    }
+    pieces.sort_unstable();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for (at, bytes) in pieces {
+        match runs.last_mut() {
+            Some((start, n)) if *start + *n == at => *n += bytes,
+            _ => runs.push((at, bytes)),
+        }
+    }
+    runs
+}
+
+/// DirectStorage has put bytes `[offset, offset + len)` of `pages` into
+/// memory, through a view of our own: the GPU side is told where the title
+/// sees them, so that what it copied there before they arrived (a texture
+/// uploaded when its view was written holds whatever the pages held then)
+/// is copied again. Call when the bytes are there.
+/// `VICTORY_STREAM_NOTICE=0`: not told; what is then done is
+/// `VICTORY_PAGE_WRITES`' to say (`victory_gpu::title_memory_written`).
+pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    for (at, bytes) in shown_at(pages, offset, len) {
+        if stream_notice() {
+            victory_gpu::kernel_will_write(at, bytes);
+        } else {
+            victory_gpu::title_memory_written(at, bytes, true);
+        }
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1087,6 +1117,10 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         shown_mut().forget(at, size, &slice);
+        if at < base || at + size > end {
+            // Parts of it stay, and are mapped again below.
+            victory_gpu::title_memory_splitting(at, size);
+        }
         victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1693,6 +1727,54 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// Pages say where the title has them mapped, byte for byte (after
+    /// fork PR #571's test; its runs are whole pages).
+    #[test]
+    fn pages_say_where_they_are_mapped() {
+        let pages = allocate(3);
+        let reserve = |n: usize| {
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!at.is_null());
+            at
+        };
+        // `b` keeps a page unmapped at either end, so that no run at `b`
+        // ever touches one at `a`, wherever the host puts the two.
+        let (a, b) = (reserve(3), reserve(4));
+        assert!(shown_at(&pages, 0, 3 * PAGE).is_empty(), "mapped nowhere");
+        // All three at `a`; the last two at `b`, from its second page on.
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let second = b.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(second, 2, pages[1..].as_ptr()), second);
+        let (a, second) = (a as usize, second as usize);
+        let sorted = |mut runs: Vec<(usize, usize)>| {
+            runs.sort_unstable();
+            runs
+        };
+        assert_eq!(shown_at(&pages, 0, PAGE), vec![(a, PAGE)]);
+        // A request for part of a page names those bytes alone.
+        assert_eq!(shown_at(&pages, 0x4000, 0x3000), vec![(a + 0x4000, 0x3000)]);
+        // Across two pages, shown at two addresses each: one run at each.
+        assert_eq!(
+            shown_at(&pages, PAGE + 1, PAGE),
+            sorted(vec![(a + PAGE + 1, PAGE), (second + 1, PAGE)])
+        );
+        // A page unmapped in the middle of a view: the rest still shows.
+        let middle = (a + PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert_eq!(
+            shown_at(&pages, 0, 3 * PAGE),
+            sorted(vec![(a, PAGE), (a + 2 * PAGE, PAGE), (second, 2 * PAGE)])
+        );
+        // Too few pages for the bytes: nothing (the write fails too).
+        assert!(shown_at(&pages, 0, 3 * PAGE + 1).is_empty());
+        for (at, n) in [(a, 3), (second, 2)] {
+            let at = at as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+        }
+        assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]

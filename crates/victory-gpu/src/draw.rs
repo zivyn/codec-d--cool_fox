@@ -571,6 +571,20 @@ pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), 
 /// new ones, since the start.
 pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a pass over the textures picked by index on a full card holds
+/// back the slots that need a new host copy (`VICTORY_FULL_CARD_PASS=0`:
+/// no, as before: they stay due, each pass looks at the same ones again
+/// and stops at the 257th). Held back, such a slot is looked at again
+/// after about four seconds or as soon as the card has room, and the pass
+/// goes on to the slots behind it: the ones whose host copy exists and
+/// only wants bringing up to date, and the ones whose memory went (letting
+/// their host copies go is what makes room). What is uploaded while the
+/// card has room is the same either way.
+fn full_card_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FULL_CARD_PASS").is_none_or(|v| v != "0"))
+}
+
 /// Whether a texture that has its host copy is still brought up to date
 /// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
 /// no).
@@ -1802,7 +1816,10 @@ impl State {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms().max(1);
         let next = NEXT.load(Ordering::Relaxed);
-        let due_now = if next == 0 { !room } else { now >= next };
+        // (With levels on demand the card may never be without room: the
+        // lines then start with the first texture made that way.)
+        let by_level = crate::tiles::STATS[4].load(Ordering::Relaxed) > 0;
+        let due_now = if next == 0 { !room || by_level } else { now >= next };
         if !due_now || NEXT.compare_exchange(next, now + 5000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
             return;
         }
@@ -1906,9 +1923,22 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
+        // Room again: the slots held back while the card was full are due
+        // now (`full_card_pass`).
+        if room {
+            host.texture_slots_room(frame);
+        }
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        // Levels on demand: the slots of textures whose first level with
+        // memory changed since the last pass are made again from it.
+        host.texture_views_remade();
+        // And with room, the textures whose upload left a held level
+        // without the card's memory are uploaded again.
+        if room {
+            host.texture_slots_waiting(frame);
+        }
         let (due, census) = host.texture_slots_due(frame, 4096);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -2063,7 +2093,15 @@ impl State {
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
-                    if refused > 256 {
+                    if full_card_pass() {
+                        // Held back for the frames of about four seconds
+                        // (`most`), or until the card has room; the pass
+                        // goes on, within a count that bounds one pass.
+                        host.texture_slot_held(index, write, frame + most);
+                        if refused > 1024 {
+                            break;
+                        }
+                    } else if refused > 256 {
                         break;
                     }
                     continue;
@@ -3559,13 +3597,16 @@ fn view_state(view: Option<&View>) -> String {
                     memory_state(address, crate::resource::placed_bytes(r).unwrap_or(0))
                 ),
             };
-            format!("placed texture view_format={} {state}", d[0])
+            // (Last, so that readers of the older lines still find
+            // theirs: the level the view starts at, and how many it shows.)
+            format!("placed texture view_format={} {state} view_levels={}+{}", d[0], d[4], d[5] as i32)
         }
         Some(View::Shader(r, d)) if crate::resource::texture_memory(*r as This).is_some() => {
             format!(
-                "texture object {r:#x} view_format={} {}",
+                "texture object {r:#x} view_format={} {} view_levels={}",
                 d.as_ref().map_or(0, |d| d[0]),
-                texture_state(*r as This)
+                texture_state(*r as This),
+                d.as_ref().map_or("all".to_owned(), |d| format!("{}+{}", d[4], d[5] as i32))
             )
         }
         Some(v) => format!("{v:?}").chars().take(80).collect(),

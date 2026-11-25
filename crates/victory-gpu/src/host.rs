@@ -3564,6 +3564,8 @@ pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
+#[cfg(feature = "diagnostics")]
+mod traffic;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;
@@ -4184,6 +4186,8 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
+                        #[cfg(feature = "diagnostics")]
+                        traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
                             sent.push(transition(
                                 &shadow.buffer,
@@ -4526,6 +4530,10 @@ impl Host {
             .then(|| torn::Check::new(plans.iter().map(|p| p.0), differs.unwrap_or_default(), &mut pieces));
         if let Some(check) = &check {
             total = check.total;
+        }
+        #[cfg(feature = "diagnostics")]
+        for (shadow, lo, hi, _) in &pieces {
+            traffic::moved(traffic::FETCHED, shadow.span(), std::iter::once((*lo, *hi)));
         }
         // The sends these flights ran behind, all a fetch on the copy queue
         // is known to have run behind.
@@ -8551,6 +8559,7 @@ impl Meter {
                     put[2] / 1e6,
                     put[3]
                 );
+                traffic::line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(

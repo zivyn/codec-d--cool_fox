@@ -463,6 +463,8 @@ impl Memory {
         if self.pages.contains_key(&(address / PAGE)) || !self.open.insert(n) {
             return;
         }
+        // (Its pages hold what the CPU writes beside the builder's scratch.)
+        self.copies[n].keep_stores();
         let (first, len) = self.copies[n].span();
         tracing::info!(
             start = format_args!("{first:#x}"),
@@ -791,7 +793,6 @@ pub(crate) fn ready(
     }
     let builds = use_ != Use::Reads;
     m.stats.uses[usize::from(builds)] += 1;
-    let numbered = m.copies.len();
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
     const READ: usize = usize::MAX - 0x6d;
@@ -880,17 +881,22 @@ pub(crate) fn ready(
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
+    // Every copy by every list that has come to by-address memory, whoever
+    // numbered it: an arena another list made while this one was being
+    // recorded was brought up to date by that list's submission alone, which
+    // may run after this one's (structures unpacked from zeros, and then
+    // written over by the arena's first upload: in frames that stream much in
+    // half of them, run light-8).
     let first_read = list.first_use(READ);
-    let from = if first_read { 0 } else { numbered };
-    if first_read || m.copies.len() > numbered {
+    if list.first_use(usize::MAX - (6 << 33) - m.copies.len()) {
         let (start, len) = m.directory.1.span();
         m.directory.1.refresh(list, start, len);
-    }
-    for shadow in &m.copies[from..] {
-        let (start, len) = shadow.span();
-        shadow.refresh(list, start, len);
+        for (n, shadow) in m.copies.iter().enumerate() {
+            if list.first_use(usize::MAX - (7 << 33) - n) {
+                let (start, len) = shadow.span();
+                shadow.refresh(list, start, len);
+            }
+        }
     }
     if first_read {
         list.keep(&m.faults.0);

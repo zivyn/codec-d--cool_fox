@@ -85,7 +85,7 @@ pub(crate) struct Shadow {
     window: bool,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
-    changes_only: bool,
+    changes_only: std::sync::atomic::AtomicBool,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2686,7 +2686,7 @@ impl Shadow {
             },
             card: None,
             window: false,
-            changes_only: false,
+            changes_only: Default::default(),
             mapped: false,
             place: None,
         }
@@ -3572,7 +3572,7 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let Some(card) = self.card.as_ref().filter(|_| self.changes_only || send_changed()) else {
+        let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             return self.copy(from, to);
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
@@ -3638,6 +3638,12 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Shaders store in it what is not declared: from here on only the dwords
+    /// the title changes go up ([`by_address`]).
+    pub(crate) fn keep_stores(&self) {
+        self.changes_only.store(true, Ordering::Relaxed);
     }
 
     /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
@@ -4673,7 +4679,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
-    shadow.changes_only = true;
+    shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
         staging,
         before: Mutex::default(),

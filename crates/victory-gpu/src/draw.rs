@@ -341,6 +341,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
+    /// (0: it has none yet).
+    recording: u64,
 }
 
 impl Drop for State {
@@ -371,6 +374,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -1463,7 +1467,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // (A root signature holds 64 dwords.)
+                let mut room = [0u32; 64];
+                let mut more = Vec::new();
+                let values: &mut [u32] = match room.get_mut(..dwords as usize) {
+                    Some(values) => values,
+                    None => {
+                        more.resize(dwords as usize, 0);
+                        &mut more
+                    }
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -1481,7 +1494,7 @@ impl State {
                 #[cfg(feature = "diagnostics")]
                 {
                     self.user.clear();
-                    self.user.extend_from_slice(&values);
+                    self.user.extend_from_slice(values);
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -2934,14 +2947,14 @@ impl State {
         used: &[UsedResource],
         indexed: &[RootIndexedView],
         compute: bool,
-    ) -> Vec<(u8, u32)> {
+    ) -> Few<(u8, u32), 16> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh: Few<u8, 16> = Few::default();
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            if !fresh.contains(&u.slot) {
+                fresh.push(u.slot);
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -2964,22 +2977,22 @@ impl State {
             }
         }
         fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
-        let mut made = Vec::new();
-        for slot in fresh {
+        let mut made = Few::default();
+        for &slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            // (Their places among `used`.)
+            let mut places: Few<u16, 32> = Few::default();
+            for (i, _) in used.iter().enumerate().filter(|(_, u)| tables(u) && u.slot == slot) {
+                places.push(i as u16);
+            }
+            let entries = || places.iter().map(|&i| &used[usize::from(i)]);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -3005,8 +3018,7 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
+            let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
@@ -3035,7 +3047,7 @@ impl State {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
                 // list changed since: nothing to do again.
-                let once = ready_once() && selected.is_empty() && entries.iter().all(|u| u.kind != ResourceType::Uav);
+                let once = ready_once() && selected.is_empty() && entries().all(|u| u.kind != ResourceType::Uav);
                 if once
                     && known.epoch == list.epoch()
                     && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
@@ -3048,14 +3060,14 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -3098,15 +3110,63 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || entries.iter().any(|u| u.table_offset_dwords / 8 == k)) {
+                for k in (0..n).filter(|&k| n <= 64 || entries().any(|u| u.table_offset_dwords / 8 == k)) {
                     host.slot_tabled(title + k);
                 }
             }
+            let list_views = crate::descriptor::host::list_views();
+            if self.recording == 0 {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
+            let recording = self.recording;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                // A view this list has made before: its descriptor copied,
+                // and nothing more if nothing changed in the list since.
+                if list_views
+                    && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
+                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                {
+                    let kind = entries()
+                        .find(|u| u.table_offset_dwords / 8 == k)
+                        .map(|u| u.kind)
+                        .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
+                    let was = (listed.ready, listed.tabled);
+                    if let Some(kind) = kind {
+                        let tested = TESTED_DEPTH.get();
+                        if kind == ResourceType::Srv && listed.ready.0 == list.epoch() && listed.ready.1 == tested.0 {
+                            if listed.ready.2 {
+                                TESTED_DEPTH.set((tested.0, true));
+                            }
+                        } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
+                            TESTED_DEPTH.set((tested.0, false));
+                            readable(list, kind, &view);
+                            let depth = TESTED_DEPTH.get().1;
+                            TESTED_DEPTH.set((tested.0, tested.1 || depth));
+                            if kind == ResourceType::Srv {
+                                listed.ready = (list.epoch(), tested.0, depth);
+                            }
+                        }
+                    }
+                    if let Some(title) = title_first
+                        && listed.texture
+                        && listed.tabled != Some((title + k, kind.is_some()))
+                    {
+                        listed.tabled = Some((title + k, kind.is_some()));
+                        host.texture_slot_tabled(title + k, kind.is_some());
+                        if kind.is_some() {
+                            host.mirror(title + k, table + u64::from(k) * 32, true);
+                        }
+                    }
+                    if was != (listed.ready, listed.tabled) {
+                        crate::descriptor::host::note_listed(recording, words, listed);
+                    }
+                    continue;
+                }
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
@@ -3703,7 +3763,7 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
-fn view_kind(view: &View) -> Option<ResourceType> {
+pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     match view {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
         View::Unordered(..) | View::Placed(true, ..) => Some(ResourceType::Uav),
@@ -3736,6 +3796,48 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
         DEPTH_READ
     } else {
         DEPTH_WRITE
+    }
+}
+
+/// A few things, up to `N` of them without memory of the heap: what a draw's
+/// tables are gone through with, some six lists a stage.
+struct Few<T, const N: usize> {
+    few: [T; N],
+    len: usize,
+    /// All of them, if they are more.
+    many: Vec<T>,
+}
+
+impl<T: Copy + Default, const N: usize> Default for Few<T, N> {
+    fn default() -> Self {
+        Few { few: [T::default(); N], len: 0, many: Vec::new() }
+    }
+}
+
+impl<T: Copy, const N: usize> Few<T, N> {
+    fn push(&mut self, what: T) {
+        if self.many.is_empty() && self.len < N {
+            self.few[self.len] = what;
+            self.len += 1;
+        } else {
+            if self.many.is_empty() {
+                self.many.extend_from_slice(&self.few);
+            }
+            self.many.push(what);
+        }
+    }
+}
+
+impl<T, const N: usize> std::ops::Deref for Few<T, N> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        if self.many.is_empty() { &self.few[..self.len] } else { &self.many }
+    }
+}
+
+impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        if self.many.is_empty() { &mut self.few[..self.len] } else { &mut self.many }
     }
 }
 
@@ -3806,9 +3908,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             let aliased = crate::resource::alias_of(*resource as This)
                 .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
             if !aliased
-                && let Some(t) = crate::resource::host_resource(*resource as This)
-                && crate::texture::title_written(t)
+                && let Some(t) = crate::resource::host_copy(*resource as This)
+                && t.flags() & 0x7 == 0
             {
+                // (A texture the title writes: no target, depth or unordered
+                // access, `crate::texture::title_written`.)
                 // Of a texture the title placed, the levels the view shows.
                 let first = match (&placed, view) {
                     (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
@@ -4083,7 +4187,18 @@ mod tests {
 
 #[cfg(test)]
 mod record_hash_tests {
-    use super::RecordHash;
+    use super::{Few, RecordHash};
+
+    #[test]
+    fn a_few_things_are_kept_in_order_however_many() {
+        for n in 0..10u32 {
+            let mut few: Few<u32, 4> = Few::default();
+            (0..n).for_each(|i| few.push(n - i));
+            assert_eq!(few.to_vec(), (0..n).map(|i| n - i).collect::<Vec<_>>());
+            few.sort_unstable();
+            assert_eq!(few.to_vec(), (1..=n).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn records_that_differ_hash_apart() {
@@ -4104,7 +4219,8 @@ mod record_hash_tests {
             }
         }
         assert!(seen.insert(of(&[])));
-        let zeros: Vec<u64> = (1..100).map(|n| of(&vec![[0; 3]; n])).collect();
+        // (One record of zeros is among the above.)
+        let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
 }

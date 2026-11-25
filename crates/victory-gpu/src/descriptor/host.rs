@@ -2129,6 +2129,68 @@ impl HostHeap {
         self.keep(index, kept.flatten());
     }
 
+    /// Makes slot `index` (a dynamic one) the view the record `words` names,
+    /// from this thread's descriptor of it if the recording `recording` has
+    /// made one, else as [`HostHeap::make_at`] does, and keeps that
+    /// ([`ListViews`]). What is known of the record in this recording;
+    /// `None` (the slot is not made): not a view kept so.
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        if self.sampler {
+            return None;
+        }
+        LIST_VIEWS.with(|views| {
+            let mut views = views.borrow_mut();
+            if views.is_none() {
+                *views = Some(ListViews::new()?);
+            }
+            let views = views.as_mut()?;
+            if views.recording != recording {
+                views.recording = recording;
+                views.made.clear();
+            }
+            let twins = self.twins.get(index as usize).is_some();
+            if !views.made.contains_key(&words) {
+                let view = super::view_at(words[1], words[2])?;
+                let at = 2 * views.made.len() as u32;
+                // (A constant buffer's bytes are copied for each draw.)
+                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
+                    return None;
+                }
+                let twin = twinned(&view);
+                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
+                let listed = Listed {
+                    kind: crate::draw::view_kind(&view),
+                    texture: is_texture_view(&view),
+                    ready: (0, 0, false),
+                    tabled: None,
+                };
+                views.made.insert(words, ListView { view, at, twin, kept, listed });
+            }
+            let made = &views.made[&words];
+            self.copy_from(index, views.slot(made.at));
+            if made.twin && twins {
+                self.copy_from(self.raw + index, views.slot(made.at + 1));
+                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                self.clear_twin(index);
+            }
+            self.keep(index, made.kept.clone());
+            Some(made.listed)
+        })
+    }
+
+    /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
+    /// see.
+    fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(to as usize) {
+            written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        let Some(host) = host() else { return };
+        // SAFETY: a slot of our heap, and one of this thread's heap.
+        unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
+    }
+
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
     pub(crate) fn make_null(&self, index: u32) {
         if self.sampler {
@@ -4663,4 +4725,101 @@ mod tests {
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
     }
+}
+
+/// What is known of a record a list's tables hold, in that recording of the
+/// list ([`HostHeap::make_listed`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Listed {
+    pub(crate) kind: Option<victory_shader::native::ResourceType>,
+    pub(crate) texture: bool,
+    /// Read at this epoch of the list ([`crate::host::HostList::epoch`]) with
+    /// this depth target tested: up to date; and whether it is that target's.
+    pub(crate) ready: (u64, usize, bool),
+    /// The title's slot last noted for it, and whether the draw read it.
+    pub(crate) tabled: Option<(u32, bool)>,
+}
+
+struct ListView {
+    view: View,
+    /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
+    at: u32,
+    twin: bool,
+    kept: Kept,
+    listed: Listed,
+}
+
+/// The descriptors a thread made for one recording of a list, by the record
+/// they were made from, in a heap the card does not see.
+///
+/// The title's culling and lighting dispatches each bind a table of their own
+/// that differs in one constant buffer, and the same thirty views beside it:
+/// each was found, checked, made and brought up to date anew for every
+/// dispatch, some 2,500 indirect dispatches in the one recording job the
+/// frame waits for last (timeline waits-2: 24 of 65 ms). Here a list makes a
+/// view once, as it makes a table once (`crate::draw::State::tables`), and
+/// copies its descriptor.
+struct ListViews {
+    recording: u64,
+    heap: ID3D12DescriptorHeap,
+    step: usize,
+    start: usize,
+    made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+}
+
+impl ListViews {
+    const SLOTS: u32 = 8192;
+
+    fn new() -> Option<ListViews> {
+        let host = host()?;
+        // SAFETY: plain object creation.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: Self::SLOTS,
+                    ..Default::default()
+                })
+                .ok()?;
+            let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+        }
+    }
+
+    fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
+        D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
+    }
+}
+
+thread_local! {
+    static LIST_VIEWS: std::cell::RefCell<Option<ListViews>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The view the record `words` names, as this thread made it for `recording`.
+pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
+    LIST_VIEWS.with(|views| {
+        let views = views.borrow();
+        let views = views.as_ref().filter(|v| v.recording == recording)?;
+        views.made.get(&words).map(|m| m.view.clone())
+    })
+}
+
+/// Notes what is known of the record `words` in `recording`.
+pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
+    LIST_VIEWS.with(|views| {
+        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
+            && let Some(made) = views.made.get_mut(&words)
+        {
+            made.listed = listed;
+        }
+    });
+}
+
+/// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:
+/// for every table).
+pub(crate) fn list_views() -> bool {
+    crate::toggled!("VICTORY_LIST_VIEWS")
 }

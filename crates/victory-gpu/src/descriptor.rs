@@ -1126,6 +1126,16 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     }
 }
 
+/// The words of the record at `handle`, if they are a view's.
+pub(crate) fn record_at(handle: u64) -> Option<[u32; 3]> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: the handle is a descriptor slot the title passes back.
+    let words = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    (words[0] == VIEW_TAG).then_some(words)
+}
+
 /// The view recorded at `handle`, if one is (and its resource is alive).
 pub(crate) fn view(handle: u64) -> Option<View> {
     if handle == 0 {

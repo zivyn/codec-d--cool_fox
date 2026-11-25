@@ -84,6 +84,11 @@ pub struct Options {
     pub wait_all: bool,
     /// Each list sent on its own, and waited for.
     pub wait_lists: bool,
+    /// Milliseconds the sender waits after each submission, as a title does
+    /// that prepares the next one meanwhile: the card stands idle.
+    pub pace: f64,
+    /// The card kept awake meanwhile (`crate::host::awake`).
+    pub awake: bool,
     /// Run only these lists (by their place in the frame).
     pub only: Option<(u32, u32)>,
     /// The last command that runs (list, command); after it only barriers.
@@ -95,6 +100,9 @@ pub struct Options {
     pub compare: bool,
     /// The debug layer, if it is installed.
     pub debug: bool,
+    /// The system's breadcrumbs after every command, as
+    /// `VICTORY_D3D12_DRED=light` has them.
+    pub breadcrumbs: bool,
 }
 
 impl Default for Options {
@@ -116,11 +124,14 @@ impl Default for Options {
             merge: true,
             wait_all: false,
             wait_lists: false,
+            pace: 0.0,
+            awake: false,
             only: None,
             until: None,
             skip_shaders: Vec::new(),
             compare: false,
             debug: false,
+            breadcrumbs: false,
         }
     }
 }
@@ -150,6 +161,7 @@ impl Options {
             one_submit: false,
             wait_all: false,
             wait_lists: false,
+            awake: false,
             only: None,
             skip_shaders: Vec::new(),
             ..self.clone()
@@ -488,6 +500,10 @@ pub struct Player {
 /// What a command of a list is timed as.
 type Stamp = (usize, &'static str, u32);
 
+/// With a stamp of a copy to a texture: this bit and the texture's number
+/// stand for the pipeline's.
+const COPY_TO: u32 = 1 << 31;
+
 /// A list made from commands, with what its timestamps are of.
 struct Built {
     _allocator: ID3D12CommandAllocator,
@@ -503,7 +519,7 @@ impl Player {
         let folder = find(folder)?;
         let began = Instant::now();
         let frame = Frame::read(&folder.join("frame.bin"))?;
-        let (device, info) = make_device(&frame, options.debug)?;
+        let (device, info) = make_device(&frame, options.debug, options.breadcrumbs)?;
         // SAFETY: plain creation and queries.
         let (queue, frequency) = unsafe {
             let queue: ID3D12CommandQueue =
@@ -570,7 +586,7 @@ impl Player {
         step("descriptors", &mut at);
         player.load_contents()?;
         step("contents", &mut at);
-        player.make_masters(options.buffers)?;
+        player.make_masters(options.buffers, options.restore)?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -1554,7 +1570,7 @@ impl Player {
     }
 
     /// Copies of what the frame changes; and the states it leaves.
-    fn make_masters(&mut self, buffers: Buffers) -> Result<()> {
+    fn make_masters(&mut self, buffers: Buffers, wanted: bool) -> Result<()> {
         let mut states = States::default();
         for r in &self.frame.resources {
             if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
@@ -1687,6 +1703,11 @@ impl Player {
             })
             .collect();
         ids.sort_unstable();
+        // Without restoring they are of no use, and their room may be what
+        // the frame itself lacks.
+        if !wanted {
+            ids.clear();
+        }
         let mut total = 0u64;
         let mut in_pc = 0u64;
         for id in ids {
@@ -2413,14 +2434,51 @@ impl Player {
                         "clears"
                     }
                     Cmd::Resolve { .. } | Cmd::ResolveRegion { .. } => "resolves",
-                    _ => "copies",
+                    _ => self.copy_kind(c),
                 };
-                let runs = if c.runs_shaders() { bound } else { NONE };
+                let runs = match c {
+                    c if c.runs_shaders() => bound,
+                    // Copies to textures by what they go to.
+                    Cmd::CopyResource { dst, .. }
+                    | Cmd::CopyTexture {
+                        dst: Loc::Sub { res: dst, .. },
+                        ..
+                    } => COPY_TO | dst,
+                    _ => NONE,
+                };
                 stamps.push((**next as usize, category, runs));
                 **next += 1;
             }
         }
         stamps
+    }
+
+    /// Which copies a copy is counted with: by the memory it crosses.
+    fn copy_kind(&self, c: &Cmd) -> &'static str {
+        let pc = |id: u32| {
+            self.objects.get(&id).is_some_and(|o| {
+                matches!(&self.frame.resources[o.index].place,
+                    Place::Committed { props, .. } if gpu::seen(props) != Seen::No)
+            })
+        };
+        let res = |l: &Loc| match l {
+            Loc::Sub { res, .. } | Loc::Placed { res, .. } => *res,
+        };
+        match c {
+            Cmd::CopyBuffer { dst, src, .. } => match (pc(*dst), pc(*src)) {
+                (false, true) => "copies of buffers, PC to card",
+                (true, false) => "copies of buffers, card to PC",
+                (true, true) => "copies of buffers, PC to PC",
+                (false, false) => "copies of buffers, card to card",
+            },
+            Cmd::CopyTexture { dst, src, .. } => match (pc(res(dst)), pc(res(src))) {
+                (false, true) => "copies of textures, PC to card",
+                (true, _) => "copies of textures, to the PC",
+                (false, false) => "copies of textures, card to card",
+            },
+            Cmd::CopyResource { .. } => "copies of whole resources",
+            _ => "copies",
+        }
     }
 
     unsafe fn command(&self, l: &ID3D12GraphicsCommandList, c: &Cmd, version: usize) {
@@ -2886,6 +2944,12 @@ impl Player {
             for all in &submissions {
                 if !o.wait_lists {
                     self.worker.queue.ExecuteCommandLists(all);
+                    if o.pace > 0.0 {
+                        let until = Instant::now() + std::time::Duration::from_secs_f64(o.pace / 1e3);
+                        while Instant::now() < until {
+                            std::thread::yield_now();
+                        }
+                    }
                     continue;
                 }
                 for l in all {
@@ -2907,6 +2971,7 @@ impl Player {
     /// Runs the frame as the options say.
     pub fn run(&mut self, o: &Options) -> Result<Report> {
         let mut made = self.prepare(o)?;
+        let _awake = if o.awake { crate::host::awake::start(&self.device, || true) } else { None };
         let mut stamps = Vec::new();
         for _ in 0..o.loops.max(1) {
             stamps = self.once(o, &mut made)?;
@@ -3014,7 +3079,16 @@ impl Player {
         all.truncate(o.top);
         report.shaders = all
             .into_iter()
-            .map(|(ms, n, pso)| (ms, n, self.pipeline_name(pso)))
+            .map(|(ms, n, pso)| {
+                let name = match self.objects.get(&(pso & !COPY_TO)).filter(|_| pso & COPY_TO != 0) {
+                    Some(o) => {
+                        let r = &self.frame.resources[o.index];
+                        format!("copies to #{} {}", pso & !COPY_TO, r.name)
+                    }
+                    None => self.pipeline_name(pso),
+                };
+                (ms, n, name)
+            })
             .collect();
     }
 
@@ -3229,7 +3303,7 @@ fn read_at(file: &File, mut to: &mut [u8], mut at: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-fn make_device(frame: &Frame, debug: bool) -> Result<(ID3D12Device, Option<ID3D12InfoQueue>)> {
+fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12Device, Option<ID3D12InfoQueue>)> {
     // SAFETY: plain creation and queries.
     unsafe {
         if debug {
@@ -3245,6 +3319,14 @@ fn make_device(frame: &Frame, debug: bool) -> Result<(ID3D12Device, Option<ID3D1
                     }
                 }),
                 Err(e) => tracing::warn!("no debug layer: {e}"),
+            }
+        }
+        if breadcrumbs {
+            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+            D3D12GetDebugInterface(&mut dred)?;
+            if let Some(dred) = dred {
+                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
             }
         }
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;

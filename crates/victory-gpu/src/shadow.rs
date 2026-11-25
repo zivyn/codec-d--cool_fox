@@ -83,6 +83,8 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// A window in card memory the CPU maps ([`window_mapped_for`]).
+    mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -299,7 +301,9 @@ pub(crate) fn card_stats() -> [u64; 10] {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
     out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
-    out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
+    out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
+        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
 }
@@ -445,6 +449,51 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     let (buffer, _) = host.shared_buffer(size)?;
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
     Some(buffer)
+}
+
+/// The most bytes of windows outside buffers that lie in the card's memory
+/// and are filled by the CPU through the bus (`VICTORY_WINDOWS_BAR_MB`; 0, the
+/// default, none): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
+/// copy to send and no list of changes, unlike [`window_card_most`]. The CPU
+/// only writes them, as no shader is declared to write a window; if one were,
+/// its snapshot and compare would read through the bus, right but slow. In a
+/// captured frame the lists take 26 ms of the card instead of 29, the frame 32
+/// instead of 36; filling them costs the CPU what it did.
+///
+/// Windows go there while a fifth of the card's budget is free, as with
+/// [`window_room_for`], which this comes before.
+fn window_mapped_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// Bytes alive of windows in card memory the CPU maps.
+static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
+/// to be there ([`window_mapped_most`]).
+fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let most = window_mapped_most();
+    if most == 0 {
+        return None;
+    }
+    let host = host()?;
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        return None;
+    }
+    if WINDOW_MAPPED_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+        WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let made = host.mapped_card_buffer(size, true);
+    if made.is_none() {
+        WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
+    }
+    made
 }
 
 /// Whether windows outside buffers have two sides too, so that submissions
@@ -2247,6 +2296,9 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if self.mapped {
+            WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -2631,6 +2683,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            mapped: false,
             place: None,
         }
     }
@@ -4598,6 +4651,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    // One buffer in the card's memory, filled by the CPU through the bus.
+    if let Some((buffer, data)) = window_mapped_for(len) {
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        shadow.window = true;
+        shadow.mapped = true;
+        let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);

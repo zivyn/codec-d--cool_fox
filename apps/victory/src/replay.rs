@@ -62,6 +62,16 @@ pub(crate) struct Replay {
     /// One ExecuteCommandLists for the whole frame.
     #[arg(long)]
     one_submit: bool,
+    /// Let copies of what the CPU wrote also overwrite what the card wrote in
+    /// the replay (as the recorded commands say).
+    #[arg(long)]
+    no_merge: bool,
+    /// A full wait after every draw, dispatch, copy and clear.
+    #[arg(long)]
+    wait_all: bool,
+    /// Each list sent on its own, and waited for.
+    #[arg(long)]
+    wait_lists: bool,
     /// Run only these lists, by their place in the frame (`3..7`, or `5`);
     /// of the others only barriers.
     #[arg(long)]
@@ -70,6 +80,45 @@ pub(crate) struct Replay {
     /// (may be given several times).
     #[arg(long = "skip-shader")]
     skip_shader: Vec<String>,
+    /// Find the commands that make identical runs differ: each list is run
+    /// this often from the same memory.
+    #[arg(long, num_args = 0..=1, default_missing_value = "3")]
+    diverge: Option<u32>,
+    /// Find where the picture's variants are decided: from each list on, the
+    /// rest of the frame is run this often from the same memory.
+    #[arg(long, num_args = 0..=1, default_missing_value = "5")]
+    diverge_picture: Option<u32>,
+    /// Run each draw of one list (--lists) whose pipeline's name has this in
+    /// it alone, --diverge times: how many outcomes it has.
+    #[arg(long)]
+    draws: Option<String>,
+    /// Say which lists (with --lists: commands) change words of buffers:
+    /// `<resource>:<offset>:<bytes>` (hexadecimal; repeatable).
+    #[arg(long)]
+    watch: Vec<String>,
+    /// With --diverge-picture and one list in --lists: its commands (`0..900`)
+    /// and how many are stepped over at a time.
+    #[arg(long)]
+    commands: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    step: usize,
+    /// With --diverge and --diverge-picture: only these lists (`3..7`).
+    #[arg(long)]
+    lists: Option<String>,
+    /// With --diverge: the most commands named of one list.
+    #[arg(long, default_value_t = 4)]
+    roots: u32,
+    /// Name resources the frame changes that the replay does not put back.
+    #[arg(long)]
+    check_written: bool,
+    /// Name what the heap slots hold that a command's constants name:
+    /// `<list>:<command>`.
+    #[arg(long)]
+    slots: Option<String>,
+    /// Only write the DXIL of pipelines with this in their name to the
+    /// capture's `shaders` folder.
+    #[arg(long)]
+    dump: Option<String>,
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -84,6 +133,12 @@ fn range(text: &str) -> Option<(u32, u32)> {
 }
 
 pub(crate) fn run(r: Replay) -> Result<()> {
+    if let Some(text) = &r.dump {
+        for line in play::dump(&r.folder, text)? {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     let only = match &r.only {
         Some(text) => Some(
             range(text)
@@ -107,11 +162,77 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         skip_clamps: r.skip_clamps,
         skip_hash_passes: r.skip_hash_passes,
         one_submit: r.one_submit,
+        merge: !r.no_merge,
+        wait_all: r.wait_all,
+        wait_lists: r.wait_lists,
         only,
         skip_shaders: r.skip_shader,
         compare: r.compare,
         debug: r.debug_layer,
     };
+    if let Some(text) = &r.slots {
+        let (list, command) = text
+            .split_once(':')
+            .and_then(|(l, c)| Some((l.parse().ok()?, c.parse().ok()?)))
+            .with_context(|| format!("--slots {text}: not <list>:<command>"))?;
+        let player = play::Player::load(&r.folder, &options)?;
+        return player.slots(list, command, &mut |line| println!("{line}"));
+    }
+    if r.check_written {
+        let mut player = play::Player::load(&r.folder, &options)?;
+        return player.check_written(&mut |line| println!("{line}"));
+    }
+    let mut watched = Vec::new();
+    for text in &r.watch {
+        let mut n = text
+            .split(':')
+            .map(|p| u64::from_str_radix(p.trim_start_matches("0x"), 16));
+        let mut next = || {
+            n.next()
+                .and_then(Result::ok)
+                .with_context(|| format!("--watch {text}"))
+        };
+        let id = text
+            .split(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .with_context(|| format!("--watch {text}"))?;
+        let _ = next();
+        watched.push((id, next()?, next()?));
+    }
+    if let Some(runs) = r
+        .diverge
+        .or(r.diverge_picture)
+        .or((!watched.is_empty()).then_some(2))
+    {
+        let lists = match &r.lists {
+            Some(text) => Some(range(text).with_context(|| format!("--lists {text}"))?),
+            None => None,
+        };
+        let search = play::diverge::Search {
+            runs: runs.max(2),
+            lists,
+            roots: r.roots,
+            wait_all: options.wait_all,
+            options: options.clone(),
+        };
+        let mut player = play::Player::load(&r.folder, &options)?;
+        if !watched.is_empty() {
+            return player.watch(&search, &watched, &mut |line| println!("{line}"));
+        }
+        if let Some(text) = &r.draws {
+            return player.diverge_draws(&search, text, &mut |line| println!("{line}"));
+        }
+        if r.diverge_picture.is_some() {
+            let commands = match &r.commands {
+                Some(text) => Some(range(text).with_context(|| format!("--commands {text}"))?),
+                None => None,
+            };
+            return player
+                .diverge_picture(&search, commands, r.step, &mut |line| println!("{line}"));
+        }
+        return player.diverge(&search, &mut |line| println!("{line}"));
+    }
     let reports = play::replay(&r.folder, &options)?;
     for (what, report) in &reports {
         println!("{}", report.text(what));

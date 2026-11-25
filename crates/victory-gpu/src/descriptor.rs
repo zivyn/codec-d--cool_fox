@@ -320,14 +320,22 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
-        for index in host.copied_before(frame) {
-            if host.copied_tabled(index, frame) {
-                tabled += 1;
-            } else {
-                host.mirror(index, start + u64::from(index) * step, false);
-                mirrored += 1;
+        let before = host.copied_before(frame);
+        let of_tables = std::sync::atomic::AtomicU64::new(0);
+        crate::land::each_view(before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                if host.copied_tabled(index, frame) {
+                    of_tables.fetch_add(1, Relaxed);
+                } else {
+                    host.mirror(index, start + u64::from(index) * step, false);
+                }
             }
-        }
+        });
+        let of_tables = of_tables.into_inner();
+        tabled += of_tables;
+        mirrored += before.len() as u64 - of_tables;
+        // Those of the changed pages, made together at the end.
+        let mut make: Vec<u32> = Vec::new();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -378,13 +386,18 @@ pub(crate) fn sync_heaps() {
                                 continue;
                             }
                         }
-                        host.mirror(index, start + u64::from(index) * step, false);
+                        make.push(index);
                         mirrored += 1;
                     }
                 }
                 page += crate::watch::PAGE;
             }
         }
+        crate::land::each_view(make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                host.mirror(index, start + u64::from(index) * step, false);
+            }
+        });
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
         }
@@ -395,6 +408,10 @@ pub(crate) fn sync_heaps() {
         count.fetch_add(n, Relaxed);
     }
 }
+
+/// Records [`sync_heaps`] gives a thread at a time.
+#[cfg(windows)]
+const SYNC_AT_A_TIME: usize = 256;
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was

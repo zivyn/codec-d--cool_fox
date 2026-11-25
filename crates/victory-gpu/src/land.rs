@@ -227,7 +227,7 @@ impl Pool {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn new(threads: usize) -> &'static Pool {
+    fn new(name: &'static str, threads: usize) -> &'static Pool {
         let pool: &'static Pool = Box::leak(Box::new(Pool {
             state: Mutex::new(State { work: None, next: 0, count: 0, running: 0, panicked: false }),
             more: Condvar::new(),
@@ -237,8 +237,8 @@ impl Pool {
         }));
         for i in 1..threads {
             // (A helper that is not there is only missed.)
-            let _ = std::thread::Builder::new().name(format!("victory-land-{i}")).spawn(move || {
-                crate::cores::keep_helper_on_fast_cores("victory-land");
+            let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores(name);
                 pool.help()
             });
         }
@@ -321,7 +321,19 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 /// [`Pool::each`] on the threads kept for landing.
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
-    POOL.get_or_init(|| Pool::new(threads())).each(count, f);
+    POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
+}
+
+/// Calls `f` with every number below `count`, on this thread and on threads
+/// kept for making descriptors (`VICTORY_VIEW_THREADS`, 5 with this one; 1:
+/// on this one alone).
+pub(crate) fn each_view(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(5usize);
+        Pool::new("victory-views", threads.clamp(1, 16))
+    })
+    .each(count, f);
 }
 
 /// A piece to land: the copy's number, the title address, its bytes.

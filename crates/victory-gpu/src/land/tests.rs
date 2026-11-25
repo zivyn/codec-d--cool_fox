@@ -48,7 +48,7 @@ impl Title {
 #[test]
 fn the_pool_calls_every_number_once() {
     for threads in [1usize, 2, 4, 7] {
-        let pool = Pool::new(threads);
+        let pool = Pool::new("victory-land", threads);
         std::thread::scope(|s| {
             for _ in 0..3 {
                 s.spawn(|| {
@@ -69,7 +69,7 @@ fn the_pool_calls_every_number_once() {
 /// A job that panics is told to the caller, and the pool goes on.
 #[test]
 fn a_panicking_job_reaches_the_caller() {
-    let pool = Pool::new(3);
+    let pool = Pool::new("victory-land", 3);
     for bad in 0..8usize {
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             pool.each(8, &|i| assert_ne!(i, bad, "(expected)"));
@@ -448,7 +448,7 @@ fn what_landing_costs() {
             frame("as before, guards opened ahead", dense, 1, before);
             frame("as before, nothing guarded", dense, 0, before);
             for threads in [1usize, 2, 3, 4, 5, 6, 8] {
-                let pool = Pool::new(threads);
+                let pool = Pool::new("victory-land", threads);
                 for beside in [false, true] {
                     frame(&format!("{threads} threads, beside {beside}"), dense, 2, &|landing| {
                         let cut: Vec<(usize, usize)> = landing.iter().map(|p| (p.0, BLOCK)).collect();

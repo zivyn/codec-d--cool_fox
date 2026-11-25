@@ -8756,7 +8756,8 @@ mod refresh_tests {
             assert_eq!(look(true, "taken"), 0);
             // SAFETY: the test's own memory.
             unsafe { ((region + 600) as *mut u8).write_volatile(1) };
-            assert_eq!(look(false, "written at its end"), PAGE - 500);
+            // (The kernel names the 4 KiB, the guards only the block.)
+            assert_eq!(look(false, "written at its end"), if view { PAGE } else { 4096 } - 500);
             assert_eq!(look(true, "taken again"), 0);
             // Outside the range, on its last page.
             // SAFETY: as above.

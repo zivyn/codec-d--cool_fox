@@ -2388,6 +2388,66 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
         .collect()
 }
 
+/// `runs` (from, to, whether the copy held it before), cut in those of pages
+/// held before (`pages`: page number and asking, in order) to the parts of
+/// each page that were written since (`parts`: a bit for each 4 KiB).
+fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u16]) -> Vec<(usize, usize, bool)> {
+    const PART: usize = PAGE / 16;
+    if parts.iter().all(|&p| p == u16::MAX) {
+        return runs;
+    }
+    let mut out: Vec<(usize, usize, bool)> = Vec::with_capacity(runs.len() + pages.len());
+    let mut pages = pages.iter().zip(parts).peekable();
+    for (from, to, known) in runs {
+        if !known {
+            out.push((from, to, known));
+            continue;
+        }
+        while let Some((&(page, _), &parts)) = pages.next_if(|((page, _), _)| page * PAGE < to) {
+            for k in (0..16).filter(|k| parts >> k & 1 != 0) {
+                let (a, b) = ((page * PAGE + k * PART).max(from), (page * PAGE + (k + 1) * PART).min(to));
+                if a >= b {
+                    continue;
+                }
+                match out.last_mut() {
+                    Some((_, end, true)) if *end == a => *end = b,
+                    _ => out.push((a, b, true)),
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::{PAGE, by_parts};
+
+    #[test]
+    fn runs_are_cut_to_the_parts_written() {
+        const P: usize = PAGE / 16;
+        let at = |page: usize, part: usize| page * PAGE + part * P;
+        // Pages 10 and 11 again (from the middle of 10's part 1 on), 12
+        // never taken, 14 again.
+        let runs = vec![
+            (at(10, 1) + 100, at(12, 0), true),
+            (at(12, 0), at(13, 0), false),
+            (at(14, 0), at(14, 9) + 7, true),
+        ];
+        let pages = [(10, 5), (11, 5), (14, 6)];
+        assert_eq!(by_parts(runs.clone(), &pages, &[u16::MAX; 3]), runs);
+        assert_eq!(
+            by_parts(runs, &pages, &[0b1000_0000_0000_0011, 0b11, 0b10_0000_0000]),
+            [
+                (at(10, 1) + 100, at(10, 2), true),
+                (at(10, 15), at(11, 2), true),
+                (at(12, 0), at(13, 0), false),
+                (at(14, 9), at(14, 9) + 7, true),
+            ]
+        );
+    }
+}
+
 #[cfg(test)]
 mod stale_tests {
     use super::*;
@@ -3451,6 +3511,8 @@ impl Shadow {
         // since, is as it was.
         let ranged = if crate::watch::light() { self.ranged(from, to) } else { 0 };
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
+        // Pages taken before and written since: in the order of their runs.
+        let mut again_at: Vec<(usize, u64)> = Vec::new();
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -3471,6 +3533,9 @@ impl Shadow {
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
+                if again {
+                    again_at.push((page, taken));
+                }
                 if let Some((first, known)) = run
                     && known != again
                 {
@@ -3486,6 +3551,7 @@ impl Shadow {
         if let Some((first, known)) = run {
             runs.push(((first * PAGE).max(from), ((last + 1) * PAGE).min(to), known));
         }
+        let runs = by_parts(runs, &again_at, &crate::watch::parts_written(&again_at));
         let bytes = self.take_all(runs);
         if crate::watch::light() {
             // All of the range is in the copy as of this asking.

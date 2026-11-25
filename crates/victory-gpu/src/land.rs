@@ -499,6 +499,7 @@ unsafe fn piece_at(
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);
+    let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
     for_pages(title, parts, |from, n| {
@@ -508,7 +509,26 @@ unsafe fn piece_at(
         }
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
-        let done = unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
+        let merge = |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
+        let mut done = merge(take && beside.is_some());
+        if !done.there && beside.is_none() {
+            // Away only while the runtime changes a mapping beside it: the
+            // rest of it when that is done. What is still not there then is
+            // taken as the caller says.
+            let mut put = done.dwords;
+            let again = crate::watch::again_after_change(since, || {
+                done = merge(false);
+                put += done.dwords;
+                done.there
+            });
+            if !again && take {
+                done = merge(true);
+                put += done.dwords;
+            }
+            done.dwords = put;
+            // (What was new to the first try was new.)
+            done.new = done.new.max(1);
+        }
         blocks += done.new;
         dwords += done.dwords;
         missing += u64::from(!done.there);

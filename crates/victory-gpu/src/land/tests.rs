@@ -213,6 +213,43 @@ fn a_piece_lands_what_the_card_wrote_in_its_parts() {
     }
 }
 
+/// A piece whose title memory is away only while the runtime changes a
+/// mapping lands when that is done; where it stays away the copy's CPU side
+/// takes the card's bytes (`take`) or not.
+#[test]
+fn a_piece_waits_for_a_change_of_mapping() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+    assert!(crate::safecopy::on());
+    // SAFETY: a reservation of ours, nothing of it committed.
+    let at = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+    assert_ne!(at, 0);
+    let now = [9u8; 100];
+    for take in [true, false] {
+        let mut held = [0u8; 100];
+        // SAFETY: arrays of 100 bytes.
+        let put = unsafe { piece(at, now.as_ptr(), held.as_mut_ptr(), &[(0, 100)], take, &mut Notes::default()) };
+        assert_eq!((put, held), (0, [if take { 9 } else { 0 }; 100]));
+    }
+    let (began, wait) = std::sync::mpsc::channel();
+    let change = std::thread::spawn(move || {
+        let _changing = crate::watch::title_memory_remapping();
+        began.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // SAFETY: the reservation's first page.
+        assert!(!unsafe { VirtualAlloc(at as _, PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+    });
+    wait.recv().unwrap();
+    let mut held = [0u8; 100];
+    // SAFETY: as above.
+    let put = unsafe { piece(at, now.as_ptr(), held.as_mut_ptr(), &[(0, 100)], true, &mut Notes::default()) };
+    change.join().unwrap();
+    assert_eq!((put, held), (100, now));
+    // SAFETY: committed by now.
+    assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 100) }, now);
+    // SAFETY: our reservation.
+    unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
+}
+
 /// Landings on several threads beside title threads that write the same
 /// blocks (other dwords) and a thread that refreshes a copy, guarding what
 /// it takes: no write of the title's is lost or undone, all the card wrote

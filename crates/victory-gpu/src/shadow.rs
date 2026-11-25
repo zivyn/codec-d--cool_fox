@@ -1561,6 +1561,7 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
     if crate::safecopy::on() {
         PUT[0].fetch_add(1, Ordering::Relaxed);
         PUT[2].fetch_add(merged.len() as u64, Ordering::Relaxed);
+        let since = crate::watch::changes();
         // SAFETY: title memory; a page of it that is not there fails the
         // put, and the rest is put page by page.
         if unsafe { crate::safecopy::put_changed(at as *mut u8, title, merged) } {
@@ -1569,8 +1570,14 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
         let mut from = 0;
         while from < merged.len() {
             let n = (4096 - (at + from) % 4096).min(merged.len() - from);
+            let (was, now) = (&title[from..from + n], &merged[from..from + n]);
             // SAFETY: as above.
-            unsafe { crate::safecopy::put_changed((at + from) as *mut u8, &title[from..from + n], &merged[from..from + n]) };
+            let put = || unsafe { crate::safecopy::put_changed((at + from) as *mut u8, was, now) };
+            // A page that is away only while the runtime changes a mapping
+            // beside it gets its bytes when that is done.
+            if !put() && !crate::watch::again_after_change(since, put) {
+                crate::watch::lost("what shaders wrote", at + from, n);
+            }
             from += n;
         }
         return merged.len();
@@ -1614,7 +1621,35 @@ pub(crate) fn land_as_before(start: usize, now: usize, held: usize, n: usize, ti
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{changed_runs, dword_runs};
+    use super::{changed_runs, dword_runs, put_changed};
+
+    /// What shaders wrote reaches a page that is away only while the runtime
+    /// changes a mapping; a page that stays away loses it, and nothing else.
+    #[test]
+    fn a_put_waits_for_a_change_of_mapping() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a reservation of ours, nothing of it committed.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 1 << 16, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(at, 0);
+        put_changed(at, &[0; 64], &[3; 64]);
+        let (began, wait) = std::sync::mpsc::channel();
+        let change = std::thread::spawn(move || {
+            let _changing = crate::watch::title_memory_remapping();
+            began.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            // SAFETY: the reservation's first page.
+            assert!(!unsafe { VirtualAlloc(at as _, 4096, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        });
+        wait.recv().unwrap();
+        put_changed(at, &[0; 64], &[1; 64]);
+        change.join().unwrap();
+        // SAFETY: committed by now.
+        assert_eq!(unsafe { std::slice::from_raw_parts(at as *const u8, 64) }, [1; 64]);
+        // SAFETY: our reservation.
+        unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
+    }
 
     /// Whole dwords around every changed byte and no other, whatever the
     /// alignment; small gaps joined only when asked.

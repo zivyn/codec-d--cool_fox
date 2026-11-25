@@ -88,7 +88,7 @@ pub(super) fn stage() -> u32 {
 const BETWEEN: u64 = 4 << 20;
 
 /// The most steps of a submission done this way.
-const MOST: usize = 4096;
+const MOST: usize = 12288;
 
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
@@ -247,6 +247,9 @@ fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
         }
     }
     while !more.is_empty() {
+        // (Joined once for the round: one by one the 2,800 fills of a frame
+        // sorted the ranges each time, 16 ms of the submitting thread.)
+        let (mut reads, mut writes) = (Vec::new(), Vec::new());
         for i in std::mem::take(&mut more) {
             takes(&does[i])?;
             taken[i] = true;
@@ -254,9 +257,13 @@ fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
                 if w.0 < w.1 && meet(r, w) {
                     return Err("a copy onto itself");
                 }
-                join_ranges(&mut read, [r]);
-                join_ranges(&mut written, [w]);
+                reads.push(r);
+                writes.push(w);
             }
+        }
+        join_ranges(&mut read, reads);
+        if writes.iter().any(|w| w.0 < w.1) {
+            join_ranges(&mut written, writes);
         }
         if taken.iter().filter(|t| **t).count() > MOST {
             return Err("too many steps depend on it");
@@ -288,7 +295,9 @@ fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
     let mut behind: Vec<(usize, usize)> = Vec::new();
     for (i, d) in does.iter().enumerate() {
         if taken[i] {
-            if let Some((_, w)) = reads_writes(d) {
+            if let Some((_, w)) = reads_writes(d)
+                && w.0 < w.1
+            {
                 join_ranges(&mut behind, [w]);
             }
             continue;
@@ -368,9 +377,25 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
 /// asking Windows walks the page tables, milliseconds in the title's heap).
-fn mapped(from: usize, to: usize) -> bool {
-    let mut bytes = vec![0u8; to - from];
-    read_into(from as *const u8, &mut bytes)
+/// `room`: for what is read.
+fn mapped(from: usize, to: usize, room: &mut Vec<u8>) -> bool {
+    if room.len() < to - from {
+        room.resize(to - from, 0);
+    }
+    read_into(from as *const u8, &mut room[..to - from])
+}
+
+/// A table by addresses and numbers of ours.
+type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<AddressHash>>;
+
+/// Where the bytes of the fill that is `step` (its list by address, its place
+/// in it) go.
+fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
+    let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
+    match list.deferred().copies.get(step.1)? {
+        Step::Fill(_, _, _, to) => to.clone(),
+        _ => None,
+    }
 }
 
 /// A step done on the card.
@@ -475,7 +500,7 @@ static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::Ato
 /// list by address, their place in it).
 pub(super) struct Taken {
     own: Own,
-    steps: std::collections::HashSet<(usize, usize)>,
+    steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
 }
 
@@ -543,8 +568,6 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut does = Vec::new();
-        // Where the fills' bytes go.
-        let mut fills = std::collections::HashMap::new();
         // Which step each is. One list's lock at a time: a submission may
         // name a list twice.
         let mut steps = Vec::new();
@@ -561,12 +584,7 @@ impl Host {
                         src: *src,
                         len: *len,
                         asked: read_blocked(written, *src, *len),
-                        to: {
-                            if let Some(to) = to {
-                                fills.insert(does.len(), to.clone());
-                            }
-                            to.is_some()
-                        },
+                        to: to.is_some(),
                     },
                     Step::Texture(staging) => {
                         let (at, len) = staging.memory();
@@ -605,7 +623,11 @@ impl Host {
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
-        let mut places = std::collections::HashMap::new();
+        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
+        // Some 2,800 fills a frame, of a few hundred places: what holds each
+        // is looked for once, as long as no copy is added to the writers.
+        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
+        let mut room = Vec::new();
         let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
@@ -617,7 +639,14 @@ impl Host {
             if len == 0 {
                 return Err("nothing to read");
             }
-            let from = holder(&writers, src, src + len)?;
+            let from = match held.get(&(src, len)) {
+                Some(from) => from.clone(),
+                None => {
+                    let from = holder(&writers, src, src + len)?;
+                    held.insert((src, len), from.clone());
+                    from
+                }
+            };
             let place = (Arc::as_ptr(&from) as usize, src, len, level);
             let at = match places.get(&place) {
                 Some(&at) => at,
@@ -625,7 +654,7 @@ impl Host {
                     if end + len as u64 > BETWEEN {
                         return Err("too much at once");
                     }
-                    if !mapped(src, src + len) {
+                    if !mapped(src, src + len, &mut room) {
                         return Err("not all of what it reads is mapped");
                     }
                     let at = end;
@@ -640,7 +669,7 @@ impl Host {
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
-                    if !mapped(dst, dst + len) {
+                    if !mapped(dst, dst + len, &mut room) {
                         return Err("not all of what it writes is mapped");
                     }
                     // What the steps behind it read of it is in that host
@@ -651,11 +680,12 @@ impl Host {
                         to: dst + len,
                         copy: true,
                     });
+                    held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fills.get(&i) {
-                    Some(FillTo::Slot(heap, index)) => To::Slot(*heap, *index),
-                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer.clone()),
+                _ => match fill_to(runs, steps[i]) {
+                    Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
+                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
                 },
             };
@@ -671,12 +701,22 @@ impl Host {
             return Err("no host list or buffer for it");
         };
         // First every refresh, then the writes: the bytes compared with are
-        // the title's.
+        // the title's. (One step for each host copy, over all that is read of
+        // it: a flush brings a copy up to date from the first range asked for
+        // to the last, whatever the steps.)
+        let mut spans: ByCopy<(Arc<Shadow>, usize, usize)> = ByCopy::default();
         for op in &ops {
-            op.from.0.refresh(&own.list, op.from.1 as u64, op.len as u64);
-            if let To::Copy(to, dst) = &op.to {
-                to.refresh(&own.list, *dst as u64, op.len as u64);
+            let to = match &op.to {
+                To::Copy(to, dst) => Some((to, *dst)),
+                _ => None,
+            };
+            for (shadow, at) in std::iter::once((&op.from.0, op.from.1)).chain(to) {
+                let span = spans.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| (shadow.clone(), at, at + op.len));
+                (span.1, span.2) = (span.1.min(at), span.2.max(at + op.len));
             }
+        }
+        for (shadow, from, to) in spans.into_values() {
+            shadow.refresh(&own.list, from as u64, (to - from) as u64);
         }
         let mut copied = Vec::new();
         for op in &ops {

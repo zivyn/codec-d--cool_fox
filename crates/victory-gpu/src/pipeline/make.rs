@@ -59,6 +59,10 @@ impl Pending {
         }
     }
 
+    pub(super) fn key(&self) -> &str {
+        &self.key
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));

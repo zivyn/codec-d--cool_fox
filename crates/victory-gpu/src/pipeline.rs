@@ -561,6 +561,8 @@ fn hand_out(
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
+    known::note(host.key(), &shaders, host.graphics.as_deref());
+    #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
     let builder = of_builder(&shaders);
@@ -747,6 +749,8 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub mod known;
 #[cfg(windows)]
 mod library;
 #[cfg(windows)]

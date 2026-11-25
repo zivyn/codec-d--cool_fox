@@ -340,8 +340,16 @@ impl Player {
                 continue;
             };
             let r = &self.frame.resources[at];
-            if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 || r.desc.samples[0] > 1 {
-                say(format!("{id}: a buffer or multisampled"));
+            if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {
+                // A buffer: its bytes.
+                if let Some(all) = self.contents_of(id, 0)? {
+                    std::fs::write(images.folder.join(format!("{id:05}.bin")), &all)?;
+                    say(format!("{}: {} bytes", self.called(id), all.len()));
+                }
+                continue;
+            }
+            if r.desc.samples[0] > 1 {
+                say(format!("{id}: multisampled"));
                 continue;
             }
             let (name, own) = (r.name.clone(), r.desc.format);

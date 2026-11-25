@@ -77,6 +77,30 @@ leaves out waits or work can draw another picture and, with wild data, lose
 the device: save work in other programs first. Do not run the title at the
 same time.
 
+## What draws a pixel
+
+    victory replay <folder> --pixel 1234,567 [--of 1280x720] [--lists 40..80]
+
+runs the frame once with copies of the texel under the point after every
+command that can change it, and names each command that did with its pipeline
+(id, name, DXIL hashes) and the values before and after: draws with their
+targets (where the viewport has the picture's shape), dispatches and draws with
+the textures of the picture's shape shaders may write at that time, copies,
+resolves and clears. `--of` is the size of the picture the point was read from
+(a screenshot's). The commands are numbered `<list>:<command>` as in
+`--listing`, `--slots` and `--looks`.
+
+| switch | does |
+|---|---|
+| `--pixel <id>[.<sub>]:<x>,<y>` | a texel of one texture instead (repeatable, both kinds) |
+| `--depth` | depth targets too: the whole target is copied after each draw |
+| `--targets-only` | no textures of unordered access: fewer copies |
+| `--split <list>:<command>` | the draws of that indirect call one by one, each named |
+| `--lists 40..80` | only these lists are looked into |
+
+A texture that was changed by what is not looked into is reported as "changed
+unseen". Copies of 3D textures' targets are of the slice drawn to.
+
 ## Runs that differ
 
 Shaders that give out places with atomics (the title's culling) give other

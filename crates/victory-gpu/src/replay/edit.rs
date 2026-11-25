@@ -8,6 +8,10 @@ use super::wire::{ALL, Barrier, Cmd, NONE, Va, slot};
 /// The buffer the clamped arguments of all clamp passes lie in, in lists
 /// edited by [`clamps`].
 pub const RESULTS: u32 = u32::MAX - 1;
+/// The buffer texels are read back through (`play::pixel`).
+pub const PROBE: u32 = u32::MAX - 2;
+/// A buffer of the card's that depth goes through on the way there.
+pub const SCRATCH: u32 = u32::MAX - 3;
 
 const INDIRECT_ARGUMENT: i32 = 0x200;
 const UNORDERED_ACCESS: i32 = 0x8;

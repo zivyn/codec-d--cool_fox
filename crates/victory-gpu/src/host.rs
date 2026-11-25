@@ -2184,6 +2184,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes): declaring them again would
+    /// change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2217,6 +2221,13 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// The steps recorded last write title memory: what was brought up to
+    /// date before them is not any more.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
     }
 }
 
@@ -3683,6 +3694,12 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
     d.checked_add(n) == Some(dst)
         && s.checked_add(n) == Some(src)
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+}
+
+/// See [`HostList::defer_gpu_write`].
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -6630,7 +6647,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
         self.changed_something();
     }
 
@@ -6677,15 +6694,20 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// Declared once until the list next writes title memory (but with
+    /// `VICTORY_DECLARE_ONCE=0`): the dispatches of a frame declared the
+    /// same ranges thousands of times, each a step of its own.
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) || !declare_once() {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7012,8 +7034,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
+        drop(deferred);
         self.changed_something();
     }
 

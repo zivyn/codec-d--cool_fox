@@ -131,6 +131,40 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where the host's raw twins of its buffer views start in its view heaps (0: there are none).
+///
+/// A buffer a shader picks from the heap by an index it computes is read as raw bytes whatever
+/// view the title has there, and the index comes from data: a record of a mesh long gone, a list
+/// entry nothing wrote. On AMD a raw load through a view that is not raw (typed, structured, a
+/// constant buffer's) has no end: it reads whatever lies there, up to 4 GiB on, and loses the
+/// device where nothing does; and a texture's descriptor read as a buffer's is a wild address.
+/// So the host keeps, for title slot `i`, a raw view of the same bytes at this place + `i`
+/// (a constant buffer view of a constant buffer, a null raw view of everything else and of every
+/// slot past the title's), and shaders translated while this is set read picked buffers there.
+/// A power of two above every slot index.
+static RAW_VIEWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// For a test's thread alone.
+    pub(crate) static RAW_VIEWS_HERE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// See [`RAW_VIEWS`].
+pub fn set_raw_views(first: u32) {
+    debug_assert!(first == 0 || first.is_power_of_two());
+    RAW_VIEWS.store(first, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`RAW_VIEWS`]: where shaders translated now read the buffers they pick (0: in place).
+pub fn raw_views() -> u32 {
+    #[cfg(test)]
+    if let Some(first) = RAW_VIEWS_HERE.get() {
+        return first;
+    }
+    RAW_VIEWS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -403,8 +437,23 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
+        self.heap_handle_at(block, index, sampler, nonuniform, props, false)
+    }
+
+    /// [`Shader::heap_handle`]; `bounded`: the index is inside the host's heap already
+    /// ([`raw_views`]).
+    pub fn heap_handle_at(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+        bounded: bool,
+    ) -> V {
         // a view index past the host heap (`set_view_heap_limit`) reads its null slot instead
-        let limit = VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+        // (the raw twins of buffer views lie past it: such an index comes bounded)
+        let limit = if bounded { 0 } else { VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed) };
         // (as `dx.op.binary` UMin: a compare and select emitted here made the bitcode invalid)
         let index = if !sampler && limit != 0 {
             let null = self.m.i32(limit);

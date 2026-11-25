@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
@@ -29,6 +29,28 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 const BLOCK: u64 = 64 << 20;
 /// Blocks with nothing in them that are kept.
 const SPARE: usize = 2;
+/// The same while the card has room ([`room`]): 4 GiB of them.
+const SPARE_KEPT: usize = 64;
+/// The same of blocks of staging buffers, which are the PC's memory: run
+/// crash-1 held 5.2 GB of them.
+const STAGING_KEPT: usize = 8;
+/// How many are kept now.
+static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+
+/// Sets how many empty blocks stay, by the card's memory (budget and use):
+/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
+/// Asked once a second.
+pub(crate) fn room(memory: Option<[u64; 4]>) {
+    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+}
+
+fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
+    match memory {
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        _ => SPARE,
+    }
+}
+
 /// Milliseconds until a piece given back is used again. (It was three
 /// frames, a tenth of a second while the title shows a loading screen at 30
 /// a second, with up to 18 submissions in the air.)
@@ -106,11 +128,14 @@ struct Pool<B> {
     blocks: Vec<Option<Block<B>>>,
     /// Pieces given back, and when each may be used again.
     resting: VecDeque<(u64, Piece)>,
+    /// The empty blocks it was last told to keep, and the most it keeps.
+    spare: usize,
+    most: usize,
 }
 
 impl<B: Clone> Pool<B> {
-    const fn new() -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new() }
+    const fn new(most: usize) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -168,12 +193,15 @@ impl<B: Clone> Pool<B> {
                 any |= block.free.whole(BLOCK);
             }
         }
-        if any {
+        // (Without a piece given back too, once there is less room.)
+        let most = SPARES.load(Ordering::Relaxed).min(self.most);
+        if any || most < self.spare {
+            self.spare = most;
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
                     spare += 1;
-                    if spare > SPARE {
+                    if spare > most {
                         *block = None;
                     }
                 }
@@ -192,11 +220,20 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new());
-static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new());
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
+static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Bytes of the pieces textures hold now.
+static HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes of the texture blocks no texture holds: the card's memory in use
+/// by us that new textures take first.
+pub(crate) fn texture_room() -> u64 {
+    (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -282,6 +319,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*this.cast::<Reclaim>()).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
+            HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -351,6 +389,7 @@ pub(crate) unsafe fn texture(
     let result = unsafe { device.CreatePlacedResource(&heap, piece.start, &d, state, None, &mut made) };
     match (result, made) {
         (Ok(()), Some(made)) => {
+            HELD.fetch_add(piece.len, Ordering::Relaxed);
             give_back_with(&made, piece);
             Some(made)
         }
@@ -380,8 +419,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_blocks_stay_while_the_card_has_room() {
+        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
     fn pieces_never_overlap_and_rest_before_they_are_used_again() {
-        let mut pool: Pool<u32> = Pool::new();
+        let mut pool: Pool<u32> = Pool::new(SPARE);
         let made = std::cell::Cell::new(0);
         let make = || {
             made.set(made.get() + 1);
@@ -411,7 +458,7 @@ mod tests {
         assert_eq!(pool.blocks(), blocks.min(SPARE));
         // Too big for a block, and a block that cannot be made.
         assert!(pool.take(BLOCK, 65536, 30, make).is_none());
-        let mut none: Pool<u32> = Pool::new();
+        let mut none: Pool<u32> = Pool::new(SPARE);
         assert!(none.take(65536, 65536, 0, || None).is_none());
     }
 

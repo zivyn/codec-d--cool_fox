@@ -26,8 +26,8 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
-    /// The bytes of `buffer`.
-    width: u64,
+    /// The bytes of `buffer`, once asked.
+    width: std::sync::OnceLock<u64>,
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
     gpu: u64,
@@ -2745,17 +2745,16 @@ impl Shadow {
 
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
-        self.width
+        // SAFETY: a live buffer.
+        *self.width.get_or_init(|| unsafe { self.buffer.GetDesc() }.Width)
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
-        // SAFETY: a live buffer.
-        let width = unsafe { buffer.GetDesc() }.Width;
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
-            width,
+            width: Default::default(),
             buffer,
             data,
             gpu,

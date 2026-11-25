@@ -4709,7 +4709,7 @@ impl Host {
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
+                        && shadow.asked_ahead()
                     {
                         let span = spans
                             .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -4719,6 +4719,8 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            #[cfg(feature = "diagnostics")]
+            SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             crate::watch::ask_once(&ranges);
             #[cfg(feature = "diagnostics")]
             split.part(0);
@@ -6215,9 +6217,11 @@ impl std::hash::Hasher for AddressHash {
 /// in under flights' writes; the lists' steps, the refreshes among them; the
 /// snapshots; what goes to copies in the card's memory; the lists sent; and
 /// of the steps: the refreshes, and the copies and fills (those with the
-/// refreshes a copy of title memory flushes).
+/// refreshes a copy of title memory flushes). Of the asking, which ranges it
+/// is of. Of the refreshes, those before ranges are given to shaders, one
+/// copy at a time: nanoseconds, and how many.
 #[cfg(feature = "diagnostics")]
-static SPLIT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+static SPLIT: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
 /// those known to copy nothing, and those done on several threads.
@@ -6232,6 +6236,11 @@ struct Split(std::cell::Cell<std::time::Instant>);
 impl Split {
     fn begin() -> Split {
         Split(std::cell::Cell::new(std::time::Instant::now()))
+    }
+
+    /// Nanoseconds since the last part.
+    fn so_far(&self) -> u64 {
+        self.0.get().elapsed().as_nanos() as u64
     }
 
     /// What came since the last part was part `i`.
@@ -6250,11 +6259,12 @@ fn split_line(frames: f64) {
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let s: Vec<f64> = crate::shadow::send_stats().iter().map(|&n| n as f64 / (1 << 20) as f64 / frames).collect();
     tracing::info!(
-        "preparing per frame, the submitting thread: {:.1} ms asking the write watch, {:.1} putting the title's bytes under flights' \
+        "preparing per frame, the submitting thread: {:.1} ms asking the write watch ({:.1} of them finding what to ask), {:.1} putting the title's bytes under flights' \
          writes, {:.1} in the lists' steps (refreshes {:.1} in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on \
-         several threads; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
+         several threads, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
          card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {})",
         ms[0],
+        ms[8],
         ms[1],
         ms[2],
         ms[6],
@@ -6262,6 +6272,8 @@ fn split_line(frames: f64) {
         f[1],
         f[2],
         f[3],
+        ms[9],
+        ms[10] * 1e6,
         ms[7],
         ms[3],
         ms[4],
@@ -6269,12 +6281,17 @@ fn split_line(frames: f64) {
         if crate::watch::light() { "on" } else { "off" },
     );
     tracing::info!(
-        "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB; view ranges: {:.0} answered by their \
+        "asking about title memory per frame, all threads: {:.0} kernel askings over {:.0} MB ({:.1} ms, {:.0} pages of 4 KiB found \
+         written, {:.0} askings refused); {:.0} questions about holes; view ranges: {:.0} answered by their \
          bits, {:.0} by the guards whole, {:.0} block by block; {:.0} blocks made read-only, {:.0} opened by ourselves; {:.1} ms \
          waiting for the guards, {:.1} ms changing protections; pages taken again for the card: {:.1} MB compared, {:.1} MB of them \
          as they were, {:.1} MB to go up (VICTORY_SEND_CHANGED)",
         a[0],
         a[1] / 1024.0,
+        a[11] / 1e6,
+        a[12],
+        a[10],
+        a[9],
         a[2],
         a[3],
         a[4],
@@ -6414,7 +6431,12 @@ impl Batch {
             Self::update(&shadow, from, to);
         }
         #[cfg(feature = "diagnostics")]
-        SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        {
+            let ns = started.elapsed().as_nanos() as u64;
+            SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+            SPLIT[9].fetch_add(ns, Ordering::Relaxed);
+            SPLIT[10].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Brings `[from, to)` of a copy up to date, timed.
@@ -6497,7 +6519,7 @@ impl Batch {
             let ranges: Vec<(usize, usize)> = self
                 .refreshes
                 .iter()
-                .filter(|r| !r.0.unwatched())
+                .filter(|r| r.0.asked_ahead())
                 .map(|r| (r.1, r.2))
                 .collect();
             crate::watch::ask_ahead(&ranges);
@@ -7795,6 +7817,50 @@ mod refresh_tests {
         at
     }
 
+    /// Title memory of `blocks` pages in a placeholder, one view to a page,
+    /// and every fourth page not there: as a title that streams has it.
+    fn with_holes(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS,
+            VirtualAlloc2, VirtualFree,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a placeholder and a section of our own.
+        unsafe {
+            let at = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                blocks * PAGE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(at, 0);
+            let len = blocks * PAGE;
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null());
+            for block in (0..blocks).filter(|b| b % 4 != 3) {
+                let to = at + block * PAGE;
+                VirtualFree(to as *mut _, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                let view = MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    to as *const _,
+                    (block * PAGE) as u64,
+                    PAGE,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                assert_eq!(view.Value as usize, to);
+                crate::title_memory_remapped(to, PAGE);
+            }
+            at
+        }
+    }
+
     fn memory(len: usize) -> *mut u8 {
         // SAFETY: a plain allocation.
         unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast() }
@@ -8243,12 +8309,17 @@ mod refresh_tests {
         const EACH: usize = 224 << 10;
         const BIG: usize = 174 << 20;
         let watched = title(3000 * EACH, false);
-        let views = title(1400 * EACH, true);
+        // `VICTORY_BENCH_HOLES=0`: views without holes.
+        let holes = std::env::var_os("VICTORY_BENCH_HOLES").is_none_or(|v| v != "0");
+        let views = if holes { with_holes(1400 * EACH / PAGE) } else { title(1400 * EACH, true) };
+        let there = |at: usize| !holes || (at - views) / PAGE % 4 != 3;
         let big = title(BIG, true);
         // SAFETY: the test's own memory.
         unsafe {
             std::ptr::write_bytes(watched as *mut u8, 1, 3000 * EACH);
-            std::ptr::write_bytes(views as *mut u8, 1, 1400 * EACH);
+            for at in (views..views + 1400 * EACH).step_by(PAGE).filter(|&at| there(at)) {
+                std::ptr::write_bytes(at as *mut u8, 1, PAGE);
+            }
             std::ptr::write_bytes(big as *mut u8, 1, BIG);
         }
         let mut small = Vec::new();
@@ -8271,8 +8342,10 @@ mod refresh_tests {
                 // The title's writes, and the relay's beside the submission.
                 for _ in 0..9 {
                     let at = views + random.below(1400 * EACH / 8) * 8;
-                    // SAFETY: the test's own memory.
-                    unsafe { (at as *mut u64).write_volatile(frame as u64) };
+                    if there(at) {
+                        // SAFETY: the test's own memory.
+                        unsafe { (at as *mut u64).write_volatile(frame as u64) };
+                    }
                 }
                 for _ in 0..60 {
                     let at = watched + random.below(3000 * EACH / 8) * 8;

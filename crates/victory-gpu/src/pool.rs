@@ -167,6 +167,9 @@ struct Block<B> {
     used_to: u64,
     /// The newest submission begun when it was made ([`Ripe`]).
     made: u64,
+    /// When that was (ms).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    since: u64,
 }
 
 struct Pool<B> {
@@ -258,7 +261,7 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made });
+        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
         i
     }
 
@@ -412,6 +415,25 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     }
 }
 
+/// Textures made in the last second ([`fresh`]), and when.
+static RECENT: Mutex<VecDeque<(usize, u64)>> = Mutex::new(VecDeque::new());
+
+/// Whether `texture` was made in a block in the last second.
+pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
+    let raw = texture.as_raw() as usize;
+    let since = now().saturating_sub(1000);
+    RECENT.lock().unwrap_or_else(|e| e.into_inner()).iter().rev().take_while(|r| r.1 >= since).any(|r| r.0 == raw)
+}
+
+fn made_now(texture: &ID3D12Resource) {
+    let now = now();
+    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
+        recent.pop_front();
+    }
+    recent.push_back((texture.as_raw() as usize, now));
+}
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
@@ -455,7 +477,8 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
-    let (piece, heap, _) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -483,10 +506,24 @@ pub(crate) unsafe fn texture(
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
             give_back_with(&made, piece);
+            made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
                 crate::book::made(&made, || "a texture in a block".into());
                 crate::book::block(&heap, &made, piece.start, BLOCK);
+                crate::book::note(made.as_raw() as usize, || {
+                    let block = lock(&TEXTURES).blocks.get(piece.block).and_then(Option::as_ref).map(|b| (b.made, b.since));
+                    let (submission, since) = block.unwrap_or_default();
+                    format!(
+                        "; piece {:#x}+{:#x} of block {} {:#x} made {:.1} s before it at submission {submission}, used before: {again}, made at submissions {:?}",
+                        piece.start,
+                        piece.len,
+                        piece.block,
+                        heap.as_raw() as usize,
+                        now().saturating_sub(since) as f64 / 1e3,
+                        crate::host::submissions()
+                    )
+                });
             }
             Some(made)
         }

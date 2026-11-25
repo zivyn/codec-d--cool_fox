@@ -168,29 +168,37 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             ];
             let end = regs[end_reg as usize & 15] as usize;
             let start = ctx.Rax as usize;
-            if end > start && end - start < 2 << 30 {
-                // Region by region: a block may lie across several (the title's pages are
-                // mapped one view each), and one answer for all of it was a refusal, after
-                // which every 64-byte line took an exception of its own.
-                let mut at = start;
-                while at < end {
-                    let Some(to) = writable_to(at, end) else { break };
-                    // SAFETY: committed and writable from `at` to `to`.
-                    unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
-                    at = to;
-                }
-                if at == start {
-                    return 0;
-                }
-                ZEROED.fetch_add((at - start) as u64, Relaxed);
-                if at < end {
-                    // What follows is not writable: the loop goes on there (the same
-                    // instruction again), where the real one faults too.
-                    ctx.Rax = at as u64;
-                    return CONTINUE_EXECUTION;
-                }
+            // A pass zeroes the whole line `rax` is in, wherever in it, and the test comes
+            // after it: lines are zeroed past an `end` inside one, and one is for an `end`
+            // not above the start. (The bytes from `start` to `end` were, `rax` came out as
+            // `end`, and the flags stayed what they were.)
+            const MOST: usize = (2 << 30) / 64;
+            let wanted = if end > start { (end - start).div_ceil(64) } else { 1 };
+            let passes = wanted.min(MOST);
+            let first = start & !63;
+            let Some(stop) = first.checked_add(passes * 64) else { return 0 };
+            // Region by region: a block may lie across several (the title's pages are
+            // mapped one view each), and one answer for all of it was a refusal, after
+            // which every 64-byte line took an exception of its own.
+            let mut at = first;
+            while at < stop {
+                let Some(to) = writable_to(at, stop) else { break };
+                // SAFETY: committed and writable from `at` to `to`.
+                unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
+                at = to;
             }
-            ctx.Rax = end as u64;
+            let done = (at - first) / 64;
+            if done == 0 {
+                return 0;
+            }
+            ZEROED.fetch_add((done * 64) as u64, Relaxed);
+            ctx.Rax = ctx.Rax.wrapping_add((done * 64) as u64);
+            if done < wanted {
+                // What follows is not writable (or the block is huge): the loop goes on
+                // there (the same instruction again), where the real one faults too.
+                return CONTINUE_EXECUTION;
+            }
+            ctx.EFlags = ctx.EFlags & !crate::crash::CMP_FLAGS | crate::crash::cmp_flags(ctx.Rax, end as u64);
         }
         ConsoleOnly::Rdpru => {
             let mut v = 0i64;

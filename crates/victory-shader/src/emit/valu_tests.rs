@@ -295,39 +295,6 @@ fn scalar_quad_masks_pack_nibbles_and_set_scc() {
     });
 }
 
-#[test]
-fn scalar_quad_masks_pack_nibbles_and_set_scc() {
-    let pack_words = |opcode: u32| {
-        [
-            0xBE90_0000 | opcode << 8,   // s_quadmask s16, s0 (pairs for b64)
-            sop2(0x0a, 18, 129, 128),  // s_cselect_b32 s18, 1, 0
-            sop2(0x1e, 18, 18, 144),   // s_lshl_b32 s18, s18, 16
-            sop2(0x10, 16, 16, 18),    // s_or_b32 s16, s16, s18
-            vop1(1, 0, sgpr(16)),      // v_mov_b32 v0, s16
-        ]
-    };
-    let cases = [
-        ([0, 0, 0, 0], [0, 0]),
-        ([0x8000_0420, 0x0100_0001, 0, 0], [0x1_0086, 0x1_4186]),
-        ([0, 0x8000_0000, 0, 0], [0, 0x1_8000]),
-        ([u32::MAX, u32::MAX, 0, 0], [0x1_00ff, 0x1_ffff]),
-    ];
-    let inputs = cases.map(|(input, _)| input);
-    for (wide, opcode) in [0x2c, 0x2d].into_iter().enumerate() {
-        let shader = build_valu_cs(&pack_words(opcode));
-        run_cases(&shader, &inputs, |backend, i, _, got| {
-            assert_eq!(got, cases[i].1[wide], "{backend}, opcode {opcode:#x}");
-        });
-    }
-    let high = build_valu_cs(&[
-        0xBE90_2D00, // s_quadmask_b64 s[16:17], s[0:1]
-        vop1(1, 0, sgpr(17)),
-    ]);
-    run_cases(&high, &inputs, |backend, _, _, got| {
-        assert_eq!(got, 0, "{backend}: high dword");
-    });
-}
-
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
@@ -677,51 +644,6 @@ fn v_min3_max3_med3_integer_forms_match_rdna2() {
     // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
     type Pick = fn([u32; 3]) -> u32;
     let ops: [(&str, u16, Pick); 6] = [
-        ("v_min3_i32", 0x152, |t| {
-            t.into_iter().min_by_key(|&x| x as i32).unwrap()
-        }),
-        ("v_min3_u32", 0x153, |t| t.into_iter().min().unwrap()),
-        ("v_max3_i32", 0x155, |t| {
-            t.into_iter().max_by_key(|&x| x as i32).unwrap()
-        }),
-        ("v_max3_u32", 0x156, |t| t.into_iter().max().unwrap()),
-        ("v_med3_i32", 0x158, |mut t| {
-            t.sort_by_key(|&x| x as i32);
-            t[1]
-        }),
-        ("v_med3_u32", 0x159, |mut t| {
-            t.sort_unstable();
-            t[1]
-        }),
-    ];
-    // Every ordering of three values, with the sign bit set on some so that
-    // the signed and unsigned answers differ.
-    let values = [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFF];
-    let mut cases = Vec::new();
-    for a in values {
-        for b in values {
-            for c in values {
-                cases.push([a, b, c, 0]);
-            }
-        }
-    }
-    for (name, op, pick) in ops {
-        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
-        run_cases(&shader, &cases, |backend, _, inp, got| {
-            let want = pick([inp[0], inp[1], inp[2]]);
-            assert_eq!(
-                got, want,
-                "{backend}: {name}({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
-                inp[0], inp[1], inp[2],
-            );
-        });
-    }
-}
-
-#[test]
-fn v_min3_max3_med3_integer_forms_match_rdna2() {
-    // v_{min3,max3,med3}_{i32,u32} v0, v1, v2, v3 (VOP3 0x152..0x159).
-    let ops: [(&str, u16, fn([u32; 3]) -> u32); 6] = [
         ("v_min3_i32", 0x152, |t| {
             t.into_iter().min_by_key(|&x| x as i32).unwrap()
         }),

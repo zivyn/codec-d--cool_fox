@@ -9,17 +9,21 @@ use crate::shadow::Shadow;
 
 /// The stage (`VICTORY_CARD_STEPS`; off by default): `1` constant buffers
 /// of descriptor tables (`Step::Fill` with a slot of its own), `2` the
-/// title's buffer copies (`Step::Copy`) too. Only with the relay's second
-/// stage (`relay_exact`).
+/// title's buffer copies (`Step::Copy`) too, with the steps of the same
+/// submission that depend on them. Only with the relay's second stage
+/// (`relay_exact`).
 ///
-/// Why: a root view has no size, so a pass that writes through one into the
-/// title's 174 MB heap is declared to write all that is left of it, and
-/// some pass of every flight does. The title's ring of constants lies in
-/// the same heap. One constant buffer of 480 bytes and one copy of 20 KiB a
-/// frame, at a new place of the ring each time, waited for nearly
-/// everything in the air: 25-30 ms of a 105 ms frame, the submitting thread
-/// standing (run record-1; with `VICTORY_FILL_TITLE=1` in run relaycopy-1
-/// the copy alone took over the wait).
+/// Why: eleven dispatches a frame (the skinning passes, in two early
+/// submissions) write through a view of the title's whole 174 MB heap, at
+/// places they read out of job records in buffers: no bound of what they
+/// write is known before they ran (frame capture replay2: 17af15c4015cb4b6,
+/// 55679a0547649d0b, 89d08e561897d4e5, fdd56d97a806bcca and three more,
+/// all through one view at offset 5920 of the title's bindless table). The
+/// title's ring of constants lies in the same heap. One constant buffer of
+/// 480 bytes and one copy of 20 KiB a frame, at a new place of the ring
+/// each time, waited for these passes to land: 25-30 ms of a 105 ms frame,
+/// the submitting thread standing (run record-1; with `VICTORY_FILL_TITLE=1`
+/// in run relaycopy-1 the copy alone took over the wait).
 ///
 /// What is done: a list of ours goes to the card in front of the
 /// submission's lists, in the same call. It copies the bytes read from the
@@ -41,8 +45,10 @@ use crate::shadow::Shadow;
 /// like any other list's (also under flights' declared writes:
 /// `stale_under_flights`, which settles if it cannot). Nothing of this
 /// submission writes these bytes earlier than our list: the steps are done
-/// in front of all its lists in either case, and [`plan`] refuses when
-/// another step of the submission writes what is read. Every draw that
+/// in front of all its lists in either case, and among themselves in the
+/// order they stand in wherever one depends on another: [`plan`] takes
+/// every copy and fill of the submission that writes what a taken one
+/// reads or writes, or reads what a taken one writes. Every draw that
 /// reads a buffer view of the heap relies on the same refresh and the same
 /// order; what is new is only that a constant buffer and a copy do too.
 /// Where a page is not mapped the host copy may hold other bytes than the
@@ -54,9 +60,10 @@ use crate::shadow::Shadow;
 /// memory before the title is told anything of this flight (its
 /// bottom-of-pipe writes and fences come after, in order); CPU steps of
 /// later submissions that read it find it declared and wait, or are done
-/// here. Refused: another step of the submission reads or writes the
-/// destination on the CPU, or a refresh brings another host copy of it up
-/// to date ([`plan`], [`elsewhere`]). While such a copy is in the air a
+/// here. Refused: a step of the submission that cannot be taken (a texture,
+/// vertices expanded, a fill of memory of another kind) reads the
+/// destination behind the copy, or a refresh brings another host copy of it
+/// up to date ([`plan`], [`elsewhere`]). While such a copy is in the air a
 /// submission that refreshes another host copy of its destination, or
 /// reads it in a step that is not checked otherwise, waits for it
 /// ([`copied_read`]); with the copy done on the CPU it was there at once.
@@ -77,8 +84,22 @@ pub(super) fn stage() -> u32 {
 }
 
 /// The bytes of our buffer between reading and writing: what one submission
-/// may do this way.
-const BETWEEN: u64 = 1 << 20;
+/// may do this way (each place read once, however many fills take it).
+const BETWEEN: u64 = 4 << 20;
+
+/// The most steps of a submission done this way.
+const MOST: usize = 4096;
+
+/// How a fill's bytes get where its list reads them, if the card brings
+/// them.
+#[derive(Clone)]
+pub(super) enum FillTo {
+    /// A descriptor slot that shows the fill's memory, and nothing else does
+    /// (title heap, slot): it is made to show our buffer instead.
+    Slot(usize, u32),
+    /// A buffer the card can write, filled from its beginning.
+    Buffer(ID3D12Resource),
+}
 
 /// Title memory something in the air writes: the host copy it goes through
 /// (`None`: none, the bytes reach title memory when the flight lands), from,
@@ -167,7 +188,8 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Does {
     Copy { dst: usize, src: usize, len: usize, asked: bool },
-    Fill { src: usize, len: usize, asked: bool, slot: Option<(usize, u32)> },
+    /// `to`: its memory can be given the bytes on the card.
+    Fill { src: usize, len: usize, asked: bool, to: bool },
     /// Another read on the CPU (a texture, vertices expanded).
     Read { from: usize, to: usize, asked: bool },
     /// A refresh of a host copy (named by its address).
@@ -180,51 +202,125 @@ fn meet(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.1 && b.0 < a.1
 }
 
-/// The steps of `does` (by place) to be done on the card: all that are
-/// asked for, or why not. Our list does them all in front of the
-/// submission's, every read before every write, so that is right only if no
-/// step, asked for or not, writes what one of them reads or writes, and no
-/// CPU step reads what one of them writes.
-fn plan(does: &[Does], stage: u32) -> Result<Vec<usize>, &'static str> {
-    let mut asked = Vec::new();
+/// The bytes `d` reads and writes as a copy or a fill (empty ranges for
+/// what it does not).
+fn reads_writes(d: &Does) -> Option<((usize, usize), (usize, usize))> {
+    match *d {
+        Does::Copy { dst, src, len, .. } => Some(((src, src + len), (dst, dst + len))),
+        Does::Fill { src, len, .. } => Some(((src, src + len), (0, 0))),
+        _ => None,
+    }
+}
+
+fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
+    touches(ranges, r.0, r.1)
+}
+
+/// The steps of `does` (by place) to be done on the card, in order, each
+/// with its level; or why not. All that are asked for, and every copy and
+/// fill that is in the way of one that is done there: it writes what that
+/// one reads or writes, or reads what it writes, whichever comes first. So
+/// what is left on the CPU writes none of their bytes, and reads of them
+/// only what a taken copy has not been told to write yet: bytes a step
+/// ahead of it reads, in title memory as it is.
+///
+/// Steps of a level are done together, every read before every write; a
+/// step that writes what an earlier one reads or writes, or reads what it
+/// writes, is of a higher level. Our list does them level by level.
+fn plan(does: &[Does], stage: u32) -> Result<Vec<(usize, u32)>, &'static str> {
+    let takes = |d: &Does| match *d {
+        Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
+        Does::Fill { to: false, .. } => Err("a fill of memory the card cannot be given the bytes of"),
+        _ => Ok(()),
+    };
+    let mut taken = vec![false; does.len()];
+    let (mut read, mut written) = (Vec::new(), Vec::new());
+    let mut more = Vec::new();
     for (i, d) in does.iter().enumerate() {
         match *d {
             Does::Run => return Err("a step of ours runs"),
             Does::Read { asked: true, .. } => return Err("a texture reads it"),
-            Does::Fill { asked: true, slot: None, .. } => return Err("a fill without a descriptor slot of its own"),
-            Does::Copy { asked: true, .. } if stage < 2 => return Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
-            Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => asked.push(i),
+            Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. } => more.push(i),
             _ => {}
         }
     }
-    for &i in &asked {
-        let (src, dst) = match does[i] {
-            Does::Copy { dst, src, len, .. } => ((src, src + len), Some((dst, dst + len))),
-            Does::Fill { src, len, .. } => ((src, src + len), None),
-            _ => continue,
-        };
-        for (k, d) in does.iter().enumerate() {
-            let (read, written) = match *d {
-                Does::Copy { dst, src, len, .. } => (Some((src, src + len)), Some((dst, dst + len))),
-                Does::Fill { src, len, .. } => (Some((src, src + len)), None),
-                Does::Read { from, to, .. } => (Some((from, to)), None),
-                Does::Refresh { .. } | Does::Run => (None, None),
-            };
-            if written.is_some_and(|w| meet(w, src)) {
-                return Err("a copy of the submission writes what it reads");
+    while !more.is_empty() {
+        for i in std::mem::take(&mut more) {
+            takes(&does[i])?;
+            taken[i] = true;
+            if let Some((r, w)) = reads_writes(&does[i]) {
+                if w.0 < w.1 && meet(r, w) {
+                    return Err("a copy onto itself");
+                }
+                join_ranges(&mut read, [r]);
+                join_ranges(&mut written, [w]);
             }
-            let Some(dst) = dst else {
+        }
+        if taken.iter().filter(|t| **t).count() > MOST {
+            return Err("too many steps depend on it");
+        }
+        for (i, d) in does.iter().enumerate() {
+            // A fill that cannot be taken is looked at below.
+            if taken[i] || matches!(d, Does::Fill { to: false, .. }) {
                 continue;
-            };
-            if k != i && written.is_some_and(|w| meet(w, dst)) {
-                return Err("another copy of the submission writes what it writes");
             }
-            if read.is_some_and(|r| meet(r, dst)) {
-                return Err("a step of the submission reads what it writes");
+            if let Some((r, w)) = reads_writes(d)
+                && (touched(&written, r) || touched(&written, w) || touched(&read, w))
+            {
+                more.push(i);
             }
         }
     }
-    Ok(asked)
+    let order: Vec<usize> = (0..does.len()).filter(|&i| taken[i]).collect();
+    // What stays on the CPU and reads what an earlier taken copy writes
+    // would read it too early.
+    let mut behind: Vec<(usize, usize)> = Vec::new();
+    for (i, d) in does.iter().enumerate() {
+        if taken[i] {
+            if let Some((_, w)) = reads_writes(d) {
+                join_ranges(&mut behind, [w]);
+            }
+            continue;
+        }
+        match *d {
+            Does::Read { from, to, .. } if touched(&behind, (from, to)) => {
+                return Err("a texture or expanded vertices read what it writes");
+            }
+            Does::Fill { src, len, .. } if touched(&behind, (src, src + len)) => {
+                return Err("a fill of memory the card cannot be given the bytes of reads what it writes");
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<(usize, u32)> = Vec::with_capacity(order.len());
+    // The copies among them, which alone put others behind them or have to
+    // stand behind others.
+    let mut copies: Vec<usize> = Vec::new();
+    for &i in &order {
+        let Some((r, w)) = reads_writes(&does[i]) else {
+            continue;
+        };
+        let writes = w.0 < w.1;
+        let mut level = 0;
+        // Behind what writes what this reads or writes, and, if this
+        // writes, behind what reads it.
+        let ahead: Box<dyn Iterator<Item = usize>> =
+            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
+        for k in ahead {
+            let (j, at): (usize, u32) = out[k];
+            let Some((jr, jw)) = reads_writes(&does[j]) else {
+                continue;
+            };
+            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
+                level = at + 1;
+            }
+        }
+        if writes {
+            copies.push(out.len());
+        }
+        out.push((i, level));
+    }
+    Ok(out)
 }
 
 /// Whether a refresh of `does` brings a host copy other than `shadow` up to
@@ -272,6 +368,7 @@ struct Op {
     len: usize,
     /// Its place in the buffer between.
     at: u64,
+    level: u32,
     to: To,
 }
 
@@ -280,14 +377,18 @@ enum To {
     Copy(Arc<Shadow>, usize),
     /// A descriptor slot (title heap, slot).
     Slot(usize, u32),
+    /// A buffer's beginning.
+    Buffer(ID3D12Resource),
 }
 
-/// Records what [`stage`] describes into `list` (open): `reads` are copied
-/// into `between` (source, offset in it, offset in `between`, bytes), then
-/// `writes` out of it (destination, offset in it, offset in `between`,
-/// bytes). `between` is left readable as constants, the others in the
-/// common state, as the submission's lists expect them.
+/// Records a level of what [`stage`] describes into `list` (open): `reads`
+/// are copied into `between` (source, offset in it, offset in `between`,
+/// bytes), then `writes` out of it (destination, offset in it, offset in
+/// `between`, bytes). `between` is left readable as constants (and must be
+/// so, unless this is the `first` level), the others in the common state,
+/// as the submission's lists expect them.
 fn record(
+    first: bool,
     list: &ID3D12GraphicsCommandList,
     between: &ID3D12Resource,
     reads: &[(&ID3D12Resource, u64, u64, u64)],
@@ -305,23 +406,28 @@ fn record(
         }
     }
     let both = |b: &ID3D12Resource| dests.iter().any(|d| d.as_raw() == b.as_raw());
-    let mut barriers = vec![transition(between, dest, source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)];
+    let constants = source | D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    let mut barriers = vec![transition(between, dest, constants)];
     barriers.extend(sources.iter().map(|b| transition(b, source, if both(b) { dest } else { common })));
     let done: Vec<D3D12_RESOURCE_BARRIER> = dests.iter().map(|b| transition(b, dest, common)).collect();
     // SAFETY: an open list; live buffers, and the callers' ranges lie in
     // them. The buffers start in the common state (the list is the first of
     // its call) and are promoted by their first use.
     unsafe {
-        // What earlier lists' shaders wrote, first.
-        list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-            Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                    pResource: std::mem::ManuallyDrop::new(None),
-                }),
-            },
-        }]);
+        if first {
+            // What earlier lists' shaders wrote, first.
+            list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            }]);
+        } else {
+            list.ResourceBarrier(&[transition(between, constants, dest)]);
+        }
         for &(buffer, offset, at, len) in reads {
             list.CopyBufferRegion(between, at, buffer, offset, len);
         }
@@ -426,6 +532,8 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut does = Vec::new();
+        // Where the fills' bytes go.
+        let mut fills = std::collections::HashMap::new();
         // Which step each is. One list's lock at a time: a submission may
         // name a list twice.
         let mut steps = Vec::new();
@@ -438,11 +546,16 @@ impl Host {
                         len,
                         asked: copy_blocked(written, dst, src, len).is_some(),
                     },
-                    &Step::Fill(_, src, len, slot) => Does::Fill {
-                        src,
-                        len,
-                        asked: read_blocked(written, src, len),
-                        slot,
+                    Step::Fill(_, src, len, to) => Does::Fill {
+                        src: *src,
+                        len: *len,
+                        asked: read_blocked(written, *src, *len),
+                        to: {
+                            if let Some(to) = to {
+                                fills.insert(does.len(), to.clone());
+                            }
+                            to.is_some()
+                        },
                     },
                     Step::Texture(staging) => {
                         let (at, len) = staging.memory();
@@ -468,7 +581,7 @@ impl Host {
         if chosen.is_empty() {
             return Ok(None);
         }
-        let writers = {
+        let mut writers = {
             let line = line();
             let mut all = writers(&line.line);
             all.extend(line.landing.iter().map(|w| Writer {
@@ -478,24 +591,39 @@ impl Host {
             all
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
-        let mut at = 0u64;
-        for &i in &chosen {
-            let (src, len) = match does[i] {
-                Does::Copy { src, len, .. } | Does::Fill { src, len, .. } => (src, len),
-                _ => continue,
+        // The places read (host copy, address, bytes, level): where in the
+        // buffer between their bytes are.
+        let mut places = std::collections::HashMap::new();
+        let mut end = 0u64;
+        for &(i, level) in &chosen {
+            let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
+                continue;
+            };
+            let (Does::Copy { len, .. } | Does::Fill { len, .. }) = does[i] else {
+                continue;
             };
             if len == 0 {
                 return Err("nothing to read");
             }
-            if at + len as u64 > BETWEEN {
-                return Err("too much at once");
-            }
             let from = holder(&writers, src, src + len)?;
-            if !mapped(src, src + len) {
-                return Err("not all of what it reads is mapped");
-            }
+            let place = (Arc::as_ptr(&from) as usize, src, len, level);
+            let at = match places.get(&place) {
+                Some(&at) => at,
+                None => {
+                    if end + len as u64 > BETWEEN {
+                        return Err("too much at once");
+                    }
+                    if !mapped(src, src + len) {
+                        return Err("not all of what it reads is mapped");
+                    }
+                    let at = end;
+                    end = (end + len as u64).next_multiple_of(256);
+                    places.insert(place, at);
+                    at
+                }
+            };
             let to = match does[i] {
-                Does::Copy { dst, .. } => {
+                Does::Copy { .. } => {
                     let to = holder(&writers, dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
@@ -503,35 +631,42 @@ impl Host {
                     if !mapped(dst, dst + len) {
                         return Err("not all of what it writes is mapped");
                     }
+                    // What the steps behind it read of it is in that host
+                    // copy, or nowhere.
+                    writers.push(Writer {
+                        shadow: Some(to.clone()),
+                        from: dst,
+                        to: dst + len,
+                        copy: true,
+                    });
                     To::Copy(to, dst)
                 }
-                Does::Fill { slot: Some((heap, index)), .. } => To::Slot(heap, index),
-                _ => continue,
+                _ => match fills.get(&i) {
+                    Some(FillTo::Slot(heap, index)) => To::Slot(*heap, *index),
+                    Some(FillTo::Buffer(buffer)) => To::Buffer(buffer.clone()),
+                    None => continue,
+                },
             };
             ops.push(Op {
                 from: (from, src),
                 len,
                 at,
+                level,
                 to,
             });
-            at = (at + len as u64).next_multiple_of(256);
         }
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
         };
-        let mut reads = Vec::new();
-        let mut writes = Vec::new();
-        let mut copied = Vec::new();
-        // First every refresh, then the write: the bytes compared with are
+        // First every refresh, then the writes: the bytes compared with are
         // the title's.
         for op in &ops {
             op.from.0.refresh(&own.list, op.from.1 as u64, op.len as u64);
-            reads.push((&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, op.len as u64));
             if let To::Copy(to, dst) = &op.to {
                 to.refresh(&own.list, *dst as u64, op.len as u64);
-                writes.push((&to.buffer, to.offset(*dst as u64), op.at, op.len as u64));
             }
         }
+        let mut copied = Vec::new();
         for op in &ops {
             if let To::Copy(to, dst) = &op.to {
                 to.gpu_writes(&own.list, *dst as u64, op.len as u64);
@@ -539,8 +674,26 @@ impl Host {
             }
         }
         #[cfg(feature = "diagnostics")]
-        own.list.note_op(|| format!("{} copies of title memory done on the card, {at} bytes (VICTORY_CARD_STEPS)", ops.len()));
-        record(&own.list.list, &own.between, &reads, &writes);
+        own.list.note_op(|| format!("{} copies of title memory done on the card, {end} bytes (VICTORY_CARD_STEPS)", ops.len()));
+        let levels = ops.iter().map(|op| op.level).max().unwrap_or(0);
+        for level in 0..=levels {
+            let mut reads = Vec::new();
+            let mut writes = Vec::new();
+            for op in ops.iter().filter(|op| op.level == level) {
+                let len = op.len as u64;
+                let read = (&op.from.0.buffer, op.from.0.offset(op.from.1 as u64), op.at, len);
+                // (Each place once.)
+                if places.remove(&(Arc::as_ptr(&op.from.0) as usize, op.from.1, op.len, level)).is_some() {
+                    reads.push(read);
+                }
+                match &op.to {
+                    To::Copy(to, dst) => writes.push((&to.buffer, to.offset(*dst as u64), op.at, len)),
+                    To::Buffer(buffer) => writes.push((buffer, 0, op.at, len)),
+                    To::Slot(..) => {}
+                }
+            }
+            record(level == 0, &own.list.list, &own.between, &reads, &writes);
+        }
         own.list.close();
         // SAFETY: a live buffer.
         let gpu = unsafe { own.between.GetGPUVirtualAddress() };
@@ -552,6 +705,9 @@ impl Host {
                     // (A heap that is gone: nothing can read the slot.)
                     crate::descriptor::constant_slot(*heap, *index, gpu + op.at, op.len as u32);
                 }
+                To::Buffer(_) => {
+                    DONE[0].fetch_add(1, Ordering::Relaxed);
+                }
                 To::Copy(..) => {
                     DONE[1].fetch_add(1, Ordering::Relaxed);
                 }
@@ -561,7 +717,7 @@ impl Host {
         }
         Ok(Some(Taken {
             own,
-            steps: chosen.iter().map(|&i| steps[i]).collect(),
+            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
         }))
     }
@@ -592,7 +748,7 @@ static NOTED: Mutex<Option<Noted>> = Mutex::new(None);
 fn noted(op: &Op) {
     let (to, dst) = match &op.to {
         To::Copy(to, dst) => (to.span(), *dst),
-        To::Slot(..) => ((0, 0), 0),
+        To::Slot(..) | To::Buffer(_) => ((0, 0), 0),
     };
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
     let e = noted.get_or_insert_with(Default::default).entry((op.len, op.from.0.span(), to)).or_default();
@@ -646,11 +802,20 @@ mod tests {
     }
 
     fn fill(src: usize, len: usize, asked: bool) -> Does {
-        Does::Fill { src, len, asked, slot: Some((1, 2)) }
+        Does::Fill { src, len, asked, to: true }
+    }
+
+    fn stuck(src: usize, len: usize) -> Does {
+        Does::Fill { src, len, asked: false, to: false }
+    }
+
+    /// What is done on the card, as (place, level), in stage 2.
+    fn planned(does: &[Does]) -> Vec<(usize, u32)> {
+        plan(does, 2).unwrap()
     }
 
     /// Only what is asked for is taken, all of it, and a step that stands
-    /// in none of their ways changes nothing.
+    /// in none of their ways stays where it is.
     #[test]
     fn steps_apart_from_one_another_are_taken() {
         let does = [
@@ -660,44 +825,150 @@ mod tests {
             copy(3000, 6000, 100, true),
             fill(1000, 64, false),
             Does::Read { from: 3100, to: 4000, asked: false },
+            stuck(3100, 5),
         ];
-        assert_eq!(plan(&does, 2), Ok(vec![1, 3]));
+        assert_eq!(planned(&does), [(1, 0), (3, 0)]);
         // Two fills of the same bytes.
-        assert_eq!(plan(&[fill(0, 64, true), fill(32, 64, true)], 1), Ok(vec![0, 1]));
+        assert_eq!(plan(&[fill(0, 64, true), fill(32, 64, true)], 1), Ok(vec![(0, 0), (1, 0)]));
         assert_eq!(plan(&[fill(0, 64, false)], 1), Ok(vec![]));
+        // Ends that touch are apart.
+        let does = [
+            copy(1000, 5000, 100, true),
+            copy(900, 9000, 100, false),
+            copy(1100, 9000, 5, false),
+            copy(4900, 9000, 100, false),
+        ];
+        assert_eq!(planned(&does), [(0, 0)]);
     }
 
-    /// Everything that could make the card's order another than the CPU's
-    /// refuses the lot, wherever in the submission it stands.
+    /// What depends on a taken step, or it on it, is taken too, on the level
+    /// the order of the steps asks for.
     #[test]
-    fn steps_in_one_anothers_way_are_refused() {
+    fn steps_that_depend_on_one_another_are_taken_in_order() {
         let taken = copy(1000, 5000, 100, true);
-        let refused = |other: Does| {
-            assert!(plan(&[taken, other], 2).is_err(), "{other:?} after");
-            assert!(plan(&[other, taken], 2).is_err(), "{other:?} before");
+        // Reads what it writes, behind and ahead of it.
+        assert_eq!(planned(&[taken, fill(1099, 64, false)]), [(0, 0), (1, 1)]);
+        assert_eq!(planned(&[fill(1099, 64, false), taken]), [(0, 0), (1, 1)]);
+        assert_eq!(planned(&[taken, copy(7000, 1050, 10, false)]), [(0, 0), (1, 1)]);
+        // Writes what it reads, and what it writes.
+        assert_eq!(planned(&[copy(5099, 9000, 1, false), taken]), [(0, 0), (1, 1)]);
+        assert_eq!(planned(&[taken, copy(5099, 9000, 1, false)]), [(0, 0), (1, 1)]);
+        assert_eq!(planned(&[taken, copy(999, 9000, 2, false)]), [(0, 0), (1, 1)]);
+        // The same list twice.
+        assert_eq!(planned(&[taken, taken]), [(0, 0), (1, 1)]);
+        // A chain, with steps apart from it in between, and two fills of one
+        // copy on one level.
+        let does = [
+            copy(8000, 7000, 50, false),
+            taken,
+            copy(2000, 1010, 20, false),
+            fill(90_000, 10, false),
+            fill(2000, 20, false),
+            fill(2010, 20, true),
+            copy(1000, 2005, 5, false),
+            fill(1000, 100, false),
+        ];
+        assert_eq!(planned(&does), [(1, 0), (2, 1), (4, 2), (5, 2), (6, 2), (7, 3)]);
+        // A fill is in nobody's way.
+        assert_eq!(planned(&[taken, fill(5000, 100, false)]), [(0, 0)]);
+        // A copy ahead that a taken one only shares its source with.
+        assert_eq!(planned(&[copy(7000, 5000, 10, false), taken]), [(1, 0)]);
+    }
+
+    /// Whatever the steps, done level by level (in a level every read
+    /// before every write) they read and leave what they read and leave one
+    /// after the other, the CPU's steps ahead of all of them.
+    #[test]
+    fn levels_do_what_the_order_does() {
+        let mut seed = 12345u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
         };
-        for asked in [false, true] {
-            // Writes what it reads.
-            refused(copy(5099, 9000, 1, asked));
-            // Writes what it writes.
-            refused(copy(999, 9000, 2, asked));
-            // Reads what it writes.
-            refused(copy(7000, 1050, 10, asked));
-            refused(fill(1099, 64, asked));
-            refused(Does::Read { from: 900, to: 1001, asked });
+        let (mut done, mut refused) = (0, 0);
+        for _ in 0..4000 {
+            let does: Vec<Does> = (0..2 + random(9))
+                .map(|_| {
+                    let (at, other, len) = (random(60) as usize, random(60) as usize, 1 + random(8) as usize);
+                    let asked = random(4) == 0;
+                    match random(8) {
+                        0..4 => copy(at, other, len, asked),
+                        4..6 => fill(at, len, asked),
+                        6 => stuck(at, len),
+                        _ => Does::Read { from: at, to: at + len, asked: false },
+                    }
+                })
+                .collect();
+            let Ok(chosen) = plan(&does, 2) else {
+                refused += 1;
+                continue;
+            };
+            done += 1;
+            let start: Vec<u32> = (0..80).collect();
+            // One after the other: what each reads, and what is left.
+            let mut memory = start.clone();
+            let mut wanted = Vec::new();
+            for d in &does {
+                let (from, to) = match *d {
+                    Does::Read { from, to, .. } => (from, to),
+                    _ => reads_writes(d).unwrap().0,
+                };
+                wanted.push(memory[from..to].to_vec());
+                if let Does::Copy { dst, src, len, .. } = *d {
+                    memory.copy_within(src..src + len, dst);
+                }
+            }
+            // The CPU's, then the card's.
+            let mut cpu = start.clone();
+            let taken = |i: usize| chosen.iter().any(|c| c.0 == i);
+            for (i, d) in does.iter().enumerate().filter(|&(i, _)| !taken(i)) {
+                let (from, to) = match *d {
+                    Does::Read { from, to, .. } => (from, to),
+                    _ => reads_writes(d).unwrap().0,
+                };
+                assert_eq!(cpu[from..to], wanted[i][..], "step {i} of {does:?}");
+                if let Does::Copy { dst, src, len, .. } = *d {
+                    cpu.copy_within(src..src + len, dst);
+                }
+            }
+            let mut card = cpu.clone();
+            for level in 0..=chosen.iter().map(|c| c.1).max().unwrap_or(0) {
+                let of: Vec<usize> = chosen.iter().filter(|c| c.1 == level).map(|c| c.0).collect();
+                let before = card.clone();
+                for i in of {
+                    let ((from, to), (dst, _)) = reads_writes(&does[i]).unwrap();
+                    assert_eq!(before[from..to], wanted[i][..], "step {i} of {does:?}: {chosen:?}");
+                    if matches!(does[i], Does::Copy { .. }) {
+                        card[dst..dst + to - from].copy_from_slice(&before[from..to]);
+                    }
+                }
+            }
+            assert_eq!(card, memory, "{does:?}: {chosen:?}");
         }
-        refused(Does::Run);
-        // A texture that itself waits for flights; a fill with no slot.
-        refused(Does::Read { from: 1, to: 2, asked: true });
-        refused(Does::Fill { src: 1, len: 1, asked: true, slot: None });
-        // Into itself, and the same list twice.
+        assert!(done > 500 && refused > 100, "{done} {refused}");
+    }
+
+    /// What cannot be done on the card refuses the lot, where it stands in
+    /// the way.
+    #[test]
+    fn steps_in_the_way_are_refused() {
+        let taken = copy(1000, 5000, 100, true);
+        assert!(plan(&[taken, Does::Run], 2).is_err());
+        // A texture that itself waits for flights; a fill that cannot be
+        // taken but waits.
+        assert!(plan(&[taken, Does::Read { from: 1, to: 2, asked: true }], 2).is_err());
+        assert!(plan(&[Does::Fill { src: 1, len: 1, asked: true, to: false }], 2).is_err());
+        // Reads on the CPU of what it writes: behind it, not ahead of it.
+        for read in [Does::Read { from: 900, to: 1001, asked: false }, stuck(1050, 3)] {
+            assert!(plan(&[taken, read], 2).is_err(), "{read:?} behind");
+            assert_eq!(planned(&[read, taken]), [(1, 0)], "{read:?} ahead");
+        }
+        // Also of what is taken along.
+        assert!(plan(&[taken, copy(3000, 1000, 10, false), stuck(3005, 1)], 2).is_err());
+        // Into itself, and copies without stage 2.
         assert!(plan(&[copy(1000, 1050, 100, true)], 2).is_err());
-        assert!(plan(&[taken, taken], 2).is_err());
-        // A fill of what a copy writes, and copies without stage 2.
-        assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 2).is_err());
         assert!(plan(&[taken], 1).is_err());
-        // Ends that touch are apart.
-        assert!(plan(&[taken, copy(900, 9000, 100, false), copy(1100, 9000, 5, false), copy(4900, 9000, 100, false)], 2).is_ok());
+        assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1).is_err());
     }
 
     #[test]
@@ -735,11 +1006,14 @@ mod tests {
         let own = host.own_list().unwrap();
         // Within `a` (there and back), from `a` to `b`, and a read alone.
         record(
+            true,
             &own.list.list,
             &own.between,
             &[(&a, 33, 0, 100), (&a, 2000, 256, 100), (&a, 5001, 512, 7), (&a, 9, 1024, 4)],
             &[(&a, 2000, 0, 100), (&a, 33, 256, 100), (&b, 77, 512, 7)],
         );
+        // A level behind it, of what it wrote.
+        record(false, &own.list.list, &own.between, &[(&b, 77, 2048, 7)], &[(&b, 1077, 2048, 7)]);
         own.list.close();
         // A list behind it that uses the buffers in other ways.
         let next = host.new_list().unwrap();
@@ -756,6 +1030,7 @@ mod tests {
         assert_eq!(a_bytes[2000..2100], was[33..133]);
         assert_eq!(a_bytes[33..133], was[2000..2100]);
         assert_eq!(b_bytes[77..84], was[5001..5008]);
+        assert_eq!(b_bytes[1077..1084], was[5001..5008]);
         assert_eq!(b_bytes[4096..4196], was[2000..2100]);
         // SAFETY: a mapping of 64 KiB.
         assert_eq!(unsafe { std::slice::from_raw_parts(out_data, 4) }, &was[9..13]);
@@ -780,7 +1055,10 @@ mod tests {
     fn a_copy_behind_a_flight_reads_what_the_flight_wrote() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         const LEN: usize = 4 << 20;
-        const WRITE_WATCH: u32 = 0x20_0000;
+        // Without it (`TEST_UNWATCHED=1`) the title's bytes cannot be put in
+        // under a flight's writes: the flights that declared them are waited
+        // for.
+        let write_watch = if std::env::var_os("TEST_UNWATCHED").is_some() { 0 } else { 0x20_0000 };
         let Some(host) = host() else {
             return;
         };
@@ -789,7 +1067,7 @@ mod tests {
         // second, and back.
         let (title, start) = {
             // SAFETY: memory of our own, never freed.
-            let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+            let base = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | write_watch, PAGE_READWRITE) }.cast::<u8>();
             assert!(!base.is_null());
             // SAFETY: `LEN` bytes just committed.
             (unsafe { std::slice::from_raw_parts_mut(base, LEN) }, base as usize)
@@ -831,10 +1109,21 @@ mod tests {
             for (i, b) in title[5300..5400].iter_mut().enumerate() {
                 *b = seed(1300 + i) ^ 0x5c;
             }
+            // Thousands of runs of bytes of its own.
+            for b in title[1_700_000..1_708_000].iter_mut().step_by(2) {
+                *b = 1 + round as u8;
+            }
             // Into the second buffer, and within the first.
             let b = host.new_list().unwrap();
             b.defer_copy((start + HALF + 100) as *mut u8, (start + 4001) as *const u8, 1500);
             b.defer_copy((start + 900_001) as *mut u8, (start + 4400) as *const u8, 777);
+            b.defer_copy((start + HALF + 10_000) as *mut u8, (start + 1_700_000) as *const u8, 8000);
+            // What depends on them: a copy of the first copy, upload memory
+            // filled from that, and the first one's bytes copied over.
+            b.defer_copy((start + 1_500_000) as *mut u8, (start + HALF + 600) as *const u8, 700);
+            let (staging, staged) = b.upload(host, 4096).unwrap();
+            b.defer_fill_buffer(&staging, staged, (start + 1_500_100) as *const u8, 500);
+            b.defer_copy((start + HALF + 300) as *mut u8, (start + 8000) as *const u8, 64);
             b.close();
             host.execute_own(&b);
             // What the first wrote, read by the next submission.
@@ -852,17 +1141,28 @@ mod tests {
                 })
                 .collect();
             assert!(title[4000..6000] == wanted[..], "what the flight wrote, round {round}");
-            assert!(title[HALF + 100..HALF + 1600] == wanted[1..1501], "the copy to the other buffer, round {round}");
+            // (The copy over the first one's bytes came last.)
+            let mut over = wanted[1..1501].to_vec();
+            over[200..264].fill(0);
+            assert!(title[HALF + 100..HALF + 1600] == over[..], "the copy to the other buffer, round {round}");
+            assert!(title[1_500_000..1_500_700] == wanted[501..1201], "the copy behind a copy, round {round}");
+            // SAFETY: the mapping, which the flight wrote and has landed.
+            let staged = unsafe { std::slice::from_raw_parts(staged, 500) };
+            assert!(staged == &wanted[601..1101], "the fill behind it, round {round}");
             assert!(title[900_001..900_778] == wanted[400..1177], "the copy within the buffer, round {round}");
-            assert!(title[1_200_000..1_201_500] == wanted[1..1501], "the copy of the copy, round {round}");
+            assert!(title[1_200_000..1_201_500] == over[..], "the copy of the copy, round {round}");
             assert!(title[HALF..HALF + 100].iter().all(|&x| x == 0));
-            assert!(title[HALF + 1600..].iter().all(|&x| x == 0));
+            assert!(title[HALF + 1600..HALF + 10_000].iter().all(|&x| x == 0));
+            assert!(title[HALF + 18_000..].iter().all(|&x| x == 0));
+            let runs = &title[HALF + 10_000..HALF + 18_000];
+            assert!(runs.chunks(2).all(|b| b == [1 + round as u8, 0]), "the runs, round {round}");
             a.keep(&upload);
             lists.extend([a, b, c]);
         }
         assert_eq!(host.log_messages(), None);
         let done = DONE[1].load(Ordering::Relaxed) - before;
-        eprintln!("{done} of 24 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
-        assert!(done >= 12, "only {done} copies were done on the card");
+        eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
+        eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
+        assert!(done >= 20, "only {done} copies were done on the card");
     }
 }

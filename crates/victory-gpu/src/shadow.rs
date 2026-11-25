@@ -1377,6 +1377,25 @@ mod wide_tests {
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Why [`Shadow::merge_under_writes`] last left the caller to wait.
+static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn note_stale(why: usize) {
+    STALE_WHY.store(why, Ordering::Relaxed);
+}
+
+/// [`STALE_WHY`] in words (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stale_why() -> &'static str {
+    const WHY: [&str; 4] = [
+        "the memory is not watched",
+        "the journal does not say what was written",
+        "more changed runs than a submission sends up",
+        "no snapshot",
+    ];
+    WHY[STALE_WHY.load(Ordering::Relaxed).min(3)]
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
@@ -2343,6 +2362,12 @@ impl Shadow {
         !self.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Whether one of those submissions may be writing in title memory
+    /// `[from, to)`.
+    pub(crate) fn writes_pending_in(&self, from: usize, to: usize) -> bool {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+    }
+
     /// Whether [`Shadow::update`] of `[address, address + len)` would leave
     /// title bytes behind: a range shaders may be writing holds a page the
     /// title wrote since the copy last took it. The answer comes from the
@@ -2418,6 +2443,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            note_stale(0);
             return true;
         }
         let base = start / PAGE;
@@ -2430,6 +2456,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                note_stale(1);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -2469,6 +2496,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = changed_runs(title, held);
                     if runs.len() > *runs_left {
+                        note_stale(2);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -2480,6 +2508,7 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        note_stale(3);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's

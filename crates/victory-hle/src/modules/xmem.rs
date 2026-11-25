@@ -979,10 +979,142 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    let started = std::time::Instant::now();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, to, len);
+    let ok = if alias_runs() { alias_in_runs(&mut physical, to, from, len) } else { alias_pages(&mut physical, to, from, len) };
+    alias_line([1, (len / PAGE) as u64, 0, 0, started.elapsed().as_micros() as u64]);
+    ok
+}
+
+/// Whether the pages of one mapping are mapped in runs (`VICTORY_MAP_RUNS=0`:
+/// each with a call of its own, as before).
+///
+/// While the player walks, the title maps and unmaps thousands of pages of its
+/// tiled heap a second (what it streams in), and did it on the thread its
+/// frame waits for: 13 % of that thread's time in the two kernel calls for
+/// each 64 KiB page (profile cpu-1: `NtUnmapViewOfSectionEx`,
+/// `NtMapViewOfSectionEx`). Pages next to one another in the heap and in the
+/// section are one view; a page that shows what it is to show is left alone.
+fn alias_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line: calls of [`map_alias`], their pages, pages that
+/// showed the same already, views mapped, microseconds. The line itself, at
+/// most every five seconds.
+fn alias_line(add: [u64; 5]) {
+    use std::sync::atomic::AtomicU64;
+    static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+    static SAID: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    for (count, n) in COUNTS.iter().zip(add) {
+        count.fetch_add(n, Ordering::Relaxed);
+    }
+    if add[0] == 0 {
+        return;
+    }
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    let before = said.get_or_insert_with(std::time::Instant::now);
+    let secs = before.elapsed().as_secs_f64();
+    if secs < 5.0 {
+        return;
+    }
+    *before = std::time::Instant::now();
+    let [calls, pages, same, views, us] = [0, 1, 2, 3, 4].map(|i| COUNTS[i].swap(0, Ordering::Relaxed) as f64 / secs);
+    tracing::info!(
+        "page mappings of the title's queues per second: {calls:.0} calls for {pages:.0} pages, {same:.0} of them as they were, {views:.0} \
+         views mapped, {:.1} ms (VICTORY_MAP_RUNS)",
+        us / 1e3
+    );
+}
+
+/// What title memory at `at` shows, if it shows a physical page.
+fn shown_slice(physical: &Physical, at: usize) -> Option<Slice> {
+    let (base, (_, s)) = physical.views.range(..=at).next_back().filter(|(base, (size, _))| at < **base + *size)?;
+    Some(Slice {
+        index: s.index + (at - base) / PAGE,
+        section: s.section.clone(),
+    })
+}
+
+fn follows(a: &Slice, b: &Slice) -> bool {
+    Arc::ptr_eq(&a.section, &b.section) && a.index + 1 == b.index
+}
+
+/// [`map_alias`], in runs ([`alias_runs`]).
+fn alias_in_runs(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
+    if from == 0 || len == 0 {
+        unmap(physical, to, len);
+        return true;
+    }
+    let pages = len.div_ceil(PAGE);
+    // What is to be shown, up to the first page that has no source.
+    let wanted: Vec<Slice> = (0..pages).map_while(|k| shown_slice(physical, from + k * PAGE)).collect();
+    let same: Vec<bool> = wanted
+        .iter()
+        .enumerate()
+        .map(|(k, w)| shown_slice(physical, to + k * PAGE).is_some_and(|s| Arc::ptr_eq(&s.section, &w.section) && s.index == w.index))
+        .collect();
+    let mut k = 0;
+    while k < wanted.len() {
+        let mut end = k + 1;
+        while end < wanted.len() && same[end] == same[k] && (same[k] || follows(&wanted[end - 1], &wanted[end])) {
+            end += 1;
+        }
+        let (at, bytes) = (to + k * PAGE, (end - k) * PAGE);
+        if same[k] {
+            // The title says so because it put other bytes there.
+            victory_gpu::title_memory_written(at, bytes, true);
+            alias_line([0, 0, (end - k) as u64, 0, 0]);
+        } else {
+            unmap(physical, at, bytes);
+            if !map_run(physical, at, end - k, &wanted[k]) {
+                return false;
+            }
+        }
+        k = end;
+    }
+    if wanted.len() < pages {
+        unmap(physical, to + wanted.len() * PAGE, len - wanted.len() * PAGE);
+        return false;
+    }
+    true
+}
+
+/// Maps `pages` pages of a section, from `slice` on, at `base`, where only
+/// placeholders are: as one view, or page by page if that cannot be.
+fn map_run(physical: &mut Physical, base: usize, pages: usize, slice: &Slice) -> bool {
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if pages > 1 {
+        // Each page a placeholder of its own (harmless where it is one, or
+        // not at the edge of one), then all of them one.
+        // SAFETY: both act on placeholders only.
+        let one = unsafe {
+            for k in 0..pages {
+                VirtualFree((base + k * PAGE) as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            }
+            VirtualFree(base as *mut c_void, pages * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != 0
+        };
+        if one {
+            alias_line([0, 0, 0, 1, 0]);
+            return map(physical, base, pages * PAGE, slice.clone());
+        }
+    }
+    alias_line([0, 0, 0, pages as u64, 0]);
+    (0..pages).all(|k| {
+        let slice = Slice {
+            index: slice.index + k,
+            section: slice.section.clone(),
+        };
+        map(physical, base + k * PAGE, PAGE, slice)
+    })
+}
+
+/// [`map_alias`], page by page.
+fn alias_pages(physical: &mut Physical, to: usize, from: usize, len: usize) -> bool {
+    unmap(physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -1000,7 +1132,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map(physical, to + k, PAGE, slice) {
             return false;
         }
     }
@@ -1483,6 +1615,37 @@ mod tests {
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
+        // All three in their order again, three at once at `b`, from the
+        // middle on another page, and back.
+        let scattered = [at(a, 1)];
+        assert_eq!(XMemMapPhysicalPagesScatter(scattered.as_ptr(), 1, pages[1..].as_ptr()), 1);
+        // SAFETY: mapped read-write, both.
+        let same = |k: usize, page: usize, value: u8| unsafe {
+            at(a, page).cast::<u8>().add(64).write(value);
+            assert_eq!(at(b, k).cast::<u8>().add(64).read(), value, "page {k}");
+        };
+        for _ in 0..2 {
+            assert!(map_alias(b as u64, a as u64, 3 * PAGE as u64));
+            for k in 0..3 {
+                same(k, k, 40 + k as u8);
+            }
+        }
+        assert!(map_alias(at(b, 1) as u64, a as u64, PAGE as u64));
+        same(0, 0, 51);
+        same(1, 0, 52);
+        same(2, 2, 53);
+        assert!(map_alias(b as u64, at(a, 1) as u64, 2 * PAGE as u64));
+        same(0, 1, 54);
+        same(1, 2, 55);
+        same(2, 2, 56);
+        // A source that ends: what came before it is mapped, the rest not.
+        assert!(map_alias(at(a, 1) as u64, 0, PAGE as u64));
+        assert!(!map_alias(b as u64, a as u64, 2 * PAGE as u64));
+        same(0, 0, 57);
+        assert_eq!(query(at(b, 1)).host.State, MEM_RESERVE);
+        same(2, 2, 58);
+        assert!(map_alias(b as u64, 0, 3 * PAGE as u64));
+        assert_eq!(query(at(b, 2)).host.State, MEM_RESERVE);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }

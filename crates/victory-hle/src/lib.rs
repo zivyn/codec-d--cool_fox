@@ -12,6 +12,7 @@
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
 mod host;
+mod image_watch;
 pub mod modules;
 mod registry;
 pub mod runtime;

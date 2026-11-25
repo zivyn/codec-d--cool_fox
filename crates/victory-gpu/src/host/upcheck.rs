@@ -112,12 +112,21 @@ pub(crate) fn note(copy: u64, at: usize, was: &[u8], new: &[u8]) {
     if n == 0 {
         return;
     }
+    let at = at + skip;
+    let (mut was, new) = (was[skip..skip + n].to_vec(), new[skip..skip + n].to_vec());
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
-    noted.entry(copy).or_default().push(Taken {
-        at: at + skip,
-        was: was[skip..skip + n].to_vec(),
-        new: new[skip..skip + n].to_vec(),
-    });
+    let noted = noted.entry(copy).or_default();
+    // What was noted before in this submission has not gone up yet: the card
+    // knows what stood there before that. And what it took is not what goes
+    // up where this took it again.
+    for t in noted.iter_mut() {
+        let (a, b) = (at.max(t.at), (at + n).min(t.at + t.was.len()));
+        if a < b {
+            was[a - at..b - at].copy_from_slice(&t.was[a - t.at..b - t.at]);
+            t.new[a - t.at..b - t.at].copy_from_slice(&new[a - at..b - at]);
+        }
+    }
+    noted.push(Taken { at, was, new });
 }
 
 /// A submission's look at what it sends up, until it has run.
@@ -202,6 +211,11 @@ pub(super) fn record(
 }
 
 impl Looks {
+    /// Whether `shadow` was looked at: it is left in `COPY_DEST`.
+    pub(super) fn hold(&self, shadow: &Shadow) -> bool {
+        self.of.iter().any(|(s, _)| s.id() == shadow.id())
+    }
+
     /// The submission has run: what it found is counted.
     pub(super) fn read(self) {
         // SAFETY: the mapping holds an answer for each; the card has run.
@@ -354,6 +368,69 @@ pub(super) fn reads(runs: &[&HostList]) {
     }
 }
 
+/// The title's buffer copies that are out of their place in a submission:
+/// by what is wrong, bytes and destination: how often, the last source, and
+/// (for shader writes) how much was declared.
+type Misplaced = BTreeMap<(&'static str, usize, usize), (u64, usize, usize)>;
+static MISPLACED: Mutex<(u64, Misplaced)> = Mutex::new((0, BTreeMap::new()));
+
+/// A submission is about to be prepared: its title buffer copies are done on
+/// the CPU then, all of them before the first of its draws runs. Where that
+/// is not the order of its lists: what an earlier draw of it reads of the
+/// destination, or shaders of it write there, or an earlier copy of it put
+/// there for what lies between; and a source that shaders of it write first.
+pub(super) fn order(runs: &[&HostList]) {
+    let (mut read, mut written, mut copied): (Vec<(usize, usize)>, Vec<(usize, usize)>, Vec<(usize, usize)>) =
+        (Vec::new(), Vec::new(), Vec::new());
+    let meets = |all: &[(usize, usize)], from: usize, to: usize| all.iter().rev().find(|r| r.0 < to && from < r.1).copied();
+    let mut misplaced = MISPLACED.lock().unwrap_or_else(|e| e.into_inner());
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                Step::Refresh(_, at, len) => read.push((*at, *at + *len)),
+                Step::GpuWrite(_, at, len) => written.push((*at, *at + *len)),
+                &Step::Copy(dst, src, len) => {
+                    let mut say = |what: &'static str, range: (usize, usize)| {
+                        let e = misplaced.1.entry((what, len, dst)).or_default();
+                        *e = (e.0 + 1, src, range.1 - range.0);
+                    };
+                    if let Some(r) = meets(&written, src, src + len) {
+                        say("its source is declared written earlier in the submission", r);
+                    }
+                    if let Some(r) = meets(&written, dst, dst + len) {
+                        say("its destination is declared written earlier in the submission", r);
+                    }
+                    if let Some(r) = meets(&copied, dst, dst + len) {
+                        say("its destination is copied to earlier in the submission", r);
+                    } else if let Some(r) = meets(&read, dst, dst + len) {
+                        say("its destination is read earlier in the submission", r);
+                    }
+                    copied.push((dst, dst + len));
+                }
+                _ => {}
+            }
+        }
+    }
+    let now = now_ms();
+    if now < misplaced.0 + 4000 {
+        return;
+    }
+    misplaced.0 = now;
+    let mut all: Vec<_> = std::mem::take(&mut misplaced.1).into_iter().collect();
+    all.sort_by_key(|(_, e)| std::cmp::Reverse(e.0));
+    let mut kinds: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
+    for ((what, len, _), (n, ..)) in &all {
+        let e = kinds.entry(what).or_default();
+        *e = (e.0 + n, e.1 + n * *len as u64);
+    }
+    for (what, (n, bytes)) in kinds {
+        tracing::warn!("up-copy check, copies out of place: {n} ({bytes} bytes): {what}");
+    }
+    for ((what, len, dst), (n, src, declared)) in all.into_iter().take(16) {
+        tracing::warn!("up-copy check, a copy out of place: {n} times {len:#x} bytes from {src:#x} to {dst:#x}: {what} ({declared:#x} bytes there)");
+    }
+}
+
 /// A run of words that differ at rest.
 struct Differs {
     shadow: std::sync::Arc<Shadow>,
@@ -375,8 +452,40 @@ pub(super) fn at_rest(host: &Host) {
     if look(host).is_none() {
         tracing::warn!("up-copy check: the look at rest could not be made");
     }
+    look_for_stale();
     tracing::info!(ms = began.elapsed().as_millis(), "up-copy check: the look at rest is done");
     LAST.store(now_ms(), Ordering::Relaxed);
+}
+
+/// At rest: copies of title memory, whatever reads them (meshes too), that
+/// are not what title memory holds although nothing told that it changed: a
+/// refresh will not bring them up to date.
+fn look_for_stale() {
+    const MOST: usize = 1 << 30;
+    let mut by: BTreeMap<(u64, u64), (bool, u64, usize, Vec<String>)> = BTreeMap::new();
+    let compared = crate::shadow::stale_pages(MOST, &mut |shadow, page, words, (at, copy, title)| {
+        let e = by.entry(shadow.span()).or_insert((shadow.carded(), 0, 0, Vec::new()));
+        e.1 += words as u64;
+        e.2 += 1;
+        if e.3.len() < 4 {
+            e.3.push(format!("{words} words in the 64 KiB at {page:#x} (the first at {at:#x}: the copy {copy:#x}, title memory {title:#x})"));
+        }
+    });
+    tracing::info!(
+        "up-copy check at rest: {} MB of copies held for unchanged compared with title memory, {} copies are stale",
+        compared >> 20,
+        by.len()
+    );
+    let mut by: Vec<_> = by.into_iter().collect();
+    by.sort_by_key(|(_, e)| std::cmp::Reverse(e.1));
+    for ((start, len), (carded, words, pages, some)) in by.into_iter().take(16) {
+        tracing::warn!(
+            "up-copy check at rest, stale: {start:#x}+{len:#x} ({}): {words} words in {pages} pages are not title memory's, and nothing \
+             told of it: {}",
+            if carded { "on the card" } else { "in PC memory" },
+            some.join("; ")
+        );
+    }
 }
 
 /// Sends `list` (recorded by `f`) and waits for it.
@@ -567,6 +676,12 @@ mod tests {
     /// Title memory of our own (write-watched, or a view of a section, which
     /// is guarded), and the card copy of the title buffer it is.
     fn title(resource: usize, view: bool) -> (&'static mut [u8], usize, std::sync::Arc<Shadow>) {
+        let all = title_of(resource, view, LEN);
+        assert!(all.2.carded(), "the copy is in the card's memory");
+        all
+    }
+
+    fn title_of(resource: usize, view: bool, len: usize) -> (&'static mut [u8], usize, std::sync::Arc<Shadow>) {
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_RESERVE, MapViewOfFile, PAGE_READWRITE, VirtualAlloc,
         };
@@ -574,20 +689,19 @@ mod tests {
         // SAFETY: memory of our own, never freed.
         let base = unsafe {
             if view {
-                let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, LEN as u32, std::ptr::null());
+                let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, len as u32, std::ptr::null());
                 assert!(!section.is_null());
-                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, LEN).Value.cast::<u8>()
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value.cast::<u8>()
             } else {
-                VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | WRITE_WATCH, PAGE_READWRITE).cast::<u8>()
+                VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | WRITE_WATCH, PAGE_READWRITE).cast::<u8>()
             }
         };
         assert!(!base.is_null());
-        crate::shadow::register(resource, base as u64, LEN as u64);
+        crate::shadow::register(resource, base as u64, len as u64);
         let shadow = crate::shadow::find(base as u64, 64).expect("a copy");
-        assert!(shadow.carded(), "the copy is in the card's memory");
         assert!(super::super::relay_exact() && super::super::relay_copy(), "set VICTORY_RELAY=2 VICTORY_RELAY_COPY=1");
-        // SAFETY: `LEN` bytes just committed.
-        (unsafe { std::slice::from_raw_parts_mut(base, LEN) }, base as usize, shadow)
+        // SAFETY: `len` bytes just committed.
+        (unsafe { std::slice::from_raw_parts_mut(base, len) }, base as usize, shadow)
     }
 
     /// Work for the card that takes some milliseconds.
@@ -765,6 +879,81 @@ mod tests {
         assert!(first <= 6 && back[first..].iter().all(|b| *b), "{back:?}");
     }
 
+    /// The title copies another value to the same bytes in each of three
+    /// submissions, and each has a draw (a copy here) that reads them. The
+    /// card is busy meanwhile, so all three are prepared before the first
+    /// runs: each must read its own.
+    fn each_reads_its_own(len: usize, resource: usize, carded: bool) {
+        let Some(host) = host() else {
+            return;
+        };
+        let (title, start, shadow) = title_of(resource, true, len);
+        assert_eq!(shadow.carded(), carded, "where the copy is");
+        let slow = Slow::new(host);
+        let (out, out_data) = host.shared_buffer(1 << 16).unwrap();
+        let mut lists = Vec::new();
+        const AT: usize = 8192;
+        // All there once.
+        let all = host.new_list().unwrap();
+        shadow.refresh(&all, start as u64, len as u64);
+        all.close();
+        host.execute_own(&all);
+        settle_now(WHY_SYNC);
+        lists.push(all);
+        let mut wrong = Vec::new();
+        for round in 0..6u8 {
+            for v in 0..3u8 {
+                title[65_536 + usize::from(v) * 256..][..256].fill(round * 16 + v + 1);
+            }
+            let busy = host.new_list().unwrap();
+            slow.record(&busy, 40);
+            busy.close();
+            host.execute_own(&busy);
+            lists.push(busy);
+            for v in 0..3usize {
+                let list = host.new_list().unwrap();
+                list.defer_copy((start + AT) as *mut u8, (start + 65_536 + v * 256) as *const u8, 256);
+                shadow.refresh(&list, (start + AT) as u64, 256);
+                // SAFETY: an open list; live buffers.
+                unsafe {
+                    list.list.CopyBufferRegion(&out, (v * 256) as u64, &shadow.buffer, AT as u64, 256);
+                }
+                list.close();
+                host.execute_own(&list);
+                lists.push(list);
+            }
+            settle_now(WHY_SYNC);
+            // SAFETY: a mapping of 64 KiB; the copies into it have run.
+            let read = unsafe { std::slice::from_raw_parts(out_data, 768) };
+            for v in 0..3u8 {
+                let got = read[usize::from(v) * 256];
+                if got != round * 16 + v + 1 {
+                    wrong.push((round, v, got - round * 16));
+                }
+            }
+        }
+        eprintln!("read another submission's value (round, submission, whose + 1): {wrong:?}");
+        let stale = STALE.lock().unwrap_or_else(|e| e.into_inner());
+        let found = stale.get(&shadow.span()).map_or(0, |s| s.words);
+        eprintln!("the check at sends found {found} words");
+        assert!(wrong.is_empty());
+        assert_eq!(found, 0);
+        // With the debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics).
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    fn each_submission_reads_its_own_copy_on_the_card() {
+        each_reads_its_own(LEN, 0x7777, true);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
+    fn each_submission_reads_its_own_copy_in_pc_memory() {
+        each_reads_its_own(256 << 10, 0x8888, std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"));
+    }
+
     /// Declared writes beside the title's own, in the same 64 KiB pieces and
     /// dword by dword, flights landing while later ones are in the air: in
     /// the end title memory and the card hold what each wrote last. (A byte
@@ -860,6 +1049,7 @@ mod tests {
                     on_card.is_empty() && in_title.is_empty(),
                     "round {round}: words {on_card:x?} on the card and {in_title:x?} in title memory are not what was written last"
                 );
+                assert_eq!(host.log_messages(), None);
             }
         }
     }

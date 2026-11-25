@@ -1720,6 +1720,8 @@ struct CardPlan {
     sent_as: u64,
     /// With [`upcheck`]: the look at what it sent up.
     looks: Option<upcheck::Looks>,
+    /// With [`send`]: the memory its sends come from.
+    sends: Option<send::Memory>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2973,6 +2975,17 @@ fn late_line(frames: f64) {
             r[3] / 1000.0,
             r[4] / 1000.0,
         );
+        if send::own() {
+            let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "bytes of submissions' own sent up per frame (VICTORY_SEND_OWN): {:.1} MB in {:.0} runs, {:.0} words in scatters; {:.2} ms \
+                 taking them out of the CPU sides",
+                t[0] / (1 << 20) as f64,
+                t[1],
+                t[2],
+                t[3] / 1000.0,
+            );
+        }
         let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         if t[0] > 0.0 {
             tracing::info!(
@@ -2999,6 +3012,7 @@ fn late_line(frames: f64) {
 }
 
 mod card_steps;
+mod send;
 mod torn;
 pub(crate) mod upcheck;
 
@@ -3533,7 +3547,7 @@ impl Host {
                 }
             }
         }
-        let declared = crate::picked::with(declared, &picked.written);
+        let declared = if crate::picked::lands() { crate::picked::with(declared, &picked.written) } else { declared };
         // (Of a copy with a declared range here, that says it.)
         let looked: Vec<&crate::picked::Range> =
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
@@ -3570,6 +3584,8 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut looks = None;
+        // The bytes as they are now, whatever later submissions put there.
+        let own = if send::own() { send::take(self, &dirty) } else { None };
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -3589,16 +3605,21 @@ impl Host {
                     // pass: a wait between each copy and its pass had the
                     // card do them one after the other.
                     let mut sent = Vec::new();
+                    if let Some(own) = &own {
+                        own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
+                    }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, _)) = shadow.card_sides() else {
                             continue;
                         };
                         for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            if own.is_none() {
+                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            }
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        if before.is_some() && !ranges.is_empty() {
+                        if own.is_none() && before.is_some() && !ranges.is_empty() {
                             sent.push(transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -3630,7 +3651,7 @@ impl Host {
                             ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
                         };
                         // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        let runs = if rehash_runs() || own.is_some() { crate::shadow::joined_piece_runs(runs) } else { runs };
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
@@ -3655,6 +3676,7 @@ impl Host {
             lists: used,
             sent_as,
             looks,
+            sends: own.map(send::Own::memory),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -3774,6 +3796,9 @@ impl Host {
     fn card_done(&self, plan: CardPlan) {
         if let Some(looks) = plan.looks {
             looks.read();
+        }
+        if let Some(memory) = plan.sends {
+            send::give_back(memory);
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
@@ -4744,8 +4769,11 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && upcheck::on() {
-                upcheck::reads(runs);
+            if upcheck::on() {
+                upcheck::order(runs);
+                if behind {
+                    upcheck::reads(runs);
+                }
             }
             let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
             if !stale.is_empty() {
@@ -6122,6 +6150,11 @@ impl HostList {
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
+                    // What the card holds there may be another value although
+                    // ours did not change.
+                    if send::own() {
+                        crate::shadow::send_copied(dst, len);
+                    }
                     (started, len)
                 }
                 &Step::Fill(dst, src, len, _) => {

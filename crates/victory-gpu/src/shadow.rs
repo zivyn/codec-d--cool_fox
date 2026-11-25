@@ -108,7 +108,9 @@ struct Card {
     /// side, each with the number of the send that took it
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
-    sent: Mutex<Vec<(usize, usize, u64)>>,
+    sent: Mutex<SentRuns>,
+    /// Whether something was put into `dirty` since it was last taken.
+    touched: std::sync::atomic::AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -202,11 +204,14 @@ fn card_limits() -> (u64, u64) {
     *LIMITS.get_or_init(|| {
         let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
-        let (min_bytes, max_bytes) = resolve_card_limits(
+        let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
             env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
             env_mb("VICTORY_CARD_BUFFERS_MB"),
         );
+        if card_all() {
+            min_bytes = 0;
+        }
         tracing::info!(
             vram_budget_mb = vram_budget.map(|b| b >> 20),
             card_buffers_min_mb = min_bytes >> 20,
@@ -253,6 +258,36 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
 fn card_for(size: u64) -> Option<ID3D12Resource> {
+    let there = card_room_for(size);
+    if there.is_some() || !card_all() || size >= 1 << 30 {
+        return there;
+    }
+    // Two sides all the same, the card's in the PC's memory.
+    let host = host()?;
+    if !cards() || !host.card_ready() {
+        return None;
+    }
+    let (buffer, _) = host.shared_buffer(size)?;
+    CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    Some(buffer)
+}
+
+/// Whether every title buffer's copy has two sides, however small
+/// (`VICTORY_CARD_ALL=1`; off by default).
+///
+/// A copy with one side, in the PC's memory, is what the card reads while
+/// our refreshes write it: a submission that is prepared changes it under
+/// the ones in the air ahead of it. The title's CPU does not write what they
+/// still read, but its own buffer copies are done by us at preparing
+/// (`crate::host::send` has the order of those right for copies with two
+/// sides), and so are the bytes put in beside shaders' writes.
+fn card_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
+}
+
+/// [`card_for`] in the card's own memory.
+fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
@@ -341,6 +376,46 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     buffer
 }
 
+/// What went up, by send: its number, and the offsets, in order and joined
+/// (a refresh sends thousands of runs of a few words).
+#[derive(Default)]
+struct SentRuns(Vec<(u64, Vec<(usize, usize)>)>);
+
+impl SentRuns {
+    fn note(&mut self, number: u64, ranges: Vec<(usize, usize)>) {
+        if ranges.is_empty() {
+            return;
+        }
+        let ranges = joined(ranges);
+        match self.0.iter_mut().find(|s| s.0 == number) {
+            Some((_, all)) => *all = joined([std::mem::take(all), ranges].concat()),
+            None => self.0.push((number, ranges)),
+        }
+    }
+
+    /// Sends up to `number` are of no use any more.
+    fn forget(&mut self, number: u64) {
+        self.0.retain(|s| s.0 > number);
+    }
+
+    /// Adds to `out` what sends after `number` took of `[from, to)`.
+    fn near(&self, number: u64, from: usize, to: usize, out: &mut Vec<(usize, usize)>) {
+        for (_, ranges) in self.0.iter().filter(|s| s.0 > number) {
+            let first = ranges.partition_point(|r| r.1 <= from);
+            out.extend(ranges[first..].iter().take_while(|r| r.0 < to).copied());
+        }
+    }
+
+    #[cfg(test)]
+    fn of(all: &[(usize, usize, u64)]) -> SentRuns {
+        let mut sent = SentRuns::default();
+        for &(a, b, number) in all {
+            sent.note(number, vec![(a, b)]);
+        }
+        sent
+    }
+}
+
 /// The copies in the card's memory whose CPU side changed since they were
 /// last asked: each with the changed offsets, in order and joined where
 /// they touch. The ranges are taken: the caller copies them to the card's
@@ -363,13 +438,14 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         let ranges = shadow
             .card
             .as_ref()
+            .filter(|c| c.touched.swap(false, Ordering::AcqRel))
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
                 let ranges = std::mem::take(&mut *dirty);
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.retain(|s| s.2 > fetched);
-                    sent.extend(ranges.iter().map(|&(a, b)| (a, b, sent_as)));
+                    sent.forget(fetched);
+                    sent.note(sent_as, ranges.clone());
                 }
                 ranges
             })
@@ -380,6 +456,98 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         true
     });
     out
+}
+
+/// Diagnostics (`crate::host::upcheck`, nothing in the air): copies whose
+/// pages the write watch and the guards hold for unchanged since they were
+/// taken, compared with title memory, `most` bytes a call in turn. `say` gets
+/// the copy, the title address of a page that is not the same, the words that
+/// differ and the first of them (its address, the copy's value, title
+/// memory's). Returns the bytes compared.
+pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize, (usize, u32, u32))) -> usize {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut all: Vec<Arc<Shadow>> = buffers().values().filter_map(|e| e.shadow.clone()).collect();
+    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
+    all.sort_by_key(|s| s.id);
+    let next = NEXT.load(Ordering::Relaxed);
+    let turn = all.partition_point(|s| s.id < next);
+    let mut done = 0;
+    let mut title = vec![0u8; PAGE];
+    for shadow in all[turn..].iter().chain(&all[..turn]) {
+        if done >= most {
+            NEXT.store(shadow.id, Ordering::Relaxed);
+            break;
+        }
+        let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        // (What it finds written stays noted for the next refresh.)
+        let Some((_, written)) = crate::watch::writes(start, end, true) else {
+            continue;
+        };
+        let written: std::collections::HashMap<usize, u64> = written.into_iter().collect();
+        let copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for (i, &at) in copied.iter().enumerate() {
+            let page = start / PAGE + i;
+            if at == 0 || written.get(&page).is_some_and(|&w| w > at) {
+                continue;
+            }
+            let (lo, hi) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+            let title = &mut title[..hi - lo];
+            if !crate::host::read_into(lo as *const u8, title) {
+                continue;
+            }
+            done += hi - lo;
+            // SAFETY: inside the mapping; nothing is in the air and the
+            // submission lock is held.
+            let held = unsafe { std::slice::from_raw_parts(shadow.data.add(lo - start).cast_const(), hi - lo) };
+            if held == title {
+                continue;
+            }
+            let word = |b: &[u8], k: usize| u32::from_le_bytes([b[k], b[k + 1], b[k + 2], b[k + 3]]);
+            let differ: Vec<usize> = (0..(hi - lo) & !3).step_by(4).filter(|&k| word(held, k) != word(title, k)).collect();
+            // Written meanwhile: not stale, and the next refresh sees it.
+            let again = crate::watch::writes(lo, hi, true).is_none_or(|(_, w)| w.iter().any(|&(p, w)| p == page && w > at));
+            if let Some(&k) = differ.first()
+                && !again
+            {
+                say(shadow, lo, differ.len(), (lo + k, word(held, k), word(title, k)));
+            }
+        }
+    }
+    done
+}
+
+/// Copies of memory (from, to, bytes: apart), on several threads if they are
+/// many.
+pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    if bytes > 4 << 20 {
+        wide(copy_jobs(copies));
+        return;
+    }
+    for (src, dst, len) in copies {
+        // SAFETY: the caller's ranges.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    }
+}
+
+/// A title buffer copy was done on the CPU into `[dst, dst + len)`: all of it
+/// goes up to the copies in the card's memory that hold it, whether their
+/// CPU side held the same before or not. Left out is what shaders in the air
+/// may be writing (such a copy waits for them, or is done on the card).
+pub(crate) fn send_copied(dst: usize, len: usize) {
+    for shadow in carded_copies() {
+        let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+        let (from, to) = (dst.max(start), (dst + len).min(end));
+        if from >= to {
+            continue;
+        }
+        let busy: Vec<(usize, usize)> =
+            shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+        for (a, b) in outside(from, to, busy) {
+            shadow.copy(a, b);
+        }
+    }
 }
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
@@ -2729,11 +2897,15 @@ impl Shadow {
                         return true;
                     }
                     *runs_left -= runs.len();
+                    let was = (!runs.is_empty() && crate::host::upcheck::on()).then(|| held.to_vec());
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    }
+                    if let Some(was) = was {
+                        crate::host::upcheck::note(self.id, at, &was, held);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -3126,6 +3298,13 @@ impl Shadow {
                 _ => dirty.push((from, to)),
             }
         }
+        // (Under the lock: what takes the list sees it or finds it set.)
+        card.touched.store(true, Ordering::Release);
+    }
+
+    /// Of a copy in the card's memory: where its CPU side is.
+    pub(crate) fn card_data(&self) -> *const u8 {
+        self.data
     }
 
     /// Diagnostics: of a copy in the card's memory, what its CPU side holds
@@ -3333,12 +3512,9 @@ impl Shadow {
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
-                .collect()
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < at + n && b > at).collect();
+            sent.near(fetched_after, at, at + n, &mut skip);
+            skip
         };
         title.clear();
         title.resize(n, 0);
@@ -3373,6 +3549,7 @@ impl Shadow {
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                touched: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -3393,8 +3570,8 @@ impl Shadow {
         let mut dirty = card.dirty.lock().unwrap();
         let ranges = std::mem::take(&mut *dirty);
         let mut sent = card.sent.lock().unwrap();
-        sent.retain(|s| s.2 > merged);
-        sent.extend(ranges.iter().map(|&(a, b)| (a, b, number)));
+        sent.forget(merged);
+        sent.note(number, ranges.clone());
         ranges
     }
 
@@ -3430,12 +3607,9 @@ impl Shadow {
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
-            dirty
-                .iter()
-                .copied()
-                .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < to && b > from)
-                .collect()
+            let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
+            sent.near(fetched_after, from, to, &mut skip);
+            skip
         };
         let mut put = 0;
         for &(lo, hi, now) in pieces {
@@ -3528,6 +3702,7 @@ mod land_tests {
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
+                touched: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -3603,7 +3778,7 @@ mod land_tests {
                     bytes(shadow.data as usize).copy_from_slice(&held);
                     let card = shadow.card.as_ref().expect("made with one");
                     *card.dirty.lock().unwrap() = dirty.clone();
-                    *card.sent.lock().unwrap() = sent.clone();
+                    *card.sent.lock().unwrap() = super::SentRuns::of(&sent);
                 }
                 let pieces: Vec<(usize, usize)> = (0..3).map(|p| (p * PIECE + 16, (p + 1) * PIECE - 4)).collect();
                 let mut scratch = Vec::new();
@@ -3662,10 +3837,7 @@ mod land_tests {
                     let card = shadow.card.as_ref().expect("made with one");
                     let mut dirty = card.dirty.lock().unwrap();
                     let mut sent = card.sent.lock().unwrap();
-                    let moved: Vec<_> = std::mem::take(&mut *dirty).into_iter().map(|(a, b)| (a, b, 9)).collect();
-                    sent.extend(moved);
-                    sent.sort_unstable();
-                    sent.dedup();
+                    sent.note(9, std::mem::take(&mut *dirty));
                 }
             });
             let mut now = vec![0u8; LEN];
@@ -3832,7 +4004,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
+        let big = cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -3854,6 +4026,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                touched: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -4070,6 +4243,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                touched: Default::default(),
                 size: len,
             };
             (on_card, Some(card))

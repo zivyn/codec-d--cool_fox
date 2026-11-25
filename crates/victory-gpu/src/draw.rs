@@ -1061,6 +1061,16 @@ impl State {
             h => crate::descriptor::heap(h as This).host(),
         }?;
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+        // (What it may write: its root views of unordered access.)
+        let written: Vec<u64> = t
+            .used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Descriptor)
+            .filter_map(|u| match self.roots_ref(compute).get(usize::from(u.slot)) {
+                Some(&Root::View(address)) => Some(address),
+                _ => None,
+            })
+            .collect();
         for root in self.roots_ref(compute) {
             match root {
                 // (Of a program that only walks structures, the structures'
@@ -1075,7 +1085,7 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
-        crate::memory::ready(list, heap, &addresses, &constants, use_)
+        crate::memory::ready(list, heap, &addresses, &written, &constants, use_)
     }
 
     /// The bound heap holding `handle`.

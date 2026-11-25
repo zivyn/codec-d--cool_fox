@@ -244,7 +244,7 @@ impl<'a> Lower<'a> {
             let at = self.s.m.select(c, inside, at, outside);
             return (handle, at);
         }
-        self.memory(low, high, guard)
+        self.memory(low, high, guard, false)
     }
 
     /// `count` dwords of the node from its byte `base` + `offset` (`base`

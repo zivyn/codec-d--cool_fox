@@ -391,6 +391,11 @@ pub(crate) unsafe fn texture(
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
             give_back_with(&made, piece);
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::book::made(&made, || "a texture in a block".into());
+                crate::book::block(&heap, &made, piece.start, BLOCK);
+            }
             Some(made)
         }
         _ => {

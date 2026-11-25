@@ -29,6 +29,9 @@ pub(crate) struct HostHeap {
     /// them are not null.
     raw: u32,
     twins: Vec<std::sync::atomic::AtomicBool>,
+    /// When each slot was written last (with `crate::book`; else empty).
+    #[cfg(feature = "diagnostics")]
+    written: Vec<std::sync::atomic::AtomicU32>,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
     /// The same for a slot whose descriptor is made and stays (else 0): what
@@ -939,6 +942,76 @@ pub(crate) fn describe_slots(words: &[u32]) -> Vec<(usize, u32, String)> {
     .unwrap_or_default()
 }
 
+/// For `crate::book`: the bytes of up to `n` descriptors of the view heap from
+/// slot `at` on (from the first twin on, where `at` lies before it and past
+/// the others), as the card's heap has them: the first slot, the bytes, and
+/// the slot behind the last one worth reading.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn shown_bytes(at: u32, n: u32) -> Option<(u32, Vec<u8>, u32)> {
+    super::with_view_heap(|host| {
+        let own = host.count + host.dynamic;
+        let end = if host.raw == 0 { own } else { host.raw + own };
+        let at = if at >= own && at < host.raw { host.raw } else { at };
+        let stop = if at < own { own } else { end };
+        let n = n.min(stop.saturating_sub(at));
+        if n == 0 || host.step != 32 {
+            return None;
+        }
+        let mut bytes = vec![0u8; n as usize * 32];
+        crate::host::read_into(host.cpu(at).ptr as *const u8, &mut bytes).then_some((at, bytes, end))
+    })?
+}
+
+/// For `crate::book`: what our books say of a slot of the view heap.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn slot_story(slot: u32) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    super::with_view_heap(|host| {
+        let (index, twin) = if host.raw != 0 && slot >= host.raw { (slot - host.raw, true) } else { (slot, false) };
+        let mut text = if index < host.count {
+            format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
+        } else {
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            format!("dynamic slot {} (taken {taken:?})", index - host.count)
+        };
+        if twin {
+            let made = host.twins.get(index as usize).map(|t| t.load(Relaxed));
+            text.push_str(&format!(", its raw twin (made {made:?})"));
+        }
+        if let Some(at) = host.written.get(slot as usize) {
+            text.push_str(&format!(", written last at {:.1} s", f64::from(at.load(Relaxed)) / 1e3));
+        }
+        let kept = host.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).cloned().flatten();
+        match kept {
+            None => text.push_str(", holds nothing"),
+            Some(resource) => {
+                // SAFETY: a resource the slot holds.
+                let d = unsafe { resource.GetDesc() };
+                let gpu = if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+                    // SAFETY: as above.
+                    unsafe { resource.GetGPUVirtualAddress() }
+                } else {
+                    0
+                };
+                text.push_str(&format!(
+                    ", holds {:#x}: dimension {} {}x{}x{} levels {} f{} at {gpu:#x}, {} references",
+                    resource.as_raw() as usize,
+                    d.Dimension.0,
+                    d.Width,
+                    d.Height,
+                    d.DepthOrArraySize,
+                    d.MipLevels,
+                    d.Format.0,
+                    crate::host::references(&resource)
+                ));
+            }
+        }
+        text
+    })
+    .unwrap_or_default()
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -1167,6 +1240,10 @@ impl HostHeap {
             sampler,
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
+            #[cfg(feature = "diagnostics")]
+            written: (0..if sampler || !crate::book::on() { 0 } else { size })
+                .map(|_| std::sync::atomic::AtomicU32::new(0))
+                .collect(),
             made: Mutex::new(vec![0; count as usize]),
             quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
@@ -2292,6 +2369,10 @@ impl HostHeap {
     }
 
     fn copy_to(&self, to: u32, which: u32) {
+        #[cfg(feature = "diagnostics")]
+        if let Some(written) = self.written.get(to as usize) {
+            written.store(crate::host::now_ms() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
         let (Some(from), Some(host)) = (staged(self.sampler, which), host()) else {
             return; // made in place
         };

@@ -695,6 +695,8 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        #[cfg(feature = "diagnostics")]
+        crate::book::root(gpu, len);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;

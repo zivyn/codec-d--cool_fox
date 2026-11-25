@@ -269,6 +269,8 @@ fn sweep() {
     {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::book::check();
     crate::pool::room(host().and_then(|h| h.video_memory()));
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
@@ -619,10 +621,17 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
+
+/// The host GPU if it is made already.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn made_host() -> Option<&'static Host> {
+    HOST.get()?.as_ref()
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
-    static HOST: OnceLock<Option<Host>> = OnceLock::new();
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
@@ -1520,6 +1529,18 @@ fn timing() -> bool {
 /// allocations a page fault hit (only with device-removed data on), or for
 /// the frame recorder (`VICTORY_RECORD`).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
+    #[cfg(feature = "diagnostics")]
+    if crate::book::on()
+        && let Ok(resource) = object.cast::<ID3D12Resource>()
+    {
+        let text = text();
+        crate::book::made(&resource, || text.clone());
+        return name_it(object, || text);
+    }
+    name_it(object, text);
+}
+
+fn name_it(object: &impl Interface, text: impl FnOnce() -> String) {
     #[cfg(feature = "diagnostics")]
     if crate::replay::record::on() {
         let text = text();
@@ -5341,6 +5362,8 @@ impl Host {
                 }
                 text.push_str(&crate::shadow::near(va));
                 text.push_str(&crate::descriptor::host::near_heaps(va));
+                #[cfg(feature = "diagnostics")]
+                text.push_str(&crate::book::at_loss(va));
             }
             // The plain output: the extended one (with marker texts) came
             // back without stopped lists on this host.
@@ -7586,6 +7609,12 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "an upload buffer".into());
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -8281,6 +8310,12 @@ impl Host {
                     b.Map(0, None, Some(&mut data))
                 })
         };
+        #[cfg(feature = "diagnostics")]
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::book::made(b, || "a shared buffer".into());
+        }
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
@@ -8406,6 +8441,10 @@ impl Host {
                 &mut buffer,
             )
         };
+        #[cfg(feature = "diagnostics")]
+        if let Some(b) = &buffer {
+            crate::book::made(b, || "an unordered access buffer".into());
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {

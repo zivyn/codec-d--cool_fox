@@ -3467,6 +3467,8 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
+#[cfg(feature = "diagnostics")]
+mod panel;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -7960,6 +7962,8 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    #[cfg(feature = "diagnostics")]
+    panel: panel::Panel,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -7987,6 +7991,12 @@ impl Meter {
             logged: now,
             caption: None,
         }
+    }
+
+    /// Whether the next frame counted makes the frame-rate line.
+    #[cfg(feature = "diagnostics")]
+    fn line_due(&self) -> bool {
+        self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
 
     /// Counts a presented frame.
@@ -8363,6 +8373,8 @@ impl Host {
                 .flatten();
             #[cfg(feature = "diagnostics")]
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            #[cfg(feature = "diagnostics")]
+            p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -8390,6 +8402,8 @@ impl Host {
             let mut showing = crate::timeline::span("the host's Present");
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
+            #[cfg(feature = "diagnostics")]
+            p.panel.frame(p.meter.line_due());
             p.meter.frame(p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
@@ -8442,6 +8456,8 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                panel: panel::Panel::new(),
             })
         }
     }

@@ -1252,9 +1252,12 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn stub_pipeline_is_created() {
-        let Ok(host) = super::host::Host::new(false) else {
-            eprintln!("no SM 6.6 device; skipped");
-            return;
+        let host = match super::host::Host::new(false) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("no SM 6.6 device ({e}); skipped");
+                return;
+            }
         };
         let ps = super::HostShader {
             stage: crate::HwStage::Ps,

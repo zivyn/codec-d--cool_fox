@@ -29,6 +29,10 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//!
+//! The air of a room is lit by the same probes: without rays they hold the
+//! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
+//! bounds what the air scatters by a multiple of the light around.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -44,6 +48,9 @@ pub(crate) enum Role {
     Resolve,
     /// Keeps the light visible surfaces send out.
     Radiance,
+    /// Adds the lamps' light to what the air scatters (the last program
+    /// that writes that volume before it is summed up along the view).
+    Air,
 }
 
 /// The program's part in this, by its name in the container.
@@ -53,6 +60,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Resolve)
     } else if has(b"CS_CacheScreenSpaceRadiance") {
         Some(Role::Radiance)
+    } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
+        Some(Role::Air)
     } else {
         None
     }
@@ -64,6 +73,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
+/// Where the light the air scatters is.
+pub(crate) const AIR: (u8, u32) = (1, 32);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -91,6 +102,16 @@ pub(crate) fn on() -> bool {
     set() != Set::Off && !crate::pipeline::builder_runs()
 }
 
+/// The most the air scatters, as a multiple of the light around
+/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+fn air() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
+        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -116,7 +137,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float unused0; float unused1;
+    float follow; float most; float air; float unused;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -202,6 +223,28 @@ void gather(uint3 at : SV_DispatchThreadID) {
     points[at0] = float4(red / whole - light.r * toward, light.r);
     points[at0 + 1] = float4(green / whole - light.g * toward, light.g);
     points[at0 + 2] = float4(blue / whole - light.b * toward, light.b);
+}
+#endif
+
+#ifdef AIR
+RWTexture3D<float3> scattered : register(u0);
+// No more than a multiple of the light around: of the room as the last
+// seconds showed it, and of the surface seen in this direction (towards a
+// window the air outside may be as bright as the sky is).
+[RootSignature(RS)]
+[numthreads(8, 8, 2)]
+void clear_air(uint3 at : SV_DispatchThreadID) {
+    uint w, h, d;
+    scattered.GetDimensions(w, h, d);
+    if (at.x >= w || at.y >= h || at.z >= d) return;
+    uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float far = float(at.z) / float(d);
+    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float3 c = scattered[at];
+    float has = dot(c, LUMA);
+    if (has > cap) scattered[at] = c * (cap / has);
 }
 #endif
 
@@ -300,6 +343,7 @@ struct Pass {
     place: ID3D12PipelineState,
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
+    air: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -330,6 +374,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let place = pipeline("PLACE", s!("place"))?;
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
+    let air = pipeline("AIR", s!("clear_air"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -338,6 +383,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         place,
         gather,
         raise,
+        air,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -370,8 +416,9 @@ pub(crate) struct Views {
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
     pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
-    /// The size of the light's image.
+    /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
+    pub(crate) slices: u32,
 }
 
 /// After the title's program of that role, in `list` with the program's view
@@ -387,7 +434,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
     };
-    if role == Role::Resolve && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+    if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
+        return false;
+    }
+    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -410,6 +460,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
+    words[10] = air().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -422,23 +473,24 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
-        let run = |pso: &ID3D12PipelineState, x, y| {
+        let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
-            l.Dispatch(x, y, 1);
+            l.Dispatch(x, y, z);
             uav_barrier(l);
         };
         match role {
             Role::Radiance => {
-                run(&pass.keep, 8, 9);
-                run(&pass.mean, 1, 1);
+                run(&pass.keep, 8, 9, 1);
+                run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
             }
+            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             Role::Resolve => {
                 if constant == 0.0 {
-                    run(&pass.place, 8, 9);
-                    run(&pass.gather, 20, 45);
+                    run(&pass.place, 8, 9, 1);
+                    run(&pass.gather, 20, 45, 1);
                 }
-                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8));
+                run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
     }
@@ -463,6 +515,7 @@ mod tests {
     fn roles_by_name() {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
+        assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 

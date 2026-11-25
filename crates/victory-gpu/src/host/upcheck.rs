@@ -452,8 +452,40 @@ pub(super) fn at_rest(host: &Host) {
     if look(host).is_none() {
         tracing::warn!("up-copy check: the look at rest could not be made");
     }
+    look_for_stale();
     tracing::info!(ms = began.elapsed().as_millis(), "up-copy check: the look at rest is done");
     LAST.store(now_ms(), Ordering::Relaxed);
+}
+
+/// At rest: copies of title memory, whatever reads them (meshes too), that
+/// are not what title memory holds although nothing told that it changed: a
+/// refresh will not bring them up to date.
+fn look_for_stale() {
+    const MOST: usize = 1 << 30;
+    let mut by: BTreeMap<(u64, u64), (bool, u64, usize, Vec<String>)> = BTreeMap::new();
+    let compared = crate::shadow::stale_pages(MOST, &mut |shadow, page, words, (at, copy, title)| {
+        let e = by.entry(shadow.span()).or_insert((shadow.carded(), 0, 0, Vec::new()));
+        e.1 += words as u64;
+        e.2 += 1;
+        if e.3.len() < 4 {
+            e.3.push(format!("{words} words in the 64 KiB at {page:#x} (the first at {at:#x}: the copy {copy:#x}, title memory {title:#x})"));
+        }
+    });
+    tracing::info!(
+        "up-copy check at rest: {} MB of copies held for unchanged compared with title memory, {} copies are stale",
+        compared >> 20,
+        by.len()
+    );
+    let mut by: Vec<_> = by.into_iter().collect();
+    by.sort_by_key(|(_, e)| std::cmp::Reverse(e.1));
+    for ((start, len), (carded, words, pages, some)) in by.into_iter().take(16) {
+        tracing::warn!(
+            "up-copy check at rest, stale: {start:#x}+{len:#x} ({}): {words} words in {pages} pages are not title memory's, and nothing \
+             told of it: {}",
+            if carded { "on the card" } else { "in PC memory" },
+            some.join("; ")
+        );
+    }
 }
 
 /// Sends `list` (recorded by `f`) and waits for it.

@@ -33,8 +33,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 /// the guards, blocks they did so in, blocks they opened instead; stores done
 /// beside the guards, faulting stores not understood, and blocks opened
 /// because too many came; stores and parts of copies that left the memory as
-/// it was, and were not made.
-pub(crate) static DONE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// it was, and were not made; descriptors copied onto themselves.
+pub(crate) static DONE: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 fn add(what: usize) {
     DONE[what].fetch_add(1, Relaxed);
@@ -172,6 +172,28 @@ unsafe extern "system-unwind" fn set(to: *mut u8, byte: i32, n: usize) -> *mut u
     to
 }
 
+/// Bytes of the title's that we put into its memory for it (a descriptor it
+/// has copied): as a copy of its own, but what is there already is never
+/// written (`VICTORY_SAME_RECORDS=0`: always).
+///
+/// # Safety
+/// `[from, from + n)` and `[to, to + n)` are the title's.
+pub(crate) unsafe fn put(to: *mut u8, from: *const u8, n: usize) {
+    // SAFETY: by the caller.
+    unsafe {
+        let there = || std::slice::from_raw_parts(to.cast_const(), n) == std::slice::from_raw_parts(from, n);
+        if crate::toggled!("VICTORY_SAME_RECORDS") && there() {
+            add(8);
+            return;
+        }
+        if n == 0 || !copies_on() || !crate::watch::guards_any(to as usize, n) || overlap(to as usize, from as usize, n) {
+            std::ptr::copy(from, to, n);
+            return;
+        }
+        in_pieces(to as usize, n, |_, _, _| false, |at, offset, len| std::ptr::copy_nonoverlapping(from.add(offset), at as *mut u8, len));
+    }
+}
+
 /// Whether the two ranges meet, if only in a block (of which only one might
 /// be written at another address).
 fn overlap(to: usize, from: usize, n: usize) -> bool {
@@ -257,9 +279,9 @@ fn learn(rip: usize, same: bool, can_look: bool) {
             return;
         };
         use std::io::Write;
-        let line = format!("{image} {offset:x} or\n");
+        let line = format!("{image} {offset:x}\n");
         let known = std::fs::read_to_string(&file).unwrap_or_default();
-        if known.lines().any(|l| l == line.trim_end()) {
+        if known.lines().any(|l| l.starts_with(line.trim_end())) {
             return;
         }
         if let Ok(mut file) = std::fs::OpenOptions::new().append(true).create(true).open(&file) {

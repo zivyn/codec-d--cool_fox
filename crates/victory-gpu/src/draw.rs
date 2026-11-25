@@ -328,7 +328,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -3021,16 +3021,33 @@ impl State {
             }
             // The table and what its entries hold (record words).
             let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
+                let mut h = RecordHash::default();
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.finish())
+                (table, n, h.0)
             };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // Who reads of it, and as what, as far as [`readable`] goes by it.
+            let reader = (used.as_ptr() as usize, used.len(), STORES.get(), TESTED_DEPTH.get().0);
+            if let Some(known) = self.fresh_tables.get_mut(&key) {
+                let first = known.first;
+                // This reader had it brought up to date, and nothing in the
+                // list changed since: nothing to do again.
+                let once = ready_once() && selected.is_empty() && entries.iter().all(|u| u.kind != ResourceType::Uav);
+                if once
+                    && known.epoch == list.epoch()
+                    && let Some((_, depth)) = known.ready.iter().find(|(r, _)| *r == reader)
+                {
+                    if *depth {
+                        TESTED_DEPTH.set((reader.3, true));
+                    }
+                    made.push((slot, first * 32));
+                    continue;
+                }
+                let depth_before = TESTED_DEPTH.get();
+                TESTED_DEPTH.set((depth_before.0, false));
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
@@ -3048,6 +3065,20 @@ impl State {
                         readable(list, kind, &view);
                     }
                 }
+                let depth = TESTED_DEPTH.get().1;
+                TESTED_DEPTH.set((depth_before.0, depth_before.1 || depth));
+                if once && let Some(known) = self.fresh_tables.get_mut(&key) {
+                    // (The epoch as it is now: what this changed itself it
+                    // need not do again.)
+                    let epoch = list.epoch();
+                    if known.epoch != epoch {
+                        known.epoch = epoch;
+                        known.ready.clear();
+                    }
+                    if known.ready.len() < 16 {
+                        known.ready.push((reader, depth));
+                    }
+                }
                 made.push((slot, first * 32));
                 continue;
             }
@@ -3057,7 +3088,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
-            self.fresh_tables.insert(key, first);
+            self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The title's own slots of this table: what the draw reads of
@@ -3708,6 +3739,41 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+/// A table made afresh in dynamic slots, in a list ([`State::tables`]).
+struct FreshTable {
+    first: u32,
+    /// The list's epoch ([`HostList::epoch`]) at which all its entries that
+    /// these readers (a stage's list of what it reads, whether it stores, the
+    /// tested depth target) read were brought up to date, and whether that read the
+    /// tested depth target.
+    epoch: u64,
+    ready: Vec<((usize, usize, bool, usize), bool)>,
+}
+
+/// Whether a table a list reads again, with nothing changed in the list
+/// since, is left as it is (`VICTORY_READY_ONCE=0`: every entry is gone
+/// through again at every draw).
+fn ready_once() -> bool {
+    crate::toggled!("VICTORY_READY_ONCE")
+}
+
+/// A hash of records' words: 64 bits, two multiplications a record. (The
+/// standard library's took 3 % of the recording threads' time.)
+#[derive(Default)]
+struct RecordHash(u64);
+
+impl RecordHash {
+    fn add(&mut self, [a, b, c]: [u32; 3]) {
+        let fold = |x: u64, y: u64| {
+            let p = u128::from(x) * u128::from(y);
+            p as u64 ^ (p >> 64) as u64
+        };
+        let words = u64::from(a) << 32 | u64::from(b);
+        let first = fold(self.0 ^ words ^ 0x2d35_8dcc_aa6c_78a5, 0x8bb8_4b93_962e_acc9 ^ u64::from(c));
+        self.0 = fold(first ^ 0x4b33_a62e_d433_d4a3, 0x4d5a_2da5_1de1_aa47 ^ self.0.rotate_left(23)) ^ first;
+    }
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
@@ -3763,7 +3829,9 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             };
             crate::list::ensure_state(list, *resource as This, state);
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
@@ -4010,5 +4078,33 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+}
+
+#[cfg(test)]
+mod record_hash_tests {
+    use super::RecordHash;
+
+    #[test]
+    fn records_that_differ_hash_apart() {
+        let of = |records: &[[u32; 3]]| {
+            let mut h = RecordHash::default();
+            records.iter().for_each(|r| h.add(*r));
+            h.0
+        };
+        let mut seen = std::collections::HashSet::new();
+        // One record, one word or two of it different; runs of zeros; order.
+        for a in 0..64u32 {
+            for b in 0..64u32 {
+                for c in [0, 1, 0x8000_0000, u32::MAX] {
+                    assert!(seen.insert(of(&[[a, b, c]])));
+                    assert!(seen.insert(of(&[[1, 2, 3], [a, b, c]])));
+                    assert!(seen.insert(of(&[[a, b, c], [1, 2, 3], [0, 0, 0]])));
+                }
+            }
+        }
+        assert!(seen.insert(of(&[])));
+        let zeros: Vec<u64> = (1..100).map(|n| of(&vec![[0; 3]; n])).collect();
+        assert!(zeros.iter().all(|h| seen.insert(*h)));
     }
 }

@@ -31,8 +31,17 @@ static BITS: AtomicU32 = AtomicU32::new(0);
 
 /// Whether `switch` is on now, if it is one of those that change.
 pub(crate) fn pick(switch: &str) -> Option<bool> {
-    let n = asked()?.switches.iter().position(|s| s == switch)?;
-    Some(BITS.load(Relaxed) >> n & 1 != 0)
+    bit(switch).map(on)
+}
+
+/// The number of `switch` among those that change.
+pub(crate) fn bit(switch: &str) -> Option<u32> {
+    Some(asked()?.switches.iter().position(|s| s == switch)? as u32)
+}
+
+/// Whether the switch of that number is on now.
+pub(crate) fn on(bit: u32) -> bool {
+    BITS.load(Relaxed) >> bit & 1 != 0
 }
 
 /// What the run has seen of the phase under way.

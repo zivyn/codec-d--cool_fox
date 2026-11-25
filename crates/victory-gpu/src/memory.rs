@@ -4,15 +4,14 @@
 //! structures; the structures themselves lie in plain title memory, in no
 //! buffer object).
 //!
-//! A page in a title buffer that holds all of it is in that buffer's copy
-//! ([`crate::shadow`]), which every other access uses. A page outside
-//! buffers is in a window of this module's own, on the card
-//! ([`crate::shadow::by_address`]): 4 MiB around what a dispatch names (the
-//! title's pool of dynamic structures), 256 KiB around a page a shader came
-//! to by a pointer (the streamed structures lie anywhere between other
-//! data; `VICTORY_MEMORY_WINDOW_KB`).
+//! A 64 KiB page in a title buffer that holds all of it is in that buffer's
+//! copy ([`crate::shadow`]), which every other access uses. A page outside
+//! buffers has a page of its own in an **arena**: memory of ours with a copy
+//! on the card ([`crate::shadow::by_address`]). The streamed structures lie
+//! anywhere between other data (6.6 GB of title memory in 4 MiB windows, run
+//! light-1; 8 GB in windows of 256 KiB, light-2), so a page is what is kept.
 //!
-//! This module keeps what a shader needs to find the copies:
+//! This module keeps what a shader needs to find the pages:
 //!
 //! - the **directory**: per 64 KiB page of title address space the number
 //!   of the copy that holds the page (0: none) and the page's byte offset
@@ -24,34 +23,35 @@
 //!   numbered copy (slot 0 of the run: a null view, for pages without a
 //!   copy);
 //! - the **faults**: the page numbers shaders found empty, read back here
-//!   once a frame, so the copies exist from the next frame on. A pointer a
-//!   shader takes out of memory cannot be known before it runs; the
-//!   addresses a dispatch is given as root views are made ready before it.
+//!   once a frame, so the pages are there from the next frame on. A pointer a
+//!   shader takes out of memory cannot be known before it runs.
 //!
 //! **A page that is not there when a shader touches it is a lost access**:
 //! the read gives 0, the store is dropped, and the fault note only helps
 //! the next frame. For the structure builder that is the same as a dropped
-//! stage, so before a dispatch the host makes ready everything it can see
-//! the dispatch name: the window around each root view, around each
-//! pair of root constants that is a title address and around each root
-//! constant that is one in 256-byte units (the builder passes structures
-//! all three ways), and the one after each (a structure may cross a
-//! window's end).
-//! shortcut: what a stage reaches only through pointers it reads out of
-//! memory (the structures a top-level build's instances name) is there from
-//! the second frame on; the fault count in the log says how often that
-//! happens. The top level is built anew every frame.
+//! stage, so before one of its dispatches the host makes ready what it can
+//! see the dispatch name:
+//!
+//! - 1 MiB from each root view outside buffers (structures unpacked in place:
+//!   the title ships them packed and the builder's rehydration stages unpack
+//!   each once, when it is streamed in);
+//! - 4 MiB from each pair of root constants that is a title address and from
+//!   each root constant that is one in 256-byte units (structures built);
+//! - the first page of every structure a list's upload memory names
+//!   (a top-level build's instances).
 //!
 //! **What comes back to title memory**: what the builder stores in title
 //! buffers of at most [`BACK`] bytes it names (the sizes the title reads to
-//! make a structure smaller). Structures and scratch memory stay on the card.
-//! Other programs that store by address declare the copies they name.
+//! make a structure smaller). Structures and scratch memory stay on the card
+//! (the first whole run of the builder wrote garbage over the title's
+//! objects). So an arena's page is the only place a structure is whole, and
+//! title memory must not go over it: of a page the title wrote only the
+//! dwords that changed since they were last taken go up, unless a quarter of
+//! a 4 KiB piece changed, which is other data streamed in: then all of it.
 //!
-//! shortcut: a copy that is numbered is kept for the rest of the run, and
-//! there are at most [`COPIES`] of them.
-//! shortcut: the windows a list does not name are brought up to date once a
-//! frame, by the first list that reads by address: bytes the title writes
-//! there later in the frame are seen a frame late.
+//! shortcut: a page is kept for the rest of the run.
+//! shortcut: pages a list does not name are looked at again in turn, over
+//! [`SWEEP`] frames.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -63,52 +63,83 @@ use crate::descriptor::host::HostHeap;
 use crate::host::{HostList, host};
 use crate::shadow::Shadow;
 
-/// Copies that can be numbered (the run of heap slots is one longer). A
-/// frame of the dorm names 1,100 pages outside the named windows.
-const COPIES: u32 = (1 << 14) - 1;
-/// A window around memory a dispatch names.
-const CELL: u64 = 4 << 20;
+/// Copies that can be numbered (the run of heap slots is one longer).
+const COPIES: u32 = (1 << 12) - 1;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
+/// An arena's bytes.
+const ARENA: u64 = 64 << 20;
+/// The kernel's page: what is sent whole when much of it changed.
+const PIECE: usize = 4096;
+/// From a root view; from an address in constants.
+const VIEW: u64 = 1 << 20;
+const BUILT: u64 = 4 << 20;
 /// The biggest title buffer whose builder results come back.
 const BACK: u64 = 256 << 10;
+/// Pages taken from the faults of one frame, at most.
+const FAULTS: usize = 2048;
+/// Frames over which every page is looked at once.
+const SWEEP: usize = 32;
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Use {
     Reads,
-    Writes,
-    /// A stage of the structure builder; `back`: its results come back.
-    Builder { back: bool },
+    /// Stores by address, as the structure builder; `back`: its results in
+    /// small title buffers come back.
+    Builds { back: bool },
+}
+
+/// A page of title memory in an arena.
+struct Held {
+    /// Where in the arena's memory, and the arena's place in `copies`.
+    at: usize,
+    copy: usize,
+    /// The write-watch asking after which it was last taken (0: never).
+    taken: u64,
 }
 
 struct Memory {
     /// The CPU's entries (number, offset), and the copy shaders read.
     directory: (*mut u32, Arc<Shadow>),
     faults: (ID3D12Resource, *mut u32, u64),
-    /// Copy `n` is `copies[n - 1]`; whether it is a window of ours.
-    copies: Vec<(Arc<Shadow>, bool)>,
+    /// Copy `n` is `copies[n - 1]`.
+    copies: Vec<Arc<Shadow>>,
     /// Places of title buffers' copies among `copies`.
     numbers: HashMap<usize, usize>,
+    /// Arenas: place in `copies`, address; pages of the last one handed out.
+    arenas: Vec<(usize, usize)>,
+    used: u64,
+    /// By title page.
+    pages: HashMap<u64, Held>,
+    /// Their numbers in the order they came, and where the sweep is.
+    order: Vec<u64>,
+    sweep: usize,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
-    /// The frame our windows were last brought up to date in.
-    swept: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
     stats: Stats,
+    #[cfg(feature = "diagnostics")]
+    dump: dump::Dump,
 }
 
-/// Since the last report (diagnostics).
+/// Since the last report.
 #[derive(Default)]
 struct Stats {
     from: Option<(std::time::Instant, u64)>,
-    uses: [u64; 3],
+    uses: [u64; 2],
     faults: u64,
+    unknown: u64,
     back: u64,
+    /// Pages looked at, bytes that changed, pieces sent whole.
+    looked: u64,
+    changed: u64,
+    whole: u64,
+    micros: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -123,15 +154,6 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
-}
-
-/// A window around a page a shader came to by a pointer.
-fn far_window() -> u64 {
-    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        let kb = std::env::var("VICTORY_MEMORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        kb.map(|kb| kb << 10).filter(|b| b.is_power_of_two() && (PAGE..=CELL).contains(b)).unwrap_or(256 << 10)
-    })
 }
 
 impl Memory {
@@ -154,11 +176,17 @@ impl Memory {
             faults: (faults, data.cast::<u32>(), gpu),
             copies: Vec::new(),
             numbers: HashMap::new(),
+            arenas: Vec::new(),
+            used: ARENA / PAGE,
+            pages: HashMap::new(),
+            order: Vec::new(),
+            sweep: 0,
             heaps: HashMap::new(),
             frame: u64::MAX,
-            swept: u64::MAX,
             refused: Default::default(),
             stats: Stats::default(),
+            #[cfg(feature = "diagnostics")]
+            dump: Default::default(),
         })
     }
 
@@ -169,87 +197,168 @@ impl Memory {
         unsafe { self.directory.0.add(page as usize * 2) }
     }
 
-    /// Gives the page of `address` its copy, if it has none and the memory
-    /// is the title's (a window of `window` bytes outside buffers); the place
-    /// of its copy in `copies`.
-    fn map(&mut self, address: u64, window: u64) -> Option<usize> {
-        let page = address / PAGE;
-        // The last entry stays empty: addresses past the directory read it.
-        if page >= u64::from(MEMORY_PAGES) - 1 {
+    /// The place in `copies` of the copy that holds `page`, if one does.
+    fn copy_of(&self, page: u64) -> Option<usize> {
+        if page >= u64::from(MEMORY_PAGES) {
             return None;
         }
         // SAFETY: an entry of the directory.
-        let mut number = unsafe { self.entry(page).read() };
-        if number == 0 {
-            self.make(page, window);
-            // SAFETY: as above.
-            number = unsafe { self.entry(page).read() };
-        }
-        (number as usize).checked_sub(1)
+        (unsafe { self.entry(page).read() } as usize).checked_sub(1)
     }
 
-    fn make(&mut self, page: u64, window: u64) {
-        let start = page * PAGE;
-        // A shader's pointer, or a constant taken for an address, may be
-        // anything: only memory the title has.
-        if self.refused.contains(&page) {
-            return;
+    /// Whether `page` can be given a place: in the directory, not turned down
+    /// this frame, and the title's GPU memory. (A shader's pointer, or a
+    /// constant taken for an address, may be anything.)
+    fn possible(&mut self, page: u64) -> bool {
+        // Not the last entry: addresses past the directory read it, and it
+        // stays empty.
+        if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
+            return false;
         }
-        if !crate::texture::committed(start as *const u8, PAGE as usize) {
+        let at = (page * PAGE) as usize;
+        let ours = crate::texture::committed(at as *const u8, PAGE as usize)
+            && crate::watch::writes(at, at + PAGE as usize, true).is_some();
+        if !ours {
             self.refused.insert(page);
-            return;
+            self.stats.unknown += 1;
         }
-        // The copy of a title buffer that holds all of the page, the
-        // innermost first; else a window of our own.
-        let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some() && s.left(start) >= PAGE;
-        let buffer = crate::shadow::in_buffer(start, PAGE).and_then(|_| crate::shadow::find(start, PAGE)).filter(whole);
-        let own = buffer.is_none();
-        let shadow = match buffer {
-            Some(s) => s,
-            None => {
-                if self.copies.len() >= COPIES as usize {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
-                    });
-                    return;
-                }
-                let Some(s) = crate::shadow::by_address(start & !(window - 1), window) else {
-                    return;
-                };
-                s
-            }
-        };
+        ours
+    }
+
+    /// Gives a copy a number, if one is left.
+    fn number(&mut self, shadow: Arc<Shadow>) -> Option<usize> {
+        let key = Arc::as_ptr(&shadow) as usize;
+        if let Some(&n) = self.numbers.get(&key) {
+            return Some(n);
+        }
+        if self.copies.len() >= COPIES as usize {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros"));
+            return None;
+        }
         // SAFETY: a live buffer.
         let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
-            return;
+            return None;
         }
-        let key = Arc::as_ptr(&shadow) as usize;
-        let n = match self.numbers.get(&key) {
-            Some(&n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push((shadow.clone(), own));
-                let n = self.copies.len() - 1;
-                self.numbers.insert(key, n);
-                // Every page the copy holds whole, not only the one asked
-                // for: a structure is more than 64 KiB. (Not those of title
-                // buffers inside a window: they have copies of their own.)
+        self.copies.push(shadow);
+        let n = self.copies.len() - 1;
+        self.numbers.insert(key, n);
+        Some(n)
+    }
+
+    /// Gives `page` a place, if it has none and the memory is the title's;
+    /// whether it has one then.
+    fn map(&mut self, page: u64) -> bool {
+        if self.copy_of(page).is_some() {
+            return true;
+        }
+        if !self.possible(page) {
+            return false;
+        }
+        let start = page * PAGE;
+        if crate::shadow::in_buffer(start, PAGE).is_some() {
+            let Some(shadow) = crate::shadow::find(start, PAGE) else {
+                return false;
+            };
+            let fresh = !self.numbers.contains_key(&(Arc::as_ptr(&shadow) as usize));
+            let Some(n) = self.number(shadow.clone()) else {
+                return false;
+            };
+            // Every page the copy holds whole, not only the one asked for.
+            // shortcut: a page of a title buffer inside this one that has a
+            // copy of its own is given this copy too.
+            if fresh {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     let entry = self.entry(at / PAGE);
                     // SAFETY: an entry of the directory.
-                    if unsafe { entry.read() } == 0 && (!own || crate::shadow::in_buffer(at, PAGE).is_none()) {
+                    if unsafe { entry.read() } == 0 {
                         fill(entry, n, at - first);
                     }
                     at += PAGE;
                 }
-                n
             }
-            None => return,
+            fill(self.entry(page), n, start - shadow.span().0);
+            return true;
+        }
+        if self.used == ARENA / PAGE {
+            let Some(at) = crate::upload::reserve(ARENA as usize) else {
+                return false;
+            };
+            let Some(shadow) = crate::shadow::by_address(at as u64, ARENA) else {
+                return false;
+            };
+            let Some(n) = self.number(shadow) else {
+                return false;
+            };
+            self.arenas.push((n, at));
+            self.used = 0;
+        }
+        let Some(&(copy, arena)) = self.arenas.last() else {
+            return false;
         };
-        fill(self.entry(page), n, shadow.offset_in(start).unwrap_or(0));
+        let offset = self.used * PAGE;
+        self.used += 1;
+        self.pages.insert(page, Held { at: arena + offset as usize, copy, taken: 0 });
+        self.order.push(page);
+        fill(self.entry(page), copy, offset);
+        true
+    }
+
+    /// [`Memory::map`] of the pages of `[address, address + len)`, up to the
+    /// first that is not the title's, and what the title wrote there since
+    /// they were taken goes into the arenas.
+    fn ready(&mut self, address: u64, len: u64) {
+        let first = address / PAGE;
+        let mut end = first;
+        while end * PAGE < address + len && self.map(end) {
+            end += 1;
+        }
+        self.bring(first, end);
+    }
+
+    /// Takes the pages `[first, end)` that are in arenas from title memory
+    /// where it wrote them.
+    fn bring(&mut self, first: u64, end: u64) {
+        if first >= end {
+            return;
+        }
+        let started = std::time::Instant::now();
+        let answer = crate::watch::writes((first * PAGE) as usize, (end * PAGE) as usize, true);
+        for page in first..end {
+            let Some(held) = self.pages.get_mut(&page) else {
+                continue;
+            };
+            self.stats.looked += 1;
+            let wrote = answer
+                .as_ref()
+                .map(|(_, w)| w.binary_search_by_key(&(page as usize), |w| w.0).map_or(0, |i| w[i].1));
+            let now = answer.as_ref().map_or(1, |a| a.0);
+            let stale = held.taken == 0 || wrote.is_none_or(|w| w > held.taken);
+            if !stale {
+                continue;
+            }
+            let never = std::mem::replace(&mut held.taken, now.max(1)) == 0;
+            let shadow = &self.copies[held.copy];
+            let base = held.at - shadow.span().0 as usize;
+            let mut title = [0u8; PIECE];
+            for piece in (0..PAGE as usize).step_by(PIECE) {
+                let from = (page * PAGE) as usize + piece;
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, PIECE, false);
+                // SAFETY: a page of an arena of ours, under the mutex.
+                let ours = unsafe { std::slice::from_raw_parts_mut((held.at + piece) as *mut u8, PIECE) };
+                let (changed, whole) = merge(&title, ours, never);
+                self.stats.changed += changed as u64 * 4;
+                if whole {
+                    self.stats.whole += 1;
+                    shadow.resend(base + piece, base + piece + PIECE);
+                }
+            }
+        }
+        self.stats.micros += started.elapsed().as_micros() as u64;
     }
 
     /// The pages shaders found empty since the last frame.
@@ -262,7 +371,7 @@ impl Memory {
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
             if page != 0 {
-                pages.push(page);
+                pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             }
@@ -270,66 +379,105 @@ impl Memory {
         if pages.is_empty() {
             return;
         }
+        pages.sort_unstable();
         let mut made = 0;
         for &page in &pages {
-            made += usize::from(self.map(u64::from(page) * PAGE, far_window()).is_some());
+            if made < FAULTS && self.copy_of(page).is_none() && self.map(page) {
+                made += 1;
+                self.bring(page, page + 1);
+            }
         }
         self.stats.faults += pages.len() as u64;
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 100 {
-            pages.sort_unstable();
-            let first: Vec<String> = pages.iter().take(8).map(|&p| format!("{:#x}", u64::from(p) * PAGE)).collect();
+        let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if said < 40 || said.is_multiple_of(100) {
+            let some: Vec<String> = pages
+                .iter()
+                .step_by(pages.len().div_ceil(12))
+                .map(|&p| format!("{:#x}", p * PAGE))
+                .collect();
             tracing::warn!(
                 frame = self.frame,
                 pages = pages.len(),
                 made,
-                copies = self.copies.len(),
-                ?first,
-                "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now, of those that are the title's"
+                held = self.pages.len(),
+                ?some,
+                "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
             );
         }
     }
 
-    /// What a dispatch names: the copy around `address` and the one after it;
-    /// their places in `copies`.
-    fn name(&mut self, address: u64, named: &mut Vec<usize>) {
-        for at in [address, (address & !(CELL - 1)) + CELL] {
-            if let Some(n) = self.map(at, CELL)
-                && !named.contains(&n)
-            {
-                named.push(n);
+    /// The structures named in a list's upload memory around `address`
+    /// (instances of a top-level build: a structure's address is their last
+    /// 8 bytes): the first page of each.
+    fn named_in_upload(&mut self, address: u64) {
+        let Some((from, len)) = crate::upload::block(address as usize) else {
+            return;
+        };
+        // SAFETY: the block is handed out and stays mapped; the title wrote
+        // it before it recorded the dispatch.
+        let words = unsafe { std::slice::from_raw_parts(from as *const u64, len / 8) };
+        let mut seen = std::collections::HashSet::new();
+        for &word in words {
+            if word & 0xFF == 0 && (1 << 32..1 << 37).contains(&word) && seen.insert(word / PAGE) && self.map(word / PAGE) {
+                let page = word / PAGE;
+                self.bring(page, page + 1);
             }
         }
     }
 
-    /// Every ten seconds or so, what was used (with the frame's line).
+    /// A title buffer too small to fill its pages, whose results come back:
+    /// windows of title memory itself around its pages, which go back.
+    fn small(&mut self, list: &HostList, start: u64, len: u64) {
+        let mut at = start;
+        while at < start + len {
+            let page = at / PAGE;
+            let n = ((page + 1) * PAGE).min(start + len) - at;
+            if self.copy_of(page).is_none()
+                && self.possible(page)
+                && let Some(shadow) = crate::shadow::by_address(page * PAGE, PAGE)
+                && let Some(k) = self.number(shadow)
+            {
+                fill(self.entry(page), k, 0);
+            }
+            if let Some(k) = self.copy_of(page)
+                && !self.pages.contains_key(&page)
+            {
+                self.copies[k].refresh(list, at, n);
+                self.copies[k].gpu_writes(list, at, n);
+                self.stats.back += 1;
+            }
+            at += n;
+        }
+    }
+
+    /// Every ten seconds or so, what was used.
     fn report(&mut self) {
         let now = std::time::Instant::now();
         let (since, frame) = *self.stats.from.get_or_insert((now, self.frame));
-        let seconds = now.duration_since(since).as_secs_f64();
-        if seconds < 10.0 {
+        if now.duration_since(since).as_secs_f64() < 10.0 {
             return;
         }
         let frames = self.frame.wrapping_sub(frame).max(1) as f64;
-        let (mut ours, mut bytes) = (0, 0);
-        for (s, own) in &self.copies {
-            if *own {
-                ours += 1;
-                bytes += s.span().1;
-            }
-        }
         let s = std::mem::take(&mut self.stats);
         tracing::info!(
-            "title memory by address: {ours} windows ({} MB) and {} title buffers; per frame {:.0} dispatches that read, {:.0} that write, \
-             {:.0} of the structure builder, {:.1} pages that had no copy, {:.1} results brought back",
-            bytes >> 20,
-            self.copies.len() - ours,
+            "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
+             {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
+             {:.1} pieces sent whole, {:.2} ms",
+            self.pages.len(),
+            (self.pages.len() as u64 * PAGE) >> 20,
+            self.arenas.len(),
+            self.copies.len(),
             s.uses[0] as f64 / frames,
             s.uses[1] as f64 / frames,
-            s.uses[2] as f64 / frames,
             s.faults as f64 / frames,
-            s.back as f64 / frames
+            s.unknown as f64 / frames,
+            s.back as f64 / frames,
+            s.looked as f64 / frames,
+            s.changed as f64 / 1024.0 / frames,
+            s.whole as f64 / frames,
+            s.micros as f64 / 1000.0 / frames
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -344,12 +492,32 @@ fn fill(entry: *mut u32, n: usize, offset: u64) {
     }
 }
 
+/// Puts what `title` holds into `ours` (what was last taken): the dwords that
+/// differ. How many, and whether the whole piece is to be sent again because
+/// so many did (or it was never taken).
+fn merge(title: &[u8; PIECE], ours: &mut [u8], never: bool) -> (usize, bool) {
+    if never {
+        ours.copy_from_slice(title);
+        return (PIECE / 4, true);
+    }
+    if ours == title {
+        return (0, false);
+    }
+    let mut changed = 0;
+    for (t, o) in title.chunks_exact(4).zip(ours.chunks_exact_mut(4)) {
+        if t != o {
+            o.copy_from_slice(t);
+            changed += 1;
+        }
+    }
+    (changed, changed > PIECE / 16)
+}
+
 /// Before a draw whose shader reads title memory by address: what its
-/// root arguments name gets its copies (`addresses`: its root views;
+/// root arguments name is made ready (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
 /// has its view in `heap`'s run and is brought up to date when `list` is
-/// submitted (what `use_` writes is copied back after, see the module).
-/// None if the host cannot hold it; the draw is then dropped.
+/// submitted. None if the host cannot hold it; the draw is then dropped.
 pub(crate) fn ready(list: &HostList, heap: &HostHeap, addresses: &[u64], constants: &[u32], use_: Use) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
@@ -361,30 +529,60 @@ pub(crate) fn ready(list: &HostList, heap: &HostHeap, addresses: &[u64], constan
         m.frame = frame;
         m.refused.clear();
         m.take_faults();
+        let n = m.order.len().div_ceil(SWEEP);
+        for _ in 0..n {
+            m.sweep = (m.sweep + 1) % m.order.len();
+            let page = m.order[m.sweep];
+            m.bring(page, page + 1);
+        }
         m.report();
     }
-    m.stats.uses[match use_ {
-        Use::Reads => 0,
-        Use::Writes => 1,
-        Use::Builder { .. } => 2,
-    }] += 1;
+    let builds = use_ != Use::Reads;
+    m.stats.uses[usize::from(builds)] += 1;
     let numbered = m.copies.len();
-    let mut named = Vec::new();
-    for &address in addresses {
-        m.name(address, &mut named);
-    }
+    // Once per list and page named: the builder dispatches hundreds of times
+    // a frame with the same arguments.
+    const READ: usize = usize::MAX - 0x6d;
+    let named = |kind: usize, at: u64| list.first_use(usize::MAX - (kind << 26) - (at / PAGE) as usize);
     // A title address in two constants (low dword, then bits 32 to 39), or
-    // in one in 256-byte units. A constant that only looks like one names
-    // memory nothing reads; one that is not the title's memory is refused.
+    // in one in 256-byte units (the builder's alone). A constant that only
+    // looks like one names memory nothing reads; one that is not the title's
+    // memory is refused.
+    let built = if builds { BUILT } else { PAGE };
     for (i, &c) in constants.iter().enumerate() {
         if let Some(&high) = constants.get(i + 1)
-            && (1..=0xFF).contains(&high)
+            && (1..=0x1F).contains(&high)
             && c >= 0x1_0000
         {
-            m.name(u64::from(c) | u64::from(high) << 32, &mut named);
+            let at = u64::from(c) | u64::from(high) << 32;
+            if named(1, at) {
+                m.ready(at, built);
+            }
         }
-        if c >= 0x0100_0000 {
-            m.name(u64::from(c) << 8, &mut named);
+        if builds && (0x0100_0000..0x2000_0000).contains(&c) {
+            let at = u64::from(c) << 8;
+            if named(1, at) {
+                m.ready(at, built);
+            }
+        }
+    }
+    for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
+        if !named(2, at) {
+            continue;
+        }
+        match crate::shadow::in_buffer(at, 1) {
+            Some((start, len)) if builds && len <= BACK => {
+                if use_ == (Use::Builds { back: true }) {
+                    m.small(list, start, len);
+                }
+                m.ready(at, 1);
+                m.named_in_upload(at);
+            }
+            Some(_) => {
+                m.ready(at, 1);
+                m.named_in_upload(at);
+            }
+            None => m.ready(at, if builds { VIEW } else { PAGE }),
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
@@ -397,74 +595,31 @@ pub(crate) fn ready(list: &HostList, heap: &HostHeap, addresses: &[u64], constan
             (base, 0)
         }
     };
-    for (n, (shadow, _)) in m.copies.iter().enumerate().skip(made as usize) {
+    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
         let (_, len) = shadow.span();
         heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
     // by that list's submission, which may run after this one's.
-    const READ: usize = usize::MAX - 0x6d;
-    const NAMED: usize = usize::MAX - 0x1_0000;
-    const WRITE: usize = usize::MAX - 0x2_0000;
-    const RESULT: usize = usize::MAX / 2;
     let first_read = list.first_use(READ);
-    if first_read {
-        let (start, len) = m.directory.1.span();
-        m.directory.1.refresh(list, start, len);
-        let sweep = m.swept != frame;
-        m.swept = frame;
-        for (shadow, own) in &m.copies {
-            if sweep || !own {
-                let (start, len) = shadow.span();
-                shadow.refresh(list, start, len);
-            }
-        }
-        list.keep(&m.faults.0);
-    } else if m.copies.len() > numbered {
+    let from = if first_read { 0 } else { numbered };
+    if first_read || m.copies.len() > numbered {
         let (start, len) = m.directory.1.span();
         m.directory.1.refresh(list, start, len);
     }
-    for (shadow, _) in &m.copies[numbered..] {
+    for shadow in &m.copies[from..] {
         let (start, len) = shadow.span();
         shadow.refresh(list, start, len);
     }
-    for &n in &named {
-        let (shadow, own) = &m.copies[n];
-        let (start, len) = shadow.span();
-        if *own && list.first_use(NAMED - n) {
-            shadow.refresh(list, start, len);
-        }
-        if use_ == Use::Writes && list.first_use(WRITE - n) {
-            #[cfg(feature = "diagnostics")]
-            crate::host::wide_write(start, len, 1);
-            shadow.gpu_writes(list, start, len);
-        }
+    if first_read {
+        list.keep(&m.faults.0);
+        #[cfg(feature = "diagnostics")]
+        m.dump(list, addresses);
     }
-    if use_ == (Use::Builder { back: true }) {
-        for &address in addresses {
-            let Some((start, len)) = crate::shadow::in_buffer(address, 1).filter(|b| b.1 <= BACK) else {
-                continue;
-            };
-            if !list.first_use(RESULT + start as usize) {
-                continue;
-            }
-            // The copy or copies its pages are in (it need not fill one).
-            let mut at = start;
-            while at < start + len {
-                let end = (at / PAGE + 1) * PAGE;
-                let n = end.min(start + len) - at;
-                if let Some(k) = m.map(at, CELL) {
-                    let shadow = &m.copies[k].0;
-                    shadow.refresh(list, at, n);
-                    shadow.gpu_writes(list, at, n);
-                    m.stats.back += 1;
-                }
-                at = end;
-            }
-        }
+    #[cfg(feature = "diagnostics")]
+    if use_ == Use::Reads {
+        m.dump.walked(addresses);
     }
     let directory = &m.directory.1;
     Some(Ready {
@@ -472,4 +627,124 @@ pub(crate) fn ready(list: &HostList, heap: &HostHeap, addresses: &[u64], constan
         faults: m.faults.2,
         base,
     })
+}
+
+/// `VICTORY_MEMORY_DUMP=<folder>`: when a file `go` appears there, the arenas
+/// as the card holds them are copied out and written (`arena-<n>.bin`), with
+/// `pages.txt` (title page, arena, offset) and the structures the walking
+/// programs were given: to look at the structures offline.
+#[cfg(feature = "diagnostics")]
+mod dump {
+    use super::*;
+
+    #[derive(Default)]
+    pub(super) struct Dump {
+        walked: std::collections::BTreeSet<u64>,
+        /// The frame it is written at, and the copies.
+        due: Option<(u64, Vec<(ID3D12Resource, usize)>)>,
+        done: bool,
+    }
+
+    impl Dump {
+        pub(super) fn walked(&mut self, addresses: &[u64]) {
+            if !self.done && self.walked.len() < 64 {
+                self.walked.extend(addresses);
+            }
+        }
+    }
+
+    fn folder() -> Option<&'static std::path::PathBuf> {
+        static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        FOLDER.get_or_init(|| std::env::var_os("VICTORY_MEMORY_DUMP").map(Into::into)).as_ref()
+    }
+
+    fn turn(buffer: &ID3D12Resource, before: D3D12_RESOURCE_STATES, after: D3D12_RESOURCE_STATES) -> D3D12_RESOURCE_BARRIER {
+        D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: the same pointer, not counted; the barrier is
+                    // used while the buffer lives.
+                    pResource: unsafe { std::mem::transmute_copy(buffer) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }
+    }
+
+    impl Memory {
+        /// At a list's first use: the copies are recorded into it.
+        pub(super) fn dump(&mut self, list: &HostList, _: &[u64]) {
+            let Some(folder) = folder() else { return };
+            if let Some((due, _)) = &self.dump.due {
+                if self.frame < *due {
+                    return;
+                }
+                let copies = self.dump.due.take().map(|d| d.1).unwrap_or_default();
+                let mut text = String::new();
+                for a in &self.dump.walked {
+                    text += &format!("walked {a:#x}\n");
+                }
+                for (page, held) in &self.pages {
+                    let arena = self.arenas.iter().position(|a| a.0 == held.copy).unwrap_or(usize::MAX);
+                    let at = held.at - self.arenas[arena].1;
+                    text += &format!("{:#x} {arena} {at:#x}\n", page * PAGE);
+                }
+                let _ = std::fs::write(folder.join("pages.txt"), text);
+                for (n, (_, data)) in copies.iter().enumerate() {
+                    // SAFETY: a mapping of an arena's bytes; the copies ran
+                    // frames ago.
+                    let bytes = unsafe { std::slice::from_raw_parts(*data as *const u8, ARENA as usize) };
+                    let _ = std::fs::write(folder.join(format!("arena-{n}.bin")), bytes);
+                }
+                tracing::info!(arenas = copies.len(), "title memory by address: the arenas are written out");
+                return;
+            }
+            if self.dump.done || !folder.join("go").exists() {
+                return;
+            }
+            self.dump.done = true;
+            let Some(host) = host() else { return };
+            let mut copies = Vec::new();
+            for &(n, _) in &self.arenas {
+                let buffer = &self.copies[n].buffer;
+                let Some((to, data)) = host.shared_buffer(ARENA) else { break };
+                // SAFETY: an open list; live buffers of those sizes. The list
+                // has not used the arena yet.
+                unsafe {
+                    list.list.ResourceBarrier(&[turn(buffer, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    list.list.CopyBufferRegion(&to, 0, buffer, 0, ARENA);
+                    list.list.ResourceBarrier(&[turn(buffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON)]);
+                }
+                list.keep(&to);
+                copies.push((to, data as usize));
+            }
+            self.dump.due = Some((self.frame + 12, copies));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_piece_takes_what_changed_and_is_sent_whole_when_much_did() {
+        let mut title = [7u8; PIECE];
+        let mut ours = vec![0u8; PIECE];
+        assert_eq!(merge(&title, &mut ours, true), (PIECE / 4, true));
+        assert_eq!(ours, title);
+        assert_eq!(merge(&title, &mut ours, false), (0, false));
+        // A dword of it.
+        title[41] = 8;
+        assert_eq!(merge(&title, &mut ours, false), (1, false));
+        assert_eq!(ours, title);
+        // Other data.
+        title[..PIECE / 2].fill(9);
+        assert_eq!(merge(&title, &mut ours, false), (PIECE / 8, true));
+        assert_eq!(ours, title);
+    }
 }

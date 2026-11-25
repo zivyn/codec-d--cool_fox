@@ -133,6 +133,16 @@ impl Drop for Upload {
     }
 }
 
+/// The block handed out that holds `address`: its start and bytes (whole
+/// [`BLOCK`]s).
+pub(crate) fn block(address: usize) -> Option<(usize, usize)> {
+    let arenas = ARENAS.lock().unwrap_or_else(|e| e.into_inner());
+    let arena = arenas.iter().find(|a| (a.at..a.at + a.taken.len() * BLOCK).contains(&address))?;
+    let first = (address - arena.at) / BLOCK;
+    let n = arena.taken[first..].iter().take_while(|t| **t).count();
+    (n > 0).then_some((arena.at + first * BLOCK, n * BLOCK))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

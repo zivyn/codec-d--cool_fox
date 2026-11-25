@@ -1030,7 +1030,9 @@ impl State {
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
         for root in self.roots_ref(compute) {
             match root {
-                Root::View(address) => addresses.push(*address),
+                // (Of a program that only walks structures, the structures'
+                // views below: its root views are constants and tables.)
+                Root::View(address) if use_ != crate::memory::Use::Reads => addresses.push(*address),
                 Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }
@@ -1237,10 +1239,8 @@ impl State {
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
                 // Only through a store by address: what it stores through
                 // views is declared with them.
-                let use_ = if crate::pipeline::is_builder(self.pipeline as This) {
-                    crate::memory::Use::Builder { back: writes }
-                } else if writes && t.stores_by_address {
-                    crate::memory::Use::Writes
+                let use_ = if crate::pipeline::is_builder(self.pipeline as This) || writes && t.stores_by_address {
+                    crate::memory::Use::Builds { back: writes }
                 } else {
                     crate::memory::Use::Reads
                 };

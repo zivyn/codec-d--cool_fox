@@ -3587,6 +3587,11 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Offsets `[from, to)` go up again whole, as the CPU's side has them.
+    pub(crate) fn resend(&self, from: usize, to: usize) {
+        self.card_changed(from, to);
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
@@ -4566,16 +4571,14 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
     found.map(|(k, e)| (k.0, e.end - k.0))
 }
 
-/// A copy of the title memory `[start, start + len)` outside buffers for the
-/// programs that find memory by address ([`crate::memory`]), on the card: the
-/// structures rays are traced through, read with every step of every ray.
+/// A copy of the memory `[start, start + len)` (an arena of
+/// [`crate::memory`]'s, its directory, title memory around a small buffer)
+/// for the programs that find memory by address, on the card: the structures
+/// rays are traced through, read with every step of every ray.
 ///
-/// What shaders write there by address is not brought back to title memory
-/// (nothing else reads a structure; the first whole run of the builder wrote
-/// garbage over the title's objects), so the copy is the only place that has
-/// it. The CPU's side holds the title's bytes as they were last taken, and
-/// only dwords the title changed since go up: a page the title writes a part
-/// of keeps what shaders wrote in the rest.
+/// What shaders write there by address is not brought back, so the copy is
+/// the only place that has it. The CPU's side holds the bytes as they were
+/// last taken, and only dwords that changed since go up.
 pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     let host = host()?;
     if !cards() || !host.card_ready() {

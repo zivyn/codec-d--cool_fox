@@ -2542,7 +2542,7 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
-/// Raw twins ([`raw_twins`]) made since the start, and those of them that had
+/// Raw twins ([`raw_twins`]) made since the last frame line, and those of them that had
 /// to be views as the title's slot has them (a raw view begins on 16 bytes).
 pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 

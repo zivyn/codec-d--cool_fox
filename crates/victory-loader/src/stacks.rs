@@ -66,10 +66,8 @@ struct BasicInfo {
 #[repr(C, align(16))]
 struct Aligned(CONTEXT);
 
-/// Prints every other thread's stack to stderr. Each thread is suspended
-/// only while its context is read and unwound into a buffer allocated
-/// beforehand (it may hold the heap lock).
-pub fn dump_stacks() {
+/// The ids of this process's threads but the caller's.
+pub(crate) fn other_threads() -> Vec<u32> {
     // SAFETY: plain queries and a snapshot of this process's threads.
     let (me, process, snapshot) = unsafe {
         (
@@ -79,7 +77,7 @@ pub fn dump_stacks() {
         )
     };
     if snapshot == INVALID_HANDLE_VALUE {
-        return;
+        return Vec::new();
     }
     let mut ids = Vec::new();
     // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
@@ -96,6 +94,14 @@ pub fn dump_stacks() {
     }
     // SAFETY: we opened it.
     unsafe { CloseHandle(snapshot) };
+    ids
+}
+
+/// Prints every other thread's stack to stderr. Each thread is suspended
+/// only while its context is read and unwound into a buffer allocated
+/// beforehand (it may hold the heap lock).
+pub fn dump_stacks() {
+    let ids = other_threads();
     eprintln!("VIctory: stacks of {} threads", ids.len());
     for id in ids {
         // SAFETY: opens a thread of our own process.
@@ -124,7 +130,7 @@ pub fn dump_stacks() {
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
-fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
+pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     let mut frames = Vec::with_capacity(MAX_FRAMES);
     let mut info: BasicInfo = BasicInfo {
         exit_status: 0,
@@ -173,7 +179,7 @@ fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     (frames, (info.priority, info.base_priority, info.affinity))
 }
 
-fn start_of(thread: HANDLE) -> usize {
+pub(crate) fn start_of(thread: HANDLE) -> usize {
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.
     unsafe {
@@ -188,7 +194,7 @@ fn start_of(thread: HANDLE) -> usize {
     start
 }
 
-fn name_of(thread: HANDLE) -> String {
+pub(crate) fn name_of(thread: HANDLE) -> String {
     let mut name = std::ptr::null_mut();
     // SAFETY: the system allocates the string; we free it with LocalFree.
     unsafe {

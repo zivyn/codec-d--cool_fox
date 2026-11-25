@@ -8505,15 +8505,18 @@ fn indirects_around(history: &[D3D12_AUTO_BREADCRUMB_OP], done: usize, all: &ind
     let all = all.lock().unwrap_or_else(|e| e.into_inner());
     let mut text = String::new();
     let mut shown = 0;
+    let mesh = |op: &D3D12_AUTO_BREADCRUMB_OP| *op == D3D12_AUTO_BREADCRUMB_OP_DISPATCHMESH;
     for (at, op) in history.iter().enumerate().skip(done.saturating_sub(1)) {
         if shown == 4 || (at > done && *op == D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER) {
             break;
         }
-        if !indirect(op) {
+        if !indirect(op) && !mesh(op) {
             continue;
         }
         shown += 1;
-        let Some((what, words)) = all.nth(indirects::before(history, at, indirect)) else {
+        let direct = mesh(op);
+        let nth = if direct { indirects::before(history, at, mesh) } else { indirects::before(history, at, indirect) };
+        let Some((what, words)) = all.nth(nth, direct) else {
             continue;
         };
         text.push_str(&format!("; command {at} ran {what}"));

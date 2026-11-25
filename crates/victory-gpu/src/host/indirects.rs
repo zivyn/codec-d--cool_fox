@@ -14,6 +14,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+/// The kind of a direct mesh dispatch.
+pub(crate) const DIRECT: u32 = u32::MAX;
+
 /// Words of user data kept of each execution.
 pub(crate) const WORDS: usize = 16;
 
@@ -31,6 +34,8 @@ pub(crate) struct Ran {
 pub(crate) struct Indirects {
     names: HashMap<usize, String>,
     ran: Vec<Ran>,
+    /// The direct mesh dispatches, likewise.
+    meshes: Vec<Ran>,
 }
 
 /// A list's, shared with the report's table of lists.
@@ -39,28 +44,40 @@ pub(crate) type Shared = Arc<Mutex<Indirects>>;
 impl Indirects {
     /// An indirect execution of `kind` (the argument's type) of at most
     /// `count` records with `pipeline` (a host object) and user data.
+    /// A direct mesh dispatch of `count` groups is of kind [`DIRECT`].
     pub(crate) fn note(&mut self, pipeline: usize, name: &str, kind: u32, count: u32, user: &[u32]) {
         self.names.entry(pipeline).or_insert_with(|| name.to_owned());
         let used = user.len().min(WORDS);
         let mut words = [0; WORDS];
         words[..used].copy_from_slice(&user[..used]);
-        self.ran.push(Ran { pipeline, kind, count, words, used: used as u8 });
+        let ran = Ran { pipeline, kind, count, words, used: used as u8 };
+        if kind == DIRECT {
+            self.meshes.push(ran);
+        } else {
+            self.ran.push(ran);
+        }
     }
 
     pub(crate) fn clear(&mut self) {
         self.ran.clear();
+        self.meshes.clear();
         if self.names.len() > 512 {
             self.names.clear();
         }
     }
 
-    /// The `nth` execution (from 0): its text and its user data.
-    pub(crate) fn nth(&self, nth: usize) -> Option<(String, &[u32])> {
-        let ran = self.ran.get(nth)?;
+    /// The `nth` execution (from 0), or direct mesh dispatch: its text and
+    /// its user data.
+    pub(crate) fn nth(&self, nth: usize, direct: bool) -> Option<(String, &[u32])> {
+        let ran = if direct { &self.meshes } else { &self.ran }.get(nth)?;
         let name = self.names.get(&ran.pipeline).map_or("a pipeline", String::as_str);
         let words = &ran.words[..usize::from(ran.used)];
         Some((
-            format!("{name} (indirect kind {} max {}, the list's indirect execution {nth}, user data {words:x?})", ran.kind, ran.count),
+            if direct {
+                format!("{name} (a mesh dispatch of {} groups, the list's {nth}, user data {words:x?})", ran.count)
+            } else {
+                format!("{name} (indirect kind {} max {}, the list's indirect execution {nth}, user data {words:x?})", ran.kind, ran.count)
+            },
             words,
         ))
     }
@@ -104,16 +121,20 @@ mod tests {
         let history = [6, 5, 15, 5, 5];
         let nth = before(&history, 3, |op| *op == 5);
         assert_eq!(nth, 1);
-        let (text, words) = all.nth(nth).unwrap();
+        let (text, words) = all.nth(nth, false).unwrap();
         assert!(text.starts_with("[compute b] (indirect kind 2 max 1"), "{text}");
         assert_eq!(words, [7; WORDS]);
-        let (text, words) = all.nth(2).unwrap();
+        all.note(2, "[mesh b]", DIRECT, 9, &[1]);
+        let (text, _) = all.nth(0, true).unwrap();
+        assert!(text.starts_with("[compute b] (a mesh dispatch of 9 groups"), "{text}");
+        assert!(all.nth(1, true).is_none());
+        let (text, words) = all.nth(2, false).unwrap();
         assert!(text.starts_with("[compute a] (indirect kind 10 max 4"), "{text}");
         assert!(words.is_empty());
-        assert!(all.nth(3).is_none());
+        assert!(all.nth(3, false).is_none());
         assert_eq!(before(&history, 99, |op| *op == 5), 3);
         all.clear();
-        assert!(all.nth(0).is_none());
+        assert!(all.nth(0, false).is_none() && all.nth(0, true).is_none());
     }
 
     /// A table's byte offset names the slots from it on; a small word that

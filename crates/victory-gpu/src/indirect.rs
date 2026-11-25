@@ -29,7 +29,7 @@
 //! garbage records cannot run for seconds either.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
+//! groups per dimension, in x 2^20 ([`widest`]), and 2^20 per dispatch, one-dimensional mesh
 //! dispatches, the budget) cut legitimate work beyond them; raise them if
 //! the title needs more.
 
@@ -107,9 +107,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = count * instances;
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = src_args.Load3(src_at);
+        // Up to WIDEST groups in x run as asked (`widest`).
+        g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64u;
@@ -237,9 +239,42 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     make_from(device, SOURCE)
 }
 
+/// The most groups in x that an indirect dispatch runs as the title asks:
+/// 65,535 is the most D3D12 names for a dispatch, 2^20 ([`SOURCE`]'s GROUPS)
+/// what is bounded here anyway (`VICTORY_INDIRECT_WIDE=0`: 65,535; a record
+/// that asks for more still runs 65,535).
+///
+/// The title's tile lists are dispatches of one group per tile, and two of
+/// them are classes of the picture's 8x4 tiles, 115,200 in all at
+/// 2560x1440: in a captured frame 67,440 and 47,760 (the program
+/// 2dc364df5d3278b8 and 940c2635dc1312f4). Cut to 65,535 the first list lost
+/// its last 1,905 tiles, the lowest of the picture. The console runs what it
+/// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
+/// dispatch packets and group numbers are the same; D3D12 does not look at
+/// indirect counts. Other cards stay at 65,535.
+fn widest(amd: bool) -> u32 {
+    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
+    if amd && on { 1 << 20 } else { 65_535 }
+}
+
+/// Whether `device` is an AMD card's.
+fn amd(device: &ID3D12Device) -> bool {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    // SAFETY: plain queries.
+    unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+            .is_ok_and(|d| d.VendorId == 0x1002)
+    }
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    #[cfg(feature = "diagnostics")]
+    let batched = source == batch::SOURCE;
+    let source = &format!("#define WIDEST {}u\n{source}", widest(amd(device)));
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -1027,11 +1062,11 @@ void main() {
             1,
             [5, 1, 1, 0x7777_8888, 0x9999_AAAA, 0xBBBB_CCCC],
         );
-        // Record 2 exceeds 65,535 in X -> clamped to (65535, 1, 1).
+        // Record 2 exceeds what any card runs in X -> clamped to (65535, 1, 1).
         write_record(
             &mut initial_src,
             2,
-            [100_000, 1, 1, 0xDDDD_EEEE, 0xFFFF_0001, 0x0123_4567],
+            [(1 << 20) + 1, 1, 1, 0xDDDD_EEEE, 0xFFFF_0001, 0x0123_4567],
         );
         for slot in 3..MAX as usize {
             // Each garbage slot would clamp to 65535 * 16 * 1 = 1,048,560 groups
@@ -1830,6 +1865,75 @@ void main() {
             device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut sig).unwrap();
         }
         sig.unwrap()
+    }
+
+    /// An AMD card runs every group of an indirect dispatch of more than
+    /// 65,535, each under its own number: the title's tile lists
+    /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
+    #[test]
+    fn card_runs_wide_indirect_dispatches() {
+        const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedMax(4, group.x, was);
+    seen.InterlockedMax(8, thread.x, was);
+    seen.InterlockedAdd(16 + group.x * 4, 1, was);
+}
+"#;
+        let Some(mut gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        if !amd(&gpu.device) || widest(true) == 65_535 {
+            return;
+        }
+        let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
+        let pass = make_from(&gpu.device, batch::SOURCE).expect("the batched clamp must compile");
+        let sig = gpu.signature(2, 12);
+        for asked in [67_440u32, 115_200, 1 << 20, (1 << 20) + 1] {
+            let runs = if asked > 1 << 20 { 65_535 } else { asked };
+            for batched in [false, true] {
+                let (src, src_ptr, src_gpu) = gpu.shared_buffer(1024);
+                let (_budget, budget_ptr, budget_gpu) = gpu.shared_buffer(256);
+                let (_table, table_ptr, table_gpu) = gpu.shared_buffer(batch::TABLE);
+                let size = 16 + (4 << 20) + 16;
+                let seen = gpu.default_uav(size);
+                let (back, back_ptr, _) = gpu.shared_buffer(size);
+                let dst = gpu.default_uav(64 << 10);
+                // SAFETY: mapped buffers, which nothing reads yet; an open
+                // list and live buffers.
+                unsafe {
+                    std::ptr::write_bytes(budget_ptr, 0, 256);
+                    for (w, word) in [asked, 1, 1].into_iter().enumerate() {
+                        src_ptr.cast::<u32>().add(w).write_volatile(word);
+                    }
+                    if batched {
+                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                        assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
+                    } else {
+                        let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
+                        assert!(record_clamp_as(&gpu.clamp, &gpu.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false));
+                    }
+                    gpu.list.SetComputeRootSignature(&worker.root);
+                    gpu.list.SetPipelineState(&worker.pso);
+                    gpu.list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+                    gpu.list.ExecuteIndirect(&sig, 1, &dst, 0, None, 0);
+                    gpu.list.ResourceBarrier(&[uav_barrier()]);
+                    gpu.list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    gpu.list.CopyBufferRegion(&back, 0, &seen, 0, size);
+                }
+                gpu.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let word = |i: usize| unsafe { back_ptr.cast::<u32>().add(i).read_volatile() };
+                assert_eq!([word(0), word(1), word(2)], [runs, runs - 1, runs - 1], "asked for {asked}, batched {batched}");
+                let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
+                assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
+            }
+        }
     }
 
     /// What a batch's table says of records added to it: one job per

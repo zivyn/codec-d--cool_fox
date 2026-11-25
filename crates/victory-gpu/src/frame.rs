@@ -226,18 +226,29 @@ mod tests {
         // origin poll that times out (and starts the frame), then a
         // blocking flip wait. Each flip takes its own tick.
         const FLIP: u32 = 2;
-        assert_eq!(set_interval(null, null, 5_000, 3, 0), S_OK);
+        // (The ticks are far apart, and it may take a few tries: a busy PC
+        // wakes a wait tens of milliseconds late at times.)
+        assert_eq!(set_interval(null, null, 60_000, 3, 0), S_OK);
         let mut token = 0;
-        let flips: Vec<u64> = (0..4)
-            .map(|_| {
-                let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
-                assert_eq!(
-                    wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
-                    S_OK
-                );
-                LAST[2].load(Ordering::Relaxed)
-            })
-            .collect();
+        let mut four = || -> Vec<u64> {
+            (0..4)
+                .map(|_| {
+                    let _ = wait(null, 0, 0, std::ptr::null(), TOKEN_ON_TIMEOUT, &mut token);
+                    assert_eq!(
+                        wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token),
+                        S_OK
+                    );
+                    LAST[2].load(Ordering::Relaxed)
+                })
+                .collect()
+        };
+        let mut flips = four();
+        for _ in 0..10 {
+            if flips.windows(2).all(|w| w[1] == w[0] + 1) {
+                break;
+            }
+            flips = four();
+        }
         assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);

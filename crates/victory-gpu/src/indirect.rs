@@ -491,7 +491,7 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -521,6 +521,19 @@ void main() {
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        /// Last, so given up last.
+        _turn: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// The software adapter is one test's at a time. Two tests that compile
+    /// and run shaders on it at once (it is one device for the process) make
+    /// `d3d10warp.dll` (10.0.26100) crash now and then: access violations in
+    /// its own shader compiler, on its own worker threads, in 12% of runs of
+    /// all tests and 3% of runs of these alone on two threads; none in 100
+    /// runs one after the other.
+    pub(crate) fn warp_turn() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        TURN.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     impl WarpHarness {
@@ -530,6 +543,7 @@ void main() {
 
         /// On the software adapter, or the first one (for measurements).
         fn on(software: bool) -> Option<Self> {
+            let turn = warp_turn();
             // SAFETY: plain DXGI query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -572,6 +586,7 @@ void main() {
                     event,
                     clamp,
                     worker,
+                    _turn: turn,
                 })
             }
         }

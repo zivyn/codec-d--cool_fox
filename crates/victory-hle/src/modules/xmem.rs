@@ -1028,7 +1028,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             continue;
         };
         physical.forget_view(at, size, &slice);
-        victory_gpu::title_memory_remapped(at, size);
+        victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(

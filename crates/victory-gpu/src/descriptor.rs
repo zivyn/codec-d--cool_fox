@@ -514,8 +514,8 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 }
 
 /// Runs `f` with the host heap of the title's largest view heap, if there is
-/// one (reports: nothing is waited for).
-#[cfg(all(windows, feature = "diagnostics"))]
+/// one (nothing is waited for).
+#[cfg(windows)]
 pub(crate) fn with_view_heap<T>(f: impl FnOnce(&host::HostHeap) -> T) -> Option<T> {
     let heaps = SHADER_HEAPS.try_read().ok()?;
     let host = heaps

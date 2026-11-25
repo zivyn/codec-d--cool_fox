@@ -69,6 +69,8 @@ mod tdr;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod upload;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]

@@ -83,6 +83,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// Of a copy with two sides: only the dwords the title changed go up,
+    /// as with [`send_changed`] ([`by_address`]).
+    changes_only: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -2631,6 +2634,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            changes_only: false,
             place: None,
         }
     }
@@ -3515,7 +3519,7 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let Some(card) = self.card.as_ref().filter(|_| send_changed()) else {
+        let Some(card) = self.card.as_ref().filter(|_| self.changes_only || send_changed()) else {
             return self.copy(from, to);
         };
         let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
@@ -4552,6 +4556,71 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
     windows
         .filter(|&(start, bytes)| start >= cell && start <= step && start + bytes == cell + len)
         .min()
+}
+
+/// Whether `[address, address + len)` lies in one title buffer.
+pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
+    let end = address.checked_add(len)?;
+    let map = buffers_read();
+    let found = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
+    found.map(|(k, e)| (k.0, e.end - k.0))
+}
+
+/// A copy of the title memory `[start, start + len)` outside buffers for the
+/// programs that find memory by address ([`crate::memory`]), on the card: the
+/// structures rays are traced through, read with every step of every ray.
+///
+/// What shaders write there by address is not brought back to title memory
+/// (nothing else reads a structure; the first whole run of the builder wrote
+/// garbage over the title's objects), so the copy is the only place that has
+/// it. The CPU's side holds the title's bytes as they were last taken, and
+/// only dwords the title changed since go up: a page the title writes a part
+/// of keeps what shaders wrote in the rest.
+pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
+    let host = host()?;
+    if !cards() || !host.card_ready() {
+        return None;
+    }
+    // At most so much on the card's own memory (2 GiB unless
+    // `VICTORY_MEMORY_CARD_MB` says otherwise), and while it has room; past
+    // that the side shaders see is in the PC's memory.
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static USED: AtomicU64 = AtomicU64::new(0);
+    let most = *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(2048) << 20
+    });
+    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    let (staging, data) = host.shared_buffer(len)?;
+    let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
+        host.uav_buffer(len)
+    } else {
+        None
+    };
+    let buffer = match on_card {
+        Some(buffer) => buffer,
+        None => host.shared_buffer(len)?.0,
+    };
+    crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
+    crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
+    // (Counted down with the windows' on the card when it goes.)
+    WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.window = true;
+    shadow.changes_only = true;
+    shadow.card = Some(Card {
+        staging,
+        before: Mutex::default(),
+        dirty: Mutex::default(),
+        sent: Mutex::default(),
+        touched: Default::default(),
+        size: len,
+    });
+    let shadow = Arc::new(shadow);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    Some(shadow)
 }
 
 /// Copies of title memory outside buffers, by (start, length).

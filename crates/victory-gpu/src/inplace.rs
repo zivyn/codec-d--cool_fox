@@ -269,9 +269,12 @@ struct Views {
     views: BTreeMap<usize, (usize, usize, u64)>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// Our own view of a whole section, by its handle (0: the host gave
+    /// none), made when first asked for ([`beside`]) and kept.
+    whole: Vec<(usize, usize)>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new(), whole: Vec::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -280,39 +283,28 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    title_memory_section_gone(section);
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
+    // A handle's number given out again: the view was of the section that
+    // had it before (it stays mapped: someone may be writing through it).
+    v.whole.retain(|w| w.0 != section);
     v.sections.push((section, bytes, committed));
 }
 
-/// Views of ours of whole sections, by the section's handle: where.
-static WINDOWS: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
-
-/// The runtime lets go of a section, and of its handle: no view of it is
-/// mapped any more.
+/// The runtime lets go of a section, and of its handle: no view the title
+/// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
-    let window = WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&section);
-    if let Some(base) = window.filter(|&base| base != 0) {
-        // SAFETY: a view of ours. Who writes through it holds off the
-        // runtime's unmapping of the view it found the section by
-        // (`crate::watch::land_through`), which came before this.
+    let whole = {
+        let mut v = views();
+        let at = v.whole.iter().position(|w| w.0 == section);
+        at.map(|i| v.whole.swap_remove(i).1)
+    };
+    if let Some(base) = whole.filter(|&base| base != 0) {
+        // SAFETY: a view of ours. Who writes through it found the section
+        // in a view the title saw and holds off its unmapping
+        // (`crate::watch::title_memory_reading`), which came before this.
         unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut c_void }) };
     }
-}
-
-/// Where a view of ours of all of `section` is, made when first asked for;
-/// `None` if the host gives none. The caller holds off remapping
-/// (`crate::title_memory_reading`) and found the section in a view the
-/// runtime told us of, so the section lives.
-pub(crate) fn window(section: usize) -> Option<usize> {
-    let bytes = views().sections.iter().find(|s| s.0 == section)?.1;
-    let mut windows = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
-    let base = *windows.entry(section).or_insert_with(|| {
-        // SAFETY: a live section of that many bytes.
-        unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize
-    });
-    (base != 0).then_some(base)
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
@@ -371,6 +363,36 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+/// Another address of the title memory `[at, at + len)`, if it is a view of
+/// the title's pages, all of it one run of a section: in a view of ours of
+/// the whole section, which is never guarded (`crate::watch`) nor changed.
+///
+/// The section's pages are reserved and the runtime commits each before it
+/// shows it, which holds for every view of the section. The caller holds
+/// `crate::watch::title_memory_reading`: until it lets go the title sees
+/// the same pages at `at`.
+pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
+    let mut v = views();
+    let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
+        return None;
+    };
+    let base = match v.whole.iter().find(|w| w.0 == section) {
+        Some(w) => w.1,
+        None => {
+            let &(_, bytes, _) = v.sections.iter().find(|s| s.0 == section)?;
+            // SAFETY: the whole of a section the runtime made; a view the
+            // title sees is of it, so its handle is open.
+            let base = unsafe { mem::MapViewOfFile(section as _, mem::FILE_MAP_WRITE, 0, 0, bytes as usize) }.Value as usize;
+            if base == 0 {
+                tracing::warn!(error = %std::io::Error::last_os_error(), "no view of the title's pages beside its own");
+            }
+            v.whole.push((section, base));
+            base
+        }
+    };
+    (base != 0).then(|| base + offset as usize)
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and

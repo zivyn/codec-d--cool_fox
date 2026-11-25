@@ -589,10 +589,9 @@ fn published(start: usize, end: usize) -> bool {
 /// askings and the KiB they walked; view ranges answered by their bits, by
 /// the guards whole clean, and block by block; blocks made read-only; blocks
 /// opened by ourselves; nanoseconds waiting for the guards' lock and
-/// nanoseconds of changing protections (all threads); pieces put into title
-/// memory past the guards ([`land_through`]).
+/// nanoseconds of changing protections (all threads).
 #[cfg(feature = "diagnostics")]
-static ASKS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static ASKS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
 #[cfg(feature = "diagnostics")]
 fn tally(what: usize, n: u64) {
@@ -601,7 +600,7 @@ fn tally(what: usize, n: u64) {
 
 /// [`ASKS`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn asks() -> [u64; 10] {
+pub(crate) fn asks() -> [u64; 9] {
     std::array::from_fn(|i| ASKS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
@@ -637,82 +636,82 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
 /// and the frame it last was.
-static LANDED: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+static LANDED: Mutex<Option<std::collections::HashMap<usize, u64, std::hash::BuildHasherDefault<PageHash>>>> = Mutex::new(None);
+
+/// A page's number, spread: some 20,000 a frame are noted in [`LANDED`].
+#[derive(Default)]
+struct PageHash(u64);
+
+impl std::hash::Hasher for PageHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(26).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
-    note_landed(at, len);
+    {
+        let frame = crate::frame::current();
+        let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
+        let landed = landed.get_or_insert_with(Default::default);
+        for page in at / 4096..=(at + len.max(1) - 1) / 4096 {
+            landed.insert(page, frame);
+        }
+    }
     writing(at, len);
 }
 
-fn note_landed(at: usize, len: usize) {
-    let frame = crate::frame::current();
-    let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
-    let landed = landed.get_or_insert_with(Default::default);
-    for page in at / 4096..=(at + len.max(1) - 1) / 4096 {
-        landed.insert(page, frame);
-    }
-}
 
-/// Whether what shaders wrote goes into guarded title memory past the guard
-/// (`VICTORY_LAND_WINDOW=1`; off by default, not yet run in the game).
+/// What shaders wrote went into title memory through another view of the
+/// same pages (`crate::inplace::beside`): `pages` (of 4 KiB, by number)
+/// hold some of it, all of them in `spans` (address, bytes).
 ///
-/// Each piece put into title memory took the guard off its block, and the
-/// next refresh of a copy of it put it on again, two changes of protection
-/// under the guards' one lock, 10 microseconds each with the title's threads
-/// running: some 1,600 pieces a frame, in the relay's landing and in the
-/// submitting thread's refreshes. The title's own writes take some 260.
-fn land_window() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_WINDOW").is_some_and(|v| v == "1") && light())
-}
-
-/// With [`land_window`], if `[at, at + len)` is guarded view memory: `put`
-/// writes what shaders wrote there, at the address it is given, through a
-/// view of ours of the same section. Whether it did (`put` says whether it
-/// could); if not the caller goes the other way ([`landing`]), `put` begun
-/// or not.
-///
-/// Why it is the same: the runtime tells of every view it maps, and forgets
-/// those it unmaps, under the lock held here for reading, so while it is
-/// held the pages the title sees at `at` are the pages written. The block
-/// stays read-only for the title, whose own writes are seen as before. Ours
-/// is noted in the journal, after the bytes are in: an asking before that
-/// may or may not copy them, and has a number under the note's, so the next
-/// one copies the page (again).
-pub(crate) fn land_through(at: usize, len: usize, put: impl FnOnce(*mut u8) -> bool) -> bool {
-    land_window() && land_past(at, len, put)
-}
-
-fn land_past(at: usize, len: usize, put: impl FnOnce(*mut u8) -> bool) -> bool {
-    if len == 0 || !published(at, at + len) {
-        return false;
+/// Nothing faulted and no guard was opened. A guarded block stays read-only,
+/// clean, and known by its bit ([`PUBLISHED`]), all of which say that the
+/// title wrote nothing there: our write is an entry of the journal, which
+/// every answer about the block comes from, the quick ones and the guards'
+/// alike (a block whose guard is off they report anyway). So neither the
+/// guards' lock nor a protection is touched here, or by the next refresh.
+/// Noted after the bytes are in, never before: a copy that read the block
+/// before they were did so with the number of an asking made before that,
+/// which is under the one given here, and takes it again; noted before, a
+/// copy could read the older bytes with a number above the note's.
+pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) {
+    {
+        let frame = crate::frame::current();
+        let mut landed = LANDED.lock().unwrap_or_else(|e| e.into_inner());
+        let landed = landed.get_or_insert_with(Default::default);
+        for &page in pages {
+            landed.insert(page, frame);
+        }
     }
-    let Some(_mapped) = title_memory_reading_now() else {
-        return false;
-    };
-    let crate::inplace::Cover::Run(section, offset) = crate::inplace::cover(at, len) else {
-        return false;
-    };
-    let Some(base) = crate::inplace::window(section) else {
-        return false;
-    };
-    if !put((base + offset as usize) as *mut u8) {
-        return false;
-    }
-    note_landed(at, len);
     {
         let mut j = journal_mut();
         let now = next_asking();
-        for page in at / PAGE..(at + len).div_ceil(PAGE) {
-            j.written.insert(page, now);
+        let mut last = usize::MAX;
+        for &page in pages {
+            let block = page * KERNEL_PAGE / PAGE;
+            if block != last {
+                j.written.insert(block, now);
+                last = block;
+            }
         }
     }
-    #[cfg(feature = "diagnostics")]
-    tally(9, 1);
-    // As `writing` says.
-    crate::descriptor::host::remapped(at, len);
-    true
+    for &(at, len) in spans {
+        // A placed texture there changes with no descriptor written.
+        crate::descriptor::host::remapped(at, len);
+    }
 }
 
 /// Whether shaders' writes went into a page of `[at, at + len)` in the last
@@ -727,7 +726,8 @@ pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
 
 /// Whether every block of `[at, at + len)` is view memory written since a
 /// host copy last took it: guarded then, and the guard is off. (Written by
-/// the title, or by us putting a flight's shader writes into it.) Not for
+/// the title, or by us putting a flight's shader writes into it, if not
+/// beside the guard, [`landed_beside`].) Not for
 /// blocks no copy ever took, which were never guarded: the caller's range
 /// lies in a copy a flight was given, which took all of it.
 pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
@@ -736,7 +736,7 @@ pub(crate) fn written_since_taken(at: usize, len: usize) -> bool {
     }
     let g = guards();
     (at / BLOCK..=(at + len - 1) / BLOCK)
-        .all(|b| !g.protected.contains(&b) && !g.clean.contains(&b) && !g.absent.contains(&b))
+        .all(|b| !g.clean.contains(&b) && !g.absent.contains(&b))
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -1589,12 +1589,11 @@ mod many_askers_tests {
                             // or past the guard.
                             let word = at + page * PAGE + t * 8;
                             // SAFETY (both): as above.
-                            let put = next(3) == 0
-                                && super::land_past(word, 8, |to| {
-                                    unsafe { to.cast::<u64>().write_volatile(2) };
-                                    true
-                                });
-                            if put {
+                            let reading = (next(3) == 0).then(super::title_memory_reading_now).flatten();
+                            let beside = reading.as_ref().and_then(|_| crate::inplace::beside(word, 8));
+                            if let Some(to) = beside {
+                                unsafe { (to as *mut u64).write_volatile(2) };
+                                super::landed_beside(&[word / 4096], &[(word, 8)]);
                                 past.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 assert_eq!(unsafe { (word as *const u64).read_volatile() }, 2, "put elsewhere");
                             } else {

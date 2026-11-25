@@ -151,11 +151,48 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
 });
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
-    JOURNAL.read().unwrap_or_else(|e| e.into_inner())
+    if let Ok(j) = JOURNAL.try_read() {
+        return j;
+    }
+    waited(1, || JOURNAL.read().unwrap_or_else(|e| e.into_inner()))
 }
 
 fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
-    JOURNAL.write().unwrap_or_else(|e| e.into_inner())
+    if let Ok(j) = JOURNAL.try_write() {
+        return j;
+    }
+    waited(2, || JOURNAL.write().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Since the last line: waits and nanoseconds of waiting, of all threads, for
+/// the ranges held ([`ASKING`]), the journal to read it, the journal to note
+/// in it, and the guards (faults of the title's among them).
+#[cfg(feature = "diagnostics")]
+static WAITS: [[std::sync::atomic::AtomicU64; 2]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4];
+
+#[cfg(feature = "diagnostics")]
+fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering::Relaxed;
+    let began = std::time::Instant::now();
+    let got = f();
+    WAITS[what][0].fetch_add(1, Relaxed);
+    WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    got
+}
+
+#[cfg(not(feature = "diagnostics"))]
+fn waited<T>(_: usize, f: impl FnOnce() -> T) -> T {
+    f()
+}
+
+/// [`WAITS`], taken, for the log: per frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn lock_waits(frames: f64) -> String {
+    let of = |what: usize| {
+        let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
+        format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
+    };
+    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -170,8 +207,14 @@ struct Asking(usize, usize);
 impl Asking {
     fn hold(first: usize, last: usize) -> Asking {
         let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
-        while held.iter().any(|&(a, b)| a < last && first < b) {
-            held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+        if held.iter().any(|&(a, b)| a < last && first < b) {
+            held = waited(0, || {
+                let mut held = held;
+                while held.iter().any(|&(a, b)| a < last && first < b) {
+                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                held
+            });
         }
         held.push((first, last));
         Asking(first, last)
@@ -725,13 +768,10 @@ impl Tracked {
             return Vec::new();
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut new: Vec<(usize, u64)> = Vec::new();
         for (page, write) in pages {
-            if seen.get(&page).is_some_and(|&last| last >= write) {
-                continue;
-            }
-            let (start, end) = ((page * PAGE).max(from), ((page + 1) * PAGE).min(to));
-            if start >= end {
+            let last = seen.get(&page).copied();
+            if last.is_some_and(|last| last >= write) || (page * PAGE).max(from) >= ((page + 1) * PAGE).min(to) {
                 continue;
             }
             // Keep partial pages dirty: the caller has not taken the rest.
@@ -740,9 +780,26 @@ impl Tracked {
             {
                 seen.insert(page, write);
             }
-            match ranges.last_mut() {
-                Some((_, last)) if *last == start => *last = end,
-                _ => ranges.push((start, end)),
+            new.push((page, last.unwrap_or(0)));
+        }
+        // Of a page taken before, the parts written since, where they are
+        // known (`VICTORY_TAKE_PARTS=0`: the page).
+        let parts = if crate::toggled!("VICTORY_TAKE_PARTS") { parts_written(&new) } else { vec![WHOLE; new.len()] };
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        for (&(page, last), &parts) in new.iter().zip(&parts) {
+            let mut parts = if last == 0 { WHOLE } else { parts };
+            while parts != 0 {
+                let first = parts.trailing_zeros() as usize;
+                let past = first + (!(parts >> first)).trailing_zeros() as usize;
+                parts &= if past >= PARTS { 0 } else { u16::MAX << past };
+                let (start, end) = ((page * PAGE + first * KERNEL_PAGE).max(from), (page * PAGE + past.min(PARTS) * KERNEL_PAGE).min(to));
+                if start >= end {
+                    continue;
+                }
+                match ranges.last_mut() {
+                    Some((_, last)) if *last == start => *last = end,
+                    _ => ranges.push((start, end)),
+                }
             }
         }
         ranges
@@ -1365,7 +1422,10 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+    if let Ok(g) = GUARDS.try_lock() {
+        return g;
+    }
+    waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -3551,6 +3611,42 @@ mod tests {
         crate::titlewrite::ON_IN_TEST.set(false);
         drop_views(section, &[one, two], SIZE);
         crate::title_memory_section_gone(section);
+    }
+
+    /// Of a page taken before, what is taken again is the kernel's pages
+    /// written since; where they are not known, all of it.
+    #[test]
+    fn what_is_taken_again_is_what_was_written() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let write = |at: usize| {
+            // SAFETY: committed pages of ours.
+            unsafe { ((p + at) as *mut u8).write_volatile(1) }
+        };
+        let tracked = track(p, 4 * PAGE, false).expect("watched");
+        write(5);
+        write(PAGE + 5000);
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p, p + 2 * PAGE)], "never taken");
+        assert!(tracked.take(p, p + 4 * PAGE).is_empty());
+        write(PAGE + 5000);
+        write(PAGE + 8192);
+        write(PAGE + 65535);
+        write(2 * PAGE);
+        assert_eq!(
+            tracked.take(p, p + 4 * PAGE),
+            [(p + PAGE + 4096, p + PAGE + 3 * 4096), (p + 2 * PAGE - 4096, p + 3 * PAGE)],
+            "page 2 was never taken"
+        );
+        write(2 * PAGE + 70);
+        // Two askings' writes are in what is taken after both.
+        assert!(writes(p, p + 4 * PAGE, false).is_some());
+        write(2 * PAGE + 9000);
+        assert_eq!(tracked.take(p, p + 4 * PAGE), [(p + 2 * PAGE, p + 2 * PAGE + 4096), (p + 2 * PAGE + 8192, p + 2 * PAGE + 12288)]);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// The set of blocks against another of the same.

@@ -301,6 +301,9 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let (mut views, mut bytes) = (0u64, 0u64);
+    let mut spent = [0u64; 4];
+    let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut page_bytes: Vec<u8> = Vec::new();
     let mut changed: Vec<u32> = Vec::new();
     let mut wait: Vec<u32> = Vec::new();
@@ -336,7 +339,10 @@ pub(crate) fn sync_heaps() {
         mirrored += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        let began = std::time::Instant::now();
+        let taken = written.take(start as usize, end as usize);
+        spent[0] += since(began);
+        for (range_from, range_end) in taken {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -345,8 +351,13 @@ pub(crate) fn sync_heaps() {
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
                 page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let began = std::time::Instant::now();
+                let there = crate::host::read_into(from as *const u8, &mut page_bytes);
+                spent[1] += since(began);
+                if there {
                     pages += 1;
+                    views += u64::from(crate::watch::guarded(from, to));
+                    bytes += (to - from) as u64;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // A record that straddles the range's ends is left
                     // to the range that holds its first byte.
@@ -360,7 +371,9 @@ pub(crate) fn sync_heaps() {
                     // Only the records that are not the ones last seen
                     // there (`HostHeap::copied_changes`).
                     changed.clear();
+                    let began = std::time::Instant::now();
                     host.copied_changes(first as u32, &records[..(count * step) as usize], step as usize, &mut changed);
+                    spent[2] += since(began);
                     for &index in &changed {
                         let at = (u64::from(index) - first) as usize * step as usize;
                         let word = |n: usize| {
@@ -393,11 +406,13 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+        let began = std::time::Instant::now();
         crate::land::each_view(make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
             for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
         });
+        spent[3] += since(began);
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
         }
@@ -405,6 +420,10 @@ pub(crate) fn sync_heaps() {
     drop(heaps);
     let micros = started.elapsed().as_micros() as u64;
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
+        count.fetch_add(n, Relaxed);
+    }
+    let [taking, reading, comparing, making] = spent;
+    for (count, n) in SYNC_SPLIT.iter().zip([views, bytes, taking, reading, comparing, making]) {
         count.fetch_add(n, Relaxed);
     }
 }
@@ -422,6 +441,12 @@ const SYNC_AT_A_TIME: usize = 256;
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
+/// The same, of [`SYNCED`]'s pages: those in view memory that was guarded;
+/// bytes read; nanoseconds asking what was written, reading it, comparing it
+/// with what was last seen, making views.
+#[cfg(windows)]
+static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
@@ -436,20 +461,27 @@ pub(crate) fn sync_line(frames: f64) {
         );
     }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let split = [0, 1, 2, 3, 4, 5].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \
-         draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for)",
+         draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for); {:.1} of the          pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading, {:.2} comparing, {:.2} making",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         tabled as f64 / frames,
         later as f64 / frames,
         micros as f64 / 1000.0 / frames,
-        waited as f64 / 1000.0 / frames
+        waited as f64 / 1000.0 / frames,
+        split[0] / frames,
+        split[1] / (1 << 20) as f64 / frames,
+        split[2] / 1e6 / frames,
+        split[3] / 1e6 / frames,
+        split[4] / 1e6 / frames,
+        split[5] / 1e6 / frames
     );
 }
 
@@ -1249,7 +1281,15 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        #[cfg(windows)]
+        unsafe {
+            crate::titlewrite::put(dst as *mut u8, src as *const u8, len as usize)
+        };
+        // SAFETY: as above.
+        #[cfg(not(windows))]
+        unsafe {
+            std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
+        };
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);

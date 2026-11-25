@@ -1,7 +1,7 @@
 //! The stores of x86-64 code that [`super::store`] does in the title's place:
 //! moves from a register or a constant, arithmetic of those with memory
-//! (locked or not), exchanges, and the 4, 8 and 16 byte stores of the vector
-//! registers. Everything else is `None`.
+//! (locked or not), exchanges, and the 4, 8, 16 and 32 byte stores of the
+//! vector registers. Everything else is `None`.
 
 use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering::SeqCst};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
@@ -18,7 +18,7 @@ enum Alu {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Op {
     /// These bytes (the low `size` of them).
-    Put([u8; 16]),
+    Put([u8; 32]),
     /// With a value; `keeps` carry (`inc`, `dec`).
     Alu { alu: Alu, with: u64, keeps: bool },
     /// With a register, which gets what was there.
@@ -116,6 +116,27 @@ fn mask(size: usize) -> u64 {
     if size >= 8 { u64::MAX } else { (1 << (size * 8)) - 1 }
 }
 
+/// The upper half of vector register `reg`, where the context has it; nothing
+/// in it if the thread used none.
+fn upper(c: &CONTEXT, reg: usize) -> Option<[u8; 16]> {
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetXStateFeaturesMask, LocateXStateFeature};
+    const AVX: u32 = 2;
+    let mut mask = 0;
+    // SAFETY: a context as the system passes it to a handler (the calls
+    // change nothing of it).
+    unsafe {
+        if GetXStateFeaturesMask(c, &mut mask) == 0 {
+            return None;
+        }
+        if mask >> AVX & 1 == 0 {
+            return Some([0; 16]);
+        }
+        let mut len = 0;
+        let at = LocateXStateFeature(c, AVX, &mut len) as *const [u8; 16];
+        (!at.is_null() && len as usize >= 16 * 16).then(|| at.add(reg).read_unaligned())
+    }
+}
+
 /// The store at the start of `code`, which the registers are those of.
 pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
     let mut at = 0;
@@ -124,7 +145,7 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
         at += 1;
         byte
     };
-    let (mut locked, mut narrow, mut repeat) = (false, false, 0u8);
+    let (mut locked, mut narrow, mut repeat, mut long) = (false, false, 0u8, false);
     let mut byte = next()?;
     loop {
         match byte {
@@ -160,10 +181,10 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
         _ => None,
     };
     if let Some(b) = vector {
-        // (No 32 byte ones: they fill memory.)
-        if b & 4 != 0 || narrow || repeat != 0 || locked {
+        if narrow || repeat != 0 || locked {
             return None;
         }
+        long = b & 4 != 0;
         // (A store has no third register.)
         if b >> 3 & 15 != 15 {
             return None;
@@ -223,7 +244,7 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
         4
     };
     let put = |value: u64| {
-        let mut bytes = [0; 16];
+        let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&value.to_le_bytes());
         Op::Put(bytes)
     };
@@ -231,9 +252,9 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
     let vector_bytes = || {
         // SAFETY: the registers, whichever way they are named.
         let x = unsafe { &c.Anonymous.FltSave }.XmmRegisters[reg];
-        let mut bytes = [0; 16];
+        let mut bytes = [0; 32];
         bytes[..8].copy_from_slice(&x.Low.to_le_bytes());
-        bytes[8..].copy_from_slice(&x.High.to_le_bytes());
+        bytes[8..16].copy_from_slice(&x.High.to_le_bytes());
         bytes
     };
     let alu_of = |kind: u8| match kind {
@@ -244,14 +265,21 @@ pub(super) fn store(code: &[u8], c: &CONTEXT) -> Option<Store> {
         6 => Some(Alu::Xor),
         _ => None,
     };
-    let (op, size) = if two {
+    let (op, size) = if long {
+        if !matches!((byte, narrow, repeat), (0x11 | 0x29, _, 0) | (0x7f, true, 0) | (0x7f, false, 0xf3) | (0xe7, true, 0)) {
+            return None;
+        }
+        let mut bytes = vector_bytes();
+        bytes[16..].copy_from_slice(&upper(c, reg)?);
+        (Op::Put(bytes), 32)
+    } else if two {
         match (byte, narrow, repeat) {
             (0x11, _, 0) | (0x29, _, 0) | (0x7f, true, 0) | (0x7f, false, 0xf3) | (0xe7, true, 0) => (Op::Put(vector_bytes()), 16),
             (0x11, false, 0xf3) => (Op::Put(vector_bytes()), 4),
             (0x11, false, 0xf2) | (0x13, _, 0) | (0xd6, true, 0) => (Op::Put(vector_bytes()), 8),
             (0x17, _, 0) => {
                 let mut bytes = vector_bytes();
-                bytes.copy_within(8.., 0);
+                bytes.copy_within(8..16, 0);
                 (Op::Put(bytes), 8)
             }
             (0x7e, true, 0) => (Op::Put(vector_bytes()), if wide { 8 } else { 4 }),
@@ -393,7 +421,7 @@ impl Store {
             return None;
         }
         let mut there = [0u8; 32];
-        // SAFETY: by the caller.
+        // SAFETY: by the caller (32 bytes at the most).
         unsafe { std::ptr::copy_nonoverlapping(self.at as *const u8, there.as_mut_ptr(), self.size) };
         match self.op {
             Op::Put(bytes) => Some((there[..self.size] == bytes[..self.size], c.EFlags)),
@@ -406,12 +434,18 @@ impl Store {
         }
     }
 
-    /// Whether the loader can make it look before it writes
-    /// (`victory_loader::write_sites`): an `or` of a byte with a constant, of
-    /// the five bytes a jump needs.
+    /// Whether the loader may make it look before it writes
+    /// (`victory_loader::write_sites`, which looks itself): an `or` of a byte
+    /// with a constant, a move of 4 bytes or more; of the five bytes a jump
+    /// needs.
     pub(super) fn can_look(&self, code: &[u8]) -> bool {
         let at = usize::from(code[0] & 0xf0 == 0x40);
-        self.len >= 5 && code[at] == 0x80 && matches!(self.op, Op::Alu { alu: Alu::Or, .. })
+        self.len >= 5
+            && match self.op {
+                Op::Alu { alu: Alu::Or, .. } => code[at] == 0x80,
+                Op::Put(_) => matches!(code[0], 0xc4 | 0xc5) && self.size >= 16 || matches!(code[at], 0x89 | 0xc7),
+                _ => false,
+            }
     }
 
     /// Does it, with `to` for the address, and gives the registers what the
@@ -428,7 +462,7 @@ impl Store {
                 // As one, for those the processor stores as one.
                 // SAFETY (all): by the caller, aligned where it must be.
                 unsafe {
-                    let low = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
+                    let low = u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]);
                     match size {
                         1 => (to as *mut u8).write_volatile(bytes[0]),
                         2 if to.is_multiple_of(2) => (to as *mut u16).write_volatile(low as u16),
@@ -526,9 +560,8 @@ mod tests {
         assert_eq!(decoded(&[0x0f, 0x13, 0x00]), Some((0, 8, 3)));
         assert_eq!(decoded(&[0xc5, 0xf9, 0xd6, 0x00]), Some((0, 8, 4)));
         assert_eq!(decoded(&[0x66, 0x0f, 0x7e, 0x00]), Some((0, 4, 4)));
-        // Not stores of these: a 32 byte one, a load, a register's, a string
-        // instruction, a thread's own memory, a compare, adc.
-        assert_eq!(decoded(&[0xc5, 0xfc, 0x11, 0x04, 0x31]), None);
+        // Not stores of these: a load, a register's, a string instruction, a
+        // thread's own memory, a compare, adc.
         assert_eq!(decoded(&[0x48, 0x8b, 0x13]), None);
         assert_eq!(decoded(&[0x48, 0x89, 0xd3]), None);
         assert_eq!(decoded(&[0xf3, 0xa4]), None);

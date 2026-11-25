@@ -2848,8 +2848,10 @@ pub(crate) static TWINS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync:
 /// no raw view. An AMD descriptor of a raw buffer is its address (48 bits),
 /// its bytes and flags; only one that says just that is changed, and only
 /// where what the handle points at is the descriptor. False: not moved.
-fn move_raw(at: D3D12_CPU_DESCRIPTOR_HANDLE, start: u64, bytes: u32, by: u32) -> bool {
-    if !by.is_multiple_of(4) || by >= bytes {
+pub(crate) fn move_raw(at: D3D12_CPU_DESCRIPTOR_HANDLE, start: u64, bytes: u32, by: u32) -> bool {
+    // (Off dwords too, as the typed view it stands for begins there: a view
+    // of 16 bit values at an odd one.)
+    if by >= bytes {
         return false;
     }
     let mut words = [0u8; 16];
@@ -4003,7 +4005,7 @@ mod tests {
         let before = words();
         assert!(!move_raw(at, start + 16, 400, 8), "another address");
         assert!(!move_raw(at, start, 404, 8), "another size");
-        assert!(!move_raw(at, start, 400, 2), "not a dword");
+        assert!(!move_raw(at, start, 400, 400), "nothing left");
         assert_eq!(words(), before);
         if move_raw(at, start, 400, 8) {
             let moved = words();

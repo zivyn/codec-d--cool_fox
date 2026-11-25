@@ -1430,7 +1430,20 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
             .unwrap_or(DYNAMIC << 2)
     });
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        // LOCAL (NVIDIA, 11/25): a host heap capped at 1,000,000 views ran
+        // these out with the fast settings (THIN: 1,100-4,800 of 12,000-16,600
+        // tables a frame refused, each a dropped draw). `VICTORY_DYNAMIC_SLOTS`
+        // takes more of them from the title's slots kept in place (tables
+        // past those are made afresh here anyway), at most half the heap.
+        static CAPPED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        return *CAPPED.get_or_init(|| {
+            let asked = std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse::<u32>().ok());
+            let slots = asked.unwrap_or(DYNAMIC).clamp(DYNAMIC, null / 2);
+            if slots != DYNAMIC {
+                tracing::warn!(slots, title_in_place = null - slots, "LOCAL dynamic descriptor slots on a capped view heap");
+            }
+            slots
+        });
     }
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }

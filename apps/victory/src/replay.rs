@@ -81,6 +81,13 @@ pub(crate) struct Replay {
     /// Each list sent on its own, and waited for.
     #[arg(long)]
     wait_lists: bool,
+    /// Milliseconds to wait after sending each submission: the card stands
+    /// idle between them, as it does while the title prepares the next.
+    #[arg(long, default_value_t = 0.0)]
+    pace: f64,
+    /// The system's breadcrumbs after every command (VICTORY_D3D12_DRED=light).
+    #[arg(long)]
+    breadcrumbs: bool,
     /// Run only these lists, by their place in the frame (`3..7`, or `5`);
     /// of the others only barriers.
     #[arg(long)]
@@ -255,11 +262,13 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         merge: !r.no_merge,
         wait_all: r.wait_all,
         wait_lists: r.wait_lists,
+        pace: r.pace,
         only,
         until,
         skip_shaders: r.skip_shader,
         compare: r.compare,
         debug: r.debug_layer,
+        breadcrumbs: r.breadcrumbs,
     };
     if let Some(text) = &r.slots {
         let (list, command) = text

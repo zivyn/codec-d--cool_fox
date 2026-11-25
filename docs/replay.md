@@ -70,6 +70,8 @@ with the presented one.
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
 | `--skip-shader <text>` | leaves out what runs pipelines with the text in their name or DXIL hash (repeatable) |
 | `--no-restore` | leaves what a loop changed |
+| `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
+| `--breadcrumbs` | the system's breadcrumbs (`VICTORY_D3D12_DRED=light`) |
 | `--debug-layer` | D3D12's debug layer; its errors in the report |
 
 Use the median of several loops; the first is slower. An experiment that

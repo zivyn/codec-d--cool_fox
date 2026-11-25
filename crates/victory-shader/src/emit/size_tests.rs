@@ -266,3 +266,35 @@ fn a_counter_texture_is_set_by_a_store_of_one_channel() {
     // A store of two channels says nothing about the view.
     assert!(program([0xF020_1308, 0x0002_0300], 0x7E06_0289).is_err());
 }
+
+/// A load past the wave's cache (GLC) of a buffer other groups write: its
+/// view is globally coherent on the host, as is every access to it.
+#[test]
+fn a_buffer_loaded_past_the_cache_is_coherent() {
+    let program = |load: u32| {
+        let words = [
+            0x7E04_028Bu32, // v_mov_b32 v2, 11
+            0xE070_0008,    // buffer_store_dword v2, off, s[20:23], 0 offset:8
+            0x8005_0200,
+            load, // buffer_load_dword v3, off, s[20:23], 0 offset:8
+            0x8005_0300,
+            0x7E08_0503, // v_readfirstlane_b32 s4, v3
+            0xBE85_0380, // s_mov_b32 s5, 0
+        ];
+        build(&[TABLE, &words, STORE].concat(), (8, 0)).expect("translates")
+    };
+    let (plain, coherent) = (program(0xE030_0008), program(0xE030_C008));
+    // the annotations of the store's and the load's handles
+    assert_ne!(plain.dxil, coherent.dxil);
+    let texel = [[0.0; 4]; 1];
+    let views = [
+        View::Texture(1, 1, &texel),
+        View::Texture(1, 1, &texel),
+        View::RawUav(3),
+    ];
+    for shader in [&plain, &coherent] {
+        for (label, got) in run(shader, &views) {
+            assert_eq!(got[..3], [11, 0, 11], "{label}");
+        }
+    }
+}

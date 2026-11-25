@@ -1110,6 +1110,8 @@ void main(uint3 id : SV_DispatchThreadID, uint g : SV_GroupIndex) {
                 println!("  {name:20} {}", found.join("  "));
             }
         }
+        // SAFETY: a plain query.
+        println!("device: {:?}", unsafe { gpu.device.GetDeviceRemovedReason() });
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.

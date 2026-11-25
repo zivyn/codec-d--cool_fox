@@ -1300,12 +1300,14 @@ fn into_destination(
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        victory_gpu::kernel_will_write(request.destination as usize, len);
+        // GPU side's guard on title buffers; open them first, and until the
+        // bytes are there.
+        let writing = victory_gpu::kernel_writing(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
         let filled = fill(out).map(drop);
+        drop(writing);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
         if super::xmem::stream_notice() {

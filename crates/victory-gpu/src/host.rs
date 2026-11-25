@@ -704,6 +704,22 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// Zeros for a title destination that went meanwhile are no fault.
+    #[test]
+    fn zeros_where_nothing_is_are_lost() {
+        use windows_sys::Win32::System::Memory::*;
+        // SAFETY: a reservation of ours, its first page committed.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 1 << 16, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE).is_null());
+            at.write_bytes(7, 4096);
+            super::zero(at, 4096);
+            assert!(std::slice::from_raw_parts(at, 4096).iter().all(|&b| b == 0));
+            super::zero(at.add(4096), 4096);
+            VirtualFree(at.cast(), 0, MEM_RELEASE);
+        }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -6608,7 +6624,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
-    let whole = read(src, dst, len);
+    let since = crate::watch::changes();
+    // (A title destination that is away only while the runtime changes a
+    // mapping beside it is written when that is done.)
+    let whole = read(src, dst, len) || title_dst && crate::watch::again_after_change(since, || read(src, dst, len));
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -6618,6 +6637,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     // not all mapped. Then the destination stays as it is (the kernel may
     // have written its first pages).
     if title_dst && !ask_first && !crate::texture::committed(dst, len) {
+        crate::watch::lost("a copy of the title's", dst as usize, len);
         return;
     }
     #[cfg(feature = "diagnostics")]
@@ -6677,12 +6697,27 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
                 if !read(at as *const u8, to, n) {
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
+                    zero(to, n);
                 }
             });
         }
     });
+}
+
+/// Zeros at `to`, in one 4 KiB page or two. It may be title memory (the
+/// destination of a title's copy), which can go between the question whether
+/// it is there and this.
+fn zero(to: *mut u8, n: usize) {
+    static ZEROS: [u8; 4096] = [0; 4096];
+    if n <= ZEROS.len() && crate::safecopy::on() {
+        // SAFETY: a destination that is not there fails the copy.
+        if !unsafe { crate::safecopy::copy(to, ZEROS.as_ptr(), n) } {
+            crate::watch::lost("zeros", to as usize, n);
+        }
+        return;
+    }
+    // SAFETY: inside the destination, which is mapped.
+    unsafe { to.write_bytes(0, n) };
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not
@@ -6738,6 +6773,7 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();
+    let since = crate::watch::changes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         if crate::safecopy::on() {
@@ -6764,7 +6800,16 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
         if !write(at, n) {
             for_pieces(at, n, 4 << 10, |at, n| {
-                write(at, n);
+                if write(at, n) {
+                    return;
+                }
+                // The kernel's write (`VICTORY_SAFE_COPY=0`) fails where a
+                // refresh guarded the block again since the caller opened
+                // it; and any where the runtime was changing a mapping.
+                crate::watch::writing(at, n);
+                if !write(at, n) && !crate::watch::again_after_change(since, || write(at, n)) {
+                    crate::watch::lost("a host copy's bytes", at, n);
+                }
             });
         }
     });

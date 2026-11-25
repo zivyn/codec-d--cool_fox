@@ -285,13 +285,15 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     }
     ask_once_end();
     ask_ahead(ranges);
+    ask_rest(ranges);
+}
+
+/// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
+/// asking stands.
+fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
     let mut ahead = {
         let mut j = journal_mut();
-        if j.ahead.is_empty() {
-            // `ask_ahead` asked nothing (fewer than two ranges).
-            j.ahead_asked = next_asking();
-        }
         std::mem::take(&mut j.ahead)
     };
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
@@ -313,7 +315,12 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
     }
     let mut j = journal_mut();
-    let now = j.ahead_asked;
+    // A number of its own, and the one this asking stands under: between
+    // the two parts another thread may have asked about a range of the
+    // second, copied it, and the title written it since. Under the first
+    // part's number that write was older than the copy, and never copied.
+    let now = next_asking();
+    j.ahead_asked = now;
     j.written.extend(written.into_iter().map(|page| (page, now)));
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
@@ -781,6 +788,21 @@ struct Guards {
     absent: BTreeSet<usize>,
     /// Of those, the ones in placeholders ([`known_holes`]).
     held: BTreeSet<usize>,
+    /// Blocks that were absent and turned out to be other memory than views
+    /// when something was there again: never guarded, copied every time.
+    foreign: BTreeSet<usize>,
+    /// Blocks (first, past the last) the kernel writes now
+    /// ([`kernel_writing`]), and blocks the runtime has unmapped in a change
+    /// not yet done ([`title_memory_unmapping`]). Not in the sets above, and
+    /// left as they are by [`guard`], which reports them written.
+    kernel: Vec<(usize, usize)>,
+    changing: Vec<(usize, usize)>,
+}
+
+impl Guards {
+    fn left_alone(&self, block: usize) -> bool {
+        self.kernel.iter().chain(&self.changing).any(|&(first, last)| (first..last).contains(&block))
+    }
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
@@ -788,6 +810,9 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     held: BTreeSet::new(),
+    foreign: BTreeSet::new(),
+    kernel: Vec::new(),
+    changing: Vec::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -948,7 +973,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         }
         g.absent.range(first..last).filter(|block| !g.held.contains(block)).copied().collect()
     };
-    let mut came: Vec<usize> = Vec::new();
+    let mut came: Vec<(usize, bool)> = Vec::new();
     let mut uncommitted_until = first;
     for block in unsure {
         // One question for the blocks of a region.
@@ -958,14 +983,18 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             tally(9, 1);
         }
         if block >= uncommitted_until {
-            came.push(block);
+            // The hole may have been given up, and its address be the
+            // title's heap's, or code's, now: not ours to guard.
+            came.push((block, is_view(block * BLOCK, (block + 1) * BLOCK)));
         }
     }
     let mut g = guards_timed();
     #[cfg(feature = "diagnostics")]
     tally(4, 1);
-    for block in &came {
-        g.absent.remove(block);
+    for &(block, view) in &came {
+        if g.absent.remove(&block) && !view {
+            g.foreign.insert(block);
+        }
     }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -986,7 +1015,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !g.foreign.contains(&block) && !g.left_alone(block) {
                 run.get_or_insert(block);
                 continue;
             }
@@ -1046,13 +1075,13 @@ fn is_view(start: usize, end: usize) -> bool {
 /// block by block if they span views, leaving out any that fail, and
 /// noting those not committed (unmapped) absent.
 fn protect(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
-        let done = unsafe {
+        let mut done = unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
@@ -1060,6 +1089,13 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                 &mut old,
             ) != 0
         };
+        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+            // What is there is not for us to guard (code, or memory the
+            // title protects itself): as it was.
+            // SAFETY: as above.
+            unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, old, &mut old) };
+            done = false;
+        }
         #[cfg(feature = "diagnostics")]
         {
             tally(5, (to - from) as u64);
@@ -1118,7 +1154,7 @@ fn uncommitted_end(block: usize) -> usize {
 /// Gives write access back to the guarded blocks of `[start, end)` and
 /// notes them written; true if any was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
@@ -1133,7 +1169,15 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         PUBLISHED.clear(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        unsafe {
+            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+            {
+                // Not what we left there: the address is other memory's
+                // (code's, say), which keeps its protection.
+                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+            }
+        }
         PROTECTED.clear(block);
     }
     #[cfg(feature = "diagnostics")]
@@ -1162,6 +1206,49 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
+/// The kernel writes title memory `[at, at + len)` until what this returns
+/// is dropped ([`kernel_writing`]).
+pub struct KernelWrite(usize, usize);
+
+/// The runtime is about to have the kernel write title memory
+/// `[at, at + len)` (a file read): its guarded blocks are opened, as by
+/// [`writing`], and no refresh guards them again before what this returns is
+/// dropped, at the end of that call. One that did would make the kernel's
+/// write fail (the kernel does not fault into our handler): a read cut
+/// short, which the title takes for what the file holds.
+pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    {
+        let mut g = guards_timed();
+        open(&mut g, at, at.saturating_add(len));
+        if len != 0 {
+            // Nothing known of them stands while they are left alone.
+            let absent: Vec<usize> = g.absent.range(first..last).copied().collect();
+            for block in absent {
+                g.absent.remove(&block);
+                if g.held.remove(&block) {
+                    PUBLISHED.clear(block);
+                }
+            }
+            g.kernel.push((first, last));
+        }
+    }
+    crate::descriptor::host::remapped(at, len);
+    KernelWrite(first, if len == 0 { first } else { last })
+}
+
+impl Drop for KernelWrite {
+    fn drop(&mut self) {
+        if self.0 == self.1 {
+            return;
+        }
+        let mut g = guards();
+        if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
+            g.kernel.swap_remove(i);
+        }
+    }
+}
+
 /// Held shared by a read of title memory in place, and alone by the runtime
 /// while it changes what title memory shows.
 ///
@@ -1181,12 +1268,149 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// ([`title_memory_remapping`]).
 pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        // The change is done: what is there now may be guarded.
+        if CHANGING.replace((false, false)).1 {
+            guards().changing.clear();
+        }
+        CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// How often the runtime began or ended a change of what title memory
+/// shows: odd while one is under way.
+static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// This thread holds [`Remapping`]; and put blocks in
+    /// [`Guards::changing`].
+    static CHANGING: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+}
+
+/// For [`again_after_change`]: to be asked before what may fail.
+pub(crate) fn changes() -> u64 {
+    CHANGES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `f` failed to read or write title memory, at some time since [`changes`]
+/// said `since`. If the runtime changed a mapping in that time, the pages
+/// may have been away for that moment only ([`MAPPING`]): again, when the
+/// change is done. Whether `f` did it.
+pub(crate) fn again_after_change(since: u64, mut f: impl FnMut() -> bool) -> bool {
+    let mut since = since;
+    for _ in 0..4 {
+        let now = change_done();
+        if now == since {
+            return false;
+        }
+        since = now;
+        if f() {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`changes`], when no change is under way (or one has been for a second).
+fn change_done() -> u64 {
+    let mut tries = 0;
+    let mut started = None;
+    loop {
+        let now = changes();
+        if now.is_multiple_of(2) {
+            return now;
+        }
+        tries += 1;
+        if tries < 100 {
+            std::hint::spin_loop();
+            continue;
+        }
+        if started.get_or_insert_with(std::time::Instant::now).elapsed().as_secs() >= 1 {
+            return now;
+        }
+        // SAFETY: gives the processor to another thread.
+        unsafe { windows_sys::Win32::System::Threading::Sleep(u32::from(tries > 200)) };
+    }
+}
+
+/// Faults of title threads that met a change of mapping and went on after
+/// it ([`came_back`]).
+static MET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A title thread's access to `at` (`write`: a write) faulted. Whether it
+/// can be made now: if a change of mapping is under way, after it.
+///
+/// The console changes one page's mapping and no other's. Here the rest of
+/// a view is unmapped and mapped again ([`MAPPING`]), and a title thread that
+/// uses a page of it just then, which the title never gave up, faulted
+/// ("reserved, never committed", or read-only for the moment between our
+/// forgetting a guarded block and its unmapping). It waits here instead.
+/// Memory that is not there with no change under way is not waited for.
+fn came_back(at: usize, write: bool) -> bool {
+    let there = || {
+        if !write {
+            return readable_view(at);
+        }
+        // (A refresh may have guarded the page that came back.)
+        open(&mut guards(), at, at + 1) || writable(at)
+    };
+    let before = changes();
+    if there() || again_after_change(before, there) {
+        MET.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Whether `at` is in a committed page of a view that can be read.
+fn readable_view(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Type == MEM_MAPPED
+        && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
+}
+
+/// Title memory that could not be written with what was to go there (what a
+/// shader wrote, a title's copy): counted, and said at the 1st, 2nd, 4th, 8th
+/// and so on. A page the title unmapped loses nothing by it; a page that is
+/// there does.
+pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
+    static LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        let there = writable(at);
+        tracing::warn!(n, what, at = format_args!("{at:#x}"), len, there, "title memory not written");
+    }
+}
+
+
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    // For the title's own threads ([`came_back`]).
+    install();
+    let met = MET.load(std::sync::atomic::Ordering::Relaxed);
+    if met != 0 {
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if met >= 2 * SAID.load(std::sync::atomic::Ordering::Relaxed) {
+            SAID.store(met, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(met, "accesses of title threads that waited for a change of mapping");
+        }
+    }
+    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CHANGING.set((true, false));
+    Remapping(changing)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -1226,9 +1450,20 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 }
 
 /// The runtime is about to unmap title memory `[at, at + len)`: it is
-/// nothing of ours any more. Its protection goes with it.
+/// nothing of ours any more. Its protection goes with it. Until the change
+/// is done ([`Remapping`]) no refresh guards what is there: one that did
+/// before the unmapping would leave the address guarded, clean and known by
+/// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
     let mut g = title_memory_changed(at, len);
+    if CHANGING.get().0 && len != 0 {
+        CHANGING.set((true, true));
+        let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+        match g.changing.last_mut() {
+            Some(before) if before.1 == first => before.1 = last,
+            _ => g.changing.push((first, last)),
+        }
+    }
     let blocks: Vec<usize> = g
         .protected
         .range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK))
@@ -1240,6 +1475,61 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
         PUBLISHED.clear(block);
         PROTECTED.clear(block);
     }
+}
+
+/// The title is about to free or decommit memory of its own,
+/// `[at, at + len)`, or with no length the whole allocation at `at`: what
+/// was noted of its blocks (guarded, clean, absent) would be taken for true
+/// of the next memory at the address.
+pub fn title_memory_freed(at: usize, len: usize) {
+    let mut g = guards();
+    let first = at / BLOCK;
+    let noted = [&g.protected, &g.absent, &g.foreign].map(|set| set.range(first..).next());
+    let Some(noted) = noted.into_iter().flatten().min().copied() else {
+        return;
+    };
+    let end = if len != 0 {
+        at.saturating_add(len).div_ceil(BLOCK)
+    } else {
+        allocation_end(at, noted * BLOCK).div_ceil(BLOCK)
+    };
+    if noted >= end {
+        return;
+    }
+    let absent: Vec<usize> = g.absent.range(first..end).copied().collect();
+    for block in absent {
+        g.absent.remove(&block);
+        if g.held.remove(&block) {
+            PUBLISHED.clear(block);
+        }
+    }
+    let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
+    for block in foreign {
+        g.foreign.remove(&block);
+    }
+    // (Memory that is still a view is not freed by that call, which fails:
+    // it must not stay read-only.)
+    open(&mut g, at, end * BLOCK);
+}
+
+/// The end of the allocation at `at`, if `inside` lies in it; else `at`.
+fn allocation_end(at: usize, inside: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let ask = |address: usize| {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(address as *const _, &mut info, size_of_val(&info)) };
+        (n != 0 && info.AllocationBase as usize == at)
+            .then(|| (info.BaseAddress as usize).saturating_add(info.RegionSize))
+    };
+    let mut end = at;
+    let mut next = ask(inside.max(at));
+    while let Some(to) = next {
+        end = to;
+        next = ask(to);
+    }
+    end
 }
 
 /// Tells what keeps track of what title memory shows; the guards, with no
@@ -1254,12 +1544,16 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range).copied().collect();
+    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
         if g.held.remove(&block) {
             PUBLISHED.clear(block);
         }
+    }
+    let foreign: Vec<usize> = g.foreign.range(range).copied().collect();
+    for block in foreign {
+        g.foreign.remove(&block);
     }
     g
 }
@@ -1275,6 +1569,7 @@ pub(crate) fn install() {
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        const READ: usize = 0;
         const WRITE: usize = 1;
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
         // it is not a block we guard, the copy fails and goes on from there.
@@ -1290,6 +1585,13 @@ pub(crate) fn install() {
         {
             return match ours {
                 Some(exit) => fail(exit),
+                None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+                    && r.NumberParameters >= 2
+                    && r.ExceptionInformation[0] == READ
+                    && came_back(r.ExceptionInformation[1], false) =>
+                {
+                    EXCEPTION_CONTINUE_EXECUTION
+                }
                 None => EXCEPTION_CONTINUE_SEARCH,
             };
         }
@@ -1306,8 +1608,11 @@ pub(crate) fn install() {
         if writable(at) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
+        // (The runtime wants the guards to end a change.)
+        drop(g);
         match ours {
             Some(exit) => fail(exit),
+            None if came_back(at, true) => EXCEPTION_CONTINUE_EXECUTION,
             None => EXCEPTION_CONTINUE_SEARCH,
         }
     }
@@ -1432,6 +1737,299 @@ mod tests {
                 },
             )
         };
+    }
+
+    /// A placeholder of `blocks` blocks, each its own.
+    fn placeholder(blocks: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_PRESERVE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a fresh placeholder, split.
+        unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                blocks * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            for block in 0..blocks - 1 {
+                assert_ne!(
+                    VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER),
+                    0
+                );
+            }
+            p
+        }
+    }
+
+    /// Private memory of `protect` in place of the placeholder of one block.
+    fn private_at(at: usize, protect: u32) {
+        use windows_sys::Win32::System::Memory::{MEM_REPLACE_PLACEHOLDER, VirtualAlloc2};
+        // SAFETY: our placeholder.
+        let got = unsafe {
+            VirtualAlloc2(
+                windows_sys::Win32::System::Threading::GetCurrentProcess(),
+                at as *const _,
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                protect,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(got as usize, at);
+    }
+
+    fn protection(at: usize) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: plain data the query fills in.
+        unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            VirtualQuery(at as *const _, &mut info, size_of_val(&info));
+            info.Protect
+        }
+    }
+
+    /// A refresh between the opening of a kernel read's destination and the
+    /// read itself leaves it open: the read lands, and is seen.
+    #[test]
+    fn a_refresh_leaves_open_what_the_kernel_is_writing() {
+        use std::io::{Read, Seek, Write};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        let pages = |block: usize| at / PAGE + block..at / PAGE + block + 1;
+        assert!(writes(at, at + 2 * BLOCK, true).is_some());
+        assert!(published(at, at + 2 * BLOCK) || !light());
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"from the disk").unwrap();
+        file.rewind().unwrap();
+        let writing = kernel_writing(at + 100, 13);
+        // The refresh: the block being written is new to it every time, and
+        // stays open; the other is as it was.
+        for _ in 0..2 {
+            assert_eq!(guard(at, at + 2 * BLOCK), Some(pages(0).collect()));
+            let (now, found) = writes(at, at + BLOCK, true).expect("a view");
+            assert!(found.contains(&(at / PAGE, now)));
+            assert!(writable(at) && !writable(at + BLOCK));
+            assert!(!published(at, at + BLOCK));
+        }
+        // SAFETY: 13 bytes of our view, nothing else refers to them.
+        let into = unsafe { std::slice::from_raw_parts_mut((at + 100) as *mut u8, 13) };
+        assert_eq!(file.read(into).expect("the kernel's write lands"), 13);
+        assert_eq!(into, b"from the disk");
+        drop(writing);
+        // Seen by the next refresh, and guarded again.
+        assert_eq!(guard(at, at + 2 * BLOCK), Some(pages(0).collect()));
+        assert!(!writable(at));
+        assert_eq!(guard(at, at + 2 * BLOCK), Some(Vec::new()));
+        title_memory_unmapping(at, 2 * BLOCK);
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
+    }
+
+    /// A hole the kernel is to write is no known hole meanwhile, nor is one
+    /// the runtime has begun to change; after that it is again.
+    #[test]
+    fn what_is_left_alone_is_no_known_hole() {
+        let p = placeholder(3);
+        let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
+        let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
+        ask();
+        let holes = known_holes();
+        assert!((0..3).all(known) == holes);
+        let writing = kernel_writing(p + BLOCK + 5, 100);
+        for _ in 0..2 {
+            assert!(known(0) == holes && !known(1) && known(2) == holes);
+            let (now, written) = ask();
+            assert!(written.contains(&(p / PAGE + 1, now)));
+            assert!(written.iter().all(|w| w.0 == p / PAGE + 1 || w.1 < now));
+        }
+        assert!(!guards().held.contains(&(p / BLOCK + 1)));
+        drop(writing);
+        ask();
+        assert!((0..3).all(known) == holes);
+        {
+            let _changing = title_memory_remapping();
+            title_memory_unmapping(p, BLOCK);
+            ask();
+            assert!(!known(0) && !guards().held.contains(&(p / BLOCK)));
+        }
+        ask();
+        assert!((0..3).all(known) == holes);
+        title_memory_freed(p, BLOCK);
+        assert!(!known(0) && !guards().held.contains(&(p / BLOCK)));
+        title_memory_unmapping(p, 3 * BLOCK);
+        // SAFETY: our placeholders.
+        unsafe {
+            for block in 0..3 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// A refresh during a change of mapping guards nothing the runtime has
+    /// begun to unmap: no note of it stays behind.
+    #[test]
+    fn nothing_is_guarded_between_our_forgetting_it_and_its_unmapping() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        // SAFETY: a pagefile section of a block, mapped read-write.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK)
+        };
+        let at = view.Value as usize;
+        assert_ne!(at, 0);
+        assert!(writes(at, at + BLOCK, true).is_some());
+        let changing = title_memory_remapping();
+        title_memory_unmapping(at, BLOCK);
+        assert!(writes(at, at + BLOCK, true).is_some());
+        {
+            let g = guards();
+            assert!(!g.protected.contains(&(at / BLOCK)) && !g.clean.contains(&(at / BLOCK)));
+        }
+        assert!(!published(at, at + BLOCK));
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(view) };
+        drop(changing);
+        assert!(!guards().left_alone(at / BLOCK));
+    }
+
+    /// Memory at an address where blocks were guarded or absent is not
+    /// taken for them: code stays code, private memory is not guarded.
+    #[test]
+    fn other_memory_at_a_guarded_address_keeps_its_protection() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MapViewOfFile3, PAGE_EXECUTE_READ,
+            PAGE_EXECUTE_READWRITE, UnmapViewOfFile2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let p = placeholder(3);
+        // SAFETY: a section's block in place of the first placeholder.
+        let view = unsafe {
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile3(
+                section,
+                GetCurrentProcess(),
+                p as *const _,
+                0,
+                BLOCK,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(view.Value as usize, p);
+        // One block guarded, two absent.
+        assert_eq!(guard(p, p + 3 * BLOCK).map(|w| w.len()), Some(3));
+        // Not told of what comes: the view goes, code is there; and private
+        // memory in the holes.
+        // SAFETY: our view.
+        assert_ne!(unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) }, 0);
+        private_at(p, PAGE_EXECUTE_READ);
+        private_at(p + BLOCK, PAGE_READWRITE);
+        private_at(p + 2 * BLOCK, PAGE_EXECUTE_READWRITE);
+        // (The runtime's allocations it tells of, or the holes stay known.)
+        title_memory_allocated(p + BLOCK, 2 * BLOCK);
+        let as_made = || {
+            assert_eq!(protection(p), PAGE_EXECUTE_READ);
+            assert_eq!(protection(p + BLOCK), PAGE_READWRITE);
+            assert_eq!(protection(p + 2 * BLOCK), PAGE_EXECUTE_READWRITE);
+        };
+        let holes = [p / PAGE + 1, p / PAGE + 2];
+        for _ in 0..2 {
+            let written = guard(p, p + 3 * BLOCK).expect("as a view");
+            assert!(holes.iter().all(|page| written.contains(page)), "copied every time");
+            as_made();
+            let g = guards();
+            assert!(holes.iter().all(|block| !g.held.contains(block) && !g.absent.contains(block)));
+        }
+        writing(p, BLOCK);
+        as_made();
+        title_memory_unmapping(p, 3 * BLOCK);
+        // SAFETY: our allocations.
+        unsafe {
+            for block in 0..3 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// Memory the title frees leaves no note of its blocks, whether it names
+    /// its length or the allocation.
+    #[test]
+    fn freed_memory_leaves_no_notes() {
+        let p = placeholder(3);
+        let noted = |block: usize| {
+            let g = guards();
+            let block = p / BLOCK + block;
+            g.protected.contains(&block) || g.clean.contains(&block) || g.absent.contains(&block)
+        };
+        assert!(guard(p, p + 3 * BLOCK).is_some());
+        assert!(noted(0) && noted(1) && noted(2));
+        // The middle allocation.
+        title_memory_freed(p + BLOCK, 0);
+        assert!(noted(0) && !noted(1) && noted(2));
+        title_memory_freed(p, BLOCK);
+        assert!(!noted(0) && noted(2));
+        // Nothing noted there: nothing to do, and nothing beside it.
+        title_memory_freed(p + BLOCK, 0);
+        assert!(noted(2));
+        title_memory_freed(p + 2 * BLOCK, 0);
+        assert!(!noted(2));
+        // SAFETY: our placeholders.
+        unsafe {
+            for block in 0..3 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+        }
+    }
+
+    /// A write between another thread's asking about a range and the second
+    /// part of a submission's one asking is later than what that thread
+    /// copied.
+    #[test]
+    fn the_rest_of_the_one_asking_has_a_number_of_its_own() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        // One range: `ask_ahead` leaves it.
+        let ranges = [(p, p + 4 * PAGE)];
+        ask_ahead(&ranges);
+        let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
+        ask_rest(&ranges);
+        let last = journal().written.get(&(p / PAGE + 1)).copied();
+        ask_once_end();
+        assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// The runtime maps a view and then tells us; a copy's refresh on another
@@ -1868,7 +2466,8 @@ mod many_askers_tests {
                             // or past the guard.
                             let word = at + page * PAGE + t * 8;
                             // SAFETY (both): as above.
-                            let reading = (next(3) == 0).then(super::title_memory_reading_now).flatten();
+                            // (Waited for: other tests hold changes of mapping.)
+                            let reading = (next(3) == 0).then(super::title_memory_reading);
                             let beside = reading.as_ref().and_then(|_| crate::inplace::beside(word, 8));
                             if let Some(to) = beside {
                                 unsafe { (to as *mut u64).write_volatile(2) };

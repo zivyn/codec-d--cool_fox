@@ -4965,6 +4965,9 @@ impl Host {
         split.part(1);
         // What flights in the air may write.
         let air = line().written.clone();
+        if ahead_of_writes() {
+            batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+        }
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
@@ -6717,6 +6720,86 @@ struct Batch {
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
+    /// Copies (by address) brought up to date ahead of the steps, and the
+    /// range (from, to) ([`Batch::refresh_ahead`]).
+    ahead: ByCopy<(usize, usize)>,
+}
+
+/// Whether the copies that a submission's shaders write are brought up to
+/// date together, on several threads, ahead of its steps
+/// (`VICTORY_REFRESH_AHEAD=0`: each before the step that gives it to them).
+///
+/// 580 copies a frame, one after the other on the submitting thread, 3.4 to
+/// 6.5 ms (session play-1125-0203).
+fn ahead_of_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_AHEAD").is_none_or(|v| v != "0") && wide_refresh() && crate::watch::light())
+}
+
+/// What a step is to the copies' refreshes, for [`written_spans`].
+enum Touch {
+    /// A refresh of a copy (by address), from, to.
+    Refresh(usize, usize, usize),
+    /// The copy is given to shaders.
+    Write(usize),
+    /// Title memory is written.
+    Title,
+    Nothing,
+}
+
+/// Of `steps`, up to the first that writes title memory: the copies given to
+/// shaders, each with the range its refreshes before that cover.
+fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
+    // (From, to, given to shaders.)
+    let mut spans: ByCopy<(usize, usize, bool)> = ByCopy::default();
+    for step in steps {
+        match step {
+            Touch::Refresh(copy, from, to) => {
+                let span = spans.entry(copy).or_insert((from, to, false));
+                if !span.2 {
+                    (span.0, span.1) = (span.0.min(from), span.1.max(to));
+                }
+            }
+            // (Not refreshed before: nothing of it is due.)
+            Touch::Write(copy) => {
+                if let Some(span) = spans.get_mut(&copy) {
+                    span.2 = true;
+                }
+            }
+            Touch::Title => break,
+            Touch::Nothing => {}
+        }
+    }
+    spans.into_iter().filter(|(_, s)| s.2).map(|(copy, (from, to, _))| (copy, from, to)).collect()
+}
+
+#[cfg(test)]
+mod written_spans_tests {
+    use super::{Touch, written_spans};
+
+    #[test]
+    fn what_is_written_is_refreshed_ahead_up_to_its_write_and_to_title_writes() {
+        use Touch::{Nothing, Refresh, Title, Write};
+        let mut found = written_spans(
+            [
+                Refresh(1, 10, 20),
+                Refresh(2, 0, 5),
+                Nothing,
+                Refresh(1, 30, 40),
+                Write(1),
+                Refresh(1, 0, 100),
+                Write(3),
+                Refresh(3, 1, 2),
+                Refresh(4, 7, 9),
+                Write(4),
+                Title,
+                Write(2),
+            ]
+            .into_iter(),
+        );
+        found.sort_unstable();
+        assert_eq!(found, [(1, 10, 40), (4, 7, 9)]);
+    }
 }
 
 /// Whether the fills of a submission's upload memory are done together on
@@ -6755,6 +6838,9 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
+        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+            return;
+        }
         match self.index.get(&key) {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
@@ -6770,6 +6856,8 @@ impl Batch {
     /// Before shaders are given a range of `shadow`'s copy: its pending
     /// refresh is done, the others stay pending.
     fn flush_one(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) {
+        // From here on it is refreshed around what the shaders write.
+        self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
         };
@@ -6813,7 +6901,56 @@ impl Batch {
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
+        self.ahead.clear();
         self.textures.clear();
+    }
+
+    /// Before the steps of `runs` ([`ahead_of_writes`]); copies and fills
+    /// that `taken` names are not done on the CPU.
+    fn refresh_ahead(&mut self, runs: &[&HostList], taken: impl Fn(&HostList, usize) -> bool) {
+        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        let mut touches = Vec::new();
+        'steps: for list in runs {
+            for (i, step) in list.deferred().copies.iter().enumerate() {
+                touches.push(match step {
+                    Step::Refresh(shadow, at, len) => {
+                        let key = std::sync::Arc::as_ptr(shadow) as usize;
+                        copies.entry(key).or_insert_with(|| shadow.clone());
+                        Touch::Refresh(key, *at, *at + *len)
+                    }
+                    Step::GpuWrite(shadow, ..) => Touch::Write(std::sync::Arc::as_ptr(shadow) as usize),
+                    Step::Copy(..) if taken(list, i) => Touch::Nothing,
+                    Step::Copy(..) | Step::Run(_) | Step::Placed(_) => break 'steps,
+                    _ => Touch::Nothing,
+                });
+            }
+        }
+        let due: Vec<_> = written_spans(touches.into_iter())
+            .into_iter()
+            .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
+            .collect();
+        for (shadow, from, to) in &due {
+            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+        }
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        let started = std::time::Instant::now();
+        let before = PREPARING[0].load(Ordering::Relaxed);
+        crate::shadow::wide_each(due.len(), move |i| {
+            let (shadow, from, to) = &due[i];
+            if !shadow.nothing_new(*from, *to - *from) {
+                Self::update(shadow, *from, *to);
+            }
+        });
+        // The time counted is the time it took, not the threads' sum.
+        let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+        PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            let ns = began.elapsed().as_nanos() as u64;
+            SPLIT[6].fetch_add(ns, Ordering::Relaxed);
+            SPLIT[9].fetch_add(ns, Ordering::Relaxed);
+        }
     }
 
     /// The fills noted are done.

@@ -183,6 +183,20 @@ fn sync_aside() -> bool {
     *ON.get_or_init(|| sync_on() && std::env::var_os("VICTORY_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
 }
 
+/// How long that thread waits for a submission before it makes a round of its
+/// own (`VICTORY_HEAP_SYNC_EARLY=<ms>`, 4 if not given; `0`: none). The title
+/// copies its records while it records, and the first submission of a frame
+/// found all of them: 8 ms waited for (run cpu-2). A round made meanwhile
+/// leaves it those written since.
+#[cfg(windows)]
+fn sync_early() -> Option<std::time::Duration> {
+    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let ms = std::env::var("VICTORY_HEAP_SYNC_EARLY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4u64);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
 /// The thread's work: rounds asked for, rounds done.
 #[cfg(windows)]
 static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
@@ -211,13 +225,29 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
+            // Between the rounds asked for, while submissions come.
+            let mut last = std::time::Instant::now();
             loop {
                 let mut r = rounds();
-                while r.0 == r.1 {
-                    r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                let mut asked = r.0 != r.1;
+                while !asked {
+                    let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
+                        r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                        asked = r.0 != r.1;
+                        continue;
+                    };
+                    let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
+                    r = back;
+                    asked = r.0 != r.1;
+                    if over.timed_out() {
+                        break;
+                    }
                 }
                 drop(r);
-                let _over = Over;
+                let _over = asked.then(|| {
+                    last = std::time::Instant::now();
+                    Over
+                });
                 let _ = std::panic::catch_unwind(sync_heaps);
             }
         });

@@ -301,6 +301,7 @@ pub(crate) fn sync_heaps() {
     }
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut kinds = [0u64; 6];
     let mut page_bytes: Vec<u8> = Vec::new();
     let mut changed: Vec<u32> = Vec::new();
     let mut wait: Vec<u32> = Vec::new();
@@ -322,7 +323,7 @@ pub(crate) fn sync_heaps() {
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
             for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
@@ -334,6 +335,7 @@ pub(crate) fn sync_heaps() {
         let of_tables = of_tables.into_inner();
         tabled += of_tables;
         mirrored += before.len() as u64 - of_tables;
+        kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
@@ -388,12 +390,22 @@ pub(crate) fn sync_heaps() {
                         }
                         make.push(index);
                         mirrored += 1;
+                        kinds[if heap.samplers() {
+                            3
+                        } else if word(0) != VIEW_TAG {
+                            0
+                        } else if word(2) >> KIND_SHIFT == 0 {
+                            1
+                        } else {
+                            2
+                        }] += 1;
+                        kinds[5] += u64::from(!heap.samplers() && host.near_tabled(index, frame));
                     }
                 }
                 page += crate::watch::PAGE;
             }
         }
-        crate::land::each_view(make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
+        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
             for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
@@ -407,7 +419,15 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, micros, tabled, later]) {
         count.fetch_add(n, Relaxed);
     }
+    for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
+        count.fetch_add(n, Relaxed);
+    }
 }
+
+/// Of those mirrored, since the last frame line: no view, a view of an object,
+/// another, a sampler; waited and no draw came; next to a slot of a table's.
+#[cfg(windows)]
+static SYNCED_KINDS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Records [`sync_heaps`] gives a thread at a time.
 #[cfg(windows)]
@@ -436,20 +456,28 @@ pub(crate) fn sync_line(frames: f64) {
         );
     }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let kinds = [0, 1, 2, 3, 4, 5].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \
-         draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for)",
+         draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for); of the mirrored \
+         {:.0} no views, {:.0} of objects, {:.0} others, {:.0} samplers, {:.0} that waited and no draw came, {:.0} near a table's slot",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         tabled as f64 / frames,
         later as f64 / frames,
         micros as f64 / 1000.0 / frames,
-        waited as f64 / 1000.0 / frames
+        waited as f64 / 1000.0 / frames,
+        kinds[0],
+        kinds[1],
+        kinds[2],
+        kinds[3],
+        kinds[4],
+        kinds[5]
     );
 }
 

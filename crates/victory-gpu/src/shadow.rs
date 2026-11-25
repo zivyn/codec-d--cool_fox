@@ -1507,30 +1507,34 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     runs
 }
 
-/// Whether pages of a copy in the card's memory that a refresh takes again
-/// go up to the card only where they are not what the CPU's side holds
-/// already (`VICTORY_SEND_CHANGED=1`; off by default).
+/// Whether a refresh of a copy in the card's memory takes, and sends up,
+/// the dwords that title memory changed and no others
+/// (`VICTORY_SEND_CHANGED=0`: the 64 KiB pages written since it last took
+/// them, whole, as before).
 ///
-/// A refresh copies the 64 KiB pages that were written since it last took
-/// them, and all of each went up and was hashed there again. Most of them
-/// the title did not write: the relay put what shaders wrote into title
-/// memory, and the card and the CPU's side hold those bytes already
-/// ([`Shadow::card_merge_relay`]). Run record-1: 1,500 pieces (98 MB) a
-/// frame fetched from the card, 103 MB in 328 ranges sent up, 322 hash
-/// passes, while the title's own writes took some 260 guards off.
+/// A page that counts as written is mostly not the title's doing, or not all
+/// of it: a word the title wrote, and around it what shaders wrote and the
+/// title never touched; or only what the relay put into title memory, which
+/// the card and the CPU's side hold already ([`Shadow::card_merge_relay`]).
+/// Sent up whole, such a page goes over whatever the card holds there that
+/// did not come back yet, or never will (a write through a view nobody
+/// declared): what stood on the card, newer, was gone.
 ///
-/// What it rests on: the card's side holds what the CPU's side holds, but
-/// for ranges shaders may be writing (no refresh touches them) and what is
-/// still to go up. A page's first taking always goes up whole, so does one
-/// that could not be read; after that every byte that changes on the CPU's
-/// side goes up (the bytes compared are the bytes stored).
+/// What it rests on: the CPU's side is what the card's side was last known
+/// to hold, for every range no shader may be writing (no refresh touches
+/// the others). So a dword goes up only if title memory holds another value
+/// of it than the CPU's side, which then holds it too; title memory is read
+/// once, what is compared is what is stored and sent. Dwords, not bytes:
+/// no shader writes less, and the title's bytes beside a changed one in its
+/// dword are those the CPU's side holds.
 ///
-/// Why it is not on by default: a shader that writes a copy through a view
-/// nobody declared (`crate::draw`, buffers picked by index) breaks that
-/// rule. Taken again, its page went up over what it wrote; with the switch
-/// its bytes stay, as they would on the console, until the title changes the
-/// same 64 bytes: clearing them to the zeros they held before is then no
-/// change.
+/// A page never taken goes up whole as long as no shader's write was ever
+/// declared for the copy. After that it is compared as any other: the CPU's
+/// side and the card's began as zeros, both.
+///
+/// What it cannot know: that the title wrote a value over the same value.
+/// Where a shader wrote in between, through a view nobody declared, the
+/// shader's stays.
 fn send_changed() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -1538,19 +1542,19 @@ fn send_changed() -> bool {
         if crate::copystat::mode() != 0 {
             return false;
         }
-        std::env::var_os("VICTORY_SEND_CHANGED").is_some_and(|v| v == "1") && crate::safecopy::on()
+        std::env::var_os("VICTORY_SEND_CHANGED").is_none_or(|v| v != "0")
     })
 }
 
-/// Since the last frame-rate line, of pages taken again into copies in the
+/// Since the last frame-rate line, of pages taken into copies in the
 /// card's memory ([`send_changed`]): bytes compared, those of pages that
-/// held the same, and bytes to go up.
-static SEND: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// held the same, bytes to go up, and the runs they are.
+static SEND: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// [`SEND`], taken.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn send_stats() -> [u64; 3] {
-    [0, 1, 2].map(|i| SEND[i].swap(0, Ordering::Relaxed))
+pub(crate) fn send_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| SEND[i].swap(0, Ordering::Relaxed))
 }
 
 /// Whether what shaders wrote goes into title memory run by run
@@ -2993,34 +2997,47 @@ impl Shadow {
     /// Copies title memory `[from, to)` (inside the buffer) into the copy;
     /// `known`: the copy held it before ([`send_changed`]).
     fn take(&self, from: usize, to: usize, known: bool) -> usize {
-        if !known || self.card.is_none() || !send_changed() {
-            return self.copy(from, to);
+        thread_local! {
+            /// A page of title memory, as read.
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        let Some(card) = self.card.as_ref().filter(|_| send_changed()) else {
+            return self.copy(from, to);
+        };
+        let whole = !known && card.before.lock().unwrap_or_else(|e| e.into_inner()).is_none();
         let start = self.start as usize;
-        let mut at = from;
-        while at < to {
-            let n = (PAGE - at % PAGE).min(to - at);
-            // SAFETY: inside the mapping of the copy's CPU side, which
-            // nothing else writes there: no shader's range holds it.
-            let found = unsafe { crate::safecopy::update(self.data.add(at - start), at as *const u8, n) };
-            SEND[0].fetch_add(n as u64, Ordering::Relaxed);
-            match found {
-                crate::safecopy::Updated::Same => {
+        TITLE.with_borrow_mut(|title| {
+            title.resize(PAGE, 0);
+            let mut at = from;
+            while at < to {
+                let n = (PAGE - at % PAGE).min(to - at);
+                let title = &mut title[..n];
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), at as *const u8, n, false);
+                // SAFETY: inside the mapping of the copy's CPU side, which
+                // nothing else reads or writes there (the card copies from
+                // it): no shader's range holds it, and the parts of a
+                // refresh lie apart.
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
+                let was = crate::host::upcheck::on().then(|| held.to_vec());
+                let runs = if whole { vec![(0, n)] } else { dword_runs(at, held, title, 0) };
+                for &(a, len) in &runs {
+                    held[a..a + len].copy_from_slice(&title[a..a + len]);
+                    self.changed(at - start + a, at - start + a + len);
+                }
+                self.card_changed_runs(runs.iter().map(|&(a, len)| (at - start + a, at - start + a + len)));
+                if let Some(was) = was {
+                    crate::host::upcheck::note(self.id, at - start, &was, held);
+                }
+                SEND[0].fetch_add(n as u64, Ordering::Relaxed);
+                if runs.is_empty() {
                     SEND[1].fetch_add(n as u64, Ordering::Relaxed);
                 }
-                crate::safecopy::Updated::Changed(a, b) => {
-                    SEND[2].fetch_add((b - a) as u64, Ordering::Relaxed);
-                    self.changed(at - start + a, at - start + b);
-                    self.card_changed(at - start + a, at - start + b);
-                }
-                // A page is not there: as before, around it, and all of it
-                // goes up.
-                crate::safecopy::Updated::Failed => {
-                    self.copy(at, at + n);
-                }
+                SEND[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                SEND[3].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                at += n;
             }
-            at += n;
-        }
+        });
         to - from
     }
 
@@ -3055,16 +3072,24 @@ impl Shadow {
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
+        self.card_changed_runs(std::iter::once((from, to)));
+    }
+
+    /// [`Shadow::card_changed`] of each of `runs`.
+    fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
             return;
         };
-        if from >= to {
+        let mut runs = runs.filter(|r| r.0 < r.1).peekable();
+        if runs.peek().is_none() {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
-        match dirty.last_mut() {
-            Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
-            _ => dirty.push((from, to)),
+        for (from, to) in runs {
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
         }
     }
 

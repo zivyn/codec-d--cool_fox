@@ -75,6 +75,46 @@ std::arch::global_asm!(
     "vzeroupper",
     "xor eax, eax",
     "ret",
+    ".globl victory_safe_update",
+    ".globl victory_safe_update_at",
+    ".globl victory_safe_update_after",
+    ".globl victory_safe_update_failed",
+    // rcx destination, rdx source, r8 bytes (whole 64s, not none), r9 where
+    // the offset of the first 64 bytes that differed goes (-1: none did) and
+    // behind it the offset of the end of the last: stores the 64s that
+    // differ. eax: whether all could be read.
+    "victory_safe_update:",
+    "xor r10d, r10d",
+    "mov r11, -1",
+    "xor eax, eax",
+    "2:",
+    "victory_safe_update_at:",
+    "vmovdqu ymm0, ymmword ptr [rdx + r10]",
+    "vmovdqu ymm1, ymmword ptr [rdx + r10 + 32]",
+    "victory_safe_update_after:",
+    "vpxor ymm2, ymm0, ymmword ptr [rcx + r10]",
+    "vpxor ymm3, ymm1, ymmword ptr [rcx + r10 + 32]",
+    "vpor ymm2, ymm2, ymm3",
+    "vptest ymm2, ymm2",
+    "jz 3f",
+    "vmovdqu ymmword ptr [rcx + r10], ymm0",
+    "vmovdqu ymmword ptr [rcx + r10 + 32], ymm1",
+    "cmp r11, -1",
+    "cmove r11, r10",
+    "lea rax, [r10 + 64]",
+    "3:",
+    "add r10, 64",
+    "cmp r10, r8",
+    "jb 2b",
+    "mov qword ptr [r9], r11",
+    "mov qword ptr [r9 + 8], rax",
+    "vzeroupper",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_update_failed:",
+    "vzeroupper",
+    "xor eax, eax",
+    "ret",
 );
 
 unsafe extern "system" {
@@ -86,6 +126,57 @@ unsafe extern "system" {
     fn victory_safe_put_at();
     fn victory_safe_put_after();
     fn victory_safe_put_failed();
+    fn victory_safe_update(dst: *mut u8, src: *const u8, len: usize, changed: *mut [usize; 2]) -> u32;
+    fn victory_safe_update_at();
+    fn victory_safe_update_after();
+    fn victory_safe_update_failed();
+}
+
+/// What [`update`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Updated {
+    /// Every byte was the same already; nothing was stored.
+    Same,
+    /// The bytes that changed lie in these offsets.
+    Changed(usize, usize),
+    /// Not all of the source could be read; some may have been copied.
+    Failed,
+}
+
+/// Makes `dst` hold what `src` holds, storing only what differs. The source
+/// may change meanwhile: what is compared is what is stored, read once.
+///
+/// # Safety
+/// As [`copy`]'s, and the destination is memory of ours that nothing else
+/// writes.
+pub(crate) unsafe fn update(dst: *mut u8, src: *const u8, len: usize) -> Updated {
+    let whole = len / 64 * 64;
+    let (mut from, mut to) = (usize::MAX, 0);
+    if whole > 0 {
+        let mut changed = [usize::MAX, 0];
+        // SAFETY: the source's faults leave through the failing exit; the
+        // rest is the caller's.
+        if unsafe { victory_safe_update(dst, src, whole, &mut changed) } == 0 {
+            return Updated::Failed;
+        }
+        [from, to] = changed;
+    }
+    if whole < len {
+        let mut rest = [0u8; 64];
+        let rest = &mut rest[..len - whole];
+        // SAFETY: as above; `rest` is ours.
+        unsafe {
+            if !copy(rest.as_mut_ptr(), src.add(whole), rest.len()) {
+                return Updated::Failed;
+            }
+            let held = std::slice::from_raw_parts_mut(dst.add(whole), rest.len());
+            if held != rest {
+                held.copy_from_slice(rest);
+                (from, to) = (from.min(whole), len);
+            }
+        }
+    }
+    if from >= to { Updated::Same } else { Updated::Changed(from, to) }
 }
 
 /// Puts `now` at `dst` where it differs from `was`, whole dwords (as `dst`
@@ -160,7 +251,11 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
         return Some(victory_safe_copy_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
-    (from..to).contains(&at).then_some(victory_safe_put_failed as *const () as usize)
+    if (from..to).contains(&at) {
+        return Some(victory_safe_put_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_update_at as *const () as usize, victory_safe_update_after as *const () as usize);
+    (from..to).contains(&at).then_some(victory_safe_update_failed as *const () as usize)
 }
 
 #[cfg(test)]
@@ -211,6 +306,52 @@ mod tests {
                     assert!(to[..da].iter().chain(&to[da + len..]).all(|&x| x == 0xEE));
                 }
             }
+        }
+    }
+
+    /// An update makes the two the same, says where they differed (to 64
+    /// bytes), stores nothing where they did not, and fails at a page that
+    /// is not there.
+    #[test]
+    fn updates_store_what_differs() {
+        assert!(on());
+        let (src, dst) = (Pages::new(1 << 14), Pages::new(1 << 14));
+        for len in [0usize, 1, 63, 64, 65, 200, 4096, 5000] {
+            for (da, sa) in [(0usize, 0usize), (3, 0), (0, 5)] {
+                for changed in [vec![], vec![0usize], vec![len / 2], vec![len.saturating_sub(1)], vec![1, len / 3, len / 2]] {
+                    src.fill();
+                    // SAFETY: inside the two allocations.
+                    unsafe {
+                        std::ptr::write_bytes(dst.0, 0xEE, dst.1);
+                        std::ptr::copy_nonoverlapping(src.0.add(sa), dst.0.add(da), len);
+                        let at: std::collections::BTreeSet<usize> = changed.iter().copied().filter(|&i| i < len).collect();
+                        for &i in &at {
+                            *src.0.add(sa + i) ^= 0x40;
+                        }
+                        let found = update(dst.0.add(da), src.0.add(sa), len);
+                        match (at.iter().min(), at.iter().max()) {
+                            (Some(&first), Some(&last)) => {
+                                let Updated::Changed(from, to) = found else {
+                                    panic!("{len} {at:?}: {found:?}")
+                                };
+                                assert_eq!(from, first / 64 * 64);
+                                assert_eq!(to, ((last / 64 + 1) * 64).min(len));
+                            }
+                            _ => assert_eq!(found, Updated::Same),
+                        }
+                        let (to, from) = (std::slice::from_raw_parts(dst.0, dst.1), std::slice::from_raw_parts(src.0, src.1));
+                        assert_eq!(to[da..da + len], from[sa..sa + len]);
+                        assert!(to[..da].iter().chain(&to[da + len..]).all(|&x| x == 0xEE));
+                    }
+                }
+            }
+        }
+        // SAFETY: our allocation.
+        unsafe {
+            VirtualFree(src.0.add(4096).cast(), 4096, MEM_DECOMMIT);
+            assert_eq!(update(dst.0, src.0, 8192), Updated::Failed);
+            assert_eq!(update(dst.0, src.0.add(4096), 10), Updated::Failed);
+            assert_ne!(update(dst.0, src.0, 4096), Updated::Failed);
         }
     }
 

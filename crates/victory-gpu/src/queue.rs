@@ -442,6 +442,24 @@ pub(crate) fn before_sync() {
     }
 }
 
+/// Whether submissions go into the line of a thread of ours ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn line_on() -> bool {
+    behind::on()
+}
+
+/// Lists in the line may have been translated ([`crate::list::thin`]).
+#[cfg(windows)]
+pub(crate) fn line_moved() {
+    behind::wake();
+}
+
+/// This thread does work the line waits for: it does not wait for the line.
+#[cfg(windows)]
+pub(crate) fn no_drain_here() {
+    behind::no_drain_here();
+}
+
 /// Submissions the title made that the host has not begun ([`behind`]).
 #[cfg(windows)]
 pub(crate) fn queued() -> u64 {
@@ -452,6 +470,7 @@ pub(crate) fn queued() -> u64 {
 #[cfg(windows)]
 pub(crate) fn behind_line(frames: f64) {
     if behind::on() {
+        crate::list::thin::line(frames);
         behind::line(frames);
     }
 }
@@ -921,6 +940,9 @@ extern "system" fn present(
             crate::resource::host_copy(resource).map(|copy| {
                 let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
                 crate::resource::host_transition(resource, state);
+                // (Lists not translated yet leave it in no state yet: the
+                // one it is in when its turn in the line comes.)
+                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
                 (resource as usize, copy, state)
             })
         } else {

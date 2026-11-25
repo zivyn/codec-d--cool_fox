@@ -2193,6 +2193,7 @@ impl HostHeap {
                 self.put(f.index);
                 #[cfg(feature = "diagnostics")]
                 let was = shown;
+                self.quick_is(f.index, 0);
                 self.made.set(f.index, f.key);
                 self.keep(f.index, kept);
                 #[cfg(feature = "diagnostics")]

@@ -85,15 +85,22 @@ pub(super) fn stage() -> u32 {
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of
 /// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=0`: wherever it stands, as before), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]).
+/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
+/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
+/// the case did not come up once in runs submit-1 to submit-3, so it has only
+/// its tests behind it.
 ///
 /// The fills of constant buffers read the title's ring (7,500 a frame in the
 /// opening), and one copy of a few hundred bytes a frame writes into it at its
 /// place in a list. The whole submission was refused for it, and stood 40 to
 /// 60 ms until the flights had landed (run n19).
 fn placed_order() -> bool {
-    crate::toggled!("VICTORY_PLACED_ORDER")
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PLACED_ORDER") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
 /// Why [`plan`] refuses for [`place`].

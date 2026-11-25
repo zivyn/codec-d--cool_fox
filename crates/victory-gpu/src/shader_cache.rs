@@ -54,6 +54,10 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // So is the view heap's null slot (it differs by host GPU):
+                // a translation cached without the clamp must not be served.
+                crate::descriptor::host::probe_view_limit();
+                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
                 // So are the switches that pick the form of a wave64 program:

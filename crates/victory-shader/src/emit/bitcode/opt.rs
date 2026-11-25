@@ -399,6 +399,82 @@ impl Module {
         Some((bits, *x as u64 & mask(bits)))
     }
 
+    /// The bits of a 32-bit float that is a constant, given as one or as a
+    /// cast of an integer constant.
+    pub(crate) fn float_k(&self, v: V) -> Option<f32> {
+        let (v, cast) = match v {
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, x) => (x, true),
+                _ => return None,
+            },
+            _ => (v, false),
+        };
+        let V::Const(i) = v else { return None };
+        match &self.consts[i as usize].1 {
+            Const::Float(bits) if !cast => Some(f32::from_bits(*bits)),
+            Const::Int(_) if cast => {
+                let (bits, x) = self.int_k(v)?;
+                (bits == 32).then_some(f32::from_bits(x as u32))
+            }
+            _ => None,
+        }
+    }
+
+    /// For a float that is a number and not an infinity whatever the program
+    /// reads: a power of two its magnitude does not pass.
+    pub(crate) fn bounded(&self, v: V, depth: u32) -> Option<f32> {
+        if let Some(k) = self.float_k(v) {
+            return k.is_finite().then(|| k.abs().max(1e-30).log2().ceil());
+        }
+        let V::Inst(i) = v else { return None };
+        let depth = depth.checked_sub(1)?;
+        let of = |v: V| self.bounded(v, depth);
+        // (A power that overflows, or might with rounding, is no bound.)
+        let held = |b: f32| (b < 126.0).then_some(b);
+        match &self.insts[i as usize].op {
+            Op::Cast(Cast::UiToFp | Cast::SiToFp, _) => Some(32.0),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
+                    _ => None,
+                },
+                _ => None,
+            },
+            Op::Bin(Bin::Mul, a, b) => held(of(*a)? + of(*b)?),
+            Op::Bin(Bin::Add | Bin::Sub, a, b) => held(of(*a)?.max(of(*b)?) + 1.0),
+            Op::Select(_, a, b) => Some(of(*a)?.max(of(*b)?)),
+            Op::Call(_, args) => {
+                let (_, code) = self.int_k(*args.first()?)?;
+                match (code, &args[1..]) {
+                    // Saturated, a fraction, a cosine or sine (of a number).
+                    (7, [_]) => Some(0.0),
+                    (6, [x]) => of(*x),
+                    (22 | 12 | 13, [x]) => of(*x).map(|_| 0.0),
+                    (26..=29, [x]) => held(of(*x)? + 1.0),
+                    // Of two numbers; or one of them the other way round: the
+                    // minimum (36) of a constant and a maximum of another.
+                    (35 | 36, [a, b]) => match (of(*a), of(*b)) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => {
+                            let other = if code == 35 { 36 } else { 35 };
+                            let (inner, k) = if self.float_k(*b).is_some() { (*a, *b) } else { (*b, *a) };
+                            let k = self.float_k(k).and_then(|_| of(k))?;
+                            let V::Inst(j) = inner else { return None };
+                            let Op::Call(_, inner) = &self.insts[j as usize].op else { return None };
+                            let (_, code) = self.int_k(*inner.first()?)?;
+                            let low = inner[1..].iter().find(|x| self.float_k(**x).is_some())?;
+                            (code == other).then_some(())?;
+                            Some(k.max(of(*low)?))
+                        }
+                    },
+                    (46, [a, b, c]) => held((of(*a)? + of(*b)?).max(of(*c)?) + 1.0),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// The constant `x` of the integer type `ty`, kept sign-extended as
     /// [`Module::i32`] and [`Module::bool`] keep theirs.
     fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {

@@ -195,6 +195,25 @@ pub(crate) struct Replay {
     /// `<list>:<command>` (repeatable).
     #[arg(long)]
     split: Vec<String>,
+    /// Take shaders from this folder where it has them (`<hash>.dxil`, by the
+    /// hash the runtime names the title's shader by).
+    #[arg(long)]
+    shaders: Option<PathBuf>,
+    /// With --compare: the folder the second run's shaders are from.
+    #[arg(long)]
+    shaders_b: Option<PathBuf>,
+    /// Only translate the capture's shaders, into this folder (for --shaders),
+    /// with the translator's settings of this run. Containers are looked up in
+    /// `containers` beside the capture, and first collected there from the
+    /// title's files.
+    #[arg(long)]
+    retranslate: Option<PathBuf>,
+    /// With --retranslate: the view heap's null slot, and where raw twins of
+    /// views start, as the capture's shaders have them (0: none).
+    #[arg(long, default_value_t = 0)]
+    view_limit: u32,
+    #[arg(long, default_value_t = 0)]
+    raw_views: u32,
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -228,6 +247,9 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     if let Some(text) = &r.flow {
         let lists = range(text).with_context(|| format!("--flow {text}"))?;
         return play::look::flow(&r.folder, lists, r.flow_draws, r.flow_slots, &mut |line| println!("{line}"));
+    }
+    if let Some(into) = &r.retranslate {
+        return retranslate(&r.folder, into, r.view_limit, r.raw_views);
     }
     let until = match &r.until {
         Some(text) => Some(
@@ -270,6 +292,8 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         only,
         until,
         skip_shaders: r.skip_shader,
+        shaders: r.shaders,
+        shaders_b: r.shaders_b,
         compare: r.compare,
         debug: r.debug_layer,
         breadcrumbs: r.breadcrumbs,
@@ -406,6 +430,66 @@ pub(crate) fn run(r: Replay) -> Result<()> {
     if let [(_, before), (_, after)] = &reports[..] {
         println!("{:+.2} ms", after.median_ms() - before.median_ms());
     }
+    Ok(())
+}
+
+/// Translates the capture's shaders into `into`.
+fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32, raw_views: u32) -> Result<()> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let wanted = play::title_shaders(folder)?;
+    let kept = play::find(folder)?.with_file_name("containers");
+    std::fs::create_dir_all(&kept)?;
+    std::fs::create_dir_all(into)?;
+    let mut missing: std::collections::HashSet<&str> = wanted
+        .iter()
+        .map(|w| w.1.as_str())
+        .filter(|h| !kept.join(format!("{h}.cdxil")).exists())
+        .collect();
+    if !missing.is_empty() {
+        println!("{} of {} containers are looked for in the title's files", missing.len(), wanted.len());
+        for root in crate::default_paths(Vec::new())? {
+            for entry in walkdir::WalkDir::new(root).into_iter().filter_map(std::result::Result::ok) {
+                let size = entry.metadata().map_or(0, |m| m.len());
+                if missing.is_empty() || !entry.file_type().is_file() || size > crate::shader::MAX_FILE {
+                    continue;
+                }
+                let Ok(data) = std::fs::read(entry.path()) else { continue };
+                for source in crate::shader::sources(&data) {
+                    let Some(bytes) = source.bytes() else { continue };
+                    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                    if missing.remove(hash.as_str()) {
+                        std::fs::write(kept.join(format!("{hash}.cdxil")), &bytes[..])?;
+                    }
+                }
+            }
+        }
+    }
+    println!("{} containers not found", missing.len());
+    victory_shader::emit::set_host_max_wave(64);
+    victory_shader::emit::set_host_rdna(true);
+    victory_shader::emit::set_view_heap_limit(view_limit);
+    victory_shader::emit::set_raw_views(raw_views);
+    let all: Vec<_> = wanted.iter().collect();
+    let (next, done) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let started = std::time::Instant::now();
+    std::thread::scope(|s| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            s.spawn(|| {
+                while let Some((stage, hash)) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
+                    match victory_shader::emit::translate(&bytes) {
+                        Ok(t) => {
+                            if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
+                                done.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        Err(e) => println!("{stage} {hash}: {e}"),
+                    }
+                }
+            });
+        }
+    });
+    println!("{} of {} shaders translated, {:.1} s", done.into_inner(), all.len(), started.elapsed().as_secs_f64());
     Ok(())
 }
 

@@ -65,8 +65,14 @@ pub(crate) fn pressured() -> bool {
 
 /// A soft per-frame admission limit. A single texture can cross it. The
 /// queue retains unserved slots so they can be retried on later frames.
-pub(crate) fn prefetch_limit(bytes: u64, pressure: bool) -> u64 {
-    if pressure { bytes.min(16 << 20) } else { bytes }
+pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, limited: bool, staging: u64) -> u64 {
+    if pressure {
+        bytes.min(16 << 20)
+    } else if limited && staging >= GIB {
+        bytes.min(32 << 20)
+    } else {
+        bytes
+    }
 }
 
 #[cfg(test)]
@@ -85,9 +91,12 @@ mod tests {
 
     #[test]
     fn prefetch_respects_existing_budgets_and_resumes_after_recovery() {
-        assert_eq!(prefetch_limit(0, true), 0);
-        assert_eq!(prefetch_limit(8 << 20, true), 8 << 20);
-        assert_eq!(prefetch_limit(512 << 20, true), 16 << 20);
-        assert_eq!(prefetch_limit(192 << 20, false), 192 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, true, GIB), 32 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, true, GIB - 1), 512 << 20);
+        assert_eq!(prefetch_limit(512 << 20, false, false, 2 * GIB), 512 << 20);
+        assert_eq!(prefetch_limit(0, true, false, 0), 0);
+        assert_eq!(prefetch_limit(8 << 20, true, false, 0), 8 << 20);
+        assert_eq!(prefetch_limit(512 << 20, true, false, 0), 16 << 20);
+        assert_eq!(prefetch_limit(192 << 20, false, false, 0), 192 << 20);
     }
 }

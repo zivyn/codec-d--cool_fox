@@ -42,7 +42,18 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let pressure = crate::residency::pressured();
+    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    SPARES.store(limit, Ordering::Relaxed);
+    let tick = now();
+    // A full pool can become idle while another subsystem needs the VRAM.
+    // A busy allocator observes the new limit on its next allocation or tick.
+    if let Ok(mut pool) = TEXTURES.try_lock() {
+        pool.reclaim(tick, limit, true);
+    }
+    if let Ok(mut pool) = STAGING.try_lock() {
+        pool.reclaim(tick, if pressure { 0 } else { limit }, true);
+    }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -272,6 +283,10 @@ impl<B: Clone> Pool<B> {
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
+        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+    }
+
+    fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
         let mut any = false;
         while let Some(&(ready, piece)) = self.resting.front()
             && ready <= now
@@ -283,9 +298,9 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
-        if any || most < self.spare {
-            self.spare = most;
+        let most = limit.min(self.most);
+        let previous = std::mem::replace(&mut self.spare, most);
+        if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
@@ -558,6 +573,28 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn budget_tick_reclaims_idle_blocks_without_reusing_live_or_resting_pieces() {
+        let mut pool = Pool::new(STAGING_KEPT);
+        let (held, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(1)).unwrap();
+        let (resting, _, _) = pool.take(BLOCK / 2, 1, 0, || Some(2)).unwrap();
+        pool.give(resting, 0);
+        for i in 0..12 {
+            pool.add(i, 0);
+        }
+        pool.reclaim(0, SPARE_KEPT, true);
+        assert_eq!(pool.blocks(), STAGING_KEPT + 1);
+        pool.reclaim(REST - 1, SPARE, true);
+        assert_eq!(pool.blocks(), SPARE + 1);
+        assert_eq!(pool.resting.len(), 1);
+        pool.reclaim(REST, 0, true);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.resting.is_empty());
+        pool.give(held, REST);
+        pool.reclaim(2 * REST, 0, true);
+        assert_eq!(pool.blocks(), 0);
     }
 
     #[test]

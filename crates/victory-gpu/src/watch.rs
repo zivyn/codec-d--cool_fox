@@ -1049,12 +1049,14 @@ static TOLD: Bits = Bits::new();
 /// read-only for another view, one sees the other.
 static ALIASED: Bits = Bits::new();
 
-/// A block a write fault opened without the guards' lock, when, and the
-/// other views of its page it told as written ([`TOLD`]).
+/// A block a write fault opened without the guards' lock, when, the other
+/// views of its page it told as written ([`TOLD`]), and [`hot`] as the
+/// faulting thread found it.
 struct Opened {
     block: usize,
     at: std::time::Instant,
     others: Vec<usize>,
+    hot: Option<std::time::Duration>,
 }
 
 /// Those whose notes are not settled yet ([`settle`]), and how many.
@@ -1148,7 +1150,7 @@ fn open_unlocked(block: usize) -> bool {
     // After the protection: who settles it may let the block be guarded again.
     {
         let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
-        opened.push(Opened { block, at, others });
+        opened.push(Opened { block, at, others, hot: hot() });
         TO_SETTLE.store(opened.len(), SeqCst);
     }
     #[cfg(feature = "diagnostics")]
@@ -1178,7 +1180,7 @@ fn settle(g: &mut Guards) {
         TO_SETTLE.store(0, SeqCst);
         std::mem::take(&mut *opened)
     };
-    for Opened { block, at, mut others } in opened {
+    for Opened { block, at, mut others, hot } in opened {
         if g.aliased.contains(block) {
             if others.is_empty() {
                 // Guarded with its other views after the fault looked: they
@@ -1201,7 +1203,7 @@ fn settle(g: &mut Guards) {
             PUBLISHED.clear(block);
             PROTECTED.clear(block);
         }
-        g.opened_at(block, at);
+        g.opened_at(block, at, hot);
         // (Another fault may have told the same views: they are not clean
         // now, and its own block keeps them so, `protect_alias`.)
         for &other in &others {
@@ -1611,6 +1613,46 @@ fn rest() -> std::time::Duration {
 thread_local! {
     /// [`rest`], for what this thread asks.
     static REST_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+    /// [`hot`], for this thread's faults.
+    static HOT_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+/// How long a block the title writes again and again is left open
+/// (`VICTORY_GUARD_HOT=<milliseconds>`; off unless given, 50 when only
+/// `VICTORY_AB` names it, which turns it on and off): a block that a write
+/// fault opens within that time after its last rest ended rests that long.
+///
+/// Nearly every block a frame makes read-only is written again and faults:
+/// 321 to 1,017 blocks made read-only and 323 to 331 guard faults a frame
+/// in play (logs coolfox-20261126-155824 and -172435), each fault a change
+/// of protection on a title thread and each guarding one on ours, with the
+/// guards' lock held. A block that rests counts as written at every asking,
+/// as for [`rest`], so nothing is missed: it is copied at each refresh that
+/// takes it while it rests, with no fault and no change of protection.
+fn hot() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    {
+        let keep = HOT_IN_TEST.get();
+        (!keep.is_zero()).then_some(keep)
+    }
+    #[cfg(not(test))]
+    {
+        static HOT: std::sync::OnceLock<(std::time::Duration, Option<u32>)> = std::sync::OnceLock::new();
+        let &(keep, _bit) = HOT.get_or_init(|| {
+            let ms = std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|ms| *ms > 0.0);
+            #[cfg(feature = "diagnostics")]
+            let bit = crate::ab::bit("VICTORY_GUARD_HOT");
+            #[cfg(not(feature = "diagnostics"))]
+            let bit = None;
+            let ms = ms.or(bit.map(|_| 50.0)).unwrap_or(0.0);
+            (std::time::Duration::from_secs_f64(ms.min(1e6) / 1000.0), bit)
+        });
+        #[cfg(feature = "diagnostics")]
+        if _bit.is_some_and(|bit| !crate::ab::on(bit)) {
+            return None;
+        }
+        (!keep.is_zero()).then_some(keep)
+    }
 }
 
 struct Guards {
@@ -1637,8 +1679,9 @@ struct Guards {
     /// one opens them all. (A write's range can be huge, `fread`'s, so only
     /// these are looked up.)
     aliased: Blocks,
-    /// Blocks opened by a write fault, and when ([`rest`]).
-    opened: std::collections::HashMap<usize, std::time::Instant, std::hash::BuildHasherDefault<PageHash>>,
+    /// Blocks opened by a write fault, when ([`rest`]), and how long they
+    /// rest for being written again and again ([`hot`]; zero if not).
+    opened: std::collections::HashMap<usize, (std::time::Instant, std::time::Duration), std::hash::BuildHasherDefault<PageHash>>,
 }
 
 impl Guards {
@@ -1648,25 +1691,33 @@ impl Guards {
 
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
-        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+        self.opened.get(&block).is_some_and(|&(at, hot)| at.elapsed() < rest.max(hot))
     }
 
     /// A write fault opened `block`.
     fn opened(&mut self, block: usize) {
-        self.opened_at(block, std::time::Instant::now());
+        self.opened_at(block, std::time::Instant::now(), hot());
     }
 
-    /// A write fault opened `block` at `at`.
-    fn opened_at(&mut self, block: usize, at: std::time::Instant) {
+    /// A write fault opened `block` at `at`; `hot`, as the faulting thread
+    /// found [`hot`].
+    fn opened_at(&mut self, block: usize, at: std::time::Instant, hot: Option<std::time::Duration>) {
         const MANY: usize = 1 << 13;
         if self.opened.len() >= MANY {
-            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            self.opened.retain(|_, (at, hot)| at.elapsed() < (*hot).max(std::time::Duration::from_millis(50)));
             if self.opened.len() >= MANY {
                 self.opened.clear();
             }
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
-        self.opened.insert(block, at);
+        // Opened again within that time after its last rest: it rests that
+        // long now.
+        let hot = hot
+            .filter(|&keep| {
+                self.opened.get(&block).is_some_and(|&(before, rested)| at.saturating_duration_since(before) < rested.max(rest()) + keep)
+            })
+            .unwrap_or_default();
+        self.opened.insert(block, (at, hot));
     }
 
     /// `block`'s page is guarded together with its other views ([`ALIASED`]
@@ -2841,9 +2892,13 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     for block in foreign {
         g.foreign.remove(&block);
     }
-    let aliased: Vec<usize> = g.aliased.range(range).collect();
+    let aliased: Vec<usize> = g.aliased.range(range.clone()).collect();
     for block in aliased {
         g.unalias(block);
+    }
+    // What the title wrote again and again there was another page ([`hot`]).
+    if hot().is_some() || cfg!(test) {
+        g.opened.retain(|block, (_, hot)| hot.is_zero() || !range.contains(block));
     }
     g
 }
@@ -3881,6 +3936,45 @@ mod tests {
         drop_views(section, &[one, two], BLOCK);
     }
 
+    /// A block written again soon after it rested ([`hot`]) rests longer: no
+    /// fault for its writes meanwhile, told as written at each asking, at
+    /// every view, and guarded again when that is over.
+    #[test]
+    fn a_block_written_again_and_again_rests_longer() {
+        const KEEP: std::time::Duration = std::time::Duration::from_millis(300);
+        let (section, one, two) = two_views(BLOCK);
+        let page = |view: usize| view / PAGE;
+        HOT_IN_TEST.set(KEEP);
+        for view in [one, two, one, two] {
+            assert!(writes(view, view + BLOCK, true).is_some());
+        }
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        // (Not opened lately as far as the guards know: another test's
+        // memory may have been at the address.)
+        guards().opened.remove(&(two / BLOCK));
+        // SAFETY (all): a view, opened by the handler.
+        unsafe { ((two + 8) as *mut u8).write(1) };
+        // The first time: guarded again at the next asking (no rest here).
+        assert_eq!(guard(two, two + BLOCK), Some(vec![page(two)]));
+        assert!(!writable(two));
+        // Written again: it rests.
+        unsafe { ((two + 8) as *mut u8).write(2) };
+        for _ in 0..3 {
+            assert_eq!(guard(two, two + BLOCK), Some(vec![page(two)]));
+            assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]), "the other view is not clean while it rests");
+            assert!(writable(two) && !writable(one), "no fault for the next write");
+            unsafe { ((two + 8) as *mut u8).write(3) };
+        }
+        std::thread::sleep(KEEP + std::time::Duration::from_millis(50));
+        HOT_IN_TEST.set(std::time::Duration::ZERO);
+        assert_eq!(guard(two, two + BLOCK), Some(vec![page(two)]));
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page(one)]));
+        assert!(!writable(two) && !writable(one));
+        assert_eq!(guard(two, two + BLOCK), Some(Vec::new()));
+        assert_eq!(guard(one, one + BLOCK), Some(Vec::new()));
+        drop_views(section, &[one, two], BLOCK);
+    }
+
     /// What is put in beside a guard is told at every view, once, and the
     /// block stays read-only; until it has had its share.
     #[test]
@@ -4289,7 +4383,7 @@ mod tests {
         unsafe { windows_sys::Win32::System::Memory::VirtualProtect(two as *const _, BLOCK, PAGE_READWRITE, &mut old) };
         {
             let mut opened = OPENED.lock().unwrap();
-            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)] });
+            opened.push(Opened { block: block(two), at: std::time::Instant::now(), others: vec![block(one)], hot: None });
             TO_SETTLE.store(opened.len(), SeqCst);
         }
         assert_eq!(guard(one, one + BLOCK), Some(vec![block(one)]));

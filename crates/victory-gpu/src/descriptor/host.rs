@@ -1035,6 +1035,49 @@ fn not_taken(site: usize) {
     });
 }
 
+/// Whether a slot's record of a texture object the host renders to or writes
+/// (a target, depth or unordered access texture: not `resource::title_fills`)
+/// is queued for the pass over textures picked by index, as any texture
+/// (`VICTORY_QUEUE_HOST_TEXTURES=0`: it is not; the slot leaves the queue as
+/// a buffer view's would).
+///
+/// The pass takes such a slot and finds nothing to bring up to date: it
+/// neither makes nor uploads anything for it, and takes it out
+/// (`draw.rs` `heap_textures`, the first of its "nothing to bring up to
+/// date"). The title writes such views into its tables' slots every frame,
+/// so they are queued again and again, take the queue's lock, and stand
+/// among the slots due (58,978 of 90,699 slots the pass took in 5 s of a
+/// cutscene found nothing to do, coolfox-20261126-233017 18:02:23; the line
+/// of 18ff932 says how many of those were such views). Off by default: the
+/// slots due are fewer, so a pass reaches others sooner, the catch-up budget
+/// (`VICTORY_TEXTURE_CATCHUP`, by the count due) starts less often, and a
+/// bake's pass is asked less often (the queue's write count).
+pub(crate) fn queue_host_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_HOST_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Records of textures the host writes left out of the queue
+/// ([`queue_host_textures`]) since the start, counted by each thread in
+/// batches.
+pub(crate) static HOST_TEXTURES_LEFT_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn host_texture_left_out() {
+    const BATCH: u32 = 64;
+    thread_local! {
+        static N: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    N.with(|n| {
+        let now = n.get() + 1;
+        if now >= BATCH {
+            HOST_TEXTURES_LEFT_OUT.fetch_add(u64::from(now), std::sync::atomic::Ordering::Relaxed);
+            n.set(0);
+        } else {
+            n.set(now);
+        }
+    });
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -3086,7 +3129,12 @@ impl HostHeap {
             }
             Some(View::Shader(r, _)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                true
+                // A texture the host renders to or writes: nothing for the
+                // pass to bring up to date ([`queue_host_textures`]).
+                queue_host_textures() || crate::resource::title_fills(*r as crate::object::This) || {
+                    host_texture_left_out();
+                    false
+                }
             }
             _ => false,
         };

@@ -9203,7 +9203,8 @@ impl Meter {
                          stale views, {} else); waited for {} ms ({}, {}, {}, {}, {}, {}, {} ms by the same places); held {} ms \
                          taking the slots due, {} ms making slots due, {} ms for stale views; not taken {} times, as nothing would \
                          have changed ({} noting a slot's record, {} by table reads, {} for stale views); since the start, {} slots \
-                         taken out by a table read after the first of their frame (VICTORY_TABLED_REREAD=1)",
+                         taken out by a table read after the first of their frame (VICTORY_TABLED_REREAD=1), {} records of textures \
+                         the host writes left out of the queue (VICTORY_QUEUE_HOST_TEXTURES=0)",
                         taken.iter().sum::<u64>(),
                         taken[0],
                         taken[1],
@@ -9228,6 +9229,7 @@ impl Meter {
                         skipped[4],
                         skipped[5],
                         crate::descriptor::host::TABLED_WRITES[2].load(Ordering::Relaxed),
+                        crate::descriptor::host::HOST_TEXTURES_LEFT_OUT.load(Ordering::Relaxed),
                     );
                 }
             }

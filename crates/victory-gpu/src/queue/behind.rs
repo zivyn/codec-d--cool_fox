@@ -255,8 +255,10 @@ impl<W: Work> Lane<W> {
 
     /// The parts of `entry`, which stands for them, in place `at`.
     fn unfold(state: &mut State<W>, at: usize, entry: Entry<W>) {
+        let began = Instant::now();
         let (number, queue, runs) = (entry.number, entry.queue, usize::from(entry.what.runs()));
         let parts = entry.what.unfold();
+        STATS[UNFOLDING].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
         state.runs -= runs;
         state.runs += parts.iter().filter(|p| p.runs()).count();
         for (i, what) in parts.into_iter().enumerate() {
@@ -611,8 +613,9 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// times they found things in it (the sum of their numbers) and the most; what
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
-/// not met at a present.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// not met at a present; parts joined; what our thread spent taking the
+/// lists of submissions whose translation was done out of the line.
+static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -625,6 +628,9 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+/// Microseconds of [`Lane::unfold`] (the lists detached, new host lists
+/// given to the title's lists), under the line's lock and not in [`BUSY`].
+const UNFOLDING: usize = 11;
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -850,7 +856,8 @@ pub(super) fn line(frames: f64) {
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
-         when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \
+         when one was added (at most {:.0}); that thread worked {:.1} ms, and {:.2} ms more taking translated lists out of the \
+         line (under its lock); threads of the title waited {:.1} ms for room in the \
          line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
          submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
         s[RUNS] / frames,
@@ -858,6 +865,7 @@ pub(super) fn line(frames: f64) {
         s[DEPTH] / s[RUNS].max(1.0),
         s[DEEPEST],
         ms(BUSY),
+        ms(UNFOLDING),
         ms(ROOM),
         ms(AT_PRESENT),
         ms(DRAINING),

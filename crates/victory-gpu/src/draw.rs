@@ -881,6 +881,24 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// the ones whose first page was not there (asked by the first page alone,
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Microseconds the pass over textures picked by index spent, since the
+/// last 5-second line, on: looks again at slots uploaded whole (a
+/// fingerprint of 48 KiB), asking how much of a texture's memory is mapped,
+/// asking whether a host copy holds what memory holds (a digest of all of
+/// it), and making host copies and staging their uploads (`readable`); and
+/// the passes in all. The pass stops at `VICTORY_TEXTURE_STAGE_MS` (16 in
+/// the launcher), and in play it ran 18-20 ms a frame for about 20
+/// textures: these say what took the time.
+pub(crate) static HEAP_TEXTURE_MICROS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// `f`'s result, its time added to [`HEAP_TEXTURE_MICROS`]' place `slot`.
+fn timed<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    HEAP_TEXTURE_MICROS[slot].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    out
+}
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
@@ -2949,7 +2967,8 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let looked = timed(0, || crate::texture::fingerprint(at, len));
+                if looked == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2990,7 +3009,7 @@ impl State {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
-                let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                let mapped = timed(1, || crate::texture::mapped_bytes(address as *const u8, len as usize));
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
@@ -3135,7 +3154,7 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
-            let same = !tabled && crate::texture::unchanged(resource, first);
+            let same = !tabled && timed(2, || crate::texture::unchanged(resource, first));
             if same {
                 HEAP_TEXTURES_SAME.fetch_add(1, Ordering::Relaxed);
                 if let (Some(sync), Some(key), Some(handle)) = (sync.as_deref_mut(), bake_key, heap.handle(index)) {
@@ -3196,7 +3215,7 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
-                readable(list, sampled.kind, view);
+                timed(3, || readable(list, sampled.kind, view));
                 crate::texture::PICKING.set(None);
             }
             // A failed or deferred staging allocation leaves this slot due.
@@ -3300,6 +3319,7 @@ impl State {
         if sync.is_none() && baking && served {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
+        HEAP_TEXTURE_MICROS[4].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
         served
     }
 

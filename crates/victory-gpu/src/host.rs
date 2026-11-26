@@ -8841,6 +8841,28 @@ impl Meter {
                     crate::descriptor::host::STALE[3].load(Ordering::Relaxed),
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
+                // What the queue's room test (`crate::resource::room`) weighs.
+                if let Some([budget, used, blocks, buffers, targets, line]) =
+                    crate::resource::room_terms(host().and_then(|h| h.video_memory()))
+                {
+                    let weighed = used.saturating_sub(blocks) + buffers + targets;
+                    tracing::info!(
+                        "the texture queue's room: {used} MB in use - {blocks} MB free in texture blocks + {buffers} MB kept for \
+                         card copies of title buffers + {targets} MB kept for render targets = {weighed} MB against a line of \
+                         {line} MB ({} % of a budget of {budget} MB): {}",
+                        crate::resource::room_percent(),
+                        if weighed < line { "room" } else { "no room, new textures wait" }
+                    );
+                }
+                let [looks, mapped, same, made, all] =
+                    [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURE_MICROS[i].swap(0, Ordering::Relaxed) / 1000);
+                if all > 0 {
+                    tracing::info!(
+                        "the pass over textures picked by index, in the last 5 seconds: {all} ms in all, of them {looks} ms looking                          again at slots uploaded whole, {mapped} ms asking what of a texture's memory is mapped, {same} ms asking                          whether a host copy holds what memory holds, {made} ms making host copies and staging uploads; uploaded                          since the start: {} textures, {} MB",
+                        crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
+                        crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20
+                    );
+                }
             }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));

@@ -80,6 +80,8 @@
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
 
+#[cfg(all(test, windows))]
+mod bench_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]

@@ -207,6 +207,36 @@ fn resolve_card_limits(
     (min_bytes, max_bytes)
 }
 
+/// Title buffers turned down by [`card_limits`]' second number, since the start.
+static CARD_CAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The size from which a copy may go past the most bytes of copies
+/// ([`within_cap`]): 16 MiB.
+const BIG_COPY: u64 = 16 << 20;
+
+/// Whether a copy of `size` bytes may be made when copies hold `held` bytes
+/// and at most `most` are allowed ([`card_limits`]). A copy of [`BIG_COPY`]
+/// or more may take up to half of `most` beyond it.
+///
+/// The copies are made first come, first served, and the world's load makes
+/// them all within a few seconds: 1,305 of them (1,239 under 64 KiB, which
+/// are made in 64 KiB pieces) took the 512 MB of an 8 GB card before the
+/// title's upscaler made its 21 MB working buffer. That one stayed in the
+/// PC's memory, and the compute passes that read and write it from every
+/// thread took 264 of the frame's 390 ms on the card (a pass of the same
+/// code and grid takes under a millisecond with the buffer in the card's
+/// memory and 60 to 120 with it in the PC's). The big copies are few and
+/// each is read by whole passes, so they get a margin the many small ones
+/// do not.
+fn within_cap(held: u64, size: u64, most: u64) -> bool {
+    let allowed = if size >= BIG_COPY {
+        most.saturating_add(most / 2)
+    } else {
+        most
+    };
+    held.saturating_add(size) <= allowed
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -422,8 +452,22 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+    let held = CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    if !within_cap(held, size, most) {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Said: with no line, a buffer left in the PC's memory by the cap
+        // looks like any other (the first 16, then every 64th).
+        let n = CARD_CAPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_multiple_of(64) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB; {} buffers turned down by the limit so far, frame {}",
+                size >> 10,
+                held >> 20,
+                most >> 20,
+                n,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -5426,8 +5470,26 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        tail_of, window_of, within_cap,
     };
+
+    /// Copies fill the limit first come, first served, but a big one still fits in the margin
+    /// half the limit again gives, and nothing wraps at the extremes.
+    #[test]
+    fn big_copies_fit_past_the_limit_small_ones_do_not() {
+        const MIB: u64 = 1 << 20;
+        let most = 512 * MIB;
+        assert!(within_cap(500 * MIB, 12 * MIB, most));
+        assert!(!within_cap(500 * MIB, 13 * MIB, most));
+        assert!(!within_cap(512 * MIB, 64 << 10, most));
+        // A big copy: up to 768 MiB in all.
+        assert!(within_cap(515 * MIB, 21 * MIB, most));
+        assert!(within_cap(747 * MIB, 21 * MIB, most));
+        assert!(!within_cap(748 * MIB, 21 * MIB, most));
+        // Just under big: no margin.
+        assert!(!within_cap(515 * MIB, 16 * MIB - 1, most));
+        assert!(within_cap(0, u64::MAX, u64::MAX));
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {

@@ -3412,11 +3412,12 @@ impl State {
                         Some((view, key)) => (Some(view), Some(key)),
                         None => (None, None),
                     }
+                } else if shows_other || late {
+                    // The view read at the start of this slot's turn (read
+                    // again, the views' table was asked twice a slot).
+                    (held.clone(), None)
                 } else {
-                    let view = heap.handle(index).and_then(|handle| {
-                        if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
-                    });
-                    (view, None)
+                    (heap.handle(index).and_then(|handle| host.mirror(index, handle, true)), None)
                 }
             });
             // (`nothing`: the slot has nothing to bring up to date.)

@@ -549,6 +549,12 @@ pub fn emit(
         // an LDS read and write in one lane-branch region, so no other form translates
         // them on 32-lane hosts and their dispatches were dropped (no volumetric light
         // or fog on NVIDIA). Widened, they translate (4 and 7 branches taken wave-wide).
+        // The underwater one (`CS_TransmissionVolumetricsSubmerged`) likewise (29 branches).
+        // The triangle clip's heap defragmentation (`vfx_triangleClip:CS_DefragHeap_
+        // ComputeRelocations`, groups of 128) holds two console waves, which walk the heap
+        // each its own way: their host waves meet per console wave ([`widen`]). (Its
+        // `CS_CollectTriangles_Meshlets`, groups of 1024, does not fit that way: its own LDS
+        // is the host group's whole 32 KiB.)
         let scene_kernel = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
             && matches!(
                 c.digest,
@@ -556,7 +562,10 @@ pub fn emit(
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
                     | [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
                     | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
-            );
+                    | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
+            )
+            || matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 128)
+                && c.digest == [0x50, 0xcf, 0x28, 0x32, 0x8b, 0x58, 0x05, 0x3d, 0xa8, 0x9a, 0x8d, 0xa0, 0x1a, 0xa1, 0x23, 0xc6];
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
@@ -595,7 +604,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop);
+                        let again = widen(c, native, base, why, driver_loop, wide_on);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -657,7 +666,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false, false);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -696,15 +705,17 @@ pub fn emit(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. Where a thread group is several console
+/// waves, those decide differently and a group barrier inside such a branch would wait for
+/// threads that never come: the host waves of each console wave meet on their own there
+/// ([`lower::with_pair_meetings`]; whole console waves only), when `groups` allows it.
 fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
     active_loop_only: bool,
+    groups: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -714,6 +725,7 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) if groups && cs.threads.iter().product::<u32>() % 64 == 0 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -722,13 +734,21 @@ fn widen(
         }
         _ => return Err(NOT),
     }
+    // (several console waves to a group, each two host waves)
+    let pairs = native.wave64
+        && lower::host_max_wave() == 32
+        && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
     let mut wide = std::collections::HashSet::new();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
-        let r = emit_program(c, native, p, &st, &io, &res);
+        let r = if pairs {
+            lower::with_pair_meetings(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            emit_program(c, native, p, &st, &io, &res)
+        };
         let needs = lower::take_needs();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
@@ -756,7 +776,8 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
+        let around = || lower::branches_around(&st, &needs);
+        let more: Vec<usize> = if pairs { lower::with_pair_meetings(around) } else { around() }
             .unwrap_or_default()
             .into_iter()
             .filter(|b| !wide.contains(b))

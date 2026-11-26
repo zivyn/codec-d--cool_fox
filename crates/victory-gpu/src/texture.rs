@@ -1436,7 +1436,11 @@ impl Staging {
             }
             return size;
         }
-        if through_copy() {
+        // (A texture with pages in views the runtime keeps in its books
+        // alone, `VICTORY_SOFT_VIEWS`, has no memory to read in place: its
+        // bytes come from the pages, through the copy. `_mapped` is held: no
+        // view becomes one of those before the read in place below is done.)
+        if through_copy() || !crate::watch::soft_runs(start, size).is_empty() {
             return with_title(self.memory, size, |tiled| {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -1790,9 +1794,31 @@ fn by_views() -> bool {
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
 /// unmapped until their pages arrive).
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+    if crate::watch::soft().is_some() {
+        // Views the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`)
+        // are committed as far as the title goes, and stay as they are;
+        // Windows is asked about what lies between them.
+        let runs = crate::watch::soft_runs(at as usize, len);
+        if runs.is_empty() {
+            return committed_there(at, len);
+        }
+        let (mut from, end) = (at as usize, at as usize + len);
+        for (run, bytes) in runs {
+            if run > from && !committed_there(from as *const u8, run - from) {
+                return false;
+            }
+            from = run + bytes;
+        }
+        return from >= end || committed_there(from as *const u8, end - from);
+    }
     // Memory the runtime mapped lazily is committed as far as the title
     // goes: made real before Windows is asked.
     crate::watch::materialize(at as usize, len);
+    committed_there(at, len)
+}
+
+/// [`committed`], of memory the host has mapped or has not.
+fn committed_there(at: *const u8, len: usize) -> bool {
     if by_query() {
         return committed_by_query(at, len);
     }

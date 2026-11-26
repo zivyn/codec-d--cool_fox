@@ -8,6 +8,8 @@
 # -Resolution      the height the game renders at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
 #                  Series S outputs 1080p (so up to 1080 there), Series X 2160p. Default: half the output (540 on S,
 #                  1080 on X). The play-S-*.ps1 and play-X-*.ps1 scripts next to this one call it with each.
+# -Adapter         on a PC with more than one card, the one to use: part of its name (-Adapter 5060) or its index
+#                  (-Adapter '#1'). Default: Windows' default card (the one the main display is on).
 # -Build           target\diag (the default, the build all measurements are of) or target\release
 #                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
 # -More            other settings: -More @{VICTORY_PANEL='1'}
@@ -19,6 +21,7 @@ param(
     [switch]$Quality,
     [switch]$RayTracing,
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
+    [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -77,6 +80,7 @@ if ($Resolution) {
     }
     $settings.VICTORY_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
 }
+if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
 Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"

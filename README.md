@@ -179,6 +179,8 @@ Also in, off by default:
 - F9 frame capture (`capture.rs`): with `VICTORY_CAPTURE=<folder>` and
   `VICTORY_DUMP_TARGETS=1`, F9 saves the next frame's picture, its commands and
   every 2D target.
+- `VICTORY_ADAPTER=<part of a card's name, or #index>` (`host.rs`): the card to
+  run on when there is more than one (`play-nvidia.ps1 -Adapter`).
 
 ---
 
@@ -258,7 +260,7 @@ subtitles stay sharp either way. Series S outputs 1920x1080 and Series X
 
 | Script | Console | World drawn at | Render scale | Tested on the RTX 5070 |
 |---|---|---|---|---|
-| `play-S-1080p.ps1` | Series S | 1920x1080 | 1.0 | not yet (one report of a crash on an RTX 2080 8 GB) |
+| `play-S-1080p.ps1` | Series S | 1920x1080 | 1.0 | **crashes at start** (the title stops at a breakpoint; also reported on an RTX 2080) |
 | `play-S-720p.ps1` | Series S | 1280x720 | 0.667 | not yet |
 | `play-S-540p.ps1` | Series S | 960x540 | 0.5 | yes: the default, about 18-22 fps |
 | `play-S-480p.ps1` | Series S | 853x480 | 0.444 | not yet |
@@ -283,11 +285,33 @@ What to expect:
 - **Lower is softer and smears more.** The title's temporal upscaler rebuilds
   detail from earlier frames. At low resolutions and low frame rates, fast
   camera moves (driving, turning quickly) leave visible trails.
-- **Higher needs more video memory.** At 1.0 the title's targets are at full
-  size on top of the 1.5 GB set aside for memory compares. On an 8 GB card,
-  stay at 720p or lower if 1080p crashes.
+- **Series S at 1080p (render scale 1.0) does not work yet.** The title stops
+  at a breakpoint as soon as it starts, on a 12 GB card too, so it is not video
+  memory. Use 720p or lower on Series S.
 - Series S cannot go above 1080p: its output is 1080p, and the script says so
   and stops if asked for more.
+
+### More than one card, and other cards
+
+On a PC with two cards, `-Adapter` picks one by part of its name or its index
+(`-Adapter 5060`, `-Adapter '#1'`); it sets `VICTORY_ADAPTER`, and the log says
+which card the game is on. Without it the game uses Windows' default card, the
+one the main display is on.
+
+Measured on the same PC (Ryzen 7 9800X3D), same build and settings
+(`play-S-540p`, the default), one run each in the prison prologue:
+
+| Card | Slot it sits in | fps | Preparing a frame (CPU) | On the GPU |
+|---|---|---|---|---|
+| RTX 5070 12 GB | PCIe 5.0 x16, drives the display | 19.3 | 34 ms | 4.6 ms |
+| RTX 5060 Ti 16 GB | PCIe 4.0 x4, no display attached | 14.9 | 50 ms | 5.4 ms |
+
+The GPU work itself is close; the gap is in preparing frames, mostly copies of
+title memory to and from the card. This layer moves tens of MB a frame, so the
+link to the card matters: the 5060 Ti here has about an eighth of the 5070's
+bandwidth, and its finished frames are also copied to the 5070 to be shown.
+In a full-speed slot with the display on it, a 5060 Ti should land closer to
+the 5070. Neither run lost the device; both refused the same 7 programs.
 
 `-Resolution` works on `play-nvidia.ps1` itself too
 (`-Resolution 720 -SeriesX`), and `-More @{VICTORY_RENDER_SCALE='0.6'}` still

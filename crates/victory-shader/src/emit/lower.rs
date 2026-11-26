@@ -11137,6 +11137,14 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // The array slice is no coordinate of the level of detail:
+                // the validator wants every coordinate past the texture's
+                // dimensions undefined.
+                let cs: Vec<V> = cs
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &x)| if k < spatial { x } else { fu })
+                    .collect();
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(

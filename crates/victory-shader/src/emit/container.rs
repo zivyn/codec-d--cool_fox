@@ -64,6 +64,69 @@ impl SigElement {
     }
 }
 
+/// The registers a stage links through (D3D12's limit on input and output rows).
+const SIGNATURE_ROWS: u32 = 32;
+
+/// Gives the elements packed into one row a single interpolation mode, which
+/// the validator requires (the console's packing, and the default modes, do
+/// not: an integer or a front face beside a float).
+///
+/// An element whose mode is fixed keeps it: an integer or `SV_IsFrontFace`
+/// (constant) and, with `read_fixed` (pixel inputs), a float the program
+/// reads. The row takes the first fixed mode and every element free to
+/// follow does. A fixed element of another mode moves to a row of its own
+/// (a row of its mode, per original row): shaders reach signature elements
+/// by id and column, and stages link by semantic, so the row is only
+/// metadata. Without a free row it stays and the validator says so.
+pub(crate) fn unify_row_interp(elements: &mut [SigElement], read_fixed: bool) {
+    let mut next = elements
+        .iter()
+        .filter_map(|e| e.row)
+        .max()
+        .map_or(0, |r| r + 1);
+    let mut rows: Vec<u32> = elements
+        .iter()
+        .filter(|e| e.interp != 0)
+        .filter_map(|e| e.row)
+        .collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let fixed = |e: &SigElement| {
+        if e.kind == 13 || e.kind == 0 && e.comp != 9 {
+            Some(1)
+        } else {
+            (read_fixed && e.usage != 0).then_some(e.interp)
+        }
+    };
+    for row in rows {
+        let here = |e: &SigElement| e.row == Some(row) && e.interp != 0;
+        let Some(first) = elements.iter().find(|e| here(e)) else {
+            continue;
+        };
+        let mode = elements
+            .iter()
+            .filter(|e| here(e))
+            .find_map(fixed)
+            .unwrap_or(first.interp);
+        let mut moved: [Option<u32>; 8] = [None; 8];
+        for e in elements.iter_mut().filter(|e| here(e)) {
+            match fixed(e) {
+                Some(own) if own != mode => {
+                    let slot = &mut moved[usize::from(own & 7)];
+                    if slot.is_none() && next < SIGNATURE_ROWS {
+                        *slot = Some(next);
+                        next += 1;
+                    }
+                    if let Some(to) = *slot {
+                        e.row = Some(to);
+                    }
+                }
+                _ => e.interp = mode,
+            }
+        }
+    }
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -471,6 +534,82 @@ mod tests {
         assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
         assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
             .is_err());
+    }
+
+    fn element(kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: "TEXCOORD".into(),
+            index: u32::from(col),
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn a_row_shares_one_interpolation_mode() {
+        // An unread float beside an integer and beside a front face follows
+        // them to constant; a row of floats with one mode is left alone.
+        let mut els = [
+            element(0, 5, 1, 0, 0, 1),
+            element(0, 9, 2, 0, 1, 0),
+            element(13, 5, 1, 1, 0, 0),
+            element(0, 9, 2, 1, 1, 0),
+            element(0, 9, 2, 2, 0, 1),
+            element(0, 9, 2, 2, 1, 0),
+        ];
+        unify_row_interp(&mut els, true);
+        let modes: Vec<_> = els.iter().map(|e| (e.row, e.interp)).collect();
+        assert_eq!(
+            modes,
+            [
+                (Some(0), 1),
+                (Some(0), 1),
+                (Some(1), 1),
+                (Some(1), 1),
+                (Some(2), 2),
+                (Some(2), 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_read_float_that_cannot_follow_moves_to_a_row_of_its_own() {
+        // Read smooth beside an integer, and two floats read two ways.
+        let mut els = [
+            element(0, 5, 1, 0, 0, 1),
+            element(0, 9, 2, 0, 1, 1),
+            element(0, 9, 2, 1, 0, 1),
+            element(0, 9, 5, 1, 1, 1),
+            element(0, 9, 5, 1, 2, 1),
+            element(0, 9, 2, 3, 0, 0),
+        ];
+        unify_row_interp(&mut els, true);
+        let rows: Vec<_> = els.iter().map(|e| (e.row, e.interp)).collect();
+        // New rows follow the last one (3); one per mode and original row.
+        assert_eq!(
+            rows,
+            [
+                (Some(0), 1),
+                (Some(4), 2),
+                (Some(1), 2),
+                (Some(5), 5),
+                (Some(5), 5),
+                (Some(3), 2)
+            ]
+        );
+        // Written outputs are free to follow: nothing moves.
+        let mut outs = [element(0, 5, 1, 0, 0, 1), element(0, 9, 2, 0, 1, 1)];
+        unify_row_interp(&mut outs, false);
+        assert_eq!(
+            outs.map(|e| (e.row, e.interp)),
+            [(Some(0), 1), (Some(0), 1)]
+        );
     }
 
     #[test]

@@ -1106,32 +1106,65 @@ impl TextureQueue {
                 if !again {
                     c[4] = c[4].max(frame.saturating_sub(w.written));
                 }
-                let class = if w.looks > 0 || w.mapped > 0 { &mut due.again } else { &mut due.fresh };
-                class.push((w.written, index, w.write));
+                if w.looks > 0 || w.mapped > 0 {
+                    // (Only these can wait for a look again: `recheck`
+                    // leaves a look, `partly` some bytes mapped.)
+                    due.again.push((w.written, index, w.write, Some(w.checked).filter(|c| c.2 != 0)));
+                } else {
+                    due.fresh.push((w.written, index, w.write));
+                }
             }
         }
         (due, c)
     }
 }
 
+/// What [`TextureQueue::recheck`] noted of a slot uploaded whole: where its
+/// memory is (address, bytes), its fingerprint, the looks that found it
+/// unchanged, the frame of the upload.
+pub(crate) type Checked = (u64, u64, u64, u8, u64);
+
+/// What the pass over textures picked by index found of a slot it took, as
+/// told to the queue ([`HostHeap::texture_slots_told`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Told {
+    /// Up to date ([`HostHeap::texture_slot_done`]): due again from frame
+    /// `.0` with `.1` bytes of its memory there, or not until written.
+    Done(Option<(u64, u64)>),
+    /// Uploaded whole, looked at again ([`HostHeap::texture_slot_recheck`]):
+    /// from frame, memory (address, bytes), fingerprint, looks, upload frame.
+    Recheck(u64, (u64, u64), u64, u8, u64),
+    /// Nothing to upload now ([`HostHeap::texture_slot_later`]): frame, most.
+    Later(u64, u64),
+    /// No room on the card ([`HostHeap::texture_slot_held`]): until frame.
+    Held(u64),
+}
+
 /// The slots due, taken from the queue ([`TextureQueue::due_and_census`]):
-/// (frame written, slot, write number) of those looked at before and of the
-/// others.
+/// (frame written, slot, write number) of those looked at before, with what
+/// [`TextureQueue::checked`] says of them, and of the others.
 #[derive(Default)]
 struct Due {
-    again: Vec<(u64, u32, u64)>,
+    again: Vec<(u64, u32, u64, Option<Checked>)>,
     fresh: Vec<(u64, u32, u64)>,
 }
 
 impl Due {
     /// Up to `max` of them, in the order [`TextureQueue::due`] serves them.
+    #[cfg(test)]
     fn order(self, max: usize) -> Vec<(u32, u64)> {
+        self.ordered(max).0
+    }
+
+    /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
+    /// each when they were taken.
+    fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
         let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        again.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        fresh.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
+        let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
         let (mut new, mut old) = (0, fresh.len());
         while new < old && order.len() < max {
             order.push((fresh[new].1, fresh[new].2));
@@ -1142,7 +1175,8 @@ impl Due {
             }
         }
         order.truncate(max);
-        order
+        known.resize(order.len(), None);
+        (order, known)
     }
 }
 
@@ -2039,9 +2073,59 @@ impl HostHeap {
     /// with its write number, in the order to serve them
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
+    #[cfg(test)]
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
         let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame);
         (if max == 0 { Vec::new() } else { due.order(max) }, census)
+    }
+
+    /// Up to `max` title slots whose texture view is due at `frame`, each
+    /// with its write number, in the order to serve them
+    /// ([`TextureQueue::due`]); beside each slot what
+    /// [`TextureQueue::checked`] said of it then, read in the same take of
+    /// the lock (the pass asked it slot by slot, under the lock each time);
+    /// and the queue's counts ([`TextureQueue::census`]).
+    pub(crate) fn texture_slots_due_known(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>, [u64; 6]) {
+        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame);
+        let (order, known) = if max == 0 { (Vec::new(), Vec::new()) } else { due.ordered(max) };
+        (order, known, census)
+    }
+
+    /// The write of the entry the queue holds for title slot `index`, by its
+    /// marks (0: none; [`QueueMarks`]); `None`: not known so (ask the queue).
+    pub(crate) fn texture_slot_write(&self, index: u32) -> Option<u64> {
+        if !queue_marks() {
+            return None;
+        }
+        self.marks.get(index)
+    }
+
+    /// What the pass found of slots it took, each with the write it was
+    /// handed and the frame it was found in, told under one take of the
+    /// lock, as [`HostHeap::texture_slot_done`], `_recheck`, `_later` and
+    /// `_held` tell it one at a time. Leaves `told` empty.
+    pub(crate) fn texture_slots_told(&self, told: &mut Vec<(u32, u64, u64, Told)>) {
+        if told.is_empty() {
+            return;
+        }
+        let mut textures = self.queue(super::queue_site::TELL);
+        for (index, write, frame, what) in told.drain(..) {
+            match what {
+                Told::Done(again) => {
+                    textures.note_served(index, write, frame);
+                    match again {
+                        Some((due, mapped)) => textures.partly(index, write, due, mapped),
+                        None => textures.done(index, write),
+                    }
+                }
+                Told::Recheck(due, at, print, looks, uploaded) => {
+                    textures.note_served(index, write, frame);
+                    textures.recheck(index, write, due, at, print, looks, uploaded);
+                }
+                Told::Later(at, most) => textures.later(index, write, at, most),
+                Told::Held(due) => textures.hold(index, write, due),
+            }
+        }
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -5976,6 +6060,75 @@ mod tests {
         heap.queue_texture(2, false, false, frame + 5 + TABLED_FRAMES);
         assert_eq!(slots(u64::MAX), []);
         assert_eq!(marks(&heap), held(&[]));
+    }
+
+    /// The slots due come in their order with what the queue knew of each
+    /// (a slot uploaded whole and waiting for a look again), as asked slot
+    /// by slot.
+    #[test]
+    fn the_slots_due_come_with_what_is_known_of_them() {
+        let mut q = TextureQueue::default();
+        for i in 0..4u32 {
+            q.written(30 + i, 1, 0, false);
+        }
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        let w31 = write(&q, 31);
+        q.recheck(31, w31, 5, (0x2000, 4096), 9, 0, 2);
+        let w32 = write(&q, 32);
+        q.later(32, w32, 2, 4);
+        let (order, known) = q.due_and_census(u64::MAX).0.ordered(100);
+        assert_eq!(order, q.due(u64::MAX, 100));
+        assert_eq!(known.len(), order.len());
+        for (&(index, _), knew) in order.iter().zip(&known) {
+            assert_eq!(*knew, q.checked(index));
+        }
+        assert_eq!(known.iter().filter(|k| k.is_some()).count(), 1);
+        let (order, known) = q.due_and_census(u64::MAX).0.ordered(1);
+        assert_eq!((order.len(), known.len()), (1, 1));
+    }
+
+    /// What the pass tells of several slots under one take of the lock ends
+    /// as told slot by slot.
+    #[test]
+    fn slots_told_together_end_as_told_one_at_a_time() {
+        let (Some(a), Some(b)) = (HostHeap::new(false, 8), HostHeap::new(false, 8)) else {
+            return; // no host GPU
+        };
+        for heap in [&a, &b] {
+            for i in 0..6 {
+                heap.queue_texture(i, true, false, 10);
+            }
+        }
+        let due = |heap: &HostHeap, at: u64| heap.texture_slots_due(at, 8).0;
+        let handed = due(&a, u64::MAX);
+        assert_eq!(handed, due(&b, u64::MAX));
+        let w = |i: u32| handed.iter().find(|d| d.0 == i).unwrap().1;
+        let what = [
+            (0, Told::Done(None)),
+            (1, Told::Done(Some((12, 4096)))),
+            (2, Told::Recheck(14, (0x1000, 64), 7, 0, 10)),
+            (3, Told::Later(10, 4)),
+            (4, Told::Held(30)),
+            // A write the queue does not hold any more: dropped.
+            (5, Told::Done(None)),
+        ];
+        let mut told: Vec<_> = what.iter().map(|&(i, t)| (i, if i == 5 { 0 } else { w(i) }, 10, t)).collect();
+        a.texture_slots_told(&mut told);
+        assert!(told.is_empty());
+        b.texture_slot_done(0, w(0), None);
+        b.texture_slot_done(1, w(1), Some((12, 4096)));
+        b.texture_slot_recheck(2, w(2), 14, (0x1000, 64), 7, 0, 10);
+        b.texture_slot_later(3, w(3), 10, 4);
+        b.texture_slot_held(4, w(4), 30);
+        b.texture_slot_done(5, 0, None);
+        for at in [10, 11, 12, 14, 30, u64::MAX] {
+            assert_eq!(due(&a, at), due(&b, at), "due at {at}");
+        }
+        for i in 0..6 {
+            assert_eq!(a.texture_slot_checked(i), b.texture_slot_checked(i));
+            assert_eq!(a.texture_slot_mapped(i), b.texture_slot_mapped(i));
+            assert_eq!(a.texture_slot_write(i).map(|w| w != 0), b.texture_slot_write(i).map(|w| w != 0));
+        }
     }
 
     /// The queue's marks say which slots it holds, by the write of each

@@ -169,8 +169,16 @@ pub(crate) fn cards() -> bool {
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
 /// local VRAM budget (`DXGI_QUERY_VIDEO_MEMORY_INFO.Budget`), in bytes.
 ///
-/// - Unknown (`None`, e.g. WARP) or `<= 12 GiB` (8–12 GB cards, whose WDDM
-///   budget is below 12 GiB): `(16, 512)` MiB, matching the 12 GB baseline.
+/// - Unknown (`None`, e.g. WARP): `(16, 512)` MiB.
+/// - `<= 12 GiB` (8–12 GB cards, whose WDDM budget is below 12 GiB): 16 MiB,
+///   and 18% of the budget between 512 and 2048 MiB. At 512 an RTX 4070
+///   SUPER (budget 11,229 MB) kept 592 MB of copies on the card and 5.7 GB in
+///   the PC's memory, which its shaders read over the bus: the opening
+///   cutscene's six heaviest compute passes took 42, 32, 27, 22, 19 and 19 ms
+///   and the card was 97% busy at 3 fps; at 2048 (1,979 MB on the card) the
+///   three heaviest took 0.19, 0.25 and 0.41 ms, all of the title's commands
+///   27-44 ms a frame, and the release build ran gameplay at 21-25 fps
+///   (2026-11-26, logs coolfox-20261126-134258 / -140021 / -140546).
 /// - `> 12 GiB` and `< 20 GiB` (16 GB cards, whose WDDM budget is typically
 ///   ~13.5–15.2 GiB): `(4, 2048)` MiB.
 /// - `>= 20 GiB` (24–32+ GB cards): `(1, (budget_mb / 4).min(8192))` MiB,
@@ -184,7 +192,7 @@ fn default_card_limits_mb(local_vram_budget: Option<u64>) -> (u64, u64) {
     const TWELVE_GIB_MB: u64 = 12 * 1024;
     const TWENTY_GIB_MB: u64 = 20 * 1024;
     if budget_mb <= TWELVE_GIB_MB {
-        (16, 512)
+        (16, (budget_mb * 18 / 100).clamp(512, 2048))
     } else if budget_mb < TWENTY_GIB_MB {
         (4, 2048)
     } else {
@@ -451,11 +459,30 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// card later windows stay where they are. The CPU's side stays in the PC's
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
+///
+/// Unset, it follows the card's budget ([`default_window_card_mb`]).
 fn window_card_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let asked = std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let budget = || crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
+        let mb = asked.unwrap_or_else(|| default_window_card_mb(budget()));
+        tracing::info!(window_card_mb = mb, asked = asked.is_some(), "card room for windows");
+        mb << 20
     })
+}
+
+/// The default of [`window_card_most`], in MiB, from the card's budget in
+/// bytes: none when it is not known; 9% of it, at most 1024 MiB, from 8 GiB
+/// on. 1024 on an RTX 4070 SUPER (budget 11,229 MB), with the copies of title
+/// buffers at 2048 ([`default_card_limits_mb`]), moved the reads of the
+/// title's allocator off the bus: the release build's gameplay went from
+/// 3 to 21-25 fps (2026-11-26, log coolfox-20261126-140546).
+fn default_window_card_mb(local_vram_budget: Option<u64>) -> u64 {
+    match local_vram_budget.map(|b| b >> 20) {
+        Some(mb) if mb >= 8 * 1024 => (mb * 9 / 100).min(1024),
+        _ => 0,
+    }
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
@@ -5434,11 +5461,13 @@ mod window_tests {
         const GIB: u64 = 1 << 30;
         const MIB: u64 = 1 << 20;
 
-        // Unknown (WARP / query failure) and <= 12 GiB keep the 12 GB baseline.
+        // Unknown (WARP / query failure): the old baseline. <= 12 GiB: 18% of
+        // the budget, 512 to 2048 MiB.
         assert_eq!(default_card_limits_mb(None), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(11 * GIB)), (16, 512));
-        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(2 * GIB)), (16, 512));
+        assert_eq!(default_card_limits_mb(Some(8 * GIB)), (16, 1474));
+        assert_eq!(default_card_limits_mb(Some(11229 * MIB)), (16, 2021));
+        assert_eq!(default_card_limits_mb(Some(12 * GIB)), (16, 2048));
 
         // 16 GB tier (> 12 GiB, < 20 GiB), including WDDM budgets around 13.5–15 GiB.
         assert_eq!(default_card_limits_mb(Some(13 * GIB)), (4, 2048));
@@ -5457,6 +5486,16 @@ mod window_tests {
         assert_eq!(resolve_card_limits(Some(12 * GIB), Some(0), Some(1024)), (MIB, 1024 * MIB));
         assert_eq!(resolve_card_limits(None, Some(u64::MAX), Some(u64::MAX)), (u64::MAX, u64::MAX));
         assert_eq!(resolve_card_limits(None, None, None), (16 * MIB, 512 * MIB));
+    }
+
+    #[test]
+    fn window_room_follows_the_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(super::default_window_card_mb(None), 0);
+        assert_eq!(super::default_window_card_mb(Some(6 * GIB)), 0);
+        assert_eq!(super::default_window_card_mb(Some(8 * GIB)), 737);
+        assert_eq!(super::default_window_card_mb(Some(11229 << 20)), 1010);
+        assert_eq!(super::default_window_card_mb(Some(24 * GIB)), 1024);
     }
 
     /// An ask that may take any window takes the longest that holds all of

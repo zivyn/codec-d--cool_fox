@@ -24,6 +24,9 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod current;
+use current::Current;
+
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
@@ -50,6 +53,9 @@ pub(crate) struct Shadow {
     ranged: Mutex<[(usize, usize, u64); 2]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Ranges a look found nothing new in, and still holds
+    /// ([`Shadow::nothing_new`]).
+    settled: Settled,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -67,10 +73,10 @@ pub(crate) struct Shadow {
     /// go in under shader writes ([`Shadow::merge_under_writes`]), which
     /// takes `before`'s lock too. Taken ahead of that one.
     merging: RwLock<()>,
-    /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
+    /// With snapshots kept ([`keeps`]): which 4 KiB units of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
-    kept: Mutex<(Vec<bool>, bool)>,
+    kept: Mutex<(Current, bool)>,
     /// When the copy was last asked for (`crate::host::moment`): a window
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
@@ -205,6 +211,36 @@ fn resolve_card_limits(
     let min_bytes = min_mb_override.unwrap_or(default_min_mb).saturating_mul(MIB).max(MIB);
     let max_bytes = max_mb_override.unwrap_or(default_max_mb).saturating_mul(MIB);
     (min_bytes, max_bytes)
+}
+
+/// Title buffers turned down by [`card_limits`]' second number, since the start.
+static CARD_CAPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The size from which a copy may go past the most bytes of copies
+/// ([`within_cap`]): 16 MiB.
+const BIG_COPY: u64 = 16 << 20;
+
+/// Whether a copy of `size` bytes may be made when copies hold `held` bytes
+/// and at most `most` are allowed ([`card_limits`]). A copy of [`BIG_COPY`]
+/// or more may take up to half of `most` beyond it.
+///
+/// The copies are made first come, first served, and the world's load makes
+/// them all within a few seconds: 1,305 of them (1,239 under 64 KiB, which
+/// are made in 64 KiB pieces) took the 512 MB of an 8 GB card before the
+/// title's upscaler made its 21 MB working buffer. That one stayed in the
+/// PC's memory, and the compute passes that read and write it from every
+/// thread took 264 of the frame's 390 ms on the card (a pass of the same
+/// code and grid takes under a millisecond with the buffer in the card's
+/// memory and 60 to 120 with it in the PC's). The big copies are few and
+/// each is read by whole passes, so they get a margin the many small ones
+/// do not.
+fn within_cap(held: u64, size: u64, most: u64) -> bool {
+    let allowed = if size >= BIG_COPY {
+        most.saturating_add(most / 2)
+    } else {
+        most
+    };
+    held.saturating_add(size) <= allowed
 }
 
 /// The smallest title buffer whose copy goes to the card's memory, and the
@@ -422,8 +458,22 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         }
         return None;
     }
-    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+    let held = CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
+    if !within_cap(held, size, most) {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        // Said: with no line, a buffer left in the PC's memory by the cap
+        // looks like any other (the first 16, then every 64th).
+        let n = CARD_CAPPED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_multiple_of(64) {
+            tracing::info!(
+                "no card copy for a title buffer of {} KiB: the copies made hold {} MB of at most {} MB; {} buffers turned down by the limit so far, frame {}",
+                size >> 10,
+                held >> 20,
+                most >> 20,
+                n,
+                crate::frame::current()
+            );
+        }
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -905,8 +955,7 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
+/// (on by default, `VICTORY_RELAY=0` turns it off). `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
@@ -926,7 +975,7 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2"))
 }
 
 /// The submission being prepared (its number among those started): what
@@ -1316,6 +1365,71 @@ fn give_back(v: Vec<u8>) {
     drop(gone);
 }
 
+/// Whether a copy notes the ranges it found nothing new in, and takes them
+/// for what they were while nothing touched them
+/// (`VICTORY_REFRESH_NOTES=0`: every refresh looks again, as before).
+///
+/// Of a frame's 9,700 refreshed ranges some 8,800 were found to copy
+/// nothing, in each of up to sixteen submissions, each time by the journal's
+/// lock, the copy's three and the bits. Memory known by its bits has a stamp
+/// per block (`crate::watch::untouched_since`) that every write that opens a
+/// block and every asking that notes one written moves, so a range whose
+/// stamps stand and whose bits are set is as it was.
+fn settled_on() -> bool {
+    crate::watch::light() && crate::toggled!("VICTORY_REFRESH_NOTES")
+}
+
+/// What a copy knows of the ranges its last looks found nothing new in:
+/// two, each with the [`crate::watch::tick`] taken before the look and the
+/// `epoch` then.
+#[derive(Default)]
+struct Settled {
+    /// From, to, tick and epoch of each; an empty range is no note.
+    notes: Mutex<[(usize, usize, u64, u64); 2]>,
+    /// Moved when shaders are put on the copy (a note before it is void).
+    epoch: AtomicU64,
+}
+
+impl Settled {
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Voids every note.
+    fn void(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether `[from, to)` lies in a note made in `epoch` that `still`
+    /// (given the note's tick) says nothing has touched since.
+    fn holds(&self, from: usize, to: usize, epoch: u64, still: impl FnOnce(u64) -> bool) -> bool {
+        let tick = {
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            match notes.iter().find(|n| n.3 == epoch && n.0 <= from && to <= n.1) {
+                Some(n) => n.2,
+                None => return false,
+            }
+        };
+        still(tick)
+    }
+
+    /// `[from, to)` was found to hold nothing new by a look made after
+    /// `tick` and `epoch` were read. A note of the same range is renewed,
+    /// else the older one is replaced.
+    fn note(&self, from: usize, to: usize, tick: u64, epoch: u64) {
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let at = match notes.iter().position(|n| (n.0, n.1) == (from, to)) {
+            Some(at) => at,
+            None => usize::from(notes[0].2 > notes[1].2),
+        };
+        // (Never over a newer look's: that one stands for more.)
+        if notes[at].0 == from && notes[at].1 == to && notes[at].3 == epoch && notes[at].2 > tick {
+            return;
+        }
+        notes[at] = (from, to, tick, epoch);
+    }
+}
+
 const NOT_WATCHED: u8 = 2;
 /// Watched, not by the kernel but by the guards, when last asked about.
 const GUARDED: u8 = 3;
@@ -1662,6 +1776,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    let refine = keeps();
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
@@ -1674,7 +1789,17 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             }
         })
         .collect();
-    find_pieces(scans)
+    let (found, dirty) = find_pieces_with(scans, refine);
+    // Where the shaders wrote (or the title's bytes came in), a kept
+    // snapshot is no longer current. Before the range is done with.
+    if refine {
+        for ((shadow, ..), runs) in work.iter().zip(&dirty) {
+            for &(from, to) in runs {
+                shadow.changed(from, to);
+            }
+        }
+    }
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -1683,13 +1808,25 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
 /// [`Shadow::differing`] cuts them) of `[from, to)` whose bytes differ, as
 /// (offset, bytes) in order. On several threads ([`wide`]), in pieces of
 /// work of about [`WIDE_JOB`] bytes that hold whole pieces.
+#[cfg(test)]
 fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usize, usize)>> {
+    find_pieces_with(scans, false).0
+}
+
+/// [`find_pieces`]; with `refine`, also for each scan the 4 KiB units
+/// within those pieces that differ ([`current::differing_units`]).
+#[allow(clippy::type_complexity)]
+fn find_pieces_with(
+    scans: Vec<(usize, usize, usize, usize, usize)>,
+    refine: bool,
+) -> (Vec<Vec<(usize, usize)>>, Vec<Vec<(usize, usize)>>) {
     // What a job finds: (which scan, its place among that scan's jobs, the
     // pieces).
     type Found = Vec<(usize, usize, Vec<(usize, usize)>)>;
     // A job's part of a scan: the scan, then which and place.
     type Part = (usize, usize, usize, usize, usize, usize, usize);
     let found: Arc<Mutex<Found>> = Arc::default();
+    let dirtied: Arc<Mutex<Vec<(usize, Vec<(usize, usize)>)>>> = Arc::default();
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<Part> = Vec::new();
     let mut bytes = 0;
@@ -1698,11 +1835,12 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         if group.is_empty() {
             return;
         }
-        let found = found.clone();
+        let (found, dirtied) = (found.clone(), dirtied.clone());
         jobs.push(Box::new(move || {
             let mut mine: Found = Vec::with_capacity(group.len());
             for (data, before, start, from, to, which, place) in group {
                 let mut pieces = Vec::new();
+                let mut dirty = Vec::new();
                 let mut at = from;
                 while at < to {
                     let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -1718,8 +1856,14 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     };
                     if now != old {
                         pieces.push((at, n));
+                        if refine {
+                            current::differing_units(start + at, now, old, at, &mut dirty);
+                        }
                     }
                     at += n;
+                }
+                if !dirty.is_empty() {
+                    dirtied.lock().unwrap_or_else(|e| e.into_inner()).push((which, dirty));
                 }
                 mine.push((which, place, pieces));
             }
@@ -1757,15 +1901,20 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
     for (which, _, pieces) in found {
         out[which].extend(pieces);
     }
-    out
+    let mut dirty = vec![Vec::new(); count];
+    for (which, runs) in std::mem::take(&mut *dirtied.lock().unwrap_or_else(|e| e.into_inner())) {
+        dirty[which].extend(runs);
+    }
+    (out, dirty)
 }
 
 /// Since the last frame-rate line, of the shader-written ranges looked for
 /// on the CPU (copies not in the card's memory): bytes snapshotted in
 /// windows outside buffers and in title buffers' copies; bytes compared in
 /// windows, in buffers' copies, and of those in copies of 1 MiB or more;
-/// ranges compared in windows and in buffers' copies.
-static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// ranges compared in windows and in buffers' copies; bytes declared that a
+/// kept snapshot ([`keeps`]) held already.
+static BACK_CLASS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
@@ -1780,7 +1929,7 @@ pub(crate) fn back_line(frames: f64) {
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there); {:.1} MB declared were in kept snapshots          already{}",
         mb(c[2]),
         c[5],
         mb(c[0]),
@@ -1788,6 +1937,16 @@ pub(crate) fn back_line(frames: f64) {
         c[6],
         mb(c[1]),
         mb(c[4]),
+        mb(c[7]),
+        if keep_check() {
+            format!(
+                ", VICTORY_KEEP_CHECK: {:.2} MB in {:.0} units found stale",
+                mb(STALE[0].swap(0, Ordering::Relaxed) as f64 / frames),
+                STALE[1].swap(0, Ordering::Relaxed) as f64 / frames
+            )
+        } else {
+            String::new()
+        },
     );
 }
 
@@ -1870,7 +2029,28 @@ mod wide_tests {
         // A scan of nothing (a range whose snapshot is gone).
         scans.push((0, 0, 0, 0, 0));
         wanted.push(Vec::new());
-        assert_eq!(find_pieces(scans), wanted);
+        assert_eq!(find_pieces(scans.clone()), wanted);
+        // Refined: the 4 KiB units within the pieces found, and nothing
+        // else, whatever the way the work was cut.
+        let (pieces, dirty) = super::find_pieces_with(scans.clone(), true);
+        assert_eq!(pieces, wanted);
+        for (i, &(_, _, start, from, to)) in scans.iter().enumerate() {
+            let mut want: Vec<(usize, usize)> = Vec::new();
+            for &(at, n) in &wanted[i] {
+                super::current::differing_units(start + at, &now[at..at + n], &old[at..at + n], at, &mut want);
+            }
+            let mut got = dirty[i].clone();
+            got.sort_unstable();
+            // (Runs of different jobs are not joined.)
+            let mut joined: Vec<(usize, usize)> = Vec::new();
+            for (a, b) in got {
+                match joined.last_mut() {
+                    Some(last) if last.1 == a => last.1 = b,
+                    _ => joined.push((a, b)),
+                }
+            }
+            assert_eq!(joined, want, "scan {i}: {from}..{to}");
+        }
     }
 }
 
@@ -2509,38 +2689,56 @@ impl Drop for Shadow {
 }
 
 /// Whether a copy's snapshot is kept from one submission to the next and
-/// only the pieces that changed in between are taken again
-/// (`VICTORY_KEEP_SNAPSHOTS=1`; off by default).
+/// only the units that may have changed in between are taken again (on by
+/// default; `VICTORY_KEEP_SNAPSHOTS=0` takes every declared range afresh
+/// for every submission, as before; `=1` also in the crate's tests).
 ///
 /// A snapshot is the copy's bytes before a submission, to find what its
-/// shaders wrote. Taken anew for every submission it is 1,050 MB of copying
-/// a frame (72-86 ms in gameplay, runs 61 and 62) for buffers of which
-/// 100 MB changed. Kept, a piece of it is taken again only after something
-/// changed the copy there: a refresh from title memory ([`Shadow::copy`]),
-/// shader writes found after a submission, or the bytes put back then
-/// ([`Shadow::copy_back`]).
+/// shaders wrote: after the card ran, the bytes that differ from it are
+/// the shaders' (and, in the merge, the only ones put into title memory).
+/// Taken anew for every submission it was 221 MB a frame of copying in the
+/// world (45 ms of the submitting thread, run E12) for buffers of which
+/// 43 MB changed. Kept, a 4 KiB unit of it is taken again only after
+/// something changed the copy there ([`current::Current`]): a refresh from
+/// title memory ([`Shadow::copy`], [`Shadow::take`]), bytes put into it
+/// ([`Shadow::placed_copy`]), or shader writes found after a submission
+/// (the units of every declared range that differ from the snapshot,
+/// [`find_all`], [`Shadow::copy_back_with`]: the ranges shaders write are
+/// declared by unordered-access views and root views of shaders that can
+/// store, and by the buffer copies of our own lists).
 ///
-/// What it assumes, and why it is not on by default: that nothing else
-/// writes a copy. A shader that writes a buffer through a view we did not
-/// declare as written (we declare the unordered-access views of shaders
-/// that can store) changes the copy unseen; with a fresh snapshot that
-/// write is simply never put back, with a kept one it would be taken for a
-/// write of a later submission and put back then, over whatever the title
-/// wrote there since.
+/// What it assumes, and what `VICTORY_KEEP_CHECK=1` looks at: that nothing
+/// else writes a copy. A shader that writes a buffer through a view we did
+/// not declare as written changes the copy unseen; with a fresh snapshot
+/// that write is simply never put back, with a kept one it would be taken
+/// for a write of a later submission and put back then. The check compares
+/// every unit it would not take with the copy, takes it if they differ
+/// (as a fresh snapshot would) and counts those ([`STALE`], on the frame
+/// line): zero means the assumption held.
 fn keeps() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SNAPSHOTS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_KEEP_SNAPSHOTS").map_or(!cfg!(test), |v| v == "1"))
 }
+
+/// `VICTORY_KEEP_CHECK=1`: [`keeps`] verifies what it does not take.
+fn keep_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// With [`keep_check`], since the last frame line: bytes of kept snapshots
+/// found not to hold the copy's bytes, and the units they were in.
+static STALE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Bytes of the snapshots kept, and the most that may be.
 static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
-/// `VICTORY_KEEP_SNAPSHOTS_MB`, 256 unless set (it was 768: run 80, with
-/// kept snapshots beside copies in the card's memory, ran the PC out of
-/// memory in 27 s; kept snapshots are the PC's memory, all of it resident).
+/// `VICTORY_KEEP_SNAPSHOTS_MB`, 1024 unless set (768 ran a 16 GB PC out of
+/// memory in 27 s, run 80, beside copies in the card's memory; kept
+/// snapshots are the PC's memory, all of it resident).
 fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
+        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
     })
 }
 
@@ -2976,6 +3174,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
+            settled: Settled::default(),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3040,6 +3239,8 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        // No range is known to hold nothing new while shaders may write it.
+        self.settled.void();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -3079,42 +3280,51 @@ impl Shadow {
             parts = rest;
         }
         pending.push(range);
-        let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
-        BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
-            // Piece by piece, and only the pieces not known current. A
-            // piece the part holds whole is current from now on; of a
-            // piece it holds partly only the part's bytes are taken, as
-            // without the switch, and it is taken again next time (the
-            // rest of it may belong to a range declared earlier, whose
-            // bytes stay as they were taken).
+            // Only the units not known current ([`Current::plan`]); with
+            // the check, those too that are not, taken as a fresh
+            // snapshot would.
             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            if kept.0.is_empty() {
-                kept.0 = vec![false; self.pieces(0, total.max(1)).end];
-            }
+            kept.0.track(self.start as usize, total);
+            let check = keep_check();
+            let (mut skipped, mut taken) = (Vec::new(), Vec::new());
             for (from, to) in parts {
-                if from >= to {
-                    continue;
-                }
-                for piece in self.pieces(from, to) {
-                    if kept.0[piece] {
-                        continue;
-                    }
-                    let (lo, hi) = self.piece(piece);
-                    let whole = from <= lo && hi <= to;
-                    let (lo, hi) = (lo.max(from), hi.min(to));
-                    // SAFETY: as below; `hi <= total`.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(self.data.add(lo), snapshot.as_mut_ptr().add(lo), hi - lo);
-                    }
-                    kept.0[piece] = whole;
+                if from < to {
+                    taken.extend(kept.0.plan(from, to, check.then_some(&mut skipped)));
                 }
             }
-            return;
+            drop(kept);
+            let skipped_bytes: usize = skipped.iter().map(|&(from, to)| to - from).sum();
+            for (from, to) in skipped {
+                // SAFETY: inside the copy's mapping and the snapshot's
+                // allocation, `to <= total`; no range holding these bytes
+                // is in flight, so only an unseen write changes them.
+                let (now, old) = unsafe {
+                    (std::slice::from_raw_parts(self.data.add(from), to - from), std::slice::from_raw_parts(snapshot.as_ptr().add(from), to - from))
+                };
+                if now != old {
+                    let mut units = Vec::new();
+                    current::differing_units(self.start as usize + from, now, old, from, &mut units);
+                    STALE[0].fetch_add(units.iter().map(|&(a, b)| (b - a) as u64).sum(), Ordering::Relaxed);
+                    STALE[1].fetch_add(units.len() as u64, Ordering::Relaxed);
+                    if STALE[1].load(Ordering::Relaxed) <= 8 {
+                        tracing::warn!(
+                            "a kept snapshot does not hold the copy at {:#x} ({} bytes in the range): shaders wrote it where no range was declared",
+                            self.start as usize + from,
+                            to - from
+                        );
+                    }
+                    taken.extend(units);
+                }
+            }
+            BACK_CLASS[7].fetch_add(skipped_bytes as u64, Ordering::Relaxed);
+            parts = taken;
         }
+        let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
+        BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         if wide_back() {
             // Noted, and taken with the submission's other snapshots when
             // its refreshes are done (`take_snapshots`): the range is
@@ -3402,24 +3612,13 @@ impl Shadow {
         pieces_of(self.start as usize, from, to)
     }
 
-    /// The offsets in the copy that piece `piece` holds.
-    fn piece(&self, piece: usize) -> (usize, usize) {
-        piece_at(self.start as usize, self.len as usize, piece)
-    }
-
     /// The copy's bytes at offsets `[from, to)` change: a kept snapshot is
     /// not current there any more.
     fn changed(&self, from: usize, to: usize) {
         if !keeps() || from >= to {
             return;
         }
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if kept.0.is_empty() {
-            return;
-        }
-        for piece in self.pieces(from, to) {
-            kept.0[piece] = false;
-        }
+        self.kept.lock().unwrap_or_else(|e| e.into_inner()).0.changed(from, to);
     }
 
     /// Whether shaders of a submission not yet copied back may be writing
@@ -3731,12 +3930,29 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
+        let memo = settled_on();
+        // Read ahead of the look: whatever touches the range after this is
+        // stamped above `tick`, and whatever puts shaders on it bumps `epoch`.
+        let (tick, epoch) = (crate::watch::tick(), self.settled.epoch());
+        if memo && self.settled.holds(from, to, epoch, |tick| crate::watch::untouched_since(from, to, tick)) {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from) as u64);
+            }
+            return true;
+        }
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        drop(copied);
+        if same && memo && crate::watch::untouched_since(from, to, tick) {
+            self.settled.note(from, to, tick, epoch);
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3744,6 +3960,19 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
+    }
+
+    /// [`Shadow::nothing_new`] where only what an earlier look noted is
+    /// asked: no lock but its own, none of the journal's.
+    pub(crate) fn nothing_new_noted(&self, address: usize, len: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to || self.place.is_some() {
+            return false;
+        }
+        settled_on()
+            && matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED)
+            && self.settled.holds(from, to, self.settled.epoch(), |tick| crate::watch::untouched_since(from, to, tick))
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
@@ -5426,8 +5655,26 @@ pub(crate) fn exact_line(frames: f64) {
 mod window_tests {
     use super::{
         WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        tail_of, window_of, within_cap,
     };
+
+    /// Copies fill the limit first come, first served, but a big one still fits in the margin
+    /// half the limit again gives, and nothing wraps at the extremes.
+    #[test]
+    fn big_copies_fit_past_the_limit_small_ones_do_not() {
+        const MIB: u64 = 1 << 20;
+        let most = 512 * MIB;
+        assert!(within_cap(500 * MIB, 12 * MIB, most));
+        assert!(!within_cap(500 * MIB, 13 * MIB, most));
+        assert!(!within_cap(512 * MIB, 64 << 10, most));
+        // A big copy: up to 768 MiB in all.
+        assert!(within_cap(515 * MIB, 21 * MIB, most));
+        assert!(within_cap(747 * MIB, 21 * MIB, most));
+        assert!(!within_cap(748 * MIB, 21 * MIB, most));
+        // Just under big: no margin.
+        assert!(!within_cap(515 * MIB, 16 * MIB - 1, most));
+        assert!(within_cap(0, u64::MAX, u64::MAX));
+    }
 
     #[test]
     fn card_limits_scale_with_local_vram_budget() {
@@ -5591,4 +5838,56 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod settled_tests {
+    use super::Settled;
+
+    #[test]
+    fn a_range_is_known_while_nothing_touches_it() {
+        let s = Settled::default();
+        assert!(!s.holds(10, 20, s.epoch(), |_| true), "nothing noted yet");
+        s.note(0, 100, 7, s.epoch());
+        // The note's own tick is what the look is held against.
+        assert!(s.holds(10, 20, s.epoch(), |tick| tick == 7));
+        assert!(s.holds(0, 100, s.epoch(), |_| true));
+        // Touched since (the caller's answer), or not inside the note.
+        assert!(!s.holds(10, 20, s.epoch(), |_| false));
+        assert!(!s.holds(90, 101, s.epoch(), |_| true));
+        assert!(!s.holds(0, 100, s.epoch() + 1, |_| true));
+    }
+
+    #[test]
+    fn shaders_on_the_copy_void_every_note() {
+        let s = Settled::default();
+        s.note(0, 100, 7, s.epoch());
+        s.note(200, 300, 8, s.epoch());
+        s.void();
+        assert!(!s.holds(10, 20, s.epoch(), |_| true));
+        assert!(!s.holds(210, 220, s.epoch(), |_| true));
+        // A look begun before it (its epoch is the old one) is no note after it.
+        s.note(0, 100, 9, s.epoch() - 1);
+        assert!(!s.holds(10, 20, s.epoch(), |_| true));
+        s.note(0, 100, 10, s.epoch());
+        assert!(s.holds(10, 20, s.epoch(), |_| true));
+    }
+
+    #[test]
+    fn two_ranges_are_kept_and_the_older_goes_first() {
+        let s = Settled::default();
+        let e = s.epoch();
+        s.note(0, 10, 5, e);
+        s.note(20, 30, 6, e);
+        s.note(40, 50, 7, e);
+        assert!(!s.holds(0, 10, e, |_| true), "the oldest was replaced");
+        assert!(s.holds(20, 30, e, |_| true));
+        assert!(s.holds(40, 50, e, |_| true));
+        // The same range is renewed in place, and a look from before the
+        // newest does not take its place.
+        s.note(20, 30, 9, e);
+        s.note(20, 30, 8, e);
+        assert!(s.holds(20, 30, e, |tick| tick == 9));
+        assert!(s.holds(40, 50, e, |_| true));
+    }
 }

@@ -13,6 +13,7 @@ zlib-rs.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 victory-formats.workspace = true
+victory-game.workspace = true
 victory-pipeline.workspace = true
 victory-shader.workspace = true
 

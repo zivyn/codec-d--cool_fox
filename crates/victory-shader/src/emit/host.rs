@@ -1039,6 +1039,306 @@ pub struct Dispatch<'a> {
     pub groups: [u32; 3],
 }
 
+/// What [`Host::time_compute`] fills the UAVs with.
+#[cfg(test)]
+pub const BENCH_FILL: u32 = 0x0101_0101;
+
+/// A buffer in the heap of [`Host::time_compute`], in the card's memory.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub struct BenchView {
+    /// Heap index.
+    pub index: u32,
+    /// Raw buffer size in dwords.
+    pub dwords: u32,
+    /// A UAV, else an SRV.
+    pub uav: bool,
+    /// In the PC's memory (write-back, as the host's copies of title memory), else the card's.
+    pub sysmem: bool,
+}
+
+#[cfg(test)]
+impl Host {
+    /// The wall time in milliseconds of each of `reps` back-to-back dispatches of a compute
+    /// pipeline (after one untimed warm-up), over SRVs filled with pseudo-random dwords and
+    /// UAVs filled with [`BENCH_FILL`], the user data in root parameter 0 and the root CBVs
+    /// after it, in the order [`Host::root_signature_for`] gives them; and, per UAV, how many
+    /// of its dwords are not [`BENCH_FILL`] afterwards (what the program wrote).
+    pub fn time_compute(
+        &self,
+        (root, pso): &(ID3D12RootSignature, ID3D12PipelineState),
+        user_data: &[u32],
+        cbvs: &[Vec<u32>],
+        views: &[BenchView],
+        groups: [u32; 3],
+        reps: u32,
+    ) -> Result<(f64, Vec<u64>), String> {
+        let dev = &self.device;
+        // SAFETY: D3D12 calls with descriptions that outlive them; resources stay alive until
+        // the fence says the GPU is done.
+        unsafe {
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let alloc: ID3D12CommandAllocator = dev
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .map_err(err)?;
+            let buffer = |size: u64, flags| D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: size,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: flags,
+                ..Default::default()
+            };
+            let make = |heap, desc: &D3D12_RESOURCE_DESC, state| {
+                let mut r: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: heap,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    None,
+                    &mut r,
+                )
+                .map_err(err)?;
+                r.ok_or_else(|| "no resource".to_string())
+            };
+            let slots = views.iter().map(|v| v.index + 1).max().unwrap_or(1);
+            let heap: ID3D12DescriptorHeap = dev
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: slots,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let step = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                as usize;
+            let mut keep = Vec::new();
+            for v in views {
+                let mut at = heap.GetCPUDescriptorHandleForHeapStart();
+                at.ptr += v.index as usize * step;
+                let flags = if v.uav {
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                } else {
+                    D3D12_RESOURCE_FLAG_NONE
+                };
+                let desc = buffer(u64::from(v.dwords) * 4, flags);
+                let b = if v.sysmem {
+                    let mut r: Option<ID3D12Resource> = None;
+                    dev.CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_CUSTOM,
+                            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        None,
+                        &mut r,
+                    )
+                    .map_err(err)?;
+                    r.ok_or_else(|| "no resource".to_string())?
+                } else {
+                    make(D3D12_HEAP_TYPE_DEFAULT, &desc, D3D12_RESOURCE_STATE_COMMON)?
+                };
+                if v.uav {
+                    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_UAV {
+                                NumElements: v.dwords,
+                                Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                } else {
+                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_TYPELESS,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                NumElements: v.dwords,
+                                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                                ..Default::default()
+                            },
+                        },
+                    };
+                    dev.CreateShaderResourceView(&b, Some(&desc), at);
+                }
+                keep.push((b, *v));
+            }
+            // Pseudo-random contents (xorshift), so what the program writes is not zeros.
+            {
+                let mut seed = 0x9E37_79B9_u32;
+                let mut fill = |words: &mut [u32], uav: bool| {
+                    for w in words {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        *w = if uav { BENCH_FILL } else { seed };
+                    }
+                };
+                let mut copies = Vec::new();
+                for (b, v) in &keep {
+                    if v.sysmem {
+                        let mut p = std::ptr::null_mut();
+                        b.Map(0, None, Some(&mut p)).map_err(err)?;
+                        fill(
+                            std::slice::from_raw_parts_mut(p.cast::<u32>(), v.dwords as usize),
+                            v.uav,
+                        );
+                        b.Unmap(0, None);
+                        continue;
+                    }
+                    let up = make(
+                        D3D12_HEAP_TYPE_UPLOAD,
+                        &buffer(u64::from(v.dwords) * 4, D3D12_RESOURCE_FLAG_NONE),
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                    )?;
+                    let mut p = std::ptr::null_mut();
+                    up.Map(0, None, Some(&mut p)).map_err(err)?;
+                    fill(
+                        std::slice::from_raw_parts_mut(p.cast::<u32>(), v.dwords as usize),
+                        v.uav,
+                    );
+                    up.Unmap(0, None);
+                    copies.push((b.clone(), up, u64::from(v.dwords) * 4));
+                }
+                if !copies.is_empty() {
+                    let list: ID3D12GraphicsCommandList = dev
+                        .CreateCommandList(
+                            0,
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            &alloc,
+                            None::<&ID3D12PipelineState>,
+                        )
+                        .map_err(err)?;
+                    for (b, up, bytes) in &copies {
+                        list.CopyBufferRegion(b, 0, up, 0, *bytes);
+                    }
+                    list.Close().map_err(err)?;
+                    queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+                    let fence: ID3D12Fence =
+                        dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+                    queue.Signal(&fence, 1).map_err(err)?;
+                    while fence.GetCompletedValue() < 1 {
+                        std::thread::yield_now();
+                    }
+                    alloc.Reset().map_err(err)?;
+                }
+            }
+            let mut root_views = Vec::new();
+            for data in cbvs {
+                let size = (data.len() * 4).next_multiple_of(256);
+                let b = make(
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    &buffer(size as u64, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                )?;
+                let mut p = std::ptr::null_mut();
+                b.Map(0, None, Some(&mut p)).map_err(err)?;
+                std::ptr::copy_nonoverlapping(data.as_ptr(), p.cast::<u32>(), data.len());
+                b.Unmap(0, None);
+                root_views.push(b);
+            }
+            let list: ID3D12GraphicsCommandList = dev
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, pso)
+                .map_err(err)?;
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                        pResource: std::mem::ManuallyDrop::new(None),
+                    }),
+                },
+            };
+            let mut first = true;
+            let mut run = |n: u32| -> Result<f64, String> {
+                if !first {
+                    alloc.Reset().map_err(err)?;
+                    list.Reset(&alloc, pso).map_err(err)?;
+                }
+                first = false;
+                list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                list.SetComputeRootSignature(root);
+                list.SetComputeRoot32BitConstants(
+                    0,
+                    user_data.len() as u32,
+                    user_data.as_ptr().cast(),
+                    0,
+                );
+                for (i, b) in root_views.iter().enumerate() {
+                    list.SetComputeRootConstantBufferView(1 + i as u32, b.GetGPUVirtualAddress());
+                }
+                for _ in 0..n {
+                    list.Dispatch(groups[0], groups[1], groups[2]);
+                    list.ResourceBarrier(std::slice::from_ref(&barrier));
+                }
+                list.Close().map_err(err)?;
+                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+                let began = std::time::Instant::now();
+                queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+                queue.Signal(&fence, 1).map_err(err)?;
+                while fence.GetCompletedValue() < 1 {
+                    if let Err(e) = dev.GetDeviceRemovedReason() {
+                        return Err(format!("device removed: {}", err(e)));
+                    }
+                    std::thread::yield_now();
+                }
+                Ok(began.elapsed().as_secs_f64() * 1000.0 / f64::from(n))
+            };
+            run(1)?;
+            let ms = run(reps)?;
+            // What the program wrote: the UAVs' dwords that are not zero (the fill had few).
+            let mut written = Vec::new();
+            for (b, v) in keep.iter().filter(|(_, v)| v.uav) {
+                let bytes = u64::from(v.dwords) * 4;
+                let back = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                alloc.Reset().map_err(err)?;
+                list.Reset(&alloc, pso).map_err(err)?;
+                list.CopyBufferRegion(&back, 0, b, 0, bytes);
+                list.Close().map_err(err)?;
+                queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+                queue.Signal(&fence, 1).map_err(err)?;
+                while fence.GetCompletedValue() < 1 {
+                    std::thread::yield_now();
+                }
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).map_err(err)?;
+                let words = std::slice::from_raw_parts(p.cast::<u32>(), v.dwords as usize);
+                written.push(words.iter().filter(|&&w| w != BENCH_FILL).count() as u64);
+                back.Unmap(0, None);
+            }
+            Ok((ms, written))
+        }
+    }
+}
 #[cfg(test)]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap

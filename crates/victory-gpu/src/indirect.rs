@@ -2664,6 +2664,12 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// lives (the card's copy is zeroed in the list): a recording whose
     /// clamps spend all of it is followed, after the reset, by one whose
     /// small record still runs.
+    ///
+    /// The clamp is the process's own, so `VICTORY_INDIRECT_REST` decides
+    /// what a record that does not fit does: two of the three big records
+    /// fit and leave 2,048, and the third takes that too (`REST=1`) or
+    /// nothing (the default), where the fourth record, of exactly 2,048,
+    /// takes it. Either way the budget is spent when the small record comes.
     #[test]
     fn host_list_budget_starts_empty_at_each_submission() {
         let Some(host) = super::host() else {
@@ -2696,8 +2702,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             }
             sig.unwrap()
         };
-        // Three records of 65,535 x 16 groups: about half the budget each.
-        let Some((big, big_ptr)) = host.shared_buffer(3 * u64::from(STRIDE)) else {
+        // Three records of 65,535 x 16 groups (67,107,840: 2,048 short of
+        // half the budget each), then 32 groups (2,048, what two big ones
+        // leave).
+        let Some((big, big_ptr)) = host.shared_buffer(4 * u64::from(STRIDE)) else {
             return;
         };
         let Some((small, small_ptr)) = host.shared_buffer(u64::from(STRIDE)) else {
@@ -2708,8 +2716,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         };
         // SAFETY: mapped buffers of these sizes; nothing runs yet.
         unsafe {
-            for i in 0..3 {
-                let words = [65535u32, 16, 1];
+            for (i, words) in [[65535u32, 16, 1]; 3].into_iter().chain([[32, 1, 1]]).enumerate() {
                 std::ptr::copy_nonoverlapping(
                     words.as_ptr().cast::<u8>(),
                     big_ptr.add(i * STRIDE as usize),
@@ -2723,7 +2730,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 4)).unwrap();
             let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
@@ -3146,13 +3153,27 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
     }
 
     /// Records past the list's budget come out empty, and one read by many
-    /// executions is charged for each.
+    /// executions is charged for each. A record that does not fit takes
+    /// nothing from the ones after it (`VICTORY_INDIRECT_REST`, off by
+    /// default; [`batch_charges_every_execution`]).
     #[test]
     fn warp_batch_charges_every_execution() {
+        batch_charges_every_execution(false);
+    }
+
+    /// As above where a record that does not fit takes the rest of the
+    /// budget (`VICTORY_INDIRECT_REST=1`): the records that run are the same.
+    #[test]
+    fn warp_batch_charges_every_execution_and_a_refused_one_takes_the_rest() {
+        batch_charges_every_execution(true);
+    }
+
+    fn batch_charges_every_execution(rest: bool) {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let source = batch::SOURCE.replace("REST ?", if rest { "true ?" } else { "false ?" });
+        let pass = make_from(&warp.device, &source).expect("the batched clamp must compile on WARP");
         const BUDGET: u32 = 1 << 27;
         // 2^26 vertices each, as much as a draw is let run: two fill it.
         for (times, records, filled) in [(1u32, 3u64, 2usize), (2, 1, 1), (1, 1, 1), (3, 1, 0)] {
@@ -3190,9 +3211,13 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                     (0..records as usize).map(|r| back_ptr.cast::<u32>().add(r * batch::SLOT as usize / 4).read_volatile()).collect(),
                 )
             };
-            assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
+            assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "rest {rest}, {times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            // What ran is charged; a record refused charges the rest of the
+            // budget or nothing.
+            let ran = (1 << 26) * times * filled as u32;
+            let refused = filled as u64 != records;
+            assert_eq!(spent, if rest && refused { BUDGET } else { ran }, "rest {rest}, {times} times {records}");
         }
     }
 

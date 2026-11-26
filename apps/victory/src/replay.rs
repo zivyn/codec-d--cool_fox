@@ -209,11 +209,19 @@ pub(crate) struct Replay {
     #[arg(long)]
     retranslate: Option<PathBuf>,
     /// With --retranslate: the view heap's null slot, and where raw twins of
-    /// views start, as the capture's shaders have them (0: none).
-    #[arg(long, default_value_t = 0)]
-    view_limit: u32,
-    #[arg(long, default_value_t = 0)]
-    raw_views: u32,
+    /// views start, as the capture's shaders have them (0: none). Unset: what
+    /// the runtime picks on this PC's card.
+    #[arg(long)]
+    view_limit: Option<u32>,
+    #[arg(long)]
+    raw_views: Option<u32>,
+    /// With --retranslate: the widest wave of the host the shaders are for
+    /// (32 on NVIDIA, 64 on AMD). Unset: this PC's card.
+    #[arg(long)]
+    host_wave: Option<u32>,
+    /// With --retranslate: translate as for an AMD RDNA card. Unset: this PC's card.
+    #[arg(long)]
+    host_rdna: Option<bool>,
     /// Use the D3D12 debug layer (slow).
     #[arg(long)]
     debug_layer: bool,
@@ -249,7 +257,7 @@ pub(crate) fn run(r: Replay) -> Result<()> {
         return play::look::flow(&r.folder, lists, r.flow_draws, r.flow_slots, &mut |line| println!("{line}"));
     }
     if let Some(into) = &r.retranslate {
-        return retranslate(&r.folder, into, r.view_limit, r.raw_views);
+        return retranslate(&r, into);
     }
     let until = match &r.until {
         Some(text) => Some(
@@ -434,7 +442,8 @@ pub(crate) fn run(r: Replay) -> Result<()> {
 }
 
 /// Translates the capture's shaders into `into`.
-fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32, raw_views: u32) -> Result<()> {
+fn retranslate(r: &Replay, into: &std::path::Path) -> Result<()> {
+    let folder = r.folder.as_path();
     use std::sync::atomic::{AtomicUsize, Ordering};
     let wanted = play::title_shaders(folder)?;
     let kept = play::find(folder)?.with_file_name("containers");
@@ -465,8 +474,26 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    // As the runtime tells the translator on this PC's card, unless said.
+    let all_given = r.host_wave.is_some()
+        && r.host_rdna.is_some()
+        && r.view_limit.is_some()
+        && r.raw_views.is_some();
+    let host = if all_given {
+        None
+    } else {
+        Some(play::host_translation(folder).context("the host settings of this PC's card")?)
+    };
+    let max_wave = r.host_wave.or(host.as_ref().map(|h| h.max_wave)).unwrap_or(64);
+    let rdna = r.host_rdna.or(host.as_ref().map(|h| h.rdna)).unwrap_or(false);
+    let view_limit = r.view_limit.or(host.as_ref().map(|h| h.view_limit)).unwrap_or(0);
+    let raw_views = r.raw_views.or(host.as_ref().map(|h| h.raw_views)).unwrap_or(0);
+    println!(
+        "translating for: {} wave {max_wave}, rdna {rdna}, view limit {view_limit}, raw views {raw_views}",
+        host.as_ref().map_or("(given)", |h| h.adapter.as_str()),
+    );
+    victory_shader::emit::set_host_max_wave(max_wave);
+    victory_shader::emit::set_host_rdna(rdna);
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();

@@ -80,6 +80,8 @@
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
 
+#[cfg(all(test, windows))]
+mod bench_tests;
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
@@ -557,6 +559,14 @@ pub fn emit(
             && c.part(FourCC::ACCC).is_some()
             && matches!(&original, Err(ShaderError::Unsupported { what, .. })
                 if *what == lower::DIVERGENT_MASK_EXCHANGE);
+        // The first of the program's forms that the wave-wide branches ([`widen`]) can start
+        // from: the one without skips where scalars are followed (`deep`) when it was made,
+        // else the other two, else the program itself.
+        let widen_from = |deep: Option<&ir::Program>, active_loop_only: bool| {
+            let bases = [deep, forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
+            let base = bases.into_iter().flatten().next().unwrap_or(p);
+            widen(c, native, base, why, active_loop_only)
+        };
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -579,18 +589,10 @@ pub fn emit(
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
                 if wide_on || driver_loop {
-                    let bases = [
-                        deep.as_ref().map(|f| &f.0),
-                        forms[1].1.as_ref().map(|f| &f.0),
-                        forms[0].1.as_ref().map(|f| &f.0),
-                        Some(p),
-                    ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why, driver_loop);
-                        report("wave-wide branches", &again);
-                        if done(&again) {
-                            return again.map(|(shader, _)| shader);
-                        }
+                    let again = widen_from(deep.as_ref().map(|f| &f.0), driver_loop);
+                    report("wave-wide branches", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
                     }
                 }
                 if strict {
@@ -636,6 +638,19 @@ pub fn emit(
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
                 }
+            }
+        }
+        // Where nothing else translated a console wave of 64 threads (one wave per group): its
+        // branches around cross-lane code taken wave-wide, as a last resort and not before the
+        // approximate forms, which it would replace (the barriers it puts inside branches and
+        // loops lost the card for programs the approximate forms ran).
+        // (`VICTORY_WAVE_WIDE=0` leaves it out.)
+        if wide_option.is_none() {
+            let deep = form("without skips, scalars followed", ir::without_skips(p, true));
+            let again = widen_from(deep.as_ref().map(|f| &f.0), false);
+            report("wave-wide branches (last resort)", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
             }
         }
     }

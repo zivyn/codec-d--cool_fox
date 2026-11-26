@@ -8012,6 +8012,15 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
+        if spans.len() > FEW {
+            // Those a copy noted as holding nothing new, and nothing has
+            // touched since, need no thread (nor asking ahead).
+            #[cfg(feature = "diagnostics")]
+            let all = spans.len();
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new_noted(*from, *to - *from));
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+        }
         let many = spans.len() > FEW;
         if !many {
             #[cfg(feature = "diagnostics")]
@@ -8170,6 +8179,14 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
+        if light && self.refreshes.len() > FEW {
+            // (As in `refresh_front`.)
+            #[cfg(feature = "diagnostics")]
+            let all = self.refreshes.len();
+            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_noted(*from, *to - *from));
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+        }
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]

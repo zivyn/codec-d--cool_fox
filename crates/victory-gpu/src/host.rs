@@ -5652,7 +5652,12 @@ impl Host {
         // A title list can leave a buffer promoted to COPY_DEST. Buffers
         // decay to COMMON between ExecuteCommandLists calls, so submit
         // the compare separately before signalling this submission's fence.
-        let check = card.as_ref().and_then(|c| c.check.clone()).map(|list| [Some(list)]);
+        // Keep it in the list array so the timing end markers follow it.
+        let compare_at = card.as_ref().and_then(|c| c.check.clone()).map(|list| {
+            let at = lists.len();
+            lists.push(Some(list));
+            at
+        });
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
@@ -5668,21 +5673,28 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         let stamp = stamps::take();
         #[cfg(feature = "diagnostics")]
-        if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
+        let compare_at = if let Some((ahead, behind)) = stamp.and_then(stamps::lists) {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
             firsts.iter_mut().for_each(|first| *first += 1);
-        }
+            compare_at.map(|at| at + 1)
+        } else {
+            compare_at
+        };
         #[cfg(feature = "diagnostics")]
         let sending = crate::timeline::ticks();
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists() {
+            let compare_at = if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
-            }
+                compare_at.map(|at| at + 1)
+            } else {
+                compare_at
+            };
+            let (lists, compare) = lists.split_at(compare_at.unwrap_or(lists.len()));
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
@@ -5691,8 +5703,8 @@ impl Host {
                     self.queue.ExecuteCommandLists(&lists[from..to]);
                     from = to;
                 }
-                if let Some(check) = &check {
-                    self.queue.ExecuteCommandLists(check);
+                if !compare.is_empty() {
+                    self.queue.ExecuteCommandLists(compare);
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
@@ -5727,19 +5739,22 @@ impl Host {
             working(was_working);
             return Some((submitted, sent));
         }
+        let (lists, compare) = lists.split_at(compare_at.unwrap_or(lists.len()));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
         let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
             firsts
                 .iter()
+                .enumerate()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                // Include any leading timeline marker in the first timed group.
+                .map(|((i, &a), &b)| &lists[if i == 0 { 0 } else { a }..b])
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![lists]
         };
         #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
+        let groups = [lists];
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -5747,8 +5762,8 @@ impl Host {
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                if i + 1 == groups.len() && let Some(check) = &check {
-                    self.queue.ExecuteCommandLists(check);
+                if i + 1 == groups.len() && !compare.is_empty() {
+                    self.queue.ExecuteCommandLists(compare);
                 }
                 self.card_sent();
                 let waited = self

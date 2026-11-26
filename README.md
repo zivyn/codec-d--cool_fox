@@ -47,7 +47,9 @@ What is known to be wrong:
 - Textures of what just came into view appear late while the title streams.
 - The first run with a new driver or a new build stutters while the driver makes
   pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- The title's own hang watchdog (30 s without its main loop's heartbeat) ended runs while a frame was
+  recorded or ray-tracing programs were made on its threads. Those stalls now pause it
+  (`VICTORY_WATCHDOG_HOLD=0` turns that off; not yet run in the world).
 
 ## How to run it
 

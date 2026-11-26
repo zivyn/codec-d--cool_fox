@@ -4,6 +4,7 @@
 //! is defined in docs/asset-policy.md.
 
 pub mod sgd5;
+pub mod watchdog;
 
 /// A specific build of the title executable we know how to run.
 #[derive(Debug, Clone, Copy)]

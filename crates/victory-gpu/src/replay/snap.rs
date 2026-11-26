@@ -96,6 +96,8 @@ pub(super) fn submit(
             .map(|c| c.as_ref().and_then(|c| c.0.clone()))
             .collect();
         let _ours = Ours::new();
+        // The title's thread is ours for as long as this takes.
+        let _hold = victory_game::watchdog::hold("frame recorder");
         if let Err(e) = c.submit(r, queue, &commands) {
             stop(r, &mut phase, &*e);
         }
@@ -161,6 +163,7 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
         }
         Stage::Capturing(c) if c.started => {
             let _ours = Ours::new();
+            let _hold = victory_game::watchdog::hold("frame recorder");
             let done = c.present(r, texture, state).and_then(|()| {
                 if c.frame < r.settings.frames {
                     return Ok(false);
@@ -327,6 +330,7 @@ struct Capture {
 impl Capture {
     fn new(r: &Recorder) -> Result<Capture, Fault> {
         let _ours = Ours::new();
+        let _hold = victory_game::watchdog::hold("frame recorder");
         let device = r.device().ok_or("no device")?;
         let queues = lock(&r.queues).clone();
         let direct = queues

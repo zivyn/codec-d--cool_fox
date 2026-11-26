@@ -188,7 +188,10 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && asked & 0x400 != 0 {
         victory_gpu::title_memory_write_combined(at as usize, size);
     }
-    if !at.is_null() && placeholder && constrained && flags & ADDRESS_32BIT != 0 {
+    // (Grand Theft Auto VI asks for its 32-bit heap with kind 0x42000,
+    // without the 64 KiB page bits: not `placeholder` above, though the host
+    // makes a placeholder of it all the same.)
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     note_protection(asked, kind, flags, at as usize, size);
@@ -1181,9 +1184,19 @@ fn arrange(base: usize, pages: &[usize]) {
     let Some(section) = pages.first().and_then(|p| table.pages.get(p)).map(|s| s.section.clone()) else {
         return;
     };
-    if section.pages * PAGE != bytes
+    if section.pages * PAGE < bytes
         || !pages.iter().all(|p| table.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section)))
     {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::warn!(
+                at = format_args!("{base:#x}"),
+                pages = pages.len(),
+                section_pages = section.pages,
+                reservation = bytes / PAGE,
+                "renderer port 1: pages mapped into the 32-bit heap are not of one section as big as it: left where they are"
+            );
+        }
         return;
     }
     let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
@@ -2920,8 +2933,10 @@ mod tests {
     fn the_32_bit_heap_gets_its_slices_in_address_order() {
         // As the title's heap: a 32-bit reservation of 64 KiB pages, all of
         // its pages from one call, mapped piece by piece in another order.
-        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, GRAPHICS | ADDRESS_32BIT, PAGE_READWRITE);
+        // The title's own kind: reserve and 0x40000, no 64 KiB page bits.
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, GRAPHICS | ADDRESS_32BIT, PAGE_NOACCESS);
         assert!(!base.is_null() && (base as usize) < 1 << 32);
+        assert!(LOW_RESERVATIONS.lock().unwrap().iter().any(|r| r.0 == base as usize), "the reservation is known");
         let pages = allocate(4);
         let index = |number: usize| page_table().pages.get(&number).map(|s| s.index);
         let at = |page: usize| base.wrapping_byte_add(page * PAGE);

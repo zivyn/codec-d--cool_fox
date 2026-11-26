@@ -175,6 +175,8 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
+    /// The most dynamic slots taken at once so far (logged as it climbs).
+    peak: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1494,28 +1496,37 @@ pub(crate) fn pick_views(fits: impl Fn(u32) -> bool) -> (u32, u32) {
 /// about 720,000: 2^17 left 868,000 of them, and ran out in the opening
 /// cutscene (a frame asks for up to 16,000 tables while the frame before
 /// still holds its own; a draw refused its table read slots never made
-/// for it, and the card stopped within frames). 2^18 leaves 737,000; a
-/// table past them is made afresh in these slots like any other.
+/// for it, and the card stopped within frames). 2^18 left 737,000 (now
+/// [`CAPPED_DYNAMIC`]); a table past them is made afresh in these slots like
+/// any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
-/// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
-/// (0: none): up to four times as many where the host heap has the room (a
-/// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
-/// sets the most). 2^18 ran out in the title's bigger places (session
-/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
-/// refused, with 2,639 indirect draws and dispatches).
+/// The dynamic slots of a host heap capped at [`PORTABLE_VIEWS`] (NVIDIA),
+/// which come out of the title's slots: 254,976 leave 745,023 of them, where
+/// 2^18 left 737,855 and the title wrote view records up to slot 741,277
+/// (the title copies records as bytes, and a shader that picks one by an
+/// index it computes read a null view past the host's title slots; two runs
+/// of the opening, five records). 2.7 % fewer dynamic slots than 2^18; the
+/// peak taken is logged (`HostHeap::dynamic`). `VICTORY_DYNAMIC_SLOTS` sets it.
+const CAPPED_DYNAMIC: u32 = 254_976;
+
+/// How many dynamic slots a heap of `count` title slots whose null slot is
+/// `null` (0: none) has. On a capped host heap ([`CAPPED_DYNAMIC`]) the
+/// title slots are what is left of it; `VICTORY_DYNAMIC_SLOTS=<n>` sets the
+/// number there, up or down (at least 1,024, at most half the heap). Where
+/// the host heap has room: [`DYNAMIC`] up to four times as many (`VICTORY_DYNAMIC_SLOTS`
+/// sets the most, and a lower one lowers the least too). 2^18 ran out in the
+/// title's bigger places (session play-1125-0127: 27,000 to 35,000 tables a
+/// frame, up to 3,285 of them refused, with 2,639 indirect draws and
+/// dispatches).
 fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_DYNAMIC_SLOTS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
+    static SET: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| std::env::var("VICTORY_DYNAMIC_SLOTS").ok().and_then(|v| v.trim().parse().ok()));
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        return set.map_or(CAPPED_DYNAMIC, |n| n.clamp(1 << 10, null / 2));
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    let most = set.unwrap_or(DYNAMIC << 2);
+    null.saturating_sub(count).min(most).max(DYNAMIC.min(most))
 }
 
 impl HostHeap {
@@ -1630,6 +1641,7 @@ impl HostHeap {
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+            peak: std::sync::atomic::AtomicU32::new(0),
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -1785,8 +1797,15 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed) - n as u32;
         *next = ((first + n) % end) as u32;
+        // (Under the lock.)
+        let used = self.dynamic - free;
+        let peak = self.peak.load(std::sync::atomic::Ordering::Relaxed);
+        if used >= peak + 8192 {
+            self.peak.store(used, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(used, of = self.dynamic, "dynamic descriptor slots taken at once, a new most");
+        }
         Some(self.count + first as u32)
     }
 
@@ -4910,6 +4929,11 @@ mod tests {
             assert!(!fits(PORTABLE_VIEWS + 1) || victory_shader::emit::view_heap_limit() > PORTABLE_VIEWS);
             assert_eq!(heap.count + heap.dynamic, null);
             assert!(heap.count < title);
+            if null == PORTABLE_VIEWS - 1 && std::env::var_os("VICTORY_DYNAMIC_SLOTS").is_none() {
+                // Slot 741,277 is the highest the title wrote past 2^18 dynamic slots.
+                assert_eq!(heap.dynamic, CAPPED_DYNAMIC);
+                assert!(heap.count >= 745_000);
+            }
         }
     }
 

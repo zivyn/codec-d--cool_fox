@@ -113,6 +113,11 @@ pub fn switched(switch: &str) -> Option<bool> {
 pub fn frame_phase() -> u32 {
     copystat::phase()
 }
+
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

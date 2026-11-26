@@ -24,6 +24,7 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+pub mod frame_rate;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;

@@ -12,6 +12,7 @@
 #                  (-Adapter '#1'). Default: Windows' default card (the one the main display is on).
 # -Build           target\diag (the default, the build all measurements are of) or target\release
 #                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
+# -WindowsBarMB    maximum MiB of title memory windows in CPU-mapped VRAM (0 by default).
 # -More            other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -23,7 +24,8 @@ param(
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
-    [hashtable]$More = @{}
+    [hashtable]$More = @{},
+    [uint32]$WindowsBarMB
 )
 $settings = @{
     # This fork's play set (scripts\play.ps1, not -Safe): the speed set.
@@ -54,12 +56,6 @@ $settings = @{
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '1536'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
-    # Windows of title memory outside buffers in card memory the CPU maps (resizable BAR), up to 3 GB, while the
-    # card has room (shadow.rs window_mapped_for). Otherwise they live in the PC's memory shared with the card,
-    # which Windows caps at half the RAM: on a 16 GB PC (RTX 3060) the shared memory reached 7.5 GB about a minute
-    # into the world and every run ended in 0x8007000E, then a fault in the driver. With this: no crash, the shared
-    # memory flat at about 4.4 GB, 10-12 fps instead of 2-3. Without a resizable BAR it changes nothing.
-    VICTORY_WINDOWS_BAR_MB = '3072'
 }
 # Ray tracing mostly off. The structure builder cannot run on NVIDIA (its 64-lane programs are refused; upstream
 # Marvisak/VIctory pull request 2311), so every ray misses, and the passes that turn misses into light made rooms go
@@ -87,6 +83,9 @@ if ($Resolution) {
     $settings.VICTORY_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
 }
 if ($Adapter) { $settings.VICTORY_ADAPTER = $Adapter }
+if ($PSBoundParameters.ContainsKey('WindowsBarMB')) {
+    $settings.VICTORY_WINDOWS_BAR_MB = $WindowsBarMB.ToString([Globalization.CultureInfo]::InvariantCulture)
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 $scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
 Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"

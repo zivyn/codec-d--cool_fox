@@ -54,6 +54,12 @@ $settings = @{
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_CARD_BUFFERS_MB = '1536'
     # Series S presents the interface as a second plane: laid over the game (compose.rs), else black before gameplay.
     VICTORY_COMPOSE = '1'
+    # Windows of title memory outside buffers in card memory the CPU maps (resizable BAR), up to 3 GB, while the
+    # card has room (shadow.rs window_mapped_for). Otherwise they live in the PC's memory shared with the card,
+    # which Windows caps at half the RAM: on a 16 GB PC (RTX 3060) the shared memory reached 7.5 GB about a minute
+    # into the world and every run ended in 0x8007000E, then a fault in the driver. With this: no crash, the shared
+    # memory flat at about 4.4 GB, 10-12 fps instead of 2-3. Without a resizable BAR it changes nothing.
+    VICTORY_WINDOWS_BAR_MB = '3072'
 }
 # Ray tracing mostly off. The structure builder cannot run on NVIDIA (its 64-lane programs are refused; upstream
 # Marvisak/VIctory pull request 2311), so every ray misses, and the passes that turn misses into light made rooms go

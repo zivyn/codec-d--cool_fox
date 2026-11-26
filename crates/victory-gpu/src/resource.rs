@@ -1556,6 +1556,55 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     same.then_some(other)
 }
 
+/// Says (once per kind of pair, at most 64 lines) that the texture the
+/// title placed at `address` ([`texture_at`]), `this`, lies inside the
+/// memory of a texture the host renders to or writes without starting
+/// where that texture starts. [`alias_of`] finds only a view at the very
+/// start; one placed further in (a level, a layer, a corner of an atlas) is
+/// filled from title memory, which the host's writes never reach: what
+/// lay there before (another texture's bytes) or zeros. Diagnostics for
+/// textures that read as noise or black where the title rendered them.
+#[cfg(windows)]
+fn placed_inside_target(address: u64, this: This) {
+    let hit = {
+        let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+        targets.range(..address).next_back().map(|(&start, &other)| (start, other))
+    };
+    let Some((start, other)) = hit else {
+        return;
+    };
+    let (r, o) = (resource(this), resource(other as This));
+    let Some(size) = footprint(&o.desc).map(|f| f.size) else {
+        return;
+    };
+    if address >= start.saturating_add(size) {
+        return;
+    }
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<[u32; 8]>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let pair = [
+        r.desc.width as u32,
+        r.desc.height,
+        r.desc.format,
+        u32::from(r.desc.mip_levels),
+        o.desc.width as u32,
+        o.desc.height,
+        o.desc.format,
+        u32::from(o.desc.mip_levels),
+    ];
+    let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+    if said.len() < 64 && said.insert(pair) {
+        tracing::warn!(
+            view = ?this,
+            texture = ?other,
+            offset = format_args!("{:#x}", address - start),
+            target_bytes = size,
+            target_flags = format_args!("{:#x}", o.desc.flags),
+            "a placed texture lies inside the memory of a texture the host writes, not at its start: it is filled from title memory, which the host's writes never reach (width, height, format, levels of each): {pair:?}"
+        );
+    }
+}
+
 /// Whether host copies are made on first use. On by default;
 /// `VICTORY_LAZY_TEXTURES=0` makes each when the title creates its texture,
 /// as before.
@@ -3159,6 +3208,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     }
     map.insert((address, *desc), out as usize);
     crate::texture::placed_in_host_written(address, desc);
+    placed_inside_target(address, out);
     resource(out)
         .host
         .placed

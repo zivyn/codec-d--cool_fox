@@ -24,11 +24,20 @@
 //! - +0x3eaf5d0 hands `1e6 / frame_us` to scripts, and +0x234490 scales
 //!   per-frame amounts by it (1.0 below 60 except 0.7 at 40, 0.5 from 60).
 //!
+//! - The simulation: +0x22264d0 hands each of its timers the real time
+//!   since the last frame (`QueryPerformanceCounter`); +0x2226040 makes the
+//!   step of it, at most 1/15 s and at least `1 / rate` (+0x6849844, made
+//!   at +0x22435de and +0x2241190 from +0x2241fd0, which reads the same
+//!   setting). So at 30 every frame shorter than 33.3 ms still moves game
+//!   time 33.3 ms: a fixed 30 Hz step for fast frames, delta time for slow
+//!   ones.
+//!
 //! So reporting a 120 Hz display alone changes nothing at 30 (divisor 4,
 //! 33,333 us). Here the two loads of the setting (`mov eax, [reg+210h]`)
 //! become `mov eax, rate ; nop`, so the title's frame time, interval and
-//! own limiter follow the rate asked for; the setting itself is left as it
-//! is. Each site's bytes, from the load to the store of the frame time, are
+//! own limiter follow the rate asked for, and +0x2241fd0 returns the rate
+//! too (1000 for no limit), so the shortest step follows; the setting
+//! itself is left as it is. Each site's bytes, from the load to the store of the frame time, are
 //! compared before anything is written; a site whose bytes differ is left
 //! alone and said so (another build of the title).
 
@@ -44,13 +53,13 @@ pub fn asked_interval_ms() -> Option<f64> {
     ms
 }
 
-/// `16.667` → 16.667; 0 is allowed (no wait), more than a second is not.
+/// `16.667` â†’ 16.667; 0 is allowed (no wait), more than a second is not.
 pub fn parse_interval_ms(spec: &str) -> Option<f64> {
     spec.trim().parse::<f64>().ok().filter(|ms| ms.is_finite() && (0.0..=1000.0).contains(ms))
 }
 
 /// The frame rate the title is given for an interval: `1000 / ms` rounded
-/// (16.667 → 60, 8.333 → 120, 33.333 → 30), 0 for no wait (the title's own
+/// (16.667 â†’ 60, 8.333 â†’ 120, 33.333 â†’ 30), 0 for no wait (the title's own
 /// "no limit"). `VICTORY_TITLE_FPS=<rate>` gives it outright, `off` leaves the
 /// title as it is (only our clock changes).
 pub fn title_rate(interval_ms: f64, title_fps: Option<&str>) -> Option<u32> {
@@ -79,21 +88,33 @@ pub fn title_interval_us(rate: u32, display_120: bool) -> u32 {
     TABLE[usize::from(display_120)][index as usize]
 }
 
-/// A load of the setting to change: its offset in the image and the bytes
-/// from it to the store of the frame time (the first six are the load).
+/// A read of the setting to change: its offset in the image, what it is,
+/// and the bytes there (compared first; the replacement goes at the start).
 pub struct Site {
     pub at: usize,
+    pub kind: Kind,
     pub bytes: &'static [u8],
 }
 
-/// The length of the load (`8B 8x 10 02 00 00`).
-const LOAD_LEN: usize = 6;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `mov eax, [reg+210h]` before the frame time is made of it: becomes
+    /// `mov eax, rate ; nop` (6 bytes).
+    Load,
+    /// +0x2241fd0, the rate the timers' shortest step is made of (`1 /
+    /// rate`, +0x6849844): `cmp dword [rax+210h], 0` becomes `mov eax, rate
+    /// ; jmp` to its `vcvtsi2ss` (7 bytes). Left as it was, the timers step at
+    /// least 1/30 s however short the frame: at 60 frames a second the game
+    /// ran at twice its speed (run fps-1, menus). For no limit, 1000.
+    SimRate,
+}
 
-/// The two loads (game_scarlett_master.exe 1.0.2.1, image offsets).
-pub const SITES: [Site; 2] = [
+/// The three reads (game_scarlett_master.exe 1.0.2.1, image offsets).
+pub const SITES: [Site; 3] = [
     // +0x1e0fb30: mov eax, [rdi+210h] ... mov [+0x98f84ac], eax
     Site {
         at: 0x1e0fc62,
+        kind: Kind::Load,
         bytes: &[
             0x8b, 0x87, 0x10, 0x02, 0x00, 0x00, 0xba, 0xe8, 0x03, 0x00, 0x00, 0xc5, 0xfa, 0x10, 0x0d, 0x9f, 0xa1, 0x34, 0x04, 0xb9, 0xe8,
             0x03, 0x00, 0x00, 0x3d, 0xe8, 0x03, 0x00, 0x00, 0x0f, 0x42, 0xd0, 0x85, 0xc0, 0x0f, 0x44, 0xd1, 0xc5, 0xea, 0x2a, 0xc2, 0xc5,
@@ -103,10 +124,20 @@ pub const SITES: [Site; 2] = [
     // +0x22434a0: mov eax, [rsi+210h] ... mov [+0x98f84ac], eax
     Site {
         at: 0x224359a,
+        kind: Kind::Load,
         bytes: &[
             0x8b, 0x86, 0x10, 0x02, 0x00, 0x00, 0xba, 0xe8, 0x03, 0x00, 0x00, 0xc5, 0xfa, 0x10, 0x0d, 0x67, 0x68, 0xf1, 0x03, 0xb9, 0xe8,
             0x03, 0x00, 0x00, 0x3d, 0xe8, 0x03, 0x00, 0x00, 0x0f, 0x42, 0xd0, 0x85, 0xc0, 0x0f, 0x44, 0xd1, 0xb1, 0xff, 0xc5, 0xea, 0x2a,
             0xc2, 0xc5, 0xf2, 0x5e, 0xc0, 0xc4, 0xe1, 0xfa, 0x2c, 0xc0, 0x89, 0x05, 0xd8, 0x4e, 0x6b, 0x07,
+        ],
+    },
+    // +0x2241fd0: cmp dword [rax+210h], 0 ; je ; call ; mov eax, [rax+210h] ; vcvtsi2ss xmm0, xmm0, rax
+    Site {
+        at: 0x2241fdb,
+        kind: Kind::SimRate,
+        bytes: &[
+            0x83, 0xb8, 0x10, 0x02, 0x00, 0x00, 0x00, 0x74, 0x12, 0xe8, 0xc7, 0xa1, 0xe0, 0x02, 0x8b, 0x80, 0x10, 0x02, 0x00, 0x00, 0xc4,
+            0xe1, 0xfa, 0x2a, 0xc0,
         ],
     },
 ];
@@ -119,10 +150,20 @@ pub const LIMITER_ON: usize = 0x7453ec9;
 /// 50 ms): +0 and +4 times, +0xc the step in seconds, +0x10 in milliseconds.
 pub const TIMERS: [usize; 7] = [0xa943788, 0x856c6b4, 0xabbef40, 0xa958358, 0xa958380, 0x74fa558, 0xa943768];
 
-/// `mov eax, rate ; nop`, as long as the load.
-pub fn replacement(rate: u32) -> [u8; LOAD_LEN] {
-    let r = rate.to_le_bytes();
-    [0xb8, r[0], r[1], r[2], r[3], 0x90]
+/// What goes at a site of `kind` for `rate`.
+pub fn replacement(kind: Kind, rate: u32) -> Vec<u8> {
+    match kind {
+        // mov eax, rate ; nop
+        Kind::Load => {
+            let r = rate.to_le_bytes();
+            vec![0xb8, r[0], r[1], r[2], r[3], 0x90]
+        }
+        // mov eax, rate ; jmp +13 (to the vcvtsi2ss, 20 bytes on)
+        Kind::SimRate => {
+            let r = (if rate == 0 { 1000 } else { rate }).to_le_bytes();
+            vec![0xb8, r[0], r[1], r[2], r[3], 0xeb, 0x0d]
+        }
+    }
 }
 
 /// What became of a site.
@@ -144,12 +185,13 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let code = replacement(rate);
     sites
         .iter()
         .map(|site| {
+            let code = replacement(site.kind, rate);
+            let len = code.len();
             let done = (|| {
-                if site.bytes.len() < LOAD_LEN || site.at.checked_add(site.bytes.len()).is_none_or(|end| end > size) {
+                if site.bytes.len() < len || site.at.checked_add(site.bytes.len()).is_none_or(|end| end > size) {
                     return Patched::Failed("outside the image");
                 }
                 let at = base + site.at;
@@ -162,18 +204,18 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
                 // SAFETY: the load's bytes, made writable for this and put
                 // back; nothing runs them yet.
                 unsafe {
-                    if VirtualProtect(at as *const _, LOAD_LEN, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                    if VirtualProtect(at as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
                         return Patched::Failed("Windows would not make it writable");
                     }
-                    std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, LOAD_LEN);
-                    VirtualProtect(at as *const _, LOAD_LEN, old, &mut old);
-                    FlushInstructionCache(GetCurrentProcess(), at as *const _, LOAD_LEN);
+                    std::ptr::copy_nonoverlapping(code.as_ptr(), at as *mut u8, len);
+                    VirtualProtect(at as *const _, len, old, &mut old);
+                    FlushInstructionCache(GetCurrentProcess(), at as *const _, len);
                 }
                 Patched::Done
             })();
             let offset = format_args!("{:#x}", site.at);
             match done {
-                Patched::Done => tracing::info!(site = %offset, rate, "frame rate: the title's load of its frame rate setting patched (VICTORY_FRAME_INTERVAL_MS)"),
+                Patched::Done => tracing::info!(site = %offset, kind = ?site.kind, rate, "frame rate: the title's read of its frame rate setting patched (VICTORY_FRAME_INTERVAL_MS)"),
                 Patched::Differs => tracing::warn!(site = %offset, "frame rate: not patched, the title's bytes there are not the ones expected (another build?)"),
                 Patched::Failed(why) => tracing::warn!(site = %offset, why, "frame rate: not patched"),
             }
@@ -223,9 +265,10 @@ mod tests {
         assert_eq!(title_interval_us(20, false), 50000);
     }
 
+
     #[test]
-    fn the_sites_are_loads_before_the_clamp() {
-        for site in &SITES {
+    fn the_sites_are_reads_of_the_setting() {
+        for site in SITES.iter().filter(|s| s.kind == Kind::Load) {
             // mov eax, [rdi/rsi+210h]
             assert_eq!(site.bytes[0], 0x8b);
             assert!(matches!(site.bytes[1], 0x86 | 0x87));
@@ -238,14 +281,22 @@ mod tests {
             let end = site.at + site.bytes.len();
             assert_eq!(end as i64 + i64::from(disp), FRAME_US as i64);
         }
-        assert_eq!(replacement(60), [0xb8, 60, 0, 0, 0, 0x90]);
+        let sim = SITES.iter().find(|s| s.kind == Kind::SimRate).unwrap();
+        // cmp dword [rax+210h], 0 ; ... ; mov eax, [rax+210h] at 14 ; vcvtsi2ss at 20
+        assert_eq!(&sim.bytes[..7], &[0x83, 0xb8, 0x10, 0x02, 0x00, 0x00, 0x00]);
+        assert_eq!(&sim.bytes[14..20], &[0x8b, 0x80, 0x10, 0x02, 0x00, 0x00]);
+        assert_eq!(&sim.bytes[20..], &[0xc4, 0xe1, 0xfa, 0x2a, 0xc0]);
+        let code = replacement(Kind::SimRate, 60);
+        assert_eq!(code.len() + usize::from(code[6]), 20, "the jump lands on the vcvtsi2ss");
+        assert_eq!(replacement(Kind::Load, 60), [0xb8, 60, 0, 0, 0, 0x90]);
+        assert_eq!(replacement(Kind::SimRate, 0)[1..5], 1000u32.to_le_bytes());
     }
 
     #[cfg(windows)]
     #[test]
-    fn a_site_loads_the_rate_and_others_are_left_alone() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
-        // SAFETY: fresh memory of our own.
+    fn sites_take_the_rate_and_others_are_left_alone() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: fresh memory of our own, written and run inside it.
         unsafe {
             let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
             assert!(!place.is_null());
@@ -254,15 +305,32 @@ mod tests {
             let mut other = SITES[1].bytes.to_vec();
             other[2] = 0x14; // [rsi+214h]
             std::ptr::copy_nonoverlapping(other.as_ptr(), place.add(0x200), other.len());
-            let mine = [Site { at: 0x100, bytes }, Site { at: 0x200, bytes: SITES[1].bytes }, Site { at: 0xfff0, bytes }];
+            // The simulation's rate as a function: rax = settings (+0x210 = 30),
+            // the window, ret.
+            let settings = [30u32; 0x100];
+            let sim = SITES[2].bytes;
+            let mut f = vec![0x48, 0xb8];
+            f.extend((settings.as_ptr() as u64).to_le_bytes());
+            let window_at = f.len();
+            f.extend(sim);
+            f.push(0xc3);
+            std::ptr::copy_nonoverlapping(f.as_ptr(), place.add(0x300), f.len());
+            let mine = [
+                Site { at: 0x100, kind: Kind::Load, bytes },
+                Site { at: 0x200, kind: Kind::Load, bytes: SITES[1].bytes },
+                Site { at: 0x300 + window_at, kind: Kind::SimRate, bytes: sim },
+                Site { at: 0xfff0, kind: Kind::Load, bytes },
+            ];
             let done = apply(place as usize, 0x10000, 60, &mine);
-            assert_eq!(done[..2], [Patched::Done, Patched::Differs]);
-            assert!(matches!(done[2], Patched::Failed(_)));
+            assert_eq!(done[..3], [Patched::Done, Patched::Differs, Patched::Done]);
+            assert!(matches!(done[3], Patched::Failed(_)));
             let after = std::slice::from_raw_parts(place.add(0x100), bytes.len());
-            assert_eq!(after[..6], replacement(60));
+            assert_eq!(after[..6], replacement(Kind::Load, 60)[..]);
             assert_eq!(after[6..], bytes[6..]);
             assert_eq!(std::slice::from_raw_parts(place.add(0x200), other.len()), &other[..]);
-            windows_sys::Win32::System::Memory::VirtualFree(place.cast(), 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
+            let rate: extern "system" fn() -> f32 = std::mem::transmute(place.add(0x300));
+            assert_eq!(rate(), 60.0);
+            VirtualFree(place.cast(), 0, MEM_RELEASE);
         }
     }
 }

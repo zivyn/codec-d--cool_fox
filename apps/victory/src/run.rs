@@ -259,7 +259,7 @@ pub fn run(
                 let done = unsafe { apply(image.base(), size, rate, &SITES) };
                 let patched = done.iter().filter(|d| **d == Patched::Done).count();
                 println!(
-                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} loads of its setting patched; it asks for {} us at 60 Hz)",
+                    "frame rate: our clock {ms} ms; the title's rate {rate} ({patched} of {} reads of its setting patched; it asks for {} us at 60 Hz)",
                     SITES.len(),
                     title_interval_us(rate, false)
                 );

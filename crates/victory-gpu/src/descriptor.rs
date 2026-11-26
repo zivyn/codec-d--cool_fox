@@ -1651,6 +1651,39 @@ fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
     Some(fields)
 }
 
+/// The words of a placed view's description with those its kind does not
+/// use set to zero. The first ten words are the PC's view description: for a
+/// shader resource view, the format, the dimension, the component mapping,
+/// a word of padding (the union that follows starts on 8 bytes) and the
+/// union's six words; for an unordered access view, the format, the
+/// dimension and the union's eight words. Each dimension uses only the head
+/// of the union, and the title leaves the rest unwritten: run vt-shapes saw
+/// 131,392 values in word 3 and 36,413 in word 9 of a million shapes, each
+/// a new shape for the same view. Words 10 and on (the address and the
+/// console's own fields) are kept; an unknown dimension keeps all.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    let mut d = words(desc)?;
+    // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(d[1] as usize).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(d[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| d[1] != 0) {
+        if !unordered {
+            d[3] = 0;
+        }
+        d[start + used..10].fill(0);
+    }
+    Some(d)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1660,7 +1693,7 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1671,7 +1704,7 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1994,6 +2027,47 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// Two placed views alike but for the words their kind does not use
+    /// (the padding after the component mapping, the union's unused tail)
+    /// are one record; a used word still tells them apart.
+    #[test]
+    fn placed_views_ignore_unused_view_words() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let resource = [1, 0, 0, 0, 0x4000, 0, 1, 0x10001, 0, 1, 0, 1, 0, 0];
+        // A structured buffer view: words 4-5 first element, 6 count, 7
+        // stride, 8 flags; 3 and 9 are not used.
+        let srv = [0, 1, 0x1688, 0, 16, 0, 64, 16, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        // An unordered buffer view: words 2-3 first element, 4 count, 5
+        // stride, 6-7 counter offset, 8 flags; 9 is not used.
+        let uav = [0, 1, 16, 0, 64, 16, 0, 0, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        for (unordered, create, desc, unused, used) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _), srv, [3usize, 9], 6usize),
+            (true, create_placed_uav, uav, [9, 9], 4),
+        ] {
+            create(null, &resource, &desc, handle);
+            let first = slot;
+            assert_eq!(view(handle), Some(View::Placed(unordered, resource, desc)));
+            let mut noisy = desc;
+            for w in unused {
+                noisy[w] = 0xdead_beef;
+            }
+            create(null, &resource, &noisy, handle);
+            assert_eq!(slot, first, "unused words left out");
+            let mut other = desc;
+            other[used] += 1;
+            create(null, &resource, &other, handle);
+            assert_ne!(slot, first, "a used word counts");
+        }
+        // A 2D texture view uses four words of the union (4-7): 8 and 9 go.
+        let mut tex = [28, 4, 0x1688, 0x77, 0, 1, 0, 0, 0x55, 0x66, 0x2000, 0x6, 0, 0, 0, 0];
+        create_placed_srv(null, &resource, &tex, handle);
+        tex[3] = 0;
+        (tex[8], tex[9]) = (0, 0);
+        assert_eq!(view(handle), Some(View::Placed(false, resource, tex)));
     }
 
     #[test]

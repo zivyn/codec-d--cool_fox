@@ -1742,11 +1742,25 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// The bytes of a title texture's memory, and whether all of it is mapped,
 /// if the texture has been staged for upload.
 /// (Whether it is mapped is asked only if `ask`; else it counts as mapped.)
+/// Only of a texture at an address the title mapped
+/// ([`crate::resource::at_title_address`]): the memory of any other is all
+/// there while it lives. The pass over textures picked by index asked it of
+/// every texture object it took, 20,000-57,000 every 5 seconds, most of them
+/// read through tables (a question per 256 pages: 18-111 us for 1-16 MB,
+/// milliseconds when the pages had left the working set, and each such page
+/// read back into it), for 66 found not all there in a whole run
+/// (coolfox-20261126-223059); the pass's unattributed time went with their
+/// count, 13 us each. `VICTORY_STAGED_ASK_ALL=1`: asked of every texture,
+/// as before.
 pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let s = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
+    let ask = ask
+        && (*ALL.get_or_init(|| std::env::var_os("VICTORY_STAGED_ASK_ALL").is_some_and(|v| v == "1"))
+            || crate::resource::at_title_address(resource));
     Some((s.read as u64, !ask || committed(s.memory, s.read)))
 }
 

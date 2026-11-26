@@ -898,3 +898,38 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
     }
     eprintln!("ran on the hardware device: both console waves' loops, as the console runs them");
 }
+
+/// Which LDS accesses need the host waves of their console wave to meet
+/// ([`lower::LdsOrder`]): before a barrier a lane writes its dword and reads it back (the
+/// order counts); after it the lanes read and add with atomics only (it does not: a read
+/// there may see another lane's atomic, so it is not taken as alike in every lane).
+#[test]
+fn lds_accesses_after_the_last_plain_write_need_no_meeting() {
+    let words = [
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0xD834_0000,
+        0x0000_0001, // ds_write_b32 v1, v0
+        0xD8D8_0000,
+        0x0400_0001, // ds_read_b32 v4, v1
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBF8A_0000, // s_barrier
+        0xD8D8_0000,
+        0x0500_0001, // ds_read_b32 v5, v1
+        0xD800_0000,
+        0x0000_0001, // ds_add_u32 v1, v0
+    ];
+    let mut native = native_of(&words, true, 128);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15;
+    }
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let order = lower::lds_order(&p, &st);
+    let name = |&(b, i): &(usize, usize)| (p.blocks[b].insts[i].name(), p.blocks[b].insts[i].machine.offset);
+    let mut unordered: Vec<_> = order.unordered.iter().map(name).collect();
+    unordered.sort_unstable_by_key(|x| x.1);
+    let unstable: Vec<_> = order.unstable.iter().map(name).collect();
+    assert_eq!(unordered.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32", "ds_add_u32"]);
+    assert_eq!(unstable.iter().map(|x| x.0).collect::<Vec<_>>(), ["ds_read_b32"]);
+    assert!(unordered[0].1 > 0x10, "the read after the barrier");
+}

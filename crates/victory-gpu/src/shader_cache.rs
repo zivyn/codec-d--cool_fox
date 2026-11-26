@@ -121,10 +121,51 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
-    match CACHE.get() {
+    let shader = match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
+    }?;
+    #[cfg(feature = "diagnostics")]
+    let shader = paired_override(container, shader);
+    Ok(shader)
+}
+
+/// Try cache entries made by the paired-wave translator for the 32-lane,
+/// one-million-descriptor host. The normal translation remains our source
+/// of binding metadata and remains in the translation cache.
+#[cfg(feature = "diagnostics")]
+fn paired_override(container: &[u8], mut shader: HostShader) -> HostShader {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("VICTORY_PAIRED_SHADER_DIR").map(PathBuf::from)) else {
+        return shader;
+    };
+    if shader.stage != HwStage::Cs || victory_shader::emit::host_settings() != [32, 999_999, 0, 0] {
+        return shader;
     }
+    let digest = blake3::hash(container).to_hex();
+    let hash = &digest[..16];
+    let path = dir.join(format!("{hash}.vsh"));
+    let mut bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return shader,
+        Err(e) => {
+            tracing::warn!(hash, error = %e, "could not read paired shader");
+            return shader;
+        }
+    };
+    // Paired VSH1 entries predate the half-view list. These programs have
+    // none. The equality check includes the list on our side.
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    if let Some(mut paired) = decode(&bytes) {
+        let dxil = std::mem::replace(&mut paired.dxil, shader.dxil.clone());
+        if paired == shader && dxil.starts_with(b"DXBC") {
+            shader.dxil = dxil;
+            tracing::info!(hash, "using paired Wave32 bytecode with matching shader bindings");
+            return shader;
+        }
+    }
+    tracing::warn!(hash, "paired shader entry did not match the translated shader bindings");
+    shader
 }
 
 /// The cache entry's converter: the build and the container in, the

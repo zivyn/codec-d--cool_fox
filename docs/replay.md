@@ -53,8 +53,8 @@ and gaps. With `--timing detailed`, each command: sums by kind and the
 costliest pipelines with the names the runtime logs and their DXIL hashes
 (blake3). A command's time is from the end of the one before to its own end:
 draws overlap, so it is a share of the list, not a cost alone; the extra
-timestamps cost a little too. The picture goes to `replay.png` and is compared
-with the presented one.
+timestamps cost a little too. The picture goes to `replay.png` (or `--image`; with `--compare` the unchanged run's
+beside it as `<name>-unchanged.png`) and is compared with the presented one.
 
 | switch | does |
 |---|---|
@@ -72,7 +72,7 @@ with the presented one.
 | `--no-merge` | copies of what the CPU wrote also overwrite the card's own results (below) |
 | `--skip-shader <text>` | leaves out what runs pipelines with the text in their name or DXIL hash (repeatable) |
 | `--shaders <folder>` | takes shaders from the folder where it has them: `<hash>.dxil`, by the hash the runtime names the title's shader by (a pass of ours: its own DXIL hash); with `--compare --shaders-b <folder>` a second set, turn by turn with the first |
-| `--retranslate <folder>` | only writes that folder: the capture's shaders translated by this build with the `VICTORY_*` switches of this run (`--view-limit`, `--raw-views`: the view heap's null slot and where raw views start, as the capture's shaders have them) |
+| `--retranslate <folder>` | only writes that folder: the capture's shaders translated by this build with the `VICTORY_*` switches of this run, and as the runtime tells the translator on this PC's card (wave lanes, AMD or not, the view heaps it makes: printed first). `--host-wave`, `--host-rdna`, `--view-limit`, `--raw-views` force them. The host layer's own passes (clamps, hash passes) are not retranslated: they replay as recorded |
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from (of a capture that does not fit in the card's memory with them) |
 | `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
 | `--awake` | keeps the card's clocks up (`VICTORY_CARD_AWAKE=1`) |
@@ -160,5 +160,6 @@ The `--diverge` family runs the recorded copies without the merge.
   times.
 
 Tests: `cargo test -p victory-gpu --features diagnostics` (`tests/replay.rs`
-runs a small program and compares every byte; `VICTORY_TEST_D3D_DEBUG=1` adds
+runs a small program and compares every byte; `VICTORY_TEST_KEEP=<folder>` keeps
+its capture there, a small one to try the replay on; `VICTORY_TEST_D3D_DEBUG=1` adds
 the debug layer) and `tests/replay_big.rs` (`--ignored`).

@@ -333,6 +333,60 @@ pub fn find(folder: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("no capture (frame.bin) in {}", folder.display()))
 }
 
+/// What the translator is told about the host before it translates, as the
+/// runtime tells it when it makes its device.
+#[derive(Clone, Debug)]
+pub struct HostTranslation {
+    pub adapter: String,
+    pub max_wave: u32,
+    pub rdna: bool,
+    /// The null slot of the view heap (`set_view_heap_limit`).
+    pub view_limit: u32,
+    /// Where raw twins of views start (`set_raw_views`; 0: none).
+    pub raw_views: u32,
+}
+
+/// The settings the runtime would translate with on this PC's adapter of the
+/// capture's kind (the one `Player::load` uses), found as the host layer
+/// finds them: wave lanes, vendor, and the view heaps the card makes.
+pub fn host_translation(folder: &Path) -> Result<HostTranslation> {
+    let frame = Frame::read(&find(folder)?.join("frame.bin"))?;
+    let (device, _) = make_device(&frame, false, false)?;
+    let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: a query into a structure of its size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut o1).cast(),
+            size_of_val(&o1) as u32,
+        )?;
+    }
+    let rdna = crate::indirect::amd(&device) && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64;
+    let (views, raw_views) = crate::descriptor::host::pick_views(|n| {
+        crate::descriptor::host::view_heap_fits(&device, n)
+    });
+    let adapter = {
+        // SAFETY: plain queries.
+        unsafe {
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+                .and_then(|a| a.GetDesc1())
+                .map(|d| {
+                    let end = d.Description.iter().position(|&c| c == 0).unwrap_or(d.Description.len());
+                    String::from_utf16_lossy(&d.Description[..end])
+                })
+                .unwrap_or_default()
+        }
+    };
+    Ok(HostTranslation {
+        adapter,
+        max_wave: o1.WaveLaneCountMax,
+        rdna,
+        view_limit: views - 1,
+        raw_views,
+    })
+}
+
 /// The stage and hash by which the runtime names each of the title's shaders
 /// in a capture.
 pub fn title_shaders(folder: &Path) -> Result<std::collections::BTreeSet<(String, String)>> {
@@ -457,7 +511,15 @@ pub fn replay(folder: &Path, options: &Options) -> Result<Vec<(String, Report)>>
     let mut out = Vec::new();
     if options.compare && (options.edited() || options.shaders_b.is_some()) {
         // Turn by turn: what else the machine does falls on both.
-        let image = Some(player.folder.join("replay-unchanged.png"));
+        // Beside the picture asked for, so replays of one capture at the same
+        // time (several branches) do not write the same file.
+        let image = Some(match &options.image {
+            Some(path) => path.with_file_name(format!(
+                "{}-unchanged.png",
+                path.file_stem().map_or("replay".into(), |s| s.to_string_lossy())
+            )),
+            None => player.folder.join("replay-unchanged.png"),
+        });
         let plain = Options {
             image,
             ..options.plain()

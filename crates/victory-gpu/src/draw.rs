@@ -113,7 +113,7 @@ impl TableGroup {
 }
 
 /// A root argument as the title set it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 enum Root {
     #[default]
     None,
@@ -125,7 +125,7 @@ enum Root {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct VertexView {
     address: u64,
     size: u32,
@@ -133,7 +133,7 @@ pub(crate) struct VertexView {
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct IndexView {
     address: u64,
     size: u32,
@@ -558,6 +558,8 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// See [`State::rebinds`].
+    rebinds: [u64; 2],
 }
 
 impl Drop for State {
@@ -972,13 +974,20 @@ macro_rules! once {
     }};
 }
 
-fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
+/// Sets root argument `slot`: whether that changed it.
+fn set(roots: &mut Vec<Root>, slot: u32, root: Root) -> bool {
     let slot = slot as usize;
     if roots.len() <= slot {
         roots.resize(slot + 1, Root::None);
     }
+    let changed = roots[slot] != root;
     roots[slot] = root;
+    changed
 }
+
+/// [`State::rebinds`]'s counts: of root constants, of the rest.
+const CONSTANTS: usize = 0;
+const OTHERS: usize = 1;
 
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
@@ -1168,17 +1177,33 @@ impl State {
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
+        self.rebound(OTHERS, self.pipeline != pipeline as usize);
         self.pipeline = pipeline as usize;
     }
 
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
-        self.heaps = [0; 2];
+        let was = std::mem::take(&mut self.heaps);
         for &h in heaps {
             if !h.is_null() {
                 let samplers = crate::descriptor::heap(h).samplers();
                 self.heaps[usize::from(samplers)] = h as usize;
             }
         }
+        self.rebound(OTHERS, was != self.heaps);
+    }
+
+    /// The title changed (`changed`) what the next draw or dispatch binds:
+    /// root constants ([`CONSTANTS`]) or the rest ([`OTHERS`]).
+    fn rebound(&mut self, what: usize, changed: bool) {
+        self.rebinds[what] += u64::from(changed);
+    }
+
+    /// The times the title changed what the next draw or dispatch binds:
+    /// root constants, and the rest (pipeline, heaps, tables, root views,
+    /// vertex and index buffers). Setting what is set changes nothing
+    /// ([`crate::indirect::merge`]).
+    pub(crate) fn rebinds(&self) -> [u64; 2] {
+        self.rebinds
     }
 
     fn roots(&mut self, compute: bool) -> &mut Vec<Root> {
@@ -1190,44 +1215,58 @@ impl State {
     }
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
-        set(self.roots(compute), slot, Root::Table(handle));
+        let changed = set(self.roots(compute), slot, Root::Table(handle));
+        self.rebound(OTHERS, changed);
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
-        set(self.roots(compute), slot, Root::View(address));
+        let changed = set(self.roots(compute), slot, Root::View(address));
+        self.rebound(OTHERS, changed);
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
         let roots = self.roots(compute);
         let s = slot as usize;
+        let mut changed = false;
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
-            set(roots, slot, Root::Constants(Vec::new()));
+            changed = set(roots, slot, Root::Constants(Vec::new()));
         }
         if let Root::Constants(c) = &mut roots[s] {
             let end = offset as usize + values.len();
             if c.len() < end {
                 c.resize(end, 0);
+                changed = true;
             }
+            changed |= c[offset as usize..end] != *values;
             c[offset as usize..end].copy_from_slice(values);
         }
+        self.rebound(CONSTANTS, changed);
     }
 
     pub(crate) fn set_vertex_buffers(&mut self, start: u32, views: &[VertexView]) {
+        let mut changed = false;
         for (i, v) in views.iter().enumerate() {
             if let Some(slot) = self.vertex.get_mut(start as usize + i) {
+                changed |= *slot != *v;
                 *slot = *v;
             }
         }
+        self.rebound(OTHERS, changed);
     }
 
     pub(crate) fn clear_vertex_buffers(&mut self, start: u32, count: u32) {
+        let mut changed = false;
         for slot in self.vertex.iter_mut().skip(start as usize).take(count as usize) {
+            changed |= *slot != VertexView::default();
             *slot = VertexView::default();
         }
+        self.rebound(OTHERS, changed);
     }
 
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
-        self.index = view.copied().unwrap_or_default();
+        let index = view.copied().unwrap_or_default();
+        self.rebound(OTHERS, self.index != index);
+        self.index = index;
     }
 
     /// Render targets and depth, set on the host list at once, unless it has
@@ -4507,7 +4546,9 @@ impl State {
     }
 
     /// Where the clamped record of `kind` at `arguments` of the copy `args`
-    /// is, from the open batch or a new one ([`batches`]). `None` if it
+    /// is, from the open batch or a new one ([`batches`]): the scratch
+    /// buffer, the offset, the step between records there (a slot), and
+    /// whether the pass of a new batch was recorded for it. `None` if it
     /// cannot be clamped in one.
     fn batched(
         &mut self,
@@ -4515,7 +4556,8 @@ impl State {
         args: &std::sync::Arc<crate::shadow::Shadow>,
         arguments: u64,
         kind: u32,
-    ) -> Option<(ID3D12Resource, u64)> {
+    ) -> Option<(ID3D12Resource, u64, u32, bool)> {
+        const SLOT: u32 = crate::indirect::batch::SLOT;
         const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
         // Another host list, or this one after its reset ([`windows`]).
@@ -4530,15 +4572,17 @@ impl State {
         if let Some(b) = &mut self.batch
             && let Some(at) = b.table.place(id, offset, kind)
         {
-            return Some((b.scratch.clone(), at));
+            return Some((b.scratch.clone(), at, SLOT, false));
         }
         self.batch = None;
+        // What is held back runs before the new batch's pass.
+        unsettle_indirect(list);
         let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
-        Some((scratch, at))
+        Some((scratch, at, SLOT, true))
     }
 
     /// Indirect execution of a one-argument signature of `kind` (PC
@@ -4664,8 +4708,10 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base));
-        let (bounded, at) = match batch.or(hit) {
+            .map(|w| (w.scratch.clone(), offset - w.base, w.step, false));
+        // The scratch buffer, the record's offset there, the step to the
+        // next record there, and whether a clamp pass was recorded for it.
+        let (bounded, at, step, clamped) = match batch.or(hit) {
             Some(hit) => hit,
             None => {
                 // A record a short step after the last window's last one
@@ -4695,7 +4741,8 @@ impl State {
                 }
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
-                // buffer at offset 0.
+                // buffer at offset 0. What is held back runs before it.
+                unsettle_indirect(list);
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
@@ -4720,43 +4767,108 @@ impl State {
                     records,
                     scratch: bounded.clone(),
                 });
-                (bounded, 0)
+                (bounded, 0, step, true)
             }
         };
-        let ran = match kind {
-            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
-            MESH => self.prepare_for(list, false, true),
-            DISPATCH => self.bind(list, p, true),
-            _ => false,
+        // Joined to the run before it, or weighed for the frame line
+        // (`crate::indirect::merge`).
+        use crate::indirect::merge;
+        let call = merge::Call {
+            calls: list.title_calls(),
+            rebinds: self.rebinds(),
+            kind,
+            pipeline: p.pso.as_raw() as usize,
+            single: max == 1 && count.is_none(),
+            alone: crate::pipeline::is_builder(self.pipeline as This) || kind == MESH && mesh_test() == 2,
+            clamped,
+            epoch: list.epoch(),
+            buffer: bounded.as_raw() as usize,
+            at,
+            step,
         };
-        if !ran {
-            why("prepare failed");
-            return false;
+        let joining = merge::on();
+        let verdict;
+        let joined = {
+            let mut run = list.indirect_run();
+            verdict = merge::verdict(run.as_ref().map(|(r, _)| r), &call);
+            // One record more for the execution held back, recorded with a
+            // signature of the run's step; this one's binding would be the
+            // same as the run's.
+            let joined = verdict == merge::Verdict::Joins
+                && joining
+                && match run.as_mut() {
+                    Some((r, Some(held))) => match host_signature(kind, r.step) {
+                        Some(signature) => {
+                            held.signature = signature;
+                            r.join(&call, call.epoch);
+                            true
+                        }
+                        None => false,
+                    },
+                    _ => false,
+                };
+            if !joined {
+                // What is held back runs before this binding; a binding
+                // that fails halfway leaves the list as no run's.
+                list.record_held(&mut run);
+                if let Some((r, _)) = run.as_mut() {
+                    r.settled = false;
+                }
+            }
+            joined
+        };
+        merge::count(verdict, joined);
+        if !joined {
+            let ran = match kind {
+                DRAW | INDEXED => self.prepare(list, kind == INDEXED),
+                MESH => self.prepare_for(list, false, true),
+                DISPATCH => self.bind(list, p, true),
+                _ => false,
+            };
+            if !ran {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+            });
+            let epoch = list.epoch();
+            if joining && call.single && !call.alone {
+                // Held back for the next ones to join.
+                *list.indirect_run() = Some((
+                    merge::Run::of(&call, epoch),
+                    Some(merge::Held { signature: signature.clone(), buffer: bounded.clone() }),
+                ));
+                list.hold_indirect();
+            } else {
+                if kind == MESH {
+                    self.mesh_scissor(list, true);
+                }
+                // SAFETY: an open list with everything set; the scratch buffer and
+                // host copies are kept alive by the list, and the signature is cached.
+                unsafe {
+                    list.list.ExecuteIndirect(
+                        &signature,
+                        max,
+                        &bounded,
+                        at,
+                        counter.as_ref().map(|(s, _)| &s.buffer),
+                        counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    )
+                };
+                if kind == MESH {
+                    self.mesh_scissor(list, false);
+                }
+                let mut run = list.indirect_run();
+                match run.as_mut() {
+                    Some((r, _)) if verdict == merge::Verdict::Joins => r.join(&call, epoch),
+                    _ => *run = Some((merge::Run::of(&call, epoch), None)),
+                }
+            }
         }
-        #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
-        });
         #[cfg(feature = "diagnostics")]
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
-        if kind == MESH {
-            self.mesh_scissor(list, true);
-        }
-        // SAFETY: an open list with everything set; the scratch buffer and
-        // host copies are kept alive by the list, and the signature is cached.
-        unsafe {
-            list.list.ExecuteIndirect(
-                &signature,
-                max,
-                &bounded,
-                at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
-            )
-        };
-        if kind == MESH {
-            self.mesh_scissor(list, false);
-        }
         if kind == DISPATCH {
             self.buffers_written();
         } else {
@@ -4771,6 +4883,17 @@ impl State {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// Before something is recorded into `list` for an indirect execution (a
+/// clamp pass, a binding): the execution held back is recorded first, and
+/// the list's run is no longer one the next execution can join without
+/// binding again ([`crate::indirect::merge`]).
+fn unsettle_indirect(list: &HostList) {
+    list.flush_indirect();
+    if let Some((run, _)) = list.indirect_run().as_mut() {
+        run.settled = false;
     }
 }
 

@@ -41,6 +41,7 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 pub(crate) mod batch;
+pub(crate) mod merge;
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
@@ -3262,6 +3263,101 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         }
     }
 
+    /// Runs of executions joined ([`merge`]): a run held back is recorded
+    /// by the next title call before anything else, and by the list's close
+    /// at the latest, as one execution of its records a batch's slots apart
+    /// with a signature of that stride; each record runs once. With the
+    /// debug layer on, nothing recorded is invalid.
+    #[test]
+    fn host_list_records_held_runs() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let one = one_argument(&host.device, 2, 12);
+        let joined = one_argument(&host.device, 2, batch::SLOT);
+        let Some((source, ptr)) = host.shared_buffer(1024) else {
+            return;
+        };
+        // Dispatch records 32 bytes apart, of 1 to 8 groups.
+        for i in 0..8u32 {
+            for (w, word) in [i + 1, 1, 1].into_iter().enumerate() {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i as usize * 8 + w).write_volatile(word) };
+            }
+        }
+        let Some((hits_buf, hits_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: a live buffer; the mapping holds 256 bytes and nothing runs.
+        let hits_gpu = unsafe {
+            std::ptr::write_bytes(hits_ptr, 0, 256);
+            hits_buf.GetGPUVirtualAddress()
+        };
+        let (mut table, scratch) = open_batch(&list, (1, &source), &[(1, source.clone())]).unwrap();
+        // SAFETY: an open list; the worker's root signature and pipeline;
+        // buffers the test holds until the list has run.
+        unsafe {
+            list.list.SetComputeRootSignature(&worker.root);
+            list.list.SetPipelineState(&worker.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+        }
+        let call = |calls, at| merge::Call {
+            calls,
+            rebinds: [0; 2],
+            kind: 2,
+            pipeline: 1,
+            single: true,
+            alone: false,
+            clamped: false,
+            epoch: 0,
+            buffer: scratch.as_raw() as usize,
+            at,
+            step: batch::SLOT,
+        };
+        // Records 0 to 2 held as one run, then 3 and 4.
+        for records in [0..3u64, 3..5] {
+            let calls = list.title_calls();
+            for r in records.clone() {
+                let at = table.place(1, r * 32, 2).unwrap();
+                let mut run = list.indirect_run();
+                if r == records.start {
+                    *run = Some((
+                        merge::Run::of(&call(calls, at), 0),
+                        Some(merge::Held { signature: one.clone(), buffer: scratch.clone() }),
+                    ));
+                    drop(run);
+                    list.hold_indirect();
+                    continue;
+                }
+                let Some((held_run, Some(held))) = run.as_mut() else {
+                    panic!("the run is held");
+                };
+                assert_eq!(merge::verdict(Some(held_run), &call(calls, at)), merge::Verdict::Joins);
+                held_run.join(&call(calls, at), 0);
+                held.signature = joined.clone();
+            }
+            if records.start == 0 {
+                list.title_call();
+                assert_eq!(list.title_calls(), calls + 1);
+                assert!(list.indirect_run().as_ref().is_some_and(|(r, held)| r.records == 3 && held.is_none()));
+            }
+        }
+        list.close();
+        assert!(list.indirect_run().as_ref().is_some_and(|(r, held)| r.records == 2 && held.is_none()));
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        assert!(list.indirect_run().is_none());
+        // SAFETY: the list has run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 1 + 2 + 3 + 4 + 5, "every record of both runs runs once");
+    }
+
     /// What clamps of a frame cost on the card one by one and in batches
     /// (ignored: a measurement): 2,355 executions of an empty dispatch, in
     /// 49 lists' worth of runs, as in the captured frame.
@@ -3406,6 +3502,12 @@ void work() {
         /// The same between two waits for every earlier shader write, as
         /// the clamp records them.
         ComputeWithWaits,
+        /// Nothing, and each draw an indirect execution of one record (the
+        /// records a batch's slots apart, as the layer runs the title's).
+        Indirect,
+        /// The same records in one indirect execution of them all
+        /// (`super::merge`'s joining).
+        Joined,
     }
 
     struct Rig {
@@ -3432,6 +3534,10 @@ void work() {
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
+        /// [`DRAWS`] draw records of one triangle, [`super::batch::SLOT`]
+        /// bytes apart, and a draw signature of that stride.
+        records: ID3D12Resource,
+        signature: ID3D12CommandSignature,
         card: String,
     }
 
@@ -3656,6 +3762,41 @@ void work() {
                     D3D12_RESOURCE_FLAG_NONE,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 );
+                let slot = super::batch::SLOT;
+                let records = buffer(
+                    &device,
+                    u64::from(DRAWS) * u64::from(slot),
+                    D3D12_HEAP_TYPE_UPLOAD,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_GENERIC_READ,
+                );
+                let mut data = std::ptr::null_mut();
+                records.Map(0, None, Some(&mut data)).ok()?;
+                for i in 0..DRAWS as usize {
+                    // Three vertices, one instance, from 0.
+                    for (w, word) in [3u32, 1, 0, 0].into_iter().enumerate() {
+                        data.cast::<u32>().add(i * slot as usize / 4 + w).write(word);
+                    }
+                }
+                records.Unmap(0, None);
+                let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                    ..Default::default()
+                };
+                let mut signature: Option<ID3D12CommandSignature> = None;
+                device
+                    .CreateCommandSignature(
+                        &D3D12_COMMAND_SIGNATURE_DESC {
+                            ByteStride: slot,
+                            NumArgumentDescs: 1,
+                            pArgumentDescs: &argument,
+                            NodeMask: 0,
+                        },
+                        None::<&ID3D12RootSignature>,
+                        &mut signature,
+                    )
+                    .ok()?;
+                let signature = signature?;
                 let mut stamps: Option<ID3D12QueryHeap> = None;
                 device
                     .CreateQueryHeap(
@@ -3740,6 +3881,8 @@ void work() {
                     depth_tested,
                     stamps,
                     back,
+                    records,
+                    signature,
                     card,
                 };
                 rig.finish();
@@ -3853,9 +3996,20 @@ void work() {
                                 }
                                 l.SetPipelineState(&self.pipelines[0]);
                             }
+                            Between::Indirect | Between::Joined => {}
                         }
-                        l.DrawInstanced(3, 1, 0, 0);
+                        match between {
+                            Between::Indirect => {
+                                let at = u64::from(drawn % DRAWS) * u64::from(super::batch::SLOT);
+                                l.ExecuteIndirect(&self.signature, 1, &self.records, at, None, 0);
+                            }
+                            Between::Joined => {}
+                            _ => l.DrawInstanced(3, 1, 0, 0),
+                        }
                         drawn += 1;
+                    }
+                    if between == Between::Joined {
+                        l.ExecuteIndirect(&self.signature, DRAWS / lists, &self.records, 0, None, 0);
                     }
                     if part + 1 < lists {
                         // The next list of the batch: this one is sent on
@@ -3910,6 +4064,8 @@ void work() {
             ("(g) nothing changes, in 100 lists run one by one", Between::Nothing, 100),
             ("(h) a compute pass of ours of one group before every draw", Between::Compute, 1),
             ("(i) the same pass between two waits for earlier shader writes", Between::ComputeWithWaits, 1),
+            ("(j) nothing changes, each draw an indirect execution of one record", Between::Indirect, 1),
+            ("(k) the same records in one indirect execution of them all", Between::Joined, 1),
         ];
         let mut least = Vec::new();
         for (name, between, lists) in variants {

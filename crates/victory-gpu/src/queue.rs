@@ -162,7 +162,7 @@ fn submit_cut(this: This, lists: &[This]) {
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
         let (taken, order) = crate::list::detach(&lists[..first]);
-        host.execute_late(taken, order);
+        crate::host::two_queues::for_title(Some(queue(this).kind), 0, || host.execute_late(taken, order));
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
             .iter()
@@ -383,7 +383,7 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            crate::host::two_queues::for_title(kind_of(q), 0, || host.execute_late(lists, order));
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
@@ -499,6 +499,8 @@ pub(crate) extern "system" fn create(
         return E_INVALIDARG;
     };
     tracing::debug!(?desc, "command queue");
+    #[cfg(windows)]
+    let kind = desc.kind;
     let queue = Box::new(Queue {
         object: if crate::device::newer() {
             Object::new(&NEWER_FUNCTIONS)
@@ -510,7 +512,29 @@ pub(crate) extern "system" fn create(
         #[cfg(windows)]
         held: Default::default(),
     });
-    object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out)
+    let made = object::hand_out(QUEUE, queue, iid, &QUEUE_IIDS, out);
+    #[cfg(windows)]
+    if made == S_OK
+        // SAFETY: the out pointer was written.
+        && let Some(&queue_at) = unsafe { out.as_ref() }
+    {
+        let mut kinds = lock(&KINDS);
+        kinds.retain(|k| k.0 != queue_at as usize);
+        kinds.push((queue_at as usize, kind));
+    }
+    made
+}
+
+/// The title's queues (their addresses) and their list types, for what is
+/// done with a queue's submission later, on another thread, when the
+/// queue may have been let go ([`kind_of`]).
+#[cfg(windows)]
+static KINDS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The list type of the title's queue at `queue`, if it is one.
+#[cfg(windows)]
+pub(crate) fn kind_of(queue: usize) -> Option<u32> {
+    lock(&KINDS).iter().find(|k| k.0 == queue).map(|k| k.1)
 }
 
 /// The console's queue description: an engine or pipe and a queue on it
@@ -559,6 +583,7 @@ extern "system" fn release(this: This) -> u32 {
     #[cfg(windows)]
     if left == 0 {
         lock(&WAITING).retain(|&q| q != this as usize);
+        lock(&KINDS).retain(|k| k.0 != this as usize);
     }
     left
 }

@@ -3240,6 +3240,38 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> Option<bool> {
     None
 }
 
+/// The number of the flight in the air whose bottom-of-pipe write meets
+/// `wait` ([`late_met_known`]), for `two_queues`: the part behind the wait
+/// goes to the card behind that flight, on the one queue; on a queue of its
+/// own it would have to wait for it. `None`: memory meets it now, the
+/// flight is being landed (the card has run it), or no flight's write does.
+pub(crate) fn late_met_by(wait: &crate::list::ValueWait) -> Option<u64> {
+    if !late() || wait.met() {
+        return None;
+    }
+    let (address, bytes) = wait.place();
+    let line = line();
+    let mut flight = None;
+    for item in &line.line {
+        match item {
+            Late::Run(f) => flight = Some(f.number),
+            Late::Write(at, crate::queue::Written::Value(v), n) if *at == address && *n >= bytes && wait.holds_for(*v) => {
+                return flight;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Tiles were mapped on `queue`: counted for `two_queues` if it is the
+/// host's direct queue.
+pub(crate) fn tiles_mapped_on(queue: &ID3D12CommandQueue) {
+    if two_queues::on() && host().is_some_and(|h| h.queue.as_raw() == queue.as_raw()) {
+        two_queues::tiles_mapped();
+    }
+}
+
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {
@@ -3710,6 +3742,7 @@ pub(crate) mod spans;
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
+pub(crate) mod two_queues;
 pub(crate) mod upcheck;
 #[cfg(feature = "diagnostics")]
 mod stamps;
@@ -5546,6 +5579,9 @@ impl Host {
             None => runs,
         };
         let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
+        // The plan for two queues: the textures' states before the preludes
+        // move them.
+        let probe = two_queues::on().then(|| two_queues::probe(runs));
         stage.next("submit: the sweep");
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
@@ -5692,6 +5728,10 @@ impl Host {
         }
         let declared = declared_writes(runs);
         let card = self.card_before(&declared, &picked, flown);
+        if let Some(probe) = probe {
+            let finished = FINISHED.load(Ordering::Acquire);
+            two_queues::place(probe, this_submission, card.is_some(), own.is_some(), runs.len(), finished);
+        }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -5742,7 +5782,7 @@ impl Host {
             };
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp);
+            crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
             self.card_sent();
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
@@ -5797,7 +5837,7 @@ impl Host {
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
-                crate::timeline::sent(sending, *submitted, stamp);
+                crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
                 match waited {
                     Ok(()) => {
                         working(false);
@@ -8820,6 +8860,7 @@ impl Meter {
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
+        two_queues::line(frames);
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);

@@ -291,12 +291,18 @@ pub(super) fn kernel(name: &'static str, bytes: u64, t0: u64) {
 }
 
 /// Lists went to the card between `t0` ([`ticks`]) and now, the value
-/// `fence` signalled behind them, with the timestamps at `stamp`.
-pub(crate) fn sent(t0: u64, fence: u64, stamp: Option<usize>) {
+/// `fence` signalled behind them, with the timestamps at `stamp`;
+/// `compute`: a submission of a compute queue of the title's ([`COMPUTE`]).
+pub(crate) fn sent(t0: u64, fence: u64, stamp: Option<usize>, compute: bool) {
     if on() {
-        put(Kind::Sent, "ExecuteCommandLists", (t0, ticks()), fence, stamp.map_or(0, |s| s as u64 + 1), 0);
+        let b = stamp.map_or(0, |s| s as u64 + 1) | if compute { COMPUTE } else { 0 };
+        put(Kind::Sent, "ExecuteCommandLists", (t0, ticks()), fence, b, 0);
     }
 }
+
+/// The bit of a sent event's second word (the timestamps' place plus one)
+/// that says it was a submission of a compute queue of the title's.
+pub(super) const COMPUTE: u64 = 1 << 63;
 
 /// `value` is being stored at `at`, where the title looks for it.
 #[inline(always)]

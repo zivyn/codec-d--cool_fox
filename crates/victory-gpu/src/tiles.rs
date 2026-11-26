@@ -569,6 +569,7 @@ impl Tiled {
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            crate::host::tiles_mapped_on(queue);
             match level {
                 Some(level) => given.levels[level] = true,
                 None => given.packed = true,

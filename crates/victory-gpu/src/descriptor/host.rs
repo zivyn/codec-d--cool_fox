@@ -1508,16 +1508,13 @@ pub(crate) fn pick_views(fits: impl Fn(u32) -> bool) -> (u32, u32) {
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a host heap capped at [`PORTABLE_VIEWS`] (NVIDIA),
-/// which come out of the title's slots: 196,608 (192 Ki) leave 803,391 of
-/// them. The title wrote view records up to slot 741,277 with 2^18 dynamic
-/// slots and up to 774,045 with 229,376 (the highest varies from run to run;
-/// the title copies records as bytes, and a shader that picks one by an
-/// index it computes read a null view past the host's title slots: about
-/// 3,400 records past 770,623). The dynamic slots in use peak at about
-/// 150,000, so 196,608 leaves some 29,000 slots over the highest title slot
-/// seen and some 46,000 over that peak. The peak taken is logged
-/// (`HostHeap::dynamic`). `VICTORY_DYNAMIC_SLOTS` sets it.
-const CAPPED_DYNAMIC: u32 = 196_608;
+/// which come out of the title's slots: 254,976 leave 745,023 of them, where
+/// 2^18 left 737,855 and the title wrote view records up to slot 741,277
+/// (the title copies records as bytes, and a shader that picks one by an
+/// index it computes read a null view past the host's title slots; two runs
+/// of the opening, five records). 2.7 % fewer dynamic slots than 2^18; the
+/// peak taken is logged (`HostHeap::dynamic`). `VICTORY_DYNAMIC_SLOTS` sets it.
+const CAPPED_DYNAMIC: u32 = 254_976;
 
 /// How many dynamic slots a heap of `count` title slots whose null slot is
 /// `null` (0: none) has. On a capped host heap ([`CAPPED_DYNAMIC`]) the
@@ -5016,9 +5013,9 @@ mod tests {
             assert_eq!(heap.count + heap.dynamic, null);
             assert!(heap.count < title);
             if null == PORTABLE_VIEWS - 1 && std::env::var_os("VICTORY_DYNAMIC_SLOTS").is_none() {
-                // Slot 774,045 is the highest the title wrote past 229,376 dynamic slots.
+                // Slot 741,277 is the highest the title wrote past 2^18 dynamic slots.
                 assert_eq!(heap.dynamic, CAPPED_DYNAMIC);
-                assert!(heap.count >= 803_000);
+                assert!(heap.count >= 745_000);
             }
         }
     }

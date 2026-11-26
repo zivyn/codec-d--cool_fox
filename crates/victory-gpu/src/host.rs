@@ -9202,7 +9202,8 @@ impl Meter {
                          slot, {} taking the slots due, {} making slots due, {} noting a slot's record, {} by table reads, {} for \
                          stale views, {} else); waited for {} ms ({}, {}, {}, {}, {}, {}, {} ms by the same places); held {} ms \
                          taking the slots due, {} ms making slots due, {} ms for stale views; not taken {} times, as nothing would \
-                         have changed ({} noting a slot's record, {} by table reads, {} for stale views)",
+                         have changed ({} noting a slot's record, {} by table reads, {} for stale views); since the start, {} slots \
+                         taken out by a table read after the first of their frame (VICTORY_TABLED_REREAD=1)",
                         taken.iter().sum::<u64>(),
                         taken[0],
                         taken[1],
@@ -9226,6 +9227,7 @@ impl Meter {
                         skipped[3],
                         skipped[4],
                         skipped[5],
+                        crate::descriptor::host::TABLED_WRITES[2].load(Ordering::Relaxed),
                     );
                 }
             }

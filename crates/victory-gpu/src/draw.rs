@@ -4417,9 +4417,15 @@ impl State {
                             }
                         }
                     }
+                    // (Told once per record and recording; with
+                    // `VICTORY_TABLED_REREAD=1` also of a slot the queue
+                    // holds again since: written after its first read.)
                     if let Some(title) = title_first
                         && listed.texture
-                        && listed.tabled != Some((title + k, kind.is_some()))
+                        && (listed.tabled != Some((title + k, kind.is_some()))
+                            || (crate::descriptor::host::tabled_reread()
+                                && kind.is_some()
+                                && host.texture_slot_queued(title + k)))
                     {
                         listed.tabled = Some((title + k, kind.is_some()));
                         host.texture_slot_tabled(title + k, kind.is_some());

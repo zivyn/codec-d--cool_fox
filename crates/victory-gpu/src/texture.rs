@@ -2229,6 +2229,51 @@ mod allocation_costs {
         }
     }
 
+    /// What the pass over textures picked by index pays per slot outside its
+    /// timed parts (2026-11-26): asking whether a staged texture's memory is
+    /// all there (`staged(_, true)`, a question per 256 pages), and the
+    /// fingerprint of 48 KiB made after each upload and each texture found
+    /// the same. For `cargo test -p victory-gpu --release --lib pass_costs --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn pass_costs() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        for mb in [1usize, 4, 16] {
+            let len = mb << 20;
+            // SAFETY: memory of our own, committed and touched.
+            let at = unsafe {
+                let at = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                std::ptr::write_bytes(at.cast::<u8>(), 1, len);
+                at as usize
+            };
+            const N: u32 = 200;
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                assert!(super::committed(at as *const u8, len));
+            }
+            println!("{mb} MB, all in the working set: whether it is all there, {:.1} us", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
+            // Pages out of the working set (trimmed, as Windows does to a
+            // process under pressure) are asked again by a read of a byte.
+            let mut worst = 0f64;
+            for _ in 0..5 {
+                // SAFETY: our own process.
+                unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+                let began = std::time::Instant::now();
+                assert!(super::committed(at as *const u8, len));
+                worst = worst.max(began.elapsed().as_secs_f64() * 1e6);
+            }
+            println!("{mb} MB, just trimmed from the working set: {worst:.1} us");
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(super::fingerprint(at as u64, len as u64));
+            }
+            println!("{mb} MB: a fingerprint, {:.1} us", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
+        }
+    }
+
     /// The digest tells every length and every changed byte apart, zeros
     /// among them.
     #[test]

@@ -9007,7 +9007,12 @@ impl Meter {
                     );
                 }
                 let [looks, mapped, same, staged, all, made, views] =
-                    [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_MICROS[i].swap(0, Ordering::Relaxed) / 1000);
+                    [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_NANOS[i].swap(0, Ordering::Relaxed) / 1_000_000);
+                let rest = all.saturating_sub(looks + mapped + same + staged + made + views);
+                let parts = crate::draw::HEAP_TEXTURE_REST.each_ref().map(|n| n.swap(0, Ordering::Relaxed) / 1_000_000);
+                let waits = crate::descriptor::LOCK_WAITS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) / 1_000_000);
+                let passes = crate::draw::HEAP_TEXTURE_PASSES.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                let slots = crate::draw::HEAP_TEXTURE_SLOTS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
                 if all > 0 {
                     tracing::info!(
                         "the pass over textures picked by index, in the last 5 seconds: {all} ms in all, of them {looks} ms looking \
@@ -9018,6 +9023,41 @@ impl Meter {
                         all.saturating_sub(looks + mapped + same + staged + made + views),
                         crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                         crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20
+                    );
+                }
+                if all > 0 || parts[7] > 0 {
+                    let [queue, records, prints, ahead, shown, whole, checks, before] = parts;
+                    let [n_frame, n_early, n_bake, t_frame, t_early, t_bake, at_time, at_bytes] = passes;
+                    tracing::info!(
+                        "the pass over textures picked by index, its rest in the last 5 seconds: {queue} ms telling the queue \
+                         what came of each slot, {records} ms reading the slots' records, {prints} ms fingerprints after uploads \
+                         and looks that found the host copy the same, {ahead} ms handing first uploads to the copy queue ahead, \
+                         {shown} ms slots shown after their upload, flipped or made at once, {whole} ms asking whether a staged \
+                         texture's memory is all there, {checks} ms other checks, {} ms not told apart; waited for locks: the \
+                         queue's {} ms by the pass ({} ms by other threads), the views' {} ms by the pass ({} ms by other threads); \
+                         {before} ms before the passes' loops (not in the line above); passes: {n_frame} the frame's ({} ms), \
+                         {n_early} early ({} ms), {n_bake} before bakes ({} ms), {at_time} stopped at their time, {at_bytes} at their \
+                         bytes; slots taken {}: {} looked at again and unchanged, {} memory not there, {} no more of it there, \
+                         {} nothing to bring up to date, {} held back for room, {} the same as their host copy, {} uploaded \
+                         ahead, {} uploaded in the pass's list, {} read through tables",
+                        rest.saturating_sub(queue + records + prints + ahead + shown + whole + checks),
+                        waits[0],
+                        waits[1],
+                        waits[2],
+                        waits[3],
+                        t_frame / 1_000_000,
+                        t_early / 1_000_000,
+                        t_bake / 1_000_000,
+                        slots[0],
+                        slots[1],
+                        slots[2],
+                        slots[3],
+                        slots[4],
+                        slots[5],
+                        slots[6],
+                        slots[7],
+                        slots[8],
+                        slots[9],
                     );
                 }
             }

@@ -3786,7 +3786,15 @@ impl State {
                 .unwrap_or(u32::MAX),
             _ => 0,
         };
-        if role == Role::Miss && !matches!(layer, crate::ambient::MISS_OPAQUE | crate::ambient::MISS_ALPHA) {
+        // The alpha layer only with VICTORY_AMBIENT_SPECULAR_ALPHA=1: its pixels
+        // are of transparent surfaces (glass, foam, wakes on water) and the
+        // depth read is the opaque one behind them; outdoors on water that is
+        // the bottom, the reflected direction is wrong and the estimate dark
+        // (play session 2026-11-27: dark patches on the water around a boat).
+        let alpha_too = std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1");
+        if role == Role::Miss
+            && !(layer == crate::ambient::MISS_OPAQUE || (alpha_too && layer == crate::ambient::MISS_ALPHA))
+        {
             crate::ambient::note_miss(MissNote::Water);
             return false;
         }

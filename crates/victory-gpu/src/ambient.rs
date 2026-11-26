@@ -655,7 +655,7 @@ pub(crate) fn note_miss(note: MissNote) {
     tracing::info!(
         "a stand-in for reflections (VICTORY_AMBIENT_SPECULAR={share},{sky}) in the last {:.0} s: \
          {} frames, {} dispatches of CS_RayMiss followed (surfaces: {}), each by an estimate along \
-         the reflected direction put in right after it (before CS_ResolveScreenSpace); {} of water \
+         the reflected direction put in right after it (before CS_ResolveScreenSpace); {} of water or the alpha layer \
          and {} before a frame's light was kept left as the title had them",
         now.duration_since(since).as_secs_f32(),
         s.frames.swap(0, Relaxed),

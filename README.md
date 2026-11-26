@@ -290,6 +290,14 @@ What to expect:
   memory. Use 720p or lower on Series S.
 - Series S cannot go above 1080p: its output is 1080p, and the script says so
   and stops if asked for more.
+- **16 GB of RAM works, with a resizable BAR.** Windows lets a card share at
+  most half the PC's memory, and the copies of title memory the GPU reads
+  filled that on a 16 GB PC about a minute into the world (`0x8007000E`, then a
+  driver fault). `play-nvidia.ps1` now puts them in the card's memory the CPU
+  maps (`VICTORY_WINDOWS_BAR_MB`) when the BIOS has resizable BAR on;
+  `nvidia-smi -q -d MEMORY` shows a BAR1 total about the card's size if so.
+  Without it, close what else uses memory. Expect stutters while the world
+  streams in: the game's own memory is then partly in the paging file.
 
 ### More than one card, and other cards
 

@@ -125,13 +125,9 @@ jobs:
 
   # Includes xtask's repository_passes_policy (the asset-policy check).
   #
-  # Skipped, because the software adapter (WARP) on the runner answers
-  # differently from a hardware GPU (the first two also fail on NVIDIA and
-  # are fixed on fix/indirect-tests-nvidia, not on main yet):
-  #   indirect::tests::host_list_budget_starts_empty_at_each_submission
-  #   indirect::tests::warp_batch_charges_every_execution
+  # Skipped, because the software adapter (WARP) on the runner has no depth
+  # bounds test:
   #   pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws
-  #     (WARP has no depth bounds test)
   test-rest:
     if: ${{ inputs.test_rest }}
     runs-on: windows-latest
@@ -146,8 +142,6 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude victory-shader --locked --no-fail-fast -- \
-            --skip indirect::tests::host_list_budget_starts_empty_at_each_submission \
-            --skip indirect::tests::warp_batch_charges_every_execution \
             --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws \
             2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Summary

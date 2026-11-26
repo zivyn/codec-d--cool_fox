@@ -46,12 +46,12 @@ mesh shader support. The first run builds shader pipelines and stutters;
 
 ## Where it stands (2026-11-26)
 
-Measured on the integration branch `integ/validation-2`, in the prologue cell,
-one PC with an 8 GB RTX 4060. A frame took about 410 ms at the start of the day;
-it now takes 168-175 ms (looking at a window) and 178-185 ms (dark cell).
+Measured on `integ/validation-2`, in the prologue cell, one PC with an 8 GB
+RTX 4060. A frame took about 410 ms at the start of the day; it now takes
+168-175 ms (looking at a window) and 178-185 ms (dark cell).
 
-Only on the integration branches so far (not yet on `main`; `main` is still the
-codec_d build):
+On `main` (integration #2 is merged, so `main` and the `build-main` download
+have all of this):
 
 - FSR4's shared working buffer lives in video memory: its passes went from
   about 215 ms to about 24 ms in a microbenchmark, close to free on the card.
@@ -60,8 +60,16 @@ codec_d build):
 - The title's own hang watchdog no longer ends a session during our long stalls.
 - Wave64 programs are lowered for NVIDIA's 32-lane waves.
 - The descriptor heap stays under NVIDIA's 1,000,000-descriptor limit.
-- 25,582 of 26,096 shader programs validate with the DXIL validator; the test
-  branches validate more.
+- 25,582 of 26,096 shader programs validate with the DXIL validator.
+
+Only on branches under test (not on `main` yet, so not in `build-main`; they
+are in the `build-integ-*` downloads once published):
+
+- The ambient stand-in for the title's indirect light (`fix/ambient-stand-in-variants`).
+- Showing a lower mip instead of a black texture when the card is short of room
+  (`perf/tx1-texture-room`).
+- More shader programs validating (`shaders/validator-clean`,
+  `shaders/rt-shadow-view-addresses`).
 
 ## Known wrong
 

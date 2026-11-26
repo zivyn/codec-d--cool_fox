@@ -617,6 +617,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
 
 /// A root argument for [`Host::draw`].
 #[cfg(test)]
+#[derive(Clone)]
 pub enum Root {
     Constants(Vec<u32>),
     /// A table starting at this heap index.

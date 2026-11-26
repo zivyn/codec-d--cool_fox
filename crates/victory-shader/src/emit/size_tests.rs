@@ -4,7 +4,8 @@
 //! on the host GPU and WARP.
 
 use super::host::{Stride, View};
-use super::waterfall_tests::run;
+use super::host::Root;
+use super::waterfall_tests::{run, run_with};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -367,5 +368,49 @@ fn a_tables_raw_buffer_is_read_at_its_raw_twin() {
     let views = [raw(&title), other(), other(), other(), raw(&twin), other(), View::RawUav(2)];
     for (label, got) in run(&shader, &views) {
         assert_eq!(got[..2], [0, 6], "{label}");
+    }
+}
+
+/// A ray-tracing program takes the address of a structure out of a descriptor
+/// it picks from the view heap, by an index it computes: the address is the
+/// host's, by heap slot, not the descriptor's dwords (the host's heap holds
+/// no such descriptor).
+#[test]
+fn the_address_of_a_picked_view_is_the_hosts() {
+    let program = |index: u32| {
+        let words = [
+            0xBE86_0301u32, // s_mov_b32 s6, s1
+            0xBE87_0380,    // s_mov_b32 s7, 0
+            0xBE8C_03FF,    // s_mov_b32 s12, index * 32
+            index * 32,
+            0xF408_0203, // s_load_dwordx4 s[8:11], s[6:7], s12
+            0x1800_0000,
+            0xBE84_0308, // s_mov_b32 s4, s8
+            0xBE85_0309, // s_mov_b32 s5, s9
+        ];
+        [TABLE, &words, STORE].concat()
+    };
+    let (texel, mut addresses) = ([[0.0; 4]; 1], vec![0u32; 16]);
+    addresses[2..4].copy_from_slice(&[0x1234_5678, 0x9a]);
+    addresses[6..8].copy_from_slice(&[0xdead_beef, 0x01]);
+    let views = [
+        View::Texture(1, 1, &texel),
+        View::Texture(1, 1, &texel),
+        View::RawUav(2),
+    ];
+    let table = [(
+        1,
+        Root::View {
+            srv: true,
+            data: addresses,
+        },
+    )];
+    for (index, want) in [(1, [0x1234_5678, 0x9a]), (3, [0xdead_beef, 1])] {
+        let shader = build(&program(index), (8, 0)).expect("translates");
+        // Only the host's table of addresses is asked for.
+        assert_eq!(shader.root_srvs, [super::SLOT_VIEW_ADDRESSES]);
+        for (label, got) in run_with(&shader, &views, &table) {
+            assert_eq!(got[..2], want, "{label}: heap slot {index}");
+        }
     }
 }

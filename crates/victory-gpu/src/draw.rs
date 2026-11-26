@@ -1437,6 +1437,11 @@ impl State {
                 addresses.push(self.view_address(compute, u.slot, u.dword));
             }
         }
+        // A shader that picks a view from the heap by an index it computes
+        // may take any structure's address: the ones the heap holds.
+        if t.host.root_srvs.contains(&victory_shader::emit::SLOT_VIEW_ADDRESSES) {
+            addresses.extend(heap.structure_addresses());
+        }
         crate::memory::ready(list, heap, &addresses, &written, &constants, use_, t.threads)
     }
 
@@ -1762,6 +1767,24 @@ impl State {
                                 }
                             },
                             None => once!("a shader inspects table view kinds without a view heap set"),
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
+                        // Ours: the title address of the view at each slot
+                        // of the view heap, for a shader that takes a
+                        // structure's address from a descriptor it picks.
+                        match self.heap_view_addresses(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader takes view addresses from a view heap that is not set"),
                         }
                         continue;
                     }
@@ -2133,6 +2156,26 @@ impl State {
         let gpu = host.strides_gpu()?;
         // Tag bit 1 (distinct from `heap_buffers`'s `| 1` and aligned guest pointers).
         if list.first_use(gpu as usize | 2)
+            && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
+    /// The GPU address of the bound view heap's table of view addresses by
+    /// slot, which the list holds.
+    fn heap_view_addresses(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.view_addresses_gpu()?;
+        // Tag bit 2 (distinct from `heap_buffers`'s and `heap_strides`'s).
+        if list.first_use(gpu as usize | 4)
             && let Some(buffer) = host.strides_buffer()
         {
             list.keep(buffer);

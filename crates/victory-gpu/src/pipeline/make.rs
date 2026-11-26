@@ -330,6 +330,10 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     if p.left_out.is_some() {
         return false;
     }
+    // The title's thread makes it, for as long as it takes.
+    let _hold = p.made.get().is_none().then(|| {
+        victory_game::watchdog::hold("host pipeline made on a title thread")
+    });
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -394,6 +398,7 @@ fn wait(p: &Pending, frame: u64) {
         return;
     }
     let started = Instant::now();
+    let _hold = victory_game::watchdog::hold("waiting for a host pipeline");
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {

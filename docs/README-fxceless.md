@@ -312,6 +312,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
+| `VICTORY_WATCHDOG_HOLD=0` | (any build) our stalls (a frame recording, host pipelines made on a title thread) no longer pause the title's hang watchdog; on by default |
+| `VICTORY_WATCHDOG_HOLD_MAX_S=900` | (any build) how long the pause is kept while the title's heartbeat does not move |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |

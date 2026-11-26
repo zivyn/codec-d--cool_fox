@@ -174,6 +174,7 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    arm_watchdog_hold(&image);
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -195,6 +196,25 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// Lets our stalls (a frame recording, host pipelines made on a title thread)
+/// pause the title's own hang watchdog while they last
+/// (`victory_game::watchdog`; `VICTORY_WATCHDOG_HOLD=0` leaves it alone).
+#[cfg(windows)]
+fn arm_watchdog_hold(image: &victory_loader::LoadedImage) {
+    const EXECUTE: u32 = 0x2000_0000;
+    const WRITE: u32 = 0x8000_0000;
+    let sections = &image.info().sections;
+    let of = |flag: u32| -> Vec<(u32, u32)> {
+        sections
+            .iter()
+            .filter(|s| s.characteristics & flag != 0)
+            .map(|s| (s.rva, s.virtual_size))
+            .collect()
+    };
+    // SAFETY: the image is mapped and relocated, and stays so for the run.
+    unsafe { victory_game::watchdog::arm(image.base(), &of(EXECUTE), &of(WRITE)) };
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

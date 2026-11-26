@@ -24,7 +24,9 @@ queue between two presents (the first may be the swap chain's own work for
 the frame before). One capture per process. At the frame's first submission
 the card is drained and its memory copied out; before each later one the card
 is drained again and what the CPU changed is written. The title stands still
-meanwhile. `frame recorder: the frame is captured` in the log and `frame.bin`
+meanwhile (tens of seconds in the world, with 5 GB written): the title's own
+hang watchdog is held while the recorder works (`victory_game::watchdog`), or it
+would end the run at 30 s without a tick. `frame recorder: the frame is captured` in the log and `frame.bin`
 in the folder mean it is done; `failed.txt` that it failed.
 
 **Read `notes.txt`**: everything that could not be recorded is listed there

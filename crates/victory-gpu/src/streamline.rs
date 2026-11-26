@@ -1017,7 +1017,13 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     let (Some(optimal_of), Some(set_options)) = (functions.dlss_optimal, functions.dlss_set_options) else {
         return Err("no DLSS functions".into());
     };
+    // (Timed with frame generation: its present shares this lock and
+    // Streamline with the upscaling.)
+    let began = plan.framegen.then(std::time::Instant::now);
     let mut calls = calls();
+    if let Some(began) = began {
+        spent(T_UPSCALE_LOCK, began);
+    }
     let output = camera.output;
     let optimal = |calls: &mut Calls, mode: u32| -> Option<[u32; 2]> {
         if let Some(&(_, _, size)) = calls.optimal.iter().find(|(o, m, _)| *o == output && *m == mode) {
@@ -1079,6 +1085,9 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     let code = unsafe { (sl.evaluate_feature)(abi::FEATURE_DLSS, token, inputs.as_ptr(), inputs.len() as u32, list) };
     if code != 0 {
         return Err(format!("slEvaluateFeature: {} ({code})", abi::result_name(code)));
+    }
+    if let Some(began) = began {
+        spent(T_UPSCALE, began);
     }
     Ok(Recorded { mode, optimal: optimal_of_mode(mode), changed, jitter: constants.jitter_offset, mvec_scale: constants.mvec_scale })
 }
@@ -1210,6 +1219,7 @@ pub(crate) fn before_target_draw(
         HUD_COUNTS[HUD_AGAIN].fetch_add(1, Relaxed);
         return;
     }
+    let began = std::time::Instant::now();
     let id = HUD_NEXT_ID.fetch_add(1, Relaxed) + 1;
     let Some(copy) = hudless_texture(texture, id) else { return };
     // The target as a copy's source: the composite's own preparation makes
@@ -1228,6 +1238,7 @@ pub(crate) fn before_target_draw(
     drop(pending);
     list.mark_hudless(id);
     HUD_COUNTS[HUD_COPIES].fetch_add(1, Relaxed);
+    spent(T_COPY, began);
     // SAFETY: a live texture.
     let desc = unsafe { texture.GetDesc() };
     once!(
@@ -1343,11 +1354,14 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
     let (sl, functions) = (SL.get()?, FUNCTIONS.get()?);
     let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
+    let began = std::time::Instant::now();
     let frame = frame as u32;
     let token = frame_token(sl, frame)?;
     let mark = |m: u32| {
+        let began = std::time::Instant::now();
         // SAFETY: a marker for a token of ours.
         unsafe { marker(m, token) };
+        spent(T_MARKERS, began);
     };
     let mut calls = calls();
     if calls.simulating != Some(frame) {
@@ -1470,7 +1484,43 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     }
     drop(calls);
     mark(abi::PRESENT_START);
+    spent(T_BEFORE, began);
     Some(Presenting { token, frame })
+}
+
+// Since the last frame-rate line, microseconds: on the presenting thread
+// before the present (of them in the latency markers), in the present call
+// (and the longest), after it (of them asking frame generation's state); on
+// the threads that record upscalings, recording one (of them waiting for our
+// lock); recording the copy of the colour without the interface.
+static TIMES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const T_BEFORE: usize = 0;
+const T_MARKERS: usize = 1;
+const T_PRESENT: usize = 2;
+const T_PRESENT_LONGEST: usize = 3;
+const T_AFTER: usize = 4;
+const T_STATE: usize = 5;
+const T_UPSCALE: usize = 6;
+const T_UPSCALE_LOCK: usize = 7;
+const T_COPY: usize = 8;
+
+fn spent(slot: usize, since: std::time::Instant) {
+    TIMES[slot].fetch_add(since.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// When the present call of a frame [`present_begins`] began begins: `None`
+/// without frame generation (nothing is timed then).
+pub(crate) fn present_called(presenting: &Option<Presenting>) -> Option<std::time::Instant> {
+    presenting.is_some().then(std::time::Instant::now)
+}
+
+/// The present call that began at `called` returned.
+pub(crate) fn present_returned(called: Option<std::time::Instant>) {
+    if let Some(called) = called {
+        let took = called.elapsed().as_micros() as u64;
+        TIMES[T_PRESENT].fetch_add(took, Relaxed);
+        TIMES[T_PRESENT_LONGEST].fetch_max(took, Relaxed);
+    }
 }
 
 unsafe extern "C" fn present_error(error: *const i32) {
@@ -1485,6 +1535,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
     let Some(Presenting { token, frame }) = presenting else { return };
     let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else { return };
     let (Some(marker), Some(get_state)) = (functions.pcl_set_marker, functions.dlssg_get_state) else { return };
+    let began = std::time::Instant::now();
     // SAFETY: a marker for this frame's token.
     unsafe { marker(abi::PRESENT_END, token) };
     let mut calls = calls();
@@ -1493,11 +1544,14 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         unsafe { marker(abi::SIMULATION_START, next) };
         calls.simulating = Some(frame.wrapping_add(1));
     }
+    spent(T_MARKERS, began);
     if calls.framegen_on {
         let mut state = abi::DlssgState::default();
         let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
+        let asked = std::time::Instant::now();
         // SAFETY: a structure to fill, no options (no estimate asked).
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
+        spent(T_STATE, asked);
         if code == 0 {
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
@@ -1510,6 +1564,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
             }
         }
     }
+    spent(T_AFTER, began);
 }
 
 /// Our swap chain's buffers are about to be made again: frame generation is
@@ -1799,6 +1854,23 @@ pub(crate) fn line(frames: f64) {
             FG_STATUS.load(Relaxed),
             if FG_READY.load(Relaxed) && SWAP_CHAIN_PROXIED.load(Relaxed) { "" } else { "; not running (see above)" }
         );
+        // Where the time of a frame goes in Streamline's calls.
+        let t: Vec<u64> = TIMES.iter().map(|t| t.swap(0, Relaxed)).collect();
+        if on + off > 0 {
+            let ms = |slot: usize| t[slot] as f64 / 1000.0 / frames;
+            tracing::info!(
+                "DLSS Frame Generation, time per frame: the presenting thread {:.2} ms before the present call, {:.2} ms in it (the longest {:.1} ms), {:.2} ms after it; of those {:.2} ms in the latency markers and {:.2} ms asking frame generation's state; an upscaling recorded in {:.2} ms ({:.2} ms of it waiting for the lock it shares with the present); the copy of the colour without the interface recorded in {:.3} ms",
+                ms(T_BEFORE),
+                ms(T_PRESENT),
+                t[T_PRESENT_LONGEST] as f64 / 1000.0,
+                ms(T_AFTER),
+                ms(T_MARKERS),
+                ms(T_STATE),
+                ms(T_UPSCALE),
+                ms(T_UPSCALE_LOCK),
+                ms(T_COPY)
+            );
+        }
         // Every tenth line (about ten seconds): the colour without the
         // interface, where the title draws the interface into the frame.
         static LINES: AtomicU32 = AtomicU32::new(0);

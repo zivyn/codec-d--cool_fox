@@ -9635,7 +9635,9 @@ impl Host {
                     size: [width, height],
                 },
             );
+            let called = crate::streamline::present_called(&presenting);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]

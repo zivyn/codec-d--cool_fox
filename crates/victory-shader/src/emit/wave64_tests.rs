@@ -736,3 +736,109 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+/// 64 threads in one console wave, `if (t < s0) { n += 1; lds[t] = t + 1; out[t] = lds[(t + 16) & 63]; }`
+/// after every thread has set `lds[t]` to -1, and `out[64 + t] = n` after it. The console runs
+/// the wave's lanes in step, so the read inside the branch sees the writes of both host
+/// waves' lanes. The count the branch changes and the join reads keeps the branch: it is
+/// not one that only skips code no lane is left for.
+fn lds_read_after_write_in_a_lane_branch() -> NativeProgram {
+    let words = [
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x7E08_02C1, // v_mov_b32 v4, -1
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | 13, // s_cbranch_execz past the body
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0x4A0C_0090, // v_add_nc_u32 v6, 16, v0
+        0x360C_0CBF, // v_and_b32 v6, 63, v6
+        0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000, // ds_read_b32 v7, v6
+        0x0700_0006,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000, // buffer_store_dword v7, v3, s[8:11], 0 offen
+        0x8002_0703,
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E10_0214, // v_mov_b32 v8, s20
+        0xE070_1100, // buffer_store_dword v8, v3, s[8:11], 0 offen offset:256
+        0x8002_0803,
+    ];
+    let mut native = native(&words);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+/// A console wave of 64 threads that reads in a lane branch what its own lanes wrote there,
+/// whichever host wave they are in: nothing but taking the branch wave-wide
+/// (`widen` in `emit`) lets the two host waves meet between the write and the read, so
+/// that is the form `emit` ends with where no other form translates.
+#[test]
+fn a_lane_branch_that_writes_and_reads_lds_translates_wave_wide_as_a_last_resort() {
+    let native = lds_read_after_write_in_a_lane_branch();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&container).unwrap();
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    let shader = shader.expect("a wave of 32 holds the console's wave through the wave-wide form");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for warp in [false, true] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 device (warp {warp}); not run");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            eprintln!("the device (warp {warp}) does not take this program; not run");
+            continue;
+        };
+        // (an even count: the lane read from must have written)
+        for below in [64u32, 48, 32, 20, 2] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = below;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(128)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            for t in 0..64u32 {
+                assert_eq!(out[0][64 + t as usize], 1, "warp {warp}, {below} threads in the branch, count at thread {t}");
+                let from = (t + 16) & 63;
+                let expected = match (t < below, from < below) {
+                    (false, _) => 0,
+                    (true, true) => from + 1,
+                    (true, false) => u32::MAX,
+                };
+                assert_eq!(out[0][t as usize], expected, "warp {warp}, {below} threads in the branch, thread {t}");
+            }
+        }
+    }
+}

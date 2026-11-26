@@ -996,6 +996,8 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
     Cube(u32, u16, &'a [[f32; 4]]),
+    /// An RGBA32F 3D texture SRV (width, height, depth, texels x fastest).
+    Texture3D(u32, u32, u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1175,6 +1177,48 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
+                    View::Texture3D(w, h, depth, texels) => {
+                        let desc = D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                            DepthOrArraySize: depth as u16,
+                            ..texture(w, h, D3D12_RESOURCE_FLAG_NONE)
+                        };
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let pitch = (w as usize * 16).next_multiple_of(256);
+                        let upload = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buffer(
+                                (pitch * (h * depth) as usize) as u64,
+                                D3D12_RESOURCE_FLAG_NONE,
+                            ),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                        for (row, line) in texels.chunks(w as usize).enumerate() {
+                            std::ptr::copy_nonoverlapping(
+                                line.as_ptr().cast::<u8>(),
+                                p.cast::<u8>().add(row * pitch),
+                                line.len() * 16,
+                            );
+                        }
+                        upload.Unmap(0, None);
+                        let mut from = footprint(&upload, w, h);
+                        from.Anonymous.PlacedFootprint.Footprint.Depth = depth;
+                        list.CopyTextureRegion(&subresource(&tex), 0, 0, 0, &from, None);
+                        keep.push(upload);
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, mut texels, faces, mips) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1, 1),

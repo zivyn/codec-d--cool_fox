@@ -9192,6 +9192,13 @@ impl Meter {
                         parts[7].saturating_sub(due_by_memory + remade + due_list),
                     );
                 }
+                if crate::descriptor::host::show_new_later() {
+                    tracing::info!(
+                        "slots of textures made while lists sent before them ran, shown once those had run \
+                         (VICTORY_SHOW_NEW_LATER=1), since the start: {}",
+                        crate::descriptor::host::NEW_LATER.load(Ordering::Relaxed)
+                    );
+                }
                 // The queue's lock by place (`crate::descriptor::queue_site`).
                 let lock = crate::descriptor::QUEUE_LOCK.each_ref().map(|row| row.each_ref().map(|n| n.swap(0, Ordering::Relaxed)));
                 let [taken, waited, held, skipped] = lock;

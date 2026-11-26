@@ -568,11 +568,57 @@ pub(crate) fn fresh(texture: &ID3D12Resource) -> bool {
 
 fn made_now(texture: &ID3D12Resource) {
     let now = now();
-    let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
-    while recent.front().is_some_and(|r| r.1 + 1000 < now) {
-        recent.pop_front();
+    let raw = texture.as_raw() as usize;
+    {
+        let mut recent = RECENT.lock().unwrap_or_else(|e| e.into_inner());
+        while recent.front().is_some_and(|r| r.1 + 1000 < now) {
+            recent.pop_front();
+        }
+        recent.push_back((raw, now));
     }
-    recent.push_back((texture.as_raw() as usize, now));
+    if !crate::descriptor::host::show_new_later() {
+        return;
+    }
+    let begun = crate::host::submissions().0;
+    NEWEST_BEGUN.fetch_max(begun, Ordering::Relaxed);
+    let mut unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let finished = crate::host::submissions().1;
+    // Those every submission begun before them has left behind are no
+    // one's concern any more (and a raw pointer may come again).
+    unseen.retain(|_, b| *b > finished);
+    unseen.insert(raw, begun);
+}
+
+/// Pooled textures made while submissions begun before them may still run:
+/// the submissions begun when each was made (with
+/// `crate::descriptor::host::show_new_later` only). Ported from
+/// Belobug/VIctory-Belobug-AMD 4cd2d13.
+static UNSEEN: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, u64>>> = std::sync::LazyLock::new(Default::default);
+/// The newest of those numbers (nothing to look up once it has finished).
+static NEWEST_BEGUN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a texture was made in a block while a submission begun before
+/// it may still run ([`begun_before`]).
+fn any_unseen() -> bool {
+    NEWEST_BEGUN.load(Ordering::Relaxed) > crate::host::submissions().1
+}
+
+/// The submissions begun when `texture` was made in a block, if one of
+/// those may still be on the card: lists already sent then must not find it
+/// in a slot they read by index (`crate::descriptor::host::show_new_later`).
+/// Every device loss with the pool in the report of
+/// Belobug/VIctory-Belobug-AMD (runs n08, n11, n15, steps-ab2, start-3 and a
+/// user's play-1125-2107) was a page fault at the first byte of a texture
+/// made that very millisecond, its title slot changed "at once" while lists
+/// sent before it read that slot by index.
+pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
+    if !any_unseen() {
+        return None;
+    }
+    let finished = crate::host::submissions().1;
+    let raw = texture.as_raw() as usize;
+    let unseen = UNSEEN.lock().unwrap_or_else(|e| e.into_inner());
+    unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.

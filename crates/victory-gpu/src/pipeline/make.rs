@@ -23,7 +23,9 @@
 //! will be made within what is left of the budget ([`until_made`]); and the
 //! pipelines the frame being recorded asks for are made before the ones
 //! asked for in frames before it (`Queue::recent`).
-//! `VICTORY_PIPELINE_PRIORITY=0`: as before. Passes over the
+//! `VICTORY_PIPELINE_PRIORITY=0`: as before. A dispatch is not dropped that
+//! way at all ([`compute_budget`]): what it computes may be done once and kept
+//! by the title, and it waits for its pipeline. Passes over the
 //! screen (no vertex input, no depth) have workers and a longer budget of
 //! their own ([`screen_budget`]): the title fills its lighting tables with
 //! such draws once, at the world's first frame, and behind a world's worth of
@@ -56,6 +58,10 @@ pub(crate) struct Pending {
     screen: bool,
     /// Confirmed first-scene / bake producer prepared early even on a cold cache.
     scene_input: bool,
+    /// A compute program: what it computes may be done once and kept (a
+    /// head's blend shape mappings, mip levels, colour tables), so a dispatch
+    /// of it is not dropped for want of a host pipeline ([`compute_budget`]).
+    compute: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
     /// The frame (plus one) of the last request that put it in `Queue::recent`,
@@ -136,6 +142,7 @@ impl Pending {
             || scene_input;
         let left_out = left_out(&shaders);
         Pending {
+            compute: shaders.iter().any(|s| s.stage == "compute"),
             screen,
             scene_input,
             left_out,
@@ -231,6 +238,29 @@ fn screens_first() -> bool {
     !screen_budget().is_zero()
 }
 
+/// What a thread recording a dispatch waits for its pipeline at most, whatever
+/// the frame has spent: a dispatch dropped is a result lost, and the title
+/// does not always redo it (a black head after a cold start: the one dispatch
+/// that maps the blend shapes of the head was dropped behind the budget and
+/// never came back). The frame
+/// that waits asks for nothing more, and what it asked for is made first
+/// (`Queue::recent`), so the wait is the pipelines' own making, not the queue
+/// of the world's. `VICTORY_COMPUTE_WAIT_MS` (120 s; 0: as the draws, dropped past
+/// the frame's budget). The title's watchdog is held meanwhile.
+fn compute_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let millis = std::env::var("VICTORY_COMPUTE_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// Whether `p` is a pipeline whose dispatches wait for it ([`compute_budget`]).
+fn waited_for(p: &Pending) -> bool {
+    p.compute && !compute_budget().is_zero()
+}
+
+
 /// Whether a wait is skipped that cannot end in the pipeline, and the frame's
 /// own requests go first (`VICTORY_PIPELINE_PRIORITY=0`: as before).
 fn prioritised() -> bool {
@@ -319,7 +349,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         let frame = crate::frame::current();
         touch(p, frame);
-        wait(p, frame);
+        if waited_for(p) {
+            wait_for_compute(p, compute_budget());
+        } else {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
 }
@@ -362,6 +396,38 @@ pub(crate) fn early(p: &Arc<Pending>) {
 fn shared_budget() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+}
+
+/// Waits for the compute pipeline `p` for `limit` at most, on its own: not out
+/// of the frame's budget, which the first thread to wait would take all of
+/// (and the others, recording dispatches of their own, would drop them).
+fn wait_for_compute(p: &Pending, limit: Duration) {
+    let started = Instant::now();
+    let _hold = victory_game::watchdog::hold("waiting for a compute pipeline");
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let rest = limit.saturating_sub(started.elapsed());
+        if rest.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(held);
+    let waited = started.elapsed();
+    if waited > Duration::from_secs(1) || p.made.get().is_none() {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 300 {
+            tracing::info!(
+                ms = waited.as_millis() as u64,
+                made = p.made.get().is_some(),
+                shaders = ?p.shaders,
+                "a dispatch waited for its pipeline (VICTORY_COMPUTE_WAIT_MS=0: dropped past the frame's budget)"
+            );
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
 }
 
 /// Waits for `p` while frame `frame` has budget left.
@@ -894,6 +960,62 @@ mod tests {
             average = averaged(average, 8_000);
         }
         assert!((8_000..10_000).contains(&average));
+    }
+
+    fn of_stage(stage: &'static str, code: &[u8]) -> Arc<Pending> {
+        Arc::new(Pending::new(vec![super::super::shader(stage, code)], None))
+    }
+
+    /// Only compute programs are the ones whose dispatches wait for them.
+    #[test]
+    fn compute_programs_are_the_ones_waited_for() {
+        let cs = of_stage("compute", b"cs for the policy");
+        let vs = of_stage("vertex", b"vs for the policy");
+        let ps = of_stage("pixel", b"ps for the policy");
+        assert!(cs.compute && !vs.compute && !ps.compute);
+        assert!(waited_for(&cs));
+        assert!(!waited_for(&vs));
+        assert!(!waited_for(&Pending::new(Vec::new(), None)));
+    }
+
+    /// A dispatch waits for as long as its pipeline takes, past the frame's
+    /// budget, and several threads each wait for their own.
+    #[test]
+    fn a_dispatch_waits_for_its_pipeline_past_the_frames_budget() {
+        let finishes = |p: &Arc<Pending>, after: Duration| {
+            let p = p.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(after);
+                p.made.get_or_init(|| None);
+                let _held = DONE.0.lock().unwrap_or_else(|e| e.into_inner());
+                DONE.1.notify_all();
+            })
+        };
+        let (a, b) = (of_stage("compute", b"cs waited a"), of_stage("compute", b"cs waited b"));
+        let (fa, fb) = (finishes(&a, Duration::from_millis(700)), finishes(&b, Duration::from_millis(900)));
+        let started = Instant::now();
+        let waiters: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|p| std::thread::spawn(move || wait_for_compute(&p, Duration::from_secs(30))))
+            .collect();
+        for w in waiters {
+            w.join().unwrap();
+        }
+        assert!(a.made.get().is_some() && b.made.get().is_some());
+        assert!(started.elapsed() >= Duration::from_millis(850), "{:?}", started.elapsed());
+        fa.join().unwrap();
+        fb.join().unwrap();
+    }
+
+    /// The wait is bounded: a pipeline that never comes is dropped at the end of it.
+    #[test]
+    fn the_wait_for_a_dispatch_is_bounded() {
+        let p = of_stage("compute", b"cs that never comes");
+        let started = Instant::now();
+        wait_for_compute(&p, Duration::from_millis(150));
+        assert!(p.made.get().is_none());
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[cfg(feature = "diagnostics")]

@@ -11,7 +11,7 @@ where it is now.
 Code that is in this repository:
 
 - [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX):
-  the base. Its threading, write relay, card fills, copy queue and texture
+  Its threading, write relay, card fills, copy queue and texture
   read-back are all kept.
 - [Marvisak/VIctory](https://github.com/Marvisak/VIctory): the original
   compatibility layer under everything else (loader, runtime services,

@@ -242,6 +242,17 @@ fn viewable(format: i32) -> Option<i32> {
     })
 }
 
+/// The address of `texture` as its descriptor has it (its first level's),
+/// if the book is kept.
+pub(crate) fn address(texture: &ID3D12Resource) -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let desc = unsafe { texture.GetDesc() };
+    texture_address(texture, &desc)
+}
+
 /// The address of a texture: the base its descriptor has.
 fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
     struct Slot(ID3D12DescriptorHeap, usize);

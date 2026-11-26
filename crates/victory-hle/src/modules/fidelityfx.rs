@@ -232,6 +232,16 @@ extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, mem
         call(desc)
     };
     if code != OK || context.is_null() {
+        // Frame generation without DLSS leaves the upscaling to the title's
+        // own FidelityFX, which is made for the Series S sizes only.
+        if code != OK && !streamline::upscaling() {
+            tracing::error!(
+                code,
+                max_render = ?asked.max_render,
+                max_output = ?asked.max_output,
+                "FidelityFX: the title's own upscaler was not made at these sizes (its shipping FSR4 takes 1280x720 or 1920x1080 in, 1920x1080 out): with frame generation at another output size, set VICTORY_DLSS=1 as well; the title fails at its first upscaling without an upscaler"
+            );
+        }
         return code;
     }
     // SAFETY: the context was made.

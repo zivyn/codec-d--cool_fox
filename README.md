@@ -1,128 +1,187 @@
-# VIctory on an RX 7900 XTX
+# foxhound
 
-## Run the codec_d Windows build
+A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that runs an Xbox Series title
+natively on Windows from files **you** supply. foxhound is tuned for **NVIDIA RTX** GPUs: DLSS Super Resolution and
+DLSS Frame Generation in place of the title's own upscaling, the Series X profile at a native 2560x1440, and fewer
+stalls at scene cuts.
 
-Download and extract the Windows x64 ZIP from the [private releases](https://github.com/codec-d/cool_fox/releases/latest). Open PowerShell in the extracted folder and point the launcher at your own complete Xbox dump.
+> **This repository contains no game files, code or assets.** You need your own legally obtained copy of the
+> title. foxhound is not affiliated with or endorsed by the title's developer or publisher, nor by NVIDIA.
+> See [docs/asset-policy.md](docs/asset-policy.md).
 
-```powershell
-$env:VICTORY_GAME_DIR = 'D:\Games\MyDump'
-.\Play-VIctory.cmd pareto-residency
-```
+## Where it stands
 
-The launcher selects Series S and the RTX-tested residency settings. It builds its shader cache locally under `%LOCALAPPDATA%\VIctory\cache-pareto`. Set `VICTORY_CACHE_DIR` to reuse an existing cache outside the checkout. Windows x64, an AVX2 CPU, and a Direct3D 12 GPU with shader model 6.6 and mesh shader support are required.
+Tested on one PC: Windows 11, Ryzen 7 7800X3D, 32 GB RAM, **RTX 4070 SUPER 12 GB**, NVMe SSD; the Xbox Series
+build **v1.0.2.1** of the title, Series X profile, 2560x1440 output, DLSS Quality. Frame times are the layer's
+own count, in the opening scenes unless noted.
 
-To build from this checkout, install the pinned Rust toolchain and the MSVC C++ build tools with a Windows SDK, then run `cargo build --release --locked -p victory`. The same launcher finds `target\release\victory.exe`. The sections below describe the upstream AMD fork and its separate launcher.
-
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
-
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
-
-## Where it stands (2026-11-25)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
-
-| | |
+| | Frame time |
 |---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
-
-It started at 280 ms a frame in the same scenes two days earlier.
+| Opening, gameplay | 34-37 ms (27-30 fps); our CPU work per frame sets it |
+| Opening, cutscenes | median 36-38 ms, 95th percentile 49-58 ms, no second over 100 ms |
+| Open water (first boat ride) | about 47 ms (21 fps); the GPU sets it there |
+| With `-FrameGen` | every frame the title renders is shown twice (2x presented) |
+| Memory | about 8 GB of VRAM; 32 GB of RAM is enough, 64 GB is more comfortable |
 
 What is known to be wrong:
 
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- **No ray tracing.** The title traces its indirect light, reflections and lamp shadows in its own compute
+  shaders. They are off (`VICTORY_BVH_BUILDER=1` turns them on: about 3 fps and a broken picture today). An
+  estimate stands in for indirect light and for reflections of opaque surfaces: rooms are lit, but reflections
+  are blurry, and in cutscenes they can still show the sky's bright colour.
+- **Left out:** the heat-haze / in-scattering pass (it smears blocks of pixels, also on water) and the decal
+  heap's defragmentation (5.6 ms of GPU a frame). `VICTORY_LEAVE_OUT` names them.
+- **Hitches:** some single frames of 70-190 ms in cutscenes while the title streams.
+- **Frame rate:** the title runs at 30 fps. `-Fps 60` lets frames start every 1/60 s, but the layer itself costs
+  about 33 ms a frame today, so it stays near 30. 60 fps is the goal.
+- **The first run of every new build stutters** while the driver compiles pipelines (see *Warming up* below).
 
-## How to run it
+## What you need
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+- Windows 10 or 11 (x64), a CPU with AVX2, 32 GB of RAM or more, an SSD.
+- An NVIDIA GeForce RTX GPU with a recent driver for DLSS (RTX 40 or later for Frame Generation, with
+  hardware-accelerated GPU scheduling on). Any Direct3D 12 GPU with shader model 6.6 and mesh shaders runs the
+  layer without DLSS.
+- **Your own dump** of the title's Xbox Series build v1.0.2.1 (the folder with `game_scarlett_master.exe`).
+  Other builds may start, but the image patches (1440p output, FidelityFX path, frame rate) check every byte
+  they change and leave a differing build alone.
+- [Rust](https://rustup.rs) (the toolchain is pinned in `rust-toolchain.toml`; rustup fetches it), and the
+  **Visual Studio Build Tools** with "Desktop development with C++" (MSVC and a Windows SDK).
+- For DLSS: NVIDIA's **Streamline SDK** (below). You download it yourself; nothing of NVIDIA's is in this
+  repository.
+
+## Build
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+git clone https://github.com/readmet3xt-lab/foxhound
+cd foxhound
+cargo build --release --locked -p victory
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+The diagnostics build (frame timelines, captures, GPU timing) is optional:
+`cargo build --locked --profile diag -p victory --features diagnostics`.
 
-Before the first run, ahead of time (both can be stopped and go on later):
+## Set up
+
+1. **Point it at your copy.** Copy `victory.example.toml` to `victory.toml` (git-ignored) and set `game_dir` to
+   your dump's folder. Keep your files **outside** this repository; the tools refuse otherwise.
+
+   ```toml
+   [paths]
+   game_dir = 'D:\Games\MyDump'
+   ```
+
+2. **DLSS (optional, recommended on RTX).** Download the Streamline SDK release from
+   <https://github.com/NVIDIA-RTX/Streamline/releases> (tested: `streamline-sdk-v2.14.16.zip`; it comes under
+   NVIDIA's RTX SDK license, which you accept yourself), unpack it **outside** the repository, and point foxhound
+   at its `bin\x64` folder:
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable('VICTORY_STREAMLINE_DIR', 'D:\sdk\streamline-sdk-v2.14.16\bin\x64', 'User')
+   ```
+
+   Check it without the title: `target\release\victory.exe upscaler-check --device` (and `--present` for Frame
+   Generation). Details: [docs/dlss.md](docs/dlss.md). Without Streamline the launcher runs without DLSS.
+
+3. **Translate the shaders ahead** (a few minutes, once per new build of foxhound):
+
+   ```powershell
+   $env:VICTORY_HOST_WAVE = '32'   # NVIDIA runs 32-lane waves; leave it out on AMD
+   target\release\victory.exe shaders
+   ```
+
+## Run
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+.\scripts\play-foxhound.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
 ```
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+| Option | What |
+|---|---|
+| *(none)* | Series X profile, 2560x1440, DLSS Quality (if Streamline is set up), all fixes on |
+| `-Dlss off` / `dlaa` / `balanced` / `performance` | the title's own upscaling, or another DLSS mode |
+| `-FrameGen` | DLSS Frame Generation (about +1.4 GB of VRAM) |
+| `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
+| `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
+| `-Build diag` | the diagnostics build |
+| `-More @{VICTORY_X='1'}` | add or override any switch |
 
-## What is different here
+Full screen: start the game, then run `.\scripts\fullscreen.ps1` in another window (borderless, the size of the
+monitor the game is on).
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
+Logs go to `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`. Close the game window to quit.
 
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+### Warming up (once per build or driver)
+
+The first run of a build compiles pipelines while playing and stutters. Runs write down every pipeline the title
+makes (`VICTORY_PIPELINE_BOOK=1`, set by the launcher); afterwards make them all ahead:
+
+```powershell
+$env:VICTORY_HOST_WAVE = '32'
+target\release\victory.exe warm
+```
+
+The NVIDIA driver keeps its compiled pipelines **per program path**: a build run from another folder starts cold.
+
+## Switches worth knowing
+
+Every `VICTORY_...` switch is described in a comment where the code reads it. The launcher's full set is in
+`scripts/play-foxhound.ps1`; these are the ones foxhound added or changed:
+
+| Switch | Launcher | What |
+|---|---|---|
+| `VICTORY_DLSS`, `VICTORY_DLSS_MODE` | `quality` | DLSS Super Resolution through the title's FidelityFX dispatch |
+| `VICTORY_FRAMEGEN` | off (`-FrameGen`) | DLSS Frame Generation, with the picture before the HUD tagged |
+| `VICTORY_NATIVE_1440P` | on | Series X renders and outputs 2560x1440 (image patched) |
+| `VICTORY_SOFT_VIEWS` | `copies` | the title's tiled-heap page mappings kept without Windows views: no freezes at scene cuts |
+| `VICTORY_WC_NO_BACK`, `_MIN_KB` | `1`, `1024` | shader writes into big write-combined copies are not copied back |
+| `VICTORY_AMBIENT`, `VICTORY_AMBIENT_SPECULAR` | `0.8`, `1` | estimates of indirect light and of reflections (no ray tracing) |
+| `VICTORY_EARLY_DEPTH` | on | pixel programs keep the console's early depth test |
+| `VICTORY_PRELUDE_UPLOADS`, `VICTORY_SHOW_NEW_LATER`, `VICTORY_TABLED_REREAD` | on | texture upload order and slot changes (flicker, device losses) |
+| `VICTORY_SYNC_IN_PLACE`, `VICTORY_SPANS_QUICK`, `VICTORY_HEAP_SYNC_AT_SUBMIT` | on | cheaper descriptor-heap bookkeeping |
+| `VICTORY_PORT_CONSTANTS` | off | the title's constants heap read in place: less CPU, but on a 12 GB card the GPU then waits (slower overall) |
+| `VICTORY_FRAME_INTERVAL_MS` | off | experimental: the title's own 30 fps setting patched to a higher rate |
+| `VICTORY_BVH_BUILDER` | off | the title's ray tracing (slow, broken) |
+
+## How it works, and the findings
+
+- [docs/architecture.md](docs/architecture.md): the layer's parts.
+- [docs/findings.md](docs/findings.md): measurements behind the choices.
+- [docs/dlss.md](docs/dlss.md): DLSS and Frame Generation.
+- [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md): the title's ray tracing and the light estimate.
+- [docs/replay.md](docs/replay.md): recording a frame and replaying it.
+- [docs/asset-policy.md](docs/asset-policy.md): what may and may not be in this repository.
+
+## Contributing
+
+Issues and pull requests are welcome. Never attach or commit anything from the game: files, dumps, shader dumps
+or extracted data. Describe faults technically. `cargo xtask policy` (also the pre-commit hook in `.githooks/`)
+checks the asset policy.
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+A tree of other people's work with more on top; the history is kept, and commits taken from elsewhere name the
+commit and its author.
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors: the loader, the runtime
+  services, the Direct3D 12 back end and the shader recompiler.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and the people whose pull requests it carries.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: the submission line, write
+  guards, relay and much of the speed work this fork starts from.
+- **[codec-d/cool_fox](https://github.com/codec-d/cool_fox)**: the base this fork was taken from.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: native 1440p output, the FidelityFX path on Series X,
+  ray tracing fixes.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**: the light estimate, renderer
+  ports (constants heap in place, heap records), texture upload order, the frame rate switch; ported commits name
+  their source.
+- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**, **[myokex/victory-amd](https://github.com/myokex/victory-amd)**
+  (with Spexivus, joroyt and tightfall), Joshua Odom, **Geckomacabre** and **cxy0072019-sketch**.
+- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same title behaves under another
+  layer; no code of it is here.
+- NVIDIA Streamline, DLSS and Reflex are NVIDIA's; they are loaded at run time from a folder you supply.
+- Much of this fork's code was written with [Claude Code](https://claude.com/claude-code).
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not covered is named in
+[docs/asset-policy.md](docs/asset-policy.md).

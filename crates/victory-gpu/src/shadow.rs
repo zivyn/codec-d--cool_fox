@@ -1403,14 +1403,13 @@ impl Settled {
     /// Whether `[from, to)` lies in a note made in `epoch` that `still`
     /// (given the note's tick) says nothing has touched since.
     fn holds(&self, from: usize, to: usize, epoch: u64, still: impl FnOnce(u64) -> bool) -> bool {
-        let tick = {
-            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
-            match notes.iter().find(|n| n.3 == epoch && n.0 <= from && to <= n.1) {
-                Some(n) => n.2,
-                None => return false,
-            }
-        };
-        still(tick)
+        self.find(from, to, epoch).is_some_and(still)
+    }
+
+    /// The tick of a note made in `epoch` that holds `[from, to)`.
+    fn find(&self, from: usize, to: usize, epoch: u64) -> Option<u64> {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        notes.iter().find(|n| n.3 == epoch && n.0 <= from && to <= n.1).map(|n| n.2)
     }
 
     /// `[from, to)` was found to hold nothing new by a look made after
@@ -1429,6 +1428,11 @@ impl Settled {
         notes[at] = (from, to, tick, epoch);
     }
 }
+
+/// A range copied whole this long is cut into pieces of [`WHOLE_PART`] for
+/// the threads of [`wide_each`].
+const WHOLE_LONG: usize = 4 << 20;
+const WHOLE_PART: usize = 2 << 20;
 
 const NOT_WATCHED: u8 = 2;
 /// Watched, not by the kernel but by the guards, when last asked about.
@@ -3919,6 +3923,18 @@ impl Shadow {
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            let began = std::time::Instant::now();
+            let same = self.nothing_new_look(address, len);
+            crate::copystat::add(crate::copystat::C::LooksNs, began.elapsed().as_nanos() as u64);
+            same
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        self.nothing_new_look(address, len)
+    }
+
+    fn nothing_new_look(&self, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -3934,14 +3950,25 @@ impl Shadow {
         // Read ahead of the look: whatever touches the range after this is
         // stamped above `tick`, and whatever puts shaders on it bumps `epoch`.
         let (tick, epoch) = (crate::watch::tick(), self.settled.epoch());
-        if memo && self.settled.holds(from, to, epoch, |tick| crate::watch::untouched_since(from, to, tick)) {
-            #[cfg(feature = "diagnostics")]
-            {
-                use crate::copystat::{C, add};
-                add(C::Checked, (to - from) as u64);
-                add(C::Unchanged, (to - from) as u64);
+        if memo {
+            match self.settled.find(from, to, epoch) {
+                Some(noted) if crate::watch::untouched_since(from, to, noted) => {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::NoteHits, 1);
+                        add(C::Checked, (to - from) as u64);
+                        add(C::Unchanged, (to - from) as u64);
+                    }
+                    return true;
+                }
+                #[cfg(feature = "diagnostics")]
+                Some(_) => crate::copystat::add(crate::copystat::C::NoteTouched, 1),
+                #[cfg(feature = "diagnostics")]
+                None => crate::copystat::add(crate::copystat::C::NoteNone, 1),
+                #[cfg(not(feature = "diagnostics"))]
+                _ => {}
             }
-            return true;
         }
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
@@ -3950,8 +3977,15 @@ impl Shadow {
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
         drop(copied);
-        if same && memo && crate::watch::untouched_since(from, to, tick) {
-            self.settled.note(from, to, tick, epoch);
+        if same && memo {
+            if crate::watch::untouched_since(from, to, tick) {
+                self.settled.note(from, to, tick, epoch);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::NoteMade, 1);
+            } else {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::NoteUnknown, 1);
+            }
         }
         #[cfg(feature = "diagnostics")]
         if same {
@@ -3970,9 +4004,14 @@ impl Shadow {
         if from >= to || self.place.is_some() {
             return false;
         }
-        settled_on()
+        let held = settled_on()
             && matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED)
-            && self.settled.holds(from, to, self.settled.epoch(), |tick| crate::watch::untouched_since(from, to, tick))
+            && self.settled.holds(from, to, self.settled.epoch(), |tick| crate::watch::untouched_since(from, to, tick));
+        #[cfg(feature = "diagnostics")]
+        if held {
+            crate::copystat::add(crate::copystat::C::NoteHits, 1);
+        }
+        held
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
@@ -4005,11 +4044,58 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
+        self.whole_check(from, to);
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Diagnostic (`VICTORY_WHOLE_CHECK=1`; off by default): before a long
+    /// range of memory that is not watched is copied whole, title memory
+    /// is compared with what the copy holds, and the 4 KiB pages that
+    /// differ are counted and said (the first 32 times, then at powers of
+    /// two) with whether shaders were ever declared to write the copy. A
+    /// range whose pages never differ when `written` is false is a range
+    /// the title and the runtime do not change between its refreshes
+    /// (the FSR4 working buffer, 21 MB, was copied whole twice a frame:
+    /// run P2-3). Not for copies with shader ranges pending (their gaps are
+    /// refreshed one by one).
+    #[cfg(feature = "diagnostics")]
+    fn whole_check(&self, from: usize, to: usize) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if to - from < WHOLE_LONG || !*ON.get_or_init(|| crate::switch::on("VICTORY_WHOLE_CHECK")) {
+            return;
+        }
+        let start = self.start as usize;
+        let mut title = vec![0u8; 1 << 20];
+        let (mut differing, mut checked, mut at) = (0u64, 0u64, from);
+        while at < to {
+            let n = title.len().min(to - at);
+            if crate::host::read_into(at as *const u8, &mut title[..n]) {
+                // SAFETY: inside the copy's mapping (`update` cut the range).
+                let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                differing += title[..n].chunks(4096).zip(held.chunks(4096)).filter(|(a, b)| a != b).count() as u64;
+                checked += n as u64;
+            }
+            at += n;
+        }
+        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if said <= 32 || said.is_power_of_two() {
+            tracing::info!(
+                said,
+                copy = self.id,
+                title = format_args!("{from:#x}+{:#x}", to - from),
+                checked_mb = checked >> 20,
+                differing_pages = differing,
+                shaders_declared = self.written.load(Ordering::Relaxed),
+                on_the_card = self.card.is_some(),
+                "a range of memory that is not watched, about to be copied whole (VICTORY_WHOLE_CHECK=1)"
+            );
+        }
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
@@ -4309,6 +4395,16 @@ impl Shadow {
                 // SAFETY: inside the mapping, as above.
                 crate::host::copy_mapped(unsafe { self.data.add(a) }, (start + a) as *const u8, b - a, false);
                 crate::host::upcheck::note(self.id, a, &was, &self.card_held(a, b - a));
+            });
+        } else if to - from >= WHOLE_LONG && crate::toggled!("VICTORY_WIDE_WHOLE") {
+            // A long range, on several threads: 21 MB of memory that is not
+            // watched, copied whole twice a frame on one thread, were 11 ms
+            // of a frame's 50 of refreshes (run P2-3).
+            let (dst, src) = (at as usize, from);
+            let parts = (to - from).div_ceil(WHOLE_PART);
+            wide_each(parts, move |i| {
+                let (lo, hi) = (i * WHOLE_PART, ((i + 1) * WHOLE_PART).min(to - from));
+                crate::host::copy_mapped((dst + lo) as *mut u8, (src + lo) as *const u8, hi - lo, false);
             });
         } else {
             crate::host::copy_mapped(at, from as *const u8, to - from, false);

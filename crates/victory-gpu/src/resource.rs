@@ -2714,6 +2714,21 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+        // The big ones are named with how they were made: heap type, CPU page
+        // property, pool, flags (what the title could write from the CPU).
+        if desc.width >= 16 << 20 {
+            tracing::info!(
+                at = format_args!("{:#x}", resource.data() as u64),
+                bytes = desc.width,
+                heap_kind = heap.kind,
+                cpu_pages = heap.cpu_pages,
+                pool = heap.pool,
+                heap_flags,
+                desc = ?desc,
+                committed = matches!(resource.backing, Backing::Committed(_)),
+                "a big title buffer"
+            );
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }

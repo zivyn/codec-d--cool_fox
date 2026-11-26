@@ -1058,6 +1058,40 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Which of six kinds [`kept`] counts a view under: [`KIND_CONSTANT`],
+/// [`KIND_SHADER`], [`KIND_UNORDERED`], [`KIND_SAMPLER`],
+/// [`KIND_CONSOLE_SAMPLER`], [`KIND_PLACED`]. Plain indices, not an enum, so
+/// the breakdown can be a plain array.
+///
+/// Gated the same as [`kept`]/[`views_kept`], their only callers (besides
+/// the tests that check them directly): with `diagnostics` off, nothing
+/// else in the file would use these, which `-D warnings` turns into a hard
+/// error, not just a warning, in configurations that enable it.
+#[cfg(all(windows, feature = "diagnostics"))]
+const KIND_CONSTANT: usize = 0;
+#[cfg(all(windows, feature = "diagnostics"))]
+const KIND_SHADER: usize = 1;
+#[cfg(all(windows, feature = "diagnostics"))]
+const KIND_UNORDERED: usize = 2;
+#[cfg(all(windows, feature = "diagnostics"))]
+const KIND_SAMPLER: usize = 3;
+#[cfg(all(windows, feature = "diagnostics"))]
+const KIND_CONSOLE_SAMPLER: usize = 4;
+#[cfg(all(windows, feature = "diagnostics"))]
+const KIND_PLACED: usize = 5;
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn kind_index(view: &View) -> usize {
+    match view {
+        View::Constant(..) => KIND_CONSTANT,
+        View::Shader(..) => KIND_SHADER,
+        View::Unordered(..) => KIND_UNORDERED,
+        View::Sampler(..) => KIND_SAMPLER,
+        View::ConsoleSampler(..) => KIND_CONSOLE_SAMPLER,
+        View::Placed(..) => KIND_PLACED,
+    }
+}
+
 /// For the memory line: the distinct views kept ([`Views`]), those of them
 /// free for reuse, and the bytes the table and its index hold for them (an
 /// estimate: an entry of the table, and one of the index with its share of
@@ -1066,21 +1100,73 @@ fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// record, or all of them with `VICTORY_VIEW_INLINE=0`), the shapes of
 /// placed views kept, and the views named whole in their records since the
 /// start: constant buffer views, views of placed memory.
+///
+/// The second element is the same table, by [`kind_index`]: for each of the
+/// six `View` kinds, how many of its entries are occupied (named in
+/// [`Views::index`] right now) versus sitting on [`Views::free`] (a freed
+/// slot keeps its *last* occupant's kind — [`Views::entry`] only overwrites
+/// `list[i].0` when the slot is reused — so a freed entry is counted by
+/// what it last held, never by a "current" kind it no longer has), and that
+/// kind's flat share of bytes: one `list` slot each, nothing more. That
+/// share deliberately does **not** include: any spare `Vec` capacity beyond
+/// `list.len()`, or `index`/`shapes`/`shape_index`'s own tree overhead —
+/// none of those three are attributable to one kind, since the index does
+/// not record which kind a key belongs to; **the first element's byte
+/// estimate above folds those three in, undivided, on top of the same flat
+/// per-entry share this breakdown also counts.** `by_resource`'s own
+/// memory is not in either number — the first element's formula never
+/// accounted for it either, so this breakdown is not omitting something
+/// the original estimate had; neither number has ever included it.
+/// Nothing the GPU/driver itself holds is in either number. **The six
+/// kinds' third column does not sum to the first element's byte estimate
+/// above, and is not meant to** — it answers "how many slots, of which
+/// kind, and their flat share," not "where did every byte go." This
+/// identifies which kinds hold entries; it says nothing about which
+/// specific entries are still meaningful to the title, only how many there
+/// are and whether the table itself still considers them occupied.
+///
+/// One pass over `Views::list`, plus one over the normally much smaller
+/// `Views::free` (no separate scan, no temporary allocation sized by
+/// `list.len()`, no second lock acquisition) — the same order of work the
+/// first element alone already did. [`crate::copystat::log_memory`] calls
+/// this once and logs both parts; nothing on the write path
+/// ([`Views::entry`], [`forget`], [`words_for`]) is touched. `log_memory`
+/// itself runs no more than once every 5 seconds
+/// (`Host`'s `self.logged.elapsed() >= Duration::from_secs(5)` gate in
+/// `host.rs`) — not "every sixth line," which is a different, unrelated
+/// cadence belonging to [`log_memory_map`](crate::copystat) alone.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn views_kept() -> [u64; 8] {
+pub(crate) fn views_kept() -> ([u64; 8], [[u64; 3]; 6]) {
+    kept(&views_read())
+}
+
+/// The counting itself, taking `views` directly rather than through
+/// [`views_read`]: a pure function of one snapshot, so a test can check its
+/// arithmetic against a `Views` value it builds and owns, with no shared
+/// state and nothing to race against (see `kind_breakdown_is_exact_for_a_\
+/// known_table` below). [`views_kept`] is the only real caller.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn kept(views: &Views) -> ([u64; 8], [[u64; 3]; 6]) {
     use std::sync::atomic::Ordering::Relaxed;
-    let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
+    // Pass 1, over `list`: every kind's total (occupied and free alike).
+    let mut by_kind = [[0u64; 3]; 6];
     for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
-        }
+        let k = kind_index(view);
+        by_kind[k][0] += 1;
+        by_kind[k][2] += each;
     }
-    [
+    // Pass 2, over the normally much smaller `free`: move each freed
+    // index's count from "occupied" to "free" within its own kind.
+    for &i in &views.free {
+        let k = kind_index(&views.list[i as usize].0);
+        by_kind[k][0] -= 1;
+        by_kind[k][1] += 1;
+    }
+    let constants = by_kind[KIND_CONSTANT][0] + by_kind[KIND_CONSTANT][1];
+    let placed = by_kind[KIND_PLACED][0] + by_kind[KIND_PLACED][1];
+    let summary = [
         views.list.len() as u64,
         views.free.len() as u64,
         views.list.capacity() as u64 * each
@@ -1092,7 +1178,8 @@ pub(crate) fn views_kept() -> [u64; 8] {
         views.shapes.len() as u64,
         NAMED_WHOLE[0].load(Relaxed),
         NAMED_WHOLE[1].load(Relaxed),
-    ]
+    ];
+    (summary, by_kind)
 }
 
 impl View {
@@ -1891,5 +1978,150 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    // --- Memory-validation pass (MEMORY_VALIDATION.md): the two tests below
+    // check [`kept`]'s per-kind counting arithmetic -- the contribution's
+    // own scope, per a later review round that narrowed it to exactly this.
+    // Both build and own a local `Views` value; neither touches the real,
+    // shared `VIEWS` static, a raw pointer, or any unsafe code, so neither
+    // can race another test or any hot-path call, and both need
+    // `feature = "diagnostics"` to exist at all (the same gate `kept`
+    // itself has). Earlier revisions of this pass also carried tests that
+    // validated specific `MEMORY_DEEP_RESEARCH.md` §1.5 hypotheses
+    // (`Sampler`/`ConsoleSampler`/overflow-`Constant` entries being
+    // unreachable by `forget`; distinct descriptions of one live resource
+    // accumulating) and a timing benchmark -- removed from this
+    // contribution after a review found real soundness issues in them (an
+    // undefined-behavior `transmute` of a partially-initialized struct,
+    // writes through pointers derived from `as_ptr()` rather than
+    // `as_mut_ptr()`, and a race on `Views::free`'s exact membership
+    // between dropping one lock and taking another, under this file's
+    // real parallel test execution). Those findings were already reached
+    // and recorded honestly in `MEMORY_VALIDATION.md` before their tests
+    // existed; removing the tests does not retract the findings, only the
+    // since-judged-unnecessary extra surface of carrying them as committed,
+    // unsafe-code-adjacent tests for a contribution scoped to the
+    // breakdown's own counters. See `MEMORY_VALIDATION.md`'s "Update,
+    // round 3" for the full reasoning.
+
+    /// [`kept`]'s per-kind arithmetic, checked against a `Views` value this
+    /// test builds and owns — no shared state, nothing to race against.
+    /// Three `Shader` entries (one on the free list), one `Sampler`, two
+    /// `Placed`, and one freed slot whose last occupant was a `Constant`
+    /// (freed slots keep their last view's word until reused, so they are
+    /// still classified by it — see [`kept`]'s doc comment).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn kind_breakdown_is_exact_for_a_known_table() {
+        let list = vec![
+            (View::Shader(1, None), 1),
+            (View::Shader(2, None), 1),
+            (View::Shader(3, None), 1), // index 2: on the free list below
+            (View::Sampler([0; 13]), 1),
+            (View::Placed(false, [0; 14], [0; 16]), 1),
+            (View::Placed(true, [1; 14], [1; 16]), 1),
+            (View::Constant(0x1000, 256), 2), // index 6: on the free list below
+        ];
+        let free = vec![6, 2];
+        let views = Views {
+            list,
+            index: Default::default(),
+            by_resource: Default::default(),
+            free,
+            shapes: Vec::new(),
+            shape_index: Default::default(),
+        };
+        let (summary, by_kind) = kept(&views);
+        let each = size_of::<(View, u32)>() as u64;
+        assert_eq!(by_kind[KIND_CONSTANT], [0, 1, each], "Constant: none occupied, one freed");
+        assert_eq!(by_kind[KIND_SHADER], [2, 1, 3 * each], "Shader: two occupied, one freed");
+        assert_eq!(by_kind[KIND_UNORDERED], [0, 0, 0], "Unordered: none at all");
+        assert_eq!(by_kind[KIND_SAMPLER], [1, 0, each], "Sampler: one occupied, none freed");
+        assert_eq!(by_kind[KIND_CONSOLE_SAMPLER], [0, 0, 0], "ConsoleSampler: none at all");
+        assert_eq!(by_kind[KIND_PLACED], [2, 0, 2 * each], "Placed: two occupied, none freed");
+        // The breakdown must account for every entry exactly once: this is
+        // the property that would catch a kind miscounted or double-counted
+        // if this test's per-kind numbers above were ever wrong together.
+        let (total_occupied, total_free): (u64, u64) =
+            by_kind.iter().fold((0, 0), |(o, f), k| (o + k[0], f + k[1]));
+        assert_eq!(total_occupied + total_free, views.list.len() as u64);
+        assert_eq!(total_free, views.free.len() as u64);
+        // Cross-checked against the existing summary's own Constant/Placed
+        // totals (occupied + free, same definition `kept` always used).
+        assert_eq!(summary[0], views.list.len() as u64);
+        assert_eq!(summary[1], views.free.len() as u64);
+        assert_eq!(summary[3], by_kind[KIND_CONSTANT][0] + by_kind[KIND_CONSTANT][1], "constants");
+        assert_eq!(summary[4], by_kind[KIND_PLACED][0] + by_kind[KIND_PLACED][1], "placed");
+    }
+
+    /// A second, isolated fixture (its own `Views`, no shared state),
+    /// requested after an independent review of the first one noted it
+    /// left `index` empty despite having "occupied" entries, and checked
+    /// `Unordered`/`ConsoleSampler` only at zero. This one gives every one
+    /// of the six kinds a real occupied entry (not just a zero case), then
+    /// exercises the exact property the now-removed "a kind's entry count
+    /// never shrinks" assertion got wrong: reusing a freed index for a
+    /// *different* kind — exactly what [`Views::entry`]'s `free.pop()`
+    /// path does, overwriting `list[i].0` in place — moves one unit from
+    /// the old kind's total to the new kind's, with nothing actually
+    /// removed from the table as a whole.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn kind_breakdown_covers_all_six_kinds_and_cross_kind_recycling() {
+        let each = size_of::<(View, u32)>() as u64;
+        // One occupied entry of every kind; nothing free yet.
+        let before = Views {
+            list: vec![
+                (View::Shader(0x9_1000, None), 1),        // index 0: recycled below
+                (View::Unordered(0x9_2000, 0, None), 1),  // index 1
+                (View::Sampler([7; 13]), 1),               // index 2
+                (View::ConsoleSampler([8; 27]), 1),         // index 3
+                (View::Placed(false, [0; 14], [0; 16]), 1), // index 4: freed below
+                (View::Constant(0x9_3000, 256), 1),         // index 5
+            ],
+            index: Default::default(),
+            by_resource: Default::default(),
+            free: Vec::new(),
+            shapes: Vec::new(),
+            shape_index: Default::default(),
+        };
+        let (_, before_kind) = kept(&before);
+        for (k, name) in [
+            (KIND_CONSTANT, "Constant"),
+            (KIND_SHADER, "Shader"),
+            (KIND_UNORDERED, "Unordered"),
+            (KIND_SAMPLER, "Sampler"),
+            (KIND_CONSOLE_SAMPLER, "ConsoleSampler"),
+            (KIND_PLACED, "Placed"),
+        ] {
+            assert_eq!(before_kind[k], [1, 0, each], "{name}: exactly one occupied entry, none free");
+        }
+
+        // Index 0 (a Shader) is recycled for an Unordered view -- the same
+        // in-place overwrite `Views::entry`'s `free.pop()` branch performs
+        // (`self.list[i as usize].0 = view.clone()`) -- and index 4 (the
+        // Placed entry) is freed and left that way.
+        let before_len = before.list.len();
+        let mut after = before;
+        after.list[0] = (View::Unordered(0x9_4000, 0, None), 2);
+        after.free = vec![4];
+        let (_, after_kind) = kept(&after);
+        assert_eq!(after_kind[KIND_SHADER], [0, 0, 0], "Shader's only entry is gone -- recycled into a different kind, not freed as Shader");
+        assert_eq!(after_kind[KIND_UNORDERED], [2, 0, 2 * each], "Unordered now holds its own entry plus the recycled one");
+        assert_eq!(after_kind[KIND_PLACED], [0, 1, each], "Placed's one entry is now on the free list, still counted as Placed");
+        // The two kinds untouched by either change are exactly unchanged.
+        assert_eq!(after_kind[KIND_SAMPLER], before_kind[KIND_SAMPLER]);
+        assert_eq!(after_kind[KIND_CONSOLE_SAMPLER], before_kind[KIND_CONSOLE_SAMPLER]);
+        assert_eq!(after_kind[KIND_CONSTANT], before_kind[KIND_CONSTANT]);
+        // The property the removed assertion got wrong, stated directly:
+        // Shader's total (occupied + free) dropped from 1 to 0 even though
+        // nothing was freed FOR Shader -- its slot was recycled away
+        // entirely into a different kind. A real "nothing shrinks" check
+        // only holds for `list.len()` as a whole (unchanged here, 6 either
+        // way), never for one kind's own total.
+        let shader_total = |k: &[[u64; 3]; 6]| k[KIND_SHADER][0] + k[KIND_SHADER][1];
+        assert!(shader_total(&after_kind) < shader_total(&before_kind));
+        assert_eq!(before_len, after.list.len(), "list.len() itself is unaffected by recycling");
     }
 }

@@ -290,14 +290,16 @@ What to expect:
   memory. Use 720p or lower on Series S.
 - Series S cannot go above 1080p: its output is 1080p, and the script says so
   and stops if asked for more.
-- **On 16 GB PCs, try `-WindowsBarMB 3072` with resizable BAR enabled.**
+- **16 GB PCs: turned on for you, best with resizable BAR enabled.**
   On the tested 16 GB PC with an RTX 3060, shared GPU memory approached its
   limit about a minute into the world (`0x8007000E`, then a driver fault).
   The 3072 MiB cap from [PR #6](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/6)
   let eligible title memory windows use CPU-mapped VRAM while the card had room.
-  The launcher leaves this off by default. Pass a cap in MiB to
-  `play-nvidia.ps1` or any resolution wrapper. `-WindowsBarMB 0` disables it,
-  and `-More @{VICTORY_WINDOWS_BAR_MB='...'}` takes precedence.
+  The launcher sets it by itself on PCs with under 24 GB of RAM (Windows lets
+  the card share half the RAM) and leaves it off on larger ones. Pass a cap in
+  MiB to `play-nvidia.ps1` or any resolution wrapper to choose for yourself:
+  `-WindowsBarMB 0` disables it, and `-More @{VICTORY_WINDOWS_BAR_MB='...'}`
+  takes precedence.
 
 ### More than one card, and other cards
 

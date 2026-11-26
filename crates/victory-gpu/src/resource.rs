@@ -627,6 +627,84 @@ pub(crate) fn family(format: u32) -> u32 {
 /// sRGB formats and their linear twins.
 pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 
+/// Views made in another format than their typed host texture's, since the
+/// start ([`note_cast`]).
+pub(crate) static CAST_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Notes a `kind` of view ("render target", "shader resource", ...) whose
+/// title format `view` is not its typed host texture's `own`: D3D12 has
+/// such a view read or write in the texture's format (shader views are
+/// given it, `descriptor::host::fits`) or leaves it to the driver (render
+/// targets), so an sRGB view of UNORM memory loses its conversion - linear
+/// light stored in 8 bits without it keeps few steps in the dark. Each pair
+/// is said once, with what the host allows of format casts.
+/// shortcut: instrumentation for the posterised colours on NVIDIA
+/// (2026-11-26); typeless host textures and the same format pass silently.
+#[cfg(windows)]
+pub(crate) fn note_cast(kind: &'static str, own: u32, view: u32) {
+    if view == 0 || view == own || target_format(view) == own {
+        return;
+    }
+    let typeless = family(own) == own && family(own + 1) == own;
+    if typeless {
+        return;
+    }
+    CAST_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<(&'static str, u32, u32)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 128 && seen.insert((kind, own, view)) {
+        let (fully_typed, relaxed) = casting_support();
+        tracing::info!(
+            kind,
+            texture_format = own,
+            view_format = view,
+            same_family = family(own) == family(view),
+            srgb_pair = SRGB.iter().any(|&(s, l)| (s == view && l == own) || (s == own && l == view)),
+            host_casts_fully_typed = fully_typed,
+            host_relaxed_casts = relaxed,
+            "a view in another format than its typed host texture"
+        );
+    }
+}
+
+/// Whether the host may view a typed texture in another format of its
+/// family (`CastingFullyTypedFormatSupported`), and in castable formats
+/// named at creation (`RelaxedFormatCastingSupported`).
+#[cfg(windows)]
+pub(crate) fn casting_support() -> (bool, bool) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    static SUPPORT: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *SUPPORT.get_or_init(|| {
+        let Some(host) = crate::host::host() else {
+            return (false, false);
+        };
+        let mut o3 = D3D12_FEATURE_DATA_D3D12_OPTIONS3::default();
+        let mut o12 = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+        // SAFETY: feature structures of their sizes.
+        let (a, b) = unsafe {
+            (
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS3,
+                    (&raw mut o3).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS3>() as u32,
+                ),
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS12,
+                    (&raw mut o12).cast(),
+                    size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS12>() as u32,
+                ),
+            )
+        };
+        let support = (
+            a.is_ok() && o3.CastingFullyTypedFormatSupported.as_bool(),
+            b.is_ok() && o12.RelaxedFormatCastingSupported.as_bool(),
+        );
+        tracing::info!(fully_typed = support.0, relaxed = support.1, "host format casting");
+        support
+    })
+}
+
 /// The format a view of a title texture must name when its host copy is
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.

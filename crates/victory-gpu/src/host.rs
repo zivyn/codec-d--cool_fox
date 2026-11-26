@@ -6090,6 +6090,11 @@ impl Host {
         desc: Option<&D3D12_RENDER_TARGET_VIEW_DESC>,
     ) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         let slot = self.next_rtv.fetch_add(1, Ordering::Relaxed) % RTV_RING;
+        if let (Some(r), Some(d)) = (resource, desc) {
+            // SAFETY: a live resource.
+            let own = unsafe { r.GetDesc() }.Format.0 as u32;
+            crate::resource::note_cast("render target", own, d.Format.0 as u32);
+        }
         // SAFETY: a slot of our heap and a live resource, or none with a
         // description (a typed null view).
         unsafe {

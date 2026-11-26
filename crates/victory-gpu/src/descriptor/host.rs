@@ -4060,6 +4060,11 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if let Some(format) = format
         && !typeless
     {
+        crate::resource::note_cast(
+            if unordered { "unordered access" } else { "shader resource" },
+            own,
+            view,
+        );
         *format = d.Format;
     }
     true

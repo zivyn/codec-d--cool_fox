@@ -116,6 +116,9 @@ struct Created {
     flags: u32,
     max_render: [u32; 2],
     max_output: [u32; 2],
+    /// Made smaller than asked for the shipping FSR4 (DLSS on): the title's
+    /// own upscaling must not run on it at the size asked.
+    clamped: bool,
 }
 
 static CONTEXTS: Mutex<Option<HashMap<usize, Created>>> = Mutex::new(None);
@@ -175,22 +178,65 @@ fn contexts<T>(f: impl FnOnce(&mut HashMap<usize, Created>) -> T) -> T {
     f(contexts.get_or_insert_with(HashMap::new))
 }
 
+/// The largest output the title's shipping FSR4 accepts: it carries only the
+/// fixed-resolution quality shader tables of the Series S (1280x720 in,
+/// 1920x1080 out). Other sizes fail the context's creation ("Shipping FSR4
+/// configuration mismatch: maxUpscaleSize must be 1920x1080", "maxRenderSize
+/// must be 1280x720 for a tight fixed-resolution allocation or 1920x1080 for
+/// the legacy allocation"), and the title, which does not look at the result,
+/// divides by zero at its first upscaling (2026-11-26, 4070 SUPER).
+const SHIPPING_MAX_OUTPUT: [u32; 2] = [1920, 1080];
+const SHIPPING_MAX_RENDER: [u32; 2] = [1280, 720];
+
+/// The sizes the title's shipping FSR4 accepts for a context, if `render` and
+/// `output` are not those: (render, output).
+fn shipping_sizes(render: [u32; 2], output: [u32; 2]) -> Option<([u32; 2], [u32; 2])> {
+    ((render, output) != (SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT)).then_some((SHIPPING_MAX_RENDER, SHIPPING_MAX_OUTPUT))
+}
+
 extern "C" fn ffxCreateContext(context: *mut *mut c_void, desc: *mut Header, memory: *const c_void) -> u32 {
     let Some(create) = original(0) else { return PARAMETER };
     // SAFETY: the title's own function, with its arguments.
-    let code = unsafe { std::mem::transmute::<*const (), Create>(create)(context, desc, memory) };
-    if code != OK || context.is_null() || desc.is_null() {
-        return code;
-    }
+    let call = |desc: *mut Header| unsafe { std::mem::transmute::<*const (), Create>(create)(context, desc, memory) };
     // SAFETY: the title passes a chain of descriptions.
-    if unsafe { (*desc).kind } != CREATE_UPSCALE {
+    let upscaler = !desc.is_null() && unsafe { (*desc).kind } == CREATE_UPSCALE;
+    if !upscaler {
+        return call(desc);
+    }
+    // SAFETY: an upscaler description, by its type.
+    let asked = unsafe { desc.cast::<CreateUpscale>().read() };
+    // With DLSS taking the upscalings, the title's own context only has to
+    // exist (for its queries and our bookkeeping): it is made at a size its
+    // shipping tables accept, and DLSS gets the sizes the title asked for.
+    let shipping = streamline::upscaling().then(|| shipping_sizes(asked.max_render, asked.max_output)).flatten();
+    let clamped = shipping.is_some();
+    let code = if let Some((render, output)) = shipping {
+        let mut fitted = asked;
+        fitted.max_render = render;
+        fitted.max_output = output;
+        // SAFETY: the title's description, rewritten for the call and put back.
+        unsafe { desc.cast::<CreateUpscale>().write(fitted) };
+        let code = call(desc);
+        // SAFETY: as above.
+        unsafe { desc.cast::<CreateUpscale>().write(asked) };
+        tracing::info!(
+            asked_render = ?asked.max_render,
+            asked_output = ?asked.max_output,
+            made_render = ?fitted.max_render,
+            made_output = ?fitted.max_output,
+            code,
+            "FidelityFX: the title's upscaler made at a size its shipping FSR4 accepts; DLSS upscales to the size asked"
+        );
+        code
+    } else {
+        call(desc)
+    };
+    if code != OK || context.is_null() {
         return code;
     }
-    // SAFETY: an upscaler description, by its type; the context was made.
-    let (created, handle) = unsafe {
-        let d = desc.cast::<CreateUpscale>().read();
-        (Created { flags: d.flags, max_render: d.max_render, max_output: d.max_output }, *context as usize)
-    };
+    // SAFETY: the context was made.
+    let handle = unsafe { *context } as usize;
+    let created = Created { flags: asked.flags, max_render: asked.max_render, max_output: asked.max_output, clamped };
     tracing::info!(
         context = format_args!("{handle:#x}"),
         flags = format_args!("{:#x}", created.flags),
@@ -260,6 +306,14 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     match streamline::upscale(&up) {
         Taken::Dlss => OK,
         Taken::Noted => own(),
+        Taken::No(why) if created.clamped => {
+            // The title's FidelityFX on a context made for 1080p at the
+            // output size asked would read past its tables: no upscaling
+            // this frame (the output keeps the last one) rather than that.
+            refused(why);
+            once!(warn, "FidelityFX: DLSS did not take an upscaling on a context made smaller than asked; none ran");
+            OK
+        }
         Taken::No(why) => {
             streamline::forwarded();
             refused(why);
@@ -387,7 +441,7 @@ mod tests {
     /// the context's largest is the output.
     #[test]
     fn a_dispatch_reads_as_its_upscaling() {
-        let created = Created { flags: 0x29, max_render: [2560, 1440], max_output: [2560, 1440] };
+        let created = Created { flags: 0x29, max_render: [2560, 1440], max_output: [2560, 1440], clamped: false };
         let up = upscale(&dispatch([2560, 1440]), &created, 0xabc);
         assert_eq!(up.context, 0xabc);
         assert_eq!(up.list as usize, 0x1000);
@@ -401,6 +455,17 @@ mod tests {
         assert_eq!((up.pre_exposure, up.frame_ms), (1.5, 33.3));
         let up = upscale(&dispatch([0, 0]), &Created { max_output: [1920, 1080], ..created }, 0);
         assert_eq!(up.camera.output, [1920, 1080]);
+    }
+
+    /// A context at other sizes than the shipping FSR4's is made at those
+    /// (1280x720 in, 1920x1080 out); one at them is left as it is.
+    #[test]
+    fn contexts_are_made_at_the_shipping_sizes() {
+        let shipping = Some(([1280, 720], [1920, 1080]));
+        assert_eq!(shipping_sizes([1706, 960], [2560, 1440]), shipping);
+        assert_eq!(shipping_sizes([2560, 1440], [2560, 1440]), shipping);
+        assert_eq!(shipping_sizes([1280, 720], [2560, 1440]), shipping);
+        assert_eq!(shipping_sizes([1280, 720], [1920, 1080]), None);
     }
 
     struct Fixed;

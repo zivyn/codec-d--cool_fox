@@ -547,6 +547,12 @@ pub fn serving() -> bool {
     PLAN.get().is_some_and(|p| p.dlss || p.framegen)
 }
 
+/// Whether DLSS is to take the title's upscale dispatches (`VICTORY_DLSS=1`
+/// and Streamline loaded).
+pub fn upscaling() -> bool {
+    PLAN.get().is_some_and(|p| p.dlss)
+}
+
 /// The host device is made: Streamline is given it (`slSetD3DDevice`), the
 /// feature functions are fetched, and, for frame generation, the direct
 /// queue is made through Streamline's device proxy. The native queue to use

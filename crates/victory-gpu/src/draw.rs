@@ -3157,66 +3157,64 @@ impl State {
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
-        if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
-            && crate::ambient::on()
-            && self.ambient(list, p, role)
+        if let Some(stage) = p.stages.first()
+            && let Some(role) = stage.shader.ambient
+            && crate::ambient::wanted()
         {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
+            let outcome = if crate::pipeline::builder_runs() {
+                Err(crate::ambient::BUILDER_RUNS)
+            } else {
+                self.ambient(list, p, role)
+            };
+            let raised = outcome.is_ok();
+            crate::ambient::note(&stage.shader.hash, &stage.shader.container, role, outcome);
+            if raised {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         }
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
-    /// (`crate::ambient`). Whether it recorded anything.
-    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
-        let Some(t) = p.stages.first().map(|s| s.translated()) else {
-            return false;
-        };
-        let Some(heap) = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
-        else {
-            return false;
-        };
-        let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
-            t.used.iter().find(|u| {
-                u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })?;
+    /// (`crate::ambient`): the size of the image it raised, or why it did
+    /// not.
+    fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> Result<[u32; 2], &'static str> {
+        use crate::ambient::{Role, Views};
+        let t = p.stages.first().ok_or("no stage")?.translated();
+        let heap = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+            .flatten()
+            .ok_or("no host view heap is set")?;
+        // Where this program has its images: by shader register, as each
+        // variant of the title's programs has them at other places.
+        let places = crate::ambient::places(role, &t.used)?;
+        let entry = |(slot, offset): (u8, u32)| {
             let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
-                return None;
+                return Err("its table is not set");
             };
-            let resource = match crate::descriptor::view(table + u64::from(offset) * 4)? {
-                View::Shader(r, _) | View::Unordered(r, ..) => r,
-                _ => return None,
+            let resource = match crate::descriptor::view(table + u64::from(offset) * 4) {
+                Some(View::Shader(r, _) | View::Unordered(r, ..)) => r,
+                _ => return Err("its view is not a shader view"),
             };
             let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
                 Some(m) => m.1,
                 None => self.user_value(true, slot, RootType::Table, 0),
             };
-            let host = crate::resource::host_resource(resource as This)?;
+            let host = crate::resource::host_resource(resource as This).ok_or("its resource has no host copy")?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+            Ok((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
-        let at = match role {
-            Role::Resolve => LIGHT,
-            Role::Radiance => RADIANCE,
-            Role::Air => AIR,
-        };
-        let image = entry(ResourceType::Uav, at);
-        let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
-        };
-        let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
-            once!(?role, "no stand-in for the indirect light: other tables");
-            return false;
-        };
+        let (of, image) = entry(places.image)?;
+        let (seen, depth) = if role == Role::Resolve { entry(places.depth)? } else { (of, image) };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = if role == Role::Resolve { 42 } else { 26 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
-            once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
-            return false;
+        if of.Format.0 != format || volume != (role == Role::Air) {
+            return Err("its image is of another format or dimension");
+        }
+        if (seen.Width, seen.Height) != (of.Width, of.Height) {
+            return Err("its depth is of another size than its image");
         }
         crate::ambient::after(list, role, &Views {
             image,

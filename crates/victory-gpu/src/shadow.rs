@@ -94,6 +94,9 @@ pub(crate) struct Shadow {
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
+    /// Whether its title memory is write-combined ([`Shadow::write_combined`]):
+    /// 0 not known yet, 1 no, 2 yes.
+    wc: AtomicU8,
     /// A window in card memory the CPU maps ([`window_mapped_for`]).
     mapped: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2084,6 +2087,125 @@ fn land_echo() -> bool {
 /// bytes a landing was noted in that were the title's too.
 pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Title memory the title asked for write-combined (the console's 0x400
+/// protection bit), as `[start, end)` ([`title_memory_write_combined`]).
+static WRITE_COMBINED: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+/// The title asked for `[at, at + len)` write-combined: its CPU writes the
+/// memory and does not read it (reads of such memory are uncached on the
+/// console, the GDK's read-back memory is cacheable).
+pub fn title_memory_write_combined(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.push((at as u64, (at + len) as u64));
+}
+
+/// The title let go of `[at, at + len)` (`len` 0: of the allocation at `at`):
+/// write-combined regions in it are forgotten.
+pub(crate) fn write_combined_freed(at: usize, len: usize) {
+    let (at, end) = (at as u64, at.saturating_add(len) as u64);
+    let mut all = WRITE_COMBINED.write().unwrap_or_else(|e| e.into_inner());
+    all.retain(|&(from, to)| {
+        if len == 0 {
+            from != at
+        } else {
+            to <= at || from >= end
+        }
+    });
+}
+
+/// Whether all of `[start, start + len)` lies in write-combined title memory
+/// (in one region the title asked for so: regions are hundreds of MB to GB).
+fn is_write_combined(start: u64, len: u64) -> bool {
+    let all = WRITE_COMBINED.read().unwrap_or_else(|e| e.into_inner());
+    all.iter()
+        .any(|&(from, to)| from <= start && start + len <= to)
+}
+
+/// Whether what shaders write into copies in the card's memory of
+/// write-combined title memory stays on the card and is not compared,
+/// fetched and merged into title memory (`VICTORY_WC_NO_BACK=1`; off by
+/// default: an experiment).
+///
+/// The write-back of shader writes (`Shadow::gpu_writes`: hashes after
+/// sends, compare passes after the lists, fetches of the pieces that differ
+/// and their merge into title memory) keeps title memory the newest for the
+/// title's CPU. Of what the gameplay frame compared (log
+/// coolfox-20261126-184458), seven of the eight largest ranges, about 360 of
+/// 730 MB a frame, lie in the title's write-combined memory (protection
+/// 0x2404: 2.2 and 3.2 GB), and 36 MB a frame of it came back.
+///
+/// What it risks, and why it may hold:
+/// - The title's CPU reading what shaders wrote there reads older bytes.
+///   Write-combined memory is what the CPU writes and the GPU reads; read
+///   back it is uncached on the console too, and results the CPU reads go
+///   to cacheable memory.
+/// - A page the CPU writes goes up whole from title memory (as before) and
+///   so takes back what shaders wrote in the same 4 KiB page since: mixed
+///   pages lose the shaders' bytes (with the write-back they were in title
+///   memory). Not the dwords alone (`send_changed`): the title writing a
+///   value it wrote before (a counter set to 0 again) would not go up.
+/// - Another host copy of the same bytes (a texture placed there) does not
+///   see what shaders wrote through title memory.
+fn wc_no_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
+}
+
+/// Bytes shaders were declared to write in write-combined copies and that
+/// were left on the card ([`wc_no_back`]), since the last frame-rate line.
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a title buffer in write-combined memory gets one copy, in card
+/// memory the CPU maps (`D3D12_HEAP_TYPE_GPU_UPLOAD`: a resizable BAR, this
+/// PC's 4070 SUPER has a 16 GiB one) instead of two sides
+/// (`VICTORY_WC_BAR=1`; off by default: an experiment).
+///
+/// Refreshes write title memory into the mapping through the bus (as they
+/// write a CPU's side now); shaders read and write the card's memory; there
+/// is no CPU's side, no send of what changed (a copy on the card before each
+/// submission), no hashes and no compare, and what shaders write stays
+/// there as with [`wc_no_back`], whose risks it takes: the CPU reading the
+/// mapping would cross the bus a few bytes at a time, so nothing of ours
+/// reads it for shader writes. A refresh writes whole pages, so a page the
+/// title writes takes back what shaders wrote in it.
+///
+/// What it costs: the same card memory as the card's side of a copy with
+/// two sides, counted with them ([`card_limits`]) and made only while a
+/// fifth of the budget is free; the PC's memory of the CPU's side is saved.
+/// Copies already made, or turned down for room, keep their two sides or
+/// stay in the PC's memory.
+fn wc_bar() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WC_BAR").is_some_and(|v| v == "1"))
+}
+
+/// A buffer of `size` bytes in card memory the CPU maps, for [`wc_bar`],
+/// counted with the card sides of copies ([`card_limits`]).
+fn wc_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let (_, most) = card_limits();
+    if size >= 1 << 30 {
+        return None;
+    }
+    let host = host()?;
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        return None;
+    }
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let made = host.mapped_card_buffer(size, true);
+    if made.is_none() {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    }
+    made
+}
+
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
 /// (`VICTORY_SEND_CHANGED=1`; off: the 64 KiB pages written since it last
@@ -2546,8 +2668,11 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
-        if self.mapped {
+        if self.mapped && window {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        } else if self.mapped {
+            // A write-combined buffer's (`wc_bar`), counted with card sides.
+            CARD_BYTES[0].fetch_sub(self.width(), Ordering::Relaxed);
         }
         if let Some(card) = &mut self.card {
             if window {
@@ -3046,6 +3171,7 @@ impl Shadow {
             card: None,
             window: false,
             changes_only: Default::default(),
+            wc: AtomicU8::new(0),
             mapped: false,
             place: None,
         }
@@ -3076,9 +3202,42 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        // Write-combined title memory, which the title's CPU does not read
+        // (`VICTORY_WC_NO_BACK`, and always for `VICTORY_WC_BAR`'s copies,
+        // which the CPU would read through the bus): what shaders write stays
+        // on the card.
+        if (self.card.is_some() && wc_no_back() || self.mapped && !self.window)
+            && self.write_combined()
+        {
+            self.written.store(true, Ordering::Relaxed);
+            WC_LEFT.fetch_add(len.min(self.left(address)), Ordering::Relaxed);
+            return;
+        }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether all of the copy's title memory was asked for write-combined
+    /// ([`title_memory_write_combined`]); found once.
+    fn write_combined(&self) -> bool {
+        // 0 unknown, 1 no, 2 yes.
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = is_write_combined(self.start, self.len);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combined title memory: what shaders write in its copy is not copied back (VICTORY_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -5040,6 +5199,29 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // Write-combined memory with `VICTORY_WC_BAR`: one buffer in the card's
+        // memory that the CPU maps, no CPU's side, nothing sent, and what
+        // shaders write stays there ([`wc_bar`]).
+        if wc_bar()
+            && is_write_combined(key.0, len)
+            && let Some((buffer, data)) = wc_mapped_for(size)
+        {
+            crate::host::name(&buffer, || {
+                format!("title buffer {:#x}+{len:#x} mapped on the card", key.0)
+            });
+            tracing::info!(
+                start = format_args!("{:#x}", key.0),
+                len,
+                "a write-combined buffer's host copy is in card memory the CPU maps"
+            );
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+            shadow.mapped = true;
+            *shadow.wc.get_mut() = 2;
+            entry.shadow = Some(Arc::new(shadow));
+            return entry.shadow.clone();
+        }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -5483,6 +5665,42 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod write_combined_tests {
+    use super::{is_write_combined, title_memory_write_combined, write_combined_freed};
+
+    /// A copy counts as write-combined only inside one such region, and not
+    /// after the region is let go (part of it or the whole allocation).
+    #[test]
+    fn write_combined_regions() {
+        // Addresses of their own: other tests share the registry.
+        let base = 0x7f00_0000_0000usize;
+        title_memory_write_combined(base, 0x100_0000);
+        assert!(is_write_combined(base as u64, 0x1000));
+        assert!(is_write_combined(base as u64 + 0xff_f000, 0x1000));
+        assert!(
+            !is_write_combined(base as u64 + 0xff_f000, 0x2000),
+            "past its end"
+        );
+        assert!(
+            !is_write_combined(base as u64 - 0x1000, 0x2000),
+            "before its start"
+        );
+        write_combined_freed(base + 0x10_0000, 0x1000);
+        assert!(
+            !is_write_combined(base as u64, 0x1000),
+            "part of it decommitted"
+        );
+        let other = base + 0x1000_0000;
+        title_memory_write_combined(other, 0x10_0000);
+        write_combined_freed(other, 0);
+        assert!(
+            !is_write_combined(other as u64, 0x1000),
+            "the allocation released"
+        );
+    }
 }
 
 #[cfg(test)]

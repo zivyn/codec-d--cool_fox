@@ -985,12 +985,50 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
-        for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+        let (due, _) = self.due_and_census(frame);
+        due.order(max)
+    }
+
+    /// [`TextureQueue::due`]'s slots, not in order yet, and
+    /// [`TextureQueue::census`], in one look at every slot: what the queue's
+    /// lock is held for. The order is made after it is let go
+    /// ([`Due::order`]). Ordered under the lock, the queue of some 40,000
+    /// slots in the first gameplay area kept it 1-5 ms a pass, and the
+    /// title's recording threads, whose every descriptor copy notes its slot
+    /// here, waited that long behind it (run timeline, 2026-11-26).
+    fn due_and_census(&self, frame: u64) -> (Due, [u64; 5]) {
+        let mut due = Due::default();
+        let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
+        for (&index, w) in &self.slots {
+            if w.mapped > 0 {
+                c[3] += 1;
+            } else if w.looks > 0 {
+                c[2] += 1;
+            }
+            if w.due <= frame {
+                c[1] += 1;
+                c[4] = c[4].max(frame.saturating_sub(w.written));
+                let class = if w.looks > 0 || w.mapped > 0 { &mut due.again } else { &mut due.fresh };
+                class.push((w.written, index, w.write));
+            }
         }
+        (due, c)
+    }
+}
+
+/// The slots due, taken from the queue ([`TextureQueue::due_and_census`]):
+/// (frame written, slot, write number) of those looked at before and of the
+/// others.
+#[derive(Default)]
+struct Due {
+    again: Vec<(u64, u32, u64)>,
+    fresh: Vec<(u64, u32, u64)>,
+}
+
+impl Due {
+    /// Up to `max` of them, in the order [`TextureQueue::due`] serves them.
+    fn order(self, max: usize) -> Vec<(u32, u64)> {
+        let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
         again.sort_unstable_by(newest_first);
@@ -1008,7 +1046,9 @@ impl TextureQueue {
         order.truncate(max);
         order
     }
+}
 
+impl TextureQueue {
     /// The entry of `index` if it is still the write the pass was handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
         self.slots.get_mut(&index).filter(|w| w.write == write)
@@ -1104,9 +1144,11 @@ impl TextureQueue {
         self.slots.get(&index).map_or(0, |w| w.mapped)
     }
 
-    /// For the frame line: slots in the queue; of them due at `frame`;
+    /// For the frame line (made with the slots due, by
+    /// [`TextureQueue::due_and_census`]): slots in the queue; of them due at `frame`;
     /// waiting for their memory (looked at, never uploaded); uploaded in
     /// part; and the frames the oldest due one has waited since its write.
+    #[cfg(test)]
     fn census(&self, frame: u64) -> [u64; 5] {
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0];
         for w in self.slots.values() {
@@ -1796,8 +1838,8 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+        let (due, census) = self.textures.lock().unwrap_or_else(|e| e.into_inner()).due_and_census(frame);
+        (if max == 0 { Vec::new() } else { due.order(max) }, census)
     }
 
     /// A number that changes when a slot is written or made due anew, and
@@ -5327,6 +5369,10 @@ mod tests {
             assert_eq!(q.due(frame, 100)[0].0, 17);
         }
         assert_eq!(q.census(9)[2], 1);
+        // The census made with the slots due is the census.
+        for at in [0, 9, frame, u64::MAX] {
+            assert_eq!(q.due_and_census(at).1, q.census(at));
+        }
         q.done(17, w17);
         assert!(!q.due(u64::MAX, 100).iter().any(|d| d.0 == 17));
         // Uploaded with part of its memory there: kept, with what was there.

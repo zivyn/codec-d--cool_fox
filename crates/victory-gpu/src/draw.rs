@@ -2545,7 +2545,7 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let mut room = crate::resource::room(memory);
+        let mut room = crate::resource::may_make(memory);
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2575,9 +2575,10 @@ impl State {
         // has run are made from that.
         host.texture_views_remade();
         host.texture_slots_flip();
-        // And with room, the textures whose upload left a held level
-        // without the card's memory are uploaded again.
-        if room {
+        // And with room for any size, the textures whose upload left a held
+        // level without the card's memory are uploaded again (with room for
+        // less than that the same levels would be left out again).
+        if room && crate::resource::level_cap(memory) == u64::MAX {
             host.texture_slots_waiting(frame);
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
@@ -3028,7 +3029,7 @@ impl State {
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                room = crate::resource::may_make(crate::host::host().and_then(|h| h.video_memory()));
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

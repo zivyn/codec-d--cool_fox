@@ -1557,9 +1557,16 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // With the card short of room every such texture is made
+            // level by level, whole in title memory or not: the levels
+            // that do not fit get no memory ([`level_cap_for`]) and the
+            // texture shows a lower mip, where a whole one took all of its
+            // chain or was refused (a black texture).
+            let squeezed = level_cap_lately() != u64::MAX;
             let partly = readable
-                && bytes >= crate::tiles::floor()
-                && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
+                && bytes >= if squeezed { crate::tiles::SQUEEZED_FLOOR } else { crate::tiles::floor() }
+                && (squeezed
+                    || !crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
                     || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
@@ -1674,6 +1681,28 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// which ended runs 20 and 24.
 #[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
+    headroom(memory) > 0
+}
+
+/// What the texture queue counts as the card's memory in use: the system's
+/// number for this process, less what our own blocks of textures
+/// ([`crate::pool::texture_room`]) and the heaps of tiles
+/// ([`crate::tiles::spare`]) have free for the next texture, plus what is
+/// kept for card copies of title buffers not made yet and for the render
+/// targets of a world not made yet ([`targets_room_kept`]).
+#[cfg(windows)]
+fn card_use(used: u64) -> u64 {
+    used.saturating_sub(crate::pool::texture_room().saturating_add(crate::tiles::spare()))
+        + crate::shadow::card_room_kept()
+        + targets_room_kept()
+}
+
+/// The bytes of host copies of textures that may still be made before
+/// [`room`] says no (negative: by how much it is past the line);
+/// `i64::MAX` while nothing limits them (the floor, a limit not reached, a
+/// card that reports no budget), `i64::MIN` past an explicit limit.
+#[cfg(windows)]
+fn headroom(memory: Option<[u64; 4]>) -> i64 {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
@@ -1685,11 +1714,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
     if let Some(limit) = limit {
-        return filled < limit;
+        return if filled < limit { i64::MAX } else { i64::MIN };
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
     if filled < floor {
-        return true;
+        return i64::MAX;
     }
     match memory {
         // What is kept for card copies of title buffers not made yet
@@ -1697,11 +1726,76 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+            let line = budget / 100 * room_percent();
+            i64::try_from(line).unwrap_or(i64::MAX).saturating_sub(i64::try_from(card_use(used)).unwrap_or(i64::MAX))
         }
-        None => filled < WITHOUT_BUDGET,
+        None if filled < WITHOUT_BUDGET => i64::MAX,
+        None => i64::MIN,
     }
+}
+
+/// The most bytes a level of a texture may take of the card for its tiles
+/// (a 4096x4096 level of four bytes a texel is 64 MiB) while the card has
+/// `headroom` bytes left to its line ([`room`]'s): `u64::MAX` for any, 0
+/// for none. The levels of a texture that do not fit are left without
+/// memory, and its views start at the first that has some (a lower mip: the
+/// texture is blurred, not black). A card with room for 1.5 GB more asks
+/// nothing of them; each 256 to 512 MB less takes the next size away, and
+/// past the line a level of one tile and the packed small ones still go in
+/// until the card is 128 MB past it.
+#[cfg(any(windows, test))]
+pub(crate) fn level_cap_for(headroom: i64) -> u64 {
+    const MB: i64 = 1 << 20;
+    match headroom {
+        h if h >= 1536 * MB => u64::MAX,
+        h if h >= 1024 * MB => 16 << 20,
+        h if h >= 512 * MB => 4 << 20,
+        h if h >= 256 * MB => 1 << 20,
+        h if h > 0 => 256 << 10,
+        h if h >= -128 * MB => 64 << 10,
+        _ => 0,
+    }
+}
+
+/// [`level_cap_for`] for the card as it is now. `VICTORY_TEXTURE_SQUEEZE=0`:
+/// any size while there is room, none without (as before).
+#[cfg(windows)]
+pub(crate) fn level_cap(memory: Option<[u64; 4]>) -> u64 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let headroom = headroom(memory);
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SQUEEZE").is_none_or(|v| v != "0")) {
+        level_cap_for(headroom)
+    } else if headroom > 0 {
+        u64::MAX
+    } else {
+        0
+    }
+}
+
+/// Whether more host copies of textures may be made now: with levels on
+/// demand while the card takes any level at all ([`level_cap_for`]: what
+/// does not fit is left without memory), else while it has [`room`].
+#[cfg(windows)]
+pub(crate) fn may_make(memory: Option<[u64; 4]>) -> bool {
+    if crate::tiles::wanted() { level_cap(memory) > 0 } else { room(memory) }
+}
+
+/// [`level_cap`] as it was at most a tenth of a second ago.
+#[cfg(windows)]
+pub(crate) fn level_cap_lately() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The tenth of a second of the last asking, counted from 1, and its
+    // answer.
+    static AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static CAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    if AT.load(Relaxed) == tenth {
+        return CAP.load(Relaxed);
+    }
+    let cap = level_cap(crate::host::host().and_then(|h| h.video_memory()));
+    CAP.store(cap, Relaxed);
+    AT.store(tenth, Relaxed);
+    cap
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1726,33 +1820,35 @@ pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let most = *MOST.get_or_init(|| {
+        // A card of 24 GB can spare 3 GB for them; on one of 8 the world's
+        // own 1.4 GB of targets (run P2-3) left 1.7 GB of the 7 kept for
+        // targets that were already made: a quarter of the budget at most.
+        let quarter = crate::host::host().and_then(|h| h.video_memory()).map_or(u64::MAX, |[budget, ..]| budget / 4);
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map_or((3072u64 << 20).min(quarter), |mb| mb.min(8192) << 20)
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    // A world's targets are made and stay: once half of what is kept for
+    // them is made and they have not grown for [`TARGETS_SETTLED_MS`], no
+    // more are coming and the rest is room again.
+    static SEEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    let now = crate::host::now_ms();
+    if SEEN[0].swap(targets, Relaxed) != targets {
+        SEEN[1].store(now, Relaxed);
+    }
+    if targets >= most / 2 && now.saturating_sub(SEEN[1].load(Relaxed)) >= TARGETS_SETTLED_MS {
+        return 0;
+    }
     most.saturating_sub(targets)
 }
 
-/// [`room`] as it was at most a tenth of a second ago, for a question
-/// asked of many textures a frame ([`room`] asks the system each time).
+/// How long the host copies a world renders to may stay the same size
+/// before the room kept for more of them is given up ([`targets_room_kept`]).
 #[cfg(windows)]
-pub(crate) fn room_lately() -> bool {
-    use std::sync::atomic::Ordering::Relaxed;
-    // The tenth of a second of the last asking, counted from 1, and its
-    // answer in the lowest bit.
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let tenth = crate::host::now_ms() / 100 + 1;
-    let last = LAST.load(Relaxed);
-    if last >> 1 == tenth {
-        return last & 1 != 0;
-    }
-    let room = room(crate::host::host().and_then(|h| h.video_memory()));
-    LAST.store((tenth << 1) | u64::from(room), Relaxed);
-    room
-}
+const TARGETS_SETTLED_MS: u64 = 20_000;
 
 /// The share of the card's budget, in percent, up to which host copies of
 /// textures picked by index are made ([`room`]): 90 unless
@@ -2037,10 +2133,7 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            crate::host::vram_keep(budget, card_use(used))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -2481,7 +2574,12 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    // (Not a reserved one: a texture cut from a block has memory of its own
+    // and no tiles for `crate::tiles` to give. Before this the pool took
+    // every one of them, `Tiled::make` found nothing to cut, and levels on
+    // demand never made a single texture.)
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -2592,14 +2690,15 @@ impl OnDemand {
     /// [`crate::tiles::Tiled::uploaded`]; `memory`: where the texture's
     /// title memory starts (its slots are made again if the first level
     /// they may show changed).
-    /// Held levels get tiles only while the card has room ([`room`]).
+    /// Held levels get tiles only up to the size the card's room allows
+    /// ([`level_cap_for`]).
     /// Returns whether a level is still without its tiles: the caller
     /// records the upload again later.
     pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
         let Some(tiled) = &self.0.tiled else {
             return false;
         };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, room(crate::host::host().and_then(|h| h.video_memory())));
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, level_cap(crate::host::host().and_then(|h| h.video_memory())));
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
@@ -4558,6 +4657,24 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn level_cap_falls_as_the_card_runs_out_of_room() {
+        const MB: i64 = 1 << 20;
+        // Plenty of room, or nothing that limits: any size.
+        assert_eq!(level_cap_for(i64::MAX), u64::MAX);
+        assert_eq!(level_cap_for(1536 * MB), u64::MAX);
+        // Each step down of the headroom takes the next size away.
+        let caps: Vec<u64> =
+            [1535, 1024, 1023, 512, 511, 256, 255, 1, 0, -128, -129].map(|mb| level_cap_for(mb * MB)).to_vec();
+        assert_eq!(
+            caps,
+            [16 << 20, 16 << 20, 4 << 20, 4 << 20, 1 << 20, 1 << 20, 256 << 10, 256 << 10, 64 << 10, 64 << 10, 0]
+        );
+        assert!(caps.windows(2).all(|w| w[0] >= w[1]), "never more memory for a fuller card");
+        // Past an explicit limit: none.
+        assert_eq!(level_cap_for(i64::MIN), 0);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

@@ -180,8 +180,14 @@ pub(crate) struct HostHeap {
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping; after
+    /// them the title address of the view at each slot, two dwords a slot
+    /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`).
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// Title slots holding a ray-tracing acceleration structure's view: the
+    /// memory they name is made ready for the shaders that pick a view from
+    /// the heap and walk what its address says.
+    structures: Slots,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1606,7 +1612,7 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * (4 + 8);
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -1643,6 +1649,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             peak: std::sync::atomic::AtomicU32::new(0),
             strides,
+            structures: Slots::new(count as usize),
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::default(),
@@ -1819,6 +1826,34 @@ impl HostHeap {
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|s| s.1)
+    }
+
+    /// The GPU address of the table of view addresses by title slot, which
+    /// lies in the strides' buffer after them.
+    pub(crate) fn view_addresses_gpu(&self) -> Option<u64> {
+        self.strides_gpu()
+            .map(|gpu| gpu + u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4)
+    }
+
+    /// The title addresses of the acceleration structures the heap's views
+    /// name.
+    pub(crate) fn structure_addresses(&self) -> Vec<u64> {
+        let Some((_, _, data)) = &self.strides else {
+            return Vec::new();
+        };
+        self.structures
+            .all(|_| true)
+            .into_iter()
+            .map(|slot| {
+                // SAFETY: inside the mapping (`write_view_address` only puts
+                // slots below `SLOT_STRIDES_COUNT`).
+                unsafe {
+                    let at = (*data as *const u32).add(view_address_dword(slot));
+                    u64::from(at.read_volatile()) | u64::from(at.add(1).read_volatile()) << 32
+                }
+            })
+            .filter(|&address| address != 0)
+            .collect()
     }
 
     /// The table's buffer, for a list to hold.
@@ -2782,6 +2817,7 @@ impl HostHeap {
         }
         let (stride, kind) = view.map_or((None, 0), view_stride_and_kind);
         self.write_stride(index, stride.unwrap_or(0) | kind);
+        self.write_view_address(index, view);
         let was = if stride.is_some() {
             self.buffers.put(index);
             true
@@ -2805,6 +2841,34 @@ impl HostHeap {
             // single aligned dword: either value is one the slot had, and
             // dynamic slots are exclusively owned until submission finishes).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
+        }
+    }
+
+    /// Writes the title address `view` starts at (0: none) for title slot
+    /// `index` into the host's table of view addresses
+    /// ([`victory_shader::emit::SLOT_VIEW_ADDRESSES`]), and notes whether
+    /// it is an acceleration structure's.
+    #[inline]
+    fn write_view_address(&self, index: u32, view: Option<&View>) {
+        let Some((_, _, data)) = &self.strides else {
+            return;
+        };
+        if index >= victory_shader::emit::SLOT_STRIDES_COUNT {
+            return;
+        }
+        let address = view.and_then(view_address).unwrap_or(0);
+        // SAFETY: inside the mapping; as for `write_stride`, shaders read
+        // the two dwords while we write (a half-written address is one a
+        // shader reads for a slot being written, which it would not use).
+        unsafe {
+            let at = (*data as *mut u32).add(view_address_dword(index));
+            at.write_volatile(address as u32);
+            at.add(1).write_volatile((address >> 32) as u32);
+        }
+        if view.is_some_and(is_structure_view) {
+            self.structures.put(index);
+        } else {
+            self.structures.remove(index);
         }
     }
 
@@ -3603,13 +3667,24 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// (no resource: the view's description holds the address, and the shader
 /// walks the structure from there itself).
 pub(crate) fn view_address(view: &View) -> Option<u64> {
-    const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
     match view {
-        View::Shader(_, Some(desc)) if desc[1] == STRUCTURE => {
+        View::Shader(_, Some(desc)) if is_structure_view(view) => {
             Some(u64::from(desc[4]) | u64::from(desc[5]) << 32)
         }
         _ => buffer_range(view).map(|range| range.0),
     }
+}
+
+/// Whether `view` is a ray-tracing acceleration structure's.
+fn is_structure_view(view: &View) -> bool {
+    const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+    matches!(view, View::Shader(_, Some(desc)) if desc[1] == STRUCTURE)
+}
+
+/// The dword of the strides' buffer where the title address of slot `index`
+/// starts: after the `SLOT_STRIDES_COUNT` strides, two dwords a slot.
+fn view_address_dword(index: u32) -> usize {
+    victory_shader::emit::SLOT_STRIDES_COUNT as usize + index as usize * 2
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -5107,6 +5182,55 @@ mod tests {
         assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
         assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
         assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
+    }
+
+    /// The table of view addresses by title slot holds a buffer view's
+    /// start and an acceleration structure's location (words 4 and 5 of
+    /// its description), nothing for the rest; the slots of structures are
+    /// the ones a shader that picks views from the heap has made ready.
+    #[test]
+    fn view_addresses_are_kept_by_title_slot() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let Some((_, _, data)) = heap.strides else {
+            panic!("view heap should allocate its table of addresses");
+        };
+        let at = |slot: u32| {
+            // SAFETY: inside the mapping of `heap.strides`.
+            unsafe {
+                let words = (data as *const u32).add(view_address_dword(slot));
+                u64::from(words.read_volatile()) | u64::from(words.add(1).read_volatile()) << 32
+            }
+        };
+        // Words as the title wrote them: format 0, dimension 11 (a
+        // structure), the location 0xd_5f1c_0000.
+        let mut words = [0u32; 10];
+        (words[1], words[4], words[5]) = (11, 0x5f1c_0000, 0xd);
+        let structure = View::Shader(0, Some(words));
+        // A placed buffer view: dimension 1, its memory at 0x1_2345_6700
+        // (description dwords 10 and 11).
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        let mut desc = [0u32; 16];
+        (desc[1], desc[6], desc[10], desc[11]) = (1, 64, 0x2345_6700, 1);
+        let buffer = View::Placed(false, resource, desc);
+        heap.write_view_address(1, Some(&structure));
+        heap.write_view_address(2, Some(&buffer));
+        assert_eq!(
+            (at(0), at(1), at(2)),
+            (0, 0x0000_000d_5f1c_0000, 0x1_2345_6700)
+        );
+        assert_eq!(heap.structure_addresses(), [0x0000_000d_5f1c_0000]);
+        // Written over, the slot is a buffer's: no structure is left.
+        heap.write_view_address(1, Some(&buffer));
+        assert_eq!(at(1), 0x1_2345_6700);
+        assert!(heap.structure_addresses().is_empty());
+        heap.write_view_address(1, None);
+        assert_eq!(at(1), 0);
+        // Past the table: nothing is written.
+        heap.write_view_address(victory_shader::emit::SLOT_STRIDES_COUNT, Some(&structure));
+        assert!(heap.structure_addresses().is_empty());
     }
 
     /// What may stand for a texture that is not there yet: one of its kind in

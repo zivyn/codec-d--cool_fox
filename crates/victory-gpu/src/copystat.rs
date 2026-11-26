@@ -129,6 +129,9 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Waits for a pipeline not made because it would not be within the
+    /// frame's budget (`pipeline::make`).
+    PipelineSkips,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1179,7 +1182,7 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
-         threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
+         threads); {:.1} ms waiting for pipelines ({:.0} waits skipped as too long); dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
          guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
@@ -1188,6 +1191,7 @@ pub(crate) fn log(frames: f64) {
         c[C::RecordCalls as usize],
         c[C::RecordNs as usize] / 1e6,
         ms(c[C::PipelineWaitUs as usize]),
+        c[C::PipelineSkips as usize],
         c[C::DynamicAsked as usize],
         c[C::DynamicRefused as usize],
         c[C::DynamicNs as usize] / 1e6,

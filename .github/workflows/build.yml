@@ -118,10 +118,10 @@ jobs:
       - name: Tests
         run: |
           set -o pipefail
-          cargo test -p victory-shader --locked --no-fail-fast -- --test-threads=4 2>&1 | tee test.log
+          cargo test -p victory-shader --locked --no-fail-fast -- --test-threads=4 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Summary
         if: ${{ !cancelled() }}
-        run: bash .github/scripts/test-summary.sh "victory-shader (4 threads)" test.log
+        run: bash .github/scripts/test-summary.sh "victory-shader (4 threads)" "$RUNNER_TEMP/test.log"
 
   # Includes xtask's repository_passes_policy (the asset-policy check).
   #
@@ -149,10 +149,10 @@ jobs:
             --skip indirect::tests::host_list_budget_starts_empty_at_each_submission \
             --skip indirect::tests::warp_batch_charges_every_execution \
             --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws \
-            2>&1 | tee test.log
+            2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Summary
         if: ${{ !cancelled() }}
-        run: bash .github/scripts/test-summary.sh "workspace except victory-shader" test.log
+        run: bash .github/scripts/test-summary.sh "workspace except victory-shader" "$RUNNER_TEMP/test.log"
 
   # Non-blocking: the fork still has warnings (summary only).
   clippy:
@@ -169,13 +169,13 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          cargo clippy --workspace --all-targets --locked 2>&1 | tee clippy.log
+          cargo clippy --workspace --all-targets --locked 2>&1 | tee "$RUNNER_TEMP/clippy.log"
       - name: Summary
         if: ${{ !cancelled() }}
         run: |
           {
             echo "## Clippy (non-blocking)"
-            echo "$(grep -c '^warning' clippy.log || true) warning lines, $(grep -c '^error' clippy.log || true) error lines"
+            echo "$(grep -c '^warning' "$RUNNER_TEMP/clippy.log" || true) warning lines, $(grep -c '^error' "$RUNNER_TEMP/clippy.log" || true) error lines"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # Rolling prerelease per branch (tag build-<branch, / replaced by ->), moved

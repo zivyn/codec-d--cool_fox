@@ -3902,10 +3902,33 @@ impl State {
                 let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
                 scan(ResourceType::Srv, &|d| depth_like(d) && size == Some((d.Width, d.Height)))
             }),
-            Role::Miss => usual_depth(MISS_DEPTH).or_else(|| {
+            Role::Miss => usual_depth(MISS_DEPTH)
+                .filter(|(d, _)| {
+                    image.as_ref().is_some_and(|(i, _)| {
+                        d.Width.abs_diff(i.Width * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(i.Height) * 2) <= 1
+                    })
+                })
+                .or_else(|| {
                 let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                // The picture's depth: twice the rays' image each way (run
+                // final-4: a looser match took another depth texture, which the
+                // size check then refused, "another image").
                 scan(ResourceType::Srv, &|d| {
-                    depth_like(d) && half.is_some_and(|(w, h)| d.Width >= w && d.Height >= h && d.Width <= w * 4)
+                    use windows::Win32::Graphics::Dxgi::Common::{
+                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+                        DXGI_FORMAT_R32G8X24_TYPELESS,
+                    };
+                    depth_like(d)
+                        && matches!(
+                            d.Format,
+                            DXGI_FORMAT_R32_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT
+                                | DXGI_FORMAT_R32G8X24_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        )
+                        && half.is_some_and(|(w, h)| {
+                            d.Width.abs_diff(w * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
+                        })
                 })
             }),
             Role::Radiance | Role::Air => image,

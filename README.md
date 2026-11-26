@@ -72,6 +72,7 @@ RTX 5070 12 GB with a Ryzen 7 9800X3D, in the prologue:
    1.0.2.1 executable pins its internal render scale: the 3D world is drawn at
    half width and half height (960x540 on Series S), a quarter of the pixels,
    then stretched back to 1080p. This is why the world is softer than the menus.
+   Other resolutions: see [Picking a resolution](#picking-a-resolution).
 3. **The title's own upscaler** (`VICTORY_OWN_UPSCALER=1`). On Series S the
    title upscales with AMD FidelityFX (FSR), whose compute programs cannot be
    translated here, so that step drew nothing. A patch makes the title use its
@@ -235,8 +236,62 @@ scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
 `scripts\play-nvidia.ps1` starts a copy of the build named `victory_sm.exe`, so
 NVIDIA Smooth Motion applies every time once it is turned on for that exe in the
 NVIDIA App. `-NoSmoothMotion` runs `victory.exe` itself; `-SeriesX` uses the
-Series X profile (sharper, much slower). The fork's own `scripts\play.ps1` is
+Series X profile (sharper, much slower); `-Quality` gives fewer stretched bodies
+and less rainbow skin for about 7 fps. The fork's own `scripts\play.ps1` is
 still there for AMD cards.
+
+### Picking a resolution
+
+There is one script per console and resolution in `scripts\`. Each one runs
+`play-nvidia.ps1` with `-Resolution` set, and takes the same `-Exe` path and
+other switches:
+
+```powershell
+scripts\play-S-720p.ps1 -Exe <path of your copy's executable>
+scripts\play-X-1080p.ps1 -Exe <path of your copy's executable> -Quality
+```
+
+The resolution is the height the 3D world is drawn at. The title's own
+upscaler then stretches it to the console's output, and menus, the HUD and
+subtitles stay sharp either way. Series S outputs 1920x1080 and Series X
+3840x2160, so the same height is a different render scale on each:
+
+| Script | Console | World drawn at | Render scale | Tested on the RTX 5070 |
+|---|---|---|---|---|
+| `play-S-1080p.ps1` | Series S | 1920x1080 | 1.0 | not yet (one report of a crash on an RTX 2080 8 GB) |
+| `play-S-720p.ps1` | Series S | 1280x720 | 0.667 | not yet |
+| `play-S-540p.ps1` | Series S | 960x540 | 0.5 | yes: the default, about 18-22 fps |
+| `play-S-480p.ps1` | Series S | 853x480 | 0.444 | not yet |
+| `play-X-2160p.ps1` | Series X | 3840x2160 | 1.0 | yes, about 6 fps |
+| `play-X-1440p.ps1` | Series X | 2560x1440 | 0.667 | not yet |
+| `play-X-1080p.ps1` | Series X | 1920x1080 | 0.5 | yes: the `-SeriesX` default, about 7 fps |
+| `play-X-720p.ps1` | Series X | 1280x720 | 0.333 | not yet |
+| `play-X-540p.ps1` | Series X | 960x540 | 0.25 | not yet |
+| `play-X-480p.ps1` | Series X | 853x480 | 0.222 | not yet |
+
+What to expect:
+
+- **Lower is faster, up to a point.** On this machine the frame time is mostly
+  the CPU preparing the GPU's work (about 33 ms a frame on Series S), not the
+  GPU drawing pixels. Going below 540p saves GPU time, but the frame rate stops
+  rising once the CPU is the limit.
+- **Series S is much faster than Series X at the same resolution.** The console
+  profile changes far more than resolution: the title picks the smaller
+  console's level of detail, effects and memory budgets. `play-S-540p` and
+  `play-X-540p` draw the same number of pixels, but the Series X one does
+  more work for each frame.
+- **Lower is softer and smears more.** The title's temporal upscaler rebuilds
+  detail from earlier frames. At low resolutions and low frame rates, fast
+  camera moves (driving, turning quickly) leave visible trails.
+- **Higher needs more video memory.** At 1.0 the title's targets are at full
+  size on top of the 1.5 GB set aside for memory compares. On an 8 GB card,
+  stay at 720p or lower if 1080p crashes.
+- Series S cannot go above 1080p: its output is 1080p, and the script says so
+  and stops if asked for more.
+
+`-Resolution` works on `play-nvidia.ps1` itself too
+(`-Resolution 720 -SeriesX`), and `-More @{VICTORY_RENDER_SCALE='0.6'}` still
+sets any scale from 0.2 to 1.0.
 
 Before the first run, ahead of time (both can be stopped and go on later):
 

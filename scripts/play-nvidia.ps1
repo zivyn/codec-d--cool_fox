@@ -5,6 +5,9 @@
 # -SeriesX         the Series X profile instead (slower: about 7 fps at half scale)
 # -Quality         fewer stretched/jumping bodies and less rainbow skin, at about 13 fps instead of about 20
 # -RayTracing      keep the title's ray-tracing passes (off by default: see below)
+# -Resolution      the height the game renders at before the title's own upscaler: 2160, 1440, 1080, 720, 540 or 480.
+#                  Series S outputs 1080p (so up to 1080 there), Series X 2160p. Default: half the output (540 on S,
+#                  1080 on X). The play-S-*.ps1 and play-X-*.ps1 scripts next to this one call it with each.
 # -Build           target\diag (the default, the build all measurements are of) or target\release
 #                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
 # -More            other settings: -More @{VICTORY_PANEL='1'}
@@ -15,6 +18,7 @@ param(
     [switch]$SeriesX,
     [switch]$Quality,
     [switch]$RayTracing,
+    [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -63,7 +67,19 @@ if ($Quality) {
     # Costs about 7 fps (the submitting thread waits about 30 ms a frame for the card).
     $settings.VICTORY_RELAY = '1'; $settings.VICTORY_CARD_STEPS = '0'; $settings.VICTORY_TEXTURE_NO_WAIT = '0'
 }
+# The render scale is the rendered height over the output height (Series S 1080, Series X 2160).
+$outHeight = if ($SeriesX) { 2160 } else { 1080 }
+$console = if ($SeriesX) { 'X' } else { 'S' }
+if ($Resolution) {
+    if ([int]$Resolution -gt $outHeight) {
+        Write-Host "Series $console outputs ${outHeight}p: ${Resolution}p is above it."
+        return
+    }
+    $settings.VICTORY_RENDER_SCALE = ([int]$Resolution / $outHeight).ToString('0.####', [Globalization.CultureInfo]::InvariantCulture)
+}
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+$scale = [double]::Parse($settings.VICTORY_RENDER_SCALE, [Globalization.CultureInfo]::InvariantCulture)
+Write-Host "Series $console, rendering at $([int]($outHeight * $scale))p (render scale $($settings.VICTORY_RENDER_SCALE))"
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
 if (-not (Test-Path $victory)) { Write-Host "No $victory. Build it first (README.md)."; return }

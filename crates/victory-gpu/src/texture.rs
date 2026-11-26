@@ -753,6 +753,25 @@ pub(crate) struct Digest(u128);
 /// [`upload`] of the levels from `first` on, the ones a view shows: of a
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
+/// Whether `list` has recorded [`upload_from`]'s upload of `resource`
+/// from level `first` (or been asked to: see [`UPLOAD_STAGED`]).
+pub(crate) fn upload_listed(list: &HostList, resource: This, first: u32) -> bool {
+    let first = if crate::resource::held_only() { first } else { 0 };
+    list.used(upload_key(resource, first))
+}
+
+/// The key [`upload_from`] asks `HostList::first_use` with.
+fn upload_key(resource: This, first: u32) -> usize {
+    1 << 63 | (resource as usize) << 4 | first as usize & 15
+}
+
+thread_local! {
+    /// Set by [`upload_from`] when it found or made the texture's staging
+    /// buffer (its upload is recorded or checked at submission): for a
+    /// caller that must know the upload happened.
+    pub(crate) static UPLOAD_STAGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let first = if crate::resource::held_only() { first } else { 0 };
     let host_written = HOST_WRITTEN
@@ -767,7 +786,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     }
     // Once a list for each first level; not again for one that the list's
     // upload of larger ones held too.
-    if !list.first_use(1 << 63 | (resource as usize) << 4 | first as usize & 15) {
+    if !list.first_use(upload_key(resource, first)) {
         return;
     }
     if !list.first_use(resource as usize) && staged_from(resource) <= first {
@@ -781,6 +800,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     let Some(staging) = staging(resource, &copy, first) else {
         return;
     };
+    UPLOAD_STAGED.set(true);
     use std::sync::atomic::Ordering::Relaxed;
     let baking = BAKING.get();
     if baking {

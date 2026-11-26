@@ -250,6 +250,16 @@ fn bake_candidates(words: Vec<u32>, names_texture: impl Fn(u32) -> bool) -> Vec<
         .collect()
 }
 
+/// Says why a bake's source could not be brought up to date (the first
+/// 64 times): the bake reads it as it stands.
+fn bake_source_failed(index: u32, view: &View, why: &str) {
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) < 64 {
+        let text: String = format!("{view:?}").chars().take(200).collect();
+        tracing::warn!(slot = index, frame = crate::frame::current(), "a decoration bake's source was not brought up to date: {why}; {text}");
+    }
+}
+
 /// Adds one bake's counts to [`BAKE_SOURCES`] and says them: every bake
 /// that found a source not up to date (the first 256), and the totals at
 /// bakes 1, 2, 4, 8 ...
@@ -886,11 +896,14 @@ pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new
 /// last 5-second line, on: looks again at slots uploaded whole (a
 /// fingerprint of 48 KiB), asking how much of a texture's memory is mapped,
 /// asking whether a host copy holds what memory holds (a digest of all of
-/// it), and making host copies and staging their uploads (`readable`); and
-/// the passes in all. The pass stops at `VICTORY_TEXTURE_STAGE_MS` (16 in
+/// it), staging uploads (`readable`); the passes in all; making host copies
+/// (`resource::host_resource`: creation, residency); and making the slots'
+/// views (`mirror`, the placed texture's resource). In the first runs with
+/// the line (2026-11-26 16:52) the first four were a third of the passes'
+/// time. The pass stops at `VICTORY_TEXTURE_STAGE_MS` (16 in
 /// the launcher), and in play it ran 18-20 ms a frame for about 20
 /// textures: these say what took the time.
-pub(crate) static HEAP_TEXTURE_MICROS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+pub(crate) static HEAP_TEXTURE_MICROS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// `f`'s result, its time added to [`HEAP_TEXTURE_MICROS`]' place `slot`.
 fn timed<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -2441,11 +2454,13 @@ impl State {
                 }
             }
         }
+        // (Not a null view: slot 1 and others hold views of no resource,
+        // which small numbers among the words name all the time; they were
+        // the "failed" sources of the first runs, 588 of 3,720.)
         bake_candidates(words, |w| {
-            heap.handle(w)
-                .and_then(crate::descriptor::view)
-                .as_ref()
-                .is_some_and(crate::descriptor::host::is_texture_view)
+            heap.handle(w).and_then(crate::descriptor::view).as_ref().is_some_and(|view| {
+                crate::descriptor::host::is_texture_view(view) && !matches!(view, View::Shader(0, _))
+            })
         })
     }
 
@@ -2505,6 +2520,7 @@ impl State {
             let Some(texture) = crate::resource::host_resource(resource) else {
                 // The host refused it (its creation failed).
                 n[8] += 1;
+                bake_source_failed(index, &view, "the host has no copy of it (refused)");
                 continue;
             };
             if !crate::texture::title_written(texture) || crate::texture::host_wrote(resource as usize) {
@@ -2526,15 +2542,31 @@ impl State {
             // another view; the texture has no host copy yet; its host copy
             // holds other bytes than its memory now.
             n[if !shown { 3 } else if !had_copy { 4 } else { 7 }] += 1;
+            // The pass recorded its upload on this list already (with
+            // `BAKING`: read exactly at submission): nothing more to do.
+            if crate::texture::upload_listed(list, resource, first) {
+                sync.publish.push((index, handle, key));
+                continue;
+            }
             let was_staged = crate::texture::is_staged(resource);
             let _ = crate::residency::take_staging_deferred();
+            crate::texture::UPLOAD_STAGED.set(false);
             readable(list, ResourceType::Srv, &view);
-            let failed = crate::residency::take_staging_deferred() || crate::residency::upload_refused();
+            let why = if crate::residency::take_staging_deferred() {
+                Some("its staging buffer was deferred")
+            } else if crate::residency::upload_refused() {
+                Some("uploads are refused for a moment after the host ran out of memory")
+            } else if !crate::texture::UPLOAD_STAGED.get() {
+                Some("no upload was recorded (no console layout, an XOR mode, or no staging buffer)")
+            } else {
+                None
+            };
             if !was_staged {
                 crate::texture::unstage(resource);
             }
-            if failed {
+            if let Some(why) = why {
                 n[8] += 1;
+                bake_source_failed(index, &view, why);
                 continue;
             }
             if let Some(copy) = crate::resource::host_copy(resource) {
@@ -3104,23 +3136,25 @@ impl State {
                 && !sync_bake
                 && crate::descriptor::host::show_after()
                 && heap.handle(index).is_some_and(|handle| !host.texture_slot_made_from(index, handle));
-            let (view, bake_key) = if sync_bake {
-                match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
-                    Some((view, key)) => (Some(view), Some(key)),
-                    None => (None, None),
+            let (view, bake_key) = timed(6, || {
+                if sync_bake {
+                    match heap.handle(index).and_then(|handle| host.prepare_bake_slot(index, handle)) {
+                        Some((view, key)) => (Some(view), Some(key)),
+                        None => (None, None),
+                    }
+                } else {
+                    let view = heap.handle(index).and_then(|handle| {
+                        if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
+                    });
+                    (view, None)
                 }
-            } else {
-                let view = heap.handle(index).and_then(|handle| {
-                    if shows_other || late { crate::descriptor::view(handle) } else { host.mirror(index, handle, true) }
-                });
-                (view, None)
-            };
+            });
             let at_once = || {
                 if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
                     let _ = host.mirror(index, handle, true);
                 }
             };
-            let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+            let placed = timed(6, || view.as_ref().and_then(crate::descriptor::host::placed_texture));
             if crate::residency::upload_refused() {
                 served = false;
                 break;
@@ -3133,7 +3167,7 @@ impl State {
                     continue;
                 }
             };
-            let texture = crate::resource::host_resource(resource);
+            let texture = timed(5, || crate::resource::host_resource(resource));
             if crate::residency::upload_refused() {
                 served = false;
                 break;

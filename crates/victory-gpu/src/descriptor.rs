@@ -197,9 +197,72 @@ fn sync_early() -> Option<std::time::Duration> {
     })
 }
 
+/// The rounds submissions asked the thread for, and those done.
+///
+/// A round covers every ask made before it began, not one ask: two
+/// submissions that begin while a round runs share the next one (a round
+/// that begins after an ask sees what the title wrote before it).
+#[cfg(windows)]
+#[derive(Default)]
+struct Rounds {
+    asked: u64,
+    done: u64,
+}
+
+#[cfg(windows)]
+impl Rounds {
+    /// A submission asks for a round; the number it waits for.
+    fn ask(&mut self) -> u64 {
+        self.asked += 1;
+        self.asked
+    }
+
+    fn pending(&self) -> bool {
+        self.done < self.asked
+    }
+
+    /// A round begins: it covers the asks up to this one.
+    fn begin(&self) -> u64 {
+        self.asked
+    }
+
+    fn finish(&mut self, covered: u64) {
+        self.done = self.done.max(covered);
+    }
+
+    fn covers(&self, mine: u64) -> bool {
+        self.done >= mine
+    }
+}
+
+/// How many doublings of the wait between early rounds follow rounds that
+/// found nothing (`VICTORY_HEAP_SYNC_BACKOFF=<n>`, 2 if not given: up to four
+/// times as long; `0`: the same wait always). A round that finds nothing
+/// still asks the kernel about the whole heap (and resets what it finds, with
+/// a flush of the other processors' translations), and the 4 ms ones went on
+/// for the whole of a 190 ms frame of which the title records in 64.
+#[cfg(windows)]
+fn sync_backoff() -> u32 {
+    static STEPS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STEPS.get_or_init(|| std::env::var("VICTORY_HEAP_SYNC_BACKOFF").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2u32).min(6))
+}
+
+/// The wait before an early round after `quiet` rounds in a row that found
+/// nothing.
+#[cfg(windows)]
+fn early_wait(every: std::time::Duration, quiet: u32, steps: u32) -> std::time::Duration {
+    every * (1u32 << quiet.min(steps))
+}
+
 /// The thread's work: rounds asked for, rounds done.
 #[cfg(windows)]
-static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::sync::Mutex::new((0, 0)), std::sync::Condvar::new());
+static SYNC_ROUNDS: (std::sync::Mutex<Rounds>, std::sync::Condvar) = (std::sync::Mutex::new(Rounds { asked: 0, done: 0 }), std::sync::Condvar::new());
+
+/// Since the last frame line, the thread's rounds: for submissions, early,
+/// early ones that found nothing, and the longest for a submission in
+/// microseconds.
+#[cfg(windows)]
+static SYNC_ROUND_COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// [`sync_heaps`], begun; done when it is dropped (with [`sync_aside`]), or
 /// when this returns.
@@ -216,42 +279,57 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
+            use std::sync::atomic::Ordering::Relaxed;
             crate::cores::keep_on_fast_cores("victory-heap-sync");
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-            /// A round is over, however it ends.
-            struct Over;
+            /// A round is over, however it ends: the asks it began with are met.
+            struct Over(u64);
             impl Drop for Over {
                 fn drop(&mut self) {
-                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).1 += 1;
+                    SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).finish(self.0);
                     SYNC_ROUNDS.1.notify_all();
                 }
             }
             // Between the rounds asked for, while submissions come.
             let mut last = std::time::Instant::now();
+            // Rounds in a row that found nothing.
+            let mut quiet = 0u32;
             loop {
                 let mut r = rounds();
-                let mut asked = r.0 != r.1;
+                let mut asked = r.pending();
                 while !asked {
                     let Some(every) = sync_early().filter(|_| last.elapsed().as_millis() < 500) else {
                         r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
-                        asked = r.0 != r.1;
+                        asked = r.pending();
                         continue;
                     };
-                    let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, every).unwrap_or_else(|e| e.into_inner());
+                    let (back, over) = SYNC_ROUNDS.1.wait_timeout(r, early_wait(every, quiet, sync_backoff())).unwrap_or_else(|e| e.into_inner());
                     r = back;
-                    asked = r.0 != r.1;
+                    asked = r.pending();
                     if over.timed_out() {
                         break;
                     }
                 }
+                let covers = r.begin();
                 drop(r);
+                let began = std::time::Instant::now();
                 let _over = asked.then(|| {
-                    last = std::time::Instant::now();
-                    Over
+                    last = began;
+                    Over(covers)
                 });
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
-                let _ = std::panic::catch_unwind(sync_heaps);
+                // (A round that panicked found something, as far as we know.)
+                let found = std::panic::catch_unwind(sync_heaps).unwrap_or(true);
+                quiet = if found { 0 } else { quiet.saturating_add(1) };
+                let micros = began.elapsed().as_micros() as u64;
+                if asked {
+                    SYNC_ROUND_COUNTS[0].fetch_add(1, Relaxed);
+                    SYNC_ROUND_COUNTS[3].fetch_max(micros, Relaxed);
+                } else {
+                    SYNC_ROUND_COUNTS[1].fetch_add(1, Relaxed);
+                    SYNC_ROUND_COUNTS[2].fetch_add(u64::from(!found), Relaxed);
+                }
             }
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
@@ -260,10 +338,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         sync_heaps();
         return SyncedHeaps(None);
     }
-    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    rounds.0 += 1;
-    let mine = rounds.0;
-    drop(rounds);
+    let mine = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).ask();
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
 }
@@ -276,7 +351,7 @@ impl Drop for SyncedHeaps {
         };
         let began = std::time::Instant::now();
         let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-        while rounds.1 < mine {
+        while !rounds.covers(mine) {
             rounds = SYNC_ROUNDS.1.wait(rounds).unwrap_or_else(|e| e.into_inner());
         }
         drop(rounds);
@@ -293,12 +368,15 @@ impl Drop for SyncedHeaps {
 /// few hundred views made by calls; without it those host slots stayed
 /// null, or went on showing what they showed before.
 /// `VICTORY_HEAP_SYNC=0`: not done, as before. [`SYNCED`] counts.
+///
+/// Whether there was anything to look at: changed pages or records due.
 #[cfg(windows)]
-pub(crate) fn sync_heaps() {
+pub(crate) fn sync_heaps() -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
-        return;
+        return false;
     }
+    let mut found = false;
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
@@ -323,6 +401,7 @@ pub(crate) fn sync_heaps() {
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
+        found |= !before.is_empty();
         let of_tables = std::sync::atomic::AtomicU64::new(0);
         crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
             for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
@@ -342,6 +421,7 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let taken = written.take(start as usize, end as usize);
         spent[0] += since(began);
+        found |= !taken.is_empty();
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
             let mut page = range_from & !(crate::watch::PAGE - 1);
@@ -473,6 +553,7 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
         count.fetch_add(n, Relaxed);
     }
+    found
 }
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,
@@ -534,6 +615,7 @@ pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let rounds = [0, 1, 2, 3].map(|i| SYNC_ROUND_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     if pages == 0 {
         return;
     }
@@ -542,7 +624,7 @@ pub(crate) fn sync_line(frames: f64) {
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \
          draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for); of the mirrored \
          {:.0} no views (with those of slots that show none), {:.0} of objects, {:.0} others, {:.0} samplers, {:.0} that waited and no draw came; \
-         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading and comparing, {:.2} making",
+         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading and comparing, {:.2} making;          rounds of the thread (VICTORY_HEAP_SYNC_BACKOFF={}): {:.1} for submissions, {:.1} early of which {:.1} found nothing,          the longest for a submission {:.2} ms",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
@@ -559,7 +641,12 @@ pub(crate) fn sync_line(frames: f64) {
         split[1] / (1 << 20) as f64 / frames,
         split[2] / 1e6 / frames,
         split[3] / 1e6 / frames,
-        split[4] / 1e6 / frames
+        split[4] / 1e6 / frames,
+        sync_backoff(),
+        rounds[0] / frames,
+        rounds[1] / frames,
+        rounds[2] / frames,
+        rounds[3] / 1000.0
     );
 }
 
@@ -1558,6 +1645,40 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// A round covers every ask made before it began, and only those.
+    #[cfg(windows)]
+    #[test]
+    fn a_round_meets_the_asks_made_before_it_began() {
+        let mut rounds = Rounds::default();
+        assert!(!rounds.pending());
+        let first = rounds.ask();
+        // The round begins; two more submissions ask while it runs.
+        let covers = rounds.begin();
+        let (second, third) = (rounds.ask(), rounds.ask());
+        rounds.finish(covers);
+        assert!(rounds.covers(first));
+        assert!(!rounds.covers(second) && !rounds.covers(third), "asked after the round began: it may have missed their records");
+        assert!(rounds.pending());
+        // One round for both of them, not one each.
+        let covers = rounds.begin();
+        rounds.finish(covers);
+        assert!(rounds.covers(second) && rounds.covers(third));
+        assert!(!rounds.pending());
+        // A round that finishes late does not take back what a later one met.
+        rounds.finish(first);
+        assert!(rounds.covers(third));
+    }
+
+    /// Early rounds wait longer after rounds that found nothing, up to a limit.
+    #[cfg(windows)]
+    #[test]
+    fn early_rounds_back_off_while_nothing_is_found() {
+        let every = std::time::Duration::from_millis(4);
+        let waits: Vec<u128> = (0..6).map(|quiet| early_wait(every, quiet, 2).as_millis()).collect();
+        assert_eq!(waits, [4, 8, 16, 16, 16, 16]);
+        assert!((0..6).all(|quiet| early_wait(every, quiet, 0) == every), "no steps: the same wait always");
     }
 
     #[cfg(windows)]

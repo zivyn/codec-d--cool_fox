@@ -3825,10 +3825,47 @@ impl State {
         // final-1: 416 of 472 dispatches had "other tables"): where the
         // usual place has none, the first table entry of that kind that
         // fits (a 2D R11G11B10 image; a 2D 32-bit depth at least its size).
+        // A depth-stencil texture's view of its stencil plane (formats
+        // X32_TYPELESS_G8X24_UINT, X24_TYPELESS_G8_UINT, or a 2D view of plane
+        // 1) is no depth: the estimate made of it puts every point far away
+        // with its normal to the camera (flat floors). Seen in the capture
+        // haze2: after the _ReflectiveCaustics variant 34fb51b8a0312e82 the
+        // place (0,464) named #6481's stencil plane.
+        fn stencil_view(view: Option<View>) -> bool {
+            match view {
+                Some(View::Shader(_, Some(d))) => {
+                    matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[5] == 1)
+                }
+                _ => false,
+            }
+        }
+        let stencil_at = |(slot, offset): (u8, u32)| {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return false;
+            };
+            stencil_view(crate::descriptor::view(table + u64::from(offset) * 4))
+        };
+        let depth_like = |d: &D3D12_RESOURCE_DESC| {
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && matches!(
+                    d.Format,
+                    DXGI_FORMAT_R32_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT
+                        | DXGI_FORMAT_R32G8X24_TYPELESS
+                        | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        | DXGI_FORMAT_R24G8_TYPELESS
+                        | DXGI_FORMAT_D24_UNORM_S8_UINT
+                )
+        };
         let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
             t.used
                 .iter()
                 .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter(|u| kind != ResourceType::Srv || !stencil_at((u.slot, u.table_offset_dwords)))
                 .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
                 .find(|(desc, _)| fits(desc))
         };
@@ -3840,24 +3877,26 @@ impl State {
             }),
             _ => entry(ResourceType::Uav, at),
         };
+        let usual_depth = |at: (u8, u32)| {
+            if stencil_at(at) {
+                static STENCIL: AtomicU64 = AtomicU64::new(0);
+                if STENCIL.fetch_add(1, Ordering::Relaxed) == 0 {
+                    tracing::info!(?role, ?at, "stand-in: the depth place names a stencil plane; another depth view of the tables is taken (counted once)");
+                }
+                None
+            } else {
+                entry(ResourceType::Srv, at)
+            }
+        };
         let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Miss => entry(ResourceType::Srv, MISS_DEPTH).or_else(|| {
+            Role::Resolve => usual_depth(DEPTH).or_else(|| {
+                let size = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                scan(ResourceType::Srv, &|d| depth_like(d) && size == Some((d.Width, d.Height)))
+            }),
+            Role::Miss => usual_depth(MISS_DEPTH).or_else(|| {
                 let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
                 scan(ResourceType::Srv, &|d| {
-                    use windows::Win32::Graphics::Dxgi::Common::{
-                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
-                        DXGI_FORMAT_R32G8X24_TYPELESS,
-                    };
-                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
-                        && matches!(
-                            d.Format,
-                            DXGI_FORMAT_R32_TYPELESS
-                                | DXGI_FORMAT_D32_FLOAT
-                                | DXGI_FORMAT_R32G8X24_TYPELESS
-                                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
-                        )
-                        && half.is_some_and(|(w, h)| d.Width >= w && d.Height >= h && d.Width <= w * 4)
+                    depth_like(d) && half.is_some_and(|(w, h)| d.Width >= w && d.Height >= h && d.Width <= w * 4)
                 })
             }),
             Role::Radiance | Role::Air => image,
@@ -3866,6 +3905,35 @@ impl State {
             once!(?role, "no stand-in for the indirect light: other tables");
             if role == Role::Miss {
                 crate::ambient::note_miss(MissNote::NotReady);
+                // Once per program: what its tables hold, so one run names
+                // the place of the rays' image and of the depth.
+                static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.len() < 16 && !seen.contains(&p.name) {
+                    seen.push(p.name.clone());
+                    let held: Vec<String> = t
+                        .used
+                        .iter()
+                        .filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Uav | ResourceType::Srv))
+                        .map(|u| {
+                            let at = (u.slot, u.table_offset_dwords);
+                            match entry(u.kind, at) {
+                                Some((d, _)) => format!(
+                                    "{:?}{:?} {}x{} f{} dim{}{}",
+                                    u.kind,
+                                    at,
+                                    d.Width,
+                                    d.Height,
+                                    d.Format.0,
+                                    d.Dimension.0,
+                                    if stencil_at(at) { " stencil" } else { "" }
+                                ),
+                                None => format!("{:?}{:?} -", u.kind, at),
+                            }
+                        })
+                        .collect();
+                    tracing::info!(program = %p.name, tables = %held.join("; "), "reflections stand-in: a miss program whose rays' image or depth was not found");
+                }
             }
             return false;
         };

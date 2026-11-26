@@ -14,8 +14,8 @@ or publisher.
 
 ## Download
 
-Every push is built by GitHub Actions on a Windows runner. Two kinds of builds
-are kept as rolling prereleases (each is replaced by the next push to its branch):
+Builds are made by GitHub Actions on a Windows runner, started by hand. Two kinds of builds
+are kept as rolling prereleases (each is replaced by the next published build of its branch):
 
 - [`build-main`](https://github.com/zivyn/codec-d--cool_fox/releases/tag/build-main):
   the `main` branch, what has been checked in the game.
@@ -24,7 +24,7 @@ are kept as rolling prereleases (each is replaced by the next push to its branch
 
 Each release holds `victory.exe` (release build), `victory-diag.exe` (the same
 with the `diagnostics` switches), `dxil.dll` (the DXIL validator, only for
-`--validate` and `--pipelines`), `Play-VIctory.cmd` and `SHA256SUMS.txt`. Put
+`--validate` and `--pipelines`) and `Play-VIctory.cmd`. Put
 them in one folder. The game itself is not included: you supply your own dump.
 
 ## Run
@@ -85,7 +85,7 @@ cargo build --release --locked -p victory
 
 `Play-VIctory.cmd` finds `target\release\victory.exe`. The diagnostics build is
 `cargo build --profile diag --locked -p victory --features diagnostics`. CI
-builds both and runs the tests on every push
+builds both and runs the tests on demand
 ([workflow](.github/workflows/build.yml)). Commands and debugging switches:
 [docs/README-fxceless.md](docs/README-fxceless.md). The history of the AMD
 RX 7900 XTX work is in avatarmanz's README.

@@ -56,6 +56,21 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
+    // is loaded before anything of the title or the host GPU, and fails soft;
+    // only if it offers one of them does the title render through its
+    // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
+    let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    let available = victory_hle::streamline::init(&asked);
+    let upscaler = (available.dlss || available.framegen).then_some(asked.mode);
+    if asked.any() {
+        println!(
+            "upscaling      DLSS {}, frame generation {}{}",
+            if available.dlss { "on" } else if asked.dlss { "asked, not available" } else { "off" },
+            if available.framegen { "on" } else if asked.framegen { "asked, not available" } else { "off" },
+            upscaler.map(|m| format!(", scene at the {} scale ({})", m.name(), m.scale())).unwrap_or_default()
+        );
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -70,15 +85,46 @@ pub fn run(
     let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
     let images = if native_1440p {
         anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
-        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p)?;
+        if upscaler.is_some() && render_1080p {
+            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
+        }
+        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())?;
         // SAFETY: nothing else runs yet; the title and the display mode list
         // read these later.
         unsafe {
             std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
             std::env::set_var("VICTORY_NATIVE_1440P", "1");
         }
-        println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
-        cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+        match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
+            Some((mode, Ok(()))) => {
+                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
+                println!(
+                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
+                    native_1440p::WIDTH,
+                    native_1440p::HEIGHT,
+                    mode.name()
+                );
+                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+            }
+            other => {
+                if let Some((_, Err(e))) = other {
+                    println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                }
+                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
+                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+            }
+        }
+    } else if let Some(mode) = upscaler {
+        match native_1440p::prepare_upscaler(&mut prepared, mode) {
+            Ok(()) => {
+                println!("display        the title's output, scene at {} of it through its FidelityFX path ({})", mode.scale(), mode.name());
+                cfg.cache_subdir(&format!("images/upscaler-{}", mode.name()))?
+            }
+            Err(e) => {
+                println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                cfg.cache_subdir("images")?
+            }
+        }
     } else {
         cfg.cache_subdir("images")?
     };
@@ -182,7 +228,10 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The title's FidelityFX calls go through ours when DLSS or frame
+    // generation is on (bound as before otherwise).
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.

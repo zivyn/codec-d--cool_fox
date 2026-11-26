@@ -156,11 +156,21 @@ fork's constant.
 | variable | does |
 |---|---|
 | `VICTORY_AMBIENT=<share>` | the estimate, 1 all of it (unset: the title's own) |
+| `VICTORY_AMBIENT=<share>,floor:<level>` | the estimate, and nowhere less than the constant (the estimate is the mean of what visible surfaces send out, so a room only a sun patch lights stays near black) |
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
 
 It is off while the builder runs.
+
+The title has several variants of the resolving program (seven in its
+shaders). They have the diffuse light and the depth at the same shader
+registers but at other places in their tables, so the stand-in finds them
+by register in each program's own resource list. A program it cannot follow
+says why once (`stand-in for the indirect light: skipped`), the first
+dispatch it raises says `applied`, and every 256th frame a line per program
+counts, since the last one, the dispatches raised and the ones not and why
+(`ambient coverage:`).
 
 ## Where to look
 

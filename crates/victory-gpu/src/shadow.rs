@@ -3916,11 +3916,58 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
+        self.whole_check(from, to);
+        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Diagnostic (`VICTORY_WHOLE_CHECK=1`; off by default): before a long
+    /// range of memory that is not watched is copied whole, title memory
+    /// is compared with what the copy holds, and the 4 KiB pages that
+    /// differ are counted and said (the first 32 times, then at powers of
+    /// two) with whether shaders were ever declared to write the copy. A
+    /// range whose pages never differ when `written` is false is a range
+    /// the title and the runtime do not change between its refreshes
+    /// (the FSR4 working buffer, 21 MB, was copied whole twice a frame:
+    /// run P2-3). Not for copies with shader ranges pending (their gaps are
+    /// refreshed one by one).
+    #[cfg(feature = "diagnostics")]
+    fn whole_check(&self, from: usize, to: usize) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if to - from < WHOLE_LONG || !*ON.get_or_init(|| crate::switch::on("VICTORY_WHOLE_CHECK")) {
+            return;
+        }
+        let start = self.start as usize;
+        let mut title = vec![0u8; 1 << 20];
+        let (mut differing, mut checked, mut at) = (0u64, 0u64, from);
+        while at < to {
+            let n = title.len().min(to - at);
+            if crate::host::read_into(at as *const u8, &mut title[..n]) {
+                // SAFETY: inside the copy's mapping (`update` cut the range).
+                let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                differing += title[..n].chunks(4096).zip(held.chunks(4096)).filter(|(a, b)| a != b).count() as u64;
+                checked += n as u64;
+            }
+            at += n;
+        }
+        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+        if said <= 32 || said.is_power_of_two() {
+            tracing::info!(
+                said,
+                copy = self.id,
+                title = format_args!("{from:#x}+{:#x}", to - from),
+                checked_mb = checked >> 20,
+                differing_pages = differing,
+                shaders_declared = self.written.load(Ordering::Relaxed),
+                on_the_card = self.card.is_some(),
+                "a range of memory that is not watched, about to be copied whole (VICTORY_WHOLE_CHECK=1)"
+            );
+        }
     }
 
     /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a

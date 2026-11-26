@@ -1,5 +1,52 @@
 # VIctory on NVIDIA
 
+## Built from many projects
+
+This repository did not come from one place. Over several weeks we built, ran
+and measured the work of many projects on the same NVIDIA machine, kept what
+worked on this card, and brought the best of each together here. No single one
+of them runs this well on NVIDIA by itself; the combination is what gets it to
+where it is now.
+
+Code that is in this repository:
+
+- [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX):
+  the base. Its threading, write relay, card fills, copy queue and texture
+  read-back are all kept.
+- [Marvisak/VIctory](https://github.com/Marvisak/VIctory): the original
+  compatibility layer under everything else (loader, runtime services,
+  Direct3D 12 back end, shader recompiler).
+- [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (formerly
+  victory-fork): the fork the 7900 XTX one grew from, and the Series S interface
+  plane (pull request 1189, Tissma95), which fixed the black menus.
+- victory-perf, carrying patches from
+  [ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort): the
+  title patches for render scale, the title's own upscaler and the watchdog.
+- Through the 7900 XTX fork:
+  [DexNom/VIctory](https://github.com/DexNom/VIctory),
+  [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD),
+  [FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY),
+  [myokex/victory-amd](https://github.com/myokex/victory-amd), Geckomacabre and
+  cxy0072019-sketch.
+
+Projects we ran, tested or studied along the way, whose lessons shaped the
+settings and fixes here (none of their code is in this repository unless listed
+above):
+
+- Projectfork-l/fork-l (no longer public): the first attempt, where the
+  retail executable's boot was worked through.
+- Our own builds of Marvisak/VIctory and fxceless/victory-fork, where the
+  ray-walk skip, the half render scale and most of the measurements in the
+  table below came from.
+- [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)
+  builds with its fixes combined.
+- [zm0kiemedia/Neptune_VI](https://github.com/zm0kiemedia/Neptune_VI) (formerly
+  vicecitybaby).
+- [xcl-dev/xcl](https://github.com/xcl-dev/xcl), another layer for the same
+  title, read for how the title behaves there.
+
+Full credits, with what each person contributed, are at the end of this README.
+
 ## What this fork changes, and how it gets its frame rate
 
 Everything below is what `scripts\play-nvidia.ps1` turns on. Measured on an
@@ -179,7 +226,7 @@ commits taken from elsewhere name the commit and its author.
   every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
   reads into title memory.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
+- **[XCL](https://github.com/xcl-dev/xcl)** (GPL-2.0-only) was read for how the same
   title behaves under another layer; no code of it is here.
 - This fork's changes were made with [Claude Code](https://claude.com/claude-code).
 

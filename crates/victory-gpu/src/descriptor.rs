@@ -323,6 +323,7 @@ pub(crate) fn sync_heaps() {
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
+        let (mut past, mut past_highest) = (0u64, None::<u32>);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
         crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
             for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
@@ -373,6 +374,11 @@ pub(crate) fn sync_heaps() {
                 out.views += u64::from(crate::watch::guarded(from, to));
                 out.bytes += (to - from) as u64;
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                if !samplers {
+                    let (n, highest) = views_past(&page_bytes, from - start as usize, step, mirrored_count);
+                    out.past += n;
+                    out.past_highest = out.past_highest.max(highest);
+                }
                 // A record that straddles the range's ends is left
                 // to the range that holds its first byte.
                 let first = ((from - start as usize) as u64).div_ceil(step).max(slots.start);
@@ -442,6 +448,8 @@ pub(crate) fn sync_heaps() {
             tabled += part.tabled;
             kinds[0] += part.nothing;
             later += part.wait.len() as u64;
+            past += part.past;
+            past_highest = past_highest.max(part.past_highest);
             mirrored += part.make.len() as u64;
             wait.append(&mut part.wait);
             make.append(&mut part.make);
@@ -457,6 +465,9 @@ pub(crate) fn sync_heaps() {
             }
         });
         spent[2] += since(began);
+        if let Some(highest) = past_highest {
+            note_views_past(past, highest, heap.desc.count, host.count());
+        }
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
         }
@@ -493,6 +504,10 @@ struct SyncPart {
     make: Vec<u32>,
     wait: Vec<u32>,
     kinds: [u64; 5],
+    /// View records the title wrote past the host heap's title slots, and
+    /// the highest slot of them ([`views_past`]).
+    past: u64,
+    past_highest: Option<u32>,
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -578,6 +593,50 @@ fn changed_slots(
     let first = from / step;
     let last = to.div_ceil(step).min(u64::from(mirrored_count));
     first.min(last)..last
+}
+
+/// How many view records lie in the bytes of one changed page of a title view
+/// heap past the first `mirrored_count` slots (those the host heap has no slot
+/// for: it holds at most 1,000,000 views on NVIDIA, fewer title slots than the
+/// title's heap), and the highest slot of them. `page_from` is the page's
+/// offset in the heap. A shader that picks one of these by an index it
+/// computes reads a null view.
+#[cfg(windows)]
+fn views_past(page: &[u8], page_from: usize, step: u64, mirrored_count: u32) -> (u64, Option<u32>) {
+    let step = step as usize;
+    if step < 4 {
+        return (0, None);
+    }
+    let first = page_from.div_ceil(step).max(mirrored_count as usize);
+    let mut found = (0u64, None);
+    for slot in first.. {
+        let at = slot * step - page_from;
+        let Some(record) = page.get(at..at + step) else { break };
+        if u32::from_le_bytes([record[0], record[1], record[2], record[3]]) == VIEW_TAG {
+            found = (found.0 + 1, Some(slot as u32));
+        }
+    }
+    found
+}
+
+/// Says (a few times) that the title wrote views to slots the host heap has
+/// none for.
+#[cfg(windows)]
+fn note_views_past(count: u64, highest: u32, title: u32, host: u32) {
+    static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let total = TOTAL.fetch_add(count, std::sync::atomic::Ordering::Relaxed) + count;
+    let before = SEEN.fetch_max(highest, std::sync::atomic::Ordering::Relaxed);
+    // First time, then each time it climbs by 16,384 slots.
+    if highest >= before.saturating_add(1 << 14) || before == 0 {
+        tracing::warn!(
+            highest,
+            total,
+            title,
+            host,
+            "the title wrote view records past the host heap's title slots: views read by an index a shader computes read a null view there (tables are snapshotted)"
+        );
+    }
 }
 
 /// The title's view heap that shaders of a list without one get their views
@@ -1558,6 +1617,31 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    /// Views the title writes past the host heap's title slots are found
+    /// by slot, whatever the page's offset.
+    #[cfg(windows)]
+    #[test]
+    fn views_past_the_host_heap_are_counted() {
+        let step = 32usize;
+        let record = |tag: u32| {
+            let mut r = vec![0u8; step];
+            r[..4].copy_from_slice(&tag.to_le_bytes());
+            r
+        };
+        // A page of eight slots starting at slot 10: 12 (a view) is
+        // before the limit of 14, 14 and 17 are views, 15 holds none.
+        let mut page = Vec::new();
+        for slot in 10..18u32 {
+            page.extend(record(if matches!(slot, 12 | 14 | 17) { VIEW_TAG } else { 0 }));
+        }
+        assert_eq!(views_past(&page, 10 * step, step as u64, 14), (2, Some(17)));
+        assert_eq!(views_past(&page, 10 * step, step as u64, 18), (0, None));
+        assert_eq!(views_past(&page, 10 * step, step as u64, 0), (3, Some(17)));
+        // A page that does not start on a record: the first whole one counts
+        // and a cut-off last one does not.
+        assert_eq!(views_past(&page[8..page.len() - 8], 10 * step + 8, step as u64, 0), (2, Some(14)));
     }
 
     #[cfg(windows)]

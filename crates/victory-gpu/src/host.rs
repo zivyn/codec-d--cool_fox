@@ -8972,13 +8972,14 @@ impl Meter {
             );
             crate::tiles::status();
             {
-                let [queued, due, away, partly, oldest] =
-                    [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
+                let [queued, due, away, partly, oldest, again] =
+                    [0, 1, 2, 3, 4, 5].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
                 let [same, parts, tails] =
                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
                 tracing::info!(
-                    "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
-                     {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
+                    "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest not uploaded yet written \
+                     {oldest} frames ago), {away} waiting for their memory, {partly} uploaded in part, {again} uploaded whole and \
+                     waiting to be looked at again; since the start: {} slots found uploaded already by \
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
@@ -9007,7 +9008,12 @@ impl Meter {
                     );
                 }
                 let [looks, mapped, same, staged, all, made, views] =
-                    [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_MICROS[i].swap(0, Ordering::Relaxed) / 1000);
+                    [0, 1, 2, 3, 4, 5, 6].map(|i| crate::draw::HEAP_TEXTURE_NANOS[i].swap(0, Ordering::Relaxed) / 1_000_000);
+                let rest = all.saturating_sub(looks + mapped + same + staged + made + views);
+                let parts = crate::draw::HEAP_TEXTURE_REST.each_ref().map(|n| n.swap(0, Ordering::Relaxed) / 1_000_000);
+                let waits = crate::descriptor::LOCK_WAITS.each_ref().map(|n| n.swap(0, Ordering::Relaxed) / 1_000_000);
+                let passes = crate::draw::HEAP_TEXTURE_PASSES.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                let slots = crate::draw::HEAP_TEXTURE_SLOTS.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
                 if all > 0 {
                     tracing::info!(
                         "the pass over textures picked by index, in the last 5 seconds: {all} ms in all, of them {looks} ms looking \
@@ -9018,6 +9024,55 @@ impl Meter {
                         all.saturating_sub(looks + mapped + same + staged + made + views),
                         crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                         crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20
+                    );
+                }
+                let served = crate::descriptor::host::SERVED.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                if served[0] + served[3] > 0 {
+                    tracing::info!(
+                        "textures picked by index served for the first time in the last 5 seconds: {} at their first look, \
+                         {:.1} frames after they were due ({} at most: the pass's own lateness), {} after their memory was \
+                         found not there, {:.1} frames after their write ({} at most)",
+                        served[0],
+                        served[1] as f64 / served[0].max(1) as f64,
+                        served[2],
+                        served[3],
+                        served[4] as f64 / served[3].max(1) as f64,
+                        served[5]
+                    );
+                }
+                if all > 0 || parts[7] > 0 {
+                    let [queue, records, prints, ahead, shown, whole, checks, before] = parts;
+                    let [n_frame, n_early, n_bake, t_frame, t_early, t_bake, at_time, at_bytes] = passes;
+                    tracing::info!(
+                        "the pass over textures picked by index, its rest in the last 5 seconds: {queue} ms telling the queue \
+                         what came of each slot, {records} ms reading the slots' records, {prints} ms fingerprints after uploads \
+                         and looks that found the host copy the same, {ahead} ms handing first uploads to the copy queue ahead, \
+                         {shown} ms slots shown after their upload, flipped or made at once, {whole} ms asking whether a staged \
+                         texture's memory is all there, {checks} ms other checks, {} ms not told apart; waited for locks: the \
+                         queue's {} ms by the pass ({} ms by other threads), the views' {} ms by the pass ({} ms by other threads); \
+                         {before} ms before the passes' loops (not in the line above); passes: {n_frame} the frame's ({} ms), \
+                         {n_early} early ({} ms), {n_bake} before bakes ({} ms), {at_time} stopped at their time, {at_bytes} at their \
+                         bytes; slots taken {}: {} looked at again and unchanged, {} memory not there, {} no more of it there, \
+                         {} nothing to bring up to date, {} held back for room, {} the same as their host copy, {} uploaded \
+                         ahead, {} uploaded in the pass's list, {} read through tables",
+                        rest.saturating_sub(queue + records + prints + ahead + shown + whole + checks),
+                        waits[0],
+                        waits[1],
+                        waits[2],
+                        waits[3],
+                        t_frame / 1_000_000,
+                        t_early / 1_000_000,
+                        t_bake / 1_000_000,
+                        slots[0],
+                        slots[1],
+                        slots[2],
+                        slots[3],
+                        slots[4],
+                        slots[5],
+                        slots[6],
+                        slots[7],
+                        slots[8],
+                        slots[9],
                     );
                 }
             }

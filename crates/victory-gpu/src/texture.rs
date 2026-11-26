@@ -1742,12 +1742,49 @@ pub(crate) fn is_staged(resource: This) -> bool {
 /// The bytes of a title texture's memory, and whether all of it is mapped,
 /// if the texture has been staged for upload.
 /// (Whether it is mapped is asked only if `ask`; else it counts as mapped.)
+/// Only of a texture at an address the title mapped
+/// ([`crate::resource::at_title_address`]): the memory of any other is all
+/// there while it lives. The pass over textures picked by index asked it of
+/// every texture object it took, 20,000-57,000 every 5 seconds, most of them
+/// read through tables (a question per 256 pages: 18-111 us for 1-16 MB,
+/// milliseconds when the pages had left the working set, and each such page
+/// read back into it), for 66 found not all there in a whole run
+/// (coolfox-20261126-223059); the pass's unattributed time went with their
+/// count, 13 us each. Of one at a title address, the runtime's views of
+/// physical pages answer where they cover the memory ([`all_there`]: one
+/// look, under a microsecond), as they do for placed textures
+/// ([`mapped_bytes`]). `VICTORY_STAGED_ASK_ALL=1`: Windows is asked of every
+/// texture, as before.
 pub(crate) fn staged(resource: This, ask: bool) -> Option<(u64, bool)> {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let s = {
         let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
         map.as_ref()?.get(&(resource as usize))?.clone()
     };
-    Some((s.read as u64, !ask || committed(s.memory, s.read)))
+    let whole = !ask
+        || if *ALL.get_or_init(|| std::env::var_os("VICTORY_STAGED_ASK_ALL").is_some_and(|v| v == "1")) {
+            committed(s.memory, s.read)
+        } else {
+            !crate::resource::at_title_address(resource) || all_there(s.memory, s.read)
+        };
+    Some((s.read as u64, whole))
+}
+
+/// Whether all of `[at, at + len)` is mapped: by the runtime's views of
+/// physical pages where any lies there (as [`mapped_bytes`] asks), else by
+/// asking Windows ([`committed`]).
+fn all_there(at: *const u8, len: usize) -> bool {
+    match by_views().then(|| crate::inplace::shown_bytes(at as usize, len)).flatten() {
+        Some(there) => there >= len as u64,
+        None => committed(at, len),
+    }
+}
+
+/// Whether how much of title memory is mapped is asked of the runtime's
+/// views of physical pages first (`VICTORY_MAPPED_BY_VIEWS=0`: of Windows).
+fn by_views() -> bool {
+    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1861,8 +1898,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     // knows which are there: one look, where the host was asked for every
     // 64 KiB of the texture (and once more for each that is not there).
     // `VICTORY_MAPPED_BY_VIEWS=0`: the host is asked, as before.
-    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
+    if by_views()
         && let Some(there) = crate::inplace::shown_bytes(start, len)
     {
         return there;
@@ -2030,6 +2066,32 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    /// Whether memory is all there is answered by the runtime's views of
+    /// physical pages where they lie, and by Windows where none does.
+    #[test]
+    fn all_there_asks_the_views_where_they_lie() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: a reservation of our own, its first two blocks committed.
+        let at = unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 4 * BLOCK, MEM_RESERVE, PAGE_READWRITE);
+            VirtualAlloc(at, 2 * BLOCK, MEM_COMMIT, PAGE_READWRITE);
+            at as usize
+        };
+        let there = |len| super::all_there(at as *const u8, len);
+        assert!(there(2 * BLOCK));
+        assert!(!there(3 * BLOCK));
+        // The runtime's views of the first two blocks answer for them.
+        for block in 0..2 {
+            crate::title_memory_view(at + block * BLOCK, BLOCK, 9, 0);
+        }
+        assert!(there(2 * BLOCK));
+        assert!(!there(3 * BLOCK));
+        crate::inplace::views_gone(at, 4 * BLOCK);
+        // SAFETY: our reservation, released whole.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
@@ -2226,6 +2288,51 @@ mod allocation_costs {
                 println!("{name}, {how}: {:.1} us a look", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
             }
             crate::inplace::views_gone(noted, blocks * BLOCK);
+        }
+    }
+
+    /// What the pass over textures picked by index pays per slot outside its
+    /// timed parts (2026-11-26): asking whether a staged texture's memory is
+    /// all there (`staged(_, true)`, a question per 256 pages), and the
+    /// fingerprint of 48 KiB made after each upload and each texture found
+    /// the same. For `cargo test -p victory-gpu --release --lib pass_costs --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn pass_costs() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        for mb in [1usize, 4, 16] {
+            let len = mb << 20;
+            // SAFETY: memory of our own, committed and touched.
+            let at = unsafe {
+                let at = VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                std::ptr::write_bytes(at.cast::<u8>(), 1, len);
+                at as usize
+            };
+            const N: u32 = 200;
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                assert!(super::committed(at as *const u8, len));
+            }
+            println!("{mb} MB, all in the working set: whether it is all there, {:.1} us", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
+            // Pages out of the working set (trimmed, as Windows does to a
+            // process under pressure) are asked again by a read of a byte.
+            let mut worst = 0f64;
+            for _ in 0..5 {
+                // SAFETY: our own process.
+                unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+                let began = std::time::Instant::now();
+                assert!(super::committed(at as *const u8, len));
+                worst = worst.max(began.elapsed().as_secs_f64() * 1e6);
+            }
+            println!("{mb} MB, just trimmed from the working set: {worst:.1} us");
+            let began = std::time::Instant::now();
+            for _ in 0..N {
+                std::hint::black_box(super::fingerprint(at as u64, len as u64));
+            }
+            println!("{mb} MB: a fingerprint, {:.1} us", began.elapsed().as_secs_f64() * 1e6 / f64::from(N));
         }
     }
 

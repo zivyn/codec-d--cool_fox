@@ -13,6 +13,28 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+thread_local! {
+    /// Set while this thread runs the pass over textures picked by index
+    /// (`crate::draw::State::heap_textures`): its waits for the locks below
+    /// are counted apart from other threads' ([`LOCK_WAITS`]).
+    pub(crate) static IN_TEXTURE_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Nanoseconds threads waited for a lock another thread held, since the
+/// last 5-second line: the queue of textures picked by index's
+/// (`host::TextureQueue`) by the texture pass's thread and by the others
+/// (the threads that note slot writes in it), then the table of views'
+/// ([`VIEWS`]) likewise. Only waits are counted: a lock taken at once costs
+/// nothing here (`try_lock` first).
+pub(crate) static LOCK_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A wait for lock `which` (0: the texture queue's, 1: the views table's)
+/// that began at `started` is over: counted in [`LOCK_WAITS`].
+pub(crate) fn waited(which: usize, started: std::time::Instant) {
+    let other = usize::from(!IN_TEXTURE_PASS.get());
+    LOCK_WAITS[2 * which + other].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -1051,11 +1073,29 @@ fn words_for(view: View) -> [u32; 2] {
 }
 
 fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
-    VIEWS.read().unwrap_or_else(|e| e.into_inner())
+    match VIEWS.try_read() {
+        Ok(views) => views,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            waited(1, started);
+            views
+        }
+    }
 }
 
 fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
-    VIEWS.write().unwrap_or_else(|e| e.into_inner())
+    match VIEWS.try_write() {
+        Ok(views) => views,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            waited(1, started);
+            views
+        }
+    }
 }
 
 /// For the memory line: the distinct views kept ([`Views`]), those of them

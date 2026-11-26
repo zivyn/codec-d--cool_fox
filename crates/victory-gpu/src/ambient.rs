@@ -29,6 +29,8 @@
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
+//! `VICTORY_AMBIENT_ONCE=1`: one bounce of the title's own light, without the
+//! stand-in's light coming back to it ([`once`]).
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
@@ -102,6 +104,26 @@ pub(crate) fn on() -> bool {
     set() != Set::Off && !crate::pipeline::builder_runs()
 }
 
+/// `VICTORY_AMBIENT_ONCE=1`: the estimate is one bounce of the light the
+/// title's own lighting put there, not of the stand-in's too.
+///
+/// The light the visible surfaces send out (the estimate's source) is that of
+/// the frame before, which the stand-in had raised: its own light comes back
+/// to it, reflected. With a share `level` of what surfaces send out, and
+/// surfaces sending out a share `a` of the light they get (`e` their own),
+/// the light settles at `level * e / (1 - level * a)` instead of
+/// `level * (a * l + e)`: at 0.8 and walls that send out 0.6, 1.9 times
+/// one bounce, more near pale surfaces and lamps (the overexposed rooms).
+/// With this switch the raise notes, at the 25 places of each cell that the
+/// next keep reads, which share of the light there is the title's own; the
+/// keep counts each place's light by that share. Light that is the
+/// surface's own (lamps) is counted down as well where the stand-in raised
+/// it: shortcut, no albedo to tell the two apart.
+fn once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_ONCE").is_some_and(|v| v == "1"))
+}
+
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
@@ -137,11 +159,13 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float once;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// CELLS + 1 on where they are, from SHARES on the share of the title's own
+// light at each of the 25 places of a cell the keep reads (x; y: written).
+#define SHARES (2 * CELLS + 1)
 RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
@@ -168,7 +192,10 @@ void keep(uint3 at : SV_DispatchThreadID) {
         float3 c = max(radiance[p], 0.0);
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
-        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+        c /= max(1.0, dot(c, LUMA) / 20.0);
+        // Not the stand-in's own light, reflected (`once`).
+        float4 share = cells[SHARES + (at.y * CX + at.x) * 25 + y * 5 + x];
+        sum += once > 0.0 && share.y > 0.0 ? c * saturate(share.x) : c;
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
@@ -326,14 +353,27 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    float3 now = max(was, found);
+    light[p] = pack(now);
+    if (once > 0.0) {
+        // At the places the next keep reads, the share of the light that is
+        // the title's own.
+        float2 gc = (float2(p) + 0.5) / size * float2(CX, CY);
+        uint2 cell = min(uint2(gc), uint2(CX - 1, CY - 1));
+        uint2 k = min(uint2((gc - float2(cell)) * 5.0), uint2(4, 4));
+        uint2 q = uint2((float2(cell) + (float2(k) + 0.5) / 5.0) * size / float2(CX, CY));
+        if (q.x == uint(p.x) && q.y == uint(p.y)) {
+            float share = dot(was, LUMA) / max(dot(now, LUMA), 1e-6);
+            cells[SHARES + (cell.y * CX + cell.x) * 25 + k.y * 5 + k.x] = float4(share, 1.0, 0.0, 0.0);
+        }
+    }
 }
 #endif
 "#;
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 1 + 25 * CELLS) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -461,6 +501,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = if once() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -517,6 +558,52 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// The keep and raise as they act on the light, frame after frame, for
+    /// surfaces that send out `a` of the light they get and the title's own
+    /// light `title` on each (`VICTORY_AMBIENT_ONCE`'s model): the light it
+    /// settles at on each surface.
+    fn settle(level: f32, a: f32, title: &[f32], once: bool) -> Vec<f32> {
+        let mut light = title.to_vec();
+        let mut share = vec![1.0f32; title.len()];
+        for _ in 0..500 {
+            // Keep: what the surfaces sent out (the frame before), counted by
+            // the share of the title's own light there with `once`.
+            let sent: f32 = light
+                .iter()
+                .zip(&share)
+                .map(|(l, s)| a * l * if once { *s } else { 1.0 })
+                .sum::<f32>()
+                / title.len() as f32;
+            // Raise: never below the title's own light.
+            for (i, t) in title.iter().enumerate() {
+                light[i] = t.max(level * sent);
+                share[i] = t / light[i].max(1e-6);
+            }
+        }
+        light
+    }
+
+    /// Without it the stand-in's own light comes back to it: a lit wall and a
+    /// dark one settle at `level a t / 2 / (1 - level a / 2)` on the dark one,
+    /// a third more than one bounce at walls that send out 0.6, three
+    /// quarters more at 0.9. With it, one bounce of the title's light.
+    #[test]
+    fn once_is_one_bounce_of_the_titles_light() {
+        for a in [0.6f32, 0.9] {
+            let one_bounce = 0.8 * a * 1.0 / 2.0;
+            let fed = settle(0.8, a, &[1.0, 0.0], false)[1];
+            let once = settle(0.8, a, &[1.0, 0.0], true)[1];
+            assert!(
+                (fed - one_bounce / (1.0 - 0.8 * a / 2.0)).abs() < 1e-4,
+                "a={a}: fed back {fed}"
+            );
+            assert!((once - one_bounce).abs() < 1e-4, "a={a}: once {once}");
+            assert!(fed > 1.3 * once);
+        }
+        // Where the title's light is above the estimate nothing changes.
+        assert_eq!(settle(0.8, 0.6, &[1.0, 1.0], true), vec![1.0, 1.0]);
     }
 
     /// The passes compile with the system's compiler and the host takes them.

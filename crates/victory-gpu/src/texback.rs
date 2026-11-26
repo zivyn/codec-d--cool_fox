@@ -197,55 +197,168 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
     Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
 }
 
-/// Once the list has run, tile its texels back into the same title allocation.
+/// Whether texture read-backs are written into title memory by a thread of
+/// their own (`VICTORY_TEXBACK_ASYNC`; on unless `0`).
+///
+/// Writing one takes the lock against mapping changes
+/// ([`crate::watch::title_memory_reading`]), and while the title streams the
+/// world it changes mappings all the time: on the thread that lands
+/// submissions the wait for that lock stood 100-400 ms in some frames
+/// (run 5 of the 16 GB machine, RTX 3060: "textures shaders wrote" in the
+/// read-backs line, two to ten 350 KB water maps a frame), and with it the
+/// landing of everything else. Here the landing thread only copies the
+/// texels out of the read-back buffer; the waiting, tiling and writing go to
+/// [`writer`]. Of several copies of one texture waiting there only the newest
+/// is written: the title reads the frame before at most, which it may on the
+/// console too.
+fn asynchronous() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_ASYNC").is_none_or(|v| v != "0"))
+}
+
+/// A read-back's texels taken out of its buffer, to be tiled into title memory.
+struct Landing {
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    mips: u32,
+    layout: victory_formats::texture::Layout,
+    ticket: Arc<Ticket>,
+    /// The read-back buffer's bytes, from 0 to the end of its last subresource.
+    data: Vec<u8>,
+}
+
+/// Once the list has run, tile its texels back into the same title allocation
+/// (on [`writer`]'s thread when [`asynchronous`]).
 pub(crate) fn land(back: &Back) {
-    static COPIED: AtomicU64 = AtomicU64::new(0);
-    static STALE: AtomicU64 = AtomicU64::new(0);
-    let _mapping = crate::watch::title_memory_reading();
-    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
-        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
-        if skipped.is_power_of_two() {
-            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
-        }
+        stale();
         return;
     }
-    let (at, end) = back.range();
+    let len = back
+        .footprints
+        .iter()
+        .zip(&back.rows)
+        .map(|(f, &rows)| f.Offset as usize + f.Footprint.RowPitch as usize * rows as usize * f.Footprint.Depth as usize)
+        .max()
+        .unwrap_or(0);
+    let mut mapped = std::ptr::null_mut();
+    // SAFETY: our read-back buffer, written by the list that has run; `len`
+    // ends with its last subresource, which it holds.
+    let data = unsafe {
+        if back.buffer.Map(0, None, Some(&mut mapped)).is_err() || mapped.is_null() {
+            return;
+        }
+        let data = std::slice::from_raw_parts(mapped.cast::<u8>().cast_const(), len).to_vec();
+        back.buffer.Unmap(0, None);
+        data
+    };
+    let landing = Landing {
+        footprints: back.footprints.clone(),
+        rows: back.rows.clone(),
+        mips: back.mips,
+        layout: back.layout.clone(),
+        ticket: back.ticket.clone(),
+        data,
+    };
+    match asynchronous().then(writer).flatten() {
+        Some(writer) => writer.send(landing),
+        None => write(&landing),
+    }
+}
+
+fn stale() {
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+    if skipped.is_power_of_two() {
+        tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+    }
+}
+
+/// Tiles a read-back's texels into its title allocation.
+fn write(landing: &Landing) {
+    use crate::land::{count, spent, stat};
+    static COPIED: AtomicU64 = AtomicU64::new(0);
+    let asked = std::time::Instant::now();
+    let _mapping = crate::watch::title_memory_reading();
+    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    let working = spent(stat::TB_WAIT, asked);
+    if !landing.ticket.valid.load(Ordering::Acquire) {
+        stale();
+        return;
+    }
+    let (at, end) = (landing.ticket.at, landing.ticket.end);
     let size = end - at;
     let mut tiled = vec![0u8; size];
     // Keep title bytes the subresources do not cover.
     if !crate::host::read_into(at as *const u8, &mut tiled) {
         return;
     }
-    let mut data = std::ptr::null_mut();
-    // SAFETY: our read-back buffer, written by the list that has run.
-    unsafe {
-        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-            return;
-        }
-    }
-    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
-        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+    for (i, (footprint, &rows)) in landing.footprints.iter().zip(&landing.rows).enumerate() {
+        let (mip, slice) = (i as u32 % landing.mips, i as u32 / landing.mips);
         let f = footprint.Footprint;
         let pitch = f.RowPitch as usize;
-        let len = pitch * rows as usize * f.Depth as usize;
-        // SAFETY: the subresource's part of the mapped buffer.
-        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
-        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+        let from = footprint.Offset as usize;
+        let linear = &landing.data[from..from + pitch * rows as usize * f.Depth as usize];
+        if let Err(e) = landing.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
-            // SAFETY: mapped above.
-            unsafe { back.buffer.Unmap(0, None) };
             return;
         }
     }
-    // SAFETY: mapped above.
-    unsafe { back.buffer.Unmap(0, None) };
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    spent(stat::TB_WORK, working);
+    count(stat::TB_WRITTEN, 1);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
         tracing::info!(copied, bytes = size, "texture readback landed");
     }
+}
+
+/// The thread that writes read-backs into title memory, and what waits for it.
+struct Writer {
+    /// By title address: the newest landing for that allocation.
+    waiting: Mutex<std::collections::HashMap<usize, Landing>>,
+    more: std::sync::Condvar,
+}
+
+impl Writer {
+    fn send(&self, landing: Landing) {
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        if waiting.insert(landing.ticket.at, landing).is_some() {
+            crate::land::count(crate::land::stat::TB_REPLACED, 1);
+        }
+        drop(waiting);
+        self.more.notify_one();
+    }
+}
+
+/// The writer, if its thread could be started (if not, landings are written
+/// where they are made, as before).
+fn writer() -> Option<&'static Writer> {
+    static WRITER: OnceLock<Option<&'static Writer>> = OnceLock::new();
+    *WRITER.get_or_init(|| {
+        let writer: &'static Writer =
+            Box::leak(Box::new(Writer { waiting: Mutex::new(std::collections::HashMap::new()), more: std::sync::Condvar::new() }));
+        let started = std::thread::Builder::new().name("texture read-backs".into()).spawn(move || loop {
+            let batch: Vec<Landing> = {
+                let mut waiting = writer.waiting.lock().unwrap_or_else(|e| e.into_inner());
+                while waiting.is_empty() {
+                    waiting = writer.more.wait(waiting).unwrap_or_else(|e| e.into_inner());
+                }
+                waiting.drain().map(|(_, landing)| landing).collect()
+            };
+            for landing in &batch {
+                write(landing);
+            }
+        });
+        match started {
+            Ok(_) => Some(writer),
+            Err(e) => {
+                tracing::warn!(error = %e, "no thread for texture read-backs: they are written where they land");
+                None
+            }
+        }
+    })
 }
 
 

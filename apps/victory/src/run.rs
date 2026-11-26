@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+#[path = "native_1440p.rs"]
+mod native_1440p;
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -54,14 +57,31 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
-    let images = cfg.cache_subdir("images")?;
+    // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
+    // patched image goes to a folder of its own, beside the stock one.
+    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
+    let images = if native_1440p {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
+        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p)?;
+        // SAFETY: nothing else runs yet; the title and the display mode list
+        // read these later.
+        unsafe {
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
+            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+        }
+        println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
+        cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+    } else {
+        cfg.cache_subdir("images")?
+    };
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes

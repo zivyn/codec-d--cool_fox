@@ -3972,11 +3972,18 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let frontend = if count == 3 && instances == 1 { self.native_frontend_viewport() } else { None };
+            if let Some(viewport) = frontend {
+                viewports(list, &[viewport]);
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if frontend.is_some() {
+                viewports(list, &self.viewports);
+            }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -3991,6 +3998,58 @@ impl State {
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+    }
+
+    /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
+    /// it patches the image for it): the frontend's last triangle is drawn
+    /// in output pixels, but some screens project it against the legacy
+    /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
+    /// the projection lands on the 2560x1440 target. The scissor and target
+    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
+    /// GPL-3.0-or-later).
+    fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1"))
+            || self.depth != 0
+        {
+            return None;
+        }
+        let [viewport] = self.viewports.as_slice() else {
+            return None;
+        };
+        if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+            return None;
+        }
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        if !pipeline.stages.iter().any(|stage| stage.shader.hash == "0602c2384acbb3b2")
+            || !pipeline.stages.iter().any(|stage| stage.shader.hash == "a78d088fa55aa495")
+        {
+            return None;
+        }
+        let Root::Table(table) = self.roots_ref(false).first()? else {
+            return None;
+        };
+        let View::Constant(address, 480) = crate::descriptor::view(table.checked_add(64)?)? else {
+            return None;
+        };
+        let mut matrix = [0u8; 64];
+        if !crate::host::read_into(address.checked_add(64)? as *const u8, &mut matrix) {
+            return None;
+        }
+        #[rustfmt::skip]
+        let legacy_projection: [f32; 16] = [
+            2.0 / 3840.0, 0.0, 0.0, 0.0,
+            0.0, -2.0 / 2160.0, 0.0, 0.0,
+            0.0, 0.0, -1.0, 0.0,
+            -1.0, 1.0, 0.0, 1.0,
+        ];
+        if !matrix.as_chunks::<4>().0.iter().zip(legacy_projection).all(|(word, expected)| f32::from_le_bytes(*word) == expected)
+        {
+            return None;
+        }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the 1440p target"));
+        Some(D3D12_VIEWPORT { Width: 3840.0, Height: 2160.0, ..*viewport })
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first

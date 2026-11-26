@@ -1,0 +1,220 @@
+name: Build
+
+# Builds, tests and publishes victory.exe off the developers' machines, in
+# parallel jobs. Started by hand only, choosing the jobs that are needed:
+#   gh workflow run build.yml --ref <branch> -f build_diag=false -f test_rest=true
+# Nothing from the game is ever present here: tests that need the game or a
+# hardware GPU skip themselves when they are missing.
+run-name: Build ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+    inputs:
+      build_release:
+        description: Build victory.exe (release)
+        type: boolean
+        default: true
+      build_diag:
+        description: Build victory-diag.exe (diagnostics)
+        type: boolean
+        default: true
+      test_shader:
+        description: Tests of victory-shader
+        type: boolean
+        default: false
+      test_rest:
+        description: Tests of the rest of the workspace (with the asset policy)
+        type: boolean
+        default: false
+      clippy:
+        description: Clippy (non-blocking)
+        type: boolean
+        default: false
+      publish:
+        description: Update the rolling prerelease (only on main and integ/**)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  # The repo's cache budget is 10 GB: only main and integ/** save caches, the
+  # other branches restore them without evicting.
+  SAVE_CACHE: ${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/integ/') }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-release:
+    if: ${{ inputs.build_release }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      # The version, targets and components pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - run: cargo build --release --locked -p victory
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp target/release/victory.exe dist/victory.exe
+          cp Play-VIctory.cmd dist/Play-VIctory.cmd
+          # dxil.dll (for --validate and --pipelines) from the runner's Windows SDK.
+          dxil="$(ls -d "/c/Program Files (x86)/Windows Kits/10/bin/"*/x64/dxil.dll 2>/dev/null | sort | tail -n 1)"
+          if [ -n "$dxil" ]; then cp "$dxil" dist/dxil.dll; else echo "::warning::no dxil.dll on the runner"; fi
+      - uses: actions/upload-artifact@v5
+        with:
+          name: victory-release
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  build-diag:
+    if: ${{ inputs.build_diag }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - run: cargo build --profile diag --locked -p victory --features diagnostics
+      - name: Collect
+        run: |
+          mkdir -p dist
+          cp target/diag/victory.exe dist/victory-diag.exe
+      - uses: actions/upload-artifact@v5
+        with:
+          name: victory-diag
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  # victory-shader's tests run apart with few threads: many tests creating
+  # WARP devices at once crash the runner (no hardware GPU there, so the
+  # GPU-only tests skip and the rest use WARP).
+  test-shader:
+    if: ${{ inputs.test_shader }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - name: Tests
+        run: |
+          set -o pipefail
+          cargo test -p victory-shader --locked --no-fail-fast -- --test-threads=4 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/test-summary.sh "victory-shader (4 threads)" "$RUNNER_TEMP/test.log"
+
+  # Includes xtask's repository_passes_policy (the asset-policy check).
+  #
+  # Skipped, because the software adapter (WARP) on the runner answers
+  # differently from a hardware GPU (the first two also fail on NVIDIA and
+  # are fixed on fix/indirect-tests-nvidia, not on main yet):
+  #   indirect::tests::host_list_budget_starts_empty_at_each_submission
+  #   indirect::tests::warp_batch_charges_every_execution
+  #   pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws
+  #     (WARP has no depth bounds test)
+  test-rest:
+    if: ${{ inputs.test_rest }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - name: Tests
+        run: |
+          set -o pipefail
+          cargo test --workspace --exclude victory-shader --locked --no-fail-fast -- \
+            --skip indirect::tests::host_list_budget_starts_empty_at_each_submission \
+            --skip indirect::tests::warp_batch_charges_every_execution \
+            --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws \
+            2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: bash .github/scripts/test-summary.sh "workspace except victory-shader" "$RUNNER_TEMP/test.log"
+
+  # Non-blocking: the fork still has warnings (summary only).
+  clippy:
+    if: ${{ inputs.clippy }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - name: Clippy
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo clippy --workspace --all-targets --locked 2>&1 | tee "$RUNNER_TEMP/clippy.log"
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## Clippy (non-blocking)"
+            echo "$(grep -c '^warning' "$RUNNER_TEMP/clippy.log" || true) warning lines, $(grep -c '^error' "$RUNNER_TEMP/clippy.log" || true) error lines"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Rolling prerelease per branch (tag build-<branch, / replaced by ->), moved
+  # to the commit, assets replaced: a stable public URL for the latest exe,
+  # e.g. .../releases/download/build-main/victory.exe
+  publish:
+    needs: [build-release, build-diag]
+    # Runs when at least one build ran and none failed.
+    if: ${{ !cancelled() && inputs.publish && (github.ref_name == 'main' || startsWith(github.ref_name, 'integ/')) && !contains(needs.*.result, 'failure') && contains(needs.*.result, 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: victory-*
+          merge-multiple: true
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          tag="build-${BRANCH//\//-}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          notes="Rolling build of \`${BRANCH}\` at ${GITHUB_SHA}, from ${run_url}. Files: $(ls dist | xargs). Replaced by the next published run."
+          if gh api "repos/${GH_REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${tag}" -f sha="${GITHUB_SHA}" -F force=true >/dev/null
+            gh release edit "$tag" --prerelease --title "Build ${BRANCH}" --notes "$notes"
+          else
+            gh release create "$tag" --prerelease --target "${GITHUB_SHA}" --title "Build ${BRANCH}" --notes "$notes"
+          fi
+          gh release upload "$tag" dist/* --clobber
+          {
+            echo "## Published ${GITHUB_SHA::9}"
+            echo "Release: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}"
+            echo
+            echo "Exe: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/download/${tag}/victory.exe"
+          } >> "$GITHUB_STEP_SUMMARY"

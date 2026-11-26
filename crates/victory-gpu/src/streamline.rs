@@ -71,6 +71,14 @@ pub struct Asked {
     pub reactive: bool,
     /// `VICTORY_STREAMLINE_LOG=<folder>`: Streamline's own log there, verbose.
     pub log_dir: Option<PathBuf>,
+    /// `VICTORY_FRAMEGEN_HUDLESS=0`: with frame generation, no colour
+    /// without the interface is copied or tagged where the title draws its
+    /// interface into the frame (Series X).
+    pub hudless: bool,
+    /// `VICTORY_STREAMLINE_PRESENT=1`: with DLSS and no frame generation,
+    /// our swap chain is Streamline's proxy of it, so that Streamline sees
+    /// the presents (its bookkeeping per frame).
+    pub present_hook: bool,
 }
 
 impl Asked {
@@ -102,6 +110,8 @@ impl Asked {
             mvec: plan::pair(var("VICTORY_DLSS_MV").as_deref()),
             reactive: var("VICTORY_DLSS_REACTIVE").is_none_or(|v| v.trim() != "0"),
             log_dir: var("VICTORY_STREAMLINE_LOG").filter(|v| !v.trim().is_empty() && v.trim() != "0").map(PathBuf::from),
+            hudless: var("VICTORY_FRAMEGEN_HUDLESS").is_none_or(|v| v.trim() != "0"),
+            present_hook: on("VICTORY_STREAMLINE_PRESENT"),
         })
     }
 
@@ -194,6 +204,7 @@ struct Sl {
     get_feature_function: abi::SlGetFeatureFunction,
     get_new_frame_token: abi::SlGetNewFrameToken,
     set_d3d_device: abi::SlSetD3DDevice,
+    shutdown: abi::SlShutdown,
 }
 
 static SL: OnceLock<Sl> = OnceLock::new();
@@ -237,6 +248,8 @@ unsafe impl Sync for Proxies {}
 static PROXIES: OnceLock<Proxies> = OnceLock::new();
 /// Our present goes through Streamline's swap chain.
 static SWAP_CHAIN_PROXIED: AtomicBool = AtomicBool::new(false);
+/// Our swap chain is Streamline's proxy of it ([`present_hooked`]).
+static PRESENT_HOOKED: AtomicBool = AtomicBool::new(false);
 
 /// Library calls that are not thread safe, and what the upscaling keeps
 /// between frames, one caller at a time.
@@ -537,6 +550,7 @@ fn load(path: &Path) -> Result<Sl, String> {
         get_feature_function: get!(c"slGetFeatureFunction", abi::SlGetFeatureFunction),
         get_new_frame_token: get!(c"slGetNewFrameToken", abi::SlGetNewFrameToken),
         set_d3d_device: get!(c"slSetD3DDevice", abi::SlSetD3DDevice),
+        shutdown: get!(c"slShutdown", abi::SlShutdown),
         _library: library,
     })
 }
@@ -711,6 +725,7 @@ pub(crate) fn swap_chain_factory(factory: &IDXGIFactory2) -> Option<(IDXGIFactor
 /// frame generation stays off).
 pub(crate) fn swap_chain_made(proxied: bool, error: Option<&windows::core::Error>) {
     SWAP_CHAIN_PROXIED.store(proxied, Release);
+    HUDLESS_WANTED.store(proxied && FG_READY.load(Acquire) && PLAN.get().is_some_and(|p| p.asked.hudless), Release);
     if proxied {
         tracing::info!("Streamline: our swap chain is Streamline's proxy; DLSS Frame Generation can run on its presents");
     } else {
@@ -720,6 +735,36 @@ pub(crate) fn swap_chain_made(proxied: bool, error: Option<&windows::core::Error
             "Streamline: the swap chain could not be made through the proxy; made as before, frame generation off"
         );
     }
+}
+
+/// `VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame generation: Streamline's
+/// proxy of `swap_chain`, whose Present, ResizeBuffers and GetBuffer run
+/// Streamline's hooks first (its common plugin frees what it retired and
+/// keeps its video memory budget at each present; without it, it logs
+/// "presentCommon() was not observed" after 60 upscalings and frees nothing
+/// it retired). `swap_chain` itself if the switch is off, frame generation
+/// owns the swap chain, or the upgrade fails.
+pub(crate) fn present_hooked(swap_chain: IDXGISwapChain3) -> IDXGISwapChain3 {
+    let (Some(plan), Some(sl)) = (PLAN.get(), SL.get()) else { return swap_chain };
+    if !plan.asked.present_hook || !plan.dlss || !DLSS_READY.load(Acquire) || SWAP_CHAIN_PROXIED.load(Acquire) {
+        return swap_chain;
+    }
+    let mut raw = swap_chain.as_raw();
+    // SAFETY: an owned reference of ours; on success `raw` is a new proxy
+    // that holds its own reference to the swap chain.
+    let code = unsafe { (sl.upgrade_interface)(&mut raw) };
+    if code != 0 || raw.is_null() || raw == swap_chain.as_raw() {
+        tracing::warn!(
+            "Streamline: the swap chain was not upgraded: {} ({code}); presents stay unseen by Streamline",
+            abi::result_name(code)
+        );
+        return swap_chain;
+    }
+    tracing::info!("Streamline: our swap chain is Streamline's proxy of it (VICTORY_STREAMLINE_PRESENT=1): it sees every present");
+    PRESENT_HOOKED.store(true, Release);
+    // SAFETY: the proxy's one reference, now ours; it implements the swap
+    // chain interfaces up to IDXGISwapChain4 and holds the swap chain.
+    unsafe { IDXGISwapChain3::from_raw(raw) }
 }
 
 fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
@@ -972,7 +1017,13 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     let (Some(optimal_of), Some(set_options)) = (functions.dlss_optimal, functions.dlss_set_options) else {
         return Err("no DLSS functions".into());
     };
+    // (Timed with frame generation: its present shares this lock and
+    // Streamline with the upscaling.)
+    let began = plan.framegen.then(std::time::Instant::now);
     let mut calls = calls();
+    if let Some(began) = began {
+        spent(T_UPSCALE_LOCK, began);
+    }
     let output = camera.output;
     let optimal = |calls: &mut Calls, mode: u32| -> Option<[u32; 2]> {
         if let Some(&(_, _, size)) = calls.optimal.iter().find(|(o, m, _)| *o == output && *m == mode) {
@@ -1035,6 +1086,9 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     if code != 0 {
         return Err(format!("slEvaluateFeature: {} ({code})", abi::result_name(code)));
     }
+    if let Some(began) = began {
+        spent(T_UPSCALE, began);
+    }
     Ok(Recorded { mode, optimal: optimal_of_mode(mode), changed, jitter: constants.jitter_offset, mvec_scale: constants.mvec_scale })
 }
 
@@ -1050,6 +1104,220 @@ pub fn upscaler_destroyed(context: usize) {
     let code = unsafe { (sl.free_resources)(abi::FEATURE_DLSS, &viewport) };
     calls.last = None;
     tracing::info!(code, result = abi::result_name(code), "DLSS: the title's upscaler was destroyed; DLSS let go of its resources");
+}
+
+/// The title's interface composite where the interface is no plane of the
+/// present (Series X): one triangle that blends the interface target
+/// (3840x2160, premultiplied) over the frame's colour, with these vertex and
+/// pixel shaders, the frame's last draw into the texture it presents. Seen
+/// in every frame listing of 2026-11-26 (stock 3840x2160 output: once a
+/// frame, after the scene's composite into the same texture) and bound from
+/// frame 3 on in the 1440p runs with DLSS; `draw::State::native_frontend_viewport`
+/// (DexNom's) names the same draw.
+const INTERFACE_COMPOSITE: [&str; 2] = ["0602c2384acbb3b2", "a78d088fa55aa495"];
+
+/// Whether draws are looked at for the colour without the interface: frame
+/// generation runs on our swap chain and `VICTORY_FRAMEGEN_HUDLESS` is not 0.
+#[inline]
+pub(crate) fn hudless_wanted() -> bool {
+    HUDLESS_WANTED.load(Relaxed)
+}
+
+static HUDLESS_WANTED: AtomicBool = AtomicBool::new(false);
+
+/// The host textures of the last presents (their addresses): the textures
+/// the title presents (it has two, in turn).
+static SHOWN: [std::sync::atomic::AtomicUsize; 4] = [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+static SHOWN_NEXT: AtomicU32 = AtomicU32::new(0);
+
+/// A copy of a presented texture taken in front of the interface composite.
+struct Copied {
+    id: u64,
+    /// The host texture copied (its address).
+    target: usize,
+    texture: ID3D12Resource,
+}
+
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for Copied {}
+
+/// The copies recorded in lists not submitted yet, and those submitted and
+/// not presented yet, in submission order.
+static HUD_PENDING: Mutex<Vec<Copied>> = Mutex::new(Vec::new());
+static HUD_SUBMITTED: Mutex<Vec<Copied>> = Mutex::new(Vec::new());
+static HUD_NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// The two textures the copies go to in turn (a present reads one while the
+/// next frame's lists may already be recorded), with their size and format.
+struct HudlessTextures {
+    size: [u32; 2],
+    format: i32,
+    textures: [ID3D12Resource; 2],
+}
+
+// SAFETY: as above.
+unsafe impl Send for HudlessTextures {}
+
+static HUD_TEXTURES: Mutex<Option<HudlessTextures>> = Mutex::new(None);
+
+// Since the last line about it (every ten seconds): copies recorded, presents
+// tagged with one, presents with frame generation on that had none, composite
+// draws, those after a copy in their list, draws of other pipelines into a
+// presented texture.
+static HUD_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const HUD_COPIES: usize = 0;
+const HUD_TAGGED: usize = 1;
+const HUD_MISSING: usize = 2;
+const HUD_COMPOSITES: usize = 3;
+const HUD_AGAIN: usize = 4;
+const HUD_OTHERS: usize = 5;
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Before a draw of `pipeline` into `target` alone (no depth), with frame
+/// generation: if `target` is a texture the title presents and the draw is
+/// the title's interface composite ([`INTERFACE_COMPOSITE`]; `triangle`: one
+/// triangle, one instance), the target as it is now, the frame without the
+/// interface, is copied into a texture of ours, recorded into `list` in
+/// front of the draw; the present after the list's submission tags it as
+/// the colour without the interface. One copy a list. Other pipelines that
+/// draw into a presented texture are named in the log once each: the
+/// interface is in the copy if one of them draws it before the composite.
+pub(crate) fn before_target_draw(
+    list: &crate::host::HostList,
+    target: crate::object::This,
+    pipeline: &crate::pipeline::host::HostPipeline,
+    triangle: bool,
+) {
+    let Some(texture) = crate::resource::host_resource(target) else { return };
+    let shown = texture.as_raw() as usize;
+    if !SHOWN.iter().any(|s| s.load(Relaxed) == shown) {
+        return;
+    }
+    let composite = triangle && INTERFACE_COMPOSITE.iter().all(|hash| pipeline.stages.iter().any(|s| s.shader.hash == *hash));
+    if !composite {
+        HUD_COUNTS[HUD_OTHERS].fetch_add(1, Relaxed);
+        static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+        let key = std::ptr::from_ref(pipeline) as usize;
+        let mut seen = lock(&SEEN);
+        if !seen.contains(&key) && seen.len() < 24 {
+            seen.push(key);
+            tracing::info!(
+                pipeline = %pipeline.name,
+                state = %pipeline.state,
+                triangle,
+                after_the_copy_in_its_list = list.hudless() != 0,
+                "DLSS Frame Generation: this pipeline draws into the texture the title presents (the scene's composite does; an interface drawn here before the interface composite would be in the colour without the interface)"
+            );
+        }
+        return;
+    }
+    HUD_COUNTS[HUD_COMPOSITES].fetch_add(1, Relaxed);
+    if list.hudless() != 0 {
+        HUD_COUNTS[HUD_AGAIN].fetch_add(1, Relaxed);
+        return;
+    }
+    let began = std::time::Instant::now();
+    let id = HUD_NEXT_ID.fetch_add(1, Relaxed) + 1;
+    let Some(copy) = hudless_texture(texture, id) else { return };
+    // The target as a copy's source: the composite's own preparation makes
+    // it a render target again.
+    const COPY_SOURCE: u32 = 0x800;
+    crate::list::ensure_state(list, target, COPY_SOURCE);
+    // SAFETY: an open list; the source is in the copy source state in it,
+    // ours stays a copy's destination; same size, one level, formats of one
+    // family.
+    unsafe { list.list.CopyResource(&copy, texture) };
+    list.keep(&copy);
+    list.keep(texture);
+    let mut pending = lock(&HUD_PENDING);
+    pending.retain(|c| id.saturating_sub(c.id) < 16);
+    pending.push(Copied { id, target: shown, texture: copy });
+    drop(pending);
+    list.mark_hudless(id);
+    HUD_COUNTS[HUD_COPIES].fetch_add(1, Relaxed);
+    spent(T_COPY, began);
+    // SAFETY: a live texture.
+    let desc = unsafe { texture.GetDesc() };
+    once!(
+        info,
+        width = desc.Width,
+        height = desc.Height,
+        format = desc.Format.0,
+        pipeline = %pipeline.name,
+        state = %pipeline.state,
+        "DLSS Frame Generation: the colour without the interface is copied in front of the title's interface composite (first time)"
+    );
+}
+
+/// One of the two textures the colour without the interface is copied to
+/// (copy `id`'s), made like `target` in the swap chain's format; `None` if
+/// `target` is no plain 2D texture of a format that is shown.
+fn hudless_texture(target: &ID3D12Resource, id: u64) -> Option<ID3D12Resource> {
+    // SAFETY: a live texture.
+    let desc = unsafe { target.GetDesc() };
+    let plain = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && desc.DepthOrArraySize == 1
+        && desc.MipLevels == 1
+        && desc.SampleDesc.Count == 1;
+    let format = crate::host::swap_format(desc.Format).filter(|_| plain);
+    let Some(format) = format else {
+        once!(
+            warn,
+            format = desc.Format.0,
+            levels = desc.MipLevels,
+            samples = desc.SampleDesc.Count,
+            "DLSS Frame Generation: the presented texture cannot be copied for the colour without the interface; none is tagged"
+        );
+        return None;
+    };
+    let size = [desc.Width as u32, desc.Height];
+    let mut textures = lock(&HUD_TEXTURES);
+    if textures.as_ref().is_none_or(|t| t.size != size || t.format != format.0) {
+        let device = &crate::host::host()?.device;
+        let make = || texture(device, size, format, D3D12_RESOURCE_FLAG_NONE, COPY_DEST);
+        match (make(), make()) {
+            (Ok(a), Ok(b)) => *textures = Some(HudlessTextures { size, format: format.0, textures: [a, b] }),
+            (Err(e), _) | (_, Err(e)) => {
+                once!(warn, error = %e, "DLSS Frame Generation: no texture for the colour without the interface; none is tagged");
+                return None;
+            }
+        }
+    }
+    textures.as_ref().map(|t| t.textures[(id % 2) as usize].clone())
+}
+
+/// A host list that recorded copy `id` of the colour without the interface
+/// is submitted (in submission order, before the present that follows it).
+pub(crate) fn hudless_submitted(id: u64) {
+    let copied = {
+        let mut pending = lock(&HUD_PENDING);
+        let at = pending.iter().position(|c| c.id == id);
+        at.map(|i| pending.swap_remove(i))
+    };
+    if let Some(copied) = copied {
+        let mut submitted = lock(&HUD_SUBMITTED);
+        if submitted.len() >= 8 {
+            submitted.remove(0);
+        }
+        submitted.push(copied);
+    }
+}
+
+/// At a present of host texture `shown`: it is one the title presents
+/// ([`SHOWN`]), and the first copy of it submitted since its last present,
+/// if any, is the frame's colour without the interface.
+fn hudless_for(shown: &ID3D12Resource) -> Option<ID3D12Resource> {
+    let shown = shown.as_raw() as usize;
+    if !SHOWN.iter().any(|s| s.load(Relaxed) == shown) {
+        SHOWN[SHOWN_NEXT.fetch_add(1, Relaxed) as usize % SHOWN.len()].store(shown, Relaxed);
+    }
+    let mut submitted = lock(&HUD_SUBMITTED);
+    let first = submitted.iter().position(|c| c.target == shown).map(|i| submitted.remove(i));
+    submitted.retain(|c| c.target != shown);
+    first.map(|c| c.texture)
 }
 
 /// The planes a present shows (Series S: the scene and the interface over
@@ -1077,16 +1345,23 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     // The tagged textures' states are those the submissions before this
     // present left: only the line of submissions orders the two.
     if !crate::queue::line_on() && !CHECKING.load(Relaxed) {
+        HUDLESS_WANTED.store(false, Relaxed);
         once!(warn, "DLSS Frame Generation: the line of submissions did not start; frame generation stays off");
         return None;
     }
+    // Where the interface is no plane of its own (Series X): the copy of
+    // this texture taken in front of the title's interface composite.
+    let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
     let (sl, functions) = (SL.get()?, FUNCTIONS.get()?);
     let (set_options, marker) = (functions.dlssg_set_options?, functions.pcl_set_marker?);
+    let began = std::time::Instant::now();
     let frame = frame as u32;
     let token = frame_token(sl, frame)?;
     let mark = |m: u32| {
+        let began = std::time::Instant::now();
         // SAFETY: a marker for a token of ours.
         unsafe { marker(m, token) };
+        spent(T_MARKERS, began);
     };
     let mut calls = calls();
     if calls.simulating != Some(frame) {
@@ -1107,6 +1382,9 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     let on = if let Some((id, depth, motion, camera)) = fresh {
         PRESENTED_ID.store(id, Relaxed);
         let plan = PLAN.get()?;
+        // (Frame generation reads the camera's planes and matrices: the
+        // nearer plane is the near one, whichever way the title names them.)
+        let camera = camera.planes_in_order();
         let constants = camera.constants(plan.asked.jitter, plan.asked.mvec);
         // SAFETY: constants for this frame and viewport.
         let code = unsafe { (sl.set_constants)(&constants, token, &viewport) };
@@ -1123,6 +1401,15 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         if let Some((over, over_state)) = planes.overlay {
             resources.push((abi::Resource::texture(planes.base.0.as_raw(), planes.base.1), abi::BUFFER_HUDLESS_COLOR, planes.size));
             resources.push((abi::Resource::texture(over.as_raw(), over_state), abi::BUFFER_UI_COLOR_AND_ALPHA, planes.size));
+        } else if let Some(copy) = &hudless {
+            // One plane with the interface drawn into it: the copy taken in
+            // front of the interface composite (ours, always a copy's
+            // destination; Streamline holds it until the tags of the frame
+            // go).
+            resources.push((abi::Resource::texture(copy.as_raw(), COPY_DEST), abi::BUFFER_HUDLESS_COLOR, planes.size));
+            HUD_COUNTS[HUD_TAGGED].fetch_add(1, Relaxed);
+        } else if hudless_wanted() {
+            HUD_COUNTS[HUD_MISSING].fetch_add(1, Relaxed);
         }
         let tags: Vec<abi::ResourceTag> = resources
             .iter_mut()
@@ -1140,6 +1427,15 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             output = ?camera.output,
             back_buffer = ?planes.size,
             interface_plane = planes.overlay.is_some(),
+            interface_free_copy = hudless.is_some(),
+            depth_state = format_args!("{:#x}", resources[0].0.state),
+            motion_state = format_args!("{:#x}", resources[1].0.state),
+            near = constants.camera_near,
+            far = constants.camera_far,
+            fov = constants.camera_fov,
+            depth_inverted = camera.depth_inverted(),
+            jitter = ?constants.jitter_offset,
+            mvec_scale = ?constants.mvec_scale,
             "DLSS Frame Generation: first frame with depth and motion vectors tagged"
         );
         code == 0
@@ -1170,13 +1466,61 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     }
     if calls.framegen_on {
         FG_ON.fetch_add(1, Relaxed);
-        FG_ON_ALL.fetch_add(1, Relaxed);
+        // What it takes of the card's memory: before its first present and
+        // some seconds of presents later.
+        let presents = FG_ON_ALL.fetch_add(1, Relaxed) + 1;
+        if (presents == 1 || presents == 240)
+            && !CHECKING.load(Relaxed)
+            && let Some(host) = crate::host::host()
+        {
+            host.log_video_memory(if presents == 1 {
+                "right before the first present with frame generation on"
+            } else {
+                "240 presents with frame generation on later"
+            });
+        }
     } else {
         FG_OFF.fetch_add(1, Relaxed);
     }
     drop(calls);
     mark(abi::PRESENT_START);
+    spent(T_BEFORE, began);
     Some(Presenting { token, frame })
+}
+
+// Since the last frame-rate line, microseconds: on the presenting thread
+// before the present (of them in the latency markers), in the present call
+// (and the longest), after it (of them asking frame generation's state); on
+// the threads that record upscalings, recording one (of them waiting for our
+// lock); recording the copy of the colour without the interface.
+static TIMES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+const T_BEFORE: usize = 0;
+const T_MARKERS: usize = 1;
+const T_PRESENT: usize = 2;
+const T_PRESENT_LONGEST: usize = 3;
+const T_AFTER: usize = 4;
+const T_STATE: usize = 5;
+const T_UPSCALE: usize = 6;
+const T_UPSCALE_LOCK: usize = 7;
+const T_COPY: usize = 8;
+
+fn spent(slot: usize, since: std::time::Instant) {
+    TIMES[slot].fetch_add(since.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// When the present call of a frame [`present_begins`] began begins: `None`
+/// without frame generation (nothing is timed then).
+pub(crate) fn present_called(presenting: &Option<Presenting>) -> Option<std::time::Instant> {
+    presenting.is_some().then(std::time::Instant::now)
+}
+
+/// The present call that began at `called` returned.
+pub(crate) fn present_returned(called: Option<std::time::Instant>) {
+    if let Some(called) = called {
+        let took = called.elapsed().as_micros() as u64;
+        TIMES[T_PRESENT].fetch_add(took, Relaxed);
+        TIMES[T_PRESENT_LONGEST].fetch_max(took, Relaxed);
+    }
 }
 
 unsafe extern "C" fn present_error(error: *const i32) {
@@ -1191,6 +1535,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
     let Some(Presenting { token, frame }) = presenting else { return };
     let (Some(sl), Some(functions)) = (SL.get(), FUNCTIONS.get()) else { return };
     let (Some(marker), Some(get_state)) = (functions.pcl_set_marker, functions.dlssg_get_state) else { return };
+    let began = std::time::Instant::now();
     // SAFETY: a marker for this frame's token.
     unsafe { marker(abi::PRESENT_END, token) };
     let mut calls = calls();
@@ -1199,11 +1544,14 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         unsafe { marker(abi::SIMULATION_START, next) };
         calls.simulating = Some(frame.wrapping_add(1));
     }
+    spent(T_MARKERS, began);
     if calls.framegen_on {
         let mut state = abi::DlssgState::default();
         let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
+        let asked = std::time::Instant::now();
         // SAFETY: a structure to fill, no options (no estimate asked).
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
+        spent(T_STATE, asked);
         if code == 0 {
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
@@ -1216,6 +1564,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
             }
         }
     }
+    spent(T_AFTER, began);
 }
 
 /// Our swap chain's buffers are about to be made again: frame generation is
@@ -1245,13 +1594,48 @@ pub(crate) fn resizing() {
 /// stand-in depth and motion vectors tagged, frame generation on. The lines
 /// say what happened.
 pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
+    let mut lines = check_run(output, device, present);
+    lines.extend(shut_down());
+    lines
+}
+
+/// The host device was made for [`check`].
+static CHECK_DEVICE: AtomicBool = AtomicBool::new(false);
+
+/// The end of [`check`] with a device: frame generation off, our swap chain
+/// let go, Streamline shut down (`slShutdown`), before the process ends.
+/// Streamline's guide asks for the shutdown before the devices go. Without
+/// it the process failed fast at its exit after `--present` (exit code
+/// 0xC0000409, which some shells show as 9), with frame generation on and
+/// its swap chain still up; with it the exit code is 0 (2026-11-27, SDK
+/// 2.14.16). Nothing of Streamline is called afterwards.
+/// `VICTORY_CHECK_TEARDOWN=0`: left out.
+fn shut_down() -> Option<String> {
+    if !CHECK_DEVICE.load(Relaxed) || std::env::var("VICTORY_CHECK_TEARDOWN").is_ok_and(|v| v.trim() == "0") {
+        return None;
+    }
+    let (sl, host) = (SL.get()?, crate::host::host()?);
+    resizing();
+    host.drop_presenter();
+    for ready in [&FG_READY, &DLSS_READY, &SWAP_CHAIN_PROXIED, &HUDLESS_WANTED] {
+        ready.store(false, Release);
+    }
+    *lock(&SUBMITTED) = None;
+    lock(&HUD_SUBMITTED).clear();
+    // SAFETY: initialised; nothing of it is in use or called from here on.
+    let code = unsafe { (sl.shutdown)() };
+    Some(format!("Streamline shut down: {} ({code})", abi::result_name(code)))
+}
+
+fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
     let mut lines = Vec::new();
     let mut asked = match Asked::from_env() {
         Ok(asked) => asked,
         Err(why) => return vec![why],
     };
     asked.dlss = true;
-    asked.framegen = true;
+    // (`VICTORY_STREAMLINE_PRESENT=1` is for DLSS without frame generation.)
+    asked.framegen = !asked.present_hook;
     let available = match load_and_init(&asked, false) {
         Ok(available) => available,
         Err(why) => return vec![format!("Streamline did not load from {}: {why}", asked.dir.display())],
@@ -1260,7 +1644,13 @@ pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         "Streamline loaded from {}: DLSS {}, frame generation {} on this GPU",
         asked.dir.display(),
         if available.dlss { "supported" } else { "NOT supported" },
-        if available.framegen { "supported" } else { "NOT supported" }
+        if available.framegen {
+            "supported"
+        } else if asked.framegen {
+            "NOT supported"
+        } else {
+            "not asked for (VICTORY_STREAMLINE_PRESENT=1)"
+        }
     ));
     if !device {
         return lines;
@@ -1269,6 +1659,7 @@ pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         lines.push("no host D3D12 device".into());
         return lines;
     };
+    CHECK_DEVICE.store(true, Relaxed);
     let (dlss, framegen) = (DLSS_READY.load(Acquire), FG_READY.load(Acquire));
     lines.push(format!("device handed over: DLSS ready {dlss}, frame generation ready {framegen} (queue through Streamline's device proxy)"));
     let render = asked.mode.render_size(output);
@@ -1277,8 +1668,9 @@ pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         motion_scale: [render[0] as f32, render[1] as f32],
         render,
         output,
-        near: 0.1,
-        far: 10_000.0,
+        // (The far plane first, as the title names them.)
+        near: 10_000.0,
+        far: 0.15,
         fov_y: 1.0,
         reset: true,
         flags: plan::FFX_HIGH_DYNAMIC_RANGE | plan::FFX_DEPTH_INVERTED | plan::FFX_AUTO_EXPOSURE,
@@ -1317,7 +1709,14 @@ pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         textures[DEPTH] = Some((depth.clone(), SHADER_READ));
         textures[MOTION] = Some((motion.clone(), SHADER_READ));
         textures[OUTPUT] = Some((out, UNORDERED));
-        for round in 0..3 {
+        // (`VICTORY_STREAMLINE_PRESENT=1`: DLSS alone, with a present through
+        // Streamline's proxy of our swap chain after each upscaling, more of
+        // them than Streamline waits for a present.)
+        let hooked = present && asked.present_hook && !framegen;
+        for round in 0..if hooked { 120 } else { 3 } {
+            if hooked && round > 0 {
+                host.present_planes(&base, 0, None, round);
+            }
             let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
             let list = match host.new_list() {
                 Ok(list) => list,
@@ -1349,11 +1748,26 @@ pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
                 }
             }
         }
-        lines.push("DLSS ran three times on stand-in textures; the device is fine".into());
+        lines.push(if hooked {
+            format!(
+                "DLSS ran 120 times on stand-in textures with a present after each; our swap chain is {}Streamline's proxy of it (VICTORY_STREAMLINE_PRESENT=1); the device is fine",
+                if PRESENT_HOOKED.load(Relaxed) { "" } else { "NOT " }
+            )
+        } else {
+            "DLSS ran three times on stand-in textures; the device is fine".into()
+        });
     }
     if present && framegen {
         CHECKING.store(true, Relaxed);
         let (on, shown) = (FG_ON_ALL.load(Relaxed), FG_SHOWN_ALL.load(Relaxed));
+        // A stand-in for the colour without the interface, tagged as the
+        // copies in front of the title's interface composite are: ours, a
+        // copy's destination, of the back buffer's size and format.
+        let copy = {
+            use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+            texture(device, output, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, COPY_DEST).ok()
+        };
+        let tagged = HUD_COUNTS[HUD_TAGGED].load(Relaxed);
         for frame in 1..=180u64 {
             let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
             *SUBMITTED.lock().unwrap_or_else(|e| e.into_inner()) = Some(Noted {
@@ -1362,14 +1776,18 @@ pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
                 motion: Source::Fixed(motion.clone(), SHADER_READ),
                 camera,
             });
+            if let Some(copy) = &copy {
+                lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: copy.clone() });
+            }
             host.present_planes(&base, 0, None, frame);
             std::thread::sleep(std::time::Duration::from_millis(16));
         }
         crate::host::settle_for_fence();
         lines.push(format!(
-            "frame generation: 180 presents, {} with it on, {} frames shown by it, status {:#x} (0 is fine){}",
+            "frame generation: 180 presents, {} with it on, {} frames shown by it, {} presents tagged with a colour without the interface, status {:#x} (0 is fine){}",
             FG_ON_ALL.load(Relaxed) - on,
             FG_SHOWN_ALL.load(Relaxed) - shown,
+            HUD_COUNTS[HUD_TAGGED].load(Relaxed) - tagged,
             FG_STATUS.load(Relaxed),
             if SWAP_CHAIN_PROXIED.load(Relaxed) { "" } else { "; the swap chain is NOT Streamline's proxy" }
         ));
@@ -1385,6 +1803,7 @@ pub fn check(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
 
 const SHADER_READ: u32 = 0xc0;
 const UNORDERED: u32 = 0x8;
+const COPY_DEST: u32 = 0x400;
 
 /// A stand-in texture for [`check`] (its contents are whatever the memory held).
 fn texture(
@@ -1435,5 +1854,31 @@ pub(crate) fn line(frames: f64) {
             FG_STATUS.load(Relaxed),
             if FG_READY.load(Relaxed) && SWAP_CHAIN_PROXIED.load(Relaxed) { "" } else { "; not running (see above)" }
         );
+        // Where the time of a frame goes in Streamline's calls.
+        let t: Vec<u64> = TIMES.iter().map(|t| t.swap(0, Relaxed)).collect();
+        if on + off > 0 {
+            let ms = |slot: usize| t[slot] as f64 / 1000.0 / frames;
+            tracing::info!(
+                "DLSS Frame Generation, time per frame: the presenting thread {:.2} ms before the present call, {:.2} ms in it (the longest {:.1} ms), {:.2} ms after it; of those {:.2} ms in the latency markers and {:.2} ms asking frame generation's state; an upscaling recorded in {:.2} ms ({:.2} ms of it waiting for the lock it shares with the present); the copy of the colour without the interface recorded in {:.3} ms",
+                ms(T_BEFORE),
+                ms(T_PRESENT),
+                t[T_PRESENT_LONGEST] as f64 / 1000.0,
+                ms(T_AFTER),
+                ms(T_MARKERS),
+                ms(T_STATE),
+                ms(T_UPSCALE),
+                ms(T_UPSCALE_LOCK),
+                ms(T_COPY)
+            );
+        }
+        // Every tenth line (about ten seconds): the colour without the
+        // interface, where the title draws the interface into the frame.
+        static LINES: AtomicU32 = AtomicU32::new(0);
+        if hudless_wanted() && LINES.fetch_add(1, Relaxed) % 10 == 9 {
+            let [copies, tagged, missing, composites, again, others] = [0, 1, 2, 3, 4, 5].map(|i| HUD_COUNTS[i].swap(0, Relaxed));
+            tracing::info!(
+                "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
+            );
+        }
     }
 }

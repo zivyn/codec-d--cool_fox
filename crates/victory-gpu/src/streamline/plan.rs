@@ -197,6 +197,20 @@ impl Camera {
         self.flags & FFX_DISPLAY_RESOLUTION_MOTION_VECTORS != 0
     }
 
+    /// The camera with its nearer plane as the near one. FidelityFX takes
+    /// the two distances in either order (its upscaler reads the smaller as
+    /// the near plane and lets the inverted-depth flag say which end of the
+    /// depth range it is), and the title, whose depth is inverted, names the
+    /// far plane first (near 10000, far 0.15 in the first dispatch of
+    /// 2026-11-26). Streamline's constants name them as they are.
+    pub fn planes_in_order(&self) -> Camera {
+        let mut camera = *self;
+        if self.near > self.far && self.far > 0.0 {
+            (camera.near, camera.far) = (self.far, self.near);
+        }
+        camera
+    }
+
     /// The size the motion vectors cover.
     pub fn motion_size(&self) -> [u32; 2] {
         if self.display_motion_vectors() { self.output } else { self.render }
@@ -460,6 +474,34 @@ mod tests {
             }
         }
         assert_eq!(invert(&[[0.0; 4]; 4]), None);
+    }
+
+    /// The title names the far plane first (inverted depth): in order, the
+    /// projection puts the nearer plane at depth 1 and the farther at 0; as
+    /// named, it took the farther for the near plane of an endless range.
+    #[test]
+    fn planes_named_far_first_are_put_in_order() {
+        let mut named = camera(FFX_DEPTH_INVERTED);
+        (named.near, named.far) = (10_000.0, 0.15);
+        let ordered = named.planes_in_order();
+        assert_eq!((ordered.near, ordered.far), (0.15, 10_000.0));
+        assert_eq!(ordered.planes_in_order(), ordered);
+        let c = ordered.constants([1.0, 1.0], [1.0, 1.0]);
+        assert_eq!((c.camera_near, c.camera_far), (0.15, 10_000.0));
+        let depth = |z: f32| {
+            let m = &c.camera_view_to_clip;
+            (z * m[2][2] + m[3][2]) / (z * m[2][3] + m[3][3])
+        };
+        assert!((depth(0.15) - 1.0).abs() < 1e-5 && depth(10_000.0).abs() < 1e-5);
+        // As named: an endless range from 10000 on.
+        let wrong = named.constants([1.0, 1.0], [1.0, 1.0]);
+        assert_eq!(wrong.camera_view_to_clip[3][2], 10_000.0);
+        // An endless far plane, or a plane at 0, is left alone.
+        let mut endless = camera(FFX_DEPTH_INVERTED);
+        (endless.near, endless.far) = (0.15, f32::MAX);
+        assert_eq!(endless.planes_in_order(), endless);
+        (endless.near, endless.far) = (0.15, 0.0);
+        assert_eq!(endless.planes_in_order(), endless);
     }
 
     #[test]

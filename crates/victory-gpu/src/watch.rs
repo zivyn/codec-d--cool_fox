@@ -659,6 +659,11 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    // Guarding asks Windows about the pages and protects them: a lazy view
+    // is none to it yet.
+    if guarded {
+        materialize(start, end.saturating_sub(start));
+    }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
@@ -2065,6 +2070,8 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    // The kernel's write does not fault into the handler.
+    materialize(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2554,6 +2561,29 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     g
 }
 
+/// The runtime's way to make title memory it mapped only in its books
+/// real (`xmem`, `VICTORY_LAZY_VIEWS=1`): `(address, bytes)` makes every
+/// such view that overlaps the range a mapping of the host's, and says
+/// whether there was one (and all of them could be made).
+static LAZY_VIEWS: std::sync::OnceLock<fn(usize, usize) -> bool> = std::sync::OnceLock::new();
+
+/// The runtime maps title memory lazily: views it tells of (as mapped, by
+/// [`title_memory_remapped`] and `title_memory_view`) may be no mapping of
+/// the host's until something touches them. `materialize` makes them one.
+pub fn use_lazy_views(materialize: fn(usize, usize) -> bool) {
+    let _ = LAZY_VIEWS.set(materialize);
+}
+
+/// Makes title memory `[at, at + len)` that the runtime mapped lazily a
+/// mapping of the host's ([`use_lazy_views`]); whether any of it was lazy.
+/// Called before every touch of title memory the fault handler below does
+/// not see: reads and writes through the kernel, protection changes, and
+/// questions to Windows about the pages. (A fault in title memory, the
+/// title's or ours, comes to [`install`]'s handler, which asks first.)
+pub(crate) fn materialize(at: usize, len: usize) -> bool {
+    LAZY_VIEWS.get().is_some_and(|f| f(at, len.max(1)))
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 pub(crate) fn install() {
@@ -2578,6 +2608,14 @@ pub(crate) fn install() {
             unsafe { (*context).Rip = exit as u64 };
             EXCEPTION_CONTINUE_EXECUTION
         };
+        // Memory the runtime mapped lazily: mapped now, and the access is
+        // made again (any access, the title's or ours).
+        if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && r.NumberParameters >= 2
+            && materialize(r.ExceptionInformation[1], 1)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         if r.ExceptionCode != EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE

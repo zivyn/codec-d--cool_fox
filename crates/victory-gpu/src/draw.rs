@@ -2297,6 +2297,11 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
+        let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
+        if !crate::residency::admit_texture_pass(required) {
+            BAKE_SERVED.store(0, Ordering::Relaxed);
+            return;
+        }
         let baking = crate::texture::BAKING.get();
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
@@ -2362,7 +2367,6 @@ impl State {
         };
         // Apply the shared frame ceiling after early-pass and catch-up budgets.
         // A bake samples its inputs immediately and cannot retry that draw.
-        let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
         let bytes_at_most = if required || asked.is_some() {
             bytes_at_most
         } else {
@@ -2374,7 +2378,9 @@ impl State {
         BAKE_SERVED.store(0, Ordering::Relaxed);
         let mut served = true;
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+            if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span
+                || !crate::residency::admit_texture_pass(required)
+            {
                 served = false;
                 break;
             }
@@ -2539,6 +2545,10 @@ impl State {
                 }
             };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
+            if crate::residency::upload_refused() {
+                served = false;
+                break;
+            }
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
@@ -2548,6 +2558,10 @@ impl State {
                 }
             };
             let texture = crate::resource::host_resource(resource);
+            if crate::residency::upload_refused() {
+                served = false;
+                break;
+            }
             let title_fills = texture.is_some_and(crate::texture::title_written);
             if !title_fills {
                 at_once();
@@ -2606,6 +2620,10 @@ impl State {
                     crate::texture::ahead::send(job);
                 }
             }
+            if ahead.is_none() && crate::residency::upload_refused() {
+                served = false;
+                break;
+            }
             let late = late && ahead.is_none();
             if let Some(view) = &view
                 && ahead.is_none()
@@ -2615,6 +2633,12 @@ impl State {
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
                 readable(list, sampled.kind, view);
                 crate::texture::PICKING.set(None);
+            }
+            // A failed allocation leaves this slot due. Publishing it or
+            // marking it served would lose the only retry for some materials.
+            if ahead.is_none() && crate::residency::upload_refused() {
+                served = false;
+                break;
             }
             if shows_other && let Some(handle) = heap.handle(index) {
                 host.texture_slot_flip(list, index, handle);

@@ -14,6 +14,43 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
     (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
 }
 
+// The texture sweep may run for seconds inside a single submitted frame.
+static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
+static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
+static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn allocation_error(error: &windows::core::Error) {
+    if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+        RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn upload_refused() -> bool {
+    crate::host::coarse_ms() < RETRY_UPLOAD_AT.load(Ordering::Relaxed)
+}
+
+fn has_upload_reserve(commit: u64, bake: bool) -> bool {
+    commit >= if bake { 2 * GIB } else { 4 * GIB }
+}
+
+/// Leave commit for game allocations and submissions already in flight. Direct
+/// texture consumers bypass this gate. Bake prefetch gets priority over lookahead.
+pub(crate) fn admit_texture_pass(bake: bool) -> bool {
+    let now = crate::host::coarse_ms();
+    if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let next = NEXT_COMMIT_SAMPLE.load(Ordering::Relaxed);
+    if now >= next && NEXT_COMMIT_SAMPLE.compare_exchange(
+        next, now.saturating_add(32), Ordering::Relaxed, Ordering::Relaxed,
+    ).is_ok() {
+        if let Some(status) = memory_status() {
+            AVAILABLE_COMMIT.store(status.ullAvailPageFile, Ordering::Relaxed);
+        }
+    }
+    has_upload_reserve(AVAILABLE_COMMIT.load(Ordering::Relaxed), bake)
+}
+
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
@@ -78,6 +115,16 @@ pub(crate) fn prefetch_limit(bytes: u64, pressure: bool, limited: bool, staging:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bake_and_lookahead_leave_room_for_live_game_allocations() {
+        for (commit, bake, lookahead) in [
+            (277 << 20, false, false), (2 * GIB, true, false), (4 * GIB, true, true),
+        ] {
+            assert_eq!(has_upload_reserve(commit, true), bake);
+            assert_eq!(has_upload_reserve(commit, false), lookahead);
+        }
+    }
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {

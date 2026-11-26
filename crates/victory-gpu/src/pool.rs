@@ -191,11 +191,12 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -237,10 +238,13 @@ impl<B: Clone> Pool<B> {
             unripe.sort_unstable();
             found = unripe.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
         }
+        // A failed 64 MiB block must not trigger another driver call for each
+        // small texture. Existing free ranges remain usable during backoff.
         let (i, start) = match found {
             Some(found) => found,
             None => {
-                let i = self.add(make()?, ripe.started);
+                let memory = self.grow(now, &mut make)?;
+                let i = self.add(memory, ripe.started);
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
@@ -253,7 +257,7 @@ impl<B: Clone> Pool<B> {
             }
             let empty = self.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
             if empty < ripe.ahead
-                && let Some(memory) = make()
+                && let Some(memory) = self.grow(now, &mut make)
             {
                 self.add(memory, ripe.started);
             }
@@ -262,6 +266,17 @@ impl<B: Clone> Pool<B> {
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
+    }
+
+    fn grow(&mut self, now: u64, make: &mut impl FnMut() -> Option<B>) -> Option<B> {
+        if now < self.retry_growth_at {
+            return None;
+        }
+        let block = make();
+        if block.is_none() {
+            self.retry_growth_at = now.saturating_add(500);
+        }
+        block
     }
 
     fn add(&mut self, memory: B, made: u64) -> usize {
@@ -503,6 +518,7 @@ pub(crate) unsafe fn texture(
         let mut heap: Option<ID3D12Heap> = None;
         // SAFETY: plain creation.
         if let Err(e) = unsafe { device.CreateHeap(&desc, &mut heap) } {
+            crate::residency::allocation_error(&e);
             tracing::warn!(error = %e, "no block of texture memory");
         }
         if let Some(h) = &heap
@@ -573,6 +589,18 @@ mod tests {
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn a_failed_block_is_not_retried_for_each_small_upload() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let calls = std::cell::Cell::new(0);
+        let refuse = || { calls.set(calls.get() + 1); None };
+        for size in [704008, 179720, 179720, 24080, 48648, 524288, 89616, 351760] {
+            assert!(pool.take(size, 512, 12, refuse).is_none());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(pool.take(24080, 512, 1012, || Some(1)).is_some());
     }
 
     #[test]

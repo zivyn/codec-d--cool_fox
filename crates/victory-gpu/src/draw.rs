@@ -968,6 +968,52 @@ fn outcome(which: usize) {
     HEAP_TEXTURE_SLOTS[which].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Of [`HEAP_TEXTURE_REST`]' place 4 (slots shown after their upload,
+/// flipped or made at once), since the last 5-second line: nanoseconds and
+/// calls of slots made at once (`HostHeap::mirror` by the pass), of slots
+/// shown after their upload (`texture_slot_show_after`), and of slots
+/// flipped (`texture_slot_flip`, or made at once as they show an earlier
+/// view of the same texture): [ns made, ns after, ns flipped, made, after,
+/// flipped].
+pub(crate) static HEAP_TEXTURE_SHOWN: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// `f`'s result, its time added to [`HEAP_TEXTURE_REST`]' place 4 and to
+/// [`HEAP_TEXTURE_SHOWN`]' place `which`.
+fn shown<T>(which: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    let ns = started.elapsed().as_nanos() as u64;
+    HEAP_TEXTURE_REST[4].fetch_add(ns, Ordering::Relaxed);
+    HEAP_TEXTURE_SHOWN[which].fetch_add(ns, Ordering::Relaxed);
+    HEAP_TEXTURE_SHOWN[3 + which].fetch_add(1, Ordering::Relaxed);
+    out
+}
+
+/// Of the slots the pass found nothing to bring up to date for
+/// ([`slot_outcome::NOTHING`]), since the last 5-second line: views of a
+/// texture object the host renders to or writes (the queue held them for
+/// nothing: a host texture is never uploaded); slots with no texture view
+/// or no texture the host can make; slots whose host texture is the host's
+/// own (a target, depth or unordered access texture placed in title
+/// memory); and of all these, the ones the pass made at once.
+pub(crate) static HEAP_TEXTURE_NOTHING: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Of [`HEAP_TEXTURE_REST`]' place 7 (the passes' work before their loops),
+/// since the last 5-second line, in nanoseconds: slots made due (room on the
+/// card again, memory mapped, unmapped or written, levels waiting); views
+/// made again and slots flipped after earlier uploads; the slots due taken
+/// from the queue and ordered. (The rest of it: budgets, counts, the card
+/// accounting line.)
+pub(crate) static HEAP_TEXTURE_BEFORE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `f`'s result, its time added to [`HEAP_TEXTURE_BEFORE`]' place `slot`.
+fn before<T>(slot: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let out = f();
+    HEAP_TEXTURE_BEFORE[slot].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
+}
+
 /// Passes since the last 5-second line by kind (the frame's, from
 /// [`State::heap_buffers`]; the early one at a frame's first draw; before a
 /// bake draw), their loops' nanoseconds by kind, and the passes that stopped
@@ -2983,40 +3029,46 @@ impl State {
             once!("textures picked by index: the card has no room for more; they wait");
         }
         let mut refused = 0;
-        // Room again: the slots held back while the card was full are due
-        // now (`full_card_pass`).
-        if room {
-            host.texture_slots_room(frame);
-        }
-        // Slots whose texture's memory the runtime mapped, unmapped or
-        // wrote since the last pass are due again.
-        host.texture_slots_remapped(frame);
         let baking = crate::texture::BAKING.get();
-        if baking {
-            host.texture_slots_bake_written(frame);
-        }
-        host.texture_slots_short(frame);
-        // The slots of textures whose first level with memory (levels on
-        // demand), or whose host copy for one with more levels, changed since
-        // the last pass are made again from it; those whose new view's upload
-        // has run are made from that.
-        host.texture_views_remade();
-        host.texture_slots_flip();
+        before(0, || {
+            // Room again: the slots held back while the card was full are
+            // due now (`full_card_pass`).
+            if room {
+                host.texture_slots_room(frame);
+            }
+            // Slots whose texture's memory the runtime mapped, unmapped or
+            // wrote since the last pass are due again.
+            host.texture_slots_remapped(frame);
+            if baking {
+                host.texture_slots_bake_written(frame);
+            }
+            host.texture_slots_short(frame);
+        });
+        before(1, || {
+            // The slots of textures whose first level with memory (levels
+            // on demand), or whose host copy for one with more levels,
+            // changed since the last pass are made again from it; those
+            // whose new view's upload has run are made from that.
+            host.texture_views_remade();
+            host.texture_slots_flip();
+        });
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
         if room {
-            host.texture_slots_waiting(frame);
+            before(0, || host.texture_slots_waiting(frame));
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        let (mut due, census) = before(2, || host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 }));
         // (Those that are due later after all that are due.)
         let on_time = due.len();
         if baking {
-            let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
-            static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
-            let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
-            let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
-            due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
+            before(2, || {
+                let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
+                static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
+                let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
+                let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
+                due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
+            });
         }
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
@@ -3211,6 +3263,7 @@ impl State {
                 && !crate::resource::title_fills(object as This)
             {
                 outcome(slot_outcome::NOTHING);
+                HEAP_TEXTURE_NOTHING[0].fetch_add(1, Ordering::Relaxed);
                 rest(0, || host.texture_slot_done(index, write, None));
                 continue;
             }
@@ -3290,9 +3343,11 @@ impl State {
                     (view, None)
                 }
             });
-            let at_once = || {
+            // (`nothing`: the slot has nothing to bring up to date.)
+            let at_once = |nothing: bool| {
                 if (late || bake_key.is_some()) && let Some(handle) = heap.handle(index) {
-                    rest(4, || {
+                    HEAP_TEXTURE_NOTHING[3].fetch_add(u64::from(nothing), Ordering::Relaxed);
+                    shown(0, || {
                         let _ = host.mirror(index, handle, true);
                     });
                 }
@@ -3305,8 +3360,9 @@ impl State {
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
-                    at_once();
+                    at_once(true);
                     outcome(slot_outcome::NOTHING);
+                    HEAP_TEXTURE_NOTHING[1].fetch_add(1, Ordering::Relaxed);
                     rest(0, || host.texture_slot_done(index, write, None));
                     continue;
                 }
@@ -3318,9 +3374,10 @@ impl State {
             }
             let title_fills = rest(6, || texture.is_some_and(crate::texture::title_written));
             if !title_fills {
-                at_once();
+                at_once(true);
                 // a render target, a depth or unordered access texture: the host's own
                 outcome(slot_outcome::NOTHING);
+                HEAP_TEXTURE_NOTHING[2].fetch_add(1, Ordering::Relaxed);
                 rest(0, || host.texture_slot_done(index, write, None));
                 continue;
             }
@@ -3344,17 +3401,17 @@ impl State {
                     sync.publish.push((index, handle, key));
                 } else {
                     if shows_other && let Some(handle) = heap.handle(index) {
-                        rest(4, || {
+                        shown(2, || {
                             let _ = host.mirror(index, handle, true);
                         });
                     }
                     // Its bytes are in, or on the way there in a list before.
                     if late && texture.is_some_and(crate::pool::fresh) && !crate::texture::ahead::there(resource) {
                         if let Some(handle) = heap.handle(index) {
-                            rest(4, || host.texture_slot_show_after(list, index, handle));
+                            shown(1, || host.texture_slot_show_after(list, index, handle));
                         }
                     } else {
-                        at_once();
+                        at_once(false);
                     }
                 }
                 let again = partly.map(|mapped| (frame + 1, mapped));
@@ -3422,10 +3479,10 @@ impl State {
                 sync.publish.push((index, handle, key));
             }
             if shows_other && let Some(handle) = heap.handle(index) {
-                rest(4, || host.texture_slot_flip(list, index, handle));
+                shown(2, || host.texture_slot_flip(list, index, handle));
             }
             if late && let Some(handle) = heap.handle(index) {
-                rest(4, || host.texture_slot_show_after(list, index, handle));
+                shown(1, || host.texture_slot_show_after(list, index, handle));
             }
             #[cfg(feature = "diagnostics")]
             if crate::book::on()

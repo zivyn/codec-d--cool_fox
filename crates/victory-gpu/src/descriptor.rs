@@ -30,10 +30,43 @@ pub(crate) static LOCK_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::
 
 /// A wait for lock `which` (0: the texture queue's, 1: the views table's)
 /// that began at `started` is over: counted in [`LOCK_WAITS`].
-pub(crate) fn waited(which: usize, started: std::time::Instant) {
+pub(crate) fn waited(which: usize, started: std::time::Instant) -> u64 {
     let other = usize::from(!IN_TEXTURE_PASS.get());
-    LOCK_WAITS[2 * which + other].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    let ns = started.elapsed().as_nanos() as u64;
+    LOCK_WAITS[2 * which + other].fetch_add(ns, std::sync::atomic::Ordering::Relaxed);
+    ns
 }
+
+/// The places that take the lock of the queue of textures picked by index
+/// (`host::TextureQueue`), counted apart in [`QUEUE_LOCK`].
+pub(crate) mod queue_site {
+    /// The pass asks what is known of a slot, or tells what came of it.
+    pub(crate) const TELL: usize = 0;
+    /// The pass takes the slots due and the queue's counts.
+    pub(crate) const DUE: usize = 1;
+    /// Slots made due by memory mapped, unmapped or written, by room on
+    /// the card again, by levels waiting for it.
+    pub(crate) const MADE_DUE: usize = 2;
+    /// A slot's record made, copied in or made by a draw or the pass: the
+    /// slot queued, kept, or taken out.
+    pub(crate) const WRITE: usize = 3;
+    /// A draw read the slot through a table: taken out.
+    pub(crate) const TABLE: usize = 4;
+    /// Slots made stale by a newer view of other memory: taken out.
+    pub(crate) const STALE: usize = 5;
+    /// Anything else (counts for the lines, the bakes' news).
+    pub(crate) const OTHER: usize = 6;
+    pub(crate) const COUNT: usize = 7;
+}
+
+/// Since the last 5-second line, by [`queue_site`]: the times the texture
+/// queue's lock was taken; the nanoseconds threads waited for it; the
+/// nanoseconds it was held by the places that hold it for many slots at a
+/// time (the slots due, slots made due, stale views); and the times it was
+/// not taken because what was asked would have changed nothing
+/// (`host::QueueMarks`).
+pub(crate) static QUEUE_LOCK: [[std::sync::atomic::AtomicU64; queue_site::COUNT]; 4] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; queue_site::COUNT] }; 4];
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(

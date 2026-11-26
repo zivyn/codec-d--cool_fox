@@ -9170,6 +9170,64 @@ impl Meter {
                         slots[9],
                     );
                 }
+                let shown = crate::draw::HEAP_TEXTURE_SHOWN.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                let nothing = crate::draw::HEAP_TEXTURE_NOTHING.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+                let ahead_of = crate::draw::HEAP_TEXTURE_BEFORE.each_ref().map(|n| n.swap(0, Ordering::Relaxed) / 1_000_000);
+                if all > 0 || parts[7] > 0 {
+                    let [made_ns, after_ns, flipped_ns, made, after, flipped] = shown;
+                    let [due_by_memory, remade, due_list] = ahead_of;
+                    tracing::info!(
+                        "the pass over textures picked by index, its parts in the last 5 seconds: slots shown: {} ms made at \
+                         once ({made}), {} ms shown after their upload ({after}), {} ms flipped ({flipped}); nothing to bring \
+                         up to date: {} views of textures the host writes, {} without a texture, {} the host's own texture, {} of \
+                         them made at once; before the loops: {due_by_memory} ms making slots due, {remade} ms views made again \
+                         and slots flipped, {due_list} ms taking the slots due, {} ms the rest",
+                        made_ns / 1_000_000,
+                        after_ns / 1_000_000,
+                        flipped_ns / 1_000_000,
+                        nothing[0],
+                        nothing[1],
+                        nothing[2],
+                        nothing[3],
+                        parts[7].saturating_sub(due_by_memory + remade + due_list),
+                    );
+                }
+                // The queue's lock by place (`crate::descriptor::queue_site`).
+                let lock = crate::descriptor::QUEUE_LOCK.each_ref().map(|row| row.each_ref().map(|n| n.swap(0, Ordering::Relaxed)));
+                let [taken, waited, held, skipped] = lock;
+                if taken.iter().sum::<u64>() + skipped.iter().sum::<u64>() > 0 {
+                    let ms = |ns: u64| ns / 1_000_000;
+                    tracing::info!(
+                        "the texture queue's lock in the last 5 seconds: taken {} times ({} by the pass asking of or telling of a \
+                         slot, {} taking the slots due, {} making slots due, {} noting a slot's record, {} by table reads, {} for \
+                         stale views, {} else); waited for {} ms ({}, {}, {}, {}, {}, {}, {} ms by the same places); held {} ms \
+                         taking the slots due, {} ms making slots due, {} ms for stale views; not taken {} times, as nothing would \
+                         have changed ({} noting a slot's record, {} by table reads, {} for stale views)",
+                        taken.iter().sum::<u64>(),
+                        taken[0],
+                        taken[1],
+                        taken[2],
+                        taken[3],
+                        taken[4],
+                        taken[5],
+                        taken[6],
+                        ms(waited.iter().sum::<u64>()),
+                        ms(waited[0]),
+                        ms(waited[1]),
+                        ms(waited[2]),
+                        ms(waited[3]),
+                        ms(waited[4]),
+                        ms(waited[5]),
+                        ms(waited[6]),
+                        ms(held[1]),
+                        ms(held[2]),
+                        ms(held[5]),
+                        skipped.iter().sum::<u64>(),
+                        skipped[3],
+                        skipped[4],
+                        skipped[5],
+                    );
+                }
             }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));

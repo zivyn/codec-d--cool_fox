@@ -1804,20 +1804,56 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// The queue of textures picked by index, locked by place `site`
+/// (`super::queue_site`): for the places that hold it for many slots at a
+/// time, how long it was held is counted when it is let go.
+struct QueueGuard<'a> {
+    queue: std::sync::MutexGuard<'a, TextureQueue>,
+    held: Option<(usize, std::time::Instant)>,
+}
+
+impl std::ops::Deref for QueueGuard<'_> {
+    type Target = TextureQueue;
+    fn deref(&self) -> &TextureQueue {
+        &self.queue
+    }
+}
+
+impl std::ops::DerefMut for QueueGuard<'_> {
+    fn deref_mut(&mut self) -> &mut TextureQueue {
+        &mut self.queue
+    }
+}
+
+impl Drop for QueueGuard<'_> {
+    fn drop(&mut self) {
+        if let Some((site, since)) = self.held {
+            super::QUEUE_LOCK[2][site].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 impl HostHeap {
-    /// The queue of textures picked by index, locked; a wait for its lock
-    /// is counted (`super::LOCK_WAITS`).
-    fn queue(&self) -> std::sync::MutexGuard<'_, TextureQueue> {
-        match self.textures.try_lock() {
+    /// The queue of textures picked by index, locked by place `site`
+    /// (`super::queue_site`); the lock taken, a wait for it, and how long
+    /// the places that hold it for many slots held it are counted
+    /// (`super::LOCK_WAITS`, `super::QUEUE_LOCK`).
+    fn queue(&self, site: usize) -> QueueGuard<'_> {
+        use super::queue_site::{DUE, MADE_DUE, STALE};
+        use std::sync::atomic::Ordering::Relaxed;
+        let queue = match self.textures.try_lock() {
             Ok(queue) => queue,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
                 let started = std::time::Instant::now();
                 let queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                super::waited(0, started);
+                super::QUEUE_LOCK[1][site].fetch_add(super::waited(0, started), Relaxed);
                 queue
             }
-        }
+        };
+        super::QUEUE_LOCK[0][site].fetch_add(1, Relaxed);
+        let held = matches!(site, DUE | MADE_DUE | STALE).then(|| (site, std::time::Instant::now()));
+        QueueGuard { queue, held }
     }
 
     /// `n` consecutive free dynamic slots (view heaps only), taken until
@@ -1900,14 +1936,14 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 6]) {
-        let (due, census) = self.queue().due_and_census(frame);
+        let (due, census) = self.queue(super::queue_site::DUE).due_and_census(frame);
         (if max == 0 { Vec::new() } else { due.order(max) }, census)
     }
 
     /// A number that changes when a slot is written or made due anew, and
     /// whether memory was noted since a pass last took the notes.
     pub(crate) fn texture_news(&self) -> (u64, bool) {
-        let writes = self.queue().writes;
+        let writes = self.queue(super::queue_site::OTHER).writes;
         let noted = |ranges: &Mutex<Vec<(u64, u64)>>| !ranges.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         (writes, noted(&REMAPPED) || noted(&PAGE_WRITTEN) || noted(&BAKE_PAGE_WRITTEN))
     }
@@ -1917,7 +1953,7 @@ impl HostHeap {
     /// look): for the card accounting line
     /// (`crate::resource::card_accounting`).
     pub(crate) fn texture_slots_all_due(&self, frame: u64) -> Vec<(u32, bool)> {
-        let textures = self.queue();
+        let textures = self.queue(super::queue_site::OTHER);
         textures
             .slots
             .iter()
@@ -1931,7 +1967,7 @@ impl HostHeap {
     /// that many bytes of its memory there, not all), or not until the
     /// slot is written again.
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::TELL);
         textures.note_served(index, write, crate::frame::current());
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
@@ -1951,38 +1987,38 @@ impl HostHeap {
         looks: u8,
         uploaded: u64,
     ) {
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::TELL);
         textures.note_served(index, write, crate::frame::current());
         textures.recheck(index, write, due, at, print, looks, uploaded);
     }
 
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
-        self.queue().checked(index)
+        self.queue(super::queue_site::TELL).checked(index)
     }
 
     /// Nothing to upload at title slot `index` now (its memory is not
     /// mapped, or no more of it than before): looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     pub(crate) fn texture_slot_later(&self, index: u32, write: u64, frame: u64, most: u64) {
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::TELL);
         textures.later(index, write, frame, most);
     }
 
     /// See [`TextureQueue::hold`].
     pub(crate) fn texture_slot_held(&self, index: u32, write: u64, due: u64) {
-        self.queue().hold(index, write, due);
+        self.queue(super::queue_site::TELL).hold(index, write, due);
     }
 
     /// See [`TextureQueue::room`].
     pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
-        self.queue().room(frame)
+        self.queue(super::queue_site::MADE_DUE).room(frame)
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
-        self.queue().mapped(index)
+        self.queue(super::queue_site::TELL).mapped(index)
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -2010,7 +2046,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -2035,7 +2071,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -2095,7 +2131,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
         for &slot in &slots {
             textures.changed(slot, frame, frame);
@@ -2116,7 +2152,7 @@ impl HostHeap {
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
         let held = slots.len();
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         // Uploaded before: out of the queue, or in it after an upload (in
         // part, or whole and being looked at again).
         slots.retain(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0));
@@ -2206,7 +2242,7 @@ impl HostHeap {
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::MADE_DUE);
         for &slot in &slots {
             textures.changed(slot, frame, frame + 1);
         }
@@ -2701,7 +2737,7 @@ impl HostHeap {
         if old != now | TABLED_READ {
             stamp.store(now | TABLED_READ, Relaxed);
             if tabled_out() {
-                let mut textures = self.queue();
+                let mut textures = self.queue(super::queue_site::TABLE);
                 if textures.slots.remove(&index).is_some() {
                     TABLED_WRITES[1].fetch_add(1, Relaxed);
                 }
@@ -2737,7 +2773,7 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
-        let mut textures = self.queue();
+        let mut textures = self.queue(super::queue_site::WRITE);
         if texture && !read_now {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2846,7 +2882,7 @@ impl HostHeap {
         };
         if !stale.is_empty() {
             STALE[0].fetch_add(stale.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            let mut textures = self.queue();
+            let mut textures = self.queue(super::queue_site::STALE);
             for &(slot, _) in &stale {
                 textures.remove(slot);
             }
@@ -3474,7 +3510,7 @@ impl HostHeap {
     /// `index` at `frame`, in a few words (diagnostics).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn texture_slot_state(&self, index: u32, frame: u64) -> String {
-        let textures = self.queue();
+        let textures = self.queue(super::queue_site::OTHER);
         match textures.slots.get(&index) {
             None => "not queued".into(),
             Some(w) => format!(

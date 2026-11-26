@@ -2154,6 +2154,18 @@ fn wc_no_back() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WC_NO_BACK").is_some_and(|v| v == "1"))
 }
 
+/// The smallest copy whose shader writes [`wc_no_back`] leaves on the card,
+/// in bytes (`VICTORY_WC_NO_BACK_MIN_KB`, 0 unset: all). With every copy
+/// left, the 4070 SUPER's cutscenes went near black (run xd-wcnoback,
+/// 2026-11-26: small results the title reads back, such as exposure, came
+/// back stale) while most of the saving is in a few ranges of hundreds of MB.
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) * 1024
+    })
+}
+
 /// Bytes shaders were declared to write in write-combined copies and that
 /// were left on the card ([`wc_no_back`]), since the last frame-rate line.
 pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
@@ -3206,7 +3218,7 @@ impl Shadow {
         // (`VICTORY_WC_NO_BACK`, and always for `VICTORY_WC_BAR`'s copies,
         // which the CPU would read through the bus): what shaders write stays
         // on the card.
-        if (self.card.is_some() && wc_no_back() || self.mapped && !self.window)
+        if (self.card.is_some() && wc_no_back() && self.len >= wc_no_back_min() || self.mapped && !self.window)
             && self.write_combined()
         {
             self.written.store(true, Ordering::Relaxed);

@@ -4713,6 +4713,48 @@ impl Copied<'_> {
         let last = unsafe { std::slice::from_raw_parts_mut(self.at.add(at), end - at) };
         changed_records(last, &records[..end - at], self.step, first, out);
     }
+
+    /// As [`Copied::changes`] for the `count` records of title memory at
+    /// `title` (slot `first` on), 32 bytes each, read where they are, each
+    /// once ([`crate::safecopy::changed`]); `bits` is room. False when a page
+    /// of them could not be read: those before it are done, the others
+    /// stay as last seen.
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]; `title` is title memory (read by a copy that
+    /// fails where a page is not there).
+    pub(crate) unsafe fn changes_in_place(&self, first: u32, title: *const u8, count: usize, bits: &mut Vec<u64>, out: &mut Vec<u32>) -> bool {
+        let at = first as usize * self.step;
+        let count = count.min(self.len.saturating_sub(at) / 32);
+        if self.step != 32 || count == 0 {
+            return true;
+        }
+        bits.clear();
+        bits.resize(count.div_ceil(64), 0);
+        // SAFETY: within the records held; the caller's slots alone.
+        let whole = unsafe { crate::safecopy::changed(title, self.at.add(at), count, bits) };
+        for (n, &word) in bits.iter().enumerate() {
+            let mut word = word;
+            while word != 0 {
+                out.push(first + (n * 64) as u32 + word.trailing_zeros());
+                word &= word - 1;
+            }
+        }
+        whole
+    }
+
+    /// The `count` records last seen from slot `first` on (fewer where the
+    /// heap ends).
+    ///
+    /// # Safety
+    /// As [`Copied::changes`]: no other call beside this one has any of
+    /// these slots.
+    pub(crate) unsafe fn seen(&self, first: u32, count: usize) -> &[u8] {
+        let at = (first as usize * self.step).min(self.len);
+        let len = (count * self.step).min(self.len - at);
+        // SAFETY: within the records held; the caller's slots alone.
+        unsafe { std::slice::from_raw_parts(self.at.add(at), len) }
+    }
 }
 
 /// The records (`step` bytes each, the first is slot `first`) that differ

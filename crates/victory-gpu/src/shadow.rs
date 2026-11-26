@@ -53,6 +53,9 @@ pub(crate) struct Shadow {
     ranged: Mutex<[(usize, usize, u64); 2]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Ranges a look found nothing new in, and still holds
+    /// ([`Shadow::nothing_new`]).
+    settled: Settled,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -1316,6 +1319,71 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+/// Whether a copy notes the ranges it found nothing new in, and takes them
+/// for what they were while nothing touched them
+/// (`VICTORY_REFRESH_NOTES=0`: every refresh looks again, as before).
+///
+/// Of a frame's 9,700 refreshed ranges some 8,800 were found to copy
+/// nothing, in each of up to sixteen submissions, each time by the journal's
+/// lock, the copy's three and the bits. Memory known by its bits has a stamp
+/// per block (`crate::watch::untouched_since`) that every write that opens a
+/// block and every asking that notes one written moves, so a range whose
+/// stamps stand and whose bits are set is as it was.
+fn settled_on() -> bool {
+    crate::watch::light() && crate::toggled!("VICTORY_REFRESH_NOTES")
+}
+
+/// What a copy knows of the ranges its last looks found nothing new in:
+/// two, each with the [`crate::watch::tick`] taken before the look and the
+/// `epoch` then.
+#[derive(Default)]
+struct Settled {
+    /// From, to, tick and epoch of each; an empty range is no note.
+    notes: Mutex<[(usize, usize, u64, u64); 2]>,
+    /// Moved when shaders are put on the copy (a note before it is void).
+    epoch: AtomicU64,
+}
+
+impl Settled {
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Voids every note.
+    fn void(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Whether `[from, to)` lies in a note made in `epoch` that `still`
+    /// (given the note's tick) says nothing has touched since.
+    fn holds(&self, from: usize, to: usize, epoch: u64, still: impl FnOnce(u64) -> bool) -> bool {
+        let tick = {
+            let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            match notes.iter().find(|n| n.3 == epoch && n.0 <= from && to <= n.1) {
+                Some(n) => n.2,
+                None => return false,
+            }
+        };
+        still(tick)
+    }
+
+    /// `[from, to)` was found to hold nothing new by a look made after
+    /// `tick` and `epoch` were read. A note of the same range is renewed,
+    /// else the older one is replaced.
+    fn note(&self, from: usize, to: usize, tick: u64, epoch: u64) {
+        let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let at = match notes.iter().position(|n| (n.0, n.1) == (from, to)) {
+            Some(at) => at,
+            None => usize::from(notes[0].2 > notes[1].2),
+        };
+        // (Never over a newer look's: that one stands for more.)
+        if notes[at].0 == from && notes[at].1 == to && notes[at].3 == epoch && notes[at].2 > tick {
+            return;
+        }
+        notes[at] = (from, to, tick, epoch);
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3062,6 +3130,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
+            settled: Settled::default(),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3126,6 +3195,8 @@ impl Shadow {
             return;
         }
         let range = (address, address + len);
+        // No range is known to hold nothing new while shaders may write it.
+        self.settled.void();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -3815,12 +3886,29 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
+        let memo = settled_on();
+        // Read ahead of the look: whatever touches the range after this is
+        // stamped above `tick`, and whatever puts shaders on it bumps `epoch`.
+        let (tick, epoch) = (crate::watch::tick(), self.settled.epoch());
+        if memo && self.settled.holds(from, to, epoch, |tick| crate::watch::untouched_since(from, to, tick)) {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from) as u64);
+            }
+            return true;
+        }
         // Around ranges shaders are writing the refresh asks gap by gap.
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        drop(copied);
+        if same && memo && crate::watch::untouched_since(from, to, tick) {
+            self.settled.note(from, to, tick, epoch);
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3828,6 +3916,19 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
+    }
+
+    /// [`Shadow::nothing_new`] where only what an earlier look noted is
+    /// asked: no lock but its own, none of the journal's.
+    pub(crate) fn nothing_new_noted(&self, address: usize, len: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to || self.place.is_some() {
+            return false;
+        }
+        settled_on()
+            && matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED)
+            && self.settled.holds(from, to, self.settled.epoch(), |tick| crate::watch::untouched_since(from, to, tick))
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
@@ -5675,4 +5776,56 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod settled_tests {
+    use super::Settled;
+
+    #[test]
+    fn a_range_is_known_while_nothing_touches_it() {
+        let s = Settled::default();
+        assert!(!s.holds(10, 20, s.epoch(), |_| true), "nothing noted yet");
+        s.note(0, 100, 7, s.epoch());
+        // The note's own tick is what the look is held against.
+        assert!(s.holds(10, 20, s.epoch(), |tick| tick == 7));
+        assert!(s.holds(0, 100, s.epoch(), |_| true));
+        // Touched since (the caller's answer), or not inside the note.
+        assert!(!s.holds(10, 20, s.epoch(), |_| false));
+        assert!(!s.holds(90, 101, s.epoch(), |_| true));
+        assert!(!s.holds(0, 100, s.epoch() + 1, |_| true));
+    }
+
+    #[test]
+    fn shaders_on_the_copy_void_every_note() {
+        let s = Settled::default();
+        s.note(0, 100, 7, s.epoch());
+        s.note(200, 300, 8, s.epoch());
+        s.void();
+        assert!(!s.holds(10, 20, s.epoch(), |_| true));
+        assert!(!s.holds(210, 220, s.epoch(), |_| true));
+        // A look begun before it (its epoch is the old one) is no note after it.
+        s.note(0, 100, 9, s.epoch() - 1);
+        assert!(!s.holds(10, 20, s.epoch(), |_| true));
+        s.note(0, 100, 10, s.epoch());
+        assert!(s.holds(10, 20, s.epoch(), |_| true));
+    }
+
+    #[test]
+    fn two_ranges_are_kept_and_the_older_goes_first() {
+        let s = Settled::default();
+        let e = s.epoch();
+        s.note(0, 10, 5, e);
+        s.note(20, 30, 6, e);
+        s.note(40, 50, 7, e);
+        assert!(!s.holds(0, 10, e, |_| true), "the oldest was replaced");
+        assert!(s.holds(20, 30, e, |_| true));
+        assert!(s.holds(40, 50, e, |_| true));
+        // The same range is renewed in place, and a look from before the
+        // newest does not take its place.
+        s.note(20, 30, 9, e);
+        s.note(20, 30, 8, e);
+        assert!(s.holds(20, 30, e, |tick| tick == 9));
+        assert!(s.holds(40, 50, e, |_| true));
+    }
 }

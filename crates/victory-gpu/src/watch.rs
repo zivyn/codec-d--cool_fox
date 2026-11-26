@@ -58,6 +58,8 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        // (A copy's note that it found nothing new in the page is void.)
+        stamp(page);
         let before = self.written.insert(page, now).unwrap_or(0);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -950,6 +952,53 @@ impl Bits {
 /// it tells of that ([`title_memory_remapped`]) before the title is.
 static PUBLISHED: Bits = Bits::new();
 
+/// Slots of [`STAMPED`]; a block's is its number modulo this (blocks that
+/// share a slot only make each other's notes void sooner).
+const STAMPS: usize = 1 << 18;
+
+/// Per block (see [`STAMPS`]), the [`TICK`] of the last time something
+/// could have made what a copy knows of the block wrong: its bit was
+/// cleared ([`unpublish`]) or an asking noted it written
+/// ([`Journal::note`]).
+static STAMPED: [std::sync::atomic::AtomicU64; STAMPS] = [const { std::sync::atomic::AtomicU64::new(0) }; STAMPS];
+
+/// Counts the stamps.
+static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn stamp(block: usize) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let tick = TICK.fetch_add(1, SeqCst) + 1;
+    STAMPED[block % STAMPS].fetch_max(tick, SeqCst);
+}
+
+/// The number to hold [`untouched_since`] against: read before what a note
+/// is made of is looked at.
+pub(crate) fn tick() -> u64 {
+    TICK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether `[start, end)` is view memory known by its bits ([`PUBLISHED`])
+/// that nothing has touched since `tick` (taken ahead of a look at it that
+/// found nothing new): no write opened any block of it, and no asking noted
+/// any written. What a copy found of the range is then as it was, and the
+/// look need not be made again.
+///
+/// The bits are read first, then the stamps: an asking stamps the page
+/// before it sets the bit again, so a bit seen set after a stamp reads the
+/// stamp too.
+pub(crate) fn untouched_since(start: usize, end: usize, tick: u64) -> bool {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    published(start, end)
+        && last - first < STAMPS
+        && (first..last).all(|block| STAMPED[block % STAMPS].load(std::sync::atomic::Ordering::SeqCst) <= tick)
+}
+
+/// Clears `block`'s bit, noting that it was touched.
+fn unpublish(block: usize) {
+    stamp(block);
+    PUBLISHED.clear(block);
+}
+
 /// The blocks read-only by our hand, or about to be: set under the guards'
 /// lock ahead of the protection, cleared under it when the block is open
 /// again. Who finds none set has no guard to open and need not wait for the
@@ -1020,7 +1069,7 @@ pub(crate) fn put_beside(block: usize, weight: u32, put: impl FnOnce(usize)) -> 
         BESIDE.set(view / BLOCK);
     }
     for view in shown.iter().filter(|&&view| view != 0) {
-        PUBLISHED.clear(view / BLOCK);
+        unpublish(view / BLOCK);
     }
     Beside::Done
 }
@@ -1051,7 +1100,7 @@ fn publish(pages: &[usize]) {
             // (Put there since: whoever did clears the bit after this is
             // set, or its own bit is found here.)
             if BESIDE.any(page, page + 1) {
-                PUBLISHED.clear(page);
+                unpublish(page);
             }
         }
     }
@@ -1125,7 +1174,7 @@ pub fn title_memory_allocated(at: usize, len: usize) {
     let blocks: Vec<usize> = g.held.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).collect();
     for block in blocks {
         g.held.remove(block);
-        PUBLISHED.clear(block);
+        unpublish(block);
     }
 }
 
@@ -1155,7 +1204,7 @@ pub(crate) fn look_at_holes() {
             // already, and forgotten.)
             let mut g = guards();
             if g.held.remove(block) {
-                PUBLISHED.clear(block);
+                unpublish(block);
                 static SAID: std::sync::Once = std::sync::Once::new();
                 SAID.call_once(|| {
                     tracing::warn!(
@@ -1985,7 +2034,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
                 if one {
                     // Before the first can be written.
                     g.clean.remove(other);
-                    PUBLISHED.clear(other);
+                    unpublish(other);
                     continue;
                 }
                 g.aliased.remove(other);
@@ -2011,7 +2060,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     for &block in blocks {
         g.protected.remove(block);
         g.clean.remove(block);
-        PUBLISHED.clear(block);
+        unpublish(block);
     }
     for &block in blocks {
         let mut old = 0;
@@ -2075,7 +2124,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
             for block in absent {
                 g.absent.remove(block);
                 if g.held.remove(block) {
-                    PUBLISHED.clear(block);
+                    unpublish(block);
                 }
             }
             g.kernel.push((first, last));
@@ -2215,7 +2264,7 @@ pub fn title_memory_splitting(at: usize, len: usize) {
     // all of them told as written before the first is writable.)
     for &other in &others {
         g.clean.remove(other / BLOCK);
-        PUBLISHED.clear(other / BLOCK);
+        unpublish(other / BLOCK);
     }
     open(&mut g, at, at.saturating_add(len));
     for other in others {
@@ -2464,7 +2513,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
     for block in blocks {
         g.protected.remove(block);
         g.clean.remove(block);
-        PUBLISHED.clear(block);
+        unpublish(block);
         PROTECTED.clear(block);
     }
 }
@@ -2492,7 +2541,7 @@ pub fn title_memory_freed(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(block);
         if g.held.remove(block) {
-            PUBLISHED.clear(block);
+            unpublish(block);
         }
     }
     let foreign: Vec<usize> = g.foreign.range(first..end).copied().collect();
@@ -2540,7 +2589,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     for block in absent {
         g.absent.remove(block);
         if g.held.remove(block) {
-            PUBLISHED.clear(block);
+            unpublish(block);
         }
     }
     let foreign: Vec<usize> = g.foreign.range(range.clone()).copied().collect();
@@ -2692,6 +2741,46 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn what_opens_or_notes_a_block_voids_what_was_known_of_it() {
+        // Blocks no memory has: only their bits and stamps.
+        let first = 0x6000_0000usize;
+        let (start, end) = (first * BLOCK, (first + 4) * BLOCK);
+        for block in first..first + 4 {
+            PUBLISHED.set(block);
+        }
+        let before = tick();
+        assert!(untouched_since(start, end, before));
+        // A write opens a block: the bit goes, and the stamp stays when an asking
+        // sets the bit again.
+        unpublish(first + 2);
+        assert!(!untouched_since(start, end, before));
+        PUBLISHED.set(first + 2);
+        assert!(!untouched_since(start, end, before));
+        // Beside it nothing happened; of a later look the block is as it is.
+        assert!(untouched_since(start, start + 2 * BLOCK, before));
+        let after = tick();
+        assert!(untouched_since(start, end, after));
+        // An asking that notes a page written stamps it, with the bit set.
+        let mut j = Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead: Vec::new(),
+            ahead_asked: 0,
+            kept: false,
+        };
+        j.note(first + 1, WHOLE, 5);
+        assert!(!untouched_since(start, end, after));
+        assert!(untouched_since(start + 2 * BLOCK, end, after));
+        // Memory whose bits are not set is not known, whatever the stamps.
+        assert!(!untouched_since(end, end + BLOCK, tick()));
     }
 }
 

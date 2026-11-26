@@ -1210,6 +1210,13 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The title calls that may record into the list ([`HostList::title_call`]).
+    title_calls: std::sync::atomic::AtomicU64,
+    /// The run of indirect executions the list's last one belongs to
+    /// ([`crate::indirect::merge`]), and its execution if it is held back.
+    indirect_run: Mutex<Option<(crate::indirect::merge::Run, Option<crate::indirect::merge::Held>)>>,
+    /// Whether an execution is held back.
+    holding: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4118,6 +4125,9 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                title_calls: std::sync::atomic::AtomicU64::new(0),
+                indirect_run: Mutex::default(),
+                holding: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6279,6 +6289,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.flush_indirect();
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6331,6 +6342,8 @@ impl HostList {
     /// for).
     pub(crate) fn reset(&self) {
         self.changed_something();
+        self.holding.store(false, Ordering::Relaxed);
+        *self.indirect_run.lock().unwrap_or_else(|e| e.into_inner()) = None;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
@@ -6376,6 +6389,53 @@ impl HostList {
     /// See [`HostList::changed_something`].
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::Relaxed)
+    }
+
+    /// A title call that may record into the list (all but indirect
+    /// executions and calls that only change what the next draw or dispatch
+    /// binds, `crate::list`): the indirect execution held back, if one is,
+    /// is recorded first ([`crate::indirect::merge`]).
+    pub(crate) fn title_call(&self) {
+        self.title_calls.fetch_add(1, Ordering::Relaxed);
+        self.flush_indirect();
+    }
+
+    /// The title calls recorded into the list so far.
+    pub(crate) fn title_calls(&self) -> u64 {
+        self.title_calls.load(Ordering::Relaxed)
+    }
+
+    /// Records the indirect execution held back, if one is: before
+    /// anything else is recorded into the list.
+    pub(crate) fn flush_indirect(&self) {
+        if self.holding.load(Ordering::Relaxed) {
+            self.record_held(&mut self.indirect_run());
+        }
+    }
+
+    /// As [`HostList::flush_indirect`], with the list's run in hand.
+    pub(crate) fn record_held(
+        &self,
+        run: &mut Option<(crate::indirect::merge::Run, Option<crate::indirect::merge::Held>)>,
+    ) {
+        if let Some((run, held)) = run.as_mut()
+            && let Some(held) = held.take()
+        {
+            self.holding.store(false, Ordering::Relaxed);
+            held.record(&self.list, run);
+        }
+    }
+
+    /// The list's run of indirect executions ([`crate::indirect::merge`]).
+    pub(crate) fn indirect_run(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<(crate::indirect::merge::Run, Option<crate::indirect::merge::Held>)>> {
+        self.indirect_run.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The list's run holds its execution back from here on.
+    pub(crate) fn hold_indirect(&self) {
+        self.holding.store(true, Ordering::Relaxed);
     }
 
     /// Whether any deferred steps or texture state transitions have been
@@ -8754,6 +8814,7 @@ impl Meter {
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
         );
+        crate::indirect::merge::line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);

@@ -1825,7 +1825,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // used.
         Some([budget, used, ..]) => {
             used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
+                < room_line(budget)
         }
         None => filled < WITHOUT_BUDGET,
     }
@@ -1934,7 +1934,7 @@ pub(crate) fn room_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
             crate::pool::texture_room(),
             crate::shadow::card_room_kept(),
             targets_room_kept(),
-            budget / 100 * room_percent(),
+            room_line(budget),
         ]
         .map(|bytes| bytes >> 20),
     )
@@ -1965,6 +1965,8 @@ pub(crate) fn room_lately() -> bool {
 /// textures wait (runs 170-174); the card copies of title buffers from
 /// 1 MiB up take 449 MB more of the card than before (941 against 492),
 /// and 94 gives the textures about that much back.
+///
+/// Unless that switch is set the line is [`line_for`] the budget instead.
 #[cfg(windows)]
 pub(crate) fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1974,6 +1976,31 @@ pub(crate) fn room_percent() -> u64 {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map_or(90, |percent| percent.clamp(50, 97))
     })
+}
+
+/// The line [`room`] weighs the card's use against, in bytes of a budget
+/// of `budget`: `VICTORY_TEXTURE_ROOM_PERCENT`'s share of it if set, else
+/// [`line_for`] it.
+#[cfg(windows)]
+pub(crate) fn room_line(budget: u64) -> u64 {
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
+        budget / 100 * room_percent()
+    } else {
+        line_for(budget)
+    }
+}
+
+/// The budget less what is left free for the host's own needs that are
+/// made with no room test (render target bursts, buffer copies, upload
+/// buffers): 768 MiB or a twentieth of the budget, whichever is more; never
+/// under 90 % of it. A flat 90 % left 1,060 MB of a 10,600 MB budget unused
+/// while new textures waited (2026-11-26 16:52 run: "no room" at 9,526 to
+/// 9,881 MB weighed against 9,519 to 9,583); this gives about 290 MB of it
+/// to textures there, and keeps 90 % on cards of 7.5 GB or less.
+#[cfg(any(windows, test))]
+fn line_for(budget: u64) -> u64 {
+    budget.saturating_sub((768u64 << 20).max(budget / 20)).max(budget / 100 * 90)
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -2244,7 +2271,7 @@ pub(crate) fn let_go_idle() {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
-            crate::host::vram_keep(budget, used)
+            crate::host::vram_keep_below(budget, used, room_line(budget))
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
@@ -4748,6 +4775,20 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    /// The texture queue's line: the budget less 768 MiB or 5 %, never under
+    /// 90 % of it.
+    #[test]
+    fn room_line_follows_the_budget() {
+        const MIB: u64 = 1 << 20;
+        // 10,600 MB: 768 MiB free (92.8 %), not 1,060 MB.
+        assert_eq!(line_for(10_600 * MIB), 9_832 * MIB);
+        // 24 GB: 5 % free.
+        assert_eq!(line_for(24_000 * MIB), 22_800 * MIB);
+        // 6 GB: 90 % (768 MiB would be more than a tenth).
+        assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
+        assert_eq!(line_for(0), 0);
     }
 
     /// The room kept for render targets goes once the world's targets are

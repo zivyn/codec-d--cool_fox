@@ -3212,6 +3212,14 @@ impl HostHeap {
         out
     }
 
+    /// Slots taken by [`HostHeap::copied_before`] for `frame` and left
+    /// undone: they come first again, due at `frame` as before.
+    pub(crate) fn copied_requeue(&self, frame: u64, slots: Vec<u32>) {
+        if !slots.is_empty() {
+            self.waiting.lock().unwrap_or_else(|e| e.into_inner()).push_front((frame.saturating_sub(COPIED_GRACE), slots));
+        }
+    }
+
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
@@ -5623,6 +5631,28 @@ mod tests {
         assert!(set.remove(64) && !set.remove(64) && !set.remove(5));
         assert_eq!(set.take(), [0, 63, 130, 199]);
         assert!(set.take().is_empty());
+    }
+
+    /// Records that wait for a draw come due after the grace frames, an
+    /// early round may take those due a frame ahead, and what it leaves is
+    /// due again at that frame, before what waited after it.
+    #[test]
+    fn records_left_undone_come_due_again_first() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        heap.copied_wait(10, vec![1, 2]);
+        heap.copied_wait(11, vec![3]);
+        assert!(heap.copied_before(10 + COPIED_GRACE - 1).is_empty());
+        // A frame ahead: only what was found in frame 10.
+        assert_eq!(heap.copied_before(10 + COPIED_GRACE), [1, 2]);
+        heap.copied_requeue(10 + COPIED_GRACE, vec![2]);
+        // Not due a frame sooner than it was taken for, due then, with the rest.
+        assert!(heap.copied_before(10 + COPIED_GRACE - 1).is_empty());
+        assert_eq!(heap.copied_before(11 + COPIED_GRACE), [2, 3]);
+        assert!(heap.copied_before(u64::MAX).is_empty());
+        heap.copied_requeue(5, Vec::new());
+        assert!(heap.copied_before(u64::MAX).is_empty());
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

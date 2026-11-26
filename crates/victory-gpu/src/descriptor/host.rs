@@ -1404,6 +1404,12 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// the last slot is the null slot every view index at or past it reads.
 const UNCAPPED_VIEWS: u32 = 1 << 21;
 
+/// What a host that refuses [`UNCAPPED_VIEWS`] but takes more than
+/// [`PORTABLE_VIEWS`] is tried with: the title's heap (1,245,184) and
+/// [`DYNAMIC`] slots, with room. NVIDIA (RTX 4060, driver 32.0.15.9186, binding
+/// tier 3) takes exactly 1,000,000 and nothing more.
+const MID_VIEWS: u32 = 3 << 19;
+
 /// Where the raw twins of the title's slots start in a heap that has them
 /// ([`raw_twins`]): past every slot a title's heap and the dynamic ones take.
 const RAW_TWINS: u32 = 1 << 21;
@@ -1457,6 +1463,8 @@ pub(crate) fn probe_view_limit() {
             RAW_TWINS
         } else if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
+        } else if fits(MID_VIEWS) {
+            MID_VIEWS
         } else {
             PORTABLE_VIEWS
         };
@@ -4858,6 +4866,44 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host heap holds what the device takes: no more than the limit
+    /// it picked, the title's slots when the device takes that many, else
+    /// the room left past the dynamic slots; and a device that refuses more
+    /// than 1,000,000 views (NVIDIA, tier 3 too) gets a heap that size, with
+    /// the null slot last.
+    #[test]
+    fn view_heap_follows_what_the_device_takes() {
+        let Some(host) = host() else { return };
+        let fits = |count: u32| {
+            // SAFETY: plain heap creation; released at once.
+            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: count,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+            };
+            made.is_ok()
+        };
+        let title = 1_245_184u32;
+        let Some(heap) = HostHeap::new(false, title) else { return };
+        let null = victory_shader::emit::view_heap_limit();
+        let size = if heap.raw == 0 { null + 1 } else { 2 * heap.raw };
+        assert!(fits(size), "the heap the host made is one the device takes");
+        // Views past the heap are the null slot's, never past the device's.
+        assert!(heap.count + heap.dynamic <= null, "title and dynamic slots lie before the null slot");
+        if fits(title + DYNAMIC) {
+            // A device that takes the title's heap shows all of it.
+            assert_eq!(heap.count, title);
+        } else {
+            assert!(null < title + DYNAMIC);
+            assert!(!fits(PORTABLE_VIEWS + 1) || victory_shader::emit::view_heap_limit() > PORTABLE_VIEWS);
+            assert_eq!(heap.count + heap.dynamic, null);
+            assert!(heap.count < title);
+        }
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.

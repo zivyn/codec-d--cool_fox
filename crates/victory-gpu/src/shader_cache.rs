@@ -84,6 +84,16 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // So is whether pixel programs keep the console's early depth test
+        // (`VICTORY_EARLY_DEPTH=1`): only while it is on, so that the
+        // translations cached without it are still served without it.
+        if victory_shader::emit::early_depth() {
+            tracing::info!(
+                "VICTORY_EARLY_DEPTH=1: pixel programs whose console code tests depth before them get the host's early depth-stencil test"
+            );
+            bytes.extend_from_slice(b"VICTORY_EARLY_DEPTH=1");
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

@@ -1597,6 +1597,12 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // Helpers woken: one for each job beyond the one this thread takes
+    // first, at most all of them. All were woken for every call (4 for 2
+    // jobs), and those that found nothing went back to sleep; a helper busy
+    // meanwhile looks at the queue before it sleeps again, and this thread
+    // takes what nobody took.
+    let wake = (jobs.len() - 1).min(wide_threads());
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1613,7 +1619,11 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    if wake >= wide_threads() {
+        workers.more.notify_all();
+    } else {
+        (0..wake).for_each(|_| workers.more.notify_one());
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {

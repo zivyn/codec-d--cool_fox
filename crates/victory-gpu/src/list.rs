@@ -476,14 +476,16 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which finds it so (or wants it closed).
+        fresh.leave_open();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
+        // (Submitted again without a reset: it runs closed, empty.)
+        host.close_if_left_open();
         let earlier = std::mem::take(&mut list.earlier);
         let gate = std::mem::take(&mut list.gate);
         let uploads = std::mem::take(&mut *list.uploads.lock().unwrap_or_else(|e| e.into_inner()));
@@ -548,8 +550,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             continue;
         };
         // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
+        // reset, which finds it so (or wants it closed).
+        fresh.leave_open();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -557,6 +559,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             let Some(host) = (*list).host.replace(fresh) else {
                 continue;
             };
+            // (Submitted again without a reset: it runs closed, empty.)
+            host.close_if_left_open();
             let uploads =
                 std::mem::take(&mut *(*list).uploads.lock().unwrap_or_else(|e| e.into_inner()));
             let state =

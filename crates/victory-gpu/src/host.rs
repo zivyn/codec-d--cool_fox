@@ -1085,6 +1085,59 @@ mod tests {
         }
     }
 
+    /// Views the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`) are
+    /// placeholders to the host: their bytes are read from their pages,
+    /// beside memory read as before and memory that is not there (zeros),
+    /// and they count as committed.
+    #[test]
+    fn views_in_the_books_alone_are_read_from_their_pages() {
+        use crate::watch::test_books::{IN_BOOKS, books};
+        use windows_sys::Win32::System::Memory::*;
+        const K: usize = 64 << 10;
+        books();
+        let (pages, more) = (vec![0x22u8; K], vec![0x33u8; K]);
+        // SAFETY: a reservation of ours, of which the first block is
+        // committed and written; the second and the fourth are views in the
+        // books, the third is not there.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), 4 * K, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!at.is_null());
+            assert!(!VirtualAlloc(at.cast(), K, MEM_COMMIT, PAGE_READWRITE).is_null());
+            at.write_bytes(0x11, K);
+            let views = [(at as usize + K, K, pages.as_ptr() as usize), (at as usize + 3 * K, K, more.as_ptr() as usize)];
+            IN_BOOKS.lock().unwrap().extend(views);
+            let expected = |from: usize| match from / K {
+                0 => 0x11,
+                1 => 0x22,
+                3 => 0x33,
+                _ => 0,
+            };
+            // All there, from inside a page into the view in the books.
+            let mut out = vec![0xeeu8; 2 * K - 0x300];
+            assert!(super::read_into(at.add(0x300), &mut out));
+            assert!(out.iter().enumerate().all(|(i, &b)| b == expected(i + 0x300)));
+            // Over the block that is not there: no whole read; the copy has
+            // zeros there and the bytes around it, the views' from the pages.
+            let mut out = vec![0xeeu8; 4 * K];
+            assert!(!super::read_into(at, &mut out));
+            let mut out = vec![0xeeu8; 4 * K - 54];
+            super::copy_mapped(out.as_mut_ptr(), at.add(27), 4 * K - 54, false);
+            for (i, &b) in out.iter().enumerate() {
+                assert_eq!(b, expected(i + 27), "byte {:#x}", i + 27);
+            }
+            let mut out = vec![0xeeu8; 4 * K];
+            assert_eq!(super::read_there(at, &mut out), 3 * K);
+            assert!(out.iter().enumerate().all(|(i, &b)| b == expected(i)));
+            // Committed, as far as the title goes; the hole is not.
+            assert!(crate::texture::committed(at, 2 * K));
+            assert!(crate::texture::committed(at.add(K + 5), K - 5));
+            assert!(!crate::texture::committed(at, 3 * K));
+            assert!(crate::texture::committed(at.add(3 * K), K));
+            IN_BOOKS.lock().unwrap().retain(|view| !views.contains(view));
+            assert_ne!(VirtualFree(at.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     /// Zeros for a title destination that went meanwhile are no fault.
     #[test]
     fn zeros_where_nothing_is_are_lost() {
@@ -8463,11 +8516,26 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
+        // A view in the runtime's books alone (`VICTORY_SOFT_VIEWS`) is a
+        // placeholder to the host, which would have it read as zeros: its
+        // bytes come from the pages, and the host is asked only about what
+        // lies before the next such view.
+        let mut plain = remaining;
+        if let Some(soft) = crate::watch::soft() {
+            let (from_pages, n) = (soft.read)(at as usize, to, remaining);
+            if from_pages && n != 0 {
+                offset += n;
+                continue;
+            }
+            if n != 0 {
+                plain = n;
+            }
+        }
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
-            .saturating_sub(at as usize).min(remaining);
+            .saturating_sub(at as usize).min(plain);
         if size != size_of_val(&info) || n == 0 {
             read_pieces(at, to, remaining);
             break;
@@ -8569,11 +8637,38 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // Views the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`) are
+    // read from their pages, and stay as they are: no view of the host's is
+    // made for our reading. What lies between them is read as before.
+    if let Some(soft) = crate::watch::soft() {
+        let mut done = 0;
+        while done < len {
+            let (at, to) = (src.wrapping_add(done), dst.wrapping_add(done));
+            let (mut from_pages, mut n) = (soft.read)(at as usize, to, len - done);
+            if !from_pages && n != 0 && !read_plain(at, to, n) {
+                // (Mapped so between the question and the read: once more.)
+                (from_pages, n) = (soft.read)(at as usize, to, len - done);
+                if !from_pages {
+                    return false;
+                }
+            }
+            if n == 0 {
+                return false;
+            }
+            done += n;
+        }
+        return true;
+    }
     // (The kernel's read does not fault into the handler that makes lazily
     // mapped title memory real.)
     crate::watch::materialize(src as usize, len);
+    read_plain(src, dst, len)
+}
+
+/// [`read`] of memory the host has mapped, or has not.
+fn read_plain(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if crate::safecopy::on() {
         // SAFETY: the destination is mapped writable memory of `len` bytes;
         // a source page that is not there fails the copy.

@@ -673,8 +673,9 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     // Guarding asks Windows about the pages and protects them: a lazy view
-    // is none to it yet.
-    if guarded {
+    // is none to it yet. (Not so a view in the books alone, which is
+    // guarded there: [`use_soft_views`].)
+    if guarded && soft().is_none() {
         materialize(start, end.saturating_sub(start));
     }
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -2200,7 +2201,24 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     if g.protected.contains(block) {
         return true;
     }
-    if g.left_alone(block) || g.rests(block, rest()) {
+    if g.left_alone(block) {
+        return false;
+    }
+    // A view in the runtime's books alone ([`use_soft_views`]): nothing
+    // writes through it before a fault makes it a mapping of the host's,
+    // which opens it and every other view of its page
+    // ([`title_memory_made_real`]). Guarded in the books, with no call to
+    // the host, which has a placeholder there and would refuse: then the
+    // view guarded with it was never clean and copied again at every asking
+    // (run xw-lazy, `VICTORY_LAZY_VIEWS=1`: 2.4 to 3.4 GB of copies a frame,
+    // 2 fps).
+    if soft_block(block) {
+        PROTECTED.set(block);
+        g.protected.insert(block);
+        SOFT_GUARDS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
+    if g.rests(block, rest()) {
         return false;
     }
     // Ahead of the protection.
@@ -2266,12 +2284,24 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     // Ahead of the protection (`PROTECTED`).
     (from..to).for_each(|block| PROTECTED.set(block));
-    if set(from, to) {
+    // Views in the runtime's books alone ([`use_soft_views`]) are guarded
+    // there: the host has a placeholder at their addresses, would refuse,
+    // and the block would count as not there. Nothing writes through one
+    // before a fault makes it real, which opens it
+    // ([`title_memory_made_real`]).
+    let soft = soft_runs(from * BLOCK, (to - from) * BLOCK);
+    let in_books = |block: usize| soft.iter().any(|&(at, n)| at <= block * BLOCK && (block + 1) * BLOCK <= at + n);
+    if soft.is_empty() && set(from, to) {
         note(g, from, to);
         return;
     }
     let mut uncommitted_until = from;
     for block in from..to {
+        if in_books(block) {
+            note(g, block, block + 1);
+            SOFT_GUARDS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
         // (Not one question a block of a region that is not there.)
         if block >= uncommitted_until && set(block, block + 1) {
             note(g, block, block + 1);
@@ -2931,7 +2961,90 @@ pub fn use_lazy_views(materialize: fn(usize, usize) -> bool) {
 /// questions to Windows about the pages. (A fault in title memory, the
 /// title's or ours, comes to [`install`]'s handler, which asks first.)
 pub(crate) fn materialize(at: usize, len: usize) -> bool {
-    LAZY_VIEWS.get().is_some_and(|f| f(at, len.max(1)))
+    match soft() {
+        Some(soft) => (soft.materialize)(at, len.max(1)),
+        None => LAZY_VIEWS.get().is_some_and(|f| f(at, len.max(1))),
+    }
+}
+
+/// What the runtime gives for the views it keeps in its books alone
+/// (`xmem`, `VICTORY_SOFT_VIEWS`): title memory it tells of as mapped
+/// ([`title_memory_remapped`], `title_memory_view`) where the host has a
+/// placeholder and no view, until the title's CPU touches it.
+///
+/// With these the GPU side leaves such a view as it is where it can: it
+/// reads its bytes from the pages ([`SoftViews::read`], `crate::host`'s
+/// reads; a texture all or partly in such views is read through a copy),
+/// takes it for committed (`crate::texture::committed`) and guards it in
+/// the books ([`protect_here`], [`protect_alias`]: no protection change, no
+/// question to the host). Whatever else touches one makes it a mapping of
+/// the host's first: a fault, the title's or ours (the handler below), and
+/// what that handler does not see ([`materialize`]: our writes through the
+/// kernel, the kernel's writes the runtime announces).
+pub struct SoftViews {
+    /// `(address, bytes)`: makes every such view that overlaps the range a
+    /// mapping of the host's; whether there was one and all could be made.
+    pub materialize: fn(usize, usize) -> bool,
+    /// The same for an access that faulted: `(address, the code's address)`.
+    pub fault: fn(usize, usize) -> bool,
+    /// `(address, to, bytes)`: if such a view holds `address`, copies its
+    /// bytes from there on to `to`, to the view's end at most, and says
+    /// `(true, bytes copied)`; else `(false, n)`: the next `n` bytes (up to
+    /// `bytes`) are in no such view, and are read as other memory is.
+    pub read: fn(usize, *mut u8, usize) -> (bool, usize),
+    /// `(address, bytes)`: the parts of the range such views show, in
+    /// order, those that touch as one: `(address, bytes)`.
+    pub runs: fn(usize, usize) -> Vec<(usize, usize)>,
+}
+
+static SOFT_VIEWS: std::sync::OnceLock<SoftViews> = std::sync::OnceLock::new();
+
+/// The runtime keeps views in its books alone ([`SoftViews`]).
+pub fn use_soft_views(hooks: SoftViews) {
+    let _ = SOFT_VIEWS.set(hooks);
+}
+
+pub(crate) fn soft() -> Option<&'static SoftViews> {
+    SOFT_VIEWS.get()
+}
+
+/// The parts of `[at, at + len)` that views in the runtime's books alone
+/// show ([`SoftViews::runs`]); none without such views.
+pub(crate) fn soft_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    match soft() {
+        Some(soft) if len != 0 => (soft.runs)(at, len),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether a view in the runtime's books alone shows all of `block`.
+fn soft_block(block: usize) -> bool {
+    soft_runs(block * BLOCK, BLOCK) == [(block * BLOCK, BLOCK)]
+}
+
+/// Since the start: blocks of views in the runtime's books alone guarded
+/// there ([`protect_here`]), and such blocks guarded there as another view
+/// of a page that is guarded ([`protect_alias`]).
+static SOFT_GUARDS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// [`SOFT_GUARDS`], for the runtime's line about its views.
+pub fn soft_view_guards() -> [u64; 2] {
+    [0, 1].map(|i| SOFT_GUARDS[i].load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The runtime made a view it had in its books alone a mapping of the
+/// host's, read-write, at `[at, at + len)` ([`SoftViews`]): from now on the
+/// title writes through it without a fault. What was guarded of it in the
+/// books is opened, and with it every other view of its pages
+/// ([`open`]): all of them count as written at the next asking. Called when
+/// the view is there (as [`title_memory_remapped`] is), with the runtime's
+/// lock on its views held.
+pub fn title_memory_made_real(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut g = guards();
+    open(&mut g, at, at.saturating_add(len));
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -2962,7 +3075,12 @@ pub(crate) fn install() {
         // made again (any access, the title's or ours).
         if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && r.NumberParameters >= 2
-            && materialize(r.ExceptionInformation[1], 1)
+            && match soft() {
+                // (Counted by whose code it was: the title's own touch of a
+                // view is what the books cannot spare it.)
+                Some(soft) => (soft.fault)(r.ExceptionInformation[1], r.ExceptionAddress as usize),
+                None => materialize(r.ExceptionInformation[1], 1),
+            }
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -3077,6 +3195,48 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+/// A runtime that keeps views in its books alone, for tests
+/// ([`use_soft_views`]; one set of hooks for the whole test process).
+#[cfg(test)]
+pub(crate) mod test_books {
+    /// What that runtime keeps in its books alone: address, bytes, and
+    /// where their pages are (0: nowhere, never read); apart from each other.
+    pub(crate) static IN_BOOKS: std::sync::Mutex<Vec<(usize, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Its hooks: the views are [`IN_BOOKS`], read from their pages; it
+    /// makes none real itself.
+    pub(crate) fn books() {
+        super::use_soft_views(super::SoftViews {
+            materialize: |_, _| false,
+            fault: |_, _| false,
+            read: |at, to, len| {
+                let views = IN_BOOKS.lock().unwrap_or_else(|e| e.into_inner());
+                let readable = |view: &&(usize, usize, usize)| view.2 != 0 && (view.0..view.0 + view.1).contains(&at);
+                if let Some(&(base, bytes, pages)) = views.iter().find(readable) {
+                    let n = (base + bytes - at).min(len);
+                    // SAFETY: the test's pages hold the view's bytes, and
+                    // its `to` as many as it asked for.
+                    unsafe { std::ptr::copy_nonoverlapping((pages + (at - base)) as *const u8, to, n) };
+                    return (true, n);
+                }
+                let next = views.iter().filter(|view| view.2 != 0).map(|view| view.0).filter(|&base| base > at).min();
+                (false, next.map_or(len, |next| (next - at).min(len)))
+            },
+            runs: |at, len| {
+                let views = IN_BOOKS.lock().unwrap_or_else(|e| e.into_inner());
+                let mut runs: Vec<(usize, usize)> = views
+                    .iter()
+                    .map(|&(base, bytes, _)| (base.max(at), (base + bytes).min(at + len)))
+                    .filter(|&(from, to)| from < to)
+                    .map(|(from, to)| (from, to - from))
+                    .collect();
+                runs.sort_unstable();
+                runs
+            },
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3870,6 +4030,107 @@ mod tests {
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         assert_eq!(guard(guarded, guarded + SIZE), Some(Vec::new()));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    use super::test_books::{IN_BOOKS, books};
+
+    /// A view the runtime keeps in its books alone (`VICTORY_SOFT_VIEWS`): a
+    /// placeholder to the host. It is guarded in the books, on its own and
+    /// as another view of a guarded page, so that both it and that view come
+    /// clean; a write told of at it, or through the other view, is reported
+    /// at both; and made a view of the host's, it and the other view count
+    /// as written, and it is guarded as any view from then on.
+    #[test]
+    fn a_view_in_the_books_alone_is_guarded_there() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const SIZE: usize = 2 * BLOCK;
+        books();
+        // SAFETY: a fresh placeholder of two blocks, and a pagefile section
+        // of two with one view of the host's.
+        let (soft, section, real) = unsafe {
+            let soft = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                SIZE,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(soft, 0);
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let real = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert_ne!(real, 0);
+            (soft, section, real)
+        };
+        // As the runtime tells of them: the one in the books first known as
+        // such, then told of as mapped.
+        IN_BOOKS.lock().unwrap().push((soft, SIZE, 0));
+        title_memory_remapped(soft, SIZE);
+        crate::inplace::title_memory_view(soft, SIZE, section as usize, 0);
+        title_memory_remapped(real, SIZE);
+        crate::inplace::title_memory_view(real, SIZE, section as usize, 0);
+        let blocks = |at: usize| vec![at / BLOCK, at / BLOCK + 1];
+        let block = |at: usize, k: usize| vec![at / BLOCK + k];
+        let none = Some(Vec::new());
+        // Guarded in the books: told once, then clean, with the host never
+        // asked to protect the placeholder (which it refuses).
+        assert_eq!(guard(soft, soft + SIZE), Some(blocks(soft)));
+        assert_eq!(guard(soft, soft + SIZE), none);
+        assert!(guards().absent.range(soft / BLOCK..soft / BLOCK + 2).next().is_none(), "there, as far as the title goes");
+        // The view of the host's comes clean beside it.
+        assert_eq!(guard(real, real + SIZE), Some(blocks(real)));
+        assert_eq!(guard(real, real + SIZE), none);
+        assert_eq!(guard(soft, soft + SIZE), none);
+        assert!(!writable(real));
+        // A write through the view of the host's: reported at both.
+        // SAFETY: the view, read-write once the handler has opened it.
+        unsafe { ((real + BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert_eq!(guard(soft, soft + SIZE), Some(block(soft, 1)));
+        assert_eq!(guard(real, real + SIZE), Some(block(real, 1)));
+        assert_eq!(guard(soft, soft + SIZE), none);
+        assert_eq!(guard(real, real + SIZE), none);
+        // A write the runtime tells of at the view in its books (bytes
+        // DirectStorage put into the pages): reported at both.
+        writing(soft, BLOCK);
+        assert_eq!(guard(real, real + SIZE), Some(block(real, 0)));
+        assert_eq!(guard(soft, soft + SIZE), Some(block(soft, 0)));
+        assert_eq!(guard(real, real + SIZE), none);
+        assert_eq!(guard(soft, soft + SIZE), none);
+        // The title's CPU touched it: the runtime maps it, read-write, and
+        // tells. Both views count as written, whatever was written.
+        // SAFETY: the placeholder takes a view of the section.
+        let view = unsafe {
+            MapViewOfFile3(section, GetCurrentProcess(), soft as *const _, 0, SIZE, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0)
+        };
+        assert_eq!(view.Value as usize, soft);
+        IN_BOOKS.lock().unwrap().retain(|view| view.0 != soft);
+        title_memory_made_real(soft, SIZE);
+        assert!(writable(soft));
+        assert_eq!(guard(real, real + SIZE), Some(blocks(real)));
+        assert_eq!(guard(soft, soft + SIZE), Some(blocks(soft)));
+        assert_eq!(guard(real, real + SIZE), none);
+        // A view as any other now: read-only by our hand, and a write
+        // through it faults and is reported at both.
+        assert!(!writable(soft));
+        // SAFETY: the view, read-write once the handler has opened it.
+        unsafe { ((soft + 8) as *mut u8).write_volatile(2) };
+        assert_eq!(guard(real, real + SIZE), Some(block(real, 0)));
+        assert_eq!(guard(soft, soft + SIZE), Some(block(soft, 0)));
+        // SAFETY: the bytes went into the section's page.
+        assert_eq!(unsafe { ((real + 8) as *const u8).read_volatile() }, 2);
+        for at in [soft, real] {
+            title_memory_remapped(at, SIZE);
+            // SAFETY: our views.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+        }
+        // SAFETY: the section's last reference.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
     }
 
     /// A write of the runtime's own, told at one view of the pages

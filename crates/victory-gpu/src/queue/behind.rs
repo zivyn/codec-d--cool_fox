@@ -378,8 +378,9 @@ type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>
 enum Job {
     /// The queue waits for the fence (its address) to reach the value.
     Wait(usize, u64),
-    /// A part of a submission waits for a memory value.
-    Value(crate::list::ValueWait),
+    /// A part of a submission to the queue (its address) waits for a memory
+    /// value.
+    Value(usize, crate::list::ValueWait),
     /// A submission, or a part of one: the lists' host sides and the order
     /// they run in.
     Run(usize, Vec<crate::list::Detached>, Vec<usize>),
@@ -416,7 +417,7 @@ impl Work for Job {
     fn ask(&self) -> Option<Ask> {
         match self {
             &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
-            Job::Value(wait) => Some(Ask::Value(*wait)),
+            Job::Value(_, wait) => Some(Ask::Value(*wait)),
             Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
             _ => None,
         }
@@ -468,19 +469,23 @@ impl Work for Job {
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
-        let (count, lists, signals) = match self {
-            Job::Run(_, lists, order) => (1, (&*lists, &*order), &[][..]),
-            Job::Joined(_, lists, order, parts, signals) => (1 + parts.len(), (&*lists, &*order), &signals[..]),
+        let (queue, count, lists, signals) = match self {
+            Job::Run(queue, lists, order) => (*queue, 1, (&*lists, &*order), &[][..]),
+            Job::Joined(queue, lists, order, parts, signals) => (*queue, 1 + parts.len(), (&*lists, &*order), &signals[..]),
             _ => return Err(next),
         };
         let hosts = || lists.1.iter().map(|&i| lists.0[i].host());
         match &next {
-            Job::Value(wait) => {
-                let met = wait.met()
-                    || crate::host::late_met_known(wait) == Some(true)
-                    || hosts().any(|list| crate::host::will_meet(list, wait));
-                if !met {
+            Job::Value(_, wait) => {
+                let met = wait.met();
+                let ahead = !met && crate::host::late_met_known(wait) == Some(true);
+                if !met && !ahead && !hosts().any(|list| crate::host::will_meet(list, wait)) {
                     return Err(next);
+                }
+                // Met by a flight in the air: on a queue of its own the
+                // submission would wait for it.
+                if ahead && crate::host::two_queues::on() && !hosts().any(|list| crate::host::will_meet(list, wait)) {
+                    crate::host::two_queues::value_passed(queue, wait);
                 }
             }
             &Job::Wait(fence, value) => {
@@ -539,27 +544,32 @@ impl Work for Job {
         }
         match self {
             // (A folded one is unfolded, never done.)
-            Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
+            Job::Wait(..) | Job::Lists(..) => {}
+            Job::Value(queue, wait) => {
+                if !forced {
+                    crate::host::two_queues::value_passed(queue, &wait);
+                }
+            }
             Job::Run(queue, lists, order) => {
-                let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
-                match crate::host::host() {
+                let after = crate::host::two_queues::take_after(queue);
+                crate::host::two_queues::for_title(super::kind_of(queue), after, || match crate::host::host() {
                     Some(host) => host.execute_late(lists, order),
                     None => drop(lists),
-                }
+                });
                 QUEUED.fetch_sub(1, Relaxed);
             }
             Job::Joined(queue, lists, order, parts, signals) => {
-                let _ = queue;
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
-                match crate::host::host() {
+                let after = crate::host::two_queues::take_after(queue);
+                crate::host::two_queues::for_title(super::kind_of(queue), after, || match crate::host::host() {
                     Some(host) => host.execute_parts(lists, order, &parts),
                     None => drop(lists),
-                }
+                });
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
                 for (fence, value) in signals {
@@ -792,7 +802,7 @@ fn jobs_of(this: This, lists: &[This]) -> Vec<Job> {
     }
     if first < lists.len() {
         for (waits, taken, order) in crate::list::detach_parts(&lists[first..]) {
-            jobs.extend(waits.into_iter().map(Job::Value));
+            jobs.extend(waits.into_iter().map(|wait| Job::Value(queue, wait)));
             jobs.push(Job::Run(queue, taken, order));
         }
     }

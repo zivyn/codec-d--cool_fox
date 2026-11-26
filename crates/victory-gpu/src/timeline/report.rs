@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
-use super::record::{COPY_QUEUE, DEPTH, Data, Event, Kind, frequency};
+use super::record::{COMPUTE, COPY_QUEUE, DEPTH, Data, Event, Kind, frequency};
 
 /// The process's threads at a moment.
 #[derive(Default)]
@@ -244,6 +244,8 @@ pub(super) struct Run {
     pub(super) t1: u64,
     pub(super) thread: u32,
     pub(super) on: (u64, u64),
+    /// A submission of a compute queue of the title's.
+    pub(super) compute: bool,
 }
 
 /// What was recorded, by thread and in order.
@@ -284,13 +286,15 @@ impl Trace {
                 }),
                 Kind::Wake => trace.wakes.entry(e.a).or_default().push((e.t0, e.thread)),
                 Kind::Sent => {
-                    let on = (e.b as usize).checked_sub(1).and_then(|at| stamps.get(at)).copied().unwrap_or((0, 0));
+                    let at = e.b & !COMPUTE;
+                    let on = (at as usize).checked_sub(1).and_then(|at| stamps.get(at)).copied().unwrap_or((0, 0));
                     trace.runs.push(Run {
                         fence: e.a,
                         t0: e.t0,
                         t1: e.t1,
                         thread: e.thread,
                         on,
+                        compute: e.b & COMPUTE != 0,
                     });
                     trace.spans.entry(e.thread).or_default().push(i);
                 }
@@ -568,6 +572,17 @@ pub(super) fn summary(trace: &Trace, names: &mut Names, stacks: &[[usize; DEPTH]
     for (cause, sum) in idle.into_iter().take(30) {
         let _ = writeln!(text, "  {:7.2} ms  {cause}", ms(sum) / frames);
     }
+    // The most a host queue of their own could run beside the rest
+    // (`crate::host::two_queues`).
+    let compute: Vec<&&Run> = runs.iter().filter(|r| r.compute).collect();
+    let running: u64 = compute.iter().map(|r| r.on.1.clamp(start, stop).saturating_sub(r.on.0.clamp(start, stop))).sum();
+    let _ = writeln!(
+        text,
+        "of the card's running, the submissions of the title's compute queues: {:.2} ms in {:.1} (what a host queue of their own \
+         could run beside the rest, at most)",
+        ms(running) / frames,
+        compute.len() as f64 / frames
+    );
 
     // Threads.
     let rate = (after.cycles.saturating_sub(before.cycles)) as f64 / ms(after.ticks.saturating_sub(before.ticks)).max(1e-9);

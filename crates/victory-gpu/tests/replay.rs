@@ -1647,9 +1647,18 @@ fn a_frame_is_recorded_and_replayed() {
     // With it: armed at the first present, the fourth frame is captured (a
     // frame whose lists are all recorded comes first).
     assert!(!record::on());
-    let dir = tempfile::tempdir().unwrap();
+    // `VICTORY_TEST_KEEP=<folder>`: the capture goes there and stays, a small
+    // one to try `victory replay` and the scripts on without the title.
+    let temp = tempfile::tempdir().unwrap();
+    let root = match std::env::var_os("VICTORY_TEST_KEEP") {
+        Some(keep) => {
+            std::fs::create_dir_all(&keep).unwrap();
+            std::path::PathBuf::from(keep)
+        }
+        None => temp.path().to_owned(),
+    };
     let settings = Settings {
-        folder: dir.path().to_owned(),
+        folder: root.clone(),
         at: At::Frame(1),
         frames: 1,
         always: false,
@@ -1660,7 +1669,7 @@ fn a_frame_is_recorded_and_replayed() {
     assert!(
         record::start(
             Settings {
-                folder: dir.path().to_owned(),
+                folder: root.clone(),
                 at: At::Trigger,
                 frames: 1,
                 always: false
@@ -1711,7 +1720,7 @@ fn a_frame_is_recorded_and_replayed() {
         loops: 3,
         ..Default::default()
     };
-    let mut player = Player::load(dir.path(), &plain).unwrap();
+    let mut player = Player::load(&root, &plain).unwrap();
     check(&mut player, &plain, &expected, "unchanged");
     let detailed = Options {
         detailed: true,
@@ -1819,7 +1828,7 @@ fn a_frame_is_recorded_and_replayed() {
             buffers,
             ..plain.clone()
         };
-        let mut player = Player::load(dir.path(), &o).unwrap();
+        let mut player = Player::load(&root, &o).unwrap();
         check(&mut player, &o, &expected, &format!("buffers {buffers:?}"));
     }
     let o = Options {
@@ -1828,7 +1837,7 @@ fn a_frame_is_recorded_and_replayed() {
         loops: 2,
         ..Default::default()
     };
-    let both = play::replay(dir.path(), &o).unwrap();
+    let both = play::replay(&root, &o).unwrap();
     assert_eq!(both.len(), 2);
     assert!(both.iter().all(|(_, r)| r.picture.unwrap().1));
     assert!(folder.join("replay.png").exists() && folder.join("replay-unchanged.png").exists());

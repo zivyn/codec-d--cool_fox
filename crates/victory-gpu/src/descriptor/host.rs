@@ -1435,38 +1435,46 @@ pub(crate) fn probe_view_limit() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
-        let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
-        };
-        let twins = raw_twins() && fits(2 * RAW_TWINS);
-        if twins {
-            victory_shader::emit::set_raw_views(RAW_TWINS);
+        let (views, raw) = pick_views(|count| view_heap_fits(&host.device, count));
+        if raw != 0 {
+            victory_shader::emit::set_raw_views(raw);
         }
-        // (The twins lie past the null slot.)
-        let views = if twins {
-            RAW_TWINS
-        } else if fits(UNCAPPED_VIEWS) {
-            UNCAPPED_VIEWS
-        } else {
-            PORTABLE_VIEWS
-        };
         tracing::info!(
             views,
-            raw_twins = twins,
+            raw_twins = raw != 0,
             "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
     });
+}
+
+/// Whether `device` makes a shader-visible view heap of `count` views.
+pub(crate) fn view_heap_fits(device: &ID3D12Device, count: u32) -> bool {
+    // SAFETY: plain heap creation; the heap is released at once.
+    let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: count,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    };
+    made.is_ok()
+}
+
+/// The size of every host view heap, and where its raw twins start (0: it has
+/// none; they lie past the null slot), for a host where `fits` says what
+/// heaps can be made.
+pub(crate) fn pick_views(fits: impl Fn(u32) -> bool) -> (u32, u32) {
+    let twins = raw_twins() && fits(2 * RAW_TWINS);
+    let views = if twins {
+        RAW_TWINS
+    } else if fits(UNCAPPED_VIEWS) {
+        UNCAPPED_VIEWS
+    } else {
+        PORTABLE_VIEWS
+    };
+    (views, if twins { RAW_TWINS } else { 0 })
 }
 
 /// Slots past the title's in a view heap, for tables a draw needs made

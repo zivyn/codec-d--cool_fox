@@ -699,7 +699,13 @@ impl Player {
         step("pipelines", &mut at);
         player.make_descriptors()?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        if let Err(e) = player.load_contents() {
+            // The device may be lost (a hung card says nothing else): say what the system knows.
+            for line in player.device_lost() {
+                eprintln!("{line}");
+            }
+            return Err(e);
+        }
         step("contents", &mut at);
         player.make_masters(options.buffers, options.restore)?;
         step("copies to restore from", &mut at);
@@ -723,6 +729,65 @@ impl Player {
             steps.join(", ")
         ));
         Ok(player)
+    }
+
+    /// Why the device is gone, if it is: the removal reason, the debug layer's errors, and with
+    /// `--breadcrumbs` the commands the card had not finished and the page it faulted on.
+    fn device_lost(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // SAFETY: queries on our device; the output structures belong to the system.
+        unsafe {
+            let reason = self.device.GetDeviceRemovedReason();
+            out.push(format!("device removed reason: {reason:?}"));
+            if let Some(q) = &self.info {
+                out.extend(debug_messages(q));
+            }
+            if let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData>() {
+                if let Ok(b) = dred.GetAutoBreadcrumbsOutput() {
+                    let mut node = b.pHeadAutoBreadcrumbNode;
+                    while !node.is_null() {
+                        let n = &*node;
+                        let done = if n.pLastBreadcrumbValue.is_null() { 0 } else { *n.pLastBreadcrumbValue };
+                        if done < n.BreadcrumbCount {
+                            let at = if n.pCommandHistory.is_null() || done as usize >= n.BreadcrumbCount as usize {
+                                -1
+                            } else {
+                                (*n.pCommandHistory.add(done as usize)).0
+                            };
+                            out.push(format!(
+                                "breadcrumbs: a list did {done} of {} commands; the next is op {at}",
+                                n.BreadcrumbCount
+                            ));
+                        }
+                        node = n.pNext;
+                    }
+                }
+                if let Ok(p) = dred.GetPageFaultAllocationOutput() {
+                    out.push(format!("page fault at {:#x}", p.PageFaultVA));
+                    let name = |n: &D3D12_DRED_ALLOCATION_NODE| {
+                        if n.ObjectNameA.is_null() {
+                            "unnamed".to_owned()
+                        } else {
+                            std::ffi::CStr::from_ptr(n.ObjectNameA.cast()).to_string_lossy().into_owned()
+                        }
+                    };
+                    for (what, head) in [
+                        ("existing", p.pHeadExistingAllocationNode),
+                        ("freed", p.pHeadRecentFreedAllocationNode),
+                    ] {
+                        let mut node = head;
+                        let mut shown = 0;
+                        while !node.is_null() && shown < 6 {
+                            let n = &*node;
+                            out.push(format!("  {what} allocation near it: {} (type {})", name(n), n.AllocationType.0));
+                            node = n.pNext;
+                            shown += 1;
+                        }
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn note(&mut self, n: String) {
@@ -810,7 +875,9 @@ impl Player {
             }
         };
         // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // (0x800, CREATE_NOT_ZEROED: a render target nothing cleared first, copied into by loading the capture,
+        // hangs an NVIDIA card; the replay's textures are zeroed.)
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -1542,7 +1609,8 @@ impl Player {
             }
         })?;
         let file = File::open(self.folder.join("contents.bin"))?;
-        self.upload(&textures, &file, |player, list, parts, staging| {
+        let bad_parts: std::sync::Mutex<(u32, Vec<String>)> = std::sync::Mutex::default();
+        let copy_parts = |player: &Player, list: &ID3D12GraphicsCommandList, parts: &[(&Content, u64, u64)], staging: &ID3D12Resource| {
             for (c, len, at) in parts {
                 let Some(o) = player.objects.get(&c.res) else {
                     continue;
@@ -1554,12 +1622,24 @@ impl Player {
                         list.CopyBufferRegion(&o.res, c.first, staging, *at, *len);
                         continue;
                     }
-                    let (all, _) = gpu::footprints(
+                    let (all, total) = gpu::footprints(
                         &player.device,
                         &gpu::to_desc(&r.desc),
                         c.first as u32,
                         c.count,
                     );
+                    if total != *len {
+                        // Not the layout it was written with: copying it would read past its bytes.
+                        let mut bad = bad_parts.lock().unwrap_or_else(|e| e.into_inner());
+                        bad.0 += 1;
+                        if bad.1.len() < 5 {
+                            bad.1.push(format!(
+                                "resource {} ({}) subs {}+{}: footprints {total} bytes, recorded {len}; {}x{}x{} format {} dimension {}",
+                                c.res, r.name, c.first, c.count, r.desc.width, r.desc.height, r.desc.depth, r.desc.format, r.desc.dimension
+                            ));
+                        }
+                        continue;
+                    }
                     for (i, mut f) in all.into_iter().enumerate() {
                         f.Offset += at;
                         let to = gpu::sub_location(&o.res, c.first as u32 + i as u32);
@@ -1574,7 +1654,26 @@ impl Player {
                     }
                 }
             }
-        })?;
+        };
+        if std::env::var_os("VICTORY_REPLAY_TRACE_UPLOAD").is_some() {
+            // One part at a time, each waited for: the part that hangs the card is named.
+            for part in &textures {
+                if let Err(e) = self.upload(std::slice::from_ref(part), &file, &copy_parts) {
+                    let r = self.objects.get(&part.0.res).map(|o| &self.frame.resources[o.index]);
+                    eprintln!("the upload of resource {} subs {}+{} ({} bytes at {}) failed: {e}; resource {:?}", part.0.res, part.0.first, part.0.count, part.1, part.2, r);
+                    for line in self.device_lost() {
+                        eprintln!("{line}");
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            self.upload(&textures, &file, &copy_parts)?;
+        }
+        let (bad, first_bad) = bad_parts.into_inner().unwrap_or_else(|e| e.into_inner());
+        if bad > 0 {
+            self.note(format!("{bad} texture parts do not have the size the capture wrote them with and are left out; first: {}", first_bad.join("; ")));
+        }
         // To the states of the frame's start.
         let mut back = Vec::new();
         for r in &self.frame.resources {

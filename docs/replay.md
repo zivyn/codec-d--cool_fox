@@ -17,6 +17,7 @@ Off unless `VICTORY_RECORD` is set. Build with
 | file `<folder>\go` | when it appears, the capture starts (always watched) |
 | `VICTORY_RECORD_FRAMES=<n>` | frames to capture (1) |
 | `VICTORY_RECORD_ALWAYS=1` | record lists from the start: needed only if notes say lists were not recorded (a title that submits old lists again) |
+| `VICTORY_DUMP_CONTAINERS=<folder>` | any run: every shader container the host translates is also written there as `<hash>.cdxil`, once. Point it at the `containers` folder beside the captures: `--retranslate` finds shaders in the title's files only, and the title's upscaler makes its own, so those can be retranslated only from this |
 
 At the time given, lists are recorded for a few frames, until a frame's lists
 were all recorded; the next frame is captured: everything sent to the drawing

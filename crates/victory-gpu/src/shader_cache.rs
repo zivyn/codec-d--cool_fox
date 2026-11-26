@@ -112,9 +112,46 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
+/// `VICTORY_DUMP_CONTAINERS=<folder>`: every container the host translates is also written there
+/// as `<hash>.cdxil` (the first 16 hex digits of its BLAKE3, the name the runtime gives the title's
+/// shaders), once. A recording's `victory replay --retranslate` takes its containers from the
+/// `containers` folder beside the captures: point this at it for shaders that are in no title file
+/// (the title's upscaler makes its own). Game data: the folder must lie outside any repository.
+fn dump_container(container: &[u8]) {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static DONE: std::sync::Mutex<Option<std::collections::HashSet<[u8; 8]>>> = std::sync::Mutex::new(None);
+    let Some(dir) = DIR.get_or_init(|| {
+        let dir = PathBuf::from(std::env::var_os("VICTORY_DUMP_CONTAINERS").filter(|v| !v.is_empty())?);
+        let inside = dir.ancestors().any(|a| a.join(".git").exists());
+        if inside {
+            tracing::error!(dir = %dir.display(), "VICTORY_DUMP_CONTAINERS is inside a repository: refused (game data)");
+            return None;
+        }
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(dir)
+    }) else {
+        return;
+    };
+    let hash = blake3::hash(container);
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&hash.as_bytes()[..8]);
+    let first = DONE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(key);
+    if first {
+        let path = dir.join(format!("{}.cdxil", &hash.to_hex()[..16]));
+        if !path.exists() {
+            let _ = std::fs::write(path, container);
+        }
+    }
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    dump_container(container);
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),

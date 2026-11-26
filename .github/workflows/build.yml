@@ -95,6 +95,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/diag/victory.exe dist/victory-diag.exe
+          # The symbols of this exe, to read a VICTORY_PROFILE file (module+rva) taken with it.
+          cp target/diag/victory.pdb dist/victory-diag.pdb
+          sha256sum dist/victory-diag.exe | tee dist/victory-diag.sha256
       - uses: actions/upload-artifact@v5
         with:
           name: victory-diag

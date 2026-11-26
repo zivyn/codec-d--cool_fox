@@ -254,6 +254,11 @@ fn early_wait(every: std::time::Duration, quiet: u32, steps: u32) -> std::time::
     every * (1u32 << quiet.min(steps))
 }
 
+/// A submission has asked for a round that has not begun: an early round
+/// leaves what it has not done to it.
+#[cfg(windows)]
+static SYNC_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The thread's work: rounds asked for, rounds done.
 #[cfg(windows)]
 static SYNC_ROUNDS: (std::sync::Mutex<Rounds>, std::sync::Condvar) = (std::sync::Mutex::new(Rounds { asked: 0, done: 0 }), std::sync::Condvar::new());
@@ -311,6 +316,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 let covers = r.begin();
+                SYNC_ASKED.store(false, std::sync::atomic::Ordering::Release);
                 drop(r);
                 let began = std::time::Instant::now();
                 let _over = asked.then(|| {
@@ -320,7 +326,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                 let _round =
                     crate::timeline::span(if asked { "the heaps' records, for a submission" } else { "the heaps' records, early" });
                 // (A round that panicked found something, as far as we know.)
-                let found = std::panic::catch_unwind(sync_heaps).unwrap_or(true);
+                let found = std::panic::catch_unwind(|| sync_round(!asked)).unwrap_or(true);
                 quiet = if found { 0 } else { quiet.saturating_add(1) };
                 let micros = began.elapsed().as_micros() as u64;
                 if asked {
@@ -338,7 +344,11 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         sync_heaps();
         return SyncedHeaps(None);
     }
-    let mine = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner()).ask();
+    let mine = {
+        let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+        SYNC_ASKED.store(true, std::sync::atomic::Ordering::Release);
+        rounds.ask()
+    };
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
 }
@@ -372,6 +382,23 @@ impl Drop for SyncedHeaps {
 /// Whether there was anything to look at: changed pages or records due.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() -> bool {
+    sync_round(false)
+}
+
+/// A round of [`sync_heaps`]. An `early` one (the thread's own, between the
+/// submissions') also makes the records that fall due in the next frame, and
+/// leaves that to a submission's round, a chunk at a time, if one is asked
+/// for meanwhile.
+///
+/// The log of run 3 of integration 2 had 45 ms of rounds a frame, 16 for
+/// submissions and 5 early, the longest for a submission 32 to 64 ms, and
+/// 28 ms of the 45 in none of the split's parts: one round a frame, the first
+/// after the frame changed, held the records that fell due. A record that waited four frames for a draw to read it through a table
+/// is made one frame sooner then: made from the record as it stands, as
+/// any round does, and a draw that read it in the frame between would have
+/// made the same view.
+#[cfg(windows)]
+fn sync_round(early: bool) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     if !sync_on() {
         return false;
@@ -381,6 +408,7 @@ pub(crate) fn sync_heaps() -> bool {
     let (mut pages, mut looked, mut mirrored, mut tabled, mut later) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let (mut views, mut bytes) = (0u64, 0u64);
     let mut spent = [0u64; 3];
+    let mut due = 0u64;
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut kinds = [0u64; 5];
     let mut wait: Vec<u32> = Vec::new();
@@ -400,23 +428,33 @@ pub(crate) fn sync_heaps() -> bool {
         let mirrored_count = heap.desc.count.min(host.count());
         // The records of some frames ago that no draw read through a table
         // since: a shader may pick them by index.
-        let before = host.copied_before(frame);
+        let due_at = frame + u64::from(early);
+        let before = host.copied_before(due_at);
         let (mut past, mut past_highest) = (0u64, None::<u32>);
         found |= !before.is_empty();
-        let of_tables = std::sync::atomic::AtomicU64::new(0);
+        let began = std::time::Instant::now();
+        let (of_tables, made, left) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::Mutex::new(Vec::new()));
         crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
-                if host.copied_tabled(index, frame) {
+            let chunk = before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default();
+            if early && SYNC_ASKED.load(std::sync::atomic::Ordering::Acquire) {
+                left.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(chunk);
+                return;
+            }
+            for &index in chunk {
+                if host.copied_tabled(index, due_at) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
                     host.mirror(index, start + u64::from(index) * step, false);
+                    made.fetch_add(1, Relaxed);
                 }
             }
         });
-        let of_tables = of_tables.into_inner();
+        host.copied_requeue(due_at, left.into_inner().unwrap_or_else(|e| e.into_inner()));
+        let (of_tables, made) = (of_tables.into_inner(), made.into_inner());
         tabled += of_tables;
-        mirrored += before.len() as u64 - of_tables;
-        kinds[4] += before.len() as u64 - of_tables;
+        mirrored += made;
+        kinds[4] += made;
+        due += since(began);
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
@@ -558,7 +596,7 @@ pub(crate) fn sync_heaps() -> bool {
         count.fetch_add(n, Relaxed);
     }
     let [taking, reading, making] = spent;
-    for (count, n) in SYNC_SPLIT.iter().zip([views, bytes, taking, reading, making]) {
+    for (count, n) in SYNC_SPLIT.iter().zip([views, bytes, taking, reading, making, due]) {
         count.fetch_add(n, Relaxed);
     }
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
@@ -612,7 +650,7 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 7] = [const { std::sync
 /// bytes read; nanoseconds asking what was written, reading it and comparing
 /// it with what was last seen, making views.
 #[cfg(windows)]
-static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
@@ -628,7 +666,7 @@ pub(crate) fn sync_line(frames: f64) {
         );
     }
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
-    let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let split = [0, 1, 2, 3, 4, 5].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     let rounds = [0, 1, 2, 3].map(|i| SYNC_ROUND_COUNTS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     if pages == 0 {
@@ -639,7 +677,7 @@ pub(crate) fn sync_line(frames: f64) {
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \
          draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for); of the mirrored \
          {:.0} no views (with those of slots that show none), {:.0} of objects, {:.0} others, {:.0} samplers, {:.0} that waited and no draw came; \
-         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading and comparing, {:.2} making;          rounds of the thread (VICTORY_HEAP_SYNC_BACKOFF={}): {:.1} for submissions, {:.1} early of which {:.1} found nothing,          the longest for a submission {:.2} ms",
+         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading and comparing, {:.2} making, {:.2} making the records that fell due;          rounds of the thread (VICTORY_HEAP_SYNC_BACKOFF={}): {:.1} for submissions, {:.1} early of which {:.1} found nothing,          the longest for a submission {:.2} ms",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
@@ -657,6 +695,7 @@ pub(crate) fn sync_line(frames: f64) {
         split[2] / 1e6 / frames,
         split[3] / 1e6 / frames,
         split[4] / 1e6 / frames,
+        split[5] / 1e6 / frames,
         sync_backoff(),
         rounds[0] / frames,
         rounds[1] / frames,

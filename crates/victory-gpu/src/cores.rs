@@ -69,8 +69,27 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// The priority our own threads that a frame waits for, and those they share
+/// their work with, run at (`VICTORY_HELPER_PRIORITY=<n>`, a thread priority
+/// from -2 to 2; not given: as made, normal, the submitting thread above
+/// normal). A frame's timeline in the first gameplay area (run timeline,
+/// 2026-11-26) had such threads woken and not running yet for 4-11 ms of its
+/// chain: the listing threads up to 5.4 ms at a time, while the title's own
+/// workers held every processor.
+fn helper_priority() -> Option<i32> {
+    static PRIORITY: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    *PRIORITY.get_or_init(|| {
+        std::env::var("VICTORY_HELPER_PRIORITY").ok().and_then(|v| v.trim().parse::<i32>().ok()).map(|p| p.clamp(-2, 2))
+    })
+}
+
 fn ask(what: &str, from: u32) {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, SetThreadSelectedCpuSets};
+    if let Some(priority) = helper_priority() {
+        // SAFETY: this thread's own priority.
+        let set = unsafe { SetThreadPriority(GetCurrentThread(), priority) } != 0;
+        tracing::debug!(what, priority, set, "the thread's priority (VICTORY_HELPER_PRIORITY)");
+    }
     if stage() < from {
         return;
     }

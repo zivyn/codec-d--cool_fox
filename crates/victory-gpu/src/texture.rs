@@ -788,7 +788,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if staging.on_demand {
         let since = staging.waiting.load(Relaxed);
         if since != 0 && crate::host::long_ago(since, 1000, 2) {
-            if crate::resource::room_lately() {
+            if crate::resource::level_cap_lately() == u64::MAX {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
@@ -893,7 +893,7 @@ fn record_upload(
     const COPY_DEST: u32 = 0x400;
     // A texture cut from a block may lie where another did: what the card
     // holds of that one is done with before the first upload into this one.
-    if crate::pool::on() && !staging.uploaded.load(Relaxed) {
+    if crate::pool::on() && !staging.on_demand && !staging.uploaded.load(Relaxed) {
         let aliasing = D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

@@ -2523,6 +2523,19 @@ impl State {
                 bake_source_failed(index, &view, "the host has no copy of it (refused)");
                 continue;
             };
+            // A view placed in the memory of a texture the host writes, in
+            // another format (`crate::resource::alias_of`): `readable`
+            // copies that texture's texels into it on the host, no upload.
+            // (Lighting tables read as R9G9B9E5: 6 to 13 sources a run were
+            // counted as failed for want of an upload.)
+            if crate::resource::alias_of(resource).is_some() {
+                readable(list, ResourceType::Srv, &view);
+                n[if shown { 2 } else { 5 }] += 1;
+                if !shown {
+                    sync.publish.push((index, handle, key));
+                }
+                continue;
+            }
             if !crate::texture::title_written(texture) || crate::texture::host_wrote(resource as usize) {
                 // A texture the host renders to, writes or copied into: its
                 // contents are the host's own; the slot only has to show it.

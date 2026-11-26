@@ -857,7 +857,7 @@ fn log_memory() {
     // code has allocated.
     let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
     let window = crate::shadow::window_use();
-    let views = crate::descriptor::views_kept();
+    let (views, views_by_kind) = crate::descriptor::views_kept();
     let own: Vec<u64> = (0..8).map(owned).collect();
     tracing::info!(
         "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
@@ -918,6 +918,25 @@ fn log_memory() {
         mb(census[9]),
         mb(kept[6]),
         big_blocks(),
+    );
+    // The view table's entries by kind: how many of each are occupied
+    // versus on the free list now (a freed one, by what it last held), and
+    // that kind's flat share of bytes (one list slot each -- this does NOT
+    // include index/shapes' own tree overhead or spare Vec capacity, which
+    // the estimate above folds in undivided on top of the same flat share;
+    // by_resource's own memory is in neither number, and never was -- see
+    // `descriptor::kept`'s doc comment for the full scope of what this
+    // breakdown does and does not attribute).
+    tracing::info!(
+        "memory, view table by kind (occupied+free, flat MB -- not the whole byte estimate \
+         above): constant {}+{} {:.0} MB, shader {}+{} {:.0} MB, unordered {}+{} {:.0} MB, \
+         sampler {}+{} {:.0} MB, console sampler {}+{} {:.0} MB, placed {}+{} {:.0} MB",
+        views_by_kind[0][0], views_by_kind[0][1], mb(views_by_kind[0][2]),
+        views_by_kind[1][0], views_by_kind[1][1], mb(views_by_kind[1][2]),
+        views_by_kind[2][0], views_by_kind[2][1], mb(views_by_kind[2][2]),
+        views_by_kind[3][0], views_by_kind[3][1], mb(views_by_kind[3][2]),
+        views_by_kind[4][0], views_by_kind[4][1], mb(views_by_kind[4][2]),
+        views_by_kind[5][0], views_by_kind[5][1], mb(views_by_kind[5][2]),
     );
     // Round 3: whether windows hold the same memory more than once (they
     // can, once they are cut finer than 4 MiB), and how many host lists

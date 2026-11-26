@@ -290,14 +290,14 @@ What to expect:
   memory. Use 720p or lower on Series S.
 - Series S cannot go above 1080p: its output is 1080p, and the script says so
   and stops if asked for more.
-- **16 GB of RAM works, with a resizable BAR.** Windows lets a card share at
-  most half the PC's memory, and the copies of title memory the GPU reads
-  filled that on a 16 GB PC about a minute into the world (`0x8007000E`, then a
-  driver fault). `play-nvidia.ps1` now puts them in the card's memory the CPU
-  maps (`VICTORY_WINDOWS_BAR_MB`) when the BIOS has resizable BAR on;
-  `nvidia-smi -q -d MEMORY` shows a BAR1 total about the card's size if so.
-  Without it, close what else uses memory. Expect stutters while the world
-  streams in: the game's own memory is then partly in the paging file.
+- **On 16 GB PCs, try `-WindowsBarMB 3072` with resizable BAR enabled.**
+  On the tested 16 GB PC with an RTX 3060, shared GPU memory approached its
+  limit about a minute into the world (`0x8007000E`, then a driver fault).
+  The 3072 MiB cap from [PR #6](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/6)
+  let eligible title memory windows use CPU-mapped VRAM while the card had room.
+  The launcher leaves this off by default. Pass a cap in MiB to
+  `play-nvidia.ps1` or any resolution wrapper. `-WindowsBarMB 0` disables it,
+  and `-More @{VICTORY_WINDOWS_BAR_MB='...'}` takes precedence.
 
 ### More than one card, and other cards
 

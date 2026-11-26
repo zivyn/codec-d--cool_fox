@@ -17,8 +17,9 @@ Code that is in this repository:
   compatibility layer under everything else (loader, runtime services,
   Direct3D 12 back end, shader recompiler).
 - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (formerly
-  victory-fork): the fork the 7900 XTX one grew from, and the Series S interface
-  plane (pull request 1189, Tissma95), which fixed the black menus.
+  victory-fork): the fork the 7900 XTX one grew from, the Series S interface
+  plane (pull request 1189, Tissma95), which fixed the black menus, and the face
+  network fix (pull request 927, tippythetaidum), which made faces move.
 - victory-perf, carrying patches from
   [ZigZagBoi1/ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort): the
   title patches for render scale, the title's own upscaler and the watchdog.
@@ -123,7 +124,60 @@ RTX 5070 12 GB with a Ryzen 7 9800X3D, in the prologue:
     `crates/victory-gpu/src/shader_cache.rs`): the `VICTORY_BVH_MISS` switch, made
     part of the shader cache key so translated shaders with and without it are
     kept apart.
-12. **`scripts/play-nvidia.ps1`**: the launcher with all of the above.
+12. **`scripts/play-nvidia.ps1`**: the launcher with all of this list.
+13. **Faces move** (`crates/victory-shader/src/emit/halves.rs`, `lower.rs`,
+    `crates/victory-gpu/src/descriptor/host.rs`, `draw.rs`). Faces are driven by
+    a network of compute programs whose numbers travel as 16-bit values through
+    integer views; they were read as floats and came back as zeros on NVIDIA, so
+    no face moved. They now move as integers. Ported from fxceless/victory-fork
+    pull request 927 (tippythetaidum).
+
+14. **Ray tracing mostly off** (`scripts/rt_off_hashes.txt`, used by
+    `play-nvidia.ps1` through `VICTORY_SKIP_PIPELINES`; `-RayTracing` keeps the
+    passes). The title's ray-tracing structure builder cannot run on NVIDIA (its
+    64-lane programs are refused; Marvisak/VIctory pull request 2311), so every
+    ray misses. The passes that turn those misses into light made rooms go white
+    and hazy depending on the view angle. The 1,000 `CS_RaytracingResolve` and
+    34 traced-shadow shaders are skipped. The screen-probe and visibility traces
+    keep running: skipping them too (all 1,052 shaders of fxceless pull request
+    465's rule) left their outputs as garbage, rainbow glitter everywhere. Needs
+    the `diag` build (the skip list is a diagnostics switch).
+15. **The intro video no longer flickers** (`crates/victory-gpu/src/texture.rs`).
+    The movie's planes (linear, one-level R8 textures in a ring of three) were
+    written by the decoder through another view of the same memory, judged
+    clean when the frame was recorded, and copied a list late: frames from the
+    ring showed out of order. Video planes now always record their copy.
+
+### Settings
+
+The default set of `play-nvidia.ps1` is the speed set (about 18-22 fps on the
+RTX 5070). `-Quality` trades about 7 fps for fewer of the first two faults
+below.
+
+| Fault | Cause | Fix |
+|---|---|---|
+| Stretched bodies that jump | The relay's second stage and card steps hand skinned meshes back before they are done (avatarmanz issue 13; fxceless issue 89 on an RTX 5070) | `-Quality`: `VICTORY_RELAY=1`, `VICTORY_CARD_STEPS=0` |
+| Rainbow, pixelated skin | A texture refresh that does not wait for the runtime's remapping fills its upload from pages not there yet | `-Quality`: `VICTORY_TEXTURE_NO_WAIT=0` |
+| Some views far too bright | Without rays the light probes keep the sky's light indoors, and the fog takes it too | Always: `VICTORY_AMBIENT_AIR=1.5` (fog at most 1.5 times the light around), `VICTORY_AMBIENT_MOST=2` (new, `ambient.rs`; was a fixed 4) |
+| The picture stops until you look away | A pipeline that takes longer than the wait was waited for again in every frame it was in view | Always: each pipeline is waited for once at most (`VICTORY_PIPELINE_WAIT_ONCE`, on; `pipeline/make.rs`; the problem of fxceless issue 1181) |
+| Black blobs on faces and in the air | A NaN that a shader writes is spread by blur and the temporal upscaler | Always: `VICTORY_NAN_SCRUB=1` (new, `emit/lower.rs`): colours and image stores with NaN become 0; NaN in the fog volume is cleared too |
+
+Known faults left: the common room by its sunlit windows still goes beige and
+hazy (sky light in the fog); smearing when the camera moves fast at half scale
+(the title's own temporal upscaler); two orange glows on some corridor walls.
+Render scale 1.0 on Series S has not been tested.
+
+Also in, off by default:
+
+- `VICTORY_CONSTANT_MARKS=1`, a port of fxceless pull request 1216
+  (GamingRipperDoc): a slot picked from the heap is read as a constant buffer
+  only if it holds one (else a texture's descriptor was read as one, in the
+  meshlet culling passes).
+- `VICTORY_TARGET_VARIANTS=1`, a port of fxceless a35c557393: a pipeline is made
+  again for the render target formats bound at the draw.
+- F9 frame capture (`capture.rs`): with `VICTORY_CAPTURE=<folder>` and
+  `VICTORY_DUMP_TARGETS=1`, F9 saves the next frame's picture, its commands and
+  every 2D target.
 
 ---
 
@@ -215,8 +269,10 @@ commits taken from elsewhere name the commit and its author.
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  the 7900 XTX one started from, the people whose pull requests it carries, and
-  pull request 1189 (Tissma95) for the Series S interface plane.
+  the 7900 XTX one started from, the people whose pull requests it carries,
+  pull request 1189 (Tissma95) for the Series S interface plane, 927
+  (tippythetaidum) for the face network and 1216 (GamingRipperDoc) for the
+  marked constant buffer slots.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
   cube gradients, sparse textures.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:

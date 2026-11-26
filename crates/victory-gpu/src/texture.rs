@@ -65,6 +65,10 @@ pub(crate) struct Staging {
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
+    /// Whether the guard may stand for a hash of this texture (LOCAL,
+    /// fxceless #489): not for a video's picture planes, which the decoder
+    /// writes through another view of the same pages.
+    guard_view: bool,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
     /// uploaded it, and whether one has uploaded it at all: a list records
@@ -110,6 +114,20 @@ struct Last {
 /// Frames a guarded texture is hashed at every check from its first check,
 /// and after the hash found a change the guard did not see.
 const HOT_FRAMES: u64 = 64;
+
+/// LOCAL (wt5 build38, bodnjenie14 12457b43 "Bink video flickering"): after
+/// the hash finds a change the guard did not see, the texture stays hot this
+/// many frames (`VICTORY_VIDEO_HOT_FRAMES`, 1,024 unless said; 64 before).
+/// With 64 the intro video's ring slots went cold between their own changes
+/// and showed frames from earlier again (wt5 r_fps2; the user confirmed
+/// 1,024 fixed it). Only textures caught changing unseen get it, so the
+/// world's static textures do not pay for it.
+fn blind_hot_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_VIDEO_HOT_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024)
+    })
+}
 
 /// Whether a guarded texture whose memory the hash found changed although
 /// the guard saw no write is hashed at every check for a while
@@ -788,7 +806,15 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    // LOCAL: not for a video's picture planes (`guard_view` false). Their
+    // check at submission finds the frame the decoder wrote since, but the
+    // copy came only with the next list that samples the plane: three
+    // frames later in the video's ring of three, and the brightness and
+    // colour planes each on their own turn, so the intro showed colour
+    // ghosts and pictures from earlier (r_avm23, the user's recording).
+    // With the copy recorded here, it takes what that check puts in the
+    // staging buffer at this list's submission.
+    if staging.guard_view && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1211,6 +1237,7 @@ impl Staging {
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
         if !alone
+            && self.guard_view
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -1235,7 +1262,7 @@ impl Staging {
         // A change the guard did not see: hashed at every check for a while.
         let found_blind = |last: &mut Last| {
             if blind && hot_textures() {
-                last.hot_until = crate::frame::current() + HOT_FRAMES;
+                last.hot_until = crate::frame::current() + blind_hot_frames();
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHot, 1);
             }
@@ -1774,6 +1801,34 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // LOCAL (fxceless #489, "Fix stale frames in the opening video"): the
+    // software-decoded movie's planes are linear single-level R8 textures
+    // the decoder can write through another view of the same pages, which
+    // the guard on the sampled view does not see: with a hash every eighth
+    // frame the movie replayed its ring of three old frames (A, B, C, A, B,
+    // C). Those are hashed at every check. `VICTORY_VIDEO_PLANES=0`: as before.
+    static PLANES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let guard_view = !(*PLANES.get_or_init(|| std::env::var_os("VICTORY_VIDEO_PLANES").is_none_or(|v| v != "0"))
+        && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        && d.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM
+        && d.MipLevels == 1
+        && d.DepthOrArraySize == 1
+        && layout.desc.swizzle == victory_formats::texture::Swizzle::LINEAR);
+    // Which one-level R8 textures count as video planes, to check the rule
+    // against the title's (the first few only).
+    if d.Format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM && d.MipLevels == 1 {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+            tracing::info!(
+                width = d.Width,
+                height = d.Height,
+                layers = d.DepthOrArraySize,
+                swizzle = ?layout.desc.swizzle,
+                video_plane = !guard_view,
+                "a one-level R8 texture staged"
+            );
+        }
+    }
     let level0 = copy.base;
     let mips = level0 + u32::from(d.MipLevels);
     let first = crate::resource::read_from(&layout, first).max(level0).min(mips - 1);
@@ -1834,6 +1889,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         once: std::sync::atomic::AtomicBool::new(once() && !on_demand && PICKING.get().is_some()),
         bytes: total,
         memory,
+        guard_view,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),

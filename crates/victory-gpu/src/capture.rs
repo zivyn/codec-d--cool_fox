@@ -27,7 +27,8 @@ pub(crate) fn listed(n: u64) -> bool {
                 .filter_map(|f| f.trim().parse().ok())
                 .collect()
         })
-        .contains(&n);
+        .contains(&n)
+        || n == KEY_FRAME.load(std::sync::atomic::Ordering::Relaxed);
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
@@ -120,12 +121,33 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
+/// LOCAL: the frame F9 asked for ([`frame_drew`]); `u64::MAX`: none.
+static KEY_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    // LOCAL: with a capture folder, F9 captures the next frame as a listed
+    // one (its picture, its ops and, with VICTORY_DUMP_TARGETS=1, every
+    // target it drew): to catch a picture fault the moment it shows.
+    if folder().is_some() {
+        static WAS_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // SAFETY: a plain query of the keyboard's state.
+        let down = unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from(
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9,
+            ))
+        } < 0;
+        if down && !WAS_DOWN.swap(true, Relaxed) {
+            KEY_FRAME.store(frame + 1, Relaxed);
+            tracing::info!(frame = frame + 1, "F9: this frame is captured");
+        } else if !down {
+            WAS_DOWN.store(false, Relaxed);
+        }
+    }
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     if world_on()

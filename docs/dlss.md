@@ -55,6 +55,7 @@ later), hardware-accelerated GPU scheduling on (frame generation needs it).
 | `VICTORY_DLSS_JITTER` | `x,y` | `1,1` | multipliers for the jitter DLSS is given (`-1,1` flips x) |
 | `VICTORY_DLSS_MV` | `x,y` | `1,1` | multipliers for the motion-vector scale |
 | `VICTORY_DLSS_REACTIVE` | `0` | on | `0`: the title's reactive mask is not given to DLSS |
+| `VICTORY_FSR_PATH` | `1` | off | the title's FidelityFX path at `VICTORY_DLSS_MODE`'s scale with its own FidelityFX (no Streamline): the comparison for DLSS |
 
 ## How it works
 

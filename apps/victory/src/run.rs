@@ -62,7 +62,14 @@ pub fn run(
     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
     let asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
     let available = victory_hle::streamline::init(&asked);
-    let upscaler = (available.dlss || available.framegen).then_some(asked.mode);
+    // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
+    // scale with its own FidelityFX upscaling (no Streamline): DLSS's
+    // comparison, and on Series X what that path alone looks like.
+    let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
+    let upscaler = (available.dlss || available.framegen || fsr_path).then_some(asked.mode);
+    if fsr_path && !asked.any() {
+        println!("upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)", asked.mode.name());
+    }
     if asked.any() {
         println!(
             "upscaling      DLSS {}, frame generation {}{}",

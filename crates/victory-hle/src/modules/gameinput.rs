@@ -1241,30 +1241,34 @@ mod host {
         }
     }
 
+    /// A scripted key's virtual key: a letter, a digit, or `Enter`, `Esc`,
+    /// `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+    fn key_code(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+            _ => return None,
+        })
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// time), with or without focus. Keys as [`key_code`] names them (the
+    /// stand-in pad's table maps them to buttons). Also the keys of
+    /// [`live`] (`VICTORY_KEYS_FILE`).
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_code(key)?;
                 let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
                 let (from, to) = match at.split_once('-') {
                     Some((from, to)) => (time(from)?, time(to)?),
@@ -1276,10 +1280,107 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        for vk in live() {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
+    }
+
+    /// A key [`live`] holds: from `from` for `hold`.
+    struct LiveKey {
+        from: Instant,
+        hold: Duration,
+        vk: u8,
+    }
+
+    /// One line of `VICTORY_KEYS_FILE`: `<key> [<hold s> [<after s>]]`, held
+    /// 0.2 s by default, starting `after` seconds after it is read (0 by
+    /// default). `None` for a line that says nothing of the kind.
+    fn live_line(line: &str, read: Instant) -> Option<LiveKey> {
+        let mut words = line.split_whitespace();
+        let vk = key_code(words.next()?)?;
+        let mut seconds = || words.next().and_then(|w| w.parse::<f64>().ok()).and_then(|s| Duration::try_from_secs_f64(s).ok());
+        let hold = seconds().unwrap_or(Duration::from_millis(200)).min(Duration::from_secs(60));
+        let after = seconds().unwrap_or_default().min(Duration::from_secs(600));
+        Some(LiveKey { from: read + after, hold, vk })
+    }
+
+    /// Debugging aid for a driver outside the process:
+    /// `VICTORY_KEYS_FILE=<file>`, a text file the driver appends lines to
+    /// while the title runs, each `<key> [<hold seconds> [<after seconds>]]`
+    /// (keys as [`key_code`] names them), e.g. `Enter`, `W 3` (walk ahead for
+    /// three seconds) or `Enter 0.2 5`. A thread of ours reads what was
+    /// appended every 50 ms; lines in the file before the run are skipped.
+    /// With or without focus, as [`scripted`]. The keys held now.
+    fn live() -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::sync::Mutex;
+        static KEYS: Mutex<Vec<LiveKey>> = Mutex::new(Vec::new());
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            let Some(path) = std::env::var_os("VICTORY_KEYS_FILE") else { return };
+            tracing::info!(file = %std::path::Path::new(&path).display(), "keys are read from a file as it grows (VICTORY_KEYS_FILE)");
+            let _ = std::thread::Builder::new().name("victory-keys-file".into()).spawn(move || {
+                // Skip what is there already.
+                let mut at = std::fs::metadata(&path).map_or(0, |m| m.len());
+                let mut rest = String::new();
+                loop {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let Ok(mut file) = std::fs::File::open(&path) else { continue };
+                    let len = file.metadata().map_or(0, |m| m.len());
+                    if len < at {
+                        // Emptied or replaced: read it from the start.
+                        at = 0;
+                        rest.clear();
+                    }
+                    if len == at || file.seek(SeekFrom::Start(at)).is_err() {
+                        continue;
+                    }
+                    let mut bytes = Vec::new();
+                    let Ok(n) = file.read_to_end(&mut bytes) else { continue };
+                    at += n as u64;
+                    rest.push_str(&String::from_utf8_lossy(&bytes));
+                    let read = Instant::now();
+                    // Whole lines only; a line still being written waits.
+                    let Some(end) = rest.rfind('\n') else { continue };
+                    let lines: String = rest.drain(..=end).collect();
+                    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+                    for line in lines.lines().filter(|l| !l.trim().is_empty()) {
+                        match live_line(line, read) {
+                            Some(key) => keys.push(key),
+                            None => tracing::warn!(line, "VICTORY_KEYS_FILE: not a key line"),
+                        }
+                    }
+                }
+            });
+        });
+        let now = Instant::now();
+        let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        keys.retain(|k| now < k.from + k.hold);
+        keys.iter().filter(|k| k.from <= now).map(|k| k.vk).collect()
+    }
+
+    #[test]
+    fn live_key_lines() {
+        let t = Instant::now();
+        let k = live_line("Enter", t).unwrap();
+        assert_eq!((k.vk, k.from, k.hold), (0x0D, t, Duration::from_millis(200)));
+        let k = live_line("  w 3  ", t).unwrap();
+        assert_eq!((k.vk, k.hold), (b'W', Duration::from_secs(3)));
+        let k = live_line("Up 0.5 2", t).unwrap();
+        assert_eq!((k.vk, k.from, k.hold), (0x26, t + Duration::from_secs(2), Duration::from_millis(500)));
+        // Holds are kept to a minute; unknown keys and bad numbers say nothing or fall back.
+        assert_eq!(live_line("S 999", t).unwrap().hold, Duration::from_secs(60));
+        assert_eq!(live_line("D x", t).unwrap().hold, Duration::from_millis(200));
+        assert!(live_line("Shift", t).is_none());
+        assert!(live_line("", t).is_none());
     }
 
     /// The foreground window is one of ours (the title's or our fallback).

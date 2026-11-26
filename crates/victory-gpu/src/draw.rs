@@ -3820,10 +3820,46 @@ impl State {
             Role::Air => AIR,
             Role::Miss => MISS_LIGHT,
         };
-        let image = entry(ResourceType::Uav, at);
+        // Variants of the miss program bind the rays' image and the depth at
+        // other places of their tables than the one found first (run
+        // final-1: 416 of 472 dispatches had "other tables"): where the
+        // usual place has none, the first table entry of that kind that
+        // fits (a 2D R11G11B10 image; a 2D 32-bit depth at least its size).
+        let scan = |kind: ResourceType, fits: &dyn Fn(&D3D12_RESOURCE_DESC) -> bool| {
+            t.used
+                .iter()
+                .filter(|u| u.kind == kind && u.root == RootType::Table)
+                .filter_map(|u| entry(kind, (u.slot, u.table_offset_dwords)))
+                .find(|(desc, _)| fits(desc))
+        };
+        let image = match role {
+            Role::Miss => entry(ResourceType::Uav, at).or_else(|| {
+                scan(ResourceType::Uav, &|d| {
+                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format.0 == 26
+                })
+            }),
+            _ => entry(ResourceType::Uav, at),
+        };
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Miss => entry(ResourceType::Srv, MISS_DEPTH),
+            Role::Miss => entry(ResourceType::Srv, MISS_DEPTH).or_else(|| {
+                let half = image.as_ref().map(|(d, _)| (d.Width, d.Height));
+                scan(ResourceType::Srv, &|d| {
+                    use windows::Win32::Graphics::Dxgi::Common::{
+                        DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+                        DXGI_FORMAT_R32G8X24_TYPELESS,
+                    };
+                    d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                        && matches!(
+                            d.Format,
+                            DXGI_FORMAT_R32_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT
+                                | DXGI_FORMAT_R32G8X24_TYPELESS
+                                | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+                        )
+                        && half.is_some_and(|(w, h)| d.Width >= w && d.Height >= h && d.Width <= w * 4)
+                })
+            }),
             Role::Radiance | Role::Air => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {

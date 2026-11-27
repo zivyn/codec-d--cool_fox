@@ -29,7 +29,7 @@ pub(crate) fn host_texture(list: &HostList, resource: This, state: u32) -> Optio
 /// rules a compute shader's resource view has in the renderer.
 pub(crate) fn prepare_input(list: &HostList, resource: This) -> Option<()> {
     let texture = crate::resource::host_resource(resource)?;
-    let aliased = crate::resource::alias_of(resource).is_some_and(|source| crate::texture::alias(list, resource, source));
+    let aliased = crate::resource::alias_of(resource).is_some_and(|source| crate::texture::alias(list, resource, source.get()));
     if !aliased && crate::texture::title_written(texture) {
         crate::texture::upload_from(list, resource, 0);
     }

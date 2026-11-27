@@ -444,6 +444,10 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
         }
+        // (a program that keeps lane masks and numbers on one stack, `reads_numbers`)
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_numbers(|| translate_plain(container))
+        }
         other => other,
     }
 }

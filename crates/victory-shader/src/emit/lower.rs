@@ -1330,6 +1330,23 @@ pub(super) fn host_rdna() -> u32 {
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
 
 thread_local! {
+    /// Whether scalar operations on numbers the structure takes for masks are computed
+    /// ([`with_mask_numbers`]).
+    static MASK_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with scalar operations the structure takes for masks computed where all they
+/// read are numbers: the translation of a program the first one refused for a mask read as data
+/// ([`MASK_ELSEWHERE`]), and only such a program: with that on for every program, 66 programs of
+/// the title that already translated came out changed.
+pub(super) fn with_mask_numbers<R>(translate: impl FnOnce() -> R) -> R {
+    let before = MASK_NUMBERS.replace(true);
+    let result = translate();
+    MASK_NUMBERS.set(before);
+    result
+}
+
+thread_local! {
     /// Whether first halves of interpolations are evaluated as the pair
     /// they start ([`with_first_half_pairs`]).
     static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -6230,8 +6247,9 @@ impl<'a> Lower<'a> {
     /// number the hardware computes (the structure's own lanes for it stay for whatever reads it
     /// as a mask).
     fn reads_numbers(&self, inst: &Inst) -> bool {
-        // (`VICTORY_MASK_NUMBERS=0` keeps the refusal)
-        if std::env::var_os("VICTORY_MASK_NUMBERS").is_some_and(|v| v == "0") {
+        // (only in the translation made for a program the first one refused for a mask read as
+        // data, [`with_mask_numbers`]; `VICTORY_MASK_NUMBERS=0` keeps the refusal)
+        if !MASK_NUMBERS.get() || std::env::var_os("VICTORY_MASK_NUMBERS").is_some_and(|v| v == "0") {
             return false;
         }
         inst.reads.iter().all(|&(reg, v)| match reg {

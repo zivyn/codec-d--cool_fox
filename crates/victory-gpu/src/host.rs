@@ -3891,7 +3891,7 @@ fn late_line(frames: f64) {
         let mb = |v: f64| v / (1 << 20) as f64;
         if r[0] + r[3] + ranges > 0.0 {
             tracing::info!(
-                "the refreshes' work per frame: {:.0} spans in front of the lists' steps ({:.0} MB of range; {:.0} left after those known to copy nothing), {:.0} before shader writes ({:.0} MB of range); what the steps refer to, each byte once (VICTORY_REFRESH_SIZING=1): {:.0} MB in {:.0} refreshes; under flights' writes: {ranges:.0} declared ranges ({:.0} MB), {pages:.0} stale pages of 64 KiB in {with:.0} of them",
+                "the refreshes' work per frame: {:.0} spans in front of the lists' steps ({:.0} MB of range; {:.0} left after those known to copy nothing), {:.0} before shader writes ({:.0} MB of range); what the steps refer to, each byte once (VICTORY_REFRESH_SIZING=1): {:.0} MB in {:.0} refreshes; narrowed (VICTORY_REFRESH_NARROW={}), checked (VICTORY_REFRESH_CHECK=1): {:.1} MB looked at, {:.3} MB stale, {:.1} MB not to be looked at without asking; under flights' writes: {ranges:.0} declared ranges ({:.0} MB), {pages:.0} stale pages of 64 KiB in {with:.0} of them",
                 r[0],
                 mb(r[1]),
                 r[2],
@@ -3899,6 +3899,10 @@ fn late_line(frames: f64) {
                 mb(r[4]),
                 mb(r[5]),
                 r[6],
+                if narrow_on() { refresh_narrow_gap() >> 10 } else { 0 },
+                mb(r[7]),
+                mb(r[8]),
+                mb(r[9]),
                 mb(bytes),
             );
         }
@@ -4084,7 +4088,7 @@ static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::at
 /// Since the last frame-rate line: the spans of the refreshes in front of the
 /// lists' steps and their bytes, those left after the prune, then those due
 /// before shader writes and their bytes.
-static REFRESH_SIZE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+static REFRESH_SIZE: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 
 /// Whether the refreshes in front count what the steps really refer to, next
 /// to the span they are refreshed as (`VICTORY_REFRESH_SIZING=1`, off by
@@ -8184,8 +8188,11 @@ struct Batch {
     /// Fills not done yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
     /// Copies (by address) brought up to date ahead of the steps, and the
-    /// range (from, to) ([`Batch::refresh_ahead`]).
-    ahead: ByCopy<(usize, usize)>,
+    /// ranges (from, to) ([`Batch::refresh_ahead`]).
+    ahead: ByCopy<Vec<(usize, usize)>>,
+    /// With [`narrow_on`]: what each copy's pending refresh refers to (its
+    /// entry in `refreshes` is from the lowest to the highest), until it is done.
+    parts: ByCopy<Vec<(usize, usize)>>,
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
@@ -8228,36 +8235,45 @@ fn refresh_front() -> bool {
 /// stands: around what they write. What a later part refreshes is the
 /// title's bytes of before either.
 fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
+    front_spans_gap(steps, usize::MAX)
+}
+
+/// [`front_spans`] with a span for each run of what the refreshes refer to
+/// that lies more than `gap` bytes from the next (`usize::MAX`: one span per
+/// copy, from the lowest to the highest, as before).
+fn front_spans_gap(steps: impl Iterator<Item = Touch>, gap: usize) -> Vec<(usize, usize, usize)> {
     let mut at: ByCopy<usize> = ByCopy::default();
-    // (Copy, from, to), in the order they come, and the part that gave it to
-    // shaders last.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    // The copies in the order they come, what each is refreshed over (before
+    // the part that gave it to shaders last), and that part.
+    let mut copies: Vec<usize> = Vec::new();
+    let mut ranges: Vec<Vec<(usize, usize)>> = Vec::new();
     let mut given: Vec<u32> = Vec::new();
     let (mut part, mut last) = (1, usize::MAX);
     for step in steps {
         match step {
             Touch::Refresh(copy, from, to) => {
                 // (Most come several times on end.)
-                let i = if spans.get(last).is_some_and(|s| s.0 == copy) {
+                let i = if copies.get(last).is_some_and(|c| *c == copy) {
                     last
                 } else {
                     *at.entry(copy).or_insert_with(|| {
-                        spans.push((copy, usize::MAX, 0));
+                        copies.push(copy);
+                        ranges.push(Vec::new());
                         given.push(0);
-                        spans.len() - 1
+                        copies.len() - 1
                     })
                 };
                 last = i;
                 if given[i] != part {
-                    let span = &mut spans[i];
-                    (span.1, span.2) = (span.1.min(from), span.2.max(to));
+                    ranges[i].push((from, to));
                 }
             }
             Touch::Write(copy) => {
                 let i = *at.entry(copy).or_insert_with(|| {
-                    spans.push((copy, usize::MAX, 0));
+                    copies.push(copy);
+                    ranges.push(Vec::new());
                     given.push(0);
-                    spans.len() - 1
+                    copies.len() - 1
                 });
                 given[i] = part;
             }
@@ -8265,8 +8281,86 @@ fn front_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)>
             Touch::Title | Touch::Nothing => {}
         }
     }
-    spans.retain(|s| s.1 < s.2);
+    let mut spans = Vec::new();
+    for (copy, runs) in copies.into_iter().zip(ranges) {
+        spans.extend(joined_with_gap(runs, gap).into_iter().filter(|r| r.0 < r.1).map(|(a, b)| (copy, a, b)));
+    }
     spans
+}
+
+/// `ranges` sorted and joined where one begins no more than `gap` past the
+/// end of the one before.
+fn joined_with_gap(mut ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match out.last_mut() {
+            Some(last) if from <= last.1.saturating_add(gap) => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// The gap under which what the refreshes refer to is one span
+/// (`VICTORY_REFRESH_NARROW=1`: 64 KiB; a number: that many KiB; unset or 0:
+/// every copy's refreshes are one span from the lowest to the highest, as
+/// before).
+///
+/// A span per copy was the whole range between the first and the last thing a
+/// submission refers to: 16.6 GB of range a frame in the cell, for 49.5 MB the
+/// title changed. The asking about the written pages, the look for what is new
+/// and the loop over the pages are all over the range.
+fn refresh_narrow_gap() -> usize {
+    static GAP: OnceLock<usize> = OnceLock::new();
+    *GAP.get_or_init(|| match std::env::var("VICTORY_REFRESH_NARROW").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(1) => 64 << 10,
+        Some(kib) if kib > 1 => kib << 10,
+        _ => usize::MAX,
+    })
+}
+
+fn narrow_on() -> bool {
+    refresh_narrow_gap() != usize::MAX
+}
+
+/// With narrowing, whether what the steps refer to in a span is checked to be
+/// brought up to date (`VICTORY_REFRESH_CHECK=1`; the bytes of whole pages of
+/// it that the journal tells written since the copy took them are counted).
+fn refresh_check() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
+/// Of [`Batch::refresh_front`], with [`refresh_check`]: each range the steps
+/// refer to, cut to the spans refreshed, must be as the title has it. Counted in
+/// [`REFRESH_SIZE`]: the bytes looked at, those found stale, those that could
+/// not be looked at without asking the kernel.
+fn check_front(
+    copies: &ByCopy<std::sync::Arc<crate::shadow::Shadow>>,
+    referenced: &[(usize, usize, usize)],
+    spans: &[(usize, usize, usize)],
+) {
+    for &(key, a, b) in referenced {
+        let Some(shadow) = copies.get(&key) else {
+            continue;
+        };
+        for &(_, from, to) in spans.iter().filter(|s| s.0 == key) {
+            let (a, b) = (a.max(from), b.min(to));
+            if a >= b {
+                continue;
+            }
+            match shadow.stale_in(a, b) {
+                Some((looked, stale)) => {
+                    REFRESH_SIZE[7].fetch_add(looked as u64, Ordering::Relaxed);
+                    REFRESH_SIZE[8].fetch_add(stale as u64, Ordering::Relaxed);
+                }
+                None => {
+                    REFRESH_SIZE[9].fetch_add((b - a) as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 
 /// What a step is to the copies' refreshes, for [`written_spans`].
@@ -8285,27 +8379,37 @@ enum Touch {
 /// Of `steps`, up to the first that writes title memory: the copies given to
 /// shaders, each with the range its refreshes before that cover.
 fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize)> {
-    // (From, to, given to shaders.)
-    let mut spans: ByCopy<(usize, usize, bool)> = ByCopy::default();
+    written_spans_gap(steps, usize::MAX)
+}
+
+/// [`written_spans`] with a span for each run of what the refreshes refer to
+/// ([`front_spans_gap`]).
+fn written_spans_gap(steps: impl Iterator<Item = Touch>, gap: usize) -> Vec<(usize, usize, usize)> {
+    // (What it is refreshed over, given to shaders.)
+    let mut spans: ByCopy<(Vec<(usize, usize)>, bool)> = ByCopy::default();
     for step in steps {
         match step {
             Touch::Refresh(copy, from, to) => {
-                let span = spans.entry(copy).or_insert((from, to, false));
-                if !span.2 {
-                    (span.0, span.1) = (span.0.min(from), span.1.max(to));
+                let span = spans.entry(copy).or_insert_with(|| (Vec::new(), false));
+                if !span.1 {
+                    span.0.push((from, to));
                 }
             }
             // (Not refreshed before: nothing of it is due.)
             Touch::Write(copy) => {
                 if let Some(span) = spans.get_mut(&copy) {
-                    span.2 = true;
+                    span.1 = true;
                 }
             }
             Touch::Title => break,
             Touch::Nothing | Touch::Part => {}
         }
     }
-    spans.into_iter().filter(|(_, s)| s.2).map(|(copy, (from, to, _))| (copy, from, to)).collect()
+    spans
+        .into_iter()
+        .filter(|(_, s)| s.1)
+        .flat_map(|(copy, (runs, _))| joined_with_gap(runs, gap).into_iter().map(move |(a, b)| (copy, a, b)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -8324,6 +8428,57 @@ mod written_spans_tests {
         let span: usize = found.iter().map(|s| s.2 - s.1).sum();
         assert!(span > 1000, "the spans are wider: {found:?}");
         assert_eq!(referenced_bytes(&[]), (0, 0));
+    }
+
+    /// Narrowed spans: one per run of what the steps refer to; the union (gap
+    /// unbounded) is what it was; with no gap every referenced byte and no other
+    /// is in a span, and with a gap what is between runs that lie near is too.
+    #[test]
+    fn narrow_spans_hold_what_the_steps_refer_to_and_the_union_is_as_before() {
+        use super::{front_spans_gap, joined_with_gap, written_spans_gap};
+        use Touch::{Nothing, Part, Refresh, Write};
+        let steps = || {
+            vec![
+                Refresh(1, 0, 100),
+                Refresh(1, 150, 200),
+                Refresh(1, 10_000, 10_100),
+                Refresh(2, 5, 6),
+                Part,
+                Write(2),
+                Refresh(2, 900, 910),
+                Nothing,
+                Write(1),
+                Refresh(1, 20_000, 20_010),
+                Refresh(3, 0, 8),
+                Write(3),
+            ]
+        };
+        // The union, as before: one span per copy.
+        let mut union = front_spans(steps().into_iter());
+        union.sort_unstable();
+        assert_eq!(union, [(1, 0, 10_100), (2, 5, 6), (3, 0, 8)]);
+        // No gap: the runs, each byte referred to (before the copy was given to shaders) once.
+        let mut exact = front_spans_gap(steps().into_iter(), 0);
+        exact.sort_unstable();
+        assert_eq!(exact, [(1, 0, 100), (1, 150, 200), (1, 10_000, 10_100), (2, 5, 6), (3, 0, 8)]);
+        // A gap of 50 joins the first two of copy 1.
+        let mut near = front_spans_gap(steps().into_iter(), 50);
+        near.sort_unstable();
+        assert_eq!(near, [(1, 0, 200), (1, 10_000, 10_100), (2, 5, 6), (3, 0, 8)]);
+        // Written ahead: the same for the copies given to shaders before the first title write.
+        let mut written = written_spans_gap(steps().into_iter(), 0);
+        written.sort_unstable();
+        assert_eq!(written, [(1, 0, 100), (1, 150, 200), (1, 10_000, 10_100), (2, 5, 6), (3, 0, 8)]);
+        let mut union_written = written_spans(steps().into_iter());
+        union_written.sort_unstable();
+        assert_eq!(union_written, [(1, 0, 10_100), (2, 5, 6), (3, 0, 8)]);
+        // Every narrow span lies in the union of its copy.
+        for (copy, a, b) in exact {
+            assert!(union.iter().any(|&(c, from, to)| c == copy && from <= a && b <= to));
+        }
+        assert_eq!(joined_with_gap(vec![(10, 20), (0, 5), (21, 30)], 0), [(0, 5), (10, 20), (21, 30)]);
+        assert_eq!(joined_with_gap(vec![(10, 20), (0, 5), (21, 30)], 1), [(0, 5), (10, 30)]);
+        assert_eq!(joined_with_gap(vec![(10, 20), (0, 5), (21, 30)], usize::MAX), [(0, 30)]);
     }
 
     /// The longest span goes first, equal ones in the order they were.
@@ -8435,8 +8590,11 @@ impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
+        if self.ahead.get(&key).is_some_and(|ranges| ranges.iter().any(|&(from, to)| from <= address && end <= to)) {
             return;
+        }
+        if narrow_on() {
+            self.parts.entry(key).or_default().push((address, end));
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -8468,8 +8626,15 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
-            Self::update(&shadow, from, to);
+        // (With narrowing: what it refers to, not all between the lowest and the highest.)
+        let runs = match self.parts.remove(&(std::sync::Arc::as_ptr(&shadow) as usize)) {
+            Some(parts) if narrow_on() => joined_with_gap(parts, refresh_narrow_gap()),
+            _ => vec![(from, to)],
+        };
+        for (from, to) in runs {
+            if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+                Self::update(&shadow, from, to);
+            }
         }
         #[cfg(feature = "diagnostics")]
         {
@@ -8550,14 +8715,25 @@ impl Batch {
             REFRESH_SIZE[5].fetch_add(bytes, Ordering::Relaxed);
             REFRESH_SIZE[6].fetch_add(count, Ordering::Relaxed);
         }
-        let spans: Vec<_> = front_spans(touches.into_iter())
+        let checking = narrow_on() && refresh_check();
+        let referenced: Vec<(usize, usize, usize)> = if checking {
+            touches.iter().filter_map(|t| if let Touch::Refresh(copy, from, to) = t { Some((*copy, *from, *to)) } else { None }).collect()
+        } else {
+            Vec::new()
+        };
+        let spans: Vec<_> = front_spans_gap(touches.into_iter(), refresh_narrow_gap())
             .into_iter()
-            .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
+            .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         self.front = true;
         for (shadow, from, to) in &spans {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((*from, *to));
         }
+        let span_ranges: Vec<(usize, usize, usize)> = if checking {
+            spans.iter().map(|(shadow, from, to)| (std::sync::Arc::as_ptr(shadow) as usize, *from, *to)).collect()
+        } else {
+            Vec::new()
+        };
         #[cfg(feature = "diagnostics")]
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
@@ -8623,6 +8799,10 @@ impl Batch {
         });
         #[cfg(feature = "diagnostics")]
         Self::lap(&mut lap, crate::copystat::C::FlushEachNs);
+        // Before the asking stands no more: the journal says what it found.
+        if checking {
+            check_front(&copies, &referenced, &span_ranges);
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8656,12 +8836,12 @@ impl Batch {
                 });
             }
         }
-        let due: Vec<_> = written_spans(touches.into_iter())
+        let due: Vec<_> = written_spans_gap(touches.into_iter(), refresh_narrow_gap())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         for (shadow, from, to) in &due {
-            self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
+            self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((*from, *to));
         }
         REFRESH_SIZE[3].fetch_add(due.len() as u64, Ordering::Relaxed);
         REFRESH_SIZE[4].fetch_add(due.iter().map(|s| (s.2 - s.1) as u64).sum(), Ordering::Relaxed);
@@ -8748,6 +8928,22 @@ impl Batch {
     }
 
     fn flush_all(&mut self) {
+        // With narrowing each copy's pending refresh is what its steps refer to.
+        if narrow_on() && !self.parts.is_empty() {
+            let gap = refresh_narrow_gap();
+            let pending = std::mem::take(&mut self.refreshes);
+            for (shadow, from, to) in pending {
+                match self.parts.remove(&(std::sync::Arc::as_ptr(&shadow) as usize)) {
+                    Some(parts) => {
+                        for (a, b) in joined_with_gap(parts, gap) {
+                            self.refreshes.push((shadow.clone(), a.max(from), b.min(to)));
+                        }
+                    }
+                    None => self.refreshes.push((shadow, from, to)),
+                }
+            }
+            self.parts.clear();
+        }
         // Most of a flush's copies are as they were: they are told so here,
         // from what the submission's asking found, before anything is asked
         // and any thread woken. (Thousands of them, the heap's buffer views

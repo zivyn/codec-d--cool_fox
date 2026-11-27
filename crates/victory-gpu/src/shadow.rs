@@ -3242,6 +3242,90 @@ mod landing_tests {
 }
 
 #[cfg(test)]
+mod narrow_tests {
+    use super::{PAGE, Shadow};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    /// The tests ask ahead, which is the process's one.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Refreshing two spans apart, not the range between, loses no write: the
+    /// title's write outside them is told by the next refresh that refers to
+    /// it, one inside a span after its refresh by the next of that, and the
+    /// copy ends as the union's refresh would leave it.
+    #[test]
+    fn narrow_refreshes_lose_no_write_and_end_as_the_union_does() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let write = |page: usize, offset: usize, byte: u8| {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + offset) as *mut u8).write_volatile(byte) }
+        };
+        let mut side = vec![0u8; N * PAGE];
+        let mut union = vec![0u8; N * PAGE];
+        let copy = Shadow::unbacked(at as u64, side.as_mut_ptr(), (N * PAGE) as u64, false);
+        let whole = Shadow::unbacked(at as u64, union.as_mut_ptr(), (N * PAGE) as u64, false);
+        // Taken once, whole.
+        copy.update(at, N * PAGE);
+        whole.update(at, N * PAGE);
+        // The title writes inside the first span (page 1) and outside both (page 5).
+        write(1, 5, 1);
+        write(5, 9, 2);
+        copy.update(at, 2 * PAGE);
+        assert_eq!(side[PAGE + 5], 1);
+        assert_eq!(side[5 * PAGE + 9], 0, "nobody referred to it yet");
+        // A later submission refers to page 5: it is told, the journal kept it.
+        copy.update(at + 4 * PAGE, 3 * PAGE);
+        assert_eq!(side[5 * PAGE + 9], 2);
+        // A write inside a span after its refresh is seen by the next refresh of it.
+        write(1, 7, 3);
+        copy.update(at, 2 * PAGE);
+        assert_eq!(side[PAGE + 7], 3);
+        // The union's refresh, over all, ends the same.
+        whole.update(at, N * PAGE);
+        assert_eq!(side, union);
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The check counts the stale bytes of whole pages of a range that the
+    /// asking found written since the copy took them, and cannot look at what the
+    /// asking did not cover.
+    #[test]
+    fn the_check_counts_what_a_refresh_left_stale() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let mut side = vec![0u8; N * PAGE];
+        let copy = Shadow::unbacked(at as u64, side.as_mut_ptr(), (N * PAGE) as u64, false);
+        copy.update(at, N * PAGE);
+        // SAFETY: inside the allocation.
+        unsafe { ((at + PAGE + 1) as *mut u8).write_volatile(7) };
+        // Nothing asked ahead: it cannot be looked at without the kernel.
+        assert_eq!(copy.stale_in(at, at + 2 * PAGE), None);
+        crate::watch::ask_ahead(&[(at, at + 2 * PAGE), (at + 4 * PAGE, at + 6 * PAGE)]);
+        assert_eq!(copy.stale_in(at, at + 2 * PAGE), Some((2 * PAGE, PAGE)), "page 1 was written since it was taken");
+        copy.update(at, 2 * PAGE);
+        assert_eq!(copy.stale_in(at, at + 2 * PAGE), Some((2 * PAGE, 0)), "refreshed");
+        assert_eq!(copy.stale_in(at + 4 * PAGE, at + 6 * PAGE), Some((2 * PAGE, 0)));
+        // A range the asking did not cover.
+        assert_eq!(copy.stale_in(at + 2 * PAGE, at + 4 * PAGE), None);
+        crate::watch::ask_ahead_done();
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -4557,6 +4641,34 @@ impl Shadow {
     /// them): what a landing brings of a copy that was left out.
     pub(crate) fn whole_pieces(&self) -> Vec<(usize, usize)> {
         whole_pieces_of(self.start as usize, self.len as usize)
+    }
+
+    /// Of the whole pages of `[from, to)` (pages of 64 KiB): how many bytes were looked at and how many of
+    /// them were written since the copy took them, by what the submission's asking
+    /// found (`None`: the kernel would have to be asked). For the check of
+    /// [`crate::host`]'s narrowed refreshes, after they are done and before the
+    /// asking stands no more.
+    pub(crate) fn stale_in(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to || self.place.is_some() {
+            return Some((0, 0));
+        }
+        let (_, written) = crate::watch::asked(from, to)?;
+        let base = start / PAGE;
+        let ranged = self.ranged(from, to);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut looked, mut stale) = (0, 0);
+        let (first, last) = (from.div_ceil(PAGE), to / PAGE);
+        for page in first..last {
+            let taken = copied.get(page - base).copied().unwrap_or(0).max(ranged);
+            let write = written.binary_search_by_key(&page, |w| w.0).map_or(0, |i| written[i].1);
+            looked += PAGE;
+            if taken == 0 || write > taken {
+                stale += PAGE;
+            }
+        }
+        Some((looked, stale))
     }
 
     /// Whether a refresh of `[from, to)` of memory that is not watched may

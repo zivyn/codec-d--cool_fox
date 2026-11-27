@@ -931,6 +931,9 @@ extern "system" fn present(
     if frame.is_multiple_of(256) {
         crate::ambient::report(frame);
     }
+    // `VICTORY_LIVE_FILE`: settings that change while the title runs.
+    #[cfg(windows)]
+    crate::ambient::poll();
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

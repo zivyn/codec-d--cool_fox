@@ -163,6 +163,15 @@ fork's constant.
 
 It is off while the builder runs.
 
+`VICTORY_LIVE_FILE=<path>` (default off) makes the host read that file again every second and
+change the stand-in's settings while the title runs, to compare settings in one process. One line
+a setting: `ambient=<as VICTORY_AMBIENT>`, `ambient_air=<as VICTORY_AMBIENT_AIR>`,
+`air_cap=<level>` (the `max:` of the air alone, `off` for none) and `ambient_shade=<as
+VICTORY_AMBIENT_SHADE>`; a setting that is not there has the variable's value, a missing or empty
+file changes nothing. A change is logged (`live settings changed`) and used at the next dispatch of
+the programs the stand-in follows. With the file set the stand-in is hooked in from the start, so a
+file can turn it on.
+
 The title has several variants of the resolving program (seven in its
 shaders). They have the diffuse light and the depth at the same shader
 registers but at other places in their tables, so the stand-in finds them

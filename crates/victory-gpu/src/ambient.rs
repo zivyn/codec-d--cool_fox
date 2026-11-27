@@ -161,15 +161,91 @@ fn parse(set: &str) -> Set {
     }
 }
 
-fn set() -> Set {
+fn env_set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
+/// Settings a running host takes from the file `VICTORY_LIVE_FILE` names (read again every
+/// second, at a present; see [`poll`]). One line each, `<key>=<value>`, the values as the
+/// variables of the same name take them; a key that is not there leaves the variable's value:
+/// - `ambient=<share>[,floor:<level>]` or `ambient=constant:<level>` (`VICTORY_AMBIENT`; `0`
+///   or `off`: the title's own light),
+/// - `ambient_air=<multiple>[,max:<level>]` (`VICTORY_AMBIENT_AIR`; `0`: what the title has),
+/// - `air_cap=<level>` (the `max:` of the air alone; `off`: none),
+/// - `ambient_shade=<strength>,<metres>` (`VICTORY_AMBIENT_SHADE`).
+/// Lines starting with `#` and unknown keys are ignored.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct Live {
+    set: Option<Set>,
+    air: Option<(f32, f32)>,
+    cap: Option<f32>,
+    shade: Option<[f32; 2]>,
+}
+
+fn parse_live(text: &str) -> Live {
+    let mut live = Live::default();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let value = value.trim();
+        match key.trim() {
+            "ambient" => live.set = Some(parse(value)),
+            "ambient_air" => live.air = Some(air_setting(value)),
+            "air_cap" => {
+                live.cap = Some(value.parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).unwrap_or(f32::MAX));
+            }
+            "ambient_shade" => live.shade = Some(shade_setting(value)),
+            _ => {}
+        }
+    }
+    live
+}
+
+static LIVE: Mutex<Live> = Mutex::new(Live { set: None, air: None, cap: None, shade: None });
+
+fn live() -> Live {
+    *LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The file `VICTORY_LIVE_FILE` names, if it is set.
+fn live_file() -> Option<&'static std::path::PathBuf> {
+    static FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    FILE.get_or_init(|| std::env::var_os("VICTORY_LIVE_FILE").filter(|p| !p.is_empty()).map(Into::into)).as_ref()
+}
+
+/// At a present: the live file, read again once a second (a file that is not there or is empty
+/// leaves the variables' values). A change is logged and takes effect at the next dispatch of
+/// the title's programs the stand-in follows.
+pub(crate) fn poll() {
+    use std::time::{Duration, Instant};
+    static NEXT: Mutex<Option<Instant>> = Mutex::new(None);
+    let Some(file) = live_file() else { return };
+    let now = Instant::now();
+    {
+        let mut next = NEXT.lock().unwrap_or_else(|e| e.into_inner());
+        if next.is_some_and(|at| now < at) {
+            return;
+        }
+        *next = Some(now + Duration::from_secs(1));
+    }
+    let new = parse_live(&std::fs::read_to_string(file).unwrap_or_default());
+    let mut cur = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if *cur != new {
+        *cur = new;
+        drop(cur);
+        tracing::info!(file = %file.display(), ambient = ?set(), air = ?air_set(), shade = ?shade(), "live settings changed: the stand-in now has these");
+    }
+}
+
+fn set() -> Set {
+    live().set.unwrap_or_else(env_set)
+}
+
 /// Whether the stand-in is asked for (it still rests where the title's rays
-/// find something: [`BUILDER_RUNS`]).
+/// find something: [`BUILDER_RUNS`]). With a live file it is hooked in from the
+/// start, so that the file can turn it on.
 pub(crate) fn wanted() -> bool {
-    set() != Set::Off
+    set() != Set::Off || live_file().is_some()
 }
 
 /// Why the stand-in does nothing while the structure builder runs.
@@ -187,28 +263,37 @@ fn air_setting(set: &str) -> (f32, f32) {
     (multiple, most)
 }
 
-fn air_set() -> (f32, f32) {
+fn env_air() -> (f32, f32) {
     static SET: OnceLock<(f32, f32)> = OnceLock::new();
     *SET.get_or_init(|| air_setting(&std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default()))
+}
+
+fn air_set() -> (f32, f32) {
+    let live = live();
+    let (multiple, most) = live.air.unwrap_or_else(env_air);
+    (multiple, live.cap.unwrap_or(most))
 }
 
 fn air() -> f32 {
     air_set().0
 }
 
+/// `<strength>,<metres>` (a part that is not a number stays as it was: 1 and 0.6).
+fn shade_setting(set: &str) -> [f32; 2] {
+    let mut shade = [1.0, 0.6];
+    for (to, v) in shade.iter_mut().zip(set.split(',')) {
+        if let Ok(v) = v.trim().parse() {
+            *to = v;
+        }
+    }
+    shade
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let mut shade = [1.0, 0.6];
-        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
-        for (to, v) in shade.iter_mut().zip(set.split(',')) {
-            if let Ok(v) = v.trim().parse() {
-                *to = v;
-            }
-        }
-        shade
-    })
+    let env = *SET.get_or_init(|| shade_setting(&std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default()));
+    live().shade.unwrap_or(env)
 }
 
 const SOURCE: &str = r#"
@@ -717,6 +802,23 @@ mod tests {
     use victory_shader::{ResourceType, RootType, UsedResource};
 
     use super::*;
+
+    #[test]
+    fn live_lines_override_what_they_name() {
+        assert_eq!(parse_live(""), Live::default());
+        assert_eq!(parse_live("# nothing\nunknown=3\nno equals sign"), Live::default());
+        let live = parse_live("ambient=0.8,floor:0.1\nambient_air = 0.5,max:2\nair_cap=0.25\nambient_shade=2,1.5\n");
+        assert_eq!(live.set, Some(Set::Estimate(0.8, 0.1)));
+        assert_eq!(live.air, Some((0.5, 2.0)));
+        assert_eq!(live.cap, Some(0.25));
+        assert_eq!(live.shade, Some([2.0, 1.5]));
+        // Off is a value too (it is not the same as not being there).
+        let live = parse_live("ambient=0\nambient_air=0\nair_cap=off\r\n");
+        assert_eq!(live.set, Some(Set::Off));
+        assert_eq!(live.air, Some((0.0, f32::MAX)));
+        assert_eq!(live.cap, Some(f32::MAX));
+        assert_eq!(parse_live("ambient=constant:0.4").set, Some(Set::Constant(0.4)));
+    }
 
     #[test]
     fn the_air_setting_has_a_multiple_and_a_most() {

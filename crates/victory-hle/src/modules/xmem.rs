@@ -2484,8 +2484,8 @@ mod tests {
         let base = a as usize;
         // Pages 2 and 3 of 8 are a view of two pages.
         assert_eq!(XMemMapPhysicalPages((base + 2 * PAGE) as *mut c_void, 2, pages.as_ptr()), (base + 2 * PAGE) as *mut c_void);
-        let physical = physical();
-        let fresh = |page: usize, n: usize| no_view(&physical, base + page * PAGE, n * PAGE);
+        let views = physical();
+        let fresh = |page: usize, n: usize| no_view(&views, base + page * PAGE, n * PAGE);
         assert!(fresh(0, 2), "before it");
         assert!(!fresh(1, 2), "reaching into its start");
         assert!(!fresh(2, 1) && !fresh(3, 1), "inside it");
@@ -2493,7 +2493,7 @@ mod tests {
         assert!(!fresh(3, 2), "reaching out of its end");
         assert!(fresh(4, 4), "after it");
         assert!(fresh(3, 0), "no bytes");
-        drop(physical);
+        drop(views);
         assert_eq!(XMemMapPhysicalPages((base + 2 * PAGE) as *mut c_void, 2, std::ptr::null()), (base + 2 * PAGE) as *mut c_void);
         assert!(no_view(&physical(), base, 8 * PAGE));
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);

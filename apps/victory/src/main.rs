@@ -33,11 +33,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 /// an RTX 5080 and an RTX 3080 Ti on Windows 11): [`match_d3d12_core`] asks
 /// for the version of the file that is there, before Direct3D 12 is loaded.
 ///
-/// Without the folder, it asks for [`OS_RUNTIME`]: Windows' own runtime,
+/// Without the folder, it asks for [`os_runtime`]: Windows' own runtime,
 /// whatever its version. Asking for 614 there made a Windows 11 whose own
 /// runtime is older (22H2, build 22623, 11-27) look for 1.614 in the missing
 /// folder and refuse Direct3D 12 the same way (0x887E0003; releases before
 /// v2026.11.27.2, which asked for nothing, ran there).
+/// Windows reads it when `d3d12.dll` is loaded, so build.rs has that load
+/// wait for the first use: imported the usual way, it was loaded before
+/// `main`, and v2026.11.27.4 and .5 asked for 614 whatever was set here.
 /// (An atomic: the same bytes as a `u32`, in memory that can be written.)
 #[cfg(windows)]
 #[unsafe(no_mangle)]
@@ -55,11 +58,58 @@ fn agility_version(dll: &[u8]) -> Option<u32> {
     (major == 1 && minor >= 600).then_some(minor)
 }
 
+/// The `D3D12SDKVersion` a `D3D12Core.dll` exports: Windows' own in
+/// System32 says which version it is (616 on Windows 11 25H2), as Microsoft's do.
+fn exported_sdk_version(dll: &[u8]) -> Option<u32> {
+    let u16_at = |at: usize| Some(u16::from_le_bytes(dll.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(dll.get(at..at + 4)?.try_into().ok()?));
+    let pe = u32_at(0x3c)? as usize;
+    (dll.get(pe..pe + 4)? == b"PE\0\0").then_some(())?;
+    let sections = usize::from(u16_at(pe + 6)?);
+    let optional = pe + 24;
+    let table = optional + usize::from(u16_at(pe + 20)?);
+    // PE32+ only: the export directory is the first data directory, at 112.
+    (u16_at(optional)? == 0x20b).then_some(())?;
+    let offset = |rva: u32| -> Option<usize> {
+        (0..sections).find_map(|i| {
+            let s = table + i * 40;
+            let (size, va, raw_size, raw) = (u32_at(s + 8)?, u32_at(s + 12)?, u32_at(s + 16)?, u32_at(s + 20)?);
+            (va <= rva && rva < va + size.max(raw_size)).then(|| (rva - va + raw) as usize)
+        })
+    };
+    let exports = offset(u32_at(optional + 112)?)?;
+    // NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals
+    let count = u32_at(exports + 24)? as usize;
+    let functions_at = offset(u32_at(exports + 28)?)?;
+    let names_at = offset(u32_at(exports + 32)?)?;
+    let ordinals_at = offset(u32_at(exports + 36)?)?;
+    (0..count).find_map(|i| {
+        let name = offset(u32_at(names_at + 4 * i)?)?;
+        if dll.get(name..name + 16)? != b"D3D12SDKVersion\0" {
+            return None;
+        }
+        let ordinal = usize::from(u16_at(ordinals_at + 2 * i)?);
+        u32_at(offset(u32_at(functions_at + 4 * ordinal)?)?)
+    })
+}
+
 /// The version asked for where no `D3D12\D3D12Core.dll` is beside this
-/// program: the first Agility SDK's (1.4), at or below every Windows that
-/// reads `D3D12SDKVersion`, so Windows keeps its own runtime.
+/// program: Windows' own runtime's (from System32's `D3D12Core.dll`), so
+/// Windows keeps it, at most 614, the version the exe is tested with.
+///
+/// It was 4 (the first Agility SDK's) in v2026.11.27.5, but Windows then
+/// turned off what came after it: once Direct3D 12 read the version set
+/// here, frames held at 14 fps with a white window (Windows 11 25H2,
+/// whose own is 616; muted runs, 2026-11-27). Where the file is missing or
+/// unreadable (Windows older than 10 2004 reads no `D3D12SDKVersion`), 4.
 #[cfg(windows)]
-const OS_RUNTIME: u32 = 4;
+fn os_runtime() -> u32 {
+    let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+    std::fs::read(system.join("System32").join("D3D12Core.dll"))
+        .ok()
+        .and_then(|dll| exported_sdk_version(&dll))
+        .map_or(4, |v| v.min(614))
+}
 
 /// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
 /// beside this program, or for its own runtime where there is none. First
@@ -73,7 +123,7 @@ pub(crate) fn match_d3d12_core() {
         return;
     };
     let Ok(bytes) = std::fs::read(&core) else {
-        D3D12SDKVersion.store(OS_RUNTIME, Relaxed);
+        D3D12SDKVersion.store(os_runtime(), Relaxed);
         return;
     };
     match agility_version(&bytes) {
@@ -84,7 +134,7 @@ pub(crate) fn match_d3d12_core() {
             D3D12SDKVersion.store(v, Relaxed);
         }
         None => {
-            D3D12SDKVersion.store(OS_RUNTIME, Relaxed);
+            D3D12SDKVersion.store(os_runtime(), Relaxed);
             println!("{} is not a D3D12 Agility SDK runtime Windows can use: Windows' own is used.", core.display());
         }
     }
@@ -508,6 +558,19 @@ mod tests {
         assert_eq!(super::agility_version(&core_bytes(10, 0)), None);
         assert_eq!(super::agility_version(&[0u8; 64]), None);
         assert_eq!(super::agility_version(&core_bytes(1, 620)[..48]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_own_runtime_tells_its_version() {
+        let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap();
+        if let Ok(dll) = std::fs::read(system.join("System32").join("D3D12Core.dll")) {
+            let v = super::exported_sdk_version(&dll).expect("System32's D3D12Core.dll exports D3D12SDKVersion");
+            assert!(v >= 4, "{v}");
+            assert!((4..=614).contains(&super::os_runtime()));
+        }
+        assert_eq!(super::exported_sdk_version(&[0u8; 64]), None);
+        assert_eq!(super::exported_sdk_version(b"MZ"), None);
     }
 }
 

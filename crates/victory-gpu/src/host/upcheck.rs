@@ -317,6 +317,48 @@ fn known(copy: u64, at: usize) -> String {
 type Crossed = BTreeMap<((u64, u64), (u64, u64)), (u64, usize, usize)>;
 static CROSSED: Mutex<(u64, Crossed)> = Mutex::new((0, BTreeMap::new()));
 
+/// LOCAL (11/26, `VICTORY_RELAY_CROSS=1`): whether a refresh of `runs` reads
+/// title memory that a flight in the air may be writing through another copy
+/// of it ([`reads`] counts those). Such a refresh sends the bytes from before
+/// the flight, and draws of that submission read them: one frame of stale
+/// vertices and indices (triangles flung across the screen with the relay on,
+/// none with `VICTORY_RELAY=0`). The caller settles the flights first.
+pub(crate) fn cross_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_CROSS").is_some_and(|v| v == "1"))
+}
+
+pub(super) fn crossed(runs: &[&HostList]) -> bool {
+    let mut writes: Vec<(std::sync::Arc<Shadow>, usize, usize)> = Vec::new();
+    let mut all = Vec::new();
+    for item in &super::line().line {
+        if let Late::Run(flight) = item {
+            for (shadow, ranges) in &flight.back {
+                writes.extend(ranges.iter().map(|&(a, b)| (shadow.clone(), a, b)));
+                join_ranges(&mut all, ranges.iter().copied());
+            }
+        }
+    }
+    if writes.is_empty() {
+        return false;
+    }
+    for list in runs {
+        for step in &list.deferred().copies {
+            let Step::Refresh(shadow, at, len) = step else {
+                continue;
+            };
+            let (from, to) = (*at, *at + *len);
+            if !touches(&all, from, to) {
+                continue;
+            }
+            if writes.iter().any(|(writer, a, b)| *a < to && from < *b && !std::sync::Arc::ptr_eq(writer, shadow)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Flights are in the air and `runs` are about to be prepared: which
 /// refreshes of theirs read title memory that a flight may be writing through
 /// another copy of it. Such a refresh takes what was there before the flight

@@ -1228,12 +1228,43 @@ fn translated_compute_matches_pc() {
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
+        let view_strides: Vec<u32> = views
+            .iter()
+            .map(|v| match *v {
+                View::RawUav(_) => 1,
+                View::HalfUav(_) => 8,
+                View::Buffer { stride, .. } => match stride {
+                    Stride::Raw => 1,
+                    Stride::Typed => 16,
+                    Stride::Structured(s) => s,
+                    Stride::Format(f, bytes) => {
+                        let kind = match f.0 as u32 {
+                            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => {
+                                super::VIEW_INTEGER
+                            }
+                            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => {
+                                super::VIEW_INTEGER | super::VIEW_SIGNED
+                            }
+                            _ => 0,
+                        };
+                        bytes | kind
+                    }
+                },
+                _ => 0,
+            })
+            .collect();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv
+                && (slot == super::SLOT_STRIDES || slot == super::SLOT_TABLE_STRIDES)
+            {
+                view_strides.clone()
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }

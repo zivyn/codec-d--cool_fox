@@ -108,6 +108,11 @@ pub fn run(
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
+        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            && let Some(real) = dll.export("ffxDispatch")
+        {
+            victory_hle::modules::ffx::set_real_dispatch(real);
+        }
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
     }
@@ -162,7 +167,31 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // `VICTORY_UPSCALE=stretch` (Series S): the upscale dispatch is ours
+    // (`victory_hle::modules::ffx`, a plain stretch) instead of the title's
+    // own FidelityFX passes, which are slow translated on 32-lane hosts; the
+    // rest of that DLL stays the title's. Unset: the title's own, as before.
+    struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver, bool);
+    impl victory_loader::ImportResolver for TakeDispatch<'_> {
+        fn resolve(&self, dll: &str, symbol: &victory_pe::ImportSymbol) -> victory_loader::Resolution {
+            let ours = self.1
+                && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+                && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
+            if ours {
+                return victory_loader::Resolution::Found {
+                    address: victory_hle::modules::ffx::dispatch_address(),
+                    provenance: victory_loader::Provenance::Hle,
+                };
+            }
+            self.0.resolve(dll, symbol)
+        }
+    }
+    let take = victory_hle::console::current() == victory_hle::console::Console::SeriesS
+        && std::env::var_os("VICTORY_UPSCALE").is_some_and(|v| v == "stretch" || v == "dlss");
+    if take {
+        println!("upscale        the title's ffxDispatch is ours (VICTORY_UPSCALE=stretch|dlss)");
+    }
+    show(&exe_name, image.bind_imports(&TakeDispatch(&with_dlls, take), policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.

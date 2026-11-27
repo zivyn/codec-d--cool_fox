@@ -42,4 +42,13 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
+    // The `dlss` feature links the DLSS SDK's loader (`nvsdk_ngx_d.lib`, the
+    // dynamic-CRT one) from `VICTORY_DLSS_SDK`.
+    println!("cargo:rerun-if-env-changed=VICTORY_DLSS_SDK");
+    if std::env::var_os("CARGO_FEATURE_DLSS").is_some() {
+        let sdk = std::env::var_os("VICTORY_DLSS_SDK")
+            .map(PathBuf::from)
+            .expect("the dlss feature needs VICTORY_DLSS_SDK (the NVIDIA/DLSS checkout)");
+        println!("cargo:rustc-link-search=native={}", sdk.join("lib/Windows_x86_64/x64").display());
+    }
 }

@@ -40,7 +40,7 @@ fn asked() -> bool {
 }
 
 /// Whether it is shown now.
-fn shown() -> &'static AtomicBool {
+pub(super) fn shown() -> &'static AtomicBool {
     static SHOWN: OnceLock<AtomicBool> = OnceLock::new();
     SHOWN.get_or_init(|| AtomicBool::new(asked()))
 }
@@ -61,7 +61,7 @@ fn pressed() -> bool {
 
 /// Seven rows of five dots, the leftmost the highest bit.
 #[rustfmt::skip]
-const fn glyph(c: u8) -> [u8; 7] {
+pub(super) const fn glyph(c: u8) -> [u8; 7] {
     match c {
         b'0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
         b'1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
@@ -103,6 +103,19 @@ const fn glyph(c: u8) -> [u8; 7] {
         b'/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
         b'-' => [0, 0, 0, 0b11111, 0, 0, 0],
         b' ' => [0; 7],
+        // LOCAL (11/26): for the F1 settings menu (menu.rs).
+        b'>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
+        b'<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
+        b'*' => [0, 0b00100, 0b10101, 0b01110, 0b10101, 0b00100, 0],
+        b':' => [0, 0b01100, 0b01100, 0, 0b01100, 0b01100, 0],
+        b'_' => [0, 0, 0, 0, 0, 0, 0b11111],
+        b'=' => [0, 0, 0b11111, 0, 0b11111, 0, 0],
+        b'(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
+        b')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
+        b'+' => [0, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0],
+        b',' => [0, 0, 0, 0, 0b01100, 0b00100, 0b01000],
+        b'!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0, 0b00100],
+        b'?' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100],
         _ => [0b11111, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11111],
     }
 }
@@ -133,7 +146,7 @@ fn lit(lines: &[String], x: u32, y: u32) -> bool {
 }
 
 /// The bytes of a black and a white pixel of a swap chain's format.
-fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
+pub(super) fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
     Some(match format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM => [&[0, 0, 0, 0xFF], &[0xFF; 4]],
         DXGI_FORMAT_R10G10B10A2_UNORM => [&[0, 0, 0, 0xC0], &[0xFF; 4]],
@@ -213,8 +226,12 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
     vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
-        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
+        // LOCAL (11/26): with frame generation, the frames shown beside those rendered.
+        match crate::fg::shown_per_frame() {
+            1 => format!("FPS {:.1}  FRAME {ms:.1} MS", 1e3 / ms.max(0.001)),
+            n => format!("FPS {:.1}  FG {:.1}  FRAME {ms:.1} MS", 1e3 / ms.max(0.001), f64::from(n) * 1e3 / ms.max(0.001)),
+        },
+        format!("DRAWS {:.0}  DROPPED {:.0}  LONGEST {worst:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
         format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),

@@ -25,6 +25,9 @@ tempfile.workspace = true
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []
+# NVIDIA DLSS for the title's upscale (`VICTORY_UPSCALE=dlss`); needs the DLSS
+# SDK (NVIDIA/DLSS: include, lib/Windows_x86_64) at `VICTORY_DLSS_SDK`.
+dlss = []
 
 [lints]
 workspace = true

@@ -194,6 +194,51 @@ everything on NVIDIA cards and run fastest there**, using the Series S profile.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
+## New on 2026-11-26: another renderer, DLSS, a settings menu
+
+The default of `scripts\play-nvidia.ps1` changed. What is below this section
+was written on 2026-11-25 for the settings before it, which `-Resolution`
+still reaches.
+
+- **The renderer is CGBJ's** ([codec-d/cool_fox](https://github.com/codec-d/cool_fox)
+  `f4b48ad`, GPL-3.0 like this fork), with this fork's NVIDIA fixes on top.
+- **DLSS does the title's upscale** (from pull request 203 of
+  [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)):
+  the game renders its own 720p and DLSS takes it to 1080p, in place of the
+  render scale and the title's upscaler. Series S only.
+- **F1 in the game opens a settings menu** (arrows pick and change, Enter
+  does it): upscaler, DLSS model and sharpness, frame generation, frame rate
+  cap, ray tracing, Smooth Motion, console profile, graphics card, and the
+  speed switches. Lines marked LIVE change at once; the others are saved to
+  `victory-settings.txt` and apply at the next start, which "SAVE AND RESTART
+  NOW" does for you. F3 shows the numbers panel.
+- **DLSS frame generation** (NVIDIA Streamline), 2x to 6x, from the menu. The
+  amount changes while playing. Frames are only generated while the game's
+  window has the focus.
+- **Frame rate cap**: the title asks for 30 frames a second; the menu's FRAME
+  RATE CAP lifts that (60, 120 or none).
+- **Real ray tracing**, off by default: `-RayTracing` or the menu. On this
+  renderer the title's structure builder runs on NVIDIA (53 programs), and
+  the draws dropped for it go from hundreds or thousands a frame to one.
+
+Measured on the RTX 5070 below (Series S, DLSS, opening rooms): about 15-17
+fps without ray tracing and 13-15 with it, before generated frames.
+
+Known to be wrong with it:
+
+- **Ray tracing and DLSS frame generation together do not work**: about 0.1
+  fps and a white picture. Each alone is fine. The launcher and the layer
+  leave frame generation off when ray tracing is on (Smooth Motion can do the
+  extra frames then). The cause is not found.
+- **Without ray tracing, lit places further into the game blow out to white
+  with black holes** (the bank, outdoors): the lighting runs with every ray
+  missing. With ray tracing on, that has not been checked that far yet.
+- **With ray tracing, shaders build for minutes** the first time a place is
+  seen (about 1,700 pipelines for the opening alone).
+- **A posterized "oil paint" look** comes in some runs and not in others.
+- "SAVE AND RESTART NOW" can leave the old game's process behind without a
+  window; it goes when the PC restarts.
+
 ## Where it stands (2026-11-25)
 
 Tested on one machine only: Windows 11, AMD Ryzen 7 9800X3D, 64 GB RAM,
@@ -231,16 +276,33 @@ tools, and your own dump of the title.
 git clone https://github.com/trustno1-coder/VIctory-NVIDIA
 cd VIctory-NVIDIA
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
 ```
+
+The first start builds the layer by itself (`scripts\build-nvidia.ps1`: the
+`diag` profile with `diagnostics`).
+
+**For DLSS and DLSS frame generation, run `Get-NVIDIA-DLSS.cmd` once** (double
+click it, or `Get-NVIDIA-DLSS.cmd -NoStreamline` for DLSS alone). It downloads
+the few NVIDIA files they need, about 70 MB, from NVIDIA's own GitHub
+([NVIDIA/DLSS](https://github.com/NVIDIA/DLSS),
+[NVIDIA-RTX/Streamline](https://github.com/NVIDIA-RTX/Streamline)) into
+`nvidia-sdk\` (git-ignored), and the next start builds the layer again with
+DLSS in it (about a minute). Those files are NVIDIA's, under NVIDIA's licences,
+which are saved beside them; this repository does not carry them and may not.
+A build with DLSS links NVIDIA's loader library: it is for your own use, not
+for passing on.
+
+Without that step the game runs all the same: its 720p picture is stretched to
+the screen instead of going through DLSS (softer), and there is no DLSS frame
+generation. Nothing is downloaded unless you run that file.
 
 `scripts\play-nvidia.ps1` starts a copy of the build named `victory_sm.exe`, so
 NVIDIA Smooth Motion applies every time once it is turned on for that exe in the
 NVIDIA App. `-NoSmoothMotion` runs `victory.exe` itself; `-SeriesX` uses the
-Series X profile (sharper, much slower); `-Quality` gives fewer stretched bodies
-and less rainbow skin for about 7 fps. The fork's own `scripts\play.ps1` is
-still there for AMD cards.
+Series X profile (sharper, much slower, no DLSS); `-Quality` gives fewer
+stretched bodies, slower; `-RayTracing` turns the title's real ray tracing on.
+The fork's own `scripts\play.ps1` is still there for AMD cards.
 
 ### Picking a resolution
 

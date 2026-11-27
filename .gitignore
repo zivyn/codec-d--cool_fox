@@ -76,3 +76,8 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# NVIDIA's own files (scripts/get-nvidia-sdks.ps1 fetches them from NVIDIA; never part of this repository)
+/nvidia-sdk/
+# What the F1 menu saved
+/victory-settings.txt

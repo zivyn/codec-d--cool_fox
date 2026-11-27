@@ -25,8 +25,47 @@ const ORIGIN: u32 = 0;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 const SIXTIETH: Duration = Duration::from_micros(16_667);
 
+/// LOCAL (11/26): `VICTORY_FPS_CAP`. Unset: the title's own interval (30 frames a second on a
+/// Series S); `0`: none (ticks half a millisecond apart); `n`: n frames a second. The F1 menu
+/// changes it while running ([`set_cap`]). -1: not read yet; 0: the title's; else microseconds.
+static CAP_US: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+fn parse_cap(value: Option<&str>) -> i64 {
+    match value.map(str::trim).and_then(|v| v.parse::<u32>().ok()) {
+        None => 0,
+        Some(0) => 500,
+        Some(n) => (1_000_000 / i64::from(n)).max(500),
+    }
+}
+
+/// The interval ticks are apart: the title's, or the cap's when one is set.
+fn capped(asked: Duration) -> Duration {
+    let mut us = CAP_US.load(Ordering::Relaxed);
+    if us < 0 {
+        us = parse_cap(std::env::var("VICTORY_FPS_CAP").ok().as_deref());
+        CAP_US.store(us, Ordering::Relaxed);
+    }
+    if us == 0 { asked } else { Duration::from_micros(us as u64) }
+}
+
+/// The cap changed (the F1 menu): the clock goes on from now with the new interval.
+#[allow(dead_code)]
+pub(crate) fn set_cap(value: &str) {
+    CAP_US.store(parse_cap(Some(value).filter(|v| !v.is_empty())), Ordering::Relaxed);
+    let first = LAST.iter().map(|t| t.load(Ordering::Relaxed)).max().unwrap_or(0);
+    if let Some(c) = clock().as_mut() {
+        c.start = Instant::now();
+        c.first = first;
+        c.interval = capped(c.asked);
+        tracing::info!(asked = ?c.asked, interval = ?c.interval, "frame interval: the cap changed");
+    }
+}
+
 struct Clock {
     start: Instant,
+    /// What the title asked for.
+    asked: Duration,
+    /// What ticks are apart ([`capped`]).
     interval: Duration,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
@@ -53,7 +92,9 @@ pub(crate) extern "system" fn set_interval(
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    let asked = interval;
+    let interval = capped(asked);
+    tracing::info!(?asked, ?interval, "frame interval (VICTORY_FPS_CAP: unset the title's, 0 none, n frames a second)");
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -62,6 +103,7 @@ pub(crate) extern "system" fn set_interval(
         .unwrap_or(0);
     *clock() = Some(Clock {
         start: Instant::now(),
+        asked,
         interval,
         first,
     });
@@ -105,7 +147,8 @@ fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
         start: Instant::now(),
-        interval: SIXTIETH,
+        asked: SIXTIETH,
+        interval: capped(SIXTIETH),
         first: 0,
     });
     let elapsed = c.start.elapsed().as_nanos();

@@ -157,8 +157,9 @@ pub(super) fn pipeline_prepare() -> bool {
     if FORCE_PIPELINE.load(Relaxed) {
         return true;
     }
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_PREPARE").is_some_and(|v| v == "1"))
+    // (May change while the title runs, `VICTORY_AB`: what it asks of the item at hand is read once, and the refreshes
+    // begun stay joined, `crate::host::prefetch::join`.)
+    crate::ab::live_flag!("VICTORY_PIPELINE_PREPARE")
 }
 
 /// Tests: the pipeline's questions answer yes.
@@ -177,8 +178,7 @@ pub(super) fn round() -> u64 {
 /// waits for it at its end as for one begun then. Not for one that waited
 /// for flights ([`crate::host`] begins another after the wait).
 pub(super) fn heaps_early() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAPS_EARLY").is_some_and(|v| v == "1"))
+    crate::ab::live_flag!("VICTORY_HEAPS_EARLY")
 }
 
 /// See the module's text.
@@ -744,11 +744,15 @@ const LAG: usize = 12;
 static RAMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 
 fn ramp_first() -> Option<usize> {
-    static FIRST: OnceLock<Option<usize>> = OnceLock::new();
-    *FIRST.get_or_init(|| {
-        (std::env::var_os("VICTORY_JOIN_RAMP").is_some_and(|v| v == "1"))
-            .then(|| number("VICTORY_JOIN_RAMP_FIRST").unwrap_or(1).max(1))
-    })
+    // 0: no ramp. (May change while the title runs, `VICTORY_AB`: `RAMP` is set again at each present, and a value left
+    // from before only lets a submission take what the ramp would, up to `most`.)
+    fn first(text: Option<&str>) -> usize {
+        if text.is_some_and(|v| v == "1") { number("VICTORY_JOIN_RAMP_FIRST").unwrap_or(1).max(1) } else { 0 }
+    }
+    match crate::ab::live_value!("VICTORY_JOIN_RAMP", usize, first) {
+        0 => None,
+        n => Some(n),
+    }
 }
 
 /// The parts a submission may take with a ramp at `ramp`, of `most`.

@@ -446,8 +446,9 @@ impl WriterIndex {
 /// Whether the writers are found through a [`WriterIndex`]
 /// (`VICTORY_HOLDER_INDEX=1`; off by default).
 fn holder_index_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLDER_INDEX").is_some_and(|v| v == "1"))
+    // (May change while the title runs, `VICTORY_AB`: the index is made and used inside one planning, and holds only what
+    // that planning's writers hold.)
+    crate::ab::live_flag!("VICTORY_HOLDER_INDEX")
 }
 
 fn holder_among<'a>(
@@ -603,8 +604,8 @@ enum To {
 /// Whether the reads of a level that lie together are one copy
 /// (`VICTORY_STEPS_MERGE_READS=1`; off by default).
 fn merge_reads_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_STEPS_MERGE_READS").is_some_and(|v| v == "1"))
+    // (May change while the title runs, `VICTORY_AB`: each list's reads are recorded in one go, whole or joined.)
+    crate::ab::live_flag!("VICTORY_STEPS_MERGE_READS")
 }
 
 /// Since the last frame line: reads of levels, the copies made of them, and

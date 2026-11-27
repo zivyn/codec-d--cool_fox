@@ -37,10 +37,15 @@
 use super::*;
 
 /// Whether the next submission's refreshes are begun early.
+///
+/// (`VICTORY_PIPELINE_PREPARE` may change while the title runs, `VICTORY_AB`: [`offer`] reads this once, and a refresh
+/// offered while it was on is joined by [`join`] after it went off.)
 pub(super) fn on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::queue::pipeline_prepare() && late() && relay_exact())
+    crate::queue::pipeline_prepare() && late() && relay_exact()
 }
+
+/// Whether something was ever offered: from then on [`join`] looks at the gate whether the switch is on or not.
+static OFFERED_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Offered work, being done, and the wait for it to be over.
 struct Gate<W> {
@@ -175,6 +180,7 @@ pub(super) fn offer(excluding: &[usize]) {
         return;
     }
     start();
+    OFFERED_EVER.store(true, Ordering::Release);
     match GATE.offer(spans) {
         Ok(()) => {
             STATS[OFFERED].fetch_add(1, Ordering::Relaxed);
@@ -185,10 +191,17 @@ pub(super) fn offer(excluding: &[usize]) {
     }
 }
 
+/// Whether [`join`] looks at the gate: while the switch is on, and once anything was offered whatever the switch says
+/// now (it may change while the title runs, `VICTORY_AB`: what was offered while it was on is over before the next
+/// preparing asks or refreshes the same copies).
+fn must_join(on: bool, offered_ever: bool) -> bool {
+    on || offered_ever
+}
+
 /// Before the preparing of a submission asks or refreshes anything: the
 /// refreshes begun early are over.
 pub(super) fn join() {
-    if !on() {
+    if !must_join(on(), OFFERED_EVER.load(Ordering::Acquire)) {
         return;
     }
     let began = std::time::Instant::now();
@@ -433,6 +446,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn a_join_looks_at_the_gate_after_the_switch_went_off_once_anything_was_offered() {
+        assert!(super::must_join(true, false));
+        assert!(super::must_join(false, true));
+        assert!(super::must_join(true, true));
+        assert!(!super::must_join(false, false));
+    }
 
     /// The preparing that comes next is not begun before the work offered is
     /// done, and what is offered while some is not over is refused.

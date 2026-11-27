@@ -6322,6 +6322,9 @@ struct ListViews {
     /// views, others), compared, differing, begun again; and how much of it [`VIEW_CACHE`] has.
     counts: [u64; 8],
     sent: [u64; 8],
+    /// What [`view_cache`] said when this recording began: the whole recording goes by it (the switch may change while
+    /// the title runs, `VICTORY_AB`, and the kept views' slots are begun again only by a recording that begins with it).
+    mode: u8,
 }
 
 /// [`ListViews::counts`] of all threads, as they are handed over.
@@ -6337,12 +6340,14 @@ fn view_cache() -> u8 {
             return forced;
         }
     }
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_VIEW_CACHE").as_deref() {
-        Ok("1") => 1,
-        Ok("2") => 2,
-        _ => 0,
-    })
+    fn mode(text: Option<&str>) -> u8 {
+        match text {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => 0,
+        }
+    }
+    crate::ab::live_value!("VICTORY_VIEW_CACHE", u8, mode)
 }
 
 /// The milliseconds [`Over`] counts its age in (a test's own on its thread).
@@ -6391,6 +6396,7 @@ impl ListViews {
                 local: 0,
                 counts: [0; 8],
                 sent: [0; 8],
+                mode: 0,
             })
         }
     }
@@ -6411,7 +6417,8 @@ impl ListViews {
         self.recording = recording;
         self.made.clear();
         self.local = 0;
-        if view_cache() != 0 && self.over.begin(view_clock(), Self::KEEP_SLOTS) {
+        self.mode = view_cache();
+        if self.mode != 0 && self.over.begin(view_clock(), Self::KEEP_SLOTS) {
             self.counts[7] += 1;
         }
     }
@@ -6419,7 +6426,7 @@ impl ListViews {
     /// The view the record `words` names, made in this thread's heap (or found there from before), `None` if it is
     /// no view or cannot be made so.
     fn make(&mut self, words: [u32; 3]) -> Option<ListView> {
-        let cache = view_cache();
+        let cache = self.mode;
         // (Before anything is looked at: a change after it makes what is made stale at once.)
         let stamp = crate::shadow::stamp();
         let mut again = None;

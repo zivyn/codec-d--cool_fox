@@ -5882,12 +5882,21 @@ fn range_valid() -> bool {
     if TEST_RANGE_VALID.load(Ordering::Relaxed) {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RANGE_VALID").is_some_and(|v| v == "1"))
+    crate::ab::live_flag!("VICTORY_RANGE_VALID")
 }
 
 #[cfg(test)]
 static TEST_RANGE_VALID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The top bit of a stamp: it was made by the log of changes (`VICTORY_RANGE_VALID=1`), not by the counts. The switch may
+/// change while the title runs (`VICTORY_AB`): what was stamped one way is never said to hold by the other (the numbers
+/// of the two are unrelated), it is made again.
+const RANGE_STAMP: u64 = 1 << 63;
+
+/// Whether `stamp` was made the way `range` says.
+fn stamped_so(stamp: u64, range: bool) -> bool {
+    (stamp & RANGE_STAMP != 0) == range
+}
 
 /// A change of what is answered for addresses `[lo, hi)` (buffers and windows that came or went, copies of a view's own
 /// bytes): logged under the lock that makes it.
@@ -5897,13 +5906,15 @@ fn changed(lo: u64, hi: u64) {
 
 /// What a cache stamps what it makes from the answers of [`find`] with: read before the ask.
 pub(crate) fn stamp() -> u64 {
-    if range_valid() { CHANGES.stamp() } else { world() }
+    if range_valid() { CHANGES.stamp() | RANGE_STAMP } else { world() }
 }
 
 /// Whether what was made from answers found on addresses `[lo, hi)` when [`stamp`] was `stamp` holds still: nothing
 /// changed (with `VICTORY_RANGE_VALID=1`: nothing in that range).
 pub(crate) fn still(stamp: u64, lo: u64, hi: u64) -> bool {
-    if range_valid() { !CHANGES.changed_since(stamp, lo, hi) } else { world() == stamp }
+    let range = range_valid();
+    stamped_so(stamp, range)
+        && if range { !CHANGES.changed_since(stamp & !RANGE_STAMP, lo, hi) } else { world() == stamp }
 }
 
 #[cfg(test)]
@@ -5929,8 +5940,7 @@ fn ask_cache() -> bool {
     if TEST_ASK_CACHE.load(Ordering::Relaxed) {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_CACHE").is_some_and(|v| v == "1"))
+    crate::ab::live_flag!("VICTORY_ASK_CACHE")
 }
 
 #[cfg(test)]
@@ -5987,12 +5997,18 @@ fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 /// What [`FOUND`] stamps its answers with: the count of changes of [`BUFFERS`], or with `VICTORY_RANGE_VALID=1` of the log.
 fn found_stamp() -> u64 {
-    if range_valid() { CHANGES.stamp() } else { BUFFERS_CHANGED.load(Ordering::SeqCst) }
+    if range_valid() { CHANGES.stamp() | RANGE_STAMP } else { BUFFERS_CHANGED.load(Ordering::SeqCst) }
 }
 
 /// Whether an answer of [`FOUND`] for the ask `[lo, hi)` stamped with `stamp` holds still.
 fn found_still(stamp: u64, lo: u64, hi: u64) -> bool {
-    if range_valid() { !CHANGES.changed_since(stamp, lo, hi) } else { BUFFERS_CHANGED.load(Ordering::SeqCst) == stamp }
+    let range = range_valid();
+    stamped_so(stamp, range)
+        && if range {
+            !CHANGES.changed_since(stamp & !RANGE_STAMP, lo, hi)
+        } else {
+            BUFFERS_CHANGED.load(Ordering::SeqCst) == stamp
+        }
 }
 
 /// Remembers an answer given while `changed` was the count.
@@ -7312,6 +7328,31 @@ mod range_valid_tests {
         }
         TEST_RANGE_VALID.store(false, Ordering::Relaxed);
         assert!(told, "a range nobody changed was said to be changed 16 times");
+    }
+
+    /// `VICTORY_RANGE_VALID` may change while the title runs (`VICTORY_AB`): what was stamped one way is never said to
+    /// hold by the other, even where the two numbers happen to be the same; by its own way it holds.
+    #[test]
+    fn a_stamp_made_the_other_way_never_holds() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        pin_world_for_test(Some(7));
+        let (lo, hi) = (0x7f20_0000_0000u64, 0x7f20_0000_1000u64);
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+        let counted = stamp();
+        assert!(still(counted, lo, hi), "the count is as it was");
+        TEST_RANGE_VALID.store(true, Ordering::Relaxed);
+        let ranged = stamp();
+        let by_log_number = still(counted, lo, hi);
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+        // (The count the log had, as a count: the same number, the other way.)
+        pin_world_for_test(Some(ranged & !RANGE_STAMP));
+        let by_count_number = still(ranged, lo, hi);
+        assert!(still(stamp(), lo, hi), "a stamp of the way that is on holds while nothing moved");
+        pin_world_for_test(None);
+        assert!(ranged & RANGE_STAMP != 0 && counted & RANGE_STAMP == 0);
+        assert!(!by_log_number, "a count taken for a log number");
+        assert!(!by_count_number, "a log number taken for a count");
+        assert!(stamped_so(ranged, true) && !stamped_so(ranged, false) && stamped_so(counted, false));
     }
     /// Threads that ask for windows again and again while another changes things all over (but not there): the one window each
     /// time, with the asks remembered by range.

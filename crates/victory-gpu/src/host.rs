@@ -6472,7 +6472,9 @@ impl Host {
         });
         // The copies this submission still does something to after the card's
         // plan is made: its title buffer copies' places.
-        let excluding: Vec<usize> = if prefetch::on() {
+        // (The switch may change while the title runs, `VICTORY_AB`: read once, so that what is offered is what was excluded.)
+        let early = prefetch::on();
+        let excluding: Vec<usize> = if early {
             batch.placed.iter().map(|(shadow, ..)| std::sync::Arc::as_ptr(shadow) as usize).collect()
         } else {
             Vec::new()
@@ -6481,10 +6483,12 @@ impl Host {
         let card = self.card_before(&declared, &picked, flown, &mut || {
             if !offered {
                 offered = true;
-                prefetch::offer(&excluding);
+                if early {
+                    prefetch::offer(&excluding);
+                }
             }
         });
-        if !offered {
+        if !offered && early {
             prefetch::offer(&excluding);
         }
         // The sends are taken: from here on the references hold what the
@@ -8603,12 +8607,16 @@ fn joined_with_gap(mut ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, u
 /// title changed. The asking about the written pages, the look for what is new
 /// and the loop over the pages are all over the range.
 fn refresh_narrow_gap() -> usize {
-    static GAP: OnceLock<usize> = OnceLock::new();
-    *GAP.get_or_init(|| match std::env::var("VICTORY_REFRESH_NARROW").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-        Some(1) => 64 << 10,
-        Some(kib) if kib > 1 => kib << 10,
-        _ => usize::MAX,
-    })
+    // (May change while the title runs, `VICTORY_AB=<s>,VICTORY_REFRESH_NARROW[=<kib>]`: each use below reads it once for
+    // what it makes, and a span made either way is refreshed as it refers: see docs/ab-switches.md.)
+    fn gap(text: Option<&str>) -> usize {
+        match text.and_then(|v| v.trim().parse::<usize>().ok()) {
+            Some(1) => 64 << 10,
+            Some(kib) if kib > 1 => kib << 10,
+            _ => usize::MAX,
+        }
+    }
+    crate::ab::live_value!("VICTORY_REFRESH_NARROW", usize, gap)
 }
 
 fn narrow_on() -> bool {

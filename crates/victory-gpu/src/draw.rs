@@ -751,6 +751,15 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// `VICTORY_HEAP_RECHECK_EVERY=<frames>`: the looks at an uploaded texture
+/// picked by index go on at that interval after [`RECHECK_FRAMES`] ran out.
+fn recheck_every() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0)
+    })
+}
+
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
@@ -2748,7 +2757,15 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // `VICTORY_HEAP_RECHECK_EVERY=<frames>` (diagnostic, off): after the
+                        // last scheduled look the memory is still looked at that often, for
+                        // the whole run; the title may fill it later than the schedule.
+                        None => match recheck_every() {
+                            Some(wait) => {
+                                host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks, uploaded)
+                            }
+                            None => host.texture_slot_done(index, write, None),
+                        },
                     }
                     continue;
                 }

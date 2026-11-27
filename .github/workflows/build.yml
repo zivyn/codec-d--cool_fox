@@ -95,6 +95,7 @@ jobs:
         run: |
           mkdir -p dist
           cp target/diag/victory.exe dist/victory-diag.exe
+          cp target/diag/victory.pdb dist/victory-diag.pdb
       - uses: actions/upload-artifact@v5
         with:
           name: victory-diag

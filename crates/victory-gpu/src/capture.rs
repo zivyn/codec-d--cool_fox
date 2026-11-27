@@ -47,7 +47,33 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || n == TRIGGERED.load(std::sync::atomic::Ordering::Relaxed)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// The frame a trigger file asked for (`VICTORY_CAPTURE_TRIGGER`), or `u64::MAX`.
+static TRIGGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `VICTORY_CAPTURE_TRIGGER=<file>` (with `VICTORY_CAPTURE`): when the file
+/// appears it is deleted, and the frame two presents on is captured as the
+/// frames of `VICTORY_CAPTURE_FRAMES` are (picture, `-ops.txt`, and with
+/// `VICTORY_DUMP_TARGETS` its targets and `-targets.tsv`). The file can be
+/// made again for another frame. Called at every present.
+fn triggered(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let Some(file) = FILE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_TRIGGER").map(PathBuf::from)) else {
+        return;
+    };
+    let pending = TRIGGERED.load(Relaxed);
+    if pending != u64::MAX && pending >= frame || !file.exists() {
+        return;
+    }
+    if std::fs::remove_file(file).is_ok() {
+        TRIGGERED.store(frame + 2, Relaxed);
+        tracing::info!(frame = frame + 2, "capture trigger found: this frame is captured");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -128,6 +154,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    triggered(frame);
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -462,7 +489,13 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
+        target_stats(frame, i, resource, d, f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows, rgba.as_deref());
+        if stats_only() {
+            buffer.Unmap(0, None);
+            return;
+        }
+        if let Some(rgba) = rgba {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
@@ -472,6 +505,108 @@ fn dump_one(
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
         buffer.Unmap(0, None);
+    }
+}
+
+/// `VICTORY_DUMP_TARGETS=stats`: no pictures of the targets, only
+/// `frame-<n>-targets.tsv`.
+fn stats_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DUMP_TARGETS").is_ok_and(|v| v == "stats"))
+}
+
+/// Bytes a texel takes in a color or single-channel format the dump reads
+/// (`None`: not handled).
+fn texel_bytes(format: u32) -> Option<usize> {
+    Some(match format {
+        1..=4 => 16,
+        5..=8 => 12,
+        9..=22 => 8,
+        23..=47 | 87..=93 => 4,
+        48..=59 => 2,
+        60..=65 => 1,
+        _ => return None,
+    })
+}
+
+/// The most distinct values counted in a target.
+const DISTINCT_CAP: usize = 1 << 20;
+
+/// How many different texels (`bytes` each) the rows hold, counted up to
+/// [`DISTINCT_CAP`] (then `true`), and the most common one with its count.
+fn distinct_values(rows: &[u8], pitch: usize, w: usize, h: usize, bytes: usize) -> (usize, bool, u128, u32) {
+    let mut counts = std::collections::HashMap::<u128, u32>::new();
+    let mut capped = false;
+    for y in 0..h {
+        let row = &rows[y * pitch..y * pitch + w * bytes];
+        for t in row.chunks_exact(bytes) {
+            let mut v = [0u8; 16];
+            v[..bytes].copy_from_slice(t);
+            let key = u128::from_le_bytes(v);
+            if let Some(n) = counts.get_mut(&key) {
+                *n += 1;
+            } else if counts.len() < DISTINCT_CAP {
+                counts.insert(key, 1);
+            } else {
+                capped = true;
+            }
+        }
+    }
+    let (top, top_n) = counts.iter().max_by_key(|e| *e.1).map_or((0, 0), |(k, n)| (*k, *n));
+    (counts.len(), capped, top, top_n)
+}
+
+/// One line per target in `frame-<frame>-targets.tsv` (in the order the
+/// frame first used them, which the `-ops.txt` lines name by resource):
+/// how many different texel values the target holds as the card wrote them
+/// (`raw`, counted up to a million) and as the 8-bit picture of it
+/// (`rgba8`), the most common value and its share. A pass whose output
+/// collapses to a few values where the run before had thousands is the one
+/// that lost the detail.
+#[allow(clippy::too_many_arguments)]
+fn target_stats(
+    frame: u64,
+    i: usize,
+    resource: crate::object::This,
+    d: &D3D12_RESOURCE_DESC,
+    format: u32,
+    w: usize,
+    h: usize,
+    pitch: usize,
+    rows: &[u8],
+    rgba: Option<&[u8]>,
+) {
+    use std::io::Write;
+    let Some(folder) = folder() else { return };
+    let Some(bytes) = texel_bytes(format) else { return };
+    if w == 0 || h == 0 || rows.len() < pitch * (h - 1) + w * bytes {
+        return;
+    }
+    let (distinct, capped, top, top_n) = distinct_values(rows, pitch, w, h, bytes);
+    let rgba8 = rgba.map_or(0, |p| {
+        p.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], 0]))
+            .collect::<std::collections::HashSet<u32>>()
+            .len()
+    });
+    let line = format!(
+        "{i}	{resource:?}	{}x{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}",
+        d.Width,
+        d.Height,
+        format,
+        d.MipLevels,
+        w * h,
+        distinct,
+        if capped { "+" } else { "" },
+        top_n as f64 * 100.0 / (w * h) as f64,
+    );
+    tracing::debug!(frame, "target {line}");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(folder.join(format!("frame-{frame}-targets.tsv")))
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -860,5 +995,28 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn distinct_texels_are_counted_without_the_row_padding() {
+        // 3x2 texels of 4 bytes, rows 16 bytes apart (4 bytes of padding that differ).
+        let mut rows = vec![0u8; 16 * 2];
+        for (y, row) in [[1u32, 1, 2], [1, 3, 1]].iter().enumerate() {
+            for (x, v) in row.iter().enumerate() {
+                rows[y * 16 + x * 4..][..4].copy_from_slice(&v.to_le_bytes());
+            }
+            rows[y * 16 + 12..][..4].copy_from_slice(&(99 + y as u32).to_le_bytes());
+        }
+        let (distinct, capped, top, top_n) = distinct_values(&rows, 16, 3, 2, 4);
+        assert_eq!((distinct, capped, top, top_n), (3, false, 1, 4));
+        assert_eq!(texel_bytes(28), Some(4));
+        assert_eq!(texel_bytes(10), Some(8));
+        assert_eq!(texel_bytes(61), Some(1));
+        assert_eq!(texel_bytes(71), None);
     }
 }

@@ -54,10 +54,91 @@ fn gap(taken: &[bool], n: usize) -> Option<usize> {
     None
 }
 
+/// Pieces of address space in [4 GiB, 2^37), [`EARLY_PIECE`] each, reserved
+/// at the start (`VICTORY_LOW_EARLY_MB`, 3,200 with the structure
+/// builder, else 0). [`reserve`] commits a whole one for a request of that
+/// size (an arena of memory by address) before it looks for room.
+///
+/// By the time the builder runs, the title's mappings and ours fill that
+/// range: no 64 MiB gap was left after 19 of the builder's arenas (RTX 4090,
+/// 11-27), and the pages it could not hold read zeros (broken reflections,
+/// flicker). Reserved before the title spreads, the range costs no memory
+/// until a piece is committed. Each piece is a reservation of its own: as
+/// one reservation of 3.2 GB the submissions' write-watch askings ran
+/// across the arenas in single long walks, 2 ms a frame more.
+static EARLY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// The size of an [`EARLY`] piece: `memory.rs`'s `ARENA`.
+const EARLY_PIECE: usize = 64 << 20;
+
+/// Reserves [`EARLY`]; once, as early as the host is made.
+pub(crate) fn reserve_early() {
+    use windows_sys::Win32::System::Memory::{
+        MEM_ADDRESS_REQUIREMENTS, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements, PAGE_READWRITE,
+        VirtualAlloc2,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let mb = std::env::var("VICTORY_LOW_EARLY_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(if builder { 3200 } else { 0 });
+        let mut early = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..(mb << 20) / EARLY_PIECE {
+            let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+                LowestStartingAddress: (1usize << 32) as *mut _,
+                HighestEndingAddress: ((1usize << 37) - 1) as *mut _,
+                Alignment: 0,
+            };
+            let mut parameter = MEM_EXTENDED_PARAMETER::default();
+            parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+            parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+            // SAFETY: a fresh reservation; the parameter points at
+            // `requirements`, which outlives the call.
+            let at = unsafe {
+                VirtualAlloc2(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    EARLY_PIECE,
+                    MEM_RESERVE | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                    &mut parameter,
+                    1,
+                )
+            } as usize;
+            if at == 0 {
+                break;
+            }
+            early.push(at);
+        }
+        // The lowest first.
+        early.sort_unstable_by(|a, b| b.cmp(a));
+        if mb > 0 {
+            tracing::info!(mb, pieces = early.len(), "low memory reserved early (VICTORY_LOW_EARLY_MB)");
+        }
+    });
+}
+
+/// A whole [`EARLY`] piece, committed, for a request of its size.
+fn from_early(len: usize) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, PAGE_READWRITE, VirtualAlloc};
+    if len != EARLY_PIECE {
+        return None;
+    }
+    let at = EARLY.lock().unwrap_or_else(|e| e.into_inner()).pop()?;
+    // SAFETY: a reservation of our own, not committed before.
+    let done = unsafe { VirtualAlloc(at as *const _, len, MEM_COMMIT, PAGE_READWRITE) } as usize;
+    (done == at).then_some(at)
+}
+
 /// Fresh zeroed memory in [4 GiB, 2^37) (where the directory of memory by
 /// address reaches, `MEMORY_PAGES`), write-watched as the title's own
-/// pools are (copies then take only written pages).
+/// pools are (copies then take only written pages). From [`EARLY`] first.
 pub(crate) fn reserve(len: usize) -> Option<usize> {
+    if let Some(at) = from_early(len) {
+        return Some(at);
+    }
     use windows_sys::Win32::System::Memory::{
         MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
         PAGE_READWRITE, VirtualAlloc2,

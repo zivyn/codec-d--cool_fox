@@ -82,6 +82,27 @@ pub(crate) fn unwatch_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_UNWATCH").is_some_and(|v| v == "1"))
 }
 
+/// Whether the blocks of view memory a piece opens (the title's pages it
+/// cannot be put beside: not in the record of the views) are put back as they
+/// were after the landing (`VICTORY_LAND_REGUARD=1`, off by default; copies of
+/// buffers in default heaps whose blocks lie in them whole).
+///
+/// A piece put through the title's own address opens the guard of its block:
+/// a write that nobody is told of, so the next asking tells the block written,
+/// and the refresh takes all of its 16 pages of 4 KiB (those the landing put
+/// are compared, the others copied whole and sent up) and guards it again:
+/// 400 blocks a frame in the cell, two changes of protection each, under the
+/// lock of the guards. Here the blocks that were clean are guarded again at
+/// the job's flush ([`crate::watch::landed_reguard`]), after the landing is told
+/// to the journal as one beside the guards is, and the copy landed through is
+/// told it holds them ([`crate::shadow::Shadow::landed`]). What the title or
+/// the kernel writes in the block while it is open is not seen: the title's CPU
+/// cannot write these buffers, and the kernel's writes are told beforehand.
+pub(crate) fn reguard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_REGUARD").is_some_and(|v| v == "1"))
+}
+
 /// Whether pieces an earlier fetch holds as they are now are left out
 /// ([`Had`]; `VICTORY_LAND_SKIP=1`, off by default: counted either way).
 pub(crate) fn skip_on() -> bool {
@@ -144,7 +165,10 @@ pub(crate) mod stat {
     pub(crate) const UNWATCHED: usize = 28;
     pub(crate) const UNWATCH_DIRTY: usize = 29;
     pub(crate) const UNWATCH_NOT_WATCHED: usize = 30;
-    pub(crate) const COUNT: usize = 31;
+    /// Blocks of view memory a piece opened and the landing put back
+    /// ([`reguard_on`]).
+    pub(crate) const REGUARDED: usize = 31;
+    pub(crate) const COUNT: usize = 32;
 }
 
 pub(crate) mod quiet;
@@ -224,12 +248,15 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
-    if unwatch_on() {
+    if unwatch_on() || reguard_on() {
         tracing::info!(
-            "direct pieces per frame (VICTORY_LAND_UNWATCH=1): {:.0} put where the kernel's write watch of their block was clean and taken off it after, {:.0} where it held a write of the title's, {:.0} where the memory is not write-watched (views of pages, guarded)",
+            "direct pieces per frame (VICTORY_LAND_UNWATCH={}, VICTORY_LAND_REGUARD={}): {:.0} put where the kernel's write watch of their block was clean and taken off it after, {:.0} where it held a write of the title's, {:.0} where the memory is not write-watched (views of pages, guarded); {:.0} blocks of views opened by a piece and guarded again after",
+            u8::from(unwatch_on()),
+            u8::from(reguard_on()),
             s[stat::UNWATCHED],
             s[stat::UNWATCH_DIRTY],
             s[stat::UNWATCH_NOT_WATCHED],
+            s[stat::REGUARDED],
         );
     }
     crate::readprobe::log();
@@ -544,6 +571,9 @@ pub(crate) struct Notes {
     reset: Vec<usize>,
     /// The 64 KiB blocks of those pieces.
     clean: Vec<usize>,
+    /// The 64 KiB blocks of pieces that opened a guard that is put back at
+    /// the flush ([`reguard_on`]).
+    reguard: Vec<usize>,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -591,6 +621,14 @@ impl Notes {
             }
         }
         let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
+        // The blocks the landing opened, guarded again after it is noted: a
+        // refresh that asks before finds them written, as it does now.
+        if !self.reguard.is_empty() {
+            self.reguard.sort_unstable();
+            self.reguard.dedup();
+            count(stat::REGUARDED, self.reguard.len() as u64);
+            crate::watch::landed_reguard(&self.reguard);
+        }
         TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
         if taken() {
             for (block, before) in blocks {
@@ -611,6 +649,7 @@ impl Notes {
         self.landed.clear();
         self.reset.clear();
         self.clean.clear();
+        self.reguard.clear();
         spent(stat::NOTES, noting);
     }
 }
@@ -634,8 +673,10 @@ pub(crate) unsafe fn piece(
 ) -> u64 {
     // SAFETY: the caller's; the copy, if there is one, is held by the job.
     let unwatch = unwatch_on() && !copy.is_null() && unsafe { (*copy).unwatched_landing() };
+    // SAFETY: as above.
+    let reguard = reguard_on() && !copy.is_null() && unsafe { (*copy).reguardable_block(title / BLOCK) };
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), unwatch, copy) }
+    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), unwatch, reguard, copy) }
 }
 
 /// [`piece`], and whether a view of ours is looked for.
@@ -651,6 +692,7 @@ unsafe fn piece_at(
     notes: &mut Notes,
     beside: bool,
     unwatch: bool,
+    reguard: bool,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     let Some(end) = parts.last().map(|p| p.1) else {
@@ -671,6 +713,8 @@ unsafe fn piece_at(
     // Put where the kernel's write watch of the 64 KiB block was clean, to be
     // taken off it again ([`unwatch_on`]).
     let mut unwatched = false;
+    // Put back after ([`reguard_on`]): this piece's block, if it was clean.
+    let mut reguarded = false;
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
@@ -699,7 +743,11 @@ unsafe fn piece_at(
             }
         }
         let opening = std::time::Instant::now();
-        crate::watch::landing(from, to - from);
+        if reguard {
+            reguarded = crate::watch::landing_open(from, to - from).contains(&(title / BLOCK));
+        } else {
+            crate::watch::landing(from, to - from);
+        }
         spent(stat::NOTES, opening);
     }
     let into = beside.unwrap_or(title);
@@ -738,7 +786,7 @@ unsafe fn piece_at(
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
-            if beside.is_some() || unwatched {
+            if beside.is_some() || unwatched || reguarded {
                 let page = (title + from) / PAGE;
                 if unwatched && done.there {
                     notes.reset.push(page);
@@ -760,6 +808,10 @@ unsafe fn piece_at(
         notes.landed.push((title / BLOCK, through));
         if unwatched {
             notes.clean.push(title / BLOCK);
+        }
+        // (A page that was not there: left open, as before.)
+        if reguarded && missing == 0 {
+            notes.reguard.push(title / BLOCK);
         }
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));

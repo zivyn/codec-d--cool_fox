@@ -232,7 +232,7 @@ fn a_piece_put_where_the_watch_was_clean_is_taken_off_it() {
         let mut held = vec![0u8; len];
         let mut notes = Notes::default();
         // SAFETY: vectors of `len` bytes, memory of ours.
-        let put = unsafe { piece_at(to, now.as_ptr(), held.as_mut_ptr(), &[(0, len)], true, &mut notes, false, unwatch, std::ptr::null()) };
+        let put = unsafe { piece_at(to, now.as_ptr(), held.as_mut_ptr(), &[(0, len)], true, &mut notes, false, unwatch, false, std::ptr::null()) };
         notes.flush();
         put
     };
@@ -270,6 +270,65 @@ fn a_piece_put_where_the_watch_was_clean_is_taken_off_it() {
     assert_eq!(crate::watch::kernel_block_clean(block + 2), Some(false), "not lost with ours");
     // SAFETY: our allocation.
     unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
+}
+
+/// A piece put through the title's address into a guarded view opens the block;
+/// with the guard put back after it the block is read-only and clean again,
+/// the journal has the landing for the other copies, and a write of the title's
+/// after it faults and is seen.
+#[test]
+fn a_block_a_piece_opened_is_guarded_again_and_a_later_write_is_seen() {
+    assert!(crate::safecopy::on());
+    let title = Title::new(2 * BLOCK);
+    let len = 3 * PAGE + 100;
+    let now = vec![7u8; len];
+    let land = |block: usize, reguard: bool| {
+        let mut held = vec![0u8; len];
+        let mut notes = Notes::default();
+        let at = title.at + block * BLOCK + 8;
+        // SAFETY: vectors of `len` bytes, a view of ours.
+        let put = unsafe { piece_at(at, now.as_ptr(), held.as_mut_ptr(), &[(0, len)], true, &mut notes, false, false, reguard, std::ptr::null()) };
+        notes.flush();
+        put
+    };
+    let range = |block: usize| (title.at + block * BLOCK, title.at + (block + 1) * BLOCK);
+    let ask = |block: usize| {
+        let (from, to) = range(block);
+        crate::watch::writes(from, to, true).expect("a view")
+    };
+    // Guarded, as after a refresh.
+    ask(0);
+    ask(1);
+    ask(0);
+    ask(1);
+    assert!(crate::watch::clean_now(title.at, 2 * BLOCK));
+
+    // As before: the block stays open, and the next asking tells it written.
+    let asked = ask(0).0;
+    assert!(land(0, false) > 0);
+    assert!(!crate::watch::clean_now(range(0).0, BLOCK), "open");
+    let (_, written) = ask(0);
+    assert!(written.iter().any(|&(page, number)| page == range(0).0 / BLOCK && number > asked), "{written:?} after {asked}");
+    assert!(crate::watch::clean_now(range(0).0, BLOCK), "guarded again by that asking");
+
+    // Put back: the bytes are in, the block is guarded and clean, and the
+    // journal has it.
+    let asked = ask(1).0;
+    assert!(land(1, true) > 0);
+    // SAFETY: inside the view.
+    assert_eq!(unsafe { *((range(1).0 + 8 + len - 1) as *const u8) }, 7);
+    assert!(crate::watch::clean_now(range(1).0, BLOCK), "put back");
+    let (asked_after, written) = ask(1);
+    assert!(written.iter().any(|&(page, number)| page == range(1).0 / BLOCK && number > asked), "told: {written:?} after {asked}");
+    assert!(crate::watch::clean_now(range(1).0, BLOCK), "an asking leaves it so");
+
+    // A write of the title's after it is seen: the guard faults (the block is
+    // opened, or the store is made beside it), and the next asking tells it
+    // written.
+    // SAFETY: inside the view.
+    unsafe { ((range(1).0 + 40) as *mut u8).write_volatile(1) };
+    let (_, written) = ask(1);
+    assert!(written.iter().any(|&(page, number)| page == range(1).0 / BLOCK && number > asked_after), "{written:?} after {asked_after}");
 }
 
 /// A piece whose title memory is away only while the runtime changes a
@@ -516,7 +575,7 @@ fn what_landing_costs() {
                             let mut notes = Notes::default();
                             for &(at, now, held) in &landing[jobs[j].clone()] {
                                 // SAFETY: each its own bytes.
-                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside, false, std::ptr::null()) };
+                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside, false, false, std::ptr::null()) };
                             }
                             notes.flush();
                         });

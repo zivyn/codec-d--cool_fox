@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -14,10 +14,10 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Barycentric, Export, GsInput, GsOp, Input, Interp, Io, LdsOutput, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, GS_TABLE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -78,7 +78,12 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Geometry: what the shader declares (its primitives and limits).
+    pub geometry: Option<super::shader::Geometry>,
 }
+
+/// Emit site to the original LDS write sites and their channels, in write order.
+type GsOutputs = HashMap<Site, Vec<(Site, Vec<LdsOutput>)>>;
 
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
@@ -111,9 +116,10 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    let gs_outputs = gs_outputs_at_emit(parts)?;
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad, gs_outputs.as_ref()).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -126,6 +132,72 @@ pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, Sha
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
+}
+
+/// In a straight-line GS, keep independent values for each GSVS ring slot
+/// until its vertex is emitted. DXIL's output registers hold one vertex.
+fn gs_outputs_at_emit(parts: &Parts) -> Result<Option<GsOutputs>, ShaderError> {
+    let [block] = parts.p.blocks.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(parts.native.stage, HwStage::Gs) || !matches!(block.exit, Exit::End) {
+        return Ok(None);
+    }
+    let writes: HashMap<_, _> = parts
+        .io
+        .lds_outputs
+        .iter()
+        .map(|(site, out)| (*site, out))
+        .collect();
+    let ops: HashMap<_, _> = parts.io.gs_ops.iter().copied().collect();
+    let mut pending = BTreeMap::new();
+    let mut at_emit = HashMap::new();
+    let mut next = 0;
+    let mut batched = false;
+    for i in 0..block.insts.len() {
+        let site = (0, i);
+        if let Some(outputs) = writes.get(&site) {
+            for &out in *outputs {
+                if out.vertex < next {
+                    return Err(ShaderError::Unsupported {
+                        offset: block.insts[i].machine.offset,
+                        what: "a GS ring write after its vertex was emitted",
+                    });
+                }
+                batched |= out.vertex > next;
+                pending
+                    .entry(out.vertex)
+                    .or_insert_with(BTreeMap::new)
+                    .entry(site)
+                    .or_insert_with(Vec::new)
+                    .push(out);
+            }
+        }
+        if matches!(ops.get(&site), Some(GsOp::Emit(_) | GsOp::EmitCut(_))) {
+            let writes = pending.remove(&next).unwrap_or_default();
+            at_emit.insert(site, writes.into_iter().collect::<Vec<_>>());
+            next += 1;
+        }
+    }
+    if batched && let Some(first) = at_emit.values().next() {
+        // A batched emit must define its own outputs; registers from a
+        // previous emit cannot stand in for unwritten ring channels.
+        let channels = |writes: &[(Site, Vec<LdsOutput>)]| {
+            writes
+                .iter()
+                .flat_map(|(_, outputs)| outputs)
+                .map(|out| (out.row, out.channel))
+                .collect::<BTreeSet<_>>()
+        };
+        let first = channels(first);
+        if first.is_empty() || at_emit.values().any(|writes| channels(writes) != first) {
+            return Err(ShaderError::Unsupported {
+                offset: block.offset,
+                what: "different output channels in a batched GS ring",
+            });
+        }
+    }
+    Ok(batched.then_some(at_emit))
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -300,6 +372,17 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Merged geometry stages: a geometry program's reads of its input
+    /// vertices, an export or geometry program's writes of its outputs
+    /// (both LDS on the console), and the stream messages.
+    gs_reads: HashMap<Site, &'a [(u8, GsInput)]>,
+    lds_outputs: HashMap<Site, &'a [LdsOutput]>,
+    gs_outputs: Option<&'a GsOutputs>,
+    gs_ops: HashMap<Site, GsOp>,
+    /// Merged geometry stages: the lane masks of the prologue that enables
+    /// the wave's lanes with work ([`merged_wave_masks`]). Every host
+    /// invocation has work, so they are true.
+    merged_wave_mask: HashSet<Value>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
@@ -337,6 +420,13 @@ struct Lower<'a> {
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// With `exchange`, in a group of several console waves: the two host waves of a console
+    /// wave meet by their own counters in LDS ([`Self::pair_wait`]), not at a group barrier.
+    pair_meet: bool,
+    /// With `pair_meet`: the dwords of the program's own shared memory and the dword that takes
+    /// the writes past them (the console drops those, and reads 0); what lies past them here is
+    /// the halves' exchange, which a stray access would break.
+    lds_bound: Option<(u32, u32)>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -920,6 +1010,16 @@ pub(super) fn wave_local(p: &Program, st: &Structured) -> Result<(), (usize, &'s
     pass(&mut kind, &mut firsts, true)
 }
 
+/// Whether the host waves of a console wave in a group of several console waves meet by their
+/// own counters ([`Lower::pair_wait`]); `VICTORY_PAIR_SYNC=0` leaves that out (the form is then
+/// refused where it would be needed).
+pub(super) fn pair_meet_on() -> bool {
+    std::env::var_os("VICTORY_PAIR_SYNC").is_none_or(|v| v != "0")
+}
+
+/// How many times a half asks for the other half's count before it goes on ([`Lower::pair_wait`]).
+const PAIR_SPINS: u32 = 1 << 24;
+
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
@@ -1122,10 +1222,82 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, the shared memory of a group and the output
+/// of a mesh shader.
+pub fn host_settings() -> [u32; 6] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        host_lds_bytes(),
+        host_mesh_output_bytes(),
+    ]
+}
+
+thread_local! {
+    /// The note a translation's meeting waits leave when they give up ([`Lower::pair_wait`]):
+    /// the top bits mark it, the rest are the first 28 bits of the container's hash, which the
+    /// host's log names programs by (`PAIR_NOTE`).
+    static PROGRAM_TAG: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A wait of the two host waves that gave up leaves `PAIR_NOTE | the first seven hex digits of
+/// the program's hash` in the host's list of faults (`MEMORY_FAULTS`).
+pub const PAIR_NOTE: u32 = 0xF000_0000;
+
+/// A loop that reached its iteration limit leaves `LOOP_NOTE | the first five hex digits of the
+/// program's hash << 8 | the loop's number` in the faults buffer (`VICTORY_LOOP_NOTES=1`).
+pub const LOOP_NOTE: u32 = 0xE000_0000;
+
+/// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
+pub fn set_program_tag(container: &[u8]) {
+    let hash = blake3::hash(container);
+    let first = u32::from_be_bytes(hash.as_bytes()[..4].try_into().expect("4 bytes"));
+    PROGRAM_TAG.set(PAIR_NOTE | first >> 4);
+}
+
+static HOST_LDS_BYTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32768);
+
+/// Tells the translator how much shared memory a thread group may have on the host: D3D12's
+/// 32 KiB unless the host's GPU runs more (NVIDIA's take 48 KiB).
+pub fn set_host_lds_bytes(bytes: u32) {
+    HOST_LDS_BYTES.store(bytes.max(32768), std::sync::atomic::Ordering::Relaxed);
+}
+
+static HOST_MESH_OUTPUT_BYTES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(super::container::MESH_OUTPUT_LIMIT as u32);
+
+/// Tells the translator how much output (vertex plus primitive, as the DXIL validator measures
+/// it) a mesh shader may have on the host: D3D12's 32 KiB unless the host's GPU takes more
+/// (NVIDIA's drivers, checked on an RTX 4060). A mesh program that still passes it after its
+/// maxima come down to its lanes is refused with a reason.
+pub fn set_host_mesh_output_bytes(bytes: u32) {
+    HOST_MESH_OUTPUT_BYTES.store(
+        bytes.max(super::container::MESH_OUTPUT_LIMIT as u32),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The output of a mesh shader the host allows ([`set_host_mesh_output_bytes`]).
+pub fn host_mesh_output_bytes() -> u32 {
+    HOST_MESH_OUTPUT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_lds_bytes`], for its thread only.
+    pub(super) static TEST_HOST_LDS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The shared memory of a thread group the host allows ([`set_host_lds_bytes`]).
+pub(super) fn host_lds_bytes() -> u32 {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_HOST_LDS.get() {
+        return bytes;
+    }
+    HOST_LDS_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1182,6 +1354,7 @@ pub(super) fn host_max_wave() -> u32 {
 #[cfg(test)]
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
+    pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1323,7 +1496,8 @@ fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
 /// output entry names, taken in row order.
 fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
     let entries = match io {
-        StageIo::Vs { outputs, .. } => outputs,
+        StageIo::Vs { outputs, .. } | StageIo::Es { outputs, .. } => outputs,
+        StageIo::Gs(gs) => &gs.outputs,
         StageIo::Ms(ms) => &ms.outputs,
         _ => return HashMap::new(),
     };
@@ -1387,8 +1561,77 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// The lane masks (and the SCC beside them) a merged export or geometry
+/// program's prologue makes from its lane count in s3: `s_bfe_{i32,u32}
+/// count, s3, ...; s_bfm_b64 exec, count, 0; s_cmp_eq_u32 count, 64;
+/// s_cselect_b64 exec, -1, exec`.
+fn merged_wave_masks(p: &Program) -> HashSet<Value> {
+    let mut out = HashSet::new();
+    let Some(s3) = p.inputs.iter().find(|i| i.0 == Reg::S(3)).map(|i| i.1) else {
+        return out;
+    };
+    let Some(entry) = p.blocks.first() else {
+        return out;
+    };
+    let mut counts = HashSet::new();
+    let mut bfm = HashSet::new();
+    for inst in &entry.insts {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            continue;
+        };
+        match inst.name() {
+            "s_bfe_i32" | "s_bfe_u32" => {
+                if matches!(src.first(), Some(Operand::Scalar { code: 3, .. }))
+                    && inst.read(Reg::S(3)) == Some(s3)
+                    && let Some(&Operand::Scalar { code, .. }) = dst.as_ref()
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    counts.insert(w);
+                }
+            }
+            "s_bfm_b64" => {
+                if matches!(dst, Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && matches!(src.first(), Some(Operand::Scalar { code, .. }) if inst.read(Reg::S(*code)).is_some_and(|v| counts.contains(&v)))
+                    && matches!(src.get(1), Some(Operand::Const(128)))
+                    && let Some(w) = inst.write(Reg::S(EXEC))
+                {
+                    bfm.insert(w);
+                    out.insert(w);
+                }
+            }
+            "s_cmp_eq_u32" => {
+                if matches!(src.first(), Some(Operand::Scalar { code, .. }) if inst.read(Reg::S(*code)).is_some_and(|v| counts.contains(&v)))
+                    && matches!(
+                        src.get(1),
+                        Some(Operand::Const(192)) | Some(Operand::Literal(64))
+                    )
+                    && let Some(w) = inst.write(Reg::Scc)
+                {
+                    out.insert(w);
+                }
+            }
+            "s_cselect_b64" => {
+                if matches!(dst, Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && matches!(src.first(), Some(Operand::Const(193)))
+                    && matches!(src.get(1), Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && inst.read(Reg::S(EXEC)).is_some_and(|v| bfm.contains(&v))
+                    && let Some(w) = inst.write(Reg::S(EXEC))
+                {
+                    out.insert(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        gs_outputs: Option<&'a GsOutputs>,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1412,6 +1655,9 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // with `exchange`, the host waves of a console wave meet by counters of their own
+        let mut pair_meet = false;
+        let mut lds_bound: Option<(u32, u32)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1494,6 +1740,25 @@ impl<'a> Lower<'a> {
                                 // numbers go through two exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
+                                // A group of several console waves whose waves take branches
+                                // around the meetings on their own: each console wave's two
+                                // host waves meet by counters of their own (`pair_wait`), two
+                                // more dwords per console wave and one every other thread
+                                // zeroes, not at a group barrier the other console waves would
+                                // have to reach too.
+                                if group > 64
+                                    && group % 64 == 0
+                                    && !x.st.wide.is_empty()
+                                    && s.lds_dwords + 2 * (group / 64) + 2 <= host_lds_bytes() / 4
+                                    && pair_meet_on()
+                                {
+                                    pair_meet = true;
+                                    // (`VICTORY_PAIR_CLAMP=0` leaves the clamp out)
+                                    if std::env::var_os("VICTORY_PAIR_CLAMP").is_none_or(|v| v != "0") {
+                                        lds_bound = Some((cs.lds_bytes() / 4, s.lds_dwords + 2 * (group / 64)));
+                                    }
+                                    s.lds_dwords += 2 * (group / 64) + 1;
+                                }
                             }
                         }
                     }
@@ -1625,6 +1890,17 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        if x.native.stage == HwStage::Es {
+            // The barrier between the export and geometry halves of the
+            // console's wave: the host's stages are apart already.
+            no_barrier.extend(0..p.blocks.len());
+        }
+        s.geometry = x.geometry;
+        let merged_wave_mask = if matches!(x.native.stage, HwStage::Es | HwStage::Gs) {
+            merged_wave_masks(p)
+        } else {
+            HashSet::new()
+        };
         Lower {
             s,
             x,
@@ -1681,6 +1957,21 @@ impl<'a> Lower<'a> {
                 }
                 m
             },
+            gs_reads: x
+                .io
+                .gs_reads
+                .iter()
+                .map(|(s, r)| (*s, r.as_slice()))
+                .collect(),
+            lds_outputs: x
+                .io
+                .lds_outputs
+                .iter()
+                .map(|(s, o)| (*s, o.as_slice()))
+                .collect(),
+            gs_outputs,
+            gs_ops: x.io.gs_ops.iter().copied().collect(),
+            merged_wave_mask,
             handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
@@ -1708,6 +1999,8 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            pair_meet,
+            lds_bound,
             clane: None,
             pair: None,
             halves,
@@ -1718,7 +2011,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ps | HwStage::Vs | HwStage::Es | HwStage::Gs => MaskData::Host,
                 _ => MaskData::None,
             },
             mask_ok: false,
@@ -2109,6 +2402,7 @@ impl<'a> Lower<'a> {
                     let tb = bits(self, total);
                     let c = self.cur;
                     let (lo, _) = self.exchange_halves(c, tb);
+                    let c = self.cur;
                     let lo = back(self, lo);
                     let cl = self.console_lane();
                     let k32 = self.s.m.i32(32);
@@ -2121,6 +2415,7 @@ impl<'a> Lower<'a> {
                     let rb = bits(self, r);
                     let c = self.cur;
                     let (lo, hi) = self.exchange_halves(c, rb);
+                    let c = self.cur;
                     let (lo, hi) = (back(self, lo), back(self, hi));
                     match op {
                         Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
@@ -2330,6 +2625,11 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        // (D3D12 gives a group 32 KiB: a program that uses it all has no room for what two
+        // host waves of a console wave give each other)
+        if self.s.lds_dwords > host_lds_bytes() / 4 {
+            return Err(unsupported(0, "shared memory over 32 KiB with the exchange of the host waves"));
+        }
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -2360,11 +2660,17 @@ impl<'a> Lower<'a> {
             self.rpo[b] = n;
         }
         for (n, &b) in order.iter().enumerate() {
-            self.block[b] = Some(if n == 0 {
+            self.block[b] = Some(if n == 0 && !self.pair_meet {
                 self.s.entry
             } else {
                 self.s.m.new_block()
             });
+        }
+        if self.pair_meet {
+            // (the halves meet inside the program's first block as anywhere, and the function's
+            // first block cannot be split: the program's own starts after it)
+            let first = self.block[order[0]].expect("reachable");
+            self.s.m.terminate(self.s.entry, Term::Br(first));
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
@@ -2377,6 +2683,9 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if super::loop_why() {
+            self.list_loops(&order);
         }
         self.cur = self.s.entry;
         self.find_sections();
@@ -2551,7 +2860,18 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            // Geometry: the id of the primitive it runs for, and which of
+            // its runs for that primitive this is.
+            Input::PrimitiveId | Input::GsInstanceId if self.s.geometry.is_some() => {
+                let (name, opcode) = match input {
+                    Input::PrimitiveId => ("primitiveID.i32", 108),
+                    _ => ("gsInstanceID.i32", 100),
+                };
+                let (entry, i32t) = (self.s.entry, self.s.t.i32);
+                return Val::I32(self.s.op(entry, name, Attr::ReadNone, i32t, opcode, &[]));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
+            Input::GsInstanceId => return Val::Missing("a geometry instance id outside one"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
@@ -2651,6 +2971,12 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
+        self.load_element(self.s.entry, id, col, None)
+    }
+
+    /// [`Lower::load_any_input`] in block `entry`, at `vertex` of the input
+    /// primitive (undefined outside geometry shaders).
+    fn load_element(&mut self, entry: usize, id: usize, col: u8, vertex: Option<u32>) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -2668,12 +2994,14 @@ impl<'a> Lower<'a> {
         } else {
             ".f32"
         };
-        let entry = self.s.entry;
         let args = [
             self.s.m.i32(id as u32),
             self.s.m.i32(0),
             self.s.m.i8(col),
-            self.s.m.undef(self.s.t.i32),
+            match vertex {
+                Some(n) => self.s.m.i32(n),
+                None => self.s.m.undef(self.s.t.i32),
+            },
         ];
         let v = self.s.op(
             entry,
@@ -2690,6 +3018,23 @@ impl<'a> Lower<'a> {
             Val::I32(v)
         } else {
             Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
+        }
+    }
+
+    /// Channel `col` of input element `id` at vertex `vertex` of a geometry
+    /// program's input primitive, read where the program reads it.
+    fn load_gs_input(&mut self, id: usize, col: u8, vertex: u8) -> Result<V, Why> {
+        if self.s.inputs[id].half {
+            // shortcut: 16-bit geometry inputs are not unpacked.
+            return Err("a 16-bit geometry input");
+        }
+        let vertices = self.s.geometry.map_or(0, |gs| gs.input_vertices());
+        if u32::from(vertex) >= vertices {
+            return Err("a geometry input vertex its primitive lacks");
+        }
+        match self.load_element(self.cur, id, col, Some(u32::from(vertex))) {
+            Val::I32(x) => Ok(x),
+            _ => unreachable!("an input element loads as a dword"),
         }
     }
 
@@ -3588,6 +3933,7 @@ impl<'a> Lower<'a> {
                         need(b.unwrap_or(0));
                         return Err(DIVERGENT_MASK_EXCHANGE);
                     }
+                    self.meeting_at(at)?;
                     xy = self.exchange_halves(at, xy.0);
                 }
                 self.ballots.insert(lo, xy);
@@ -4073,6 +4419,7 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
+            Atom::Uniform(v) if self.merged_wave_mask.contains(&v) => Ok(self.s.m.bool(true)),
             Atom::Uniform(v) => match self.get(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
@@ -4099,6 +4446,7 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            Atom::Opaque(v) if self.merged_wave_mask.contains(&v) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -4141,6 +4489,20 @@ impl<'a> Lower<'a> {
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
         self.s.m.store(e, ptr, zero);
+        if self.pair_meet {
+            // The meeting counters of the console waves' halves ([`Self::pair_wait`]): thread
+            // `t` of the first threads zeroes counter `t`, the others a dword past them.
+            let slot = self.exchange.as_ref().map_or(0, |x| x.0);
+            let waves = self.s.threads.map_or(1, |t| t.iter().product::<u32>() / 64);
+            let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+            let n = self.s.m.i32(2 * waves);
+            let mine = self.s.m.cmp(e, pred::IULT, flat, n);
+            let spare = self.s.m.select(e, mine, flat, n);
+            let first = self.s.m.i32(slot + 2 * waves);
+            let at = self.s.m.bin(e, Bin::Add, first, spare);
+            let p = self.s.m.element(e, lds, at);
+            self.s.m.store(e, p, zero);
+        }
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
@@ -4196,6 +4558,101 @@ impl<'a> Lower<'a> {
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// The two host waves of a console wave meet at the end of block `at`: a group barrier
+    /// with an LDS fence, or with `pair_meet` only the two of them, which leaves the other
+    /// console waves of the group free to be elsewhere ([`Self::pair_wait`]).
+    fn meet(&mut self, at: usize) {
+        if self.pair_meet {
+            self.pair_wait(at);
+        } else {
+            self.group_sync(at);
+        }
+    }
+
+    /// Whether the halves can meet at the end of block `at`: not in the first block of the
+    /// function, which has to stay first.
+    fn meeting_at(&self, at: usize) -> Result<(), Why> {
+        if self.pair_meet && at == 0 {
+            return Err("a meeting of the host waves in the entry block");
+        }
+        Ok(())
+    }
+
+    /// The two host waves of this console wave meet, and no one else: LDS writes either made
+    /// before are seen by the other after. Each half counts its meetings in a dword of its own
+    /// (zeroed at the start, `wave_base`), publishes the count after a fence and waits until
+    /// the other half's reaches it. The counts only grow, so a half that is ahead of the other
+    /// by any number of meetings does not hold it up. Both halves run the same meetings (they
+    /// take every branch together, [`Self::wave_wide`]), and the waves of a thread group are
+    /// all on the host at once, so the wait ends. Starts a loop: what the current block holds
+    /// moves to a block ahead of it (`Module::split_before`), and it goes on after the wait.
+    fn pair_wait(&mut self, at: usize) {
+        let slot = self.exchange.as_ref().map_or(0, |e| e.0);
+        let waves = self.s.threads.map_or(1, |t| t.iter().product::<u32>() / 64);
+        let pair = self.exchange_pair(slot);
+        let cl = self.console_lane();
+        let (k5, k1, z) = (self.s.m.i32(5), self.s.m.i32(1), self.s.m.i32(0));
+        let half = self.s.m.bin(at, Bin::LShr, cl, k5);
+        let other = self.s.m.bin(at, Bin::Xor, half, k1);
+        let counters = self.s.m.i32(2 * waves);
+        let first = self.s.m.bin(at, Bin::Add, pair, counters);
+        let mine = self.s.m.bin(at, Bin::Add, first, half);
+        let theirs = self.s.m.bin(at, Bin::Add, first, other);
+        let lds = self.s.lds();
+        let mine = self.s.m.element(at, lds, mine);
+        let theirs = self.s.m.element(at, lds, theirs);
+        // what this half wrote before is in LDS before the count says so
+        self.lds_fence(at);
+        let count = self.s.m.load(at, mine);
+        let count = self.s.m.bin(at, Bin::Add, count, k1);
+        self.s.m.store(at, mine, count);
+        // Everything made so far moves to a block of its own, ahead of the wait, and `at` goes
+        // on after it: no code that holds `at` is left behind the wait.
+        let head = self.s.m.split_before(at);
+        for b in self.block.iter_mut().filter(|b| **b == Some(at)) {
+            *b = Some(head);
+        }
+        let wait = self.s.m.new_block();
+        self.s.m.terminate(head, Term::Br(wait));
+        // (an atomic: the read is made every time round, and sees the other wave's store)
+        let spins = self.s.m.phi(wait, self.s.t.i32);
+        let seen = self.s.m.atomic(wait, Rmw::Or, theirs, z);
+        let ahead = self.s.m.bin(wait, Bin::Sub, seen, count);
+        let behind = self.s.m.cmp(wait, pred::SLT, ahead, z);
+        // The whole host wave goes round together while any lane still sees the other half
+        // behind: lanes that saw its count a moment earlier or later do not part.
+        let i1t = self.s.t.i1;
+        let behind = self.s.op(wait, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[behind]);
+        self.s.flags |= flags::WAVE_OPS;
+        // A half whose other half is gone (it left where this one did not) does not hang the
+        // card: the wait gives up after a while, with what is there, and says so.
+        let next = self.s.m.bin(wait, Bin::Add, spins, k1);
+        let limit = self.s.m.i32(PAIR_SPINS);
+        let early = self.s.m.cmp(wait, pred::IULT, next, limit);
+        let again = self.s.m.bin(wait, Bin::And, behind, early);
+        self.s.m.set_phi(spins, vec![(z, head), (next, wait)]);
+        let (gave_up, note) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(wait, Term::CondBr(again, wait, gave_up));
+        self.s.m.terminate(gave_up, Term::CondBr(behind, note, at));
+        let tag = PROGRAM_TAG.get();
+        if tag != 0 {
+            let faults = self.s.root_uav_handle(super::shader::SLOT_FAULTS);
+            let place = self.s.m.i32((1 + tag % (super::shader::MEMORY_FAULTS - 1)) * 4);
+            let (value, iu) = (self.s.m.i32(tag), self.s.m.undef(self.s.t.i32));
+            let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
+            self.s.op(note, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, value, iu, iu, iu, mask, align]);
+        }
+        self.s.m.terminate(note, Term::Br(at));
+        self.lds_fence(at);
+    }
+
+    /// An LDS fence in `block`, waiting for no one.
+    fn lds_fence(&mut self, block: usize) {
+        let mode = self.s.m.i32(8);
+        let void = self.s.t.void;
+        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
@@ -4225,7 +4682,7 @@ impl<'a> Lower<'a> {
         let lds = self.s.lds();
         let ptr = self.s.m.element(at, lds, index);
         self.s.m.store(at, ptr, mine);
-        self.group_sync(at);
+        self.meet(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at, Bin::Add, pair, one);
         let p0 = self.s.m.element(at, lds, pair);
@@ -4233,7 +4690,7 @@ impl<'a> Lower<'a> {
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
         // the slots are written again only after every thread read them
-        self.group_sync(at);
+        self.meet(at);
         (lo, hi)
     }
 
@@ -4289,6 +4746,7 @@ impl<'a> Lower<'a> {
             need(made.unwrap_or(0));
             return Err(DIVERGENT_MASK_EXCHANGE);
         }
+        self.meeting_at(at)?;
         let some = self.s.m.cast(at, Cast::ZExt, some, i32t);
         let (lo, hi) = self.exchange_halves(at, some);
         let both = self.s.m.bin(at, Bin::Or, lo, hi);
@@ -4406,7 +4864,13 @@ impl<'a> Lower<'a> {
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         match self.x.st.guards[b][i] {
             None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+            Some(g) => {
+                let v = self.boolean(g, self.cur)?;
+                // Merged geometry stages: under the prologue's mask alone,
+                // every host invocation runs it.
+                let all = !self.merged_wave_mask.is_empty() && v == self.s.m.bool(true);
+                Ok((!all).then_some(v))
+            }
         }
     }
 
@@ -4654,22 +5118,19 @@ impl<'a> Lower<'a> {
         // D3D12 caps the outputs of the declared maxima at 32 KiB. Lane n
         // writes only vertex n and primitive n, so maxima past the lanes are
         // never reached: they come down to the lane count when the outputs
-        // do not fit.
-        use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
-        let (outputs, prims) = (&self.s.outputs, &self.s.prims);
-        let fits = |m: super::shader::Mesh| {
-            mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
-        };
-        if !fits(mesh) {
-            mesh.max_vertices = mesh.max_vertices.min(threads);
-            mesh.max_primitives = mesh.max_primitives.min(threads);
-            // shortcut: outputs past the cap even at the lane count are
-            // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
-            // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
-                return Err("a mesh shader whose outputs pass the host's 32 KiB");
-            }
+        // do not fit. What still passes the limit of the host's driver
+        // ([`set_host_mesh_output_bytes`]) is refused.
+        let (max_vertices, max_primitives) = super::container::mesh_maxima(
+            &self.s.outputs,
+            &self.s.prims,
+            (mesh.max_vertices, mesh.max_primitives),
+            threads,
+            u64::from(host_mesh_output_bytes()),
+        )
+        .ok_or("a mesh shader whose outputs pass the host's mesh output limit")?;
+        if (max_vertices, max_primitives) != (mesh.max_vertices, mesh.max_primitives) {
+            mesh.max_vertices = max_vertices;
+            mesh.max_primitives = max_primitives;
             self.s.mesh = Some(mesh);
         }
         let e = self.s.entry;
@@ -5037,20 +5498,60 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        // Merged geometry stages keep vertices in LDS: a geometry program
+        // reads its input primitive's there, and an export or geometry
+        // program writes its outputs there (I/O raising names both).
+        if let Some(&reads) = self.gs_reads.get(&(b, i)) {
+            let reg = dst_reg.ok_or("a geometry input read result")?;
+            for &(n, from) in reads {
+                let (id, col) = self
+                    .find_input(from.row, from.channel)
+                    .ok_or("a geometry input the signature lacks")?;
+                let x = self.load_gs_input(id, col, from.vertex)?;
+                self.write(inst, Reg::V(reg + n), x, guard);
+            }
+            return Ok(());
+        }
+        if let Some(&writes) = self.lds_outputs.get(&(b, i)) {
+            if self.gs_outputs.is_some() {
+                return Ok(());
+            }
+            return self.store_lds_outputs(writes, guard);
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // (With the halves' exchange behind the program's own memory, the accesses past it are
+        // taken as the console takes them: they read 0 and their writes go to a dword nobody
+        // reads. `inside` says which: None where nothing is behind.)
+        let dword = |l: &mut Self, bytes: u32| -> (V, Option<V>) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            let Some((own, sink)) = l.lds_bound else {
+                return (l.s.m.element(c, lds, index), None);
+            };
+            let limit = l.s.m.i32(own);
+            let inside = l.s.m.cmp(c, pred::IULT, index, limit);
+            let sink = l.s.m.i32(sink);
+            let index = l.s.m.select(c, inside, index, sink);
+            (l.s.m.element(c, lds, index), Some(inside))
+        };
+        // A value read from `inside` the program's memory, else 0.
+        let read = |l: &mut Self, x: V, inside: Option<V>| -> V {
+            match inside {
+                Some(inside) => {
+                    let z = l.s.m.i32(0);
+                    l.s.m.select(l.cur, inside, x, z)
+                }
+                None => x,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -5084,7 +5585,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inside) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -5094,6 +5595,7 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
+                let w = read(self, w, inside);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -5155,8 +5657,9 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inside) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let x = read(self, x, inside);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -5180,7 +5683,7 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, _) = dword(self, off);
                 self.s.m.store(self.cur, p, x);
             }
             self.end_guarded(at, &[]);
@@ -5216,7 +5719,7 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, inside) = dword(self, offset);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
@@ -5225,6 +5728,7 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
+            let r = read(self, r, inside);
             if let Some(reg) = dst_reg {
                 self.write(inst, Reg::V(reg), r, None);
             }
@@ -5240,6 +5744,7 @@ impl<'a> Lower<'a> {
                 .cmpxchg(self.cur, p, v0, v1.ok_or("an LDS compare")?),
         };
         let r = self.end_guarded(at, &[(r, outside)])[0];
+        let r = read(self, r, inside);
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
@@ -5358,6 +5863,7 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            || self.gs_ops.contains_key(&(b, i))
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
@@ -5369,9 +5875,7 @@ impl<'a> Lower<'a> {
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
-            let mode = self.s.m.i32(meeting_mode());
-            let void = self.s.t.void;
-            self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            self.lds_meeting();
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -5408,6 +5912,7 @@ impl<'a> Lower<'a> {
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
             }
+            Fields::Sopp { .. } if self.gs_ops.contains_key(&(b, i)) => self.gs_op(b, i),
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
@@ -5453,6 +5958,10 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        if self.pair_meet {
+            self.pair_wait(self.cur);
+            return;
+        }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -5545,6 +6054,81 @@ impl<'a> Lower<'a> {
                         if matches!(g.src.first(), Some(&Operand::Vector { reg, .. })
                             if fl.read(Reg::V(reg)) == lanes))
             })
+    }
+
+    /// A geometry program's stream message: the vertex its output writes
+    /// made is emitted, the strip cut.
+    fn store_lds_outputs(&mut self, writes: &[LdsOutput], guard: Option<V>) -> Result<(), Why> {
+        // Dwords of rows the signature lacks are padding.
+        let mut stores = Vec::new();
+        for out in writes {
+            let found = self.s.outputs.iter().position(|o| {
+                o.row == Some(u32::from(out.row))
+                    && out.channel >= o.col
+                    && out.channel < o.col + o.cols
+            });
+            let Some(id) = found else { continue };
+            if self.s.outputs[id].half {
+                // shortcut: 16-bit outputs (as `export` packs them) are
+                // not followed into LDS.
+                return Err("a 16-bit output of a merged geometry stage");
+            }
+            let x = self.i32_of(out.value)?;
+            stores.push((id, out.channel - self.s.outputs[id].col, out.value, x));
+        }
+        let at = self.begin_guarded(guard);
+        for (id, col, value, x) in stores {
+            let el = &mut self.s.outputs[id];
+            el.usage |= 1 << col;
+            let (suffix, x) = match el.comp {
+                9 => {
+                    let f = match self.floats.get(&value) {
+                        Some(&f) => f,
+                        None => self.as_float(x),
+                    };
+                    (".f32", f)
+                }
+                _ => (".i32", x),
+            };
+            let (id, zero) = (self.s.m.i32(id as u32), self.s.m.i32(0));
+            let args = [id, zero, self.s.m.i8(col), x];
+            let void = self.s.t.void;
+            let name = format!("storeOutput{suffix}");
+            self.s.op(self.cur, &name, Attr::NoUnwind, void, 5, &args);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    fn gs_op(&mut self, b: usize, i: usize) -> Result<(), Why> {
+        let (name, opcode, stream) = match self.gs_ops[&(b, i)] {
+            GsOp::Emit(s) => ("emitStream", 97, s),
+            GsOp::Cut(s) => ("cutStream", 98, s),
+            GsOp::EmitCut(s) => ("emitThenCutStream", 99, s),
+            // The end of the program's output: nothing on the host.
+            GsOp::Done => return Ok(()),
+        };
+        if stream != 0 {
+            // The signature and state declare stream 0 alone.
+            return Err("a geometry output stream other than 0");
+        }
+        let guard = self.guard(b, i)?;
+        if let Some(outputs) = self.gs_outputs.and_then(|plan| plan.get(&(b, i))) {
+            if guard.is_some() {
+                return Err("a lane-guarded emit from a batched GS ring");
+            }
+            for &((wb, wi), ref writes) in outputs {
+                // The original lane mask is part of the ring write.
+                let write_guard = self.guard(wb, wi)?;
+                self.store_lds_outputs(writes, write_guard)?;
+            }
+        }
+        let at = self.begin_guarded(guard);
+        let (stream, void) = (self.s.m.i8(0), self.s.t.void);
+        self.s
+            .op(self.cur, name, Attr::NoUnwind, void, opcode, &[stream]);
+        self.end_guarded(at, &[]);
+        Ok(())
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -6172,6 +6756,11 @@ impl<'a> Lower<'a> {
         let name = inst.name();
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
+        }
+        // The console's vertex ring offsets: the accesses they address are
+        // raised to inputs and outputs, so nothing with an effect reads them.
+        if self.scalar.get(&site).is_some_and(|a| a.param == GS_TABLE) {
+            return Err("the geometry stage's own table");
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
@@ -8812,10 +9401,11 @@ impl<'a> Lower<'a> {
                     self.s.m.store(self.cur, ptr, a);
                     self.end_guarded(at, &[]);
                     let c2 = self.cur;
-                    self.group_sync(c2);
+                    self.meet(c2);
+                    let c2 = self.cur;
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    self.meet(c2);
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -8897,7 +9487,8 @@ impl<'a> Lower<'a> {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
                         let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let (lo, hi) = self.exchange_halves(self.cur, mine);
+                        let c = self.cur;
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
@@ -12477,6 +13068,10 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
+                if super::loop_notes() {
+                    let cut = self.negated(ok);
+                    self.note_cut(t, cut);
+                }
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -12515,9 +13110,20 @@ impl<'a> Lower<'a> {
                 // AMD driver.)
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
+                    if super::loop_notes() {
+                        // (the loop would go on and the limit stops it)
+                        let over = self.negated(ok);
+                        let cut = self.s.m.bin(self.cur, Bin::And, cond, over);
+                        self.note_cut(taken, cut);
+                    }
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
+                    if super::loop_notes() {
+                        let goes_on = self.negated(cond);
+                        let cut = self.s.m.bin(self.cur, Bin::And, goes_on, stop);
+                        self.note_cut(not_taken, cut);
+                    }
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -12547,6 +13153,9 @@ impl<'a> Lower<'a> {
                 }
                 Term::Ret
             }
+            // An export program ends by jumping to the geometry half of its
+            // wave (`s_setpc_b64`): the host's next stage.
+            LaneExit::Indirect if self.x.native.stage == HwStage::Es => Term::Ret,
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
         let _ = Exit::End;
@@ -12561,6 +13170,118 @@ impl<'a> Lower<'a> {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
+    }
+
+    /// `VICTORY_LOOP_WHY=1`: one line on stderr for each loop (see [`super::loop_why`]): its
+    /// number, the header's offset, the stage and the limit in force, how many iterations a
+    /// constant bound allows, and what the body reads from memory (`glc`: a load that waits
+    /// on what other groups write).
+    fn list_loops(&self, order: &[usize]) {
+        let p = self.x.p;
+        let limit = match super::loop_limit() {
+            LOOP_LIMIT if self.s.pixel => 1 << 7,
+            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            LOOP_LIMIT => 1 << 12,
+            named => named,
+        };
+        let stage = if self.s.pixel {
+            "ps"
+        } else if self.s.mesh.is_some() {
+            "ms"
+        } else if self.s.threads.is_some() {
+            "cs"
+        } else {
+            "vs"
+        };
+        for &h in order.iter().filter(|h| self.counters.contains_key(h)) {
+            let mut body = HashSet::from([h]);
+            let mut backs: Vec<usize> = p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                .collect();
+            let tails = backs.clone();
+            while let Some(n) = backs.pop() {
+                if body.insert(n) {
+                    backs.extend(p.blocks[n].preds.iter().copied().filter(|&q| self.block[q].is_some()));
+                }
+            }
+            let (mut loads, mut glc) = (0, 0);
+            for &n in &body {
+                for i in &p.blocks[n].insts {
+                    let name = i.name();
+                    let load = match &i.fields {
+                        Fields::Smem { .. } => true,
+                        Fields::Buffer { .. } | Fields::Image { .. } => name.contains("load") || name.contains("sample"),
+                        Fields::Flat { .. } => name.contains("load"),
+                        _ => false,
+                    };
+                    loads += usize::from(load);
+                    glc += usize::from(load && matches!(&i.fields, Fields::Buffer { cache, .. } if cache.glc));
+                }
+            }
+            // The bound: what the last compare of a block that closes the loop holds against a
+            // register ("const" when one operand is a constant).
+            let mut bound = "none".to_string();
+            for &t in &tails {
+                let cmp = p.blocks[t].insts.iter().rev().find(|i| {
+                    let n = i.name();
+                    n.starts_with("s_cmp") || n.starts_with("v_cmp")
+                });
+                let Some(cmp) = cmp else { continue };
+                let src: &[Operand] = match &cmp.fields {
+                    Fields::Sop { src, .. } => src,
+                    Fields::Valu(v) => &v.src,
+                    _ => continue,
+                };
+                bound = match src.iter().find_map(|o| match o {
+                    Operand::Literal(n) => Some(u64::from(*n)),
+                    Operand::Const(c) if (128..=192).contains(c) => Some(u64::from(*c - 128)),
+                    _ => None,
+                }) {
+                    Some(n) if n > u64::from(limit) => format!("const {n} (over the limit)"),
+                    Some(n) => format!("const {n}"),
+                    None => "register".to_string(),
+                };
+                break;
+            }
+            let id = self.loop_number(h);
+            eprintln!(
+                "LOOP program={:07x} id={id} offset={:#x} stage={stage} limit={limit} bound={bound} loads={loads} glc={glc} blocks={}",
+                PROGRAM_TAG.get() & 0x0FFF_FFFF,
+                p.blocks[h].offset,
+                body.len()
+            );
+        }
+    }
+
+    fn negated(&mut self, x: V) -> V {
+        let t = self.s.m.bool(true);
+        self.s.m.bin(self.cur, Bin::Xor, x, t)
+    }
+
+    /// The number of loop header `to` among the program's (by the order of the blocks).
+    fn loop_number(&self, to: usize) -> u32 {
+        self.counters.keys().filter(|&&h| self.rpo[h] < self.rpo[to]).count() as u32
+    }
+
+    /// Where the faults buffer says that loop `to` reached its iteration limit, when `cut`
+    /// (dword 0 is the sink for the lanes that did not). `VICTORY_LOOP_NOTES=1`.
+    fn note_cut(&mut self, to: usize, cut: V) {
+        let tag = PROGRAM_TAG.get();
+        if tag == 0 {
+            return;
+        }
+        let c = self.cur;
+        let value = LOOP_NOTE | (tag >> 8 & 0x000F_FFFF) << 8 | (self.loop_number(to) & 0xFF);
+        let faults = self.s.root_uav_handle(super::shader::SLOT_FAULTS);
+        let at = self.s.m.i32((1 + value % (super::shader::MEMORY_FAULTS - 1)) * 4);
+        let zero = self.s.m.i32(0);
+        let place = self.s.m.select(c, cut, at, zero);
+        let (value, iu) = (self.s.m.i32(value), self.s.m.undef(self.s.t.i32));
+        let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, value, iu, iu, iu, mask, align]);
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
@@ -12957,6 +13678,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
         .map(|_| ())
     }
@@ -13007,6 +13729,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
     }
 
@@ -13177,7 +13900,9 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+            geometry: None,
+        })
+        .unwrap();
 
         let container =
             crate::Container::parse(&emitted.dxil).unwrap();

@@ -494,6 +494,10 @@ fn retranslate(r: &Replay, into: &std::path::Path) -> Result<()> {
     );
     victory_shader::emit::set_host_max_wave(max_wave);
     victory_shader::emit::set_host_rdna(rdna);
+    if let Some(h) = &host {
+        victory_shader::emit::set_host_lds_bytes(h.lds_bytes);
+        victory_shader::emit::set_host_mesh_output_bytes(h.mesh_output_bytes);
+    }
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();

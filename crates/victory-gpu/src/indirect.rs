@@ -283,13 +283,28 @@ fn widest(amd: bool) -> u32 {
 
 /// Whether `device` is an AMD card's.
 pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x1002
+}
+
+/// The output of a mesh shader (vertex plus primitive) NVIDIA's drivers take, where the DXIL
+/// validator and D3D12's documents say 32 KiB (`set_host_mesh_output_bytes`). An RTX 4060 drew
+/// right up to 46 KiB and lost the device at 48 (`mesh_output_limit_probe`): 40 KiB leaves room
+/// for other cards of the vendor, which are not checked.
+pub(crate) const NVIDIA_MESH_OUTPUT_BYTES: u32 = 40 * 1024;
+
+/// Whether the device is NVIDIA's.
+pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
+    vendor(device) == 0x10DE
+}
+
+fn vendor(device: &ID3D12Device) -> u32 {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
     // SAFETY: plain queries.
     unsafe {
         CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
             .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+            .map_or(0, |d| d.VendorId)
     }
 }
 

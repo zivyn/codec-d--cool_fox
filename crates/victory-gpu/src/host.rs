@@ -999,6 +999,17 @@ fn create() -> windows::core::Result<Host> {
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            // (NVIDIA's cards run 48 KiB of shared memory per thread group, where D3D12 promises
+            // 32: what a console wave split in two host waves gives its halves to exchange
+            // goes above the 32 KiB some programs use whole.)
+            if crate::indirect::nvidia(&device) {
+                victory_shader::emit::set_host_lds_bytes(48 * 1024);
+                // (and mesh shaders whose outputs pass the 32 KiB the DXIL validator allows are
+                // made and drawn right: `mesh_output_limit_probe`)
+                victory_shader::emit::set_host_mesh_output_bytes(
+                    crate::indirect::NVIDIA_MESH_OUTPUT_BYTES,
+                );
+            }
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
@@ -2834,6 +2845,12 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+    late_blocked_counted(runs, true)
+}
+
+/// [`late_blocked`]; `count` whether the kind of read is counted for the
+/// frame line (not when only asking, as [`blocked_cut`] does).
+fn late_blocked_counted(runs: &[&HostList], count: bool) -> Option<usize> {
     let (written, copies) = {
         let line = line();
         if line.written.is_empty() {
@@ -2841,7 +2858,126 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, runs, count).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+}
+
+/// What to do with a submission of several parts ([`joins`]) when preparing
+/// it would wait for flights ([`late_blocked`]): `VICTORY_SPLIT_BLOCKED=1`
+/// sends the parts in front of the first that waits, prepared and sent at
+/// once, and then the rest; `=2` only counts what it would do (the frame
+/// line says), for a run to compare with. Off by default.
+///
+/// Why: a joined submission waits for the flights its worst part reads from
+/// before it does anything (profile sub1, cell, two of four frames: one
+/// submission of 36 lists stood 61 and 117 ms at the start, the card running
+/// the flights it waited for, and then took 55 ms of the thread's work while
+/// the card ran its other work: the two never overlapped). The parts in
+/// front of that one read nothing the flights write; sent first, their
+/// preparing goes on while the flights run, and the card has their lists
+/// sooner.
+///
+/// What it does not change: the order of the lists on the queue (the parts
+/// are the same ones, in the same order, in calls of their own as they were
+/// before they were joined), and the waits (the part that reads from flights
+/// waits for the same ones; the parts before it do not write what it reads,
+/// [`joinable`] saw to that).
+fn split_blocked() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SPLIT_BLOCKED").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Since the last frame-rate line: submissions of several parts that waited
+/// for flights and had parts in front of the wait (split, or in `=2` only
+/// counted), the lists of those parts, and all the lists of those
+/// submissions.
+static BLOCKED_SPLITS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Takes [`BLOCKED_SPLITS`] for the frame-rate line.
+pub(crate) fn take_blocked_splits() -> Option<[u64; 3]> {
+    (split_blocked() > 0).then(|| [0, 1, 2].map(|i| BLOCKED_SPLITS[i].swap(0, Ordering::Relaxed)))
+}
+
+/// Of the places `parts` of a submission begin at (in `order`, ascending, the
+/// first part beginning at 0), the last at which what comes before does not
+/// wait (`waits` of the first `n` places of the order), if the whole of
+/// `len` places waits. What waits only grows with the places taken, so the
+/// parts in front of the first that waits are found by a bisection.
+fn cut_before_wait(parts: &[usize], len: usize, waits: impl Fn(usize) -> bool) -> Option<usize> {
+    if parts.is_empty() || !waits(len) {
+        return None;
+    }
+    let free = parts.partition_point(|&at| !waits(at));
+    free.checked_sub(1).map(|i| parts[i])
+}
+
+/// With `VICTORY_SPLIT_LISTS=1` (and [`split_blocked`]): the cut may also
+/// fall between two lists of a part, not only between parts, so that a
+/// submission of one part, or a part that reads from flights late in its
+/// lists, sends the lists before that read first. It is made only where the
+/// lists behind it are [`joinable`] with those before (none of their CPU
+/// steps reads what those write or copies title memory), and the first half
+/// has at least `VICTORY_SPLIT_MIN` lists (2): the second preparing has the
+/// write watch asked again and a send of its own, about 1 to 3 ms.
+fn split_lists() -> (bool, usize) {
+    static ON: OnceLock<(bool, usize)> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let min = std::env::var("VICTORY_SPLIT_MIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2usize).max(1);
+        (std::env::var_os("VICTORY_SPLIT_LISTS").is_some_and(|v| v == "1"), min)
+    })
+}
+
+/// Of `len` places of an order, the most that can go first, if the whole
+/// waits (`waits` of the first `n` places; it only grows with `n`).
+fn lists_before_wait(len: usize, waits: impl Fn(usize) -> bool) -> Option<usize> {
+    if len < 2 || !waits(len) {
+        return None;
+    }
+    // The least number of places that waits (`len` does): one less goes first.
+    let (mut low, mut high) = (1, len);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if waits(mid) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    (low > 1).then_some(low - 1)
+}
+
+/// Where a submission of `lists` run in `order`, joined from the parts that
+/// begin at `parts`, is to be cut ([`split_blocked`]), if it is.
+fn blocked_cut(lists: &[crate::list::Detached], order: &[usize], parts: &[usize]) -> Option<usize> {
+    let mode = split_blocked();
+    let (by_list, min) = split_lists();
+    if mode == 0 || (parts.is_empty() && !by_list) || !flying() {
+        return None;
+    }
+    let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+    let waits = |n: usize| late_blocked_counted(&runs[..n], false).is_some();
+    let by_part = cut_before_wait(parts, runs.len(), waits);
+    let cut = by_list
+        .then(|| lists_before_wait(runs.len(), waits))
+        .flatten()
+        // Behind it nothing may read what the lists in front write.
+        .filter(|&n| n >= min && joinable(runs[..n].iter().copied(), &runs[n..]))
+        .max(by_part)?;
+    BLOCKED_SPLITS[0].fetch_add(1, Ordering::Relaxed);
+    BLOCKED_SPLITS[1].fetch_add(cut as u64, Ordering::Relaxed);
+    BLOCKED_SPLITS[2].fetch_add(runs.len() as u64, Ordering::Relaxed);
+    (mode == 1).then_some(cut)
+}
+
+/// The places at which parts begin in the two halves of a submission cut at
+/// `cut` (a place where a part begins, which begins the second half).
+fn parts_around(parts: &[usize], cut: usize) -> (Vec<usize>, Vec<usize>) {
+    let first = parts.iter().copied().filter(|&p| p < cut).collect();
+    let second = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+    (first, second)
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
@@ -3762,7 +3898,72 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, cut_before_wait, join_ranges, lists_before_wait, parts_around, split, touches};
+
+    /// Parts of a joined submission (lists 0..12, parts beginning at 3, 5, 9)
+    /// are cut in front of the first that waits, and only if the whole does.
+    #[test]
+    fn a_joined_submission_is_cut_in_front_of_the_part_that_waits() {
+        let parts = [3, 5, 9];
+        // What waits grows with the lists taken: from the list `from` on.
+        let waits = |from: usize| move |n: usize| n > from;
+        // The part at 9 reads from flights (a list at 10): cut at 9.
+        assert_eq!(cut_before_wait(&parts, 12, waits(9)), Some(9));
+        // The part at 5 (list 6): the parts before it go, cut at 5.
+        assert_eq!(cut_before_wait(&parts, 12, waits(5)), Some(5));
+        // The first part itself (a list at 1 or 2): nothing in front of it.
+        assert_eq!(cut_before_wait(&parts, 12, waits(1)), None);
+        assert_eq!(cut_before_wait(&parts, 12, waits(2)), None);
+        // The list at 3 is the first of the second part: the first part
+        // (lists 0..3) goes alone.
+        assert_eq!(cut_before_wait(&parts, 12, waits(3)), Some(3));
+        assert_eq!(cut_before_wait(&parts, 12, waits(4)), Some(3));
+        // Nothing waits, or one part only: no cut.
+        assert_eq!(cut_before_wait(&parts, 12, |_| false), None);
+        assert_eq!(cut_before_wait(&[], 12, |_| true), None);
+        // Waiting from the first list on: nothing is in front of it.
+        assert_eq!(cut_before_wait(&parts, 12, |n| n > 0), None);
+    }
+
+    /// Between lists the cut is the most lists that do not wait, if the whole does.
+    #[test]
+    fn a_submission_is_cut_after_the_last_list_that_does_not_wait() {
+        let waits = |from: usize| move |n: usize| n > from;
+        assert_eq!(lists_before_wait(12, waits(5)), Some(5));
+        assert_eq!(lists_before_wait(12, waits(11)), Some(11));
+        assert_eq!(lists_before_wait(12, waits(0)), None);
+        assert_eq!(lists_before_wait(12, waits(12)), None);
+        assert_eq!(lists_before_wait(1, |_| true), None);
+        assert_eq!(lists_before_wait(2, waits(1)), Some(1));
+    }
+
+    /// Cut at a place where a part begins, the two halves have the parts
+    /// that begin in them, and the lists they run are the whole's, in order.
+    #[test]
+    fn the_halves_of_a_cut_submission_run_the_same_lists_in_the_same_order() {
+        let lists = vec!['a', 'b', 'c', 'd', 'e', 'f'];
+        // The order runs list 4, then 0, 1, 2, 3, 5; parts begin at 2, 4.
+        let order = vec![4, 0, 1, 2, 3, 5];
+        let parts = [2, 4];
+        let cut = 4;
+        let (first, second) = parts_around(&parts, cut);
+        assert_eq!(first, [2]);
+        assert!(second.is_empty());
+        let Ok([(la, oa), (lb, ob)]) = split(lists.clone(), order.clone(), cut) else {
+            panic!("no cut");
+        };
+        let run = |lists: &[char], order: &[usize]| order.iter().map(|&i| lists[i]).collect::<Vec<_>>();
+        let mut both = run(&la, &oa);
+        both.extend(run(&lb, &ob));
+        assert_eq!(both, run(&lists, &order));
+        assert_eq!(run(&la, &oa), ['e', 'a', 'b', 'c']);
+        // A cut in the middle of the parts keeps the later ones, from 0.
+        let (first, second) = parts_around(&[2, 4, 7, 9], 4);
+        assert_eq!((first, second), (vec![2], vec![3, 5]));
+        // A cut inside a part: the part is the second half's first, begun at 0.
+        let (first, second) = parts_around(&[2, 4, 7, 9], 5);
+        assert_eq!((first, second), (vec![2, 4], vec![2, 4]));
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -4678,6 +4879,10 @@ impl Host {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
+            // Copies of buffers only shaders touch, left out of this landing
+            // (`land::quiet`), and those that are brought whole.
+            let mut verdicts: std::collections::HashMap<usize, land::quiet::Verdict> = std::collections::HashMap::new();
+            let mut whole: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
@@ -4695,6 +4900,24 @@ impl Host {
                 let fetched = flagged_pieces(&flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    let verdict = *verdicts.entry(copy).or_insert_with(|| {
+                        let verdict = if land::quiet::on() || crate::readprobe::on() { r.shadow.landing_verdict() } else { land::quiet::Verdict::Land };
+                        if verdict == land::quiet::Verdict::Whole {
+                            whole.push(r.shadow.clone());
+                        }
+                        verdict
+                    });
+                    if verdict == land::quiet::Verdict::Left {
+                        for p in 0..r.span.pieces {
+                            if fetched.binary_search(&(copy, r.span.first + p)).is_ok() {
+                                let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                                land::count(land::stat::QUIET_PIECES, u64::from(lo < hi));
+                                land::count(land::stat::QUIET_BYTES, hi.saturating_sub(lo) as u64);
+                            }
+                        }
+                        crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                        continue;
+                    }
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
@@ -4722,6 +4945,24 @@ impl Host {
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
+            }
+            // A copy that was left out and has been told written in: all of
+            // it comes down (merged as any piece is, only what differs from
+            // the CPU's side goes into title memory).
+            for shadow in &whole {
+                let copy = std::sync::Arc::as_ptr(shadow) as usize;
+                let before = pieces.len();
+                for (lo, hi) in shadow.whole_pieces() {
+                    if seen.insert((copy, lo, hi)) {
+                        pieces.push((shadow.clone(), lo, hi, total));
+                        total += (hi - lo) as u64;
+                    }
+                }
+                tracing::warn!(
+                    start = format_args!("{:#x}", shadow.span().0),
+                    pieces = pieces.len() - before,
+                    "a copy left out of landing (VICTORY_LAND_QUIET) was told written in: it lands whole once and as any other from now on"
+                );
             }
         }
         if land::on() {
@@ -5224,6 +5465,17 @@ impl Host {
                 Ok([(lists, order), (more, behind)]) => {
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+                    self.execute_parts(lists, order, &first);
+                    self.execute_parts(more, behind, &second);
+                }
+                Err((lists, order)) => self.send_late(lists, order, parts),
+            }
+            return;
+        }
+        if let Some(cut) = blocked_cut(&lists, &order, parts) {
+            match split(lists, order, cut) {
+                Ok([(lists, order), (more, behind)]) => {
+                    let (first, second) = parts_around(parts, cut);
                     self.execute_parts(lists, order, &first);
                     self.execute_parts(more, behind, &second);
                 }
@@ -8774,6 +9026,42 @@ struct Meter {
     caption: Option<Vec<u16>>,
 }
 
+/// Diagnostics: the lines of the traffic and of the copies' statistics, with
+/// the memory line (the process's memory, the card's, the census of resources,
+/// queries of the address space: 16 ms of `VirtualQuery` and some 70 ms in
+/// all in one profile) are made by a thread of ours, not by the thread that
+/// presents (`VICTORY_LINES_ASIDE=0`: there, as before). On the thread that
+/// presents, once a second, they stood in the submit thread's critical path
+/// and in every timeline and every ms/frame of a diagnostics run. A build
+/// without diagnostics does not make these lines.
+#[cfg(feature = "diagnostics")]
+fn lines_aside(frames: f64) {
+    static WORKER: OnceLock<Option<std::sync::mpsc::Sender<f64>>> = OnceLock::new();
+    let make = |frames: f64| {
+        traffic::line(frames);
+        crate::copystat::log(frames);
+    };
+    let worker = WORKER.get_or_init(|| {
+        if std::env::var_os("VICTORY_LINES_ASIDE").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<f64>();
+        std::thread::Builder::new()
+            .name("victory-lines".into())
+            .spawn(move || {
+                while let Ok(frames) = rx.recv() {
+                    make(frames);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    match worker {
+        Some(tx) if tx.send(frames).is_ok() => {}
+        _ => make(frames),
+    }
+}
+
 impl Meter {
     fn new() -> Self {
         let now = std::time::Instant::now();
@@ -8937,6 +9225,7 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
             );
             crate::tiles::status();
+            crate::vram::log();
             {
                 let [queued, due, away, partly, oldest] =
                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
@@ -9057,8 +9346,7 @@ impl Meter {
                     put[2] / 1e6,
                     put[3]
                 );
-                traffic::line(self.copy_stats_frames as f64);
-                crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+                lines_aside(std::mem::take(&mut self.copy_stats_frames) as f64);
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
@@ -9768,7 +10056,12 @@ impl Host {
         }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
         match made {
-            Ok(()) => buffer,
+            Ok(()) => {
+                if let Some(b) = &buffer {
+                    crate::vram::prioritize(&self.device, b, size, crate::vram::Class::High);
+                }
+                buffer
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None

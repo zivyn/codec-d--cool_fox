@@ -58,6 +58,8 @@ mod popwatch;
 mod primitive;
 #[cfg(windows)]
 mod priority;
+#[cfg(windows)]
+mod vram;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -91,6 +93,8 @@ pub mod timeline;
 pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
+#[cfg(windows)]
+mod readprobe;
 #[cfg(windows)]
 mod watch;
 #[cfg(windows)]

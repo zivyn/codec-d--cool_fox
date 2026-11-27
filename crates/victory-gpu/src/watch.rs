@@ -1604,6 +1604,32 @@ impl std::hash::Hasher for PageHash {
     }
 }
 
+/// Whether the kernel's write watch holds no written page of 64 KiB block
+/// `block`: `Some(true)`; `Some(false)` if it holds one (the title wrote
+/// and nobody asked); `None` if the block is not memory the kernel watches
+/// (a view of pages, another reservation, memory that is not there). Does not
+/// reset anything.
+pub(crate) fn kernel_block_clean(block: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = [0usize; BLOCK / KERNEL_PAGE];
+    let (mut count, mut granularity) = (found.len(), 0);
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(0, (block * BLOCK) as *const _, BLOCK, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+    } != 0;
+    (!failed).then_some(count == 0)
+}
+
+/// Takes `[at, at + len)` (whole kernel pages) off the kernel's write watch:
+/// what is written there from now on is told written by the next asking, and
+/// what was is not. Only for what we wrote ourselves in a block that was clean
+/// ([`kernel_block_clean`]); a page that is not watched is left as it is.
+pub(crate) fn kernel_reset(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    // SAFETY: a plain call; the kernel refuses what it does not watch.
+    unsafe { ResetWriteWatch(at as *const _, len) };
+}
+
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
     {
@@ -1937,7 +1963,7 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
 fn protect_alias(g: &mut Guards, block: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     g.aliased.insert(block);
     if g.protected.contains(block) {
         return true;
@@ -1957,7 +1983,8 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
         tally(5, 1);
         tally(8, started.elapsed().as_nanos() as u64);
     }
-    if done && matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+    // (A page the read probe armed, `crate::readprobe`, is read-only too.)
+    if done && matches!(old & !PAGE_GUARD, PAGE_READWRITE | PAGE_READONLY) {
         g.protected.insert(block);
         #[cfg(feature = "diagnostics")]
         crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
@@ -1974,7 +2001,7 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
@@ -1988,7 +2015,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 &mut old,
             ) != 0
         };
-        if done && !matches!(old, PAGE_READWRITE | PAGE_READONLY) {
+        if done && !matches!(old & !PAGE_GUARD, PAGE_READWRITE | PAGE_READONLY) {
             // What is there is not for us to guard (code, or memory the
             // title protects itself): as it was.
             // SAFETY: as above.
@@ -2091,7 +2118,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
 
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2106,7 +2133,7 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         // SAFETY: a block we made read-only.
         unsafe {
             if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old, PAGE_READONLY | PAGE_READWRITE)
+                && !matches!(old & !PAGE_GUARD, PAGE_READONLY | PAGE_READWRITE)
             {
                 // Not what we left there: the address is other memory's
                 // (code's, say), which keeps its protection.
@@ -2458,7 +2485,7 @@ fn came_back(at: usize, write: bool) -> bool {
 /// Whether `at` is in a committed page of a view that can be read.
 fn readable_view(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -2467,7 +2494,7 @@ fn readable_view(at: usize) -> bool {
     n != 0
         && info.State == MEM_COMMIT
         && info.Type == MEM_MAPPED
-        && matches!(info.Protect, PAGE_READONLY | PAGE_READWRITE)
+        && matches!(info.Protect & !PAGE_GUARD, PAGE_READONLY | PAGE_READWRITE)
 }
 
 /// Title memory that could not be written with what was to go there (what a
@@ -2665,6 +2692,16 @@ pub(crate) fn install() {
         let _fault = crate::timeline::span("a fault looked at");
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
+        // The first touch of a page the read probe armed (`crate::readprobe`):
+        // noted, and the access goes on. Another guard page is not ours.
+        if r.ExceptionCode == 0x8000_0001u32 as NTSTATUS && r.NumberParameters >= 2 {
+            let write = r.ExceptionInformation[0] == 1;
+            return if crate::readprobe::fault(r.ExceptionInformation[1], r.ExceptionAddress as usize, write) {
+                EXCEPTION_CONTINUE_EXECUTION
+            } else {
+                EXCEPTION_CONTINUE_SEARCH
+            };
+        }
         const READ: usize = 0;
         const WRITE: usize = 1;
         // A fault of our own copies (`crate::safecopy`): whatever it is, if
@@ -2862,6 +2899,13 @@ mod stamp_tests {
 
 #[cfg(test)]
 mod tests {
+    // Tests run in parallel in one process, and address space freed by one is
+    // mapped by another at once. A change of mapping notes the range it
+    // unmaps until it is over (`Guards::changing`), whatever lies there by
+    // then: a view of another test mapped meanwhile is left alone by the
+    // guard and not made read-only (`kernel_reads_into_guarded_blocks_after_
+    // opening` failed so). The runtime maps under the same lock
+    // (`title_memory_remapping`), so the tests that map do too.
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -2916,6 +2960,7 @@ mod tests {
         };
         // SAFETY: a pagefile section of two blocks, mapped read-write.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -2972,6 +3017,7 @@ mod tests {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         // SAFETY: a fresh placeholder, split.
         unsafe {
+            let _map = title_memory_remapping();
             let p = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -3028,6 +3074,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of two blocks, mapped read-write.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -3118,6 +3165,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of a block, mapped read-write.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section =
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
             assert!(!section.is_null());
@@ -3270,6 +3318,7 @@ mod tests {
         // SAFETY: a pagefile section of two blocks, mapped read-write; the
         // view holds it.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
@@ -3323,6 +3372,7 @@ mod tests {
         // SAFETY: a new reserved pagefile section. The view holds its own
         // reference after we close the handle, including on assertion failure.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
@@ -3375,6 +3425,7 @@ mod tests {
         // SAFETY: a fresh placeholder of three blocks and a pagefile
         // section of three; the middle block is mapped first.
         let (p, section) = unsafe {
+            let _map = title_memory_remapping();
             let p = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -3467,6 +3518,7 @@ mod tests {
         // section of two; block 0 shows the section's first block, as the
         // runtime maps physical pages.
         let (p, section) = unsafe {
+            let _map = title_memory_remapping();
             let p = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -3548,6 +3600,7 @@ mod tests {
         // SAFETY: a fresh pagefile section, mapped twice; the views keep
         // the section alive and the handle is closed by the caller.
         unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
@@ -4172,6 +4225,7 @@ mod many_askers_tests {
         const THREADS: usize = 8;
         // SAFETY: views of a section of our own.
         let (section, all): (usize, [usize; VIEWS]) = unsafe {
+            let _map = super::title_memory_remapping();
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -4203,6 +4257,7 @@ mod many_askers_tests {
                         // SAFETY (all): a view of one page of the section,
                         // this thread's alone.
                         let one = unsafe {
+                            let _map = super::title_memory_remapping();
                             MapViewOfFile(section as _, FILE_MAP_WRITE, 0, (page * PAGE) as u32, PAGE).Value as usize
                         };
                         assert_ne!(one, 0);
@@ -4323,6 +4378,7 @@ mod many_askers_tests {
         const BLOCKS: usize = 8;
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
+            let _map = super::title_memory_remapping();
             let at = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -4409,6 +4465,7 @@ mod many_askers_tests {
         const BLOCKS: usize = 12;
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
+            let _map = super::title_memory_remapping();
             let at = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -4497,6 +4554,7 @@ mod many_askers_tests {
     fn bits_go_with_the_guard() {
         // SAFETY: a view of a section of our own, which stays.
         let at = unsafe {
+            let _map = super::title_memory_remapping();
             let section =
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * PAGE) as u32, std::ptr::null());
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize

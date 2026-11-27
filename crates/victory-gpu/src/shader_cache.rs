@@ -66,14 +66,17 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_WIDE",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
+            "VICTORY_PAIR_SYNC",
+            "VICTORY_PAIR_CLAMP",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
-            "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
+            "VICTORY_LOOP_NOTES",
+            "VICTORY_LOOP_WHY",
             "VICTORY_BVH_BOUNDS",
         ] {
             bytes.extend_from_slice(name.as_bytes());

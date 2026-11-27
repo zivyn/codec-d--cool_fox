@@ -279,6 +279,64 @@ pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
     (len / 32 * 32..len).any(|i| unsafe { a.add(i).read_volatile() != b.add(i).read_volatile() })
 }
 
+/// Whether the two slices (of one length) hold the same bytes. With the
+/// processor's 256-bit loads (on by default where there are; `VICTORY_COMPARE_AVX=0`
+/// turns them off) 256 bytes are taken between tests, from both slices at
+/// once; else `==`, which is the C library's `memcmp`. The compare of what shaders wrote to copies
+/// in the PC's memory against their snapshots (172 MB a frame in the cell)
+/// is this, on several threads.
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
+    static AVX: OnceLock<bool> = OnceLock::new();
+    let avx = *AVX.get_or_init(|| {
+        std::env::var_os("VICTORY_COMPARE_AVX").is_none_or(|v| v != "0") && std::arch::is_x86_feature_detected!("avx2")
+    });
+    same_with(a, b, avx)
+}
+
+/// [`same`], with the 256-bit loads or without.
+pub(crate) fn same_with(a: &[u8], b: &[u8], avx: bool) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if !avx {
+        return a == b;
+    }
+    // SAFETY: the processor has AVX2 (the caller asked for it after the
+    // check); both slices hold `len` bytes.
+    unsafe { same_avx2(a.as_ptr(), b.as_ptr(), a.len()) }
+}
+
+/// # Safety
+/// The processor has AVX2; `a` and `b` are `n` bytes that can be read.
+#[target_feature(enable = "avx2")]
+unsafe fn same_avx2(a: *const u8, b: *const u8, n: usize) -> bool {
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_or_si256, _mm256_testz_si256, _mm256_xor_si256};
+    let load = |p: *const u8, at: usize| -> __m256i {
+        // SAFETY: `at + 32 <= n`, by the loops below.
+        unsafe { _mm256_loadu_si256(p.add(at).cast::<__m256i>()) }
+    };
+    let mut at = 0;
+    while at + 256 <= n {
+        let mut any = _mm256_xor_si256(load(a, at), load(b, at));
+        for k in 1..8 {
+            any = _mm256_or_si256(any, _mm256_xor_si256(load(a, at + k * 32), load(b, at + k * 32)));
+        }
+        if _mm256_testz_si256(any, any) == 0 {
+            return false;
+        }
+        at += 256;
+    }
+    while at + 32 <= n {
+        let diff = _mm256_xor_si256(load(a, at), load(b, at));
+        if _mm256_testz_si256(diff, diff) == 0 {
+            return false;
+        }
+        at += 32;
+    }
+    // SAFETY: the bytes behind the blocks.
+    unsafe { std::slice::from_raw_parts(a.add(at), n - at) == std::slice::from_raw_parts(b.add(at), n - at) }
+}
+
 /// Puts `now` at `dst` where it differs from `was`, whole dwords (as `dst`
 /// is aligned) and not a byte beside them: other threads may be writing
 /// those. At the ends, single bytes of a dword only partly in the stretch.
@@ -611,6 +669,25 @@ mod tests {
                 w.join().expect("no write was undone");
             }
         });
+    }
+
+    /// `same` answers as `==` for every length around the loops' steps and
+    /// a difference at every place, with and without the 256-bit loads.
+    #[test]
+    fn same_answers_as_equality_wherever_the_difference_is() {
+        let avx = std::arch::is_x86_feature_detected!("avx2");
+        for len in [0usize, 1, 31, 32, 33, 255, 256, 257, 288, 511, 512, 513, 700] {
+            let a: Vec<u8> = (0..len).map(|i| (i * 7 + 1) as u8).collect();
+            for with in [false, avx] {
+                assert!(same_with(&a, &a.clone(), with), "{len} equal, avx {with}");
+                for at in 0..len {
+                    let mut b = a.clone();
+                    b[at] ^= 0x40;
+                    assert!(!same_with(&a, &b, with), "{len} {at} avx {with}");
+                }
+            }
+        }
+        assert!(!same_with(&[1, 2, 3], &[1, 2], false), "other lengths differ");
     }
 
     #[test]

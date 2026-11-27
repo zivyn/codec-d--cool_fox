@@ -664,7 +664,48 @@ impl Memory {
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
-            if page != 0 {
+            if page >= victory_shader::emit::PAIR_NOTE {
+                // Not a page: the two host waves of a console wave in some program waited for
+                // each other until they gave up (`pair_wait`), and went on without what the
+                // other was to give. Said once for each program.
+                static SAID_PAIR: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+                let mut said = SAID_PAIR.lock().unwrap_or_else(|e| e.into_inner());
+                if !said.contains(&page) {
+                    said.push(page);
+                    tracing::warn!(
+                        program = format!("{:07x}", page & 0x0FFF_FFFF),
+                        "the two host waves of a console wave gave up waiting for each other in a shader (hash starts with `program`)"
+                    );
+                }
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            } else if page >= victory_shader::emit::LOOP_NOTE {
+                // Not a page: a loop of a translated shader reached its iteration limit
+                // (`VICTORY_LOOP_NOTES=1`). The frames it did so in are counted for each
+                // program and loop, and said at the first, then at powers of two.
+                static CUTS: std::sync::Mutex<Vec<(u32, u64)>> = std::sync::Mutex::new(Vec::new());
+                let mut cuts = CUTS.lock().unwrap_or_else(|e| e.into_inner());
+                let frames = match cuts.iter_mut().find(|c| c.0 == page) {
+                    Some(c) => {
+                        c.1 += 1;
+                        c.1
+                    }
+                    None => {
+                        cuts.push((page, 1));
+                        1
+                    }
+                };
+                if frames.is_power_of_two() {
+                    tracing::warn!(
+                        program = format!("{:05x}", page >> 8 & 0x000F_FFFF),
+                        loop_id = page & 0xFF,
+                        frames,
+                        "a shader loop was cut at its limit (hash starts with `program`; `loop_id` is the loop's number in the program, `VICTORY_LOOP_WHY=1` lists them)"
+                    );
+                }
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            } else if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };

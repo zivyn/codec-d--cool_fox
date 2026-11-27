@@ -479,6 +479,10 @@ struct Lower<'a> {
     cur_ir: usize,
     /// The code offset of the instruction being lowered, for `VICTORY_WAVE_WHY`.
     at_offset: usize,
+    /// With `VICTORY_UNIFORM_LOADS=3`: the value a load at a scalar address read in every lane, for
+    /// the register it wrote under a guard (which holds it only in the lanes that ran): a read of
+    /// the first lane of that register is the same read of this, in either host wave.
+    shadow: HashMap<Value, V>,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -2219,6 +2223,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             cur_ir: 0,
             at_offset: 0,
+            shadow: HashMap::new(),
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -9693,7 +9698,20 @@ impl<'a> Lower<'a> {
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
-                let r = if halves && !alike {
+                // (the value a load at a scalar address read in every lane: the same in both host
+                // waves, whichever has a lane in EXEC, so neither needs the other)
+                let shadow = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) if halves && !alike => {
+                        inst.read(Reg::V(reg)).and_then(|x| self.shadow.get(&x).copied())
+                    }
+                    _ => None,
+                };
+                let r = if let Some(shadow) = shadow {
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    self.s.flags |= flags::WAVE_OPS;
+                    self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[shadow])
+                } else if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
@@ -12969,6 +12987,17 @@ impl<'a> Lower<'a> {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
+            // (a load at a scalar address reads one place in every lane, run or not)
+            if uniform_loads() >= 3
+                && guard.is_some()
+                && self.exchange.is_some()
+                && !typed
+                && !*offen
+                && index.is_none()
+                && let Some(new) = inst.write(Reg::V(reg + k as u8))
+            {
+                self.shadow.insert(new, x);
+            }
         }
         Ok(())
     }

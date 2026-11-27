@@ -25,6 +25,10 @@ on:
         description: Tests of the rest of the workspace (with the asset policy)
         type: boolean
         default: false
+      shader_test_binary:
+        description: Build the test program of victory-shader and keep it (to run where a GPU is)
+        type: boolean
+        default: false
       clippy:
         description: Clippy (non-blocking)
         type: boolean
@@ -125,6 +129,32 @@ jobs:
       - name: Summary
         if: ${{ !cancelled() }}
         run: bash .github/scripts/test-summary.sh "victory-shader (4 threads)" "$RUNNER_TEMP/test.log"
+
+  # The test program of victory-shader, built and not run: the tests that need a hardware GPU skip
+  # themselves here, and run where there is one (download the artifact and run it in
+  # crates/victory-shader, with --test-threads=1).
+  shader-test-binary:
+    if: ${{ inputs.shader_test_binary }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - name: Build
+        run: |
+          cargo test -p victory-shader --locked --no-run
+          exe=$(ls -t target/debug/deps/victory_shader-*.exe | head -1)
+          mkdir -p "$RUNNER_TEMP/bin"
+          cp "$exe" "$RUNNER_TEMP/bin/victory_shader_tests.exe"
+          echo "built $exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: victory-shader-tests
+          path: ${{ runner.temp }}/bin/victory_shader_tests.exe
+          retention-days: 3
 
   # Includes xtask's repository_passes_policy (the asset-policy check).
   #

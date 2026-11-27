@@ -6515,7 +6515,8 @@ mod view_cache_tests {
         let mut over: Over<u32> = Over::new();
         // Nothing kept: nothing to begin again, the clock starts.
         assert!(!over.begin(1000, 8));
-        over.map.insert([1, 2, 3], (7, over.slots(8).unwrap()));
+        let at = over.slots(8).unwrap();
+        over.map.insert([1, 2, 3], (7, at));
         assert!(!over.begin(1000 + Over::<u32>::FLUSH_MS - 1, 8));
         assert_eq!(over.map.len(), 1);
         // Old.

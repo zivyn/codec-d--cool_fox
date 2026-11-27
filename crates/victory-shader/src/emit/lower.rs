@@ -3943,6 +3943,7 @@ impl<'a> Lower<'a> {
                         continue;
                     };
                     let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)) else { continue };
+                    eprintln!("MASK-WHY {:indent$}{v:?} is written by {} at {:#x}", "", w.name(), w.machine.offset, indent = depth * 2);
                     for &(reg, r) in &w.reads {
                         let missing = match self.vals.get(&r) {
                             Some(Val::Missing(why)) => Some(*why),

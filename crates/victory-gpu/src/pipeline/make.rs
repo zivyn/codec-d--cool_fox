@@ -74,9 +74,30 @@ fn leave_out() -> &'static [String] {
     })
 }
 
+/// The light in the water's volume, in tiles (`water_shading:CS_TransmissionVolumetrics_Tiled`
+/// and `_Tiled_LocalLights`, the title 1.0.2.1): programs of one 64-lane wave a group, which a
+/// host of 32-lane waves gets in the wave-wide form only (`victory_shader::emit`, 4 and 7
+/// branches taken wave-wide). In that form they leave whole tiles of open water dark, around
+/// boats, along shores and under bridges, and take about 15 ms of the card a frame (RTX 5070,
+/// runs r_water1 and r_water3 of 2026-11-26: 25 fps with them, 30 without, the blocks gone;
+/// fxceless/victory-fork's README of 2026-11-27 names the same two programs and form). Left
+/// out there, the water has no light of its own depth (darker, bluer) and no blocks;
+/// `VICTORY_WATER_LIGHT=1` runs them as before.
+const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
+
+fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+        && victory_shader::emit::host_settings()[0] == 32
+        && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
+}
+
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if !leave_out().is_empty() && shaders.iter().any(|s| leave_out().contains(&s.hash)) {
         return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
+    if water_light_left_out(shaders) {
+        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
     }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {

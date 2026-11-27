@@ -13,7 +13,7 @@
 //! (DLSS mode, frame generation, frame rate, console, picture size), which it
 //! turns into the layer's switches; the others are the switches themselves.
 //!
-//! In every build (the stats panel is in diagnostics builds only). Drawn as
+//! In every build, as the stats panel is. Drawn as
 //! that panel is: white text on a black box, copied onto the swap chain's
 //! buffer, in the middle of the picture.
 
@@ -62,6 +62,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
+    Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
     Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
     // The layer's switches.
@@ -70,6 +71,7 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
     Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
+    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
     Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
     Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
     Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
@@ -106,8 +108,7 @@ fn fps_line() -> Option<String> {
     if !fps_line_on().load(Ordering::Relaxed) {
         return None;
     }
-    // The stats panel has that corner (diagnostics builds, F3).
-    #[cfg(feature = "diagnostics")]
+    // The stats panel has that corner (F3), and says the same.
     if super::panel::shown().load(Ordering::Relaxed) {
         return None;
     }
@@ -336,6 +337,7 @@ impl Menu {
             // Off (0) or the frames shown for each one rendered, from the next present on.
             "VICTORY_MENU_FRAMEGEN" => crate::streamline::set_framegen(value.parse().unwrap_or(0)),
             "VICTORY_FPS_LINE" => fps_line_on().store(value != "0", Ordering::Relaxed),
+            "VICTORY_PANEL" => super::panel::shown().store(value == "1", Ordering::Relaxed),
             _ => {}
         }
     }

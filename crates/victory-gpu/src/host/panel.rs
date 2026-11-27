@@ -1,5 +1,7 @@
-//! Diagnostics: the run's numbers on the picture (`VICTORY_PANEL=1`; off by
-//! default; F3 shows and hides it while our window has the focus): white
+//! The run's numbers on the picture, in every build (`VICTORY_PANEL=1`; off
+//! by default; F3 or the settings menu shows and hides it while our window
+//! has the focus; the time spent recording is counted in diagnostics builds
+//! only): white
 //! text on a black box in the upper left corner of what is shown, so that a
 //! screenshot carries them, with what it costs itself on the submitting
 //! thread. Made again twice a second from the counters of
@@ -28,7 +30,7 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 /// Characters in a line, lines, and the box's rim in dots.
 const COLUMNS: u32 = 40;
-const LINES: u32 = 9;
+const LINES: u32 = 10;
 const RIM: u32 = 3;
 
 /// The texts are put into one of these in turn: the card reads the others,
@@ -116,7 +118,10 @@ const COUNTERS: usize = 11;
 impl Counters {
     fn now() -> Counters {
         use super::{CARD_CLOCK_US, COPY_BACK, PREPARING};
-        use crate::copystat::{C, peek};
+        #[cfg(feature = "diagnostics")]
+        let recording = crate::copystat::peek(crate::copystat::C::RecordNs);
+        #[cfg(not(feature = "diagnostics"))]
+        let recording = 0;
         let get = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
         Counters([
             super::worked(),
@@ -128,7 +133,7 @@ impl Counters {
             get(&COPY_BACK[1]),
             get(&crate::shadow::CARD_STATS[0]),
             crate::draw::dropped_now(),
-            peek(C::RecordNs),
+            recording,
             crate::draw::drawn(),
         ])
     }
@@ -144,19 +149,47 @@ impl Counters {
     }
 }
 
+/// The process's memory in bytes: in physical memory, and committed
+/// (private bytes).
+fn process_memory() -> (u64, u64) {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    (c.WorkingSetSize as u64, c.PagefileUsage as u64)
+}
+
+/// The frame generation line: `per` frames shown for each one rendered.
+fn generated(fps: f64, per: u32) -> String {
+    match per {
+        0 | 1 => "FRAME GEN OFF".to_owned(),
+        per => format!("FRAME GEN {per}X  SHOWN {:.1} FPS", fps * f64::from(per)),
+    }
+}
+
 /// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-    let (working, private) = crate::copystat::process_memory();
+    let (working, private) = process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
+    let fps = 1e3 / ms.max(0.001);
     vec![
-        format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),
+        format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
+        generated(fps, crate::streamline::shown_per_frame()),
         format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
         format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
         format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3),
+        if cfg!(feature = "diagnostics") {
+            format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3)
+        } else {
+            format!("COPY BACK {:.1} MS", c[5] / 1e3)
+        },
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
@@ -302,6 +335,7 @@ impl Panel {
         }
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
+        #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
         let scale = scale(height);
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
@@ -378,6 +412,14 @@ mod tests {
                 assert_ne!(glyph(*a), glyph(*b), "{} {}", *a as char, *b as char);
             }
         }
+    }
+
+    /// The frame generation line fits the box and says what is shown.
+    #[test]
+    fn generated_frames_are_told() {
+        assert_eq!(generated(27.5, 1), "FRAME GEN OFF");
+        assert_eq!(generated(27.5, 6), "FRAME GEN 6X  SHOWN 165.0 FPS");
+        assert!(generated(999.9, 6).len() <= COLUMNS as usize);
     }
 
     #[test]

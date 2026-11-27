@@ -3840,7 +3840,6 @@ mod card_steps;
 pub(crate) mod indirects;
 mod font;
 mod menu;
-#[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
 mod send;
@@ -9233,7 +9232,7 @@ struct Presenter {
     hwnd: HWND,
     meter: Meter,
     composer: Option<crate::compose::Composer>,
-    #[cfg(feature = "diagnostics")]
+    /// The numbers panel (F3), in every build.
     panel: panel::Panel,
     /// The F1 settings menu.
     menu: menu::Menu,
@@ -9271,7 +9270,6 @@ impl Meter {
     }
 
     /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
     fn line_due(&self) -> bool {
         self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
@@ -9971,7 +9969,6 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
             p.menu.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
@@ -10033,7 +10030,6 @@ impl Host {
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
             p.menu.frame();
             p.meter.frame(p.hwnd);
@@ -10122,7 +10118,6 @@ impl Host {
                 hwnd,
                 meter: Meter::new(),
                 composer: None,
-                #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
                 menu: menu::Menu::new(),
             })

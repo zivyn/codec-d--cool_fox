@@ -1120,7 +1120,8 @@ mod tests {
         assert!(!super::wide_first(&c, ""));
         assert!(!super::wide_first(&c, " , ,"));
         // The default list, `none`, and an empty value.
-        let scan = Container::parse(&crate::dxbc::build(&[(FourCC(*b"ILDN"), b"\x10\0\0\0queue:CS_ScanMip3_ab\0".as_slice())])).unwrap();
+        let scan_bytes = crate::dxbc::build(&[(FourCC(*b"ILDN"), b"\x10\0\0\0queue:CS_ScanMip3_ab\0".as_slice())]);
+        let scan = Container::parse(&scan_bytes).unwrap();
         assert!(super::wide_first(&scan, super::wide_first_names(None)));
         assert!(!super::wide_first(&scan, super::wide_first_names(Some("none"))));
         assert!(!super::wide_first(&scan, super::wide_first_names(Some(""))));

@@ -35,6 +35,38 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Gives the title's settings file the frame rate `VICTORY_TARGET_FPS` names,
+/// if it is set (`victory_game::fps`).
+#[cfg(windows)]
+fn retarget_fps(storage: &Path) {
+    use victory_game::fps::{Applied, ENV, apply, parse, refreshes};
+    let Ok(asked) = std::env::var(ENV) else {
+        return;
+    };
+    let Some(fps) = parse(Some(&asked)) else {
+        eprintln!("{ENV}={asked}: not 15, 20, 30 or 60, left alone");
+        return;
+    };
+    match apply(storage, fps) {
+        Ok(Applied::Changed) => println!(
+            "target fps     {fps} (settings file rewritten: {} refreshes a frame; the original is kept beside it)",
+            refreshes(fps)
+        ),
+        Ok(Applied::Same) => println!("target fps     {fps} (settings file has it already)"),
+        Ok(Applied::NoFile) => println!(
+            "target fps     {fps} requested, but the title has written no settings file yet: run once, then again"
+        ),
+        Ok(Applied::Unreadable(key)) => {
+            eprintln!(
+                "target fps     {fps} requested, but the settings file has no single `{key}` element: left alone"
+            );
+        }
+        Err(e) => eprintln!(
+            "target fps     {fps} requested, but the settings file could not be written: {e}"
+        ),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -96,6 +128,9 @@ pub fn run(
         storage.display(),
         title.storage_bytes >> 20
     );
+    // `VICTORY_TARGET_FPS=<fps>`: the title's settings file asks for that
+    // frame rate (`victory_game::fps`).
+    retarget_fps(&storage);
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;

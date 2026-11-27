@@ -479,6 +479,10 @@ struct Lower<'a> {
     cur_ir: usize,
     /// The code offset of the instruction being lowered, for `VICTORY_MASK_WHY`.
     at_offset: usize,
+    /// With `VICTORY_UNIFORM_LOADS=3`: the value a load at a scalar address read in every lane, for
+    /// the register it wrote under a guard (which holds it only in the lanes that ran): a read of
+    /// the first lane of that register is the same read of this, in either host wave.
+    shadow: HashMap<Value, V>,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -649,7 +653,14 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
+///
+/// With `loads` ([`uniform_loads`]) the reads of the walk of a chain through memory too: every LDS
+/// read at an address the lanes hold alike (`ds_read2_b32` and the other widths as well as
+/// `ds_read_b32`), and, from level 2, every `buffer_load_dword*` whose address is made of scalars
+/// and such values (it reads one place, which all lanes of a host wave get; of the two host waves
+/// of a console wave the second may read a moment later, so a buffer something writes while the
+/// walk goes on is not one for this).
+fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool, loads: u32) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
@@ -679,9 +690,29 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -
                     addr: Some(Operand::Vector { reg, dwords: 1 }),
                     gds: false,
                     ..
-                } if ordered_lds && name == "ds_read_b32" => {
+                } if ordered_lds
+                    && (name == "ds_read_b32"
+                        || loads >= 1
+                            && name.starts_with("ds_read")
+                            && !name.contains("permute")
+                            && !name.ends_with("_d16")
+                            && !name.ends_with("_d16_hi")) =>
+                {
                     if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a)) {
                         same.extend(inst.writes.iter().map(|w| w.1));
+                    }
+                    continue;
+                }
+                Fields::Buffer { offen, idxen, .. } if loads >= 2 && name.starts_with("buffer_load_dword") => {
+                    // (the address VGPR, if the instruction uses one, alike in every lane)
+                    let address = !*offen && !*idxen
+                        || inst
+                            .reads
+                            .iter()
+                            .filter(|r| matches!(r.0, Reg::V(_)))
+                            .all(|r| same.contains(&r.1));
+                    if address {
+                        same.extend(inst.writes.iter().filter(|w| matches!(w.0, Reg::V(_))).map(|w| w.1));
                     }
                     continue;
                 }
@@ -1031,6 +1062,26 @@ pub(super) fn pair_meet_on() -> bool {
 
 /// How many times a half asks for the other half's count before it goes on ([`Lower::pair_wait`]).
 const PAIR_SPINS: u32 = 1 << 24;
+
+/// `VICTORY_UNIFORM_LOADS`: 0 (default) nothing; 1 the LDS reads at addresses the lanes hold alike are
+/// alike in every lane of a console wave run as two host waves, whatever their width; 2 the loads
+/// from buffers at such addresses too ([`lane_uniform`]). A read of the first lane of such a value
+/// then needs nothing from the other host wave, where a walk down a chain of blocks (one load and
+/// one first-lane read for each) paid a meeting of the two for each.
+pub(super) fn uniform_loads() -> u32 {
+    #[cfg(test)]
+    if let Some(level) = TEST_UNIFORM_LOADS.get() {
+        return level;
+    }
+    static LEVEL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_UNIFORM_LOADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`uniform_loads`], for its thread only.
+    pub(super) static TEST_UNIFORM_LOADS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
 
 /// `VICTORY_PAIR_LEAN=0` leaves the cheaper meetings out ([`Lower::lean`]).
 fn pair_lean_on() -> bool {
@@ -2144,7 +2195,7 @@ impl<'a> Lower<'a> {
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0)
+                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0, uniform_loads())
                 }
                 _ => HashSet::new(),
             },
@@ -2191,6 +2242,7 @@ impl<'a> Lower<'a> {
                 .collect(),
             cur_ir: 0,
             at_offset: 0,
+            shadow: HashMap::new(),
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -4939,6 +4991,9 @@ impl<'a> Lower<'a> {
             let lo = self.s.m.select(at, upper, z, mine);
             let hi = self.s.m.select(at, upper, mine, z);
             return (lo, hi);
+        }
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("WAVE64-EXCHANGE at {:#x} (IR block {})", self.at_offset, self.cur_ir);
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
@@ -9783,7 +9838,20 @@ impl<'a> Lower<'a> {
                     _ => true,
                 };
                 let halves = self.exchange.as_ref().is_some_and(|e| !e.1) && !self.local;
-                let r = if halves && !alike {
+                // (the value a load at a scalar address read in every lane: the same in both host
+                // waves, whichever has a lane in EXEC, so neither needs the other)
+                let shadow = match v.src.first() {
+                    Some(&Operand::Vector { reg, .. }) if halves && !alike => {
+                        inst.read(Reg::V(reg)).and_then(|x| self.shadow.get(&x).copied())
+                    }
+                    _ => None,
+                };
+                let r = if let Some(shadow) = shadow {
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    self.s.flags |= flags::WAVE_OPS;
+                    self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[shadow])
+                } else if halves && !alike {
                     if !self.all_lanes(self.cur_ir) {
                         // shortcut: `VICTORY_FIRSTLANE_OWN=1` takes the host wave's own
                         // first lane, exact when the value is the same in every lane of
@@ -13059,6 +13127,17 @@ impl<'a> Lower<'a> {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
             self.write(inst, Reg::V(reg + k as u8), x, guard);
+            // (a load at a scalar address reads one place in every lane, run or not)
+            if uniform_loads() >= 3
+                && guard.is_some()
+                && self.exchange.is_some()
+                && !typed
+                && !*offen
+                && index.is_none()
+                && let Some(new) = inst.write(Reg::V(reg + k as u8))
+            {
+                self.shadow.insert(new, x);
+            }
         }
         Ok(())
     }

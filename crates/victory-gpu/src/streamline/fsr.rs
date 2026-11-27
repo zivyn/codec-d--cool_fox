@@ -876,17 +876,16 @@ mod tests {
         assert_eq!(size_of::<PrepareV2>(), 232);
     }
 
-    fn facts(dlss: bool, dlss_fg_supported: bool, fsr_loaded: bool, series_s: bool) -> super::super::Facts {
+    fn facts(dlss: bool, dlss_fg_supported: bool, fsr_loaded: bool, _series_s: bool) -> super::super::Facts {
         super::super::Facts {
             adapter: "NVIDIA GeForce RTX 3080".into(),
-            series_s,
             no_dlss: if dlss { None } else { Some(super::super::NoDlss::Card) },
             files_missing: false,
             dlss_fg_asked: true,
             dlss_fg_supported,
             fsr_asked: true,
             fsr_loaded,
-            fsr_needs_series_s: !series_s && !dlss,
+            fsr_needs_dlss: !dlss,
         }
     }
 
@@ -916,9 +915,11 @@ mod tests {
         // RTX 20/30 on Series X with DLSS: FSR 3 instead, 2X.
         let rtx30 = lines(facts(true, false, true, false), false, true);
         assert!(rtx30.contains("NOT ON THIS CARD") && rtx30.contains("FSR 3") && rtx30.contains("2X"));
-        // No DLSS at all, Series X: FSR 3 needs Series S.
-        let amd_x = lines(facts(false, false, false, false), false, false);
-        assert!(amd_x.contains("HAS NO DLSS") && amd_x.contains("SERIES S"), "{amd_x}");
+        // No DLSS at all, either console: FSR 3 stays off, as the title stops without DLSS.
+        for series_s in [false, true] {
+            let amd = lines(facts(false, false, false, series_s), false, false);
+            assert!(amd.contains("HAS NO DLSS") && amd.contains("NEEDS DLSS"), "{amd}");
+        }
         // A card with DLSS, only turned off: say so, not "this card".
         let mut off = facts(false, true, false, false);
         off.no_dlss = Some(super::super::NoDlss::TurnedOff);
@@ -929,8 +930,6 @@ mod tests {
         missing.files_missing = true;
         let missing = lines(missing, false, false);
         assert!(missing.contains("FILES NOT FOUND") && !missing.contains("THIS CARD"), "{missing}");
-        // No DLSS, Series S: FSR 3 runs.
-        assert!(lines(facts(false, false, true, true), false, true).contains("RUNS WITHOUT DLSS"));
         // Nothing asked: nothing said.
         let mut quiet = facts(true, true, true, false);
         (quiet.dlss_fg_asked, quiet.fsr_asked) = (false, false);

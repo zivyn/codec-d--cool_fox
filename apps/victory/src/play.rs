@@ -660,18 +660,33 @@ pub(crate) fn get_d3d12() -> Result<()> {
 /// Microsoft's newer runtime is fetched beside this program, after asking.
 /// Below 6.6 every pipeline is refused and the title closes within seconds,
 /// so a start that still cannot run it stops here, saying why.
+///
+/// On Windows 10 the runtime is fetched even where its own reports 6.6 or
+/// more (an up-to-date driver says 6.8): Windows 10's own Direct3D 12
+/// refuses the root signatures the translated shaders need (descriptor
+/// heaps indexed directly), and the title closed a second after its first
+/// frame (2026-11-27, Windows 10 21H2 LTSC with an RTX 4060, issue #290;
+/// #123 and discussion #186 found the same refusal).
 fn check_shader_model() -> Result<()> {
     let needed = victory_hle::streamline::SHADER_MODEL_NEEDED;
     let Some(found) = shader_model() else { return Ok(()) };
-    if found >= needed {
-        return Ok(());
-    }
     let to = d3d12_dir()?;
     let had = to.join("D3D12Core.dll").is_file();
+    let windows_10 = !had && crate::windows_build().is_some_and(|build| build < 22000);
+    if found >= needed && !windows_10 {
+        return Ok(());
+    }
     if !had {
-        println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
-        println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
-        println!("runs 6.6. It is Microsoft's own, under Microsoft's licence, from nuget.org (about 22 MB, once),");
+        if found < needed {
+            println!("This PC's Direct3D 12 runs shader model {}.{}, and the game's translated shaders need 6.6.", found.0, found.1);
+            println!("Windows 10's own Direct3D 12 stops at 6.5; Microsoft's newer runtime (the D3D12 Agility SDK)");
+            println!("runs 6.6.");
+        } else {
+            println!("This is Windows 10: its own Direct3D 12 refuses root signatures the game's translated shaders");
+            println!("need, and the game would close at the start. Microsoft's newer runtime (the D3D12 Agility SDK)");
+            println!("takes them.");
+        }
+        println!("It is Microsoft's own, under Microsoft's licence, from nuget.org (about 22 MB, once),");
         println!("and goes into {}.", to.display());
         let yes = if std::io::stdin().is_terminal() {
             print!("Download it now? [Y/n] ");
@@ -701,6 +716,11 @@ fn check_shader_model() -> Result<()> {
                 Err(e) => println!("{e:#}"),
             }
         }
+    }
+    if found >= needed {
+        println!("Starting with Windows 10's own Direct3D 12: the game may close at the start.");
+        println!("`victory get-d3d12` fetches Microsoft's newer runtime later.");
+        return Ok(());
     }
     let now = shader_model().unwrap_or(found);
     anyhow::bail!(

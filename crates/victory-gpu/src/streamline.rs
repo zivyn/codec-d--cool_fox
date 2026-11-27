@@ -346,25 +346,27 @@ pub fn init(asked: &Asked) -> Available {
     } else {
         Some(NoDlss::Card)
     };
-    // FSR 3 frame generation needs the title's upscaling to run: on Series X that is DLSS's
-    // (the title's own FidelityFX takes the Series S sizes only, and the title fails without it).
-    let fsr_needs_series_s = asked.fsr_framegen && !asked.series_s && !available.dlss;
-    if fsr_needs_series_s {
+    // FSR 3 frame generation needs DLSS for the upscaling, on either console. On Series X the
+    // title's own FidelityFX takes the Series S sizes only and the title fails without DLSS; on
+    // Series S, with its own FidelityFX upscaler running beside our frame generation, the title
+    // stopped on a check (0x80000003 at +0x2219650) seconds into the start (2026-11-27: muted
+    // runs here, issues #272, #308 and #331; with DLSS on, both consoles ran).
+    let fsr_needs_dlss = asked.fsr_framegen && !available.dlss;
+    if fsr_needs_dlss {
         tracing::warn!(
-            "FSR 3 frame generation stays off: on Series X it needs DLSS for the upscaling, which this card or these files do not give; the Series S profile runs it"
+            "FSR 3 frame generation stays off: it needs DLSS for the upscaling, which is off, or this card or these files do not give; without it the title stops at the start"
         );
     }
-    let fsr_framegen = asked.fsr_framegen && !fsr_needs_series_s && fsr::init(&asked.fidelityfx_dir);
+    let fsr_framegen = asked.fsr_framegen && !fsr_needs_dlss && fsr::init(&asked.fidelityfx_dir);
     let _ = FACTS.set(Facts {
         adapter: default_adapter().map(|a| a.0).unwrap_or_default(),
-        series_s: asked.series_s,
         no_dlss,
         files_missing,
         dlss_fg_asked: asked.framegen,
         dlss_fg_supported: available.framegen,
         fsr_asked: asked.fsr_framegen,
         fsr_loaded: fsr_framegen,
-        fsr_needs_series_s,
+        fsr_needs_dlss,
     });
     Available { fsr_framegen, ..available }
 }
@@ -372,7 +374,6 @@ pub fn init(asked: &Asked) -> Available {
 /// What the start found out about frame generation on this card ([`notice`]).
 struct Facts {
     adapter: String,
-    series_s: bool,
     /// Why DLSS upscaling is not running (`None`: it runs).
     no_dlss: Option<NoDlss>,
     /// Streamline's files did not load (nothing is known of the card).
@@ -381,7 +382,8 @@ struct Facts {
     dlss_fg_supported: bool,
     fsr_asked: bool,
     fsr_loaded: bool,
-    fsr_needs_series_s: bool,
+    /// FSR 3 frame generation was asked and stays off: DLSS upscaling is not running.
+    fsr_needs_dlss: bool,
 }
 
 /// Why DLSS upscaling is not running: the notice must not blame a card that
@@ -448,22 +450,13 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
         } else {
             "FRAME GEN: AMD FSR 3 (CHOSEN IN F1), 2X AT MOST".into()
         });
-        if !f.series_s {
-            lines.push("SERIES X WITH FSR 3 NEEDS DLSS UPSCALING (ON)".into());
-        } else if f.no_dlss.is_some() {
-            lines.push("SERIES S MODE: FSR 3 RUNS WITHOUT DLSS".into());
-        }
-    } else if f.fsr_needs_series_s {
-        lines.push("FRAME GEN OFF: FSR 3 ON SERIES X NEEDS DLSS ON".into());
+        lines.push("FSR 3 FRAME GEN NEEDS DLSS UPSCALING (ON)".into());
+    } else if f.fsr_needs_dlss {
+        lines.push("FRAME GEN OFF: FSR 3 NEEDS DLSS UPSCALING ON".into());
         lines.push(match f.no_dlss {
             Some(NoDlss::FilesMissing) => "NVIDIA DLSS FILES NOT FOUND (VICTORY_STREAMLINE_DIR)",
             Some(NoDlss::Card) => "THIS CARD HAS NO DLSS UPSCALING",
             _ => "DLSS UPSCALING IS OFF: TURN IT ON IN F1 > DLSS",
-        }.into());
-        lines.push(if f.no_dlss == Some(NoDlss::Card) {
-            "USE F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
-        } else {
-            "OR F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
         }.into());
     } else if f.fsr_asked && !f.fsr_loaded {
         lines.push("FRAME GEN OFF: AMD FSR 3 FILES NOT FOUND".into());

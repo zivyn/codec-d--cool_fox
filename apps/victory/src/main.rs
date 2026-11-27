@@ -111,6 +111,32 @@ fn os_runtime() -> u32 {
         .map_or(4, |v| v.min(614))
 }
 
+/// Windows' build number (19045 is Windows 10 22H2, 22000 and up Windows
+/// 11), from `RtlGetVersion`, which no compatibility shim changes.
+/// `VICTORY_WINDOWS_BUILD` stands in for it (to try Windows 10's path).
+#[cfg(windows)]
+pub(crate) fn windows_build() -> Option<u32> {
+    if let Some(build) = std::env::var("VICTORY_WINDOWS_BUILD").ok().and_then(|v| v.trim().parse().ok()) {
+        return Some(build);
+    }
+    #[repr(C)]
+    struct OsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfo) -> i32;
+    }
+    let mut info = OsVersionInfo { size: size_of::<OsVersionInfo>() as u32, major: 0, minor: 0, build: 0, platform: 0, service_pack: [0; 128] };
+    // SAFETY: `info` is an OSVERSIONINFOW with its size set, as RtlGetVersion takes.
+    (unsafe { RtlGetVersion(&mut info) } == 0).then_some(info.build)
+}
+
 /// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
 /// beside this program, or for its own runtime where there is none. First
 /// thing in `main`, and again after `victory play` fetched the file: Windows

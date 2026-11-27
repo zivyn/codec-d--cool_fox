@@ -1,0 +1,32 @@
+# Asks for the logs when a new issue has none: no attached file and no pasted log lines.
+name: needs-logs
+on:
+  issues:
+    types: [opened]
+permissions:
+  issues: write
+jobs:
+  ask:
+    if: github.event.issue.user.login != github.repository_owner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          REPLY: |
+            Please attach both logs from the run that went wrong. Without them we can only guess. Paste `%LOCALAPPDATA%` into the address bar of File Explorer to get there.
+
+            1. The play log, in `%LOCALAPPDATA%\victory\logs\`: the newest `victory-nvidia-play-<date>-<time>-<number>.log` (from `victory.exe`) or `victory-nvidia-<date>-<time>.log` (from the script launcher). The window shows its path at the start, on the line `Log: ...`.
+            2. The crash log: `%LOCALAPPDATA%\VIctory\data\7952987A\crashes.log`, and, if there is one from that run, the newest `victory-<date>-<time>-<number>.crash.log` in `%LOCALAPPDATA%\VIctory\data\7952987A\temp\`.
+
+            Also say which GPU, Windows version (10 or 11)
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+            // An attached file (GitHub's upload links) or pasted log lines count as logs.
+            const attached = /https:\/\/github\.com\/(user-attachments\/files|[^\/\s]+\/[^\/\s]+\/files)\//.test(body);
+            const pasted = /victory_gpu::|victory_hle::|unhandled exception|crashes\.log:|\b(INFO|WARN|ERROR)\s+victory|\.(dll|exe)\+0x[0-9a-f]+|\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d/i.test(body);
+            if (attached || pasted) return;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body: process.env.REPLY,
+            });

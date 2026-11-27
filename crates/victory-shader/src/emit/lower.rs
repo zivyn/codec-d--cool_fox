@@ -1139,10 +1139,18 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 5] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), host_lds_bytes()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, the shared memory of a group and the output
+/// of a mesh shader.
+pub fn host_settings() -> [u32; 6] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        host_lds_bytes(),
+        host_mesh_output_bytes(),
+    ]
 }
 
 thread_local! {
@@ -1156,8 +1164,12 @@ thread_local! {
 /// the program's hash` in the host's list of faults (`MEMORY_FAULTS`).
 pub const PAIR_NOTE: u32 = 0xF000_0000;
 
+/// A loop that reached its iteration limit leaves `LOOP_NOTE | the first five hex digits of the
+/// program's hash << 8 | the loop's number` in the faults buffer (`VICTORY_LOOP_NOTES=1`).
+pub const LOOP_NOTE: u32 = 0xE000_0000;
+
 /// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
-pub(super) fn set_program_tag(container: &[u8]) {
+pub fn set_program_tag(container: &[u8]) {
     let hash = blake3::hash(container);
     let first = u32::from_be_bytes(hash.as_bytes()[..4].try_into().expect("4 bytes"));
     PROGRAM_TAG.set(PAIR_NOTE | first >> 4);
@@ -1169,6 +1181,25 @@ static HOST_LDS_BYTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// 32 KiB unless the host's GPU runs more (NVIDIA's take 48 KiB).
 pub fn set_host_lds_bytes(bytes: u32) {
     HOST_LDS_BYTES.store(bytes.max(32768), std::sync::atomic::Ordering::Relaxed);
+}
+
+static HOST_MESH_OUTPUT_BYTES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(super::container::MESH_OUTPUT_LIMIT as u32);
+
+/// Tells the translator how much output (vertex plus primitive, as the DXIL validator measures
+/// it) a mesh shader may have on the host: D3D12's 32 KiB unless the host's GPU takes more
+/// (NVIDIA's drivers, checked on an RTX 4060). A mesh program that still passes it after its
+/// maxima come down to its lanes is refused with a reason.
+pub fn set_host_mesh_output_bytes(bytes: u32) {
+    HOST_MESH_OUTPUT_BYTES.store(
+        bytes.max(super::container::MESH_OUTPUT_LIMIT as u32),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The output of a mesh shader the host allows ([`set_host_mesh_output_bytes`]).
+pub fn host_mesh_output_bytes() -> u32 {
+    HOST_MESH_OUTPUT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1240,6 +1271,7 @@ pub(super) fn host_max_wave() -> u32 {
 #[cfg(test)]
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
+    pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
@@ -2472,6 +2504,9 @@ impl<'a> Lower<'a> {
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
             }
+        }
+        if super::loop_why() {
+            self.list_loops(&order);
         }
         self.cur = self.s.entry;
         self.find_sections();
@@ -4860,22 +4895,19 @@ impl<'a> Lower<'a> {
         // D3D12 caps the outputs of the declared maxima at 32 KiB. Lane n
         // writes only vertex n and primitive n, so maxima past the lanes are
         // never reached: they come down to the lane count when the outputs
-        // do not fit.
-        use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
-        let (outputs, prims) = (&self.s.outputs, &self.s.prims);
-        let fits = |m: super::shader::Mesh| {
-            mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
-        };
-        if !fits(mesh) {
-            mesh.max_vertices = mesh.max_vertices.min(threads);
-            mesh.max_primitives = mesh.max_primitives.min(threads);
-            // shortcut: outputs past the cap even at the lane count are
-            // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
-            // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
-                return Err("a mesh shader whose outputs pass the host's 32 KiB");
-            }
+        // do not fit. What still passes the limit of the host's driver
+        // ([`set_host_mesh_output_bytes`]) is refused.
+        let (max_vertices, max_primitives) = super::container::mesh_maxima(
+            &self.s.outputs,
+            &self.s.prims,
+            (mesh.max_vertices, mesh.max_primitives),
+            threads,
+            u64::from(host_mesh_output_bytes()),
+        )
+        .ok_or("a mesh shader whose outputs pass the host's mesh output limit")?;
+        if (max_vertices, max_primitives) != (mesh.max_vertices, mesh.max_primitives) {
+            mesh.max_vertices = max_vertices;
+            mesh.max_primitives = max_primitives;
             self.s.mesh = Some(mesh);
         }
         let e = self.s.entry;
@@ -12711,6 +12743,10 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
+                if super::loop_notes() {
+                    let cut = self.negated(ok);
+                    self.note_cut(t, cut);
+                }
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -12749,9 +12785,20 @@ impl<'a> Lower<'a> {
                 // AMD driver.)
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
+                    if super::loop_notes() {
+                        // (the loop would go on and the limit stops it)
+                        let over = self.negated(ok);
+                        let cut = self.s.m.bin(self.cur, Bin::And, cond, over);
+                        self.note_cut(taken, cut);
+                    }
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
+                    if super::loop_notes() {
+                        let goes_on = self.negated(cond);
+                        let cut = self.s.m.bin(self.cur, Bin::And, goes_on, stop);
+                        self.note_cut(not_taken, cut);
+                    }
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -12795,6 +12842,118 @@ impl<'a> Lower<'a> {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
+    }
+
+    /// `VICTORY_LOOP_WHY=1`: one line on stderr for each loop (see [`super::loop_why`]): its
+    /// number, the header's offset, the stage and the limit in force, how many iterations a
+    /// constant bound allows, and what the body reads from memory (`glc`: a load that waits
+    /// on what other groups write).
+    fn list_loops(&self, order: &[usize]) {
+        let p = self.x.p;
+        let limit = match super::loop_limit() {
+            LOOP_LIMIT if self.s.pixel => 1 << 7,
+            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            LOOP_LIMIT => 1 << 12,
+            named => named,
+        };
+        let stage = if self.s.pixel {
+            "ps"
+        } else if self.s.mesh.is_some() {
+            "ms"
+        } else if self.s.threads.is_some() {
+            "cs"
+        } else {
+            "vs"
+        };
+        for &h in order.iter().filter(|h| self.counters.contains_key(h)) {
+            let mut body = HashSet::from([h]);
+            let mut backs: Vec<usize> = p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                .collect();
+            let tails = backs.clone();
+            while let Some(n) = backs.pop() {
+                if body.insert(n) {
+                    backs.extend(p.blocks[n].preds.iter().copied().filter(|&q| self.block[q].is_some()));
+                }
+            }
+            let (mut loads, mut glc) = (0, 0);
+            for &n in &body {
+                for i in &p.blocks[n].insts {
+                    let name = i.name();
+                    let load = match &i.fields {
+                        Fields::Smem { .. } => true,
+                        Fields::Buffer { .. } | Fields::Image { .. } => name.contains("load") || name.contains("sample"),
+                        Fields::Flat { .. } => name.contains("load"),
+                        _ => false,
+                    };
+                    loads += usize::from(load);
+                    glc += usize::from(load && matches!(&i.fields, Fields::Buffer { cache, .. } if cache.glc));
+                }
+            }
+            // The bound: what the last compare of a block that closes the loop holds against a
+            // register ("const" when one operand is a constant).
+            let mut bound = "none".to_string();
+            for &t in &tails {
+                let cmp = p.blocks[t].insts.iter().rev().find(|i| {
+                    let n = i.name();
+                    n.starts_with("s_cmp") || n.starts_with("v_cmp")
+                });
+                let Some(cmp) = cmp else { continue };
+                let src: &[Operand] = match &cmp.fields {
+                    Fields::Sop { src, .. } => src,
+                    Fields::Valu(v) => &v.src,
+                    _ => continue,
+                };
+                bound = match src.iter().find_map(|o| match o {
+                    Operand::Literal(n) => Some(u64::from(*n)),
+                    Operand::Const(c) if (128..=192).contains(c) => Some(u64::from(*c - 128)),
+                    _ => None,
+                }) {
+                    Some(n) if n > u64::from(limit) => format!("const {n} (over the limit)"),
+                    Some(n) => format!("const {n}"),
+                    None => "register".to_string(),
+                };
+                break;
+            }
+            let id = self.loop_number(h);
+            eprintln!(
+                "LOOP program={:07x} id={id} offset={:#x} stage={stage} limit={limit} bound={bound} loads={loads} glc={glc} blocks={}",
+                PROGRAM_TAG.get() & 0x0FFF_FFFF,
+                p.blocks[h].offset,
+                body.len()
+            );
+        }
+    }
+
+    fn negated(&mut self, x: V) -> V {
+        let t = self.s.m.bool(true);
+        self.s.m.bin(self.cur, Bin::Xor, x, t)
+    }
+
+    /// The number of loop header `to` among the program's (by the order of the blocks).
+    fn loop_number(&self, to: usize) -> u32 {
+        self.counters.keys().filter(|&&h| self.rpo[h] < self.rpo[to]).count() as u32
+    }
+
+    /// Where the faults buffer says that loop `to` reached its iteration limit, when `cut`
+    /// (dword 0 is the sink for the lanes that did not). `VICTORY_LOOP_NOTES=1`.
+    fn note_cut(&mut self, to: usize, cut: V) {
+        let tag = PROGRAM_TAG.get();
+        if tag == 0 {
+            return;
+        }
+        let c = self.cur;
+        let value = LOOP_NOTE | (tag >> 8 & 0x000F_FFFF) << 8 | (self.loop_number(to) & 0xFF);
+        let faults = self.s.root_uav_handle(super::shader::SLOT_FAULTS);
+        let at = self.s.m.i32((1 + value % (super::shader::MEMORY_FAULTS - 1)) * 4);
+        let zero = self.s.m.i32(0);
+        let place = self.s.m.select(c, cut, at, zero);
+        let (value, iu) = (self.s.m.i32(value), self.s.m.undef(self.s.t.i32));
+        let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, value, iu, iu, iu, mask, align]);
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no

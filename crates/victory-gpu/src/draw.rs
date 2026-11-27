@@ -3832,6 +3832,9 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
+            if crate::list::replay::on() {
+                crate::list::replay::table(key.0 ^ u64::from(key.1).rotate_left(48) ^ key.2.rotate_left(17));
+            }
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));

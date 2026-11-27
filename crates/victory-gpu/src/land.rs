@@ -62,6 +62,26 @@ fn beside_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_BESIDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether what a piece puts into write-watched memory the title's CPU
+/// cannot write (a default heap) is taken off the watch again
+/// (`VICTORY_LAND_UNWATCH=1`, off by default).
+///
+/// A piece put through the title's own address sets the kernel's dirty bits
+/// of the pages it writes, and the next asking about them tells them
+/// written: the refresh then reads each from title memory and compares it
+/// with the copy that was just given the same bytes (the echo: 59 MB of the
+/// 82 MB a frame the refreshes took in the cell of integ9). Where the 64 KiB
+/// block had no dirty bit before the piece (a title write that was not asked
+/// about yet would be lost with them), the pages the piece wrote are reset
+/// after it, and told to the journal as a landing is beside the guards
+/// ([`Notes::flush`]): the copies of the same memory take them again, the
+/// copy landed through knows it holds them ([`crate::shadow::Shadow::landed`]),
+/// and a write of the title's after the reset sets its bit again.
+pub(crate) fn unwatch_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_UNWATCH").is_some_and(|v| v == "1"))
+}
+
 /// Whether pieces an earlier fetch holds as they are now are left out
 /// ([`Had`]; `VICTORY_LAND_SKIP=1`, off by default: counted either way).
 pub(crate) fn skip_on() -> bool {
@@ -115,8 +135,19 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Pieces and bytes of copies left out ([`super::quiet`]).
+    pub(crate) const QUIET_PIECES: usize = 26;
+    pub(crate) const QUIET_BYTES: usize = 27;
+    /// Direct pieces ([`unwatch_on`]): put where the kernel's write watch was
+    /// clean and reset after; where it was not clean (the title wrote, or
+    /// the memory is not write-watched).
+    pub(crate) const UNWATCHED: usize = 28;
+    pub(crate) const UNWATCH_DIRTY: usize = 29;
+    pub(crate) const UNWATCH_NOT_WATCHED: usize = 30;
+    pub(crate) const COUNT: usize = 31;
 }
+
+pub(crate) mod quiet;
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
 
@@ -193,6 +224,24 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    if unwatch_on() {
+        tracing::info!(
+            "direct pieces per frame (VICTORY_LAND_UNWATCH=1): {:.0} put where the kernel's write watch of their block was clean and taken off it after, {:.0} where it held a write of the title's, {:.0} where the memory is not write-watched (views of pages, guarded)",
+            s[stat::UNWATCHED],
+            s[stat::UNWATCH_DIRTY],
+            s[stat::UNWATCH_NOT_WATCHED],
+        );
+    }
+    crate::readprobe::log();
+    if quiet::on() || s[stat::QUIET_PIECES] > 0.0 {
+        tracing::info!(
+            "left out of landing per frame (VICTORY_LAND_QUIET={}: copies of {} KiB or more in heaps the title's CPU cannot reach, nothing told written there): {:.0} pieces {:.1} MB, not fetched and not merged",
+            u8::from(quiet::on()),
+            quiet::min_bytes() >> 10,
+            s[stat::QUIET_PIECES],
+            mb(s[stat::QUIET_BYTES]),
+        );
+    }
 }
 
 /// Threads kept for landing, and the work they are at.
@@ -486,6 +535,15 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    /// Pages of 4 KiB, over all the pieces of the job, where title memory
+    /// could not be read or written (the pieces' bytes were not all put).
+    pub(crate) missing: u64,
+    /// Pages of 4 KiB, by number, of pieces put into write-watched memory
+    /// that were clean ([`unwatch_on`]): their dirty bits are reset at the
+    /// flush, before they are noted.
+    reset: Vec<usize>,
+    /// The 64 KiB blocks of those pieces.
+    clean: Vec<usize>,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -523,6 +581,15 @@ impl Notes {
             return;
         }
         let noting = std::time::Instant::now();
+        // The kernel's bits of what we wrote, off before it is noted: a write
+        // of the title's after this sets them again.
+        if !self.reset.is_empty() {
+            self.reset.sort_unstable();
+            self.reset.dedup();
+            for run in self.reset.chunk_by(|a, b| a + 1 == *b) {
+                crate::watch::kernel_reset(run[0] * PAGE, run.len() * PAGE);
+            }
+        }
         let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
         TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
         if taken() {
@@ -534,13 +601,16 @@ impl Notes {
                 if !copy.is_null() && through.all(|other| other == copy) {
                     // SAFETY: the job holds its copies until this is done.
                     let copy = unsafe { &*copy };
-                    TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now)), Ordering::Relaxed);
+                    let clean = self.clean.contains(&block);
+                    TAKEN[1].fetch_add(u64::from(copy.landed(block, before, now, clean)), Ordering::Relaxed);
                 }
             }
         }
         self.pages.clear();
         self.spans.clear();
         self.landed.clear();
+        self.reset.clear();
+        self.clean.clear();
         spent(stat::NOTES, noting);
     }
 }
@@ -562,8 +632,10 @@ pub(crate) unsafe fn piece(
     notes: &mut Notes,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
+    // SAFETY: the caller's; the copy, if there is one, is held by the job.
+    let unwatch = unwatch_on() && !copy.is_null() && unsafe { (*copy).unwatched_landing() };
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
+    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), unwatch, copy) }
 }
 
 /// [`piece`], and whether a view of ours is looked for.
@@ -578,6 +650,7 @@ unsafe fn piece_at(
     take: bool,
     notes: &mut Notes,
     beside: bool,
+    unwatch: bool,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     let Some(end) = parts.last().map(|p| p.1) else {
@@ -595,6 +668,9 @@ unsafe fn piece_at(
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
     let base = title / PAGE;
+    // Put where the kernel's write watch of the 64 KiB block was clean, to be
+    // taken off it again ([`unwatch_on`]).
+    let mut unwatched = false;
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
@@ -610,6 +686,18 @@ unsafe fn piece_at(
         };
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
         let (from, to) = (((base + first) * PAGE).max(title), ((base + last + 1) * PAGE).min(title + end));
+        // Looked at before anything is written: a bit that is set now is a
+        // write of the title's that nobody asked about, and stays.
+        if unwatch {
+            match crate::watch::kernel_block_clean(title / BLOCK) {
+                Some(true) => {
+                    unwatched = true;
+                    count(stat::UNWATCHED, 1);
+                }
+                Some(false) => count(stat::UNWATCH_DIRTY, 1),
+                None => count(stat::UNWATCH_NOT_WATCHED, 1),
+            }
+        }
         let opening = std::time::Instant::now();
         crate::watch::landing(from, to - from);
         spent(stat::NOTES, opening);
@@ -650,8 +738,11 @@ unsafe fn piece_at(
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
-            if beside.is_some() {
+            if beside.is_some() || unwatched {
                 let page = (title + from) / PAGE;
+                if unwatched && done.there {
+                    notes.reset.push(page);
+                }
                 // (Two parts in one page.)
                 if notes.pages.last() != Some(&page) {
                     notes.pages.push(page);
@@ -667,6 +758,9 @@ unsafe fn piece_at(
         // block then has two.
         let through = if missing == 0 { copy } else { std::ptr::null() };
         notes.landed.push((title / BLOCK, through));
+        if unwatched {
+            notes.clean.push(title / BLOCK);
+        }
     }
     count(stat::NEW_PIECES, u64::from(new_pages > 0));
     count(stat::PAGES, pages);
@@ -674,6 +768,7 @@ unsafe fn piece_at(
     count(stat::NEW_BLOCKS, blocks);
     count(stat::DWORDS, dwords);
     count(stat::MISSING, missing);
+    notes.missing += missing;
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     dwords * 4

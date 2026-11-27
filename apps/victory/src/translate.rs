@@ -70,6 +70,9 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Mesh programs the validator refuses for their output size alone, which the host's
+    /// driver takes (`VICTORY_HOST_MESH_OUTPUT_KIB`).
+    ms_over_limit: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -131,6 +134,7 @@ impl Tally {
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
+        self.ms_over_limit += other.ms_over_limit;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -270,6 +274,11 @@ pub fn run(
     if let Some(n) = std::env::var("VICTORY_HOST_LDS_KIB").ok().and_then(|v| v.parse::<u32>().ok()) {
         victory_shader::emit::set_host_lds_bytes(n * 1024);
     }
+    // `VICTORY_HOST_MESH_OUTPUT_KIB=64`: as for a card whose mesh shaders may have more output than
+    // the 32 KiB the DXIL validator allows (NVIDIA's, which the runtime says so for).
+    if let Some(n) = std::env::var("VICTORY_HOST_MESH_OUTPUT_KIB").ok().and_then(|v| v.parse::<u32>().ok()) {
+        victory_shader::emit::set_host_mesh_output_bytes(n * 1024);
+    }
     // `VICTORY_HOST_RDNA=1`: as for an AMD RDNA card (`VICTORY_RDNA_FLOAT`).
     victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_some_and(|v| v == "1"));
     let dll = validate.then(Validator::default_path).flatten();
@@ -384,6 +393,13 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if t.ms_over_limit > 0 {
+        println!(
+            "             {} more mesh programs validate but for an output past 32 KiB, which the host takes ({} KiB)",
+            t.ms_over_limit,
+            emit::host_mesh_output_bytes() / 1024
+        );
+    }
     #[cfg(not(windows))]
     anyhow::ensure!(pairs.is_empty(), "VICTORY_PAIRS needs the D3D12 host (Windows)");
     #[cfg(windows)]
@@ -494,6 +510,10 @@ fn translate(
     // The hash a run's log names the shader by (`hash=` in "first bind",
     // "shader does not translate", "host pipeline refused").
     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // (`VICTORY_LOOP_WHY=1` names a program by the start of this hash)
+    if emit::loop_why() {
+        emit::set_program_tag(&bytes);
+    }
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
     // those containers alone.
     static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
@@ -784,6 +804,22 @@ fn check(
                     let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
                     let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
                 }
+            }
+            // (the translator emits a mesh program past the validator's 32 KiB of output only
+            // within the host's limit)
+            if shader.stage == HwStage::Ms
+                && first.contains("output size is greater than 32768")
+                && emit::host_mesh_output_bytes() > 32 * 1024
+            {
+                t.ms_over_limit += 1;
+                if t.list {
+                    t.lines.push(format!(
+                        "{}  validated except its output size (the host takes {} KiB)",
+                        label(),
+                        emit::host_mesh_output_bytes() / 1024
+                    ));
+                }
+                return;
             }
             t.fail(format!("validator: {first}"), label);
         }

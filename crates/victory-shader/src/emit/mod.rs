@@ -102,6 +102,8 @@ mod shader;
 mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
+mod mesh_size_tests;
+#[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
 mod size_tests;
@@ -109,6 +111,8 @@ mod size_tests;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+#[cfg(all(test, windows))]
+mod loop_note_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
@@ -119,7 +123,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{PAIR_NOTE, host_settings, set_host_lds_bytes, set_host_max_wave, set_host_rdna};
+pub use lower::{
+    LOOP_NOTE, PAIR_NOTE, host_mesh_output_bytes, host_settings, set_host_lds_bytes, set_host_max_wave,
+    set_host_mesh_output_bytes, set_host_rdna, set_program_tag,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -183,6 +190,27 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// With `VICTORY_LOOP_NOTES=1` a translated loop that reaches its iteration limit
+/// (`loop_limit`) leaves a note in the faults buffer, which the host says once for each
+/// program and loop and counts by frames; off (the default) the translation is what it was.
+/// Part of the translation: the shader cache keys on it.
+pub fn loop_notes() -> bool {
+    #[cfg(test)]
+    if lower::TEST_LOOP_NOTES.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_NOTES").is_some_and(|v| v == "1"))
+}
+
+/// With `VICTORY_LOOP_WHY=1` the translator prints one line to stderr for each loop of each
+/// program it translates (`LOOP program=<7 hex> id=<n> ...`): the stage, the limit in force,
+/// the bound its exit compares with (a constant, or a register), the loads in its body.
+pub fn loop_why() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_WHY").is_some_and(|v| v == "1"))
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between

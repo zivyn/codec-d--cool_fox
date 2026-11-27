@@ -346,6 +346,8 @@ pub struct HostTranslation {
     pub raw_views: u32,
     /// Shared memory a thread group may have (`set_host_lds_bytes`).
     pub lds_bytes: u32,
+    /// Output of a mesh shader (`set_host_mesh_output_bytes`).
+    pub mesh_output_bytes: u32,
 }
 
 /// The settings the runtime would translate with on this PC's adapter of the
@@ -364,7 +366,13 @@ pub fn host_translation(folder: &Path) -> Result<HostTranslation> {
         )?;
     }
     let rdna = crate::indirect::amd(&device) && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64;
-    let lds_bytes = if crate::indirect::nvidia(&device) { 48 * 1024 } else { 32 * 1024 };
+    let nvidia = crate::indirect::nvidia(&device);
+    let lds_bytes = if nvidia { 48 * 1024 } else { 32 * 1024 };
+    let mesh_output_bytes = if nvidia {
+        crate::indirect::NVIDIA_MESH_OUTPUT_BYTES
+    } else {
+        32 * 1024
+    };
     let (views, raw_views) = crate::descriptor::host::pick_views(|n| {
         crate::descriptor::host::view_heap_fits(&device, n)
     });
@@ -388,6 +396,7 @@ pub fn host_translation(folder: &Path) -> Result<HostTranslation> {
         view_limit: views - 1,
         raw_views,
         lds_bytes,
+        mesh_output_bytes,
     })
 }
 

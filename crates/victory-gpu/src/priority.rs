@@ -76,6 +76,14 @@ pub(crate) fn mode() -> u8 {
     })
 }
 
+/// `VICTORY_TEXTURE_RECLAIM=0`: tiles are never taken back out of a texture
+/// (hot textures are still given levels first). The null mapping of a level
+/// that has tiles is what a card test must have passed.
+pub(crate) fn reclaim_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_RECLAIM").is_none_or(|v| v != "0"))
+}
+
 /// Whether textures are given tiles by priority: levels on demand are on,
 /// and the switch is not 0.
 pub(crate) fn enabled() -> bool {

@@ -232,12 +232,26 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
     Some((h.heap.clone(), index, runs))
 }
 
+/// The pool's heap at `index`, if it is still there.
+fn heap_at(index: usize) -> Option<ID3D12Heap> {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    pool.get(index)?.as_ref().map(|h| h.heap.clone())
+}
+
 /// Gives the runs `runs` of the pool's heap at `index` back; runs that
 /// touch become one. A heap with every tile free goes back to the card,
 /// unless it is the pool's only one. (Called when the texture that held
 /// the tiles is dropped: nothing on the card reads through its mappings
 /// any more, as for any host texture that is dropped.)
 fn give_back(index: usize, runs: &[(u32, u32)]) {
+    give_back_with(index, runs, true);
+}
+
+/// [`give_back`]; `release` false keeps a heap with every tile free: tiles
+/// taken out of a texture that lives ([`Tiled::unmap`]) are still mapped on
+/// the card until the queue has run the null mapping, and a heap must not be
+/// released before that.
+fn give_back_with(index: usize, runs: &[(u32, u32)], release: bool) {
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(h)) = pool.get_mut(index) else {
         return;
@@ -253,7 +267,7 @@ fn give_back(index: usize, runs: &[(u32, u32)]) {
     }
     h.free = joined;
     let all_free = h.free_tiles() == HEAP_TILES;
-    if all_free && pool.iter().flatten().count() > 1 {
+    if release && all_free && pool.iter().flatten().count() > 1 {
         pool[index] = None;
         STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
         STATS[8].fetch_add(1, Ordering::Relaxed);
@@ -859,16 +873,24 @@ impl Tiled {
             };
             let flag = D3D12_TILE_RANGE_FLAG_NULL;
             let start = 0u32;
+            // The heap the subresource's first run lies in is named although
+            // the range is null (ignored then): every other call of this
+            // module names one, and the card test's first run with a null
+            // mapping and no heap ended the process on the card.
+            let heap = given
+                .runs
+                .iter()
+                .find(|run| run.0 == subresource)
+                .and_then(|run| heap_at(run.1));
             // SAFETY: a live reserved texture; one region of the
-            // subresource's `tiles` tiles, on one null range of that many
-            // (no heap is named: every range is null).
+            // subresource's `tiles` tiles, on one null range of that many.
             unsafe {
                 queue.UpdateTileMappings(
                     texture,
                     1,
                     Some(&raw const at),
                     Some(&raw const size),
-                    None::<&ID3D12Heap>,
+                    heap.as_ref(),
                     1,
                     Some(&raw const flag),
                     Some(&raw const start),
@@ -887,7 +909,7 @@ impl Tiled {
                 }
             });
             for (index, runs) in by_heap {
-                give_back(index, &runs);
+                give_back_with(index, &runs, false);
             }
             if subresource < first_packed {
                 given.levels[subresource as usize] = false;
@@ -1033,7 +1055,7 @@ pub(crate) fn pass(headroom: i64) {
     use crate::priority::{
         Holder, KEEP_BYTES, RECLAIM_PASS_BYTES, SCAN_A_PASS, enabled, reclaim_need, reclaim_plan,
     };
-    if !enabled() {
+    if !enabled() || !crate::priority::reclaim_enabled() {
         return;
     }
     finish_retired();
@@ -1953,27 +1975,45 @@ void look() {
     }
 
     fn a_retired_level_gives_its_tiles_back(rig: &mut Rig) {
+        // Each operation is announced before it is made and the queue is
+        // waited for after it (with the debug layer's messages), so that a
+        // process that dies on the card dies in the operation last printed.
         rig.step = "step 8, a level taken back";
+        eprintln!("step 8: a texture of {SIDE}x{SIDE}, {LEVELS} levels, reserved");
         let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
         let (texture, tiled) = rig.reserved(&desc);
+        eprintln!("step 8.1: every level gets its tiles (UpdateTileMappings, {} levels with tiles of their own)", tiled.standard.len());
         rig.give(&tiled, &texture, tiled.every_level());
+        rig.run(|_| {});
         assert!(tiled.whole());
         tiled.held.store(tiled.every_level(), Ordering::Relaxed);
         let before = tiled.given_bytes();
+        eprintln!("step 8.2: level 0 is retired (no GPU call): {} tiles of {} bytes given in all", tiled.standard[0], before);
         let (begun, changed) = tiled.retire(1 << 0);
         assert_eq!((begun, changed), (1, true));
         assert_eq!(tiled.first_shown(), Some(1));
-        // The tiles stay until the mapping is made null.
-        assert_eq!(tiled.given_bytes(), before);
+        assert_eq!(tiled.given_bytes(), before, "the tiles stay until the mapping is made null");
+        eprintln!("step 8.3: level 0's {} tiles are made null (UpdateTileMappings, one region, one null range)", tiled.standard[0]);
         let freed = tiled.unmap(&rig.queue, &texture, 1 << 0);
-        rig.check("tiles taken back");
+        rig.check("the null mapping was recorded");
+        eprintln!("step 8.4: waiting for the queue to run the null mapping");
+        rig.run(|_| {});
         assert_eq!(freed, u64::from(tiled.standard[0]) * TILE);
         assert_eq!(tiled.given_bytes(), before - freed);
         assert!(!tiled.has_tiles(0) && tiled.has_tiles(1));
-        // Taken back for good only once: the level is given again on demand.
+        eprintln!("step 8.5: taken back once only");
         assert_eq!(tiled.unmap(&rig.queue, &texture, 1 << 0), 0);
+        eprintln!("step 8.6: level 0 is given tiles again");
         rig.give(&tiled, &texture, 1 << 0);
+        rig.run(|_| {});
         assert!(tiled.has_tiles(0));
+        eprintln!("step 8.7: a level of the middle taken back while others keep theirs, and the packed block");
+        let (begun, _) = tiled.retire(1 << 2 | tiled.packed_levels(tiled.standard.len() as u32));
+        assert!(begun & (1 << 2) != 0);
+        let freed = tiled.unmap(&rig.queue, &texture, begun);
+        rig.check("the null mapping of a level of the middle and the packed block");
+        rig.run(|_| {});
+        eprintln!("step 8: {freed} bytes of tiles taken back in the last call; done");
     }
 
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.

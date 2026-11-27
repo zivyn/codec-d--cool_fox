@@ -345,7 +345,7 @@ impl Menu {
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
         let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = "NO SETTINGS FILE: START WITH PLAY-FOXHOUND.PS1".to_owned();
+            self.note = "NO SETTINGS FILE: START WITH VICTORY PLAY".to_owned();
             return false;
         };
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
@@ -361,7 +361,7 @@ impl Menu {
             kept.retain(|(k, _)| k != item.var);
             kept.push((item.var.to_owned(), self.values[i].clone()));
         }
-        let mut text = String::from("# Saved by the F1 menu; scripts\\play-foxhound.ps1 applies these over its own settings (an empty value: unset).\r\n");
+        let mut text = String::from("# Saved by the F1 menu; applied over the play settings at every start (an empty value: unset).\r\n");
         for (k, v) in &kept {
             text.push_str(&format!("{k}={v}\r\n"));
         }

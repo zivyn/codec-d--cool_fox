@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod play;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -127,6 +129,16 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Play: the title with this fork's settings, as a start with no
+    /// command at all does (a double click on the program beside the
+    /// title's `game_scarlett_master.exe`). F1 in the game is the settings
+    /// menu, F3 the stats panel.
+    #[cfg(windows)]
+    Play(play::Play),
+    /// Fetch NVIDIA's DLSS and frame generation files from NVIDIA's GitHub
+    /// (about 70 MB) to where `play` looks for them.
+    #[cfg(windows)]
+    GetDlss,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -186,13 +198,35 @@ enum Console {
 }
 
 fn main() -> Result<()> {
-    victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
-    if victory_hle::modules::audio::capture::child() {
-        return Ok(());
+    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some() {
+        victory_core::logging::init("info");
+        if victory_hle::modules::audio::capture::child() {
+            return Ok(());
+        }
     }
-    let cli = Cli::parse();
+    // Started with nothing after its name (a double click): play.
+    let bare = std::env::args_os().len() == 1;
+    let cli = if bare && cfg!(windows) { Cli::parse_from(["victory", "play"]) } else { Cli::parse() };
+    // Play puts its settings into the environment and names its log file
+    // before anything else is set up.
+    #[cfg(windows)]
+    if let Command::Play(options) = &cli.command {
+        let done = play::prepare(options).and_then(|ready| {
+            victory_core::logging::init("info");
+            let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
+            run::run(&ready.exe, Unimplemented::Trap, false, true, console)
+        });
+        if let Err(e) = &done
+            && bare
+        {
+            eprintln!("Error: {e:#}");
+            play::hold_window();
+        }
+        return done;
+    }
+    victory_core::logging::init("info");
     match cli.command {
         Command::Inspect {
             file,
@@ -234,6 +268,10 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Play(_) => unreachable!("handled above"),
+        #[cfg(windows)]
+        Command::GetDlss => play::get_dlss(),
         Command::Run {
             exe,
             unimplemented,

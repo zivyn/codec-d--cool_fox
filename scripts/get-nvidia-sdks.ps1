@@ -4,12 +4,13 @@
 # them, so each person gets them from NVIDIA directly. Get-NVIDIA-DLSS.cmd in the repository's folder runs this.
 # Nothing of NVIDIA's is needed to build the layer: the files are loaded when the game runs.
 param(
-    [string]$StreamlineTag = 'v2.14.16'
+    [string]$StreamlineTag = 'v2.14.16',
+    # Another folder for them than nvidia-sdk here (`victory get-dlss` names one under %LOCALAPPDATA%\victory).
+    [string]$To = ''
 )
 $ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest's progress bar makes it many times slower
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$sdk = Join-Path $root 'nvidia-sdk'
+$sdk = if ($To) { $To } else { Join-Path (Resolve-Path (Join-Path $PSScriptRoot '..')).Path 'nvidia-sdk' }
 $sl = Join-Path $sdk 'Streamline'
 $bin = Join-Path $sl 'bin\x64'
 # What is loaded when the game runs: Streamline's interposer and plugins, DLSS and the frame generation model.
@@ -133,4 +134,4 @@ $still = @($dlls | Where-Object { -not (Test-Path (Join-Path $bin $_)) })
 if ($still) { throw "Not there after all: $($still -join ', ')" }
 Write-Host "  licences: $(Join-Path $sl 'license.txt') (Streamline) and the *.license.txt files in $bin (DLSS, Reflex)"
 Write-Host ''
-Write-Host 'Done. scripts\play-foxhound.ps1 uses them from its next start.'
+Write-Host 'Done. They are used from the next start.'

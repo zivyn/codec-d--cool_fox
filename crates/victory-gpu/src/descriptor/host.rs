@@ -88,9 +88,8 @@ struct Made {
 impl Made {
     const LOCKS: usize = 512;
 
-    fn new(count: usize) -> Self {
-        let mut keys = Vec::new();
-        keys.resize_with(count, Default::default);
+    fn new(count: usize, sparse: bool) -> Self {
+        let keys = super::sparse::words64(count, sparse);
         Made { keys, locks: [const { Mutex::new(()) }; Self::LOCKS] }
     }
 
@@ -111,7 +110,33 @@ impl Made {
     }
 }
 
+/// Host descriptor heaps alive, their bytes in the heap (shader-visible
+/// descriptors, write-combined and not in the working set), and the bytes of
+/// the per-slot arrays beside them in our memory; for the memory line.
+pub(crate) static HEAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// One host heap in [`HEAPS`] while it lives.
+struct HeapCount(u64, u64);
+
+impl HeapCount {
+    fn new(gpu: u64, cpu: u64) -> HeapCount {
+        HEAPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[1].fetch_add(gpu, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[2].fetch_add(cpu, std::sync::atomic::Ordering::Relaxed);
+        HeapCount(gpu, cpu)
+    }
+}
+
+impl Drop for HeapCount {
+    fn drop(&mut self) {
+        HEAPS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[1].fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[2].fetch_sub(self.1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct HostHeap {
+    _alive: HeapCount,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -156,11 +181,11 @@ pub(crate) struct HostHeap {
     /// A lock for each slot: one for the heap was what the recording threads
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
-    kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    kept: super::sparse::Pages<ID3D12Resource>,
     /// With `VICTORY_KEEP_FAST=1`: the address of what each slot of `kept` holds, written under its lock, so that
     /// the draw that shows a slot what it shows already finds that out without taking the lock and touching the
     /// slot's own line (the lock took 3 to 4 % of the list threads' time: nearly every ask is for the same again).
-    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
+    kept: super::sparse::Pages<ID3D12Resource>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1630,7 +1655,14 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let sparse = crate::lean::heap_sparse();
         let h = HostHeap {
+            // The per-slot arrays: a lock and an option of a pointer (24 bytes) per slot kept, 8 per
+            // quick slot, one more word each for what is made.
+            _alive: HeapCount::new(
+                u64::from(size) * u64::from(step),
+                u64::from(count + extra) * 24 + u64::from(count) * 16,
+            ),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,
@@ -1645,15 +1677,15 @@ impl HostHeap {
             written: (0..if sampler || !crate::book::on() { 0 } else { size })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
-            made: Made::new(count as usize),
-            quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            made: Made::new(count as usize, sparse),
+            quick: super::sparse::words64(count as usize, sparse),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
-            kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
             kept_raw: (0..if keep_fast() { count + extra } else { 0 })
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
+            kept: super::sparse::Pages::new((count + extra) as usize, sparse),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1663,9 +1695,7 @@ impl HostHeap {
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::default(),
-            tabled: (0..if sampler { 0 } else { count })
-                .map(|_| std::sync::atomic::AtomicU32::new(0))
-                .collect(),
+            tabled: super::sparse::words32((if sampler { 0 } else { count }) as usize, sparse),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -3057,7 +3087,8 @@ impl HostHeap {
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         use windows::core::Interface;
-        let Some(slot) = self.kept.get(index as usize) else {
+        let slot = if resource.is_some() { self.kept.get(index as usize) } else { self.kept.peek(index as usize) };
+        let Some(slot) = slot else {
             return;
         };
         let raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
@@ -3085,7 +3116,8 @@ impl HostHeap {
     /// of memory they fight over) only if the slot shows another.
     fn keep_ref(&self, index: u32, resource: &Kept) {
         use windows::core::Interface;
-        let Some(slot) = self.kept.get(index as usize) else {
+        let slot = if resource.is_some() { self.kept.get(index as usize) } else { self.kept.peek(index as usize) };
+        let Some(slot) = slot else {
             return;
         };
         let raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
@@ -3123,7 +3155,7 @@ impl HostHeap {
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.kept.peek(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes

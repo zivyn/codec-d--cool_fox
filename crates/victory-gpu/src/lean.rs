@@ -22,6 +22,8 @@
 //!   needed a quarter of them.
 //! - `VICTORY_WINDOW_KB` and `VICTORY_WINDOW_TAILS` (level 2: 1024 and on):
 //!   see `shadow::window`.
+//! - `VICTORY_HEAP_SPARSE` (off; no level turns it on): the per-slot arrays of
+//!   host view heaps take memory for the slots used ([`crate::descriptor::sparse`]).
 //!
 //! `VICTORY_RAM_TOTAL_GB=N` makes the host take the PC for one with N GiB
 //! (for the caps that depend on the size of the PC: [`crate::residency`]),
@@ -84,6 +86,15 @@ pub(crate) fn fetch_trim() -> bool {
     *ON.get_or_init(|| match std::env::var("VICTORY_FETCH_TRIM") {
         Ok(v) => v.trim() != "0",
         Err(_) => level() >= 1,
+    })
+}
+
+/// Whether the per-slot arrays of host view heaps take memory for the slots
+/// used only (`VICTORY_HEAP_SPARSE=1`; not part of the levels).
+pub(crate) fn heap_sparse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SPARSE").is_ok_and(|v| v.trim() != "0" && !v.trim().is_empty())
     })
 }
 

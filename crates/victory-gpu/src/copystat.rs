@@ -735,6 +735,40 @@ fn log_memory_map() {
         groups.len(),
         biggest.join("; ")
     );
+    // Whether the write-combined allocations are ours: the upload buffers
+    // alive ([`crate::sites`]) whose mapping starts inside each.
+    let (mut wc_n, mut wc_bytes, mut wc_ours) = (0u64, 0u64, 0u64);
+    let mut bare: HashMap<usize, (u64, u64)> = HashMap::new();
+    for (base, &(k, bytes)) in &by_allocation {
+        if k != 5 {
+            continue;
+        }
+        let size = whole.get(base).copied().unwrap_or(0);
+        let ours = crate::sites::covered(*base, size);
+        wc_n += 1;
+        wc_bytes += bytes;
+        wc_ours += ours;
+        if ours == 0 {
+            let group = bare.entry(size).or_default();
+            group.0 += 1;
+            group.1 += bytes;
+        }
+    }
+    let mut bare: Vec<(usize, (u64, u64))> = bare.into_iter().collect();
+    bare.sort_by_key(|b| std::cmp::Reverse(b.1.1));
+    let none: u64 = bare.iter().map(|b| b.1.1).sum();
+    let sizes: Vec<String> = bare
+        .iter()
+        .take(8)
+        .map(|(size, (n, bytes))| format!("{n} of {:.2} MB: {} MB", *size as f64 / (1 << 20) as f64, bytes >> 20))
+        .collect();
+    tracing::info!(
+        "memory map, write-combined: {wc_n} allocations {} MB committed; upload buffers of ours alive start in them: {} MB;          the allocations that hold none of ours: {} MB (the driver's: command memory, descriptor heaps, what it keeps), the biggest groups {}",
+        wc_bytes >> 20,
+        wc_ours >> 20,
+        none >> 20,
+        sizes.join("; ")
+    );
     // The mappings at host addresses of 8 MB or more committed, by file (the
     // pipeline library, the driver's caches, our own sections), in MB.
     use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
@@ -1007,6 +1041,17 @@ fn log_memory() {
         totals[1][2],
         mb(totals[1][3]),
         biggest.join("; "),
+    );
+    let heaps: Vec<u64> = crate::descriptor::host::HEAPS.iter().map(|h| h.load(Relaxed)).collect();
+    tracing::info!(
+        "memory, host descriptor heaps alive: {} of {:.0} MB in all (shader visible, write-combined, one for each shader-visible heap          of the title that was used, whatever its own count) and {:.0} MB of per-slot arrays beside them \
+         (VICTORY_HEAP_SPARSE={}: pages of the slots' resources made: {}, {:.0} MB of locks and pointers)",
+        heaps[0],
+        mb(heaps[1]),
+        mb(heaps[2]),
+        u8::from(crate::lean::heap_sparse()),
+        crate::descriptor::sparse::PAGES[0].load(Relaxed),
+        crate::descriptor::sparse::PAGES[1].load(Relaxed) as f64 * 16.0 / (1 << 20) as f64,
     );
     let snapshots = crate::shadow::kept_snapshots();
     let send = crate::host::send_spare();

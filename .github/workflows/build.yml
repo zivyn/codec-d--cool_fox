@@ -33,6 +33,10 @@ on:
         description: Update the rolling prerelease (only on main and integ/**)
         type: boolean
         default: true
+      build_probe:
+        description: Build the card test binaries (tests/memory_cost.rs) to run on a PC with a card
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -101,6 +105,31 @@ jobs:
       - uses: actions/upload-artifact@v5
         with:
           name: victory-diag
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error
+
+  # The tests that need a real card, built here and run on a PC that has one
+  # (`gh run download <id> -n probe-memory-cost`): never run on the runner.
+  build-probe:
+    if: ${{ inputs.build_probe }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - run: cargo test -p victory-gpu --features diagnostics --test memory_cost --no-run
+      - name: Collect
+        run: |
+          mkdir -p dist
+          exe="$(ls -t target/debug/deps/memory_cost-*.exe | head -n 1)"
+          cp "$exe" dist/memory_cost.exe
+      - uses: actions/upload-artifact@v5
+        with:
+          name: probe-memory-cost
           path: dist/
           retention-days: 14
           if-no-files-found: error

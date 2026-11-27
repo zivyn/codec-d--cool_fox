@@ -9114,7 +9114,7 @@ impl Host {
         match made {
             Ok(()) => {
                 let buffer = buffer?;
-                crate::sites::made(&buffer, crate::sites::UPLOAD, size, at);
+                crate::sites::made(&buffer, crate::sites::UPLOAD, size, data.cast(), at);
                 Some((buffer, data.cast()))
             }
             Err(e) => {
@@ -10072,7 +10072,7 @@ impl Host {
         match made {
             Ok(()) => {
                 let buffer = buffer?;
-                crate::sites::made(&buffer, crate::sites::SHARED, size, at);
+                crate::sites::made(&buffer, crate::sites::SHARED, size, data.cast(), at);
                 Some((buffer, data.cast()))
             }
             Err(e) => {

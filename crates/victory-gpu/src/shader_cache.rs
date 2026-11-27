@@ -90,6 +90,8 @@ fn build() -> [u8; 32] {
             "VICTORY_LOOP_NOTES",
             "VICTORY_LOOP_WHY",
             "VICTORY_LOOP_LIMITS",
+            "VICTORY_MEET_EXACT",
+            "VICTORY_MEET_BUDGET",
             "VICTORY_PEEK",
             "VICTORY_BVH_BOUNDS",
         ] {

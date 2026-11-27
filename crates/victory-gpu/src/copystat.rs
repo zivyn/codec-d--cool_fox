@@ -1042,6 +1042,13 @@ fn log_memory() {
         mb(totals[1][3]),
         biggest.join("; "),
     );
+    let heaps: Vec<u64> = crate::descriptor::host::HEAPS.iter().map(|h| h.load(Relaxed)).collect();
+    tracing::info!(
+        "memory, host descriptor heaps alive: {} of {:.0} MB in all (shader visible, write-combined, one for each shader-visible heap          of the title that was used, whatever its own count) and {:.0} MB of per-slot arrays beside them",
+        heaps[0],
+        mb(heaps[1]),
+        mb(heaps[2]),
+    );
     let snapshots = crate::shadow::kept_snapshots();
     let send = crate::host::send_spare();
     let staging = crate::pool::staging_empty();

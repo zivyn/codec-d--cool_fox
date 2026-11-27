@@ -111,7 +111,33 @@ impl Made {
     }
 }
 
+/// Host descriptor heaps alive, their bytes in the heap (shader-visible
+/// descriptors, write-combined and not in the working set), and the bytes of
+/// the per-slot arrays beside them in our memory; for the memory line.
+pub(crate) static HEAPS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// One host heap in [`HEAPS`] while it lives.
+struct HeapCount(u64, u64);
+
+impl HeapCount {
+    fn new(gpu: u64, cpu: u64) -> HeapCount {
+        HEAPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[1].fetch_add(gpu, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[2].fetch_add(cpu, std::sync::atomic::Ordering::Relaxed);
+        HeapCount(gpu, cpu)
+    }
+}
+
+impl Drop for HeapCount {
+    fn drop(&mut self) {
+        HEAPS[0].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[1].fetch_sub(self.0, std::sync::atomic::Ordering::Relaxed);
+        HEAPS[2].fetch_sub(self.1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct HostHeap {
+    _alive: HeapCount,
     pub(crate) buffer_sweep: Mutex<crate::draw::BufferSweep>,
     pub(crate) buffer_frame: std::sync::atomic::AtomicU64,
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1627,6 +1653,12 @@ impl HostHeap {
             })
             .flatten();
         let h = HostHeap {
+            // The per-slot arrays: a lock and an option of a pointer (24 bytes) per slot kept, 8 per
+            // quick slot, one more word each for what is made.
+            _alive: HeapCount::new(
+                u64::from(size) * u64::from(step),
+                u64::from(count + extra) * 24 + u64::from(count) * 16,
+            ),
             buffer_sweep: Mutex::default(),
             buffer_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
             heap,

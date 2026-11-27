@@ -2,11 +2,6 @@
 
 > **Before you play**
 >
-> - **You must install DLSS yourself:** run `Get-NVIDIA-DLSS.cmd` once (it is
->   in this folder; a double click does it), or have your AI assistant run it
->   for you. It downloads NVIDIA's DLSS and frame generation files, about 70 MB,
->   from NVIDIA's own GitHub; they are not part of this repository. Without
->   them the game still runs, with its own upscaling and no frame generation.
 > - **F1 in the game brings up the settings menu** (arrow keys pick and
 >   change, Enter does it). **F3 shows the stats panel** (frame rate, frame
 >   generation, draws, GPU and memory numbers).

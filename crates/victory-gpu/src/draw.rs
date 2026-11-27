@@ -5227,6 +5227,9 @@ mod record_hash_tests {
 mod state_filter_tests {
     use super::*;
 
+    /// The tests set one switch for the whole process, so they run one at a time.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// What the host list holds for each of 64 root parameters, as the calls that reach it leave it.
     type Model = [Option<(u64, u64)>; 64];
 
@@ -5234,6 +5237,7 @@ mod state_filter_tests {
     /// signature is set (which leaves no argument).
     #[test]
     fn the_filter_leaves_the_list_as_every_call_would_after_each_draw() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         TEST_STATE_FILTER.store(1, Ordering::Relaxed);
         let (mut old, mut new): (Model, Model) = ([None; 64], [None; 64]);
         let mut state = State::default();
@@ -5279,6 +5283,7 @@ mod state_filter_tests {
 
     #[test]
     fn counting_only_makes_every_call_and_says_which_were_the_same() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         TEST_STATE_FILTER.store(2, Ordering::Relaxed);
         let mut state = State::default();
         assert!(state.root_changed(true, 3, 1, 9));
@@ -5292,6 +5297,7 @@ mod state_filter_tests {
 
     #[test]
     fn vertex_and_index_buffers_are_left_out_only_when_they_are_the_same() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         TEST_STATE_FILTER.store(1, Ordering::Relaxed);
         let mut state = State::default();
         let view = |loc: u64| D3D12_VERTEX_BUFFER_VIEW { BufferLocation: loc, SizeInBytes: 64, StrideInBytes: 16 };

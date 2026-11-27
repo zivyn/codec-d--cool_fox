@@ -340,6 +340,14 @@ struct Lower<'a> {
     /// With `exchange`, in a group of several console waves: the two host waves of a console
     /// wave meet by their own counters in LDS ([`Self::pair_wait`]), not at a group barrier.
     pair_meet: bool,
+    /// With `pair_meet`: a meeting is made only where the other half may have touched what is
+    /// read or written next (`lds_elisions`), and an exchange takes one meeting, not two
+    /// (`exchange_halves`); `VICTORY_PAIR_LEAN=0`: every access, two meetings.
+    lean: bool,
+    /// The meetings of the halves made in the code, for `VICTORY_WAVE_WHY`.
+    meetings: usize,
+    /// With `lean`: the LDS accesses (IR block, instruction) that need no meeting before them.
+    lds_skip: HashSet<(usize, usize)>,
     /// With `pair_meet`: the dwords of the program's own shared memory and the dword that takes
     /// the writes past them (the console drops those, and reads 0); what lies past them here is
     /// the halves' exchange, which a stray access would break.
@@ -937,6 +945,86 @@ pub(super) fn pair_meet_on() -> bool {
 /// How many times a half asks for the other half's count before it goes on ([`Lower::pair_wait`]).
 const PAIR_SPINS: u32 = 1 << 24;
 
+/// `VICTORY_PAIR_LEAN=0` leaves the cheaper meetings out ([`Lower::lean`]).
+fn pair_lean_on() -> bool {
+    std::env::var_os("VICTORY_PAIR_LEAN").is_none_or(|v| v != "0")
+}
+
+/// The LDS accesses of a console wave run as two host waves that need no meeting of the halves
+/// before them. The halves run the same code, and one's access matters to the other's only if
+/// one of the two writes (or is an atomic): after a meeting, reads may follow reads without
+/// one, and a write waits for a meeting only if something was touched since the last. What
+/// was touched since a meeting is followed along every path to a fixpoint (`all` is
+/// [`all_lane_blocks`], `meet` the meetings at the edges of lane branches' regions); the
+/// meetings of exchanges are not counted, only those made for accesses.
+fn lds_elisions(
+    p: &crate::ir::Program,
+    st: &Structured,
+    all: &[bool],
+    meet: Option<&Vec<(bool, bool)>>,
+) -> HashSet<(usize, usize)> {
+    const READ: u8 = 1;
+    const WRITE: u8 = 2;
+    let n = st.exits.len();
+    let succ = |b: usize| -> Vec<usize> {
+        match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch { taken, not_taken, .. } => vec![taken, not_taken],
+            LaneExit::End | LaneExit::Indirect => Vec::new(),
+        }
+    };
+    let touches = |i: &Inst| {
+        let name = i.name();
+        if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+            return None;
+        }
+        Some(if name.starts_with("ds_read") { (READ, false) } else { (READ | WRITE, true) })
+    };
+    // what a block leaves behind, from what it starts with (and the accesses it needs no
+    // meeting before)
+    let run = |b: usize, entry: u8, skip: Option<&mut HashSet<(usize, usize)>>| -> u8 {
+        let mut state = if meet.is_some_and(|m| m[b].0) { 0 } else { entry };
+        let mut skip = skip;
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let Some((kind, writes)) = touches(inst) else { continue };
+            if !all[b] {
+                // (a lane branch's region: no meeting of its own, the edges have them)
+                state |= kind;
+                continue;
+            }
+            let needed = if writes { state != 0 } else { state & WRITE != 0 };
+            if needed {
+                state = 0;
+            } else if let Some(skip) = skip.as_deref_mut() {
+                skip.insert((b, i));
+            }
+            state |= kind;
+        }
+        if meet.is_some_and(|m| m[b].1) { 0 } else { state }
+    };
+    let mut entry = vec![0u8; n];
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            let out = run(b, entry[b], None);
+            for t in succ(b) {
+                if entry[t] | out != entry[t] {
+                    entry[t] |= out;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut skip = HashSet::new();
+    for b in 0..n {
+        run(b, entry[b], Some(&mut skip));
+    }
+    skip
+}
+
 /// The mode of a group barrier the translation adds (host waves meeting):
 /// a wait for the group with a shared-memory fence; the fence alone with
 /// `VICTORY_GROUP_SYNC=0` ([`super::group_sync`]).
@@ -1472,6 +1560,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // with `exchange`, the host waves of a console wave meet by counters of their own
         let mut pair_meet = false;
+        let mut lean = false;
+        let mut lds_skip: HashSet<(usize, usize)> = HashSet::new();
         let mut lds_bound: Option<(u32, u32)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
@@ -1564,15 +1654,21 @@ impl<'a> Lower<'a> {
                                 if group > 64
                                     && group % 64 == 0
                                     && !x.st.wide.is_empty()
-                                    && s.lds_dwords + 2 * (group / 64) + 2 <= host_lds_bytes() / 4
+                                    && s.lds_dwords + 4 * (group / 64) + 2 <= host_lds_bytes() / 4
                                     && pair_meet_on()
                                 {
                                     pair_meet = true;
                                     // (`VICTORY_PAIR_CLAMP=0` leaves the clamp out)
                                     if std::env::var_os("VICTORY_PAIR_CLAMP").is_none_or(|v| v != "0") {
-                                        lds_bound = Some((cs.lds_bytes() / 4, s.lds_dwords + 2 * (group / 64)));
+                                        lds_bound = Some((cs.lds_bytes() / 4, s.lds_dwords + 4 * (group / 64)));
                                     }
-                                    s.lds_dwords += 2 * (group / 64) + 1;
+                                    // (two buffers for the exchange, two counters, one dword that
+                                    // takes what is dropped)
+                                    s.lds_dwords += 4 * (group / 64) + 1;
+                                    lean = pair_lean_on();
+                                    if lean && let Some(all) = exchange.as_ref().map(|e| &e.2) {
+                                        lds_skip = lds_elisions(p, x.st, all, lds_meet.as_ref().map(|m| &m.1));
+                                    }
                                 }
                             }
                         }
@@ -1789,6 +1885,9 @@ impl<'a> Lower<'a> {
             },
             exchange,
             pair_meet,
+            lean,
+            meetings: 0,
+            lds_skip,
             lds_bound,
             clane: None,
             pair: None,
@@ -2530,6 +2629,9 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.pair_meet && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("WAVE64-MEETINGS {} in the code (lean {}, {} accesses without one)", self.meetings, self.lean, self.lds_skip.len());
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -4206,7 +4308,7 @@ impl<'a> Lower<'a> {
             let n = self.s.m.i32(2 * waves);
             let mine = self.s.m.cmp(e, pred::IULT, flat, n);
             let spare = self.s.m.select(e, mine, flat, n);
-            let first = self.s.m.i32(slot + 2 * waves);
+            let first = self.s.m.i32(slot + 4 * waves);
             let at = self.s.m.bin(e, Bin::Add, first, spare);
             let p = self.s.m.element(e, lds, at);
             self.s.m.store(e, p, zero);
@@ -4295,6 +4397,7 @@ impl<'a> Lower<'a> {
     /// all on the host at once, so the wait ends. Starts a loop: what the current block holds
     /// moves to a block ahead of it (`Module::split_before`), and it goes on after the wait.
     fn pair_wait(&mut self, at: usize) {
+        self.meetings += 1;
         let slot = self.exchange.as_ref().map_or(0, |e| e.0);
         let waves = self.s.threads.map_or(1, |t| t.iter().product::<u32>() / 64);
         let pair = self.exchange_pair(slot);
@@ -4302,7 +4405,7 @@ impl<'a> Lower<'a> {
         let (k5, k1, z) = (self.s.m.i32(5), self.s.m.i32(1), self.s.m.i32(0));
         let half = self.s.m.bin(at, Bin::LShr, cl, k5);
         let other = self.s.m.bin(at, Bin::Xor, half, k1);
-        let counters = self.s.m.i32(2 * waves);
+        let counters = self.s.m.i32(4 * waves);
         let first = self.s.m.bin(at, Bin::Add, pair, counters);
         let mine = self.s.m.bin(at, Bin::Add, first, half);
         let theirs = self.s.m.bin(at, Bin::Add, first, other);
@@ -4383,6 +4486,10 @@ impl<'a> Lower<'a> {
         }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
+        // (with `lean`, one of two pairs by the parity of the meetings made so far, which both
+        // halves have made alike: the other half may still read the last exchange's, and does
+        // not when it comes to this one's second use, `pair_buffer`)
+        let pair = if self.lean { self.pair_buffer(at, pair) } else { pair };
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4397,9 +4504,33 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        self.meet(at);
+        if !self.lean {
+            // the slots are written again only after every thread read them
+            self.meet(at);
+        }
         (lo, hi)
+    }
+
+    /// With `lean`: the pair of exchange dwords this half of the console wave uses now, of the
+    /// two the console wave has: by the parity of the meetings this half has made, which is the
+    /// other half's at the same place in the code. An exchange is one meeting, after the stores
+    /// and before the loads; the next exchange stores in the other pair, and the one after
+    /// that, in this one again, only after a meeting that the other half made after its loads.
+    fn pair_buffer(&mut self, at: usize, pair: V) -> V {
+        let waves = self.s.threads.map_or(1, |t| t.iter().product::<u32>() / 64);
+        let cl = self.console_lane();
+        let (k5, k1) = (self.s.m.i32(5), self.s.m.i32(1));
+        let half = self.s.m.bin(at, Bin::LShr, cl, k5);
+        let counters = self.s.m.i32(4 * waves);
+        let first = self.s.m.bin(at, Bin::Add, pair, counters);
+        let mine = self.s.m.bin(at, Bin::Add, first, half);
+        let lds = self.s.lds();
+        let mine = self.s.m.element(at, lds, mine);
+        let count = self.s.m.load(at, mine);
+        let odd = self.s.m.bin(at, Bin::And, count, k1);
+        let width = self.s.m.i32(2 * waves);
+        let by = self.s.m.bin(at, Bin::Mul, odd, width);
+        self.s.m.bin(at, Bin::Add, pair, by)
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -5556,6 +5687,7 @@ impl<'a> Lower<'a> {
             && matches!(inst.fields, Fields::Ds { .. })
             && !(name.starts_with("ds_swizzle") || name.contains("permute"))
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
+            && !(self.lean && self.lds_skip.contains(&(b, i)))
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
@@ -8998,6 +9130,7 @@ impl<'a> Lower<'a> {
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
+                    let k = if self.lean { self.pair_buffer(self.cur, k) } else { k };
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -9008,7 +9141,9 @@ impl<'a> Lower<'a> {
                     let c2 = self.cur;
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.meet(c2);
+                    if !self.lean {
+                        self.meet(c2);
+                    }
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);

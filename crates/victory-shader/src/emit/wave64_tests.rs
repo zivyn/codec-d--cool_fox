@@ -991,3 +991,108 @@ fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
     }
     eprintln!("ran on the hardware device: console waves branching on their own");
 }
+
+/// A loop of `s1` rounds, each of which runs a lane branch with an LDS write and read and a lane
+/// read of a lane of the console wave (so the two host waves meet in it) in `threads` threads
+/// (one group): what a meeting of the host waves costs. Thread t gives out[t] = the sum over the
+/// rounds of lane 40 of its console wave's `lane + round`.
+fn meeting_loop(threads: u32) -> NativeProgram {
+    let words = [
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBE97_0380, // s_mov_b32 s23, 0
+        0xBE98_0380, // s_mov_b32 s24, 0
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+        // loop:
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz skip
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000, // ds_read_b32 v7, v3
+        0x0700_0003,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A0A_0014, // v_add_nc_u32 v5, s20, v0
+        0xD760_0016, // v_readlane_b32 s22, v5, 40
+        0x0001_5105,
+        0x8017_1617, // s_add_u32 s23, s23, s22
+        0xBEFE_040C, // skip: s_mov_b64 exec, s[12:13]
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_0114, // s_cmp_lt_u32 s20, s1
+        0xBF85_FFEF, // s_cbranch_scc1 loop
+        0x8018_8118, // s_add_u32 s24, s24, 1
+        0xBF0A_0218, // s_cmp_lt_u32 s24, s2
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBF85_FFEB, // s_cbranch_scc1 loop
+        0x7E10_0217, // v_mov_b32 v8, s23
+        0xE070_1000, // buffer_store_dword v8, v3, s[8:11], 0 offen
+        0x8002_0803,
+    ];
+    let mut native = native_of(&words, true, threads);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= (threads * 4).div_ceil(512) << 15;
+    }
+    native
+}
+
+/// What a meeting of the host waves costs, by the time of a loop of them on the card (printed,
+/// not asserted): a group of one console wave (group barriers) against a group of two (counters).
+#[test]
+fn a_meeting_of_the_host_waves_costs_this_much() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    for threads in [64u32, 128] {
+        let native = meeting_loop(threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let container = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&container).unwrap();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let lds = lower::TEST_HOST_LDS.replace(Some(49152));
+        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        lower::TEST_HOST_LDS.set(lds);
+        let shader = shader.unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+        // (the results first, once; then the time of back-to-back dispatches)
+        let user = |rounds: u32| {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, d @ 0..=2) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = [threads, rounds, 1][d as usize];
+                }
+            }
+            ud
+        };
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(user(4000)))],
+                    views: &[View::RawUav(threads)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        for t in 0..threads {
+            let expected = 4000 * (t / 64 * 64 + 40) + 4000 * 3999 / 2;
+            assert_eq!(out[0][t as usize], expected, "{threads} threads, thread {t}");
+        }
+        let bench = [super::host::BenchView { index: 0, dwords: threads, uav: true, sysmem: false }];
+        let time = |rounds: u32| {
+            host.time_compute(&(root.clone(), pso.clone()), &user(rounds), &[], &bench, [1, 1, 1], 20)
+                .expect("time_compute")
+                .0
+        };
+        let (none, many) = (time(1), time(4000));
+        eprintln!(
+            "{threads} threads: {:.1} us a round of an LDS write, an LDS read and a lane read ({none:.2} ms for none, {many:.2} ms for 4000)",
+            (many - none) * 1e3 / 4000.0
+        );
+    }
+}

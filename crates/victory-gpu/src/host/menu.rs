@@ -159,6 +159,12 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_INDIRECT_BATCH", label: "INDIRECT BATCH", values: STAGES, live: false },
     Item { var: "VICTORY_CARD_BUFFERS_MIN_KB", label: "CARD COMPARES FROM (KB)", values: &[("64", "64"), ("1024", "1024")], live: false },
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
+    // THIN records the title's list calls on our threads. On an RTX 5080 with a 6-core CPU heads did not
+    // draw with it and frames were slower (14 a second with it, 21 to 28 without): switches for it and for
+    // what goes with it. Frame generation needs the line of submissions: without THIN, ASYNC SUBMIT gives it.
+    Item { var: "VICTORY_THIN", label: "THIN LISTS (HEADS MAY BE MISSING)", values: ON_UNSET, live: false },
+    Item { var: "VICTORY_JOIN_PARTS", label: "JOIN PARTS", values: &[("8", "8"), ("", "1 (OFF)")], live: false },
+    Item { var: "VICTORY_ASYNC_SUBMIT", label: "ASYNC SUBMIT (FRAME GEN WITHOUT THIN)", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
 const ACTIONS: [&str; 7] = [

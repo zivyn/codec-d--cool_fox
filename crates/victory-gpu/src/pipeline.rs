@@ -900,7 +900,6 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(windows, feature = "diagnostics"))]
     /// The list of hashes: one a line, comments and blanks left out, case
     /// folded, what is not a full hash ignored.
     #[test]
@@ -917,6 +916,7 @@ mod tests {
         }
     }
 
+    #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

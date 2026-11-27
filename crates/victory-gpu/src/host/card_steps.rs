@@ -1239,8 +1239,8 @@ mod tests {
             (unsafe { std::slice::from_raw_parts_mut(base, LEN) }, base as usize)
         };
         const HALF: usize = LEN / 2;
-        crate::shadow::register(0x1111, start as u64, HALF as u64);
-        crate::shadow::register(0x2222, (start + HALF) as u64, HALF as u64);
+        crate::shadow::register(0x1111, start as u64, HALF as u64, false);
+        crate::shadow::register(0x2222, (start + HALF) as u64, HALF as u64, false);
         let first = crate::shadow::find(start as u64, 64).unwrap();
         let (slow_from, slow_to) = (host.uav_buffer(64 << 20).unwrap(), host.uav_buffer(64 << 20).unwrap());
         let before = DONE[1].load(Ordering::Relaxed);

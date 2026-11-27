@@ -697,7 +697,7 @@ mod tests {
             }
         };
         assert!(!base.is_null());
-        crate::shadow::register(resource, base as u64, len as u64);
+        crate::shadow::register(resource, base as u64, len as u64, false);
         let shadow = crate::shadow::find(base as u64, 64).expect("a copy");
         assert!(super::super::relay_exact() && super::super::relay_copy(), "set VICTORY_RELAY=2 VICTORY_RELAY_COPY=1");
         // SAFETY: `len` bytes just committed.

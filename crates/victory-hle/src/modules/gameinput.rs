@@ -1313,13 +1313,24 @@ mod host {
                 return keys.clone();
             }
         }
-        let keys: Vec<u8> = std::fs::read_to_string(path)
-            .map(|text| {
-                text.split([',', ' ', '\n', '\r'])
-                    .filter_map(key_vk)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // A read that fails (the driver is replacing the file) keeps the keys held so far: an empty
+        // reading would release a key for one poll and break a hold.
+        let keys: Vec<u8> = match std::fs::read_to_string(path) {
+            Ok(text) => text
+                .split([',', ' ', '\n', '\r', '\0'])
+                .filter_map(key_vk)
+                .collect(),
+            Err(_) => last
+                .as_ref()
+                .map(|(_, keys)| keys.clone())
+                .unwrap_or_default(),
+        };
+        if last
+            .as_ref()
+            .map_or(!keys.is_empty(), |(_, old)| *old != keys)
+        {
+            tracing::info!(keys = ?keys, "key file");
+        }
         *last = Some((Instant::now(), keys.clone()));
         keys
     }

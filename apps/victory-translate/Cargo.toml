@@ -17,5 +17,11 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
+# The shared translate.rs calls it in the Windows-only commands, which a
+# Windows build (and its tests) compiles.
+[target.'cfg(windows)'.dependencies]
+victory-hle.workspace = true
+victory-shader = { workspace = true, features = ["host"] }
+
 [lints]
 workspace = true

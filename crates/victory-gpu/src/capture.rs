@@ -404,6 +404,15 @@ pub(crate) fn note_target(resource: crate::object::This) {
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    if crate::switch::on("VICTORY_CAPTURE_LEVELS")
+        && let Some(folder) = folder()
+    {
+        let lines = crate::tiles::levels_report();
+        crate::tiles::status();
+        let _ = std::fs::write(folder.join(format!("frame-{frame}-levels.tsv")), lines.join("
+"));
+        tracing::info!(frame, rows = lines.len().saturating_sub(1), "levels report written");
+    }
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {

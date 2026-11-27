@@ -6222,6 +6222,20 @@ fn view_cache() -> u8 {
     })
 }
 
+/// The milliseconds [`Over`] counts its age in (a test's own on its thread).
+fn view_clock() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_VIEW_CLOCK.with(std::cell::Cell::get) {
+        return now;
+    }
+    crate::host::coarse_ms()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_VIEW_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 #[cfg(test)]
 static TEST_VIEW_CACHE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
@@ -6274,7 +6288,7 @@ impl ListViews {
         self.recording = recording;
         self.made.clear();
         self.local = 0;
-        if view_cache() != 0 && self.over.begin(crate::host::coarse_ms(), Self::KEEP_SLOTS) {
+        if view_cache() != 0 && self.over.begin(view_clock(), Self::KEEP_SLOTS) {
             self.counts[7] += 1;
         }
     }
@@ -6564,37 +6578,31 @@ mod view_cache_tests {
         let s = heap.dynamic(4).unwrap();
 
         let counts = || LIST_VIEWS.with(|v| v.borrow().as_ref().unwrap().counts);
-        // (Other tests change the copies' state at any time, so a view may be stale when it is asked for: asked for a few
-        // times, one is found from the recording before, and none that was kept differs from one made again.)
+        // The state of the copies and the clock are this test's own: tests on other threads change the real ones.
+        crate::shadow::pin_world_for_test(Some(100));
+        TEST_VIEW_CLOCK.with(|c| c.set(Some(1000)));
         TEST_VIEW_CACHE.store(2, Relaxed);
-        let mut recording = 0xcafe_0000;
-        let mut kept = false;
-        for round in 0..8 {
-            assert!(heap.make_listed(recording, words, s).is_some());
-            assert!(heap.make_listed(recording, words, s + 1).is_some());
-            recording += 1;
-            if round > 0 && counts()[1] > 0 {
-                kept = true;
-                break;
-            }
-        }
+        // (Recording numbers of this test alone.)
+        let made = heap.make_listed(0xcafe_0001, words, s).is_some();
+        assert!(heap.make_listed(0xcafe_0001, words, s + 1).is_some() == made);
+        assert!(heap.make_listed(0xcafe_0002, words, s + 2).is_some() == made);
         let c = counts();
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
-        if c[3] == 0 && c[1] == 0 {
+        if !made {
             // The view did not make on this adapter: nothing to keep.
+            crate::shadow::pin_world_for_test(None);
             return;
         }
-        assert!(kept, "{c:?}");
-        // The second ask in a recording is found in it; every one kept from before was compared; none differed.
-        assert!(c[0] >= 1 && c[5] >= c[1] && c[6] == 0, "{c:?}");
+        // One made, one found in its recording, one kept from the one before and compared with one made again.
+        assert_eq!((c[0], c[1], c[2], c[3], c[5], c[6]), (1, 1, 0, 1, 1, 0), "{c:?}");
 
-        // The copies are others: made again, not kept (unless it was long enough ago for the kept ones to go).
+        // The copies are others: made again (in the same slot), not kept.
         TEST_VIEW_CACHE.store(1, Relaxed);
-        let (stale, flushed) = (c[2], c[7]);
-        crate::shadow::changed_for_test();
-        assert!(heap.make_listed(recording, words, s + 2).is_some());
+        crate::shadow::pin_world_for_test(Some(101));
+        assert!(heap.make_listed(0xcafe_0003, words, s + 3).is_some());
         let c = counts();
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
-        assert!(c[2] + c[7] > stale + flushed, "{c:?}");
+        crate::shadow::pin_world_for_test(None);
+        assert_eq!((c[1], c[2], c[3], c[7]), (1, 1, 2, 0), "{c:?}");
     }
 }

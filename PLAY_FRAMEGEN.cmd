@@ -13,7 +13,7 @@ if not exist "%PS1%" (
   exit /b 1
 )
 if /i "%~1"=="check" (
-  %PSH% -NoProfile -File "%PS1%" -Check
+  %PSH% -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Check
   pause
   exit /b 0
 )
@@ -38,7 +38,7 @@ if errorlevel 6 (set "PICK=6") else if errorlevel 5 (set "PICK=5") else if error
 
 :run
 echo.
-%PSH% -NoProfile -File "%PS1%" -Mode %PICK%
+%PSH% -NoProfile -ExecutionPolicy Bypass -File "%PS1%" -Mode %PICK%
 
 :end
 echo.

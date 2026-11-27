@@ -2708,6 +2708,21 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         // A host group has 32 KiB of LDS (D3D12): the program's LDS with the meetings' and
         // exchanges' dwords past it must fit (`CS_CollectTriangles_Meshlets` uses all 32 KiB).
+        if self.s.lds_dwords > HOST_LDS_DWORDS && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            // (the program's own LDS, then what the translation adds past it)
+            let own = match &self.x.native.io {
+                StageIo::Cs(cs) => cs.lds_bytes() / 4,
+                _ => 0,
+            };
+            eprintln!(
+                "WAVE64-LDS {} dwords of the host's {HOST_LDS_DWORDS}: the program's own {own}, the translation's {} (exchange {:?}, counter {:?}, meetings {:?})",
+                self.s.lds_dwords,
+                self.s.lds_dwords.saturating_sub(own),
+                self.exchange.as_ref().map(|e| e.0),
+                self.halves.or(self.ticket),
+                self.pairs,
+            );
+        }
         if self.pairs.is_some() && self.s.lds_dwords > HOST_LDS_DWORDS {
             return Err(unsupported(0, "LDS for the console waves' meetings past the host's 32 KiB"));
         }

@@ -94,7 +94,9 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
     constrained().retain(|&(id, ..)| id != registration);
 }
 
-/// The window procedure a title window had before ours.
+/// The window procedure a title window had before ours. `victory_gpu`'s
+/// `title_window` looks for this property by its name too, to know the
+/// title's window from the others of the process.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
 /// Fullscreen, the English keyboard and the mouse capture are asked for

@@ -10562,8 +10562,36 @@ impl Host {
     }
 }
 
+/// The property our hook of the title's window procedure puts on the
+/// windows the title makes (`TITLE_PROC` in `victory_hle::modules::lifecycle`).
+const TITLE_HOOK: PCWSTR = w!("victory.wndproc");
+
+/// A visible top-level window of this process, as [`title_window`] finds it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Candidate {
+    hwnd: usize,
+    /// Carries [`TITLE_HOOK`]: a window the title made.
+    hooked: bool,
+    /// Its client area is not empty.
+    sized: bool,
+}
+
+/// Which of `candidates` (in z-order, topmost first) is the title's: the
+/// one our hook marked, else the first with a client area. Pure, for testing.
+fn pick_title_window(candidates: &[Candidate]) -> Option<usize> {
+    candidates
+        .iter()
+        .find(|c| c.hooked)
+        .or_else(|| candidates.iter().find(|c| c.sized))
+        .map(|c| c.hwnd)
+}
+
 /// A visible top-level window of this process: the one the title made, if
-/// it made one.
+/// it made one. Not simply the first visible one: started under a
+/// pseudoconsole (from Windows Terminal, or by a process that has one), this
+/// process also owns a visible `PseudoConsoleWindow` of 0x0 pixels. When
+/// that one was above the title's window in z-order, the swap chain was made
+/// for it, and the title's window stayed white with no frame ever shown.
 fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
@@ -10573,16 +10601,59 @@ fn title_window() -> Option<HWND> {
             if process == windows::Win32::System::Threading::GetCurrentProcessId()
                 && IsWindowVisible(hwnd).as_bool()
             {
-                *(found.0 as *mut Option<HWND>) = Some(hwnd);
-                return false.into();
+                let mut area = RECT::default();
+                let sized = GetClientRect(hwnd, &mut area).is_ok() && area.right > area.left && area.bottom > area.top;
+                let hooked = !GetPropW(hwnd, TITLE_HOOK).0.is_null();
+                (*(found.0 as *mut Vec<Candidate>)).push(Candidate { hwnd: hwnd.0 as usize, hooked, sized });
             }
         }
         true.into()
     }
-    let mut found: Option<HWND> = None;
-    // SAFETY: the callback only writes `found`, which outlives the call.
+    let mut found: Vec<Candidate> = Vec::new();
+    // SAFETY: the callback only adds to `found`, which outlives the call.
     let _ = unsafe { EnumWindows(Some(visit), LPARAM(&raw mut found as isize)) };
-    found
+    let picked = pick_title_window(&found);
+    if !found.iter().any(|c| c.hooked) {
+        tracing::info!(
+            windows = found.len(),
+            "no window of the title's among ours: presenting to the first with a client area, if any"
+        );
+    }
+    picked.map(|hwnd| HWND(hwnd as *mut _))
+}
+
+#[cfg(test)]
+mod title_window_tests {
+    use super::{Candidate, pick_title_window};
+
+    fn window(hwnd: usize, hooked: bool, sized: bool) -> Candidate {
+        Candidate { hwnd, hooked, sized }
+    }
+
+    /// A pseudoconsole's 0x0 window above the title's in z-order.
+    #[test]
+    fn the_titles_window_wins_over_a_pseudo_console_above_it() {
+        let found = [window(1, false, false), window(2, true, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn the_titles_window_counts_even_while_its_client_area_is_empty() {
+        let found = [window(1, false, true), window(2, true, false)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn without_one_of_the_titles_the_first_with_a_client_area() {
+        let found = [window(1, false, false), window(2, false, true), window(3, false, true)];
+        assert_eq!(pick_title_window(&found), Some(2));
+    }
+
+    #[test]
+    fn a_pseudo_console_alone_is_no_window_to_present_to() {
+        assert_eq!(pick_title_window(&[window(1, false, false)]), None);
+        assert_eq!(pick_title_window(&[]), None);
+    }
 }
 
 /// `state` without the bits the host texture's flags forbid: the console

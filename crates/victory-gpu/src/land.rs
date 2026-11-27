@@ -115,8 +115,13 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Pieces and bytes of copies left out ([`super::quiet`]).
+    pub(crate) const QUIET_PIECES: usize = 26;
+    pub(crate) const QUIET_BYTES: usize = 27;
+    pub(crate) const COUNT: usize = 28;
 }
+
+pub(crate) mod quiet;
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
 
@@ -193,6 +198,15 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    if quiet::on() || s[stat::QUIET_PIECES] > 0.0 {
+        tracing::info!(
+            "left out of landing per frame (VICTORY_LAND_QUIET={}: copies of {} KiB or more in heaps the title's CPU cannot reach, nothing told written there): {:.0} pieces {:.1} MB, not fetched and not merged",
+            u8::from(quiet::on()),
+            quiet::min_bytes() >> 10,
+            s[stat::QUIET_PIECES],
+            mb(s[stat::QUIET_BYTES]),
+        );
+    }
 }
 
 /// Threads kept for landing, and the work they are at.

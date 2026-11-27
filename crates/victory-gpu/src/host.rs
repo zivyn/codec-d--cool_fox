@@ -2614,7 +2614,7 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// ([`relay`]): landings, flights landed, microseconds it waited for the
 /// card with nothing to land, microseconds it waited for fetches of card
 /// copies' pieces, microseconds of landing in all.
-static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static RELAY_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// Of the line's things in order (a flight: the value signalled on the
 /// host's fence behind it; a write or a signal behind a flight: `None`):
@@ -3844,12 +3844,13 @@ fn late_line(frames: f64) {
             "the relay per frame (VICTORY_RELAY=1): {:.1} flights landed in {:.1} landings by the thread that copies back, \
              beside the submitting thread; that thread waited {:.1} ms for the card with nothing to land and {:.1} ms for \
              fetches of card copies' pieces, and was {:.1} ms landing in all (the frame line's \"copying back\" is its time; \
-             \"settles\" above are waits of other threads for it)",
+             \"settles\" above are waits of other threads for it); {:.1} of the flights had nothing for the title to read (no copy on the card,              declared write, read-back)",
             r[1],
             r[0],
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+            r[5],
         );
         if send::own() {
             let t: Vec<f64> = send::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -5314,6 +5315,23 @@ impl Host {
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
+                // Flights whose landing has nothing for the title to read (no
+                // card copies, declared writes, read-backs of buffers or
+                // textures): the title could be told of them as soon as the
+                // card is done.
+                let bare = flights
+                    .iter()
+                    .filter(|f| {
+                        f.card.is_none()
+                            && f.back.is_empty()
+                            && f.texture_back_ranges.is_empty()
+                            && f.order.iter().all(|&i| {
+                                let d = f.lists[i].host().deferred();
+                                d.backs.is_empty() && d.texture_backs.is_empty()
+                            })
+                    })
+                    .count();
+                RELAY_STATS[5].fetch_add(bare as u64, Ordering::Relaxed);
             }
         }
         // In the order given: what tells the title the card is done.

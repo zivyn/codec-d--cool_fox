@@ -11,14 +11,20 @@
 //!
 //! The transforms themselves are not computed: the hardware takes impulse
 //! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! is not known. Outputs are silence, so reverb returns are dry, unless
+//! `VICTORY_DSP_REVERB=1` (or `interleaved`) runs convolution streams
+//! through an algorithmic reverb of ours instead (see [`reverb`]).
+// shortcut: no convolution or block transform; outputs are zeros (or the
+// stand-in reverb's). Needs the coprocessor's impulse response and spectrum
+// layouts to do better; `VICTORY_DSP_IR_DUMP=<dir>` saves each stream's
+// response for working them out.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
+
+mod reverb;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -62,6 +68,9 @@ pub struct Stream {
     frames: u32,
     channels: u32,
     status: Box<Status>,
+    /// The stand-in reverb of a convolution stream, and whether its blocks
+    /// are interleaved.
+    reverb: Option<(reverb::Reverb, bool)>,
 }
 
 /// One block of work.
@@ -155,6 +164,7 @@ pub extern "system" fn XDspActivate(
         channels,
         "audio DSP stream activated"
     );
+    note_stream(desc);
     {
         // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
         let dsp = unsafe { &*dsp };
@@ -174,6 +184,11 @@ pub extern "system" fn XDspActivate(
             reserved: 0,
             result: S_OK,
         }),
+        reverb: if kind == CONVOLUTION {
+            reverb::Reverb::from_env()
+        } else {
+            None
+        },
     });
     // SAFETY: checked non-null.
     unsafe {
@@ -181,6 +196,51 @@ pub extern "system" fn XDspActivate(
         stream.write(Box::into_raw(new));
     }
     S_OK
+}
+
+/// Logs each kind of stream the title activates once, and with
+/// `VICTORY_DSP_IR_DUMP=<dir>` saves the impulse response of the first 16
+/// (`<n>-<kind>-<frames>x<channels>.ir`, as the title gave it).
+fn note_stream(desc: &StreamDesc) {
+    static SEEN: Mutex<Vec<[u32; 5]>> = Mutex::new(Vec::new());
+    let key = [
+        desc.kind,
+        desc.options,
+        desc.frames,
+        desc.channels,
+        desc.ir_floats,
+    ];
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    let n = seen.len();
+    drop(seen);
+    let [kind, options, frames, channels, ir_floats] = key;
+    tracing::info!(
+        kind,
+        options,
+        frames,
+        channels,
+        ir_floats,
+        "audio DSP: a new kind of stream"
+    );
+    if let Some(dir) = std::env::var_os("VICTORY_DSP_IR_DUMP")
+        && n <= 16
+        && !desc.ir.is_null()
+        && ir_floats <= 0x100_0000
+    {
+        // SAFETY: the title's response of `ir_floats` floats.
+        let ir =
+            unsafe { std::slice::from_raw_parts(desc.ir.cast::<u8>(), ir_floats as usize * 4) };
+        let dir = std::path::PathBuf::from(dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(
+            dir.join(format!("{n:02}-{kind}-{frames}x{channels}.ir")),
+            ir,
+        );
+    }
 }
 
 pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
@@ -207,9 +267,27 @@ pub extern "system" fn XDspSubmitCommand(
     // SAFETY: a stream from `XDspActivate`, the title's command.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
     if !command.output.is_null() {
-        let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        let (frames, channels) = (stream.frames as usize, stream.channels as usize);
+        let gains = command.gains;
+        // The block is computed here, on the title's own thread: it checks
+        // the status one block later and takes a late command for an
+        // overrun, and the network costs a few microseconds a block.
+        if let Some((reverb, interleaved)) = &mut stream.reverb {
+            // SAFETY: the title's buffers hold one block of the stream each.
+            unsafe {
+                reverb.block(
+                    command.input,
+                    command.output,
+                    frames,
+                    channels,
+                    *interleaved,
+                    gains,
+                );
+            }
+        } else {
+            // SAFETY: the title's output buffer holds one block of the stream.
+            unsafe { std::ptr::write_bytes(command.output, 0, frames * channels) };
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -307,6 +385,68 @@ mod tests {
         assert_eq!(
             XDspActivate(dsp, &transform, &mut status, &mut stream),
             S_OK
+        );
+        assert_eq!(XDspDeactivate(stream), S_OK);
+        assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    /// With the stand-in reverb on, a stream's blocks carry a tail: an
+    /// impulse in the first block returns sound in the blocks after it,
+    /// less each time, and the status is completed as before.
+    #[test]
+    fn a_convolution_stream_with_the_stand_in_reverb_rings_and_decays() {
+        let mut base = vec![0u8; 0x10_0000];
+        let mut dsp = std::ptr::null_mut();
+        assert_eq!(
+            XDspConnectWithMaximumStreamLimit(
+                base.as_mut_ptr().cast(),
+                0x10_0000,
+                24,
+                0x80,
+                1,
+                &mut dsp
+            ),
+            S_OK
+        );
+        let desc = StreamDesc {
+            kind: CONVOLUTION,
+            options: 0,
+            frames: 0x400,
+            channels: 1,
+            ir_floats: 0,
+            ir: std::ptr::null(),
+        };
+        let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
+        assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
+        // SAFETY: just made; the test is its only user.
+        unsafe { (*stream).reverb = Some((reverb::Reverb::new(1.0, 1.0), false)) };
+        let mut input = vec![0f32; 0x400];
+        input[0] = 1.0;
+        let mut energies = Vec::new();
+        for block in 0..96 {
+            let mut output = vec![9f32; 0x400];
+            let command = Command {
+                gains: [1.0, 1.0],
+                input: if block == 0 {
+                    input.as_ptr()
+                } else {
+                    std::ptr::null()
+                },
+                output: output.as_mut_ptr(),
+                reserved: 0,
+            };
+            let mut ticket = 0;
+            assert_eq!(XDspSubmitCommand(stream, &command, &mut ticket), S_OK);
+            // SAFETY: the stream's status block.
+            assert_eq!(unsafe { (*status).completed }, ticket);
+            energies.push(output.iter().map(|v| v * v).sum::<f32>());
+        }
+        // Blocks of 21 ms: the tail has sound at 0.5 s and is much weaker at 2 s.
+        assert!(energies[23] > 0.0);
+        assert!(
+            energies[93] < energies[23] * 1e-3,
+            "{:?}",
+            &energies[20..30]
         );
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);

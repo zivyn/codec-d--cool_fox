@@ -28,6 +28,9 @@ use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
+pub mod overlap;
+pub mod stats;
+use stats::COUNTERS;
 
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
@@ -308,7 +311,7 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
 // and take whatever lies between read and write.
 // shortcut: each enabled context decodes from a cold state and the overlap
 // buffer is ignored (titles copy it between consecutive contexts of one
-// voice); keep decoder state there if a title's seams turn out audible.
+// voice), unless `VICTORY_XMA_OVERLAP=1`: see [`overlap`].
 
 use victory_formats::xma;
 
@@ -348,6 +351,8 @@ struct Trace {
     peak: i16,
     /// Milliseconds after enabling when the input ran out.
     ended_ms: Option<u128>,
+    /// When the title last made room in the ring, until it is full again.
+    room_since: Option<Instant>,
 }
 
 struct Xma {
@@ -422,8 +427,17 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
+        let decoder = if overlap::enabled() {
+            heap_bytes(context.get(8), overlap::TOKEN_BYTES)
+                .and_then(|b| overlap::restore(b, context.channels(), sample_rate(context)))
+        } else {
+            None
+        };
+        if decoder.is_some() {
+            tracing::debug!(index, "XMA voice continues from its overlap buffer");
+        }
         *slot = Some(Voice {
-            decoder: None,
+            decoder,
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
@@ -437,9 +451,11 @@ impl Xma {
                 bad_frames: 0,
                 peak: 0,
                 ended_ms: None,
+                room_since: None,
             },
         });
         drop(slot);
+        COUNTERS.voice_enabled();
         wake_decoder();
     }
 
@@ -450,6 +466,13 @@ impl Xma {
         let Some(voice) = lock(&self.voices[index as usize]).take() else {
             return;
         };
+        COUNTERS.voice_disabled();
+        if overlap::enabled()
+            && voice.trace.frames > 0
+            && let Some(decoder) = &voice.decoder
+        {
+            keep_overlap(context, decoder);
+        }
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -487,13 +510,22 @@ impl Xma {
             t.taken += blocks as usize;
             t.takes += 1;
             t.partial_takes += u32::from(blocks < size);
+            if blocks > 0 && !voice.ended {
+                voice.trace.room_since.get_or_insert_with(Instant::now);
+            }
+            let samples = blocks.min(size) as usize * SAMPLES_PER_BLOCK / context.channels();
+            COUNTERS.taken(
+                u64::from(blocks.min(size)),
+                samples as u64 * 1_000_000 / u64::from(sample_rate(context)),
+            );
         }
         drop(slot);
         wake_decoder();
     }
 
-    /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    /// Fills every enabled context's output as far as it has room; how many
+    /// contexts are enabled.
+    fn pump(&self) -> usize {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
@@ -508,6 +540,7 @@ impl Xma {
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        active
     }
 }
 
@@ -536,11 +569,17 @@ fn pump(context: Context, voice: &mut Voice) {
         let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
             return;
         };
+        let mut block_peak = 0u16;
         for pair in out.as_chunks_mut::<2>().0 {
             let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
+            block_peak = block_peak.max(sample.unsigned_abs());
             pair.copy_from_slice(&sample.to_le_bytes());
         }
+        voice.trace.peak = voice
+            .trace
+            .peak
+            .max(i16::try_from(block_peak).unwrap_or(i16::MAX));
+        COUNTERS.block_out(block_peak);
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
@@ -551,8 +590,25 @@ fn pump(context: Context, voice: &mut Voice) {
         if write == context.field(9, 0, 5) % size {
             // Full: nothing more until the title advances its read block.
             context.set_field(1, 31, 1, 0);
+            if let Some(since) = voice.trace.room_since.take() {
+                COUNTERS.refilled(since.elapsed());
+            }
         }
     }
+}
+
+/// Keeps the decoder for the context that gets a copy of this one's overlap
+/// buffer.
+fn keep_overlap(context: Context, decoder: &xma::Decoder) {
+    if let Some(buffer) = heap_bytes(context.get(8), overlap::TOKEN_BYTES) {
+        overlap::save(buffer, decoder, sample_rate(context));
+    }
+}
+
+/// A context's sample rate.
+fn sample_rate(context: Context) -> u32 {
+    const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
+    RATES[context.field(1, 27, 2) as usize]
 }
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
@@ -575,13 +631,20 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let mut current = context.field(4, 31, 1);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
-            // Out of input: the overlap tail, then nothing.
+            // Out of input: the overlap tail, then nothing; or, with the
+            // overlap kept, the decoder as it is for the stream's next input.
             if let Some(decoder) = &mut voice.decoder {
-                let mut tail = Vec::new();
-                decoder.flush(&mut tail);
-                voice.pcm.extend(tail);
+                if overlap::enabled() {
+                    keep_overlap(context, decoder);
+                } else {
+                    let mut tail = Vec::new();
+                    decoder.flush(&mut tail);
+                    voice.pcm.extend(tail);
+                }
             }
             voice.ended = true;
+            voice.trace.room_since = None;
+            COUNTERS.input_ended();
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
             context.set_field(2, 26, 5, INPUT_INVALID);
             context.set_field(2, 31, 1, 1);
@@ -608,13 +671,14 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let decoder = voice.decoder.get_or_insert_with(|| {
-        const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
-        xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
-    });
+    let decoder = voice
+        .decoder
+        .get_or_insert_with(|| xma::Decoder::new(channels, sample_rate(context)));
     let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    let decoded = decoder.decode(&frame.data, frame.bits, &mut pcm);
+    COUNTERS.frame(decoded.is_ok());
+    if let Err(e) = decoded {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
@@ -682,6 +746,30 @@ fn dump_input(index: u32, context: Context) {
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }
 
+/// The decoding thread runs above the title's ordinary threads: the
+/// hardware it stands for is never starved, and a title that keeps every
+/// core busy (6-9 frames a second here) would otherwise delay the rings
+/// past the mixer's next block. `VICTORY_XMA_PRIORITY=normal` leaves it at
+/// the default; `critical` raises it as far as it goes.
+#[cfg(windows)]
+fn raise_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
+        THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let level = match std::env::var("VICTORY_XMA_PRIORITY").as_deref() {
+        Ok("normal") => THREAD_PRIORITY_NORMAL,
+        Ok("critical") => THREAD_PRIORITY_TIME_CRITICAL,
+        _ => THREAD_PRIORITY_HIGHEST,
+    };
+    // SAFETY: the calling thread's own pseudo handle.
+    let done = unsafe { SetThreadPriority(GetCurrentThread(), level) } != 0;
+    tracing::info!(level, done, "XMA decoder thread priority");
+}
+
+#[cfg(not(windows))]
+fn raise_priority() {}
+
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
 fn wake_decoder() {
@@ -691,8 +779,14 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    raise_priority();
+                    let (mut last, mut window) = (Instant::now(), Instant::now());
                     loop {
-                        xma().pump();
+                        let start = Instant::now();
+                        let active = xma().pump();
+                        COUNTERS.pass(start - last, start.elapsed());
+                        last = start;
+                        stats::tick(&mut window, active);
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
                         std::thread::park_timeout(std::time::Duration::from_millis(2));
                     }
@@ -872,8 +966,21 @@ extern "system" fn submit(
         _ if xma_command(command, word) => {}
         // shortcut: context updates and the other SHAPE units' commands are
         // acknowledged but not carried out; add them when a title sends
-        // them (each kind is logged once above).
-        _ => {}
+        // them (each kind is logged once above, with its first words, and
+        // counted in the stats).
+        _ => {
+            COUNTERS.unknown_command();
+            static WORDS: Mutex<u64> = Mutex::new(0);
+            let mut seen = lock(&WORDS);
+            if command < 64 && *seen & 1 << command == 0 {
+                *seen |= 1 << command;
+                tracing::info!(
+                    command,
+                    words = ?(0..4).map(|i| word(i).map(|w| format!("{w:08x}"))).collect::<Vec<_>>(),
+                    "coprocessor command not carried out"
+                );
+            }
+        }
     }
     if id != 0 {
         let mut done = [0u8; 16];
@@ -1238,6 +1345,7 @@ mod tests {
                 S_OK
             );
         };
+        let _ = COUNTERS.take();
         submit(ENABLE_XMA, &[1]);
         xma().pump();
         // Full: all four blocks written (silence), the write block wrapped
@@ -1272,6 +1380,15 @@ mod tests {
 
         submit(DISABLE_XMA, &[1]);
         assert_eq!(produced(&xma()), None);
+        // What the stats saw: one voice, its six frames (all good), the 26
+        // blocks (all silent), the title's takes, the refills after them
+        // and the input running out once.
+        let w = COUNTERS.take();
+        assert_eq!((w.enabled, w.disabled), (1, 1));
+        assert_eq!((w.frames, w.bad_frames, w.input_ended), (6, 0, 1));
+        assert_eq!((w.blocks_out, w.silent_blocks, w.peak), (26, 26, 0));
+        assert!(w.blocks_taken >= 8 && w.taken_us >= 8 * 2_666, "{w:?}");
+        assert!(w.refills >= 1, "{w:?}");
         (m.release)(acp);
         ApuFree(input);
         ApuFree(output);
@@ -1320,6 +1437,7 @@ mod tests {
                 bad_frames: 0,
                 peak: 0,
                 ended_ms: None,
+                room_since: None,
             },
         };
         let mut step = |expect_next: u32| {
@@ -1426,5 +1544,30 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    /// A context's overlap buffer gets the token of its voice's decoder; a
+    /// copy of the buffer in another context (a stereo 48 kHz one like it)
+    /// finds the decoder, a cold buffer does not.
+    #[test]
+    fn the_overlap_buffer_carries_the_decoder_to_the_next_context() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut buffer, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut buffer, &mut apu, 0x400, 0x100, 2), S_OK);
+        // SAFETY: the allocation was just made.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), 0x400) };
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(1, 1 << 29 | 3 << 27);
+        context.set(8, apu);
+        assert!(overlap::restore(&bytes[..16], 2, 48_000).is_none());
+        keep_overlap(context, &xma::Decoder::new(2, 48_000));
+        let copy = bytes.to_vec();
+        assert!(overlap::restore(&copy, 2, 48_000).is_some());
+        assert!(overlap::restore(&copy, 1, 48_000).is_none());
+        ApuFree(buffer);
+        // A buffer that is not title memory is left alone.
+        context.set(8, 0);
+        keep_overlap(context, &xma::Decoder::new(2, 48_000));
     }
 }

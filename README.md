@@ -72,12 +72,19 @@
   (a mark is kept in `%LOCALAPPDATA%\victory\warmed`).
 - RTX 20 and 30 cards can try DLSS frame generation with the
   [MFG Unlocker](https://github.com/dashdogy/MFG-Unlocker) mod (not ours, and
-  not tested with this fork, which was only run on an RTX 50). Download it from
-  its own releases, rename `MFGUnlocker.dll` to `winmm.dll` and put it beside
-  `victory.exe`. victory.exe loads `winmm.dll`, so Windows starts the mod with it.
-  The start's notice then says "UNLOCKED BY A MOD" and the log names the DLL. If
-  the game crashes or frame generation fails, delete that `winmm.dll`. FSR 3
-  frame generation (2x) is the supported way on those cards.
+  not tested with this fork, which was only run on an RTX 50). It is an option,
+  off by default: **F1, MFG UNLOCKER, ON**, then restart. On, the next start
+  downloads it by itself from the mod's own GitHub release (v1.7.2, about 5 MB,
+  checked against the SHA-256 its author published) into
+  `%LOCALAPPDATA%\victory\mfg-unlocker`, and every start loads it. Nothing is
+  renamed or copied. On an RTX 20 or 30 the first start also asks once (No unless
+  you type y). `victory.exe get-mfg` downloads it by hand. The mod writes its own
+  `RTXMFG-...` logs and settings beside `victory.exe`, and Backspace opens its
+  menu. The start's notice says "UNLOCKED BY A MOD" and the log says it was
+  loaded. If the game crashes or frame generation fails, turn it off in F1 (or
+  add `VICTORY_MFG_UNLOCKER=` to `%LOCALAPPDATA%\victory\victory-settings.txt`).
+  FSR 3 frame generation (2x) is the supported way on those cards. A
+  `winmm.dll` copy of the mod beside `victory.exe` still works too.
 
 **In the game**
 

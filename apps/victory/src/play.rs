@@ -21,6 +21,13 @@
 //! no shader model 6.6 (Windows 10's own stops at 6.5), Microsoft's newer
 //! runtime, `D3D12\D3D12Core.dll` from Microsoft's NuGet package, after asking
 //! (`victory get-d3d12`). Windows loads it only from there (main.rs).
+//!
+//! MFG Unlocker, someone else's mod that unlocks DLSS Frame Generation on RTX
+//! 20 and 30 cards, is an option (F1, MFG UNLOCKER; off by default, asked once
+//! on such a card): on, it is fetched from its author's GitHub release into
+//! `%LOCALAPPDATA%\victory\mfg-unlocker` and loaded by this program at the
+//! start (`victory get-mfg` fetches it by hand). It writes its own logs and
+//! settings beside the program.
 
 use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
@@ -482,6 +489,120 @@ fn offer_fsr(card: &str) {
     }
 }
 
+/// `scripts\get-mfg-unlocker.ps1`, run by Windows PowerShell.
+const FETCH_MFG: &str = include_str!("../../../scripts/get-mfg-unlocker.ps1");
+
+/// The mod's DLL, under its own name: loaded by this program (main.rs, [`load_mfg`]), not by
+/// Windows in place of one of its own, so nothing is renamed or put beside the game.
+const MFG_DLL: &str = "MFGUnlocker.dll";
+
+/// Where `victory get-mfg` puts MFG Unlocker.
+fn mfg_home() -> Result<PathBuf> {
+    Ok(home()?.join("mfg-unlocker"))
+}
+
+/// A GeForce RTX of the 20 or 30 series ("NVIDIA GeForce RTX 3080", "... RTX 2060 SUPER"): DLSS
+/// runs, DLSS Frame Generation only with MFG Unlocker.
+fn older_rtx(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    let Some(at) = name.find("RTX") else { return false };
+    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
+    model.len() == 4 && (model.starts_with("20") || model.starts_with("30"))
+}
+
+/// Runs the fetcher: MFG Unlocker from its author's GitHub release into `to`.
+fn fetch_mfg(to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
+    let script = to.join("get-mfg-unlocker.ps1");
+    std::fs::write(&script, FETCH_MFG).with_context(|| format!("writing {}", script.display()))?;
+    let status = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-To")
+        .arg(to)
+        .status()
+        .context("starting Windows PowerShell")?;
+    let _ = std::fs::remove_file(&script);
+    anyhow::ensure!(
+        status.success() && to.join(MFG_DLL).is_file(),
+        "MFG Unlocker did not arrive (see above); the game runs without it"
+    );
+    Ok(())
+}
+
+/// `victory get-mfg`: fetches it (F1's MFG UNLOCKER turns it on).
+pub(crate) fn get_mfg() -> Result<()> {
+    let to = mfg_home()?;
+    let _ = std::fs::remove_file(to.join("declined"));
+    fetch_mfg(&to)?;
+    println!("Turn it on in the game: F1, MFG UNLOCKER, ON (or `victory play --set VICTORY_MFG_UNLOCKER=1`).");
+    Ok(())
+}
+
+/// Asks once, on an RTX 20 or 30 card, whether to turn MFG Unlocker on. No is the default: it is
+/// someone else's mod, NVIDIA does not support what it does, and it was not tested here.
+/// `true`: turned on (saved in `menu_file`, as the F1 menu would).
+fn offer_mfg(card: &str, menu_file: &Path) -> bool {
+    let Ok(to) = mfg_home() else { return false };
+    let declined = to.join("declined");
+    if declined.exists() || !std::io::stdin().is_terminal() {
+        return false;
+    }
+    println!("This card ({card}) runs DLSS, but NVIDIA's DLSS frame generation only on RTX 40 and later.");
+    println!("MFG Unlocker, someone else's mod (github.com/dashdogy/MFG-Unlocker, MIT licence, about 5 MB),");
+    println!("unlocks it on RTX 20 and 30 cards. NVIDIA does not support that, and it was not tested with");
+    println!("this game. On, it is downloaded now and at every start loaded by victory.exe; F1, MFG UNLOCKER");
+    println!("turns it off again. Off, the game uses AMD's FSR 3 frame generation (2x) on this card.");
+    print!("Turn MFG Unlocker on? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    let _ = std::io::stdin().read_line(&mut answer);
+    let _ = std::fs::create_dir_all(&to);
+    if !answer.trim().to_ascii_lowercase().starts_with('y') {
+        let _ = std::fs::write(&declined, "asked once; F1, MFG UNLOCKER turns it on\r\n");
+        println!("Left off. F1, MFG UNLOCKER turns it on later.");
+        return false;
+    }
+    let mut text = std::fs::read_to_string(menu_file).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push_str("\r\n");
+    }
+    text.push_str("VICTORY_MFG_UNLOCKER=1\r\n");
+    if let Err(e) = std::fs::write(menu_file, text) {
+        println!("Could not save the choice ({e}); on for this start only.");
+    }
+    true
+}
+
+/// With MFG Unlocker on: the DLL, fetched first where it is missing (no question: turning it on
+/// was the choice). `None`: not there (the reason said).
+fn mfg_dll() -> Option<PathBuf> {
+    let to = mfg_home().ok()?;
+    let dll = to.join(MFG_DLL);
+    if !dll.is_file() {
+        println!("MFG UNLOCKER is on and not on this PC yet: downloading it.");
+        if let Err(e) = fetch_mfg(&to) {
+            println!("{e:#}");
+            return None;
+        }
+    }
+    Some(dll)
+}
+
+/// Loads MFG Unlocker (`VICTORY_MFG_UNLOCKER_DLL`, set by [`prepare`] with the option on) into
+/// this process, before the layer makes its device or loads Streamline: it wraps NVIDIA's frame
+/// generation from there, as it would loaded by Windows in place of `winmm.dll`. It writes its
+/// own logs and settings (`RTXMFG-...`) beside the program; Backspace opens its menu.
+pub(crate) fn load_mfg() {
+    let Some(dll) = std::env::var_os("VICTORY_MFG_UNLOCKER_DLL").filter(|v| !v.is_empty()).map(PathBuf::from) else {
+        return;
+    };
+    match victory_hle::streamline::load_mod("MFG Unlocker (F1, MFG UNLOCKER)", &dll) {
+        Ok(()) => println!("MFG Unlocker loaded ({}). Backspace opens its menu.", dll.display()),
+        Err(code) => println!("MFG Unlocker did not load (Windows error {code}): running without it."),
+    }
+}
+
 /// `D3D12` beside this program: where Windows looks for Microsoft's newer
 /// Direct3D 12 runtime (main.rs's `D3D12SDKPath`).
 fn d3d12_dir() -> Result<PathBuf> {
@@ -667,6 +788,23 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
             s.insert("VICTORY_FIDELITYFX_DIR".to_owned(), dir.to_string_lossy().into_owned());
         }
     }
+    // MFG Unlocker (F1, MFG UNLOCKER): DLSS frame generation on RTX 20 and 30 cards. Asked once
+    // on such a card with DLSS on, where the choice was never made and no mod DLL is beside us.
+    let mods = mod_dlls(&here);
+    if s.contains_key("VICTORY_DLSS")
+        && !menu.iter().any(|(k, _)| k == "VICTORY_MFG_UNLOCKER")
+        && !s.contains_key("VICTORY_MFG_UNLOCKER")
+        && mods.is_empty()
+        && let Some(card) = victory_hle::streamline::adapter_name().filter(|c| older_rtx(c))
+        && offer_mfg(&card, &menu_file)
+    {
+        s.insert("VICTORY_MFG_UNLOCKER".to_owned(), "1".to_owned());
+    }
+    if s.get("VICTORY_MFG_UNLOCKER").is_some_and(|v| v == "1")
+        && let Some(dll) = mfg_dll()
+    {
+        s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
+    }
     // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
     // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
     // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
@@ -690,7 +828,6 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     let log = log_file(&home.join("logs"))?;
     let console = if series_s { "series-s" } else { "series-x" };
     let line: Vec<String> = s.iter().map(|(k, v)| format!("{k}={v}")).collect();
-    let mods = mod_dlls(&here);
     let mods_line = if mods.is_empty() {
         String::new()
     } else {
@@ -837,6 +974,14 @@ mod tests {
         assert!(fg("NVIDIA GeForce RTX 5070") && fg("NVIDIA GeForce RTX 4070 SUPER") && fg("NVIDIA GeForce RTX 5090 Laptop GPU"));
         assert!(!fg("NVIDIA GeForce RTX 3080 Ti") && !fg("NVIDIA GeForce RTX 2060") && !fg("NVIDIA GeForce GTX 1080"));
         assert!(!fg("AMD Radeon RX 7900 XTX") && !fg("Intel(R) Arc(TM) A770 Graphics") && !fg(""));
+    }
+
+    /// MFG Unlocker is offered only to RTX 20 and 30 cards.
+    #[test]
+    fn cards_offered_mfg_unlocker() {
+        assert!(older_rtx("NVIDIA GeForce RTX 3080 Ti") && older_rtx("NVIDIA GeForce RTX 2060 SUPER") && older_rtx("NVIDIA GeForce RTX 3050 Laptop GPU"));
+        assert!(!older_rtx("NVIDIA GeForce RTX 5070") && !older_rtx("NVIDIA GeForce RTX 4090") && !older_rtx("NVIDIA GeForce GTX 1080"));
+        assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
     }
 
     #[test]

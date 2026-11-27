@@ -711,6 +711,27 @@ pub fn d3d12_core_path() -> Option<PathBuf> {
     }
 }
 
+/// Loads a mod's DLL into this process for good, logged as `what` (MFG Unlocker: it wraps
+/// NVIDIA's frame generation, so it is loaded before a device is made or Streamline loaded).
+/// `Err`: Windows' error code.
+pub fn load_mod(what: &str, path: &Path) -> Result<(), u32> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+    let name = wide(path);
+    // SAFETY: a NUL-terminated path; the module stays loaded for the life of the process.
+    let (module, code) = unsafe {
+        let module = LoadLibraryW(name.as_ptr());
+        (module, if module.is_null() { GetLastError() } else { 0 })
+    };
+    if module.is_null() {
+        tracing::warn!(dll = %path.display(), code, "{what}: did not load");
+        Err(code)
+    } else {
+        tracing::info!(dll = %path.display(), "{what}: loaded");
+        Ok(())
+    }
+}
+
 /// The Authenticode signature of `path` (NVIDIA signs its DLLs), checked
 /// without going online.
 fn verify_signature(path: &Path) -> Result<(), String> {

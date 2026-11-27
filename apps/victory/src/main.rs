@@ -188,6 +188,12 @@ enum Command {
     /// does it by itself where it is needed.
     #[cfg(windows)]
     GetD3d12,
+    /// Fetch MFG Unlocker (someone else's mod, github.com/dashdogy/MFG-Unlocker,
+    /// about 5 MB): DLSS frame generation on RTX 20 and 30 cards, which NVIDIA
+    /// does not support. `play` loads it with F1's MFG UNLOCKER on, and fetches
+    /// it by itself then.
+    #[cfg(windows)]
+    GetMfg,
     /// Print the highest shader model the default GPU runs here (`play`
     /// asks it in a process of its own).
     #[cfg(windows)]
@@ -274,6 +280,8 @@ fn main() -> Result<()> {
                 play::preload(&ready.exe);
             }
             victory_core::logging::init("info");
+            // F1's MFG UNLOCKER: the mod, before the layer makes its device or loads Streamline.
+            play::load_mfg();
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
             run::run(&ready.exe, Unimplemented::Trap, false, true, console)
         });
@@ -342,6 +350,8 @@ fn main() -> Result<()> {
         Command::GetFsr => play::get_fsr(),
         #[cfg(windows)]
         Command::GetD3d12 => play::get_d3d12(),
+        #[cfg(windows)]
+        Command::GetMfg => play::get_mfg(),
         #[cfg(windows)]
         Command::ShaderModel => {
             let model = victory_hle::streamline::highest_shader_model();

@@ -2958,40 +2958,35 @@ impl HostHeap {
             }
             let views = views.as_mut()?;
             if views.recording != recording {
-                views.recording = recording;
-                views.made.clear();
+                views.begin(recording);
             }
             let twins = self.twins.get(index as usize).is_some();
-            if !views.made.contains_key(&words) {
-                let view = super::view_at(words[1], words[2])?;
-                let at = 2 * views.made.len() as u32;
-                // (A constant buffer's bytes are copied for each draw.)
-                if at >= ListViews::SLOTS || matches!(view, View::Constant(..)) {
-                    return None;
-                }
-                let twin = twinned(&view);
-                let kept = make_twinned(&view, views.slot(at), Some(views.slot(at + 1)))?;
-                let stride_word = view_stride_word(&view);
-                let listed = Listed {
-                    kind: crate::draw::view_kind(&view),
-                    texture: is_texture_view(&view),
-                    ready: (0, 0, false),
-                    tabled: None,
-                };
-                views.made.insert(words, ListView { view, at, twin, stride_word, kept, listed });
+            if let Some(view) = views.made.get(&words) {
+                views.counts[0] += 1;
+                return Some(self.listed_from(index, view, twins, views.start, views.step));
             }
-            let made = &views.made[&words];
-            self.copy_from(index, views.slot(made.at));
-            if made.twin && twins {
-                self.copy_from(self.raw + index, views.slot(made.at + 1));
-                self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                self.clear_twin(index);
-            }
-            self.write_stride(index, made.stride_word);
-            self.keep(index, made.kept.clone());
-            Some(made.listed)
+            let view = views.make(words)?;
+            let listed = self.listed_from(index, &view, twins, views.start, views.step);
+            views.made.insert(words, view);
+            Some(listed)
         })
+    }
+
+    /// Slot `index` made as the view `view` is, by copying its descriptor
+    /// (from the thread's heap that begins at `start`, `step` bytes a slot).
+    fn listed_from(&self, index: u32, view: &ListView, twins: bool, start: usize, step: usize) -> Listed {
+        let made = &*view.made;
+        let slot = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step };
+        self.copy_from(index, slot(made.at));
+        if made.twin && twins {
+            self.copy_from(self.raw + index, slot(made.at + 1));
+            self.twins[index as usize].store(true, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.clear_twin(index);
+        }
+        self.write_stride(index, made.stride_word);
+        self.keep_ref(index, &made.kept);
+        view.listed
     }
 
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
@@ -3062,6 +3057,26 @@ impl HostHeap {
         };
         // A running submission may still read the old resource through
         // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// [`HostHeap::keep`] of a resource somebody else holds: it is taken a
+    /// hold of (a count the runtime keeps for all threads at once, on a line
+    /// of memory they fight over) only if the slot shows another.
+    fn keep_ref(&self, index: u32, resource: &Kept) {
+        use windows::core::Interface;
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.clone())
+        };
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
@@ -6068,14 +6083,91 @@ pub(crate) struct Listed {
     pub(crate) tabled: Option<(u32, bool)>,
 }
 
-struct ListView {
+/// What was made for one record: shared by the recording's map and, for a buffer view, [`Over`].
+struct ListMade {
     view: View,
     /// Its descriptor's slot in [`ListViews`]; its raw twin's is the next.
     at: u32,
     twin: bool,
     stride_word: u32,
     kept: Kept,
+    kind: Option<victory_shader::native::ResourceType>,
+    texture: bool,
+}
+
+struct ListView {
+    made: std::rc::Rc<ListMade>,
+    /// What is known of it in this recording.
     listed: Listed,
+}
+
+impl ListView {
+    fn of(made: std::rc::Rc<ListMade>) -> ListView {
+        let listed = Listed { kind: made.kind, texture: made.texture, ready: (0, 0, false), tabled: None };
+        ListView { made, listed }
+    }
+}
+
+/// How a thread keeps buffer views from one recording to the next
+/// (`VICTORY_VIEW_CACHE`): by record, with the value of [`crate::shadow::world`] before it was made, which says
+/// whether the copy it shows is the one its address is found on still. Bounded: it begins again when its slots or
+/// [`Over::FLUSH_MS`] are used up (what it holds holds the host copies it shows, which are let go of when nothing
+/// shows them).
+struct Over<V> {
+    map: std::collections::HashMap<[u32; 3], (u64, V), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// The next slot free of the first [`ListViews::KEEP_SLOTS`] (a view takes two).
+    next: u32,
+    since: u64,
+}
+
+/// What [`Over::find`] says of a record.
+enum Found<'a, V> {
+    Hit(&'a V),
+    /// Made when the copies were others: the slot to make it in again.
+    Stale(u32),
+    Miss,
+}
+
+impl<V> Over<V> {
+    /// Milliseconds a view is kept at most.
+    const FLUSH_MS: u64 = 500;
+
+    fn new() -> Self {
+        Over { map: Default::default(), next: 0, since: 0 }
+    }
+
+    fn find(&self, words: &[u32; 3], world: u64, slot_of: impl Fn(&V) -> u32) -> Found<'_, V> {
+        match self.map.get(words) {
+            Some((was, v)) if *was == world => Found::Hit(v),
+            Some((_, v)) => Found::Stale(slot_of(v)),
+            None => Found::Miss,
+        }
+    }
+
+    /// A recording begins at `now` (milliseconds): everything goes if the `slots` are used up or it is old. Whether
+    /// it went.
+    fn begin(&mut self, now: u64, slots: u32) -> bool {
+        if self.map.is_empty() && self.next == 0 {
+            self.since = now;
+            return false;
+        }
+        if self.next + 2 <= slots && now.saturating_sub(self.since) < Self::FLUSH_MS {
+            return false;
+        }
+        self.map.clear();
+        self.next = 0;
+        self.since = now;
+        true
+    }
+
+    /// Two slots for a view not there yet, of `slots`; none when they are used up.
+    fn slots(&mut self, slots: u32) -> Option<u32> {
+        let at = self.next;
+        (at + 2 <= slots).then(|| {
+            self.next += 2;
+            at
+        })
+    }
 }
 
 /// The descriptors a thread made for one recording of a list, by the record
@@ -6088,16 +6180,69 @@ struct ListView {
 /// frame waits for last (timeline waits-2: 24 of 65 ms). Here a list makes a
 /// view once, as it makes a table once (`crate::draw::State::tables`), and
 /// copies its descriptor.
+///
+/// With `VICTORY_VIEW_CACHE` a buffer view is made once for the next lists too
+/// ([`Over`]): the first [`ListViews::KEEP_SLOTS`] slots are theirs, the next
+/// [`ListViews::LOCAL_SLOTS`] those of what is made for one recording only,
+/// and the last two a view made again to be compared with the one kept
+/// (`VICTORY_VIEW_CACHE=2`).
 struct ListViews {
     recording: u64,
     heap: ID3D12DescriptorHeap,
     step: usize,
     start: usize,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    over: Over<std::rc::Rc<ListMade>>,
+    /// Slots of this recording's own taken so far.
+    local: u32,
+    /// Since the thread began, for [`view_cache_line`]: found in this recording, kept from before, stale, made (buffer
+    /// views, others), compared, differing, begun again; and how much of it [`VIEW_CACHE`] has.
+    counts: [u64; 8],
+    sent: [u64; 8],
 }
 
+/// [`ListViews::counts`] of all threads, as they are handed over.
+static VIEW_CACHE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// What `VICTORY_VIEW_CACHE` says: 0 none (the default), 1 buffer views are kept from one recording to the next, 2 as
+/// 1 and each one kept is compared with one made again.
+fn view_cache() -> u8 {
+    #[cfg(test)]
+    {
+        let forced = TEST_VIEW_CACHE.load(std::sync::atomic::Ordering::Relaxed);
+        if forced != u8::MAX {
+            return forced;
+        }
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_VIEW_CACHE").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// The milliseconds [`Over`] counts its age in (a test's own on its thread).
+fn view_clock() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_VIEW_CLOCK.with(std::cell::Cell::get) {
+        return now;
+    }
+    crate::host::coarse_ms()
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_VIEW_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+static TEST_VIEW_CACHE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+
 impl ListViews {
-    const SLOTS: u32 = 8192;
+    const KEEP_SLOTS: u32 = 16384;
+    const LOCAL_SLOTS: u32 = 8192;
+    const SLOTS: u32 = Self::KEEP_SLOTS + Self::LOCAL_SLOTS + 2;
 
     fn new() -> Option<ListViews> {
         let host = host()?;
@@ -6113,13 +6258,128 @@ impl ListViews {
                 .ok()?;
             let step = host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
-            Some(ListViews { recording: 0, heap, step, start, made: Default::default() })
+            Some(ListViews {
+                recording: 0,
+                heap,
+                step,
+                start,
+                made: Default::default(),
+                over: Over::new(),
+                local: 0,
+                counts: [0; 8],
+                sent: [0; 8],
+            })
         }
     }
 
     fn slot(&self, i: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         debug_assert!(i < Self::SLOTS && !windows::core::Interface::as_raw(&self.heap).is_null());
         D3D12_CPU_DESCRIPTOR_HANDLE { ptr: self.start + i as usize * self.step }
+    }
+
+    /// A recording of a list begins on this thread.
+    fn begin(&mut self, recording: u64) {
+        for ((total, n), sent) in VIEW_CACHE.iter().zip(&self.counts).zip(&mut self.sent) {
+            if *n > *sent {
+                total.fetch_add(*n - *sent, std::sync::atomic::Ordering::Relaxed);
+                *sent = *n;
+            }
+        }
+        self.recording = recording;
+        self.made.clear();
+        self.local = 0;
+        if view_cache() != 0 && self.over.begin(view_clock(), Self::KEEP_SLOTS) {
+            self.counts[7] += 1;
+        }
+    }
+
+    /// The view the record `words` names, made in this thread's heap (or found there from before), `None` if it is
+    /// no view or cannot be made so.
+    fn make(&mut self, words: [u32; 3]) -> Option<ListView> {
+        let cache = view_cache();
+        // (Before anything is looked at: a change after it makes what is made stale at once.)
+        let world = crate::shadow::world();
+        let mut again = None;
+        if cache != 0 {
+            match self.over.find(&words, world, |m| m.at) {
+                Found::Hit(made) => {
+                    let made = made.clone();
+                    if cache < 2 || self.same_as_new(&made) {
+                        self.counts[1] += 1;
+                        return Some(ListView::of(made));
+                    }
+                    again = Some(made.at);
+                }
+                Found::Stale(at) => again = Some(at),
+                Found::Miss => {}
+            }
+            if again.is_some() {
+                self.counts[2] += 1;
+            }
+        }
+        let view = super::view_at(words[1], words[2])?;
+        // (A constant buffer's bytes are copied for each draw.)
+        if matches!(view, View::Constant(..)) {
+            return None;
+        }
+        let keep = cache != 0 && view_elements(&view).is_some();
+        let at = match again.filter(|_| keep) {
+            Some(at) => at,
+            None => match keep.then(|| self.over.slots(Self::KEEP_SLOTS)).flatten() {
+                Some(at) => at,
+                None => {
+                    if self.local + 2 > Self::LOCAL_SLOTS {
+                        return None;
+                    }
+                    let at = Self::KEEP_SLOTS + self.local;
+                    self.local += 2;
+                    at
+                }
+            },
+        };
+        let kept = make_twinned(&view, self.slot(at), Some(self.slot(at + 1)))?;
+        self.counts[if keep { 3 } else { 4 }] += 1;
+        let made = std::rc::Rc::new(ListMade {
+            twin: twinned(&view),
+            stride_word: view_stride_word(&view),
+            kind: crate::draw::view_kind(&view),
+            texture: is_texture_view(&view),
+            view,
+            at,
+            kept,
+        });
+        // (Only one that lies in the part of the heap that is kept.)
+        if keep && at < Self::KEEP_SLOTS {
+            self.over.map.insert(words, (world, made.clone()));
+        }
+        Some(ListView::of(made))
+    }
+
+    /// Whether a view made again now is the descriptor that was kept (and shows what it showed): the one kept is as
+    /// it is for what `crate::shadow::world` says, and this says whether that was all.
+    fn same_as_new(&mut self, made: &ListMade) -> bool {
+        use windows::core::Interface;
+        let scratch = Self::KEEP_SLOTS + Self::LOCAL_SLOTS;
+        self.counts[5] += 1;
+        let fresh = make_twinned(&made.view, self.slot(scratch), Some(self.slot(scratch + 1)));
+        let step = self.step.min(64);
+        let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+        let alike = fresh
+            .as_ref()
+            .is_some_and(|fresh| fresh.as_ref().map(Interface::as_raw) == made.kept.as_ref().map(Interface::as_raw))
+            && (0..2).all(|i| {
+                crate::host::read_into(self.slot(made.at + i).ptr as *const u8, &mut a[..step])
+                    && crate::host::read_into(self.slot(scratch + i).ptr as *const u8, &mut b[..step])
+                    && a[..step] == b[..step]
+            });
+        if !alike {
+            self.counts[6] += 1;
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::warn!(view = ?made.view, "a buffer view kept from an earlier list is not the one made now (VICTORY_VIEW_CACHE=2)");
+            }
+        }
+        alike
     }
 }
 
@@ -6132,7 +6392,7 @@ pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
         let views = views.as_ref().filter(|v| v.recording == recording)?;
-        views.made.get(&words).map(|m| m.view.clone())
+        views.made.get(&words).map(|m| m.made.view.clone())
     })
 }
 
@@ -6145,6 +6405,32 @@ pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
             made.listed = listed;
         }
     });
+}
+
+/// With the frame line: what [`ListViews`] did per frame over `frames`.
+pub(crate) fn view_cache_line(frames: f64) {
+    let [local, kept, stale, buffers, others, checked, differing, flushes] =
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| VIEW_CACHE[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
+    let asked = kept + stale + buffers;
+    if local + asked + others == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "views of lists' tables per frame (VICTORY_VIEW_CACHE={}): {:.0} found in the recording, {:.0} buffer views found from \
+         earlier recordings ({:.0}% of the {:.0} asked for; {:.0} stale), {:.0} buffer views and {:.0} others made, {:.0} compared with \
+         one made again ({:.0} differing), {:.1} times it began again",
+        view_cache(),
+        local / frames,
+        kept / frames,
+        if asked > 0.0 { 100.0 * kept / asked } else { 0.0 },
+        asked / frames,
+        stale / frames,
+        buffers / frames,
+        others / frames,
+        checked / frames,
+        differing / frames,
+        flushes / frames
+    );
 }
 
 /// Whether a list makes a view its tables hold once (`VICTORY_LIST_VIEWS=0`:
@@ -6221,5 +6507,102 @@ mod bake_flip_tests {
         assert_eq!(cb1(), None);
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
+    }
+}
+
+#[cfg(test)]
+mod view_cache_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn a_view_found_again_is_a_hit_until_the_copies_change() {
+        let mut over: Over<u32> = Over::new();
+        let words = [1, 2, 3];
+        assert!(matches!(over.find(&words, 7, |&at| at), Found::Miss));
+        let at = over.slots(8).unwrap();
+        over.map.insert(words, (7, at));
+        assert!(matches!(over.find(&words, 7, |&at| at), Found::Hit(&0)));
+        // Another record is no hit, and the copies being others makes it stale, with its slot to make it in again.
+        assert!(matches!(over.find(&[1, 2, 4], 7, |&at| at), Found::Miss));
+        assert!(matches!(over.find(&words, 8, |&at| at), Found::Stale(0)));
+    }
+
+    #[test]
+    fn views_take_two_slots_each_until_they_are_used_up() {
+        let mut over: Over<u32> = Over::new();
+        let got: Vec<Option<u32>> = (0..4).map(|_| over.slots(6)).collect();
+        assert_eq!(got, [Some(0), Some(2), Some(4), None]);
+        assert_eq!(over.slots(7), None);
+        assert_eq!(over.slots(8), Some(6));
+    }
+
+    #[test]
+    fn it_begins_again_when_old_or_full_and_not_before() {
+        let mut over: Over<u32> = Over::new();
+        // Nothing kept: nothing to begin again, the clock starts.
+        assert!(!over.begin(1000, 8));
+        let at = over.slots(8).unwrap();
+        over.map.insert([1, 2, 3], (7, at));
+        assert!(!over.begin(1000 + Over::<u32>::FLUSH_MS - 1, 8));
+        assert_eq!(over.map.len(), 1);
+        // Old.
+        assert!(over.begin(1000 + Over::<u32>::FLUSH_MS, 8));
+        assert!(over.map.is_empty());
+        assert_eq!(over.slots(8), Some(0));
+        // Full (the slots left are fewer than a view's).
+        over.map.insert([1, 2, 3], (7, 0));
+        for _ in 0..3 {
+            over.slots(8);
+        }
+        assert!(over.begin(1000 + Over::<u32>::FLUSH_MS + 1, 8));
+        assert_eq!(over.next, 0);
+    }
+
+    /// On the host GPU: a buffer view kept from the first recording is the one of the second (compared with a view
+    /// made again by mode 2), and a change in the copies makes it again.
+    #[test]
+    fn a_buffer_view_is_kept_from_one_recording_to_the_next() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[10, 1, 0, 0, 64, 0, 0, 0, 0, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, View::Placed(true, resource, desc));
+        let words = [slot_mem[0], slot_mem[1], slot_mem[2]];
+        let s = heap.dynamic(4).unwrap();
+
+        let counts = || LIST_VIEWS.with(|v| v.borrow().as_ref().unwrap().counts);
+        // The state of the copies and the clock are this test's own: tests on other threads change the real ones.
+        crate::shadow::pin_world_for_test(Some(100));
+        TEST_VIEW_CLOCK.with(|c| c.set(Some(1000)));
+        TEST_VIEW_CACHE.store(2, Relaxed);
+        // (Recording numbers of this test alone.)
+        let made = heap.make_listed(0xcafe_0001, words, s).is_some();
+        assert!(heap.make_listed(0xcafe_0001, words, s + 1).is_some() == made);
+        assert!(heap.make_listed(0xcafe_0002, words, s + 2).is_some() == made);
+        let c = counts();
+        TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
+        if !made {
+            // The view did not make on this adapter: nothing to keep.
+            crate::shadow::pin_world_for_test(None);
+            return;
+        }
+        // One made, one found in its recording, one kept from the one before and compared with one made again.
+        assert_eq!((c[0], c[1], c[2], c[3], c[5], c[6]), (1, 1, 0, 1, 1, 0), "{c:?}");
+
+        // The copies are others: made again (in the same slot), not kept.
+        TEST_VIEW_CACHE.store(1, Relaxed);
+        crate::shadow::pin_world_for_test(Some(101));
+        assert!(heap.make_listed(0xcafe_0003, words, s + 3).is_some());
+        let c = counts();
+        TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
+        crate::shadow::pin_world_for_test(None);
+        assert_eq!((c[1], c[2], c[3], c[7]), (1, 1, 2, 0), "{c:?}");
     }
 }

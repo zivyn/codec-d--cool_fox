@@ -174,6 +174,7 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    size_pools_as_series_x(&image);
     arm_watchdog_hold(&image);
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -196,6 +197,48 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// `VICTORY_TITLE_POOLS=series-x`: the title's start-up sizes its memory pools
+/// as on a Series X while the device stays what `--console` says
+/// (`victory_game::pools`). What the title is told of its memory follows.
+#[cfg(windows)]
+fn size_pools_as_series_x(image: &victory_loader::LoadedImage) {
+    const EXECUTE: u32 = 0x2000_0000;
+    let code: Vec<(u32, u32)> = image
+        .info()
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & EXECUTE != 0)
+        .map(|s| (s.rva, s.virtual_size))
+        .collect();
+    let asked = std::env::var(victory_game::pools::ENV).ok();
+    // SAFETY: the image is mapped and relocated, stays so for the run, and
+    // nothing of it has run yet.
+    let done = unsafe {
+        victory_game::pools::apply(asked.as_deref(), image.base(), &code, |at, was, new| {
+            victory_loader::code_patch::replace(at, was, new)
+        })
+    };
+    use victory_game::pools::Applied;
+    match done {
+        Applied::Off => {}
+        Applied::Patched(rva) => {
+            victory_hle::console::set_pools_of_series_x(true);
+            println!(
+                "title pools    sized as a Series X's (call at +{rva:#x}; {})",
+                victory_game::pools::ENV
+            );
+        }
+        Applied::NotFound => println!(
+            "title pools    {} is set, but this build's routine was not found: left as it is",
+            victory_game::pools::ENV
+        ),
+        Applied::Refused(rva) => println!(
+            "title pools    {} is set, but the call at +{rva:#x} could not be replaced: left as it is",
+            victory_game::pools::ENV
+        ),
+    }
 }
 
 /// Lets our stalls (a frame recording, host pipelines made on a title thread)

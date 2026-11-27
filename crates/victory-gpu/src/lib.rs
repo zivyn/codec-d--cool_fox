@@ -21,6 +21,8 @@ mod asked;
 mod changes;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+mod capture_window;
 #[cfg(windows)]
 mod compose;
 pub mod console;

@@ -48,3 +48,38 @@ pub fn current() -> Console {
         Console::SeriesX
     }
 }
+
+static POOLS_OF_SERIES_X: AtomicBool = AtomicBool::new(false);
+
+/// The title's memory pools were sized as a Series X's
+/// (`VICTORY_TITLE_POOLS=series-x`, `victory_game::pools`) although the
+/// device is another: what the title is told of its memory follows.
+pub fn set_pools_of_series_x(on: bool) {
+    POOLS_OF_SERIES_X.store(on, Ordering::Relaxed);
+}
+
+/// The console whose memory the title is told it has: the one it runs as,
+/// or a Series X once its pools are sized as one's.
+pub fn pools() -> Console {
+    if POOLS_OF_SERIES_X.load(Ordering::Relaxed) {
+        Console::SeriesX
+    } else {
+        current()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_pools_follow_the_device_unless_sized_as_a_series_x() {
+        set(Console::SeriesS);
+        assert_eq!(pools(), Console::SeriesS);
+        set_pools_of_series_x(true);
+        assert_eq!(pools(), Console::SeriesX);
+        assert_eq!(current(), Console::SeriesS, "the device stays what it was");
+        set_pools_of_series_x(false);
+        assert_eq!(pools(), Console::SeriesS);
+    }
+}

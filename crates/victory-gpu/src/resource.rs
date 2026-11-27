@@ -2813,6 +2813,22 @@ fn hand_out_resource(
             grown: std::sync::atomic::AtomicBool::new(false),
         },
     });
+    // Volumes the title makes (light, fog and grading tables): their size is a
+    // quality choice it makes per run (IMG1: 64x64x32 against 64x64x64), so
+    // when it chose is logged beside what the host showed it by then.
+    #[cfg(windows)]
+    if desc.dimension == 4 && desc.depth_or_array_size >= 16 {
+        tracing::info!(
+            width = desc.width,
+            height = desc.height,
+            depth = desc.depth_or_array_size,
+            format = desc.format,
+            flags = desc.flags,
+            frame = crate::frame::current(),
+            at_ms = crate::host::now_ms(),
+            "the title makes a volume texture"
+        );
+    }
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {

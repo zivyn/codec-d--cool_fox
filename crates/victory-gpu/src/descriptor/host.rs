@@ -157,6 +157,10 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// With `VICTORY_KEEP_FAST=1`: the address of what each slot of `kept` holds, written under its lock, so that
+    /// the draw that shows a slot what it shows already finds that out without taking the lock and touching the
+    /// slot's own line (the lock took 3 to 4 % of the list threads' time: nearly every ask is for the same again).
+    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1647,6 +1651,9 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept_raw: (0..if keep_fast() { count + extra } else { 0 })
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -2997,6 +3004,12 @@ impl HostHeap {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
         let Some(host) = host() else { return };
+        if COPIES.with(|c| {
+            let mut c = c.borrow_mut();
+            c.0 .then(|| c.1.push((self.cpu(to), from))).is_some()
+        }) {
+            return;
+        }
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
@@ -3043,16 +3056,21 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        use windows::core::Interface;
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
+        let raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        if self.shows_already(index, raw) {
+            return;
+        }
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
             }
+            self.shown(index, raw);
             std::mem::replace(&mut *slot, resource)
         };
         // A running submission may still read the old resource through
@@ -3070,15 +3088,36 @@ impl HostHeap {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
+        let raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        if self.shows_already(index, raw) {
+            return;
+        }
         let old = {
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
             }
+            self.shown(index, raw);
             std::mem::replace(&mut *slot, resource.clone())
         };
         if let Some(old) = old {
             crate::host::retire_resource(old);
+        }
+    }
+
+    /// Whether slot `index` holds the resource at `raw` (0: none), as the last change under its lock left it: a
+    /// slot that is changed at the same time by another thread ends up as one of the two writes made it, as with
+    /// the lock. Always false without `VICTORY_KEEP_FAST=1`.
+    #[inline]
+    fn shows_already(&self, index: u32, raw: usize) -> bool {
+        self.kept_raw.get(index as usize).is_some_and(|r| r.load(std::sync::atomic::Ordering::Relaxed) == raw)
+    }
+
+    /// Slot `index` holds the resource at `raw` from now on (under its lock).
+    #[inline]
+    fn shown(&self, index: u32, raw: usize) {
+        if let Some(r) = self.kept_raw.get(index as usize) {
+            r.store(raw, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -6083,6 +6122,56 @@ pub(crate) struct Listed {
     pub(crate) tabled: Option<(u32, bool)>,
 }
 
+thread_local! {
+    /// While a table is made (`crate::draw::State::tables`, with `VICTORY_STATE_FILTER`): whether the descriptors of its views
+    /// are copied together at its end, and those to copy: where to, where from.
+    static COPIES: std::cell::RefCell<(bool, Vec<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)>)> =
+        const { std::cell::RefCell::new((false, Vec::new())) };
+}
+
+/// Descriptors copied together, and the calls that did it, since the last frame line.
+pub(crate) static BATCHED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The copies of the views of the table that is made now are held back (or no longer are) until [`copies_flush`].
+pub(crate) fn copies_hold(on: bool) {
+    COPIES.with(|c| c.borrow_mut().0 = on);
+}
+
+/// Makes the copies held back, in one call.
+pub(crate) fn copies_flush() {
+    COPIES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.1.is_empty() {
+            return;
+        }
+        if let Some(host) = host() {
+            let (to, from): (Vec<_>, Vec<_>) = c.1.iter().copied().unzip();
+            let n = to.len() as u32;
+            // SAFETY: slots of our heap and of this thread's heap, one descriptor to each range.
+            unsafe {
+                host.device.CopyDescriptors(n, to.as_ptr(), None, n, from.as_ptr(), None, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            };
+            BATCHED[0].fetch_add(u64::from(n), std::sync::atomic::Ordering::Relaxed);
+            BATCHED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        c.1.clear();
+    });
+}
+
+/// Whether a slot's kept resource is looked at without its lock when it is the same again (`VICTORY_KEEP_FAST=1`;
+/// off by default).
+fn keep_fast() -> bool {
+    #[cfg(test)]
+    if TEST_KEEP_FAST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FAST").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+static TEST_KEEP_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// What was made for one record: shared by the recording's map and, for a buffer view, [`Over`].
 struct ListMade {
     view: View,
@@ -6114,7 +6203,9 @@ impl ListView {
 /// [`Over::FLUSH_MS`] are used up (what it holds holds the host copies it shows, which are let go of when nothing
 /// shows them).
 struct Over<V> {
-    map: std::collections::HashMap<[u32; 3], (u64, V), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// By record: the stamp ([`crate::shadow::stamp`]) it was made at, the title addresses its host copy was found
+    /// on, and what was made.
+    map: std::collections::HashMap<[u32; 3], (u64, (u64, u64), V), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The next slot free of the first [`ListViews::KEEP_SLOTS`] (a view takes two).
     next: u32,
     since: u64,
@@ -6136,10 +6227,10 @@ impl<V> Over<V> {
         Over { map: Default::default(), next: 0, since: 0 }
     }
 
-    fn find(&self, words: &[u32; 3], world: u64, slot_of: impl Fn(&V) -> u32) -> Found<'_, V> {
+    fn find(&self, words: &[u32; 3], still: impl Fn(u64, u64, u64) -> bool, slot_of: impl Fn(&V) -> u32) -> Found<'_, V> {
         match self.map.get(words) {
-            Some((was, v)) if *was == world => Found::Hit(v),
-            Some((_, v)) => Found::Stale(slot_of(v)),
+            Some((stamp, (lo, hi), v)) if still(*stamp, *lo, *hi) => Found::Hit(v),
+            Some((_, _, v)) => Found::Stale(slot_of(v)),
             None => Found::Miss,
         }
     }
@@ -6298,10 +6389,10 @@ impl ListViews {
     fn make(&mut self, words: [u32; 3]) -> Option<ListView> {
         let cache = view_cache();
         // (Before anything is looked at: a change after it makes what is made stale at once.)
-        let world = crate::shadow::world();
+        let stamp = crate::shadow::stamp();
         let mut again = None;
         if cache != 0 {
-            match self.over.find(&words, world, |m| m.at) {
+            match self.over.find(&words, crate::shadow::still, |m| m.at) {
                 Found::Hit(made) => {
                     let made = made.clone();
                     if cache < 2 || self.same_as_new(&made) {
@@ -6350,7 +6441,15 @@ impl ListViews {
         });
         // (Only one that lies in the part of the heap that is kept.)
         if keep && at < Self::KEEP_SLOTS {
-            self.over.map.insert(words, (world, made.clone()));
+            // The addresses its copy was found on: the view's own, and the whole buffer it is of.
+            let (mut lo, mut hi) = (u64::MAX, 0u64);
+            for (at, len) in [buffer_range(&made.view), buffer_extent(&made.view)].into_iter().flatten() {
+                (lo, hi) = (lo.min(at), hi.max(at.saturating_add(len.max(1))));
+            }
+            if lo >= hi {
+                (lo, hi) = (0, u64::MAX);
+            }
+            self.over.map.insert(words, (stamp, (lo, hi), made.clone()));
         }
         Some(ListView::of(made))
     }
@@ -6519,13 +6618,24 @@ mod view_cache_tests {
     fn a_view_found_again_is_a_hit_until_the_copies_change() {
         let mut over: Over<u32> = Over::new();
         let words = [1, 2, 3];
-        assert!(matches!(over.find(&words, 7, |&at| at), Found::Miss));
+        let holds = |now: u64| move |stamp: u64, _: u64, _: u64| stamp == now;
+        assert!(matches!(over.find(&words, holds(7), |&at| at), Found::Miss));
         let at = over.slots(8).unwrap();
-        over.map.insert(words, (7, at));
-        assert!(matches!(over.find(&words, 7, |&at| at), Found::Hit(&0)));
+        over.map.insert(words, (7, (0, u64::MAX), at));
+        assert!(matches!(over.find(&words, holds(7), |&at| at), Found::Hit(&0)));
         // Another record is no hit, and the copies being others makes it stale, with its slot to make it in again.
-        assert!(matches!(over.find(&[1, 2, 4], 7, |&at| at), Found::Miss));
-        assert!(matches!(over.find(&words, 8, |&at| at), Found::Stale(0)));
+        assert!(matches!(over.find(&[1, 2, 4], holds(7), |&at| at), Found::Miss));
+        assert!(matches!(over.find(&words, holds(8), |&at| at), Found::Stale(0)));
+        // By range: what changed elsewhere does not make it stale, what changed in its range does.
+        over.map.insert(words, (7, (1000, 2000), at));
+        let log = crate::changes::ChangeLog::new();
+        let stamp = log.stamp();
+        over.map.insert(words, (stamp, (1000, 2000), at));
+        log.log(5000, 6000);
+        let in_range = |stamp: u64, lo: u64, hi: u64| !log.changed_since(stamp, lo, hi);
+        assert!(matches!(over.find(&words, in_range, |&at| at), Found::Hit(_)));
+        log.log(1500, 1501);
+        assert!(matches!(over.find(&words, in_range, |&at| at), Found::Stale(0)));
     }
 
     #[test]
@@ -6543,7 +6653,7 @@ mod view_cache_tests {
         // Nothing kept: nothing to begin again, the clock starts.
         assert!(!over.begin(1000, 8));
         let at = over.slots(8).unwrap();
-        over.map.insert([1, 2, 3], (7, at));
+        over.map.insert([1, 2, 3], (7, (0, u64::MAX), at));
         assert!(!over.begin(1000 + Over::<u32>::FLUSH_MS - 1, 8));
         assert_eq!(over.map.len(), 1);
         // Old.
@@ -6551,7 +6661,7 @@ mod view_cache_tests {
         assert!(over.map.is_empty());
         assert_eq!(over.slots(8), Some(0));
         // Full (the slots left are fewer than a view's).
-        over.map.insert([1, 2, 3], (7, 0));
+        over.map.insert([1, 2, 3], (7, (0, u64::MAX), 0));
         for _ in 0..3 {
             over.slots(8);
         }
@@ -6604,5 +6714,127 @@ mod view_cache_tests {
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
         crate::shadow::pin_world_for_test(None);
         assert_eq!((c[1], c[2], c[3], c[7]), (1, 1, 2, 0), "{c:?}");
+    }
+}
+
+#[cfg(test)]
+mod batched_copy_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// The descriptors of a table's views copied together are those copied one by one.
+    #[test]
+    fn copies_held_and_made_together_are_the_copies_made_one_by_one() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[10, 1, 0, 0, 64, 0, 0, 0, 0, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, View::Placed(true, resource, desc));
+        let words = [slot_mem[0], slot_mem[1], slot_mem[2]];
+        let s = heap.dynamic(4).unwrap();
+        let recording = 0xbeef_0001;
+        if heap.make_listed(recording, words, s).is_none() {
+            return; // the view does not make on this adapter
+        }
+        let before = BATCHED[1].load(Relaxed);
+        copies_hold(true);
+        // (The second ask in the recording copies the descriptor of the first.)
+        let held = heap.make_listed(recording, words, s + 1).is_some() && heap.make_listed(recording, words, s + 2).is_some();
+        copies_flush();
+        copies_hold(false);
+        assert!(held);
+        assert!(BATCHED[1].load(Relaxed) > before, "one call for the copies of the two slots");
+        let bytes = |i: u32| {
+            let mut b = [0u8; 32];
+            crate::host::read_into(heap.cpu(i).ptr as *const u8, &mut b).then_some(b)
+        };
+        if let (Some(a), Some(b), Some(c)) = (bytes(s), bytes(s + 1), bytes(s + 2)) {
+            assert_eq!(a, b);
+            assert_eq!(a, c);
+        }
+        // Nothing is left held: the next copy is made at once.
+        assert!(COPIES.with(|c| c.borrow().1.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod keep_fast_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+
+    fn buffer() -> Option<ID3D12Resource> {
+        Some(host()?.shared_buffer(256)?.0)
+    }
+
+    /// A slot that shows the resource already does not take another hold on it, with the lock or without; and a
+    /// slot given another lets go of the first (to be retired).
+    #[test]
+    fn a_slot_that_shows_the_resource_takes_no_other_hold() {
+        TEST_KEEP_FAST.store(true, Relaxed);
+        let (Some(heap), Some(a), Some(b)) = (HostHeap::new(false, 8), buffer(), buffer()) else {
+            return; // no host GPU
+        };
+        let before = crate::host::references(&a);
+        heap.keep_ref(3, &Some(a.clone()));
+        let held = crate::host::references(&a);
+        assert_eq!(held, before + 1);
+        // Again, by reference and by value (the value is the caller's own hold, which goes at the end of the call).
+        heap.keep_ref(3, &Some(a.clone()));
+        heap.keep(3, Some(a.clone()));
+        assert_eq!(crate::host::references(&a), held);
+        assert_eq!(heap.kept_in(3).map(|r| r.as_raw()), Some(a.as_raw()));
+        assert!(heap.shows_already(3, a.as_raw() as usize));
+        assert!(!heap.shows_already(3, b.as_raw() as usize));
+        // Another resource: the first is let go of by the slot, and the fast look follows.
+        heap.keep_ref(3, &Some(b.clone()));
+        assert!(heap.shows_already(3, b.as_raw() as usize));
+        assert!(!heap.shows_already(3, a.as_raw() as usize));
+        assert_eq!(heap.kept_in(3).map(|r| r.as_raw()), Some(b.as_raw()));
+        // Nothing: the slot is empty.
+        heap.keep(3, None);
+        assert!(heap.shows_already(3, 0));
+        assert!(heap.kept_in(3).is_none());
+        // A slot nobody wrote shows nothing.
+        assert!(heap.shows_already(4, 0));
+        assert!(!heap.shows_already(4, a.as_raw() as usize));
+    }
+
+    /// Threads that write the same slots with the same two resources: each slot ends as one of the writes left it, and what
+    /// is looked at without the lock is what the slot holds.
+    #[test]
+    fn slots_written_by_threads_agree_with_what_is_looked_at_without_the_lock() {
+        TEST_KEEP_FAST.store(true, Relaxed);
+        let (Some(heap), Some(a), Some(b)) = (HostHeap::new(false, 8), buffer(), buffer()) else {
+            return; // no host GPU
+        };
+        let ours = [Some(a.clone()), Some(b.clone()), None];
+        std::thread::scope(|s| {
+            for t in 0..4usize {
+                let (heap, ours) = (&heap, &ours);
+                s.spawn(move || {
+                    for i in 0..4000usize {
+                        let slot = ((i * 7 + t) % 8) as u32;
+                        let r = &ours[(i + t) % 3];
+                        if i % 2 == 0 {
+                            heap.keep_ref(slot, r);
+                        } else {
+                            heap.keep(slot, r.clone());
+                        }
+                    }
+                });
+            }
+        });
+        for slot in 0..8u32 {
+            let held = heap.kept_in(slot).map_or(0, |r| r.as_raw() as usize);
+            assert!([0, a.as_raw() as usize, b.as_raw() as usize].contains(&held));
+            assert!(heap.shows_already(slot, held), "slot {slot}");
+        }
     }
 }

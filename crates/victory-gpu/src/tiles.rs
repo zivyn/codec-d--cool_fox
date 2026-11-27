@@ -1952,6 +1952,30 @@ void look() {
         assert_eq!(tiled.claim(small), small);
     }
 
+    fn a_retired_level_gives_its_tiles_back(rig: &mut Rig) {
+        rig.step = "step 8, a level taken back";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        rig.give(&tiled, &texture, tiled.every_level());
+        assert!(tiled.whole());
+        tiled.held.store(tiled.every_level(), Ordering::Relaxed);
+        let before = tiled.given_bytes();
+        let (begun, changed) = tiled.retire(1 << 0);
+        assert_eq!((begun, changed), (1, true));
+        assert_eq!(tiled.first_shown(), Some(1));
+        // The tiles stay until the mapping is made null.
+        assert_eq!(tiled.given_bytes(), before);
+        let freed = tiled.unmap(&rig.queue, &texture, 1 << 0);
+        rig.check("tiles taken back");
+        assert_eq!(freed, u64::from(tiled.standard[0]) * TILE);
+        assert_eq!(tiled.given_bytes(), before - freed);
+        assert!(!tiled.has_tiles(0) && tiled.has_tiles(1));
+        // Taken back for good only once: the level is given again on demand.
+        assert_eq!(tiled.unmap(&rig.queue, &texture, 1 << 0), 0);
+        rig.give(&tiled, &texture, 1 << 0);
+        assert!(tiled.has_tiles(0));
+    }
+
     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
     #[test]
     #[ignore = "on the card: run it by name with --ignored --nocapture"]
@@ -1968,6 +1992,7 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
+        a_retired_level_gives_its_tiles_back(&mut rig);
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
         }
@@ -2220,6 +2245,12 @@ void look() {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            retiring: AtomicU32::new(0),
+            sampled: AtomicU64::new(0),
+            touched: AtomicU64::new(0),
+            given_at: AtomicU64::new(0),
+            short: AtomicU64::new(0),
+            short_at: AtomicU64::new(0),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);

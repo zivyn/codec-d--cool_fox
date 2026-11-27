@@ -46,9 +46,9 @@ mesh shader support. The first run builds shader pipelines and stutters;
 
 ## Where it stands (2026-11-26)
 
-Measured on `integ/validation-3`, in the prologue cell, one PC with an 8 GB
+Measured on `integ/validation-3` and `-4`, in the prologue cell, one PC with an 8 GB
 RTX 4060. A frame took about 410 ms at the start of the day; it now takes
-162-177 ms in the cell.
+143-177 ms in the cell (about 143 ms looking at the window).
 
 On `main` (integrations #2 and #3 are merged, so `main` and the `build-main`
 download have all of this):
@@ -61,7 +61,9 @@ download have all of this):
 - Wave64 programs are lowered for NVIDIA's 32-lane waves.
 - The descriptor heap stays under NVIDIA's 1,000,000-descriptor limit.
 - The heap sync and the refreshes of copies skip work that has nothing to do
-  (heap wait 26 to 16-22 ms, refreshes 52 to 40-45 ms).
+  (heap wait 26 to 16-22 ms, refreshes 52 to 40-45 ms). A copy on the card of
+  a buffer the title's CPU cannot write is not taken whole again until a write
+  is announced (window spot 158 to 142.7 ms, the submit thread 153.6 to 135.8 ms).
 - The ambient stand-in for the title's indirect light: the dark cell now
   matches the console frames, and the window shows the rippled glass and the
   chain-link.
@@ -73,8 +75,8 @@ download have all of this):
 ## Known wrong
 
 - Glass is grainy and colours band in some runs with a warm cache; being investigated.
-- The CPU thread that submits the frame is now the main cost, about 150 of the
-  175 ms.
+- The CPU thread that submits the frame is now the main cost, about 136 of the
+  143 ms.
 - The title caps itself at 30 frames a second; lifting that without breaking
   physics, animation and cutscenes is the second half of the goal.
 

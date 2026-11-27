@@ -160,7 +160,7 @@ const WATERFALL_HALVES: [u32; 17] = [
 ];
 
 /// `WATERFALL_HALVES` as the title's shaders are translated for a host of 32-lane waves.
-fn waterfall_on_32_lanes() -> Result<HostShader, crate::ShaderError> {
+fn waterfall_on_32_lanes(half_exit: bool) -> Result<HostShader, crate::ShaderError> {
     let mut words = WATERFALL_HALVES.to_vec();
     words.push(0xBEFE_040C); // s_mov_b64 exec, s[12:13]
     let native = native_of(&words, true, 64);
@@ -172,16 +172,30 @@ fn waterfall_on_32_lanes() -> Result<HostShader, crate::ShaderError> {
     let bytes = crate::dxbc::build(&[]);
     let c = Container::parse(&bytes).expect("container");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    lower::TEST_HALF_EXIT.set(half_exit);
     let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::TEST_HALF_EXIT.set(false);
     lower::TEST_HOST_WAVE.set(was);
     shader
 }
 
-/// A waterfall whose halves finish at different rounds finishes in every lane: the upper half
-/// is not left running to the loop's limit when the lower half has left.
+/// `VICTORY_HALF_EXIT=1` adds the clearing of the half's exchange dword where it leaves the loop,
+/// and nothing without it.
+#[test]
+fn the_half_exit_switch_changes_the_translation_only_when_set() {
+    let off = waterfall_on_32_lanes(false).expect("lowered").dxil;
+    let on = waterfall_on_32_lanes(true).expect("lowered").dxil;
+    assert_eq!(off, waterfall_on_32_lanes(false).expect("lowered").dxil);
+    assert_ne!(off, on);
+    assert!(on.len() > off.len());
+}
+
+/// A waterfall whose halves finish in different rounds finishes in every lane: the upper half
+/// is not left running to the loop's limit when the lower half has left (without the switch it
+/// was: lane 63 held -1).
 #[test]
 fn a_waterfall_loop_whose_halves_finish_in_different_rounds_serves_every_lane() {
-    let shader = match waterfall_on_32_lanes() {
+    let shader = match waterfall_on_32_lanes(true) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("not translated for waves of 32 ({e}): the program of the test is refused");

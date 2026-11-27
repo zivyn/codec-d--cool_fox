@@ -429,6 +429,10 @@ struct Lower<'a> {
     lean: bool,
     /// The meetings of the halves made in the code, for `VICTORY_WAVE_WHY`.
     meetings: usize,
+    /// The exchanges of the two host waves of a console wave made so far, and the number made
+    /// when each loop header's block began (`VICTORY_HALF_EXIT`: the loops whose rounds exchange).
+    exchanged: u32,
+    loop_exchanged: HashMap<usize, u32>,
     /// The code offsets whose written values are peeked at ([`PEEK_NOTE`]).
     peek: Vec<usize>,
     /// With `lean`: the LDS accesses (IR block, instruction) that need no meeting before them.
@@ -1470,6 +1474,18 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// `VICTORY_HALF_EXIT=1`: the two host waves of a console wave that exchange in the rounds of a
+/// loop clear their exchange dword when they leave it (`Lower::half_leaves`). Off unless set.
+/// Part of the translation: the shader cache keys on it.
+fn half_exit() -> bool {
+    #[cfg(test)]
+    if TEST_HALF_EXIT.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_EXIT").is_some_and(|v| v == "1"))
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1482,6 +1498,8 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's `VICTORY_HALF_EXIT`, for its thread only.
+    pub(super) static TEST_HALF_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's `VICTORY_LOOP_LIMITS`, for its thread only.
     pub(super) static TEST_LOOP_LIMITS: std::cell::RefCell<Option<super::LoopLimits>> = const { std::cell::RefCell::new(None) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -2139,6 +2157,8 @@ impl<'a> Lower<'a> {
             pair_meet,
             lean,
             meetings: 0,
+            exchanged: 0,
+            loop_exchanged: HashMap::new(),
             peek: PEEK.with(|p| p.borrow().clone()),
             lds_skip,
             lds_bound,
@@ -2838,6 +2858,9 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            if self.counters.contains_key(&b) {
+                self.loop_exchanged.insert(b, self.exchanged);
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -4698,6 +4721,42 @@ impl<'a> Lower<'a> {
         cl
     }
 
+    /// `VICTORY_HALF_EXIT=1`: when no lane of this host wave goes round a loop again, the
+    /// block `leaving` (on the loop's way out) clears this half's exchange dword, which says
+    /// "nothing here" to the other half in the rounds it still has to make. Without it the
+    /// other half reads what this one last put there (that it had a lane, and that lane's
+    /// value) in every later round, matches no lane of its own and runs to the loop's limit:
+    /// the waterfall of a console wave whose halves finish in different rounds served only
+    /// the half that finished first. The other half's reads come after this half's last
+    /// meeting, and the lanes that stay write their own words before the next one.
+    fn half_leaves(&mut self, leaving: usize, goes_on: V) {
+        let Some((slot, small)) = self.exchange.as_ref().map(|e| (e.0, e.1)) else {
+            return;
+        };
+        if small || self.local || self.pair_meet {
+            return;
+        }
+        let c = self.cur;
+        let i1t = self.s.t.i1;
+        let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[goes_on]);
+        self.s.flags |= flags::WAVE_OPS;
+        let yes = self.s.m.bool(true);
+        let none = self.s.m.bin(c, Bin::Xor, any, yes);
+        let pair = self.exchange_pair(slot);
+        let cl = self.console_lane();
+        let five = self.s.m.i32(5);
+        let half = self.s.m.bin(c, Bin::LShr, cl, five);
+        let index = self.s.m.bin(c, Bin::Add, pair, half);
+        let lds = self.s.lds();
+        let mine = self.s.m.element(c, lds, index);
+        // (what is there stays unless this half is through: the lanes that go on write their
+        // own words again at the next exchange, whichever of the two paths runs first)
+        let was = self.s.m.load(leaving, mine);
+        let zero = self.s.m.i32(0);
+        let now = self.s.m.select(leaving, none, zero, was);
+        self.s.m.store(leaving, mine, now);
+    }
+
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
         let mode = self.s.m.i32(meeting_mode());
@@ -4821,6 +4880,7 @@ impl<'a> Lower<'a> {
             let hi = self.s.m.select(at, upper, mine, z);
             return (lo, hi);
         }
+        self.exchanged += 1;
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
         // (with `lean`, one of two pairs by the parity of the meetings made so far, which both
@@ -13321,6 +13381,24 @@ impl<'a> Lower<'a> {
                         };
                         self.enter_loop(b, to, from);
                     }
+                }
+                // The two host waves of a console wave that exchange in each round of the loop
+                // go round it as many times as the console wave does, but each ends its own
+                // loop when its lanes are through: the half that is left reads the other's
+                // last words as if they were new (`half_leaves`).
+                let closing = if back(self, taken) {
+                    Some((taken, f, cond))
+                } else if back(self, not_taken) {
+                    let goes_on = self.negated(cond);
+                    Some((not_taken, t, goes_on))
+                } else {
+                    None
+                };
+                if let Some((header, leaving, goes_on)) = closing
+                    && half_exit()
+                    && self.exchanged > self.loop_exchanged.get(&header).copied().unwrap_or(u32::MAX)
+                {
+                    self.half_leaves(leaving, goes_on);
                 }
                 Term::CondBr(cond, t, f)
             }

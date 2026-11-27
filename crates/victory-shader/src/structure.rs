@@ -104,40 +104,6 @@ const MAX_MEET: usize = 1 << 16;
 /// Conditions [`Meets`] keeps; past that, they are searched anew.
 const MAX_MEETS: usize = 1 << 18;
 
-#[cfg(test)]
-thread_local! {
-    /// A test's `VICTORY_MEET_EXACT`, for its thread only.
-    pub(crate) static TEST_MEET_EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// `VICTORY_MEET_EXACT=1`: [`Bools::meet`] knows at once that a condition and its negation
-/// leave no lane, where it used to split on every variable of the condition to find that out
-/// and gave up ("a lane may") when the function was large. Proofs that depended on such a
-/// condition (the waterfall loops of a program with many lane branches) then hold where they
-/// were refused. Off unless set: the translation of the programs that gave up changes.
-/// Part of the translation: the shader cache keys on it.
-fn meet_exact() -> bool {
-    #[cfg(test)]
-    if TEST_MEET_EXACT.get() {
-        return true;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MEET_EXACT").is_some_and(|v| v == "1"))
-}
-
-/// The case splits [`Bools::meet`] makes before it gives up: [`MAX_MEET`], or what
-/// `VICTORY_MEET_BUDGET` says (a number). Part of the translation: the shader cache keys on it.
-fn meet_budget() -> usize {
-    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        std::env::var("VICTORY_MEET_BUDGET")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(MAX_MEET)
-    })
-}
-
 /// What [`Bools::meet`] found out about one [`Bools`], for its later calls:
 /// the conditions no lane satisfies, and the case splits it took to find
 /// that out of each.
@@ -278,7 +244,7 @@ impl Bools {
     /// `Bools` found out and adds what it finds. The answer is the one
     /// `meet` gives.
     pub fn meet_seen(&self, all: &[(Bool, bool)], seen: &mut Meets) -> bool {
-        self.meet_within(all, meet_budget(), seen)
+        self.meet_within(all, MAX_MEET, seen)
     }
 
     /// [`Self::meet_seen`] with `budget` case splits.
@@ -331,14 +297,8 @@ impl Bools {
         // As a set: neither order nor repeats change the search.
         work[at..].sort_unstable();
         let mut end = at + 1;
-        let exact = meet_exact();
         for i in at + 1..kept {
             if work[i] != work[end - 1] {
-                // (a node and its negation sit side by side once sorted)
-                if exact && work[i] >> 1 == work[end - 1] >> 1 {
-                    work.truncate(at);
-                    return false;
-                }
                 work[end] = work[i];
                 end += 1;
             }
@@ -1508,36 +1468,6 @@ mod tests {
                 .collect();
             meet_anew(b, next, budget)
         })
-    }
-
-    /// A condition and its negation leave no lane, however large the function is: with
-    /// `VICTORY_MEET_EXACT` the search says so at once, where it gave up for want of splits.
-    #[test]
-    fn a_condition_and_its_negation_meet_in_no_lane_even_when_the_function_is_large() {
-        let mut b = Bools::new();
-        let mut parity = Bool::FALSE;
-        for i in 0..24 {
-            let a = b.atom(Atom::Constant(i + 2), 0);
-            parity = b.xor(parity, a);
-        }
-        let all = [(parity, true), (parity, false)];
-        // (not enough splits to tell: "a lane may")
-        assert!(b.meet_within(&all, 5, &mut Meets::default()));
-        TEST_MEET_EXACT.set(true);
-        let (small, plenty) = (
-            b.meet_within(&all, 5, &mut Meets::default()),
-            b.meet_within(&all, MAX_MEET, &mut Meets::default()),
-        );
-        // (another function with the first one's negation: still no lane)
-        let other = b.atom(Atom::Constant(99), 0);
-        let and_not = b.and(parity, other);
-        let three = b.meet_within(&[(and_not, true), (parity, false)], 5, &mut Meets::default());
-        let some = b.meet_within(&[(parity, true), (other, true)], MAX_MEET, &mut Meets::default());
-        TEST_MEET_EXACT.set(false);
-        assert!(!small && !plenty, "{small} {plenty}");
-        // (these still search: a lane for the first, and the budget decides the second)
-        assert!(three);
-        assert!(some);
     }
 
     #[test]

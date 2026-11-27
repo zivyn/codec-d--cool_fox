@@ -120,7 +120,8 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    // (`VICTORY_SEND_SPARE_MB`, `VICTORY_RAM_LEAN`: less.)
+    crate::lean::send_spare_mb(if on_card() { 256 } else { 768 }) << 20
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -157,6 +158,14 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         data: data as usize,
         size,
     })
+}
+
+/// For the memory line: buffers kept for the next submission, their bytes,
+/// and the most bytes that are kept.
+#[cfg(feature = "diagnostics")]
+pub(super) fn spare_kept() -> [u64; 3] {
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    [spare.len() as u64, spare.iter().map(|m| m.size).sum(), kept()]
 }
 
 /// The submission has run.

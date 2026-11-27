@@ -52,6 +52,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
+        // (`VICTORY_STAGING_SPARE`, `VICTORY_RAM_LEAN`: fewer.)
+        pool.most = crate::lean::staging_spare(STAGING_KEPT);
         let staging_limit = if crate::residency::critical_commit() {
             0
         } else if pressure {
@@ -370,6 +372,15 @@ pub(crate) fn texture_bytes() -> u64 {
 
 pub(crate) fn staging_bytes() -> u64 {
     lock(&STAGING).blocks() as u64 * BLOCK
+}
+
+/// For the memory line: the blocks of staging buffers, and of them how many
+/// are empty (kept for the next ask).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_empty() -> [u64; 2] {
+    let pool = lock(&STAGING);
+    let empty = pool.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+    [pool.blocks() as u64, empty as u64]
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.

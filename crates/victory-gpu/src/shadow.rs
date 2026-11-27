@@ -3069,9 +3069,14 @@ static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// snapshots are the PC's memory, all of it resident).
 fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
-    })
+    // 1024, unless the variable or `VICTORY_RAM_LEAN` ([`crate::lean`]) says.
+    *MOST.get_or_init(|| crate::lean::snapshots_mb(1024) << 20)
+}
+
+/// For the memory line: bytes of snapshots kept now, and the most that may be.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_snapshots() -> [u64; 2] {
+    [KEPT_BYTES.load(Ordering::Relaxed), kept_most()]
 }
 
 /// The 64 KiB pieces, cut at multiples of 64 KiB of title memory, that
@@ -6002,7 +6007,8 @@ fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
         let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        // (`VICTORY_RAM_LEAN=2` asks for 1 MiB where nothing else is said.)
+        grid(kb.or_else(crate::lean::window_kb))
     })
 }
 
@@ -6040,7 +6046,10 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WINDOW_TAILS") {
+        Some(v) => v == "1",
+        None => crate::lean::window_tails(),
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,

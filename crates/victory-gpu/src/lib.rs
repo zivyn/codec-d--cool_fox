@@ -45,6 +45,8 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod lean;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -78,6 +80,8 @@ pub mod shader_cache;
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod sites;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;

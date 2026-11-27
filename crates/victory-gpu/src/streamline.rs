@@ -259,8 +259,10 @@ struct Calls {
     optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
     /// The mode, sizes and preset the last options named.
     last: Option<(u32, [u32; 2], [u32; 2])>,
-    /// Frame generation: on, and the frame whose simulation began.
+    /// Frame generation: on, the frames for each rendered one last asked of it (0 off), and
+    /// the frame whose simulation began.
     framegen_on: bool,
+    framegen_times: u32,
     simulating: Option<u32>,
 }
 
@@ -268,6 +270,7 @@ static CALLS: Mutex<Calls> = Mutex::new(Calls {
     optimal: Vec::new(),
     last: None,
     framegen_on: false,
+    framegen_times: 0,
     simulating: None,
 });
 
@@ -1450,8 +1453,42 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         }
         false
     };
-    if on != calls.framegen_on {
+    // What is asked right now (the F1 menu changes it while the title runs): off, or the frames
+    // shown for each one rendered. The swap chain stays Streamline's proxy either way.
+    // `VICTORY_FRAMEGEN_CYCLE=<presents>` (a check with nobody at the keys): the amount is asked
+    // anew every that many presents, in turn 2, 4, off and 6, as the settings menu would.
+    static CYCLE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let every = *CYCLE.get_or_init(|| std::env::var("VICTORY_FRAMEGEN_CYCLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    if every > 0 {
+        static PRESENTS: AtomicU32 = AtomicU32::new(0);
+        let n = PRESENTS.fetch_add(1, Relaxed);
+        if n % every == 0 {
+            set_framegen([2, 4, 0, 6][(n / every % 4) as usize]);
+        }
+    }
+    let wanted = framegen_wanted();
+    let on = on && wanted != 0;
+    let times = if on { wanted } else { 0 };
+    if on != calls.framegen_on || times != calls.framegen_times {
         let mut options = abi::DlssgOptions::new(if on { abi::DLSSG_ON } else { abi::DLSSG_OFF });
+        // `VICTORY_FRAMEGEN_X=2..6`: frames shown for each one rendered (2 unless set), no more
+        // than this card and driver generate (the state says how many: 5 on an RTX 50).
+        let mut generated = wanted.max(2) - 1;
+        if on
+            && generated > 1
+            && let Some(get_state) = functions.dlssg_get_state
+        {
+            let mut state = abi::DlssgState::default();
+            // SAFETY: a structure to fill, no options.
+            let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
+            let most = if code == 0 { state.num_frames_to_generate_max.max(1) } else { 1 };
+            if generated > most {
+                tracing::warn!(asked = generated + 1, given = most + 1, "DLSS Frame Generation: more frames asked than this card generates");
+                generated = most;
+            }
+        }
+        options.num_frames_to_generate = generated;
+        FG_TIMES.store(generated + 1, Relaxed);
         options.flags = abi::DLSSG_RETAIN_RESOURCES_WHEN_OFF;
         options.num_back_buffers = 2;
         options.color_width = planes.size[0];
@@ -1459,9 +1496,20 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         options.on_error_callback = Some(present_error);
         // SAFETY: filled options for viewport 0, on the presenting thread.
         let code = unsafe { set_options(&viewport, &options) };
-        tracing::info!(frame, on, code, result = abi::result_name(code), "DLSS Frame Generation switched");
-        if code == 0 {
+        tracing::info!(frame, on, times = generated + 1, code, result = abi::result_name(code), "DLSS Frame Generation switched");
+        // 39, "warning: out of VRAM": the options are set all the same, with the card's memory
+        // past its budget. Taken as set: asked again at every present (1,828 times in one
+        // run, after the menu's 3X on a full 12 GB card) it showed no generated frame at all.
+        if code == 39 {
+            tracing::warn!(times = generated + 1, "DLSS Frame Generation is on with the card's memory past its budget: frames may come unevenly (the launcher leaves it room when it is on from the start)");
+        }
+        if code == 0 || code == 39 {
             calls.framegen_on = on;
+            // What was asked (the driver may give fewer): not set again until that changes.
+            calls.framegen_times = times;
+            if !on {
+                FG_PER.store(1, Relaxed);
+            }
         }
     }
     if calls.framegen_on {
@@ -1529,6 +1577,49 @@ unsafe extern "C" fn present_error(error: *const i32) {
     once!(warn, hresult = format_args!("{:#x}", code as u32), "DLSS Frame Generation: a present failed");
 }
 
+/// Frames shown for each one rendered with frame generation on, as asked at the start:
+/// `VICTORY_FRAMEGEN_X=2..6` (2 unless set); 0: ready but off until the settings menu asks.
+fn framegen_times() -> u32 {
+    static TIMES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TIMES.get_or_init(|| {
+        std::env::var("VICTORY_FRAMEGEN_X").ok().and_then(|v| v.trim().parse::<u32>().ok()).map_or(2, |n| if n == 0 { 0 } else { n.clamp(2, 6) })
+    })
+}
+
+/// Frames shown for each one rendered, as last given to frame generation.
+static FG_TIMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
+
+/// What is asked of frame generation now: 0 off, 2..6 frames shown for each one rendered;
+/// `u32::MAX`: not asked yet (then [`framegen_times`], the start's).
+static FG_WANTED: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Frames frame generation showed for the last frame presented (1 while it is off).
+static FG_PER: AtomicU32 = AtomicU32::new(1);
+
+fn framegen_wanted() -> u32 {
+    match FG_WANTED.load(Relaxed) {
+        u32::MAX => framegen_times(),
+        n => n,
+    }
+}
+
+/// Whether frame generation can be switched and changed while the title runs: it was planned
+/// at the start, so our swap chain is Streamline's proxy (the F1 menu asks).
+pub(crate) fn framegen_live() -> bool {
+    FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)
+}
+
+/// Asks frame generation off (0) or for `times` frames shown for each one rendered (2..6),
+/// from the next present on.
+pub(crate) fn set_framegen(times: u32) {
+    FG_WANTED.store(if times == 0 { 0 } else { times.clamp(2, 6) }, Relaxed);
+    tracing::info!(times, "DLSS Frame Generation: asked from the settings menu");
+}
+
+/// For the frame-rate texts: frames shown for each one rendered (1 without frame generation).
+pub(crate) fn shown_per_frame() -> u32 {
+    FG_PER.load(Relaxed).max(1)
+}
+
 /// After our swap chain's Present: the frame's last marker, the next
 /// frame's first, and what frame generation reports.
 pub(crate) fn present_ends(presenting: Option<Presenting>) {
@@ -1553,6 +1644,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
         if code == 0 {
+            FG_PER.store(state.num_frames_actually_presented.max(1), Relaxed);
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             let before = FG_STATUS.swap(state.status, Relaxed);
@@ -1581,6 +1673,8 @@ pub(crate) fn resizing() {
         // SAFETY: filled options.
         unsafe { set_options(&viewport, &options) };
         calls.framegen_on = false;
+        calls.framegen_times = 0;
+        FG_PER.store(1, Relaxed);
     }
 }
 

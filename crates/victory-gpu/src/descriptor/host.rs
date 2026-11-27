@@ -505,8 +505,9 @@ fn record_key(handle: u64) -> u64 {
 /// whose last upload left a held level without tiles (the card had no
 /// room, or no heap could be had), and when (`crate::host::moment`). A
 /// texture pass makes their slots due again once the card has room
-/// ([`HostHeap::texture_slots_waiting`]).
-static WAITING: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std::collections::BTreeMap::new());
+/// ([`HostHeap::texture_slots_waiting`]); with the cap their upload was made
+/// under ([`crate::resource::may_retry`]).
+static WAITING: Mutex<std::collections::BTreeMap<u64, (u64, u64)>> = Mutex::new(std::collections::BTreeMap::new());
 
 /// The last upload of the placed texture at `start` left a held level
 /// without tiles. A texture picked by index is uploaded once and then
@@ -515,8 +516,8 @@ static WAITING: Mutex<std::collections::BTreeMap<u64, u64>> = Mutex::new(std::co
 /// blurred, or black if no level had tiles) for as long as the title left
 /// its memory alone, where a texture refused for want of room is tried
 /// again.
-pub(crate) fn levels_waiting(start: u64) {
-    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, crate::host::moment());
+pub(crate) fn levels_waiting(start: u64, cap: u64) {
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, (crate::host::moment(), cap));
 }
 
 /// Placed textures (by the start of their memory) filled while the runtime
@@ -2185,7 +2186,7 @@ impl HostHeap {
             }
             let starts: Vec<u64> = waiting
                 .iter()
-                .filter(|&(_, &since)| crate::host::long_ago(since, 1000, 2))
+                .filter(|&(_, &(since, cap))| crate::host::long_ago(since, 1000, 2) && crate::resource::may_retry(cap))
                 .map(|(&start, _)| start)
                 .take(Self::WAITING_A_PASS)
                 .collect();

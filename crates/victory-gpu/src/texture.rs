@@ -91,6 +91,10 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// With `waiting`: the cap on levels' tiles that upload was made under
+    /// ([`crate::resource::level_cap`]); it is recorded again when the card
+    /// takes more ([`crate::resource::may_retry`]).
+    waiting_cap: std::sync::atomic::AtomicU64,
     /// Recorded for a one-shot decoration bake (`BAKING`): submission-time
     /// refresh must wait for title memory to stop remapping
     /// (`title_memory_reading`) instead of taking `no_wait()` /
@@ -788,7 +792,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     if staging.on_demand {
         let since = staging.waiting.load(Relaxed);
         if since != 0 && crate::host::long_ago(since, 1000, 2) {
-            if crate::resource::level_cap_lately() == u64::MAX {
+            if crate::resource::may_retry(staging.waiting_cap.load(Relaxed)) {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
@@ -872,11 +876,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     list.defer_texture(staging.clone());
     list.defer_host(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
-        staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
+        staging.waiting_cap.store(waiting.unwrap_or(0), Relaxed);
+        staging.waiting.store(if waiting.is_some() { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
-        if waiting {
-            crate::descriptor::host::levels_waiting(staging.memory as u64);
+        if let Some(cap) = waiting {
+            crate::descriptor::host::levels_waiting(staging.memory as u64, cap);
         }
     });
 }
@@ -1938,6 +1943,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        waiting_cap: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
     map.insert(resource as usize, s.clone());

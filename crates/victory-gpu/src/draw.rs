@@ -2618,10 +2618,11 @@ impl State {
         // has run are made from that.
         host.texture_views_remade();
         host.texture_slots_flip();
-        // And with room for any size, the textures whose upload left a held
-        // level without the card's memory are uploaded again (with room for
-        // less than that the same levels would be left out again).
-        if room && crate::resource::level_cap(memory) == u64::MAX {
+        // And when the card takes larger levels than at their upload, the
+        // textures whose upload left a held level without the card's memory
+        // are uploaded again (under the same cap the same levels would be
+        // left out again).
+        if room {
             host.texture_slots_waiting(frame);
         }
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);

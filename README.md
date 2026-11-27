@@ -59,6 +59,12 @@ download have all of this):
   instead of being dropped; cold-start waits are shorter.
 - The title's own hang watchdog no longer ends a session during our long stalls.
 - Wave64 programs are lowered for NVIDIA's 32-lane waves.
+- Compute programs with several console waves in a group (the defragmentation and
+  triangle-collection passes among them) now translate on 32-lane hosts: the two
+  host waves of a console wave meet by counters of their own. All multi-wave
+  programs translate; the ones that still do not are the geometry stages (pending
+  a port of the voxelization path), 71 mesh programs over 32 KiB of output that only
+  the validator refuses, and one adaptive shadow-ray variant.
 - The descriptor heap stays under NVIDIA's 1,000,000-descriptor limit.
 - The heap sync and the refreshes of copies skip work that has nothing to do
   (heap wait 26 to 16-22 ms, refreshes 52 to 40-45 ms). A copy on the card of
@@ -87,6 +93,8 @@ download have all of this):
 ## Known wrong
 
 - Glass is grainy and colours band in some runs with a warm cache; being investigated.
+- A full-screen white-out was seen about once in a few first runs on a fresh cache;
+  it recovers by itself. A rare defect that predates the multi-wave work; being tracked.
 - The CPU thread that submits the frame is still the main cost.
 - The title caps itself at 30 frames a second; lifting that without breaking
   physics, animation and cutscenes is the second half of the goal.

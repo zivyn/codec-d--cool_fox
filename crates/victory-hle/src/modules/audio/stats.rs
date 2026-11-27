@@ -38,6 +38,7 @@ pub struct Counters {
     gap_max_us: AtomicU64,
     pass_max_us: AtomicU64,
     peak: AtomicU64,
+    unknown_commands: AtomicU64,
 }
 
 /// The counters of one window, plain.
@@ -60,6 +61,7 @@ pub struct Window {
     pub gap_max_us: u64,
     pub pass_max_us: u64,
     pub peak: u64,
+    pub unknown_commands: u64,
 }
 
 pub static COUNTERS: Counters = Counters::new();
@@ -86,8 +88,14 @@ impl Counters {
             pass_stalls,
             gap_max_us,
             pass_max_us,
-            peak
+            peak,
+            unknown_commands
         )
+    }
+
+    /// A coprocessor command no unit of ours carries out.
+    pub fn unknown_command(&self) {
+        self.unknown_commands.fetch_add(1, Relaxed);
     }
 
     pub fn voice_enabled(&self) {
@@ -160,6 +168,7 @@ impl Counters {
             gap_max_us: t(&self.gap_max_us),
             pass_max_us: t(&self.pass_max_us),
             peak: t(&self.peak),
+            unknown_commands: t(&self.unknown_commands),
         }
     }
 }
@@ -206,6 +215,7 @@ pub fn tick(since: &mut Instant, voices: usize) {
         gap_max_ms = ms(w.gap_max_us),
         pass_max_ms = ms(w.pass_max_us),
         peak = w.peak,
+        unknown_commands = w.unknown_commands,
         "audio stats"
     );
 }

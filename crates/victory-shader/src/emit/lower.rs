@@ -429,6 +429,8 @@ struct Lower<'a> {
     lean: bool,
     /// The meetings of the halves made in the code, for `VICTORY_WAVE_WHY`.
     meetings: usize,
+    /// The code offsets whose written values are peeked at ([`PEEK_NOTE`]).
+    peek: Vec<usize>,
     /// With `lean`: the LDS accesses (IR block, instruction) that need no meeting before them.
     lds_skip: HashSet<(usize, usize)>,
     /// With `pair_meet`: the dwords of the program's own shared memory and the dword that takes
@@ -1339,11 +1341,48 @@ pub const PAIR_NOTE: u32 = 0xF000_0000;
 /// program's hash << 8 | the loop's number` in the faults buffer (`VICTORY_LOOP_NOTES=1`).
 pub const LOOP_NOTE: u32 = 0xE000_0000;
 
+/// With `VICTORY_PEEK=<hash digits>:<offset>,<offset>` (hex, at most four offsets; the program is
+/// named by the first digits of its hash, as the logs name it), a program leaves the values its
+/// instructions at those code offsets write in the faults buffer, 16 bits to a note, for the host
+/// to say: `PEEK_NOTE | offset number << 24 | register number << 20 | half << 16 | 16 bits`, at
+/// place `PEEK_PLACE` + 2 (4 offset numbers + register number) + half. A diagnostic: lane 0 of
+/// each host wave writes what it has at that point, one value for each register the instruction
+/// writes (at most four).
+pub const PEEK_NOTE: u32 = 0xD000_0000;
+/// First place of the faults buffer the peek notes use.
+pub const PEEK_PLACE: u32 = 4000;
+
+thread_local! {
+    /// The code offsets to peek at in the program this thread translates ([`PEEK_NOTE`]).
+    static PEEK: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
 pub fn set_program_tag(container: &[u8]) {
     let hash = blake3::hash(container);
     let first = u32::from_be_bytes(hash.as_bytes()[..4].try_into().expect("4 bytes"));
     PROGRAM_TAG.set(PAIR_NOTE | first >> 4);
+    let offsets = std::env::var("VICTORY_PEEK")
+        .ok()
+        .and_then(|v| {
+            let (digits, at) = v.split_once(':')?;
+            let hex = format!("{first:08x}");
+            let digits = digits.trim().to_ascii_lowercase();
+            let n = digits.len().min(8);
+            (n > 0 && hex.starts_with(&digits[..n])).then(|| {
+                at.split(',')
+                    .filter_map(|o| usize::from_str_radix(o.trim().trim_start_matches("0x"), 16).ok())
+                    .take(4)
+                    .collect::<Vec<usize>>()
+            })
+        })
+        .unwrap_or_default();
+    set_peek(offsets);
+}
+
+/// The code offsets to peek at ([`PEEK_NOTE`]).
+pub(super) fn set_peek(offsets: Vec<usize>) {
+    PEEK.with(|p| *p.borrow_mut() = offsets);
 }
 
 static HOST_LDS_BYTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32768);
@@ -2098,6 +2137,7 @@ impl<'a> Lower<'a> {
             pair_meet,
             lean,
             meetings: 0,
+            peek: PEEK.with(|p| p.borrow().clone()),
             lds_skip,
             lds_bound,
             clane: None,
@@ -2826,6 +2866,9 @@ impl<'a> Lower<'a> {
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
+                if !self.peek.is_empty() {
+                    self.peek_after(b, i);
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -13399,6 +13442,42 @@ impl<'a> Lower<'a> {
     /// The number of loop header `to` among the program's (by the order of the blocks).
     fn loop_number(&self, to: usize) -> u32 {
         self.counters.keys().filter(|&&h| self.rpo[h] < self.rpo[to]).count() as u32
+    }
+
+    /// `VICTORY_PEEK`: the values instruction `i` of block `b` wrote, if its code offset is asked
+    /// for, as notes ([`PEEK_NOTE`]) from lane 0 of each host wave.
+    fn peek_after(&mut self, b: usize, i: usize) {
+        let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
+        let Some(k) = self.peek.iter().position(|&o| o == inst.machine.offset) else { return };
+        let writes: Vec<Value> = inst
+            .writes
+            .iter()
+            .filter(|(reg, _)| matches!(reg, Reg::V(_) | Reg::S(_)) && !matches!(reg, Reg::S(c) if *c == EXEC || *c == EXEC + 1))
+            .map(|w| w.1)
+            .take(4)
+            .collect();
+        let c = self.cur;
+        let (i32t, void) = (self.s.t.i32, self.s.t.void);
+        let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        self.s.flags |= flags::WAVE_OPS;
+        let zero = self.s.m.i32(0);
+        let first = self.s.m.cmp(c, pred::EQ, lane, zero);
+        let faults = self.s.root_uav_handle(super::shader::SLOT_FAULTS);
+        for (r, value) in writes.into_iter().enumerate() {
+            let Ok(x) = self.i32_of(value) else { continue };
+            let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+            let lo = self.s.m.bin(c, Bin::And, x, low);
+            let hi = self.s.m.bin(c, Bin::LShr, x, k16);
+            for (half, part) in [(0u32, lo), (1, hi)] {
+                let head = self.s.m.i32(PEEK_NOTE | (k as u32) << 24 | (r as u32) << 20 | half << 16);
+                let note = self.s.m.bin(c, Bin::Or, head, part);
+                let at = self.s.m.i32((PEEK_PLACE + (k as u32 * 4 + r as u32) * 2 + half) * 4);
+                let place = self.s.m.select(c, first, at, zero);
+                let iu = self.s.m.undef(i32t);
+                let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+                self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, note, iu, iu, iu, mask, align]);
+            }
+        }
     }
 
     /// Where the faults buffer says that loop `to` reached its iteration limit, when `cut`

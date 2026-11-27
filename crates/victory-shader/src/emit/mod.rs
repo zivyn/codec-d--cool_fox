@@ -141,7 +141,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{
-    LOOP_NOTE, PAIR_NOTE, host_mesh_output_bytes, host_settings, set_host_lds_bytes, set_host_max_wave,
+    LOOP_NOTE, PAIR_NOTE, PEEK_NOTE, host_mesh_output_bytes, host_settings, set_host_lds_bytes, set_host_max_wave,
     set_host_mesh_output_bytes, set_host_rdna, set_program_tag,
 };
 pub use rect::rect_list_gs;

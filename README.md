@@ -46,11 +46,13 @@ mesh shader support. The first run builds shader pipelines and stutters;
 
 ## Where it stands (2026-11-27)
 
-Measured on `integ/validation-3` to `-6`, in the prologue cell, one PC with an 8 GB
+Measured on `integ/validation-3` to `-10`, in the prologue cell, one PC with an 8 GB
 RTX 4060. A frame took about 410 ms at the start of the day; it now takes
-114-135 ms looking at the window, and up to 177 ms in the cell's worst spots.
+88-91 ms looking at the window (about 11 frames a second), with the card
+working about 67 ms of it (95-113 ms before the card-copy changes) and the CPU
+about 770 ms of thread time a frame (940-990 before).
 
-On `main` (integrations #2, #3 and #6 are merged, so `main` and the `build-main`
+On `main` (integrations #2, #3, #6, #8 and #10 are merged, so `main` and the `build-main`
 download have all of this):
 
 - FSR4's shared working buffer lives in video memory: its passes went from
@@ -61,10 +63,11 @@ download have all of this):
 - Wave64 programs are lowered for NVIDIA's 32-lane waves.
 - Compute programs with several console waves in a group (the defragmentation and
   triangle-collection passes among them) now translate on 32-lane hosts: the two
-  host waves of a console wave meet by counters of their own. All multi-wave
-  programs translate; the ones that still do not are the geometry stages (pending
-  a port of the voxelization path), 71 mesh programs over 32 KiB of output that only
-  the validator refuses, and one adaptive shadow-ray variant.
+  host waves of a console wave meet by counters of their own. The 195 geometry
+  programs (and their export stages) translate, and the 71 mesh programs whose
+  output passes 32 KiB create pipelines on NVIDIA (40 KiB of mesh output). Only
+  three compute programs still do not translate (one is the adaptive
+  shadow-ray variant).
 - The descriptor heap stays under NVIDIA's 1,000,000-descriptor limit.
 - The heap sync and the refreshes of copies skip work that has nothing to do
   (heap wait 26 to 16-22 ms, refreshes 52 to 40-45 ms). A copy on the card of
@@ -89,13 +92,22 @@ download have all of this):
 - The shader translator also builds on Linux (`victory-translate`, with the
   validator as `libdxil.so`); 26,515 programs came out identical to the Windows
   build's.
+- Card copies of title buffers of 1 MiB and more get the big copies' margin
+  (the "medium" buffers), which took about 29 ms (23 %) off a frame; the AVX2
+  compare of copies against their snapshots and the re-marking of kept snapshot
+  units are on, about 6 and 7.5 ms. Mesh output and lens-flare scan programs
+  (the exact wave-wide form) were fixed, and the ambient air light has a cap
+  (`VICTORY_AMBIENT_AIR=<mult>,max:<level>`).
 
 ## Known wrong
 
-- Glass is grainy and colours band in some runs with a warm cache; being investigated.
+- Hair is blocky in some frames, intermittently.
+- Colours band on some machines, and glass is grainy in some runs with a warm cache;
+  being investigated.
+- Bright rooms show an orange fog.
 - A full-screen white-out was seen about once in a few first runs on a fresh cache;
   it recovers by itself. A rare defect that predates the multi-wave work; being tracked.
-- The CPU thread that submits the frame is still the main cost.
+- The CPU thread that submits the frame is still a large share of the frame.
 - The title caps itself at 30 frames a second; lifting that without breaking
   physics, animation and cutscenes is the second half of the goal.
 

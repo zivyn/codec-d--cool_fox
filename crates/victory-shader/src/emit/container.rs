@@ -195,6 +195,26 @@ pub(crate) fn mesh_output_bytes(
     4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
 }
 
+/// The maxima a mesh shader of `lanes` threads is emitted with: its own while its outputs
+/// fit [`MESH_OUTPUT_LIMIT`], else brought down to the lane count (lane n writes only vertex n
+/// and primitive n); `None` when they still pass what the host's driver takes (`host_limit`,
+/// never below the 32 KiB).
+pub(crate) fn mesh_maxima(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    (max_vertices, max_primitives): (u32, u32),
+    lanes: u32,
+    host_limit: u64,
+) -> Option<(u32, u32)> {
+    let size = |(v, p)| mesh_output_bytes(vertex, primitive, v, p);
+    let own = (max_vertices, max_primitives);
+    if size(own) <= MESH_OUTPUT_LIMIT {
+        return Some(own);
+    }
+    let trimmed = (max_vertices.min(lanes), max_primitives.min(lanes));
+    (size(trimmed) <= host_limit.max(MESH_OUTPUT_LIMIT)).then_some(trimmed)
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
@@ -207,7 +227,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -217,9 +237,9 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
-    /// Geometry (triangles in, triangle strips out on stream 0): its
-    /// maximum vertex count. `flag`: writes `SV_Position`.
-    pub geometry: Option<u32>,
+    /// Geometry: its primitives and maximum output vertices. `flag`: writes
+    /// `SV_Position`.
+    pub geometry: Option<super::shader::Geometry>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -273,14 +293,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
     }
-    if let Some(max_vertices) = p.geometry {
-        // Input primitive (3: triangles), output topology (5: triangle
-        // strips), stream mask, position written; the vertex maximum.
-        info[0..4].copy_from_slice(&3u32.to_le_bytes());
-        info[4..8].copy_from_slice(&5u32.to_le_bytes());
-        info[8..12].copy_from_slice(&1u32.to_le_bytes());
+    if let Some(gs) = p.geometry {
+        // Input primitive, output topology, stream mask (stream 0), then
+        // whether it writes a position.
+        for (k, v) in [gs.input, gs.topology, 1].into_iter().enumerate() {
+            info[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
         info[12] = u8::from(p.flag);
-        info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
+        info[26..28].copy_from_slice(&(gs.max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);
@@ -609,6 +629,59 @@ mod tests {
         assert_eq!(
             outs.map(|e| (e.row, e.interp)),
             [(Some(0), 1), (Some(0), 1)]
+        );
+    }
+
+    /// `n` vertex elements of four components each.
+    fn wide(n: u32) -> Vec<SigElement> {
+        (0..n)
+            .map(|i| SigElement {
+                cols: 4,
+                ..element(0, 9, 2, i, 0, 15)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mesh_output_is_measured_as_the_validator_does() {
+        // 4 bytes a component, the maxima up to multiples of 32.
+        let els = wide(16);
+        assert_eq!(mesh_output_bytes(&els, &[], 128, 64), 16 * 4 * 4 * 128);
+        assert_eq!(mesh_output_bytes(&els, &[], 100, 64), 16 * 4 * 4 * 128);
+        assert_eq!(mesh_output_bytes(&els, &[], 129, 64), 16 * 4 * 4 * 160);
+        assert_eq!(
+            mesh_output_bytes(&els, &wide(1), 128, 33),
+            16 * 4 * 4 * 128 + 4 * 4 * 64
+        );
+    }
+
+    #[test]
+    fn mesh_maxima_come_down_to_the_lanes_and_past_that_to_the_hosts_limit() {
+        let lanes = 128;
+        // 15 rows of four: 32 KiB at 128 vertices, so 256 comes down to 128.
+        assert_eq!(
+            mesh_maxima(&wide(15), &[], (256, 256), lanes, 0),
+            Some((128, 128))
+        );
+        assert_eq!(
+            mesh_maxima(&wide(7), &[], (256, 256), lanes, 0),
+            Some((256, 256))
+        );
+        // 17 rows (34816 bytes at 128 vertices) pass even at the lanes: refused unless the host
+        // takes them; a host limit below 32 KiB never lowers what D3D12 promises.
+        assert_eq!(
+            mesh_maxima(&wide(16), &[], (128, 128), lanes, 0),
+            Some((128, 128))
+        );
+        assert_eq!(mesh_maxima(&wide(17), &[], (128, 128), lanes, 0), None);
+        assert_eq!(mesh_maxima(&wide(17), &[], (128, 128), lanes, 34815), None);
+        assert_eq!(
+            mesh_maxima(&wide(17), &[], (128, 128), lanes, 34816),
+            Some((128, 128))
+        );
+        assert_eq!(
+            mesh_maxima(&wide(15), &[], (128, 128), lanes, 1),
+            Some((128, 128))
         );
     }
 

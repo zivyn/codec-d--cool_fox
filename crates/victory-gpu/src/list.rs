@@ -19,6 +19,8 @@ use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
+pub(crate) mod replay;
+#[cfg(windows)]
 pub(crate) mod thin;
 
 const ALLOCATOR_IIDS: [Iid; 4] = [

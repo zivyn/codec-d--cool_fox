@@ -6,7 +6,7 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Tag, Term, V, pred};
@@ -14,10 +14,10 @@ use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
-use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
+use crate::io::{Barycentric, Export, GsInput, GsOp, Input, Interp, Io, LdsOutput, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, GS_TABLE, MEMORY, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 /// The ray-tracing node test (`image_bvh_intersect_ray`), a child module so
@@ -78,7 +78,12 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// Geometry: what the shader declares (its primitives and limits).
+    pub geometry: Option<super::shader::Geometry>,
 }
+
+/// Emit site to the original LDS write sites and their channels, in write order.
+type GsOutputs = HashMap<Site, Vec<(Site, Vec<LdsOutput>)>>;
 
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
@@ -111,9 +116,10 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    let gs_outputs = gs_outputs_at_emit(parts)?;
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad, gs_outputs.as_ref()).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -126,6 +132,72 @@ pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, Sha
             Err(Stop::Fail(e)) => return Err(e),
         }
     }
+}
+
+/// In a straight-line GS, keep independent values for each GSVS ring slot
+/// until its vertex is emitted. DXIL's output registers hold one vertex.
+fn gs_outputs_at_emit(parts: &Parts) -> Result<Option<GsOutputs>, ShaderError> {
+    let [block] = parts.p.blocks.as_slice() else {
+        return Ok(None);
+    };
+    if !matches!(parts.native.stage, HwStage::Gs) || !matches!(block.exit, Exit::End) {
+        return Ok(None);
+    }
+    let writes: HashMap<_, _> = parts
+        .io
+        .lds_outputs
+        .iter()
+        .map(|(site, out)| (*site, out))
+        .collect();
+    let ops: HashMap<_, _> = parts.io.gs_ops.iter().copied().collect();
+    let mut pending = BTreeMap::new();
+    let mut at_emit = HashMap::new();
+    let mut next = 0;
+    let mut batched = false;
+    for i in 0..block.insts.len() {
+        let site = (0, i);
+        if let Some(outputs) = writes.get(&site) {
+            for &out in *outputs {
+                if out.vertex < next {
+                    return Err(ShaderError::Unsupported {
+                        offset: block.insts[i].machine.offset,
+                        what: "a GS ring write after its vertex was emitted",
+                    });
+                }
+                batched |= out.vertex > next;
+                pending
+                    .entry(out.vertex)
+                    .or_insert_with(BTreeMap::new)
+                    .entry(site)
+                    .or_insert_with(Vec::new)
+                    .push(out);
+            }
+        }
+        if matches!(ops.get(&site), Some(GsOp::Emit(_) | GsOp::EmitCut(_))) {
+            let writes = pending.remove(&next).unwrap_or_default();
+            at_emit.insert(site, writes.into_iter().collect::<Vec<_>>());
+            next += 1;
+        }
+    }
+    if batched && let Some(first) = at_emit.values().next() {
+        // A batched emit must define its own outputs; registers from a
+        // previous emit cannot stand in for unwritten ring channels.
+        let channels = |writes: &[(Site, Vec<LdsOutput>)]| {
+            writes
+                .iter()
+                .flat_map(|(_, outputs)| outputs)
+                .map(|out| (out.row, out.channel))
+                .collect::<BTreeSet<_>>()
+        };
+        let first = channels(first);
+        if first.is_empty() || at_emit.values().any(|writes| channels(writes) != first) {
+            return Err(ShaderError::Unsupported {
+                offset: block.offset,
+                what: "different output channels in a batched GS ring",
+            });
+        }
+    }
+    Ok(batched.then_some(at_emit))
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
@@ -300,6 +372,17 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
+    /// Merged geometry stages: a geometry program's reads of its input
+    /// vertices, an export or geometry program's writes of its outputs
+    /// (both LDS on the console), and the stream messages.
+    gs_reads: HashMap<Site, &'a [(u8, GsInput)]>,
+    lds_outputs: HashMap<Site, &'a [LdsOutput]>,
+    gs_outputs: Option<&'a GsOutputs>,
+    gs_ops: HashMap<Site, GsOp>,
+    /// Merged geometry stages: the lane masks of the prologue that enables
+    /// the wave's lanes with work ([`merged_wave_masks`]). Every host
+    /// invocation has work, so they are true.
+    merged_wave_mask: HashSet<Value>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
@@ -1139,10 +1222,18 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 5] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), host_lds_bytes()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, the shared memory of a group and the output
+/// of a mesh shader.
+pub fn host_settings() -> [u32; 6] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        host_lds_bytes(),
+        host_mesh_output_bytes(),
+    ]
 }
 
 thread_local! {
@@ -1156,8 +1247,12 @@ thread_local! {
 /// the program's hash` in the host's list of faults (`MEMORY_FAULTS`).
 pub const PAIR_NOTE: u32 = 0xF000_0000;
 
+/// A loop that reached its iteration limit leaves `LOOP_NOTE | the first five hex digits of the
+/// program's hash << 8 | the loop's number` in the faults buffer (`VICTORY_LOOP_NOTES=1`).
+pub const LOOP_NOTE: u32 = 0xE000_0000;
+
 /// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
-pub(super) fn set_program_tag(container: &[u8]) {
+pub fn set_program_tag(container: &[u8]) {
     let hash = blake3::hash(container);
     let first = u32::from_be_bytes(hash.as_bytes()[..4].try_into().expect("4 bytes"));
     PROGRAM_TAG.set(PAIR_NOTE | first >> 4);
@@ -1169,6 +1264,25 @@ static HOST_LDS_BYTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// 32 KiB unless the host's GPU runs more (NVIDIA's take 48 KiB).
 pub fn set_host_lds_bytes(bytes: u32) {
     HOST_LDS_BYTES.store(bytes.max(32768), std::sync::atomic::Ordering::Relaxed);
+}
+
+static HOST_MESH_OUTPUT_BYTES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(super::container::MESH_OUTPUT_LIMIT as u32);
+
+/// Tells the translator how much output (vertex plus primitive, as the DXIL validator measures
+/// it) a mesh shader may have on the host: D3D12's 32 KiB unless the host's GPU takes more
+/// (NVIDIA's drivers, checked on an RTX 4060). A mesh program that still passes it after its
+/// maxima come down to its lanes is refused with a reason.
+pub fn set_host_mesh_output_bytes(bytes: u32) {
+    HOST_MESH_OUTPUT_BYTES.store(
+        bytes.max(super::container::MESH_OUTPUT_LIMIT as u32),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The output of a mesh shader the host allows ([`set_host_mesh_output_bytes`]).
+pub fn host_mesh_output_bytes() -> u32 {
+    HOST_MESH_OUTPUT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -1240,6 +1354,7 @@ pub(super) fn host_max_wave() -> u32 {
 #[cfg(test)]
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
+    pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
@@ -1381,7 +1496,8 @@ fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
 /// output entry names, taken in row order.
 fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Option<u8>)> {
     let entries = match io {
-        StageIo::Vs { outputs, .. } => outputs,
+        StageIo::Vs { outputs, .. } | StageIo::Es { outputs, .. } => outputs,
+        StageIo::Gs(gs) => &gs.outputs,
         StageIo::Ms(ms) => &ms.outputs,
         _ => return HashMap::new(),
     };
@@ -1445,8 +1561,77 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// The lane masks (and the SCC beside them) a merged export or geometry
+/// program's prologue makes from its lane count in s3: `s_bfe_{i32,u32}
+/// count, s3, ...; s_bfm_b64 exec, count, 0; s_cmp_eq_u32 count, 64;
+/// s_cselect_b64 exec, -1, exec`.
+fn merged_wave_masks(p: &Program) -> HashSet<Value> {
+    let mut out = HashSet::new();
+    let Some(s3) = p.inputs.iter().find(|i| i.0 == Reg::S(3)).map(|i| i.1) else {
+        return out;
+    };
+    let Some(entry) = p.blocks.first() else {
+        return out;
+    };
+    let mut counts = HashSet::new();
+    let mut bfm = HashSet::new();
+    for inst in &entry.insts {
+        let Fields::Sop { dst, src, .. } = &inst.fields else {
+            continue;
+        };
+        match inst.name() {
+            "s_bfe_i32" | "s_bfe_u32" => {
+                if matches!(src.first(), Some(Operand::Scalar { code: 3, .. }))
+                    && inst.read(Reg::S(3)) == Some(s3)
+                    && let Some(&Operand::Scalar { code, .. }) = dst.as_ref()
+                    && let Some(w) = inst.write(Reg::S(code))
+                {
+                    counts.insert(w);
+                }
+            }
+            "s_bfm_b64" => {
+                if matches!(dst, Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && matches!(src.first(), Some(Operand::Scalar { code, .. }) if inst.read(Reg::S(*code)).is_some_and(|v| counts.contains(&v)))
+                    && matches!(src.get(1), Some(Operand::Const(128)))
+                    && let Some(w) = inst.write(Reg::S(EXEC))
+                {
+                    bfm.insert(w);
+                    out.insert(w);
+                }
+            }
+            "s_cmp_eq_u32" => {
+                if matches!(src.first(), Some(Operand::Scalar { code, .. }) if inst.read(Reg::S(*code)).is_some_and(|v| counts.contains(&v)))
+                    && matches!(
+                        src.get(1),
+                        Some(Operand::Const(192)) | Some(Operand::Literal(64))
+                    )
+                    && let Some(w) = inst.write(Reg::Scc)
+                {
+                    out.insert(w);
+                }
+            }
+            "s_cselect_b64" => {
+                if matches!(dst, Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && matches!(src.first(), Some(Operand::Const(193)))
+                    && matches!(src.get(1), Some(Operand::Scalar { code, .. }) if *code == EXEC)
+                    && inst.read(Reg::S(EXEC)).is_some_and(|v| bfm.contains(&v))
+                    && let Some(w) = inst.write(Reg::S(EXEC))
+                {
+                    out.insert(w);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        gs_outputs: Option<&'a GsOutputs>,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1705,6 +1890,17 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        if x.native.stage == HwStage::Es {
+            // The barrier between the export and geometry halves of the
+            // console's wave: the host's stages are apart already.
+            no_barrier.extend(0..p.blocks.len());
+        }
+        s.geometry = x.geometry;
+        let merged_wave_mask = if matches!(x.native.stage, HwStage::Es | HwStage::Gs) {
+            merged_wave_masks(p)
+        } else {
+            HashSet::new()
+        };
         Lower {
             s,
             x,
@@ -1761,6 +1957,21 @@ impl<'a> Lower<'a> {
                 }
                 m
             },
+            gs_reads: x
+                .io
+                .gs_reads
+                .iter()
+                .map(|(s, r)| (*s, r.as_slice()))
+                .collect(),
+            lds_outputs: x
+                .io
+                .lds_outputs
+                .iter()
+                .map(|(s, o)| (*s, o.as_slice()))
+                .collect(),
+            gs_outputs,
+            gs_ops: x.io.gs_ops.iter().copied().collect(),
+            merged_wave_mask,
             handles: HashMap::new(),
             strides: HashMap::new(),
             edges: HashMap::new(),
@@ -1800,7 +2011,7 @@ impl<'a> Lower<'a> {
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
-                HwStage::Ps | HwStage::Vs => MaskData::Host,
+                HwStage::Ps | HwStage::Vs | HwStage::Es | HwStage::Gs => MaskData::Host,
                 _ => MaskData::None,
             },
             mask_ok: false,
@@ -2473,6 +2684,9 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        if super::loop_why() {
+            self.list_loops(&order);
+        }
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2646,7 +2860,18 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            // Geometry: the id of the primitive it runs for, and which of
+            // its runs for that primitive this is.
+            Input::PrimitiveId | Input::GsInstanceId if self.s.geometry.is_some() => {
+                let (name, opcode) = match input {
+                    Input::PrimitiveId => ("primitiveID.i32", 108),
+                    _ => ("gsInstanceID.i32", 100),
+                };
+                let (entry, i32t) = (self.s.entry, self.s.t.i32);
+                return Val::I32(self.s.op(entry, name, Attr::ReadNone, i32t, opcode, &[]));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
+            Input::GsInstanceId => return Val::Missing("a geometry instance id outside one"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
             Input::FrontFace => (13, 0),
@@ -2746,6 +2971,12 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
+        self.load_element(self.s.entry, id, col, None)
+    }
+
+    /// [`Lower::load_any_input`] in block `entry`, at `vertex` of the input
+    /// primitive (undefined outside geometry shaders).
+    fn load_element(&mut self, entry: usize, id: usize, col: u8, vertex: Option<u32>) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -2763,12 +2994,14 @@ impl<'a> Lower<'a> {
         } else {
             ".f32"
         };
-        let entry = self.s.entry;
         let args = [
             self.s.m.i32(id as u32),
             self.s.m.i32(0),
             self.s.m.i8(col),
-            self.s.m.undef(self.s.t.i32),
+            match vertex {
+                Some(n) => self.s.m.i32(n),
+                None => self.s.m.undef(self.s.t.i32),
+            },
         ];
         let v = self.s.op(
             entry,
@@ -2785,6 +3018,23 @@ impl<'a> Lower<'a> {
             Val::I32(v)
         } else {
             Val::I32(self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.i32))
+        }
+    }
+
+    /// Channel `col` of input element `id` at vertex `vertex` of a geometry
+    /// program's input primitive, read where the program reads it.
+    fn load_gs_input(&mut self, id: usize, col: u8, vertex: u8) -> Result<V, Why> {
+        if self.s.inputs[id].half {
+            // shortcut: 16-bit geometry inputs are not unpacked.
+            return Err("a 16-bit geometry input");
+        }
+        let vertices = self.s.geometry.map_or(0, |gs| gs.input_vertices());
+        if u32::from(vertex) >= vertices {
+            return Err("a geometry input vertex its primitive lacks");
+        }
+        match self.load_element(self.cur, id, col, Some(u32::from(vertex))) {
+            Val::I32(x) => Ok(x),
+            _ => unreachable!("an input element loads as a dword"),
         }
     }
 
@@ -4169,6 +4419,7 @@ impl<'a> Lower<'a> {
                     .copied()
                     .unwrap_or("a lane mask from a carry")
             }),
+            Atom::Uniform(v) if self.merged_wave_mask.contains(&v) => Ok(self.s.m.bool(true)),
             Atom::Uniform(v) => match self.get(v)? {
                 Val::Bit(x) => Ok(x),
                 Val::I32(x) => {
@@ -4195,6 +4446,7 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
+            Atom::Opaque(v) if self.merged_wave_mask.contains(&v) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
             Atom::Opaque(v) if self.console_lanes => {
@@ -4612,7 +4864,13 @@ impl<'a> Lower<'a> {
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         match self.x.st.guards[b][i] {
             None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+            Some(g) => {
+                let v = self.boolean(g, self.cur)?;
+                // Merged geometry stages: under the prologue's mask alone,
+                // every host invocation runs it.
+                let all = !self.merged_wave_mask.is_empty() && v == self.s.m.bool(true);
+                Ok((!all).then_some(v))
+            }
         }
     }
 
@@ -4860,22 +5118,19 @@ impl<'a> Lower<'a> {
         // D3D12 caps the outputs of the declared maxima at 32 KiB. Lane n
         // writes only vertex n and primitive n, so maxima past the lanes are
         // never reached: they come down to the lane count when the outputs
-        // do not fit.
-        use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
-        let (outputs, prims) = (&self.s.outputs, &self.s.prims);
-        let fits = |m: super::shader::Mesh| {
-            mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
-        };
-        if !fits(mesh) {
-            mesh.max_vertices = mesh.max_vertices.min(threads);
-            mesh.max_primitives = mesh.max_primitives.min(threads);
-            // shortcut: outputs past the cap even at the lane count are
-            // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
-            // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
-                return Err("a mesh shader whose outputs pass the host's 32 KiB");
-            }
+        // do not fit. What still passes the limit of the host's driver
+        // ([`set_host_mesh_output_bytes`]) is refused.
+        let (max_vertices, max_primitives) = super::container::mesh_maxima(
+            &self.s.outputs,
+            &self.s.prims,
+            (mesh.max_vertices, mesh.max_primitives),
+            threads,
+            u64::from(host_mesh_output_bytes()),
+        )
+        .ok_or("a mesh shader whose outputs pass the host's mesh output limit")?;
+        if (max_vertices, max_primitives) != (mesh.max_vertices, mesh.max_primitives) {
+            mesh.max_vertices = max_vertices;
+            mesh.max_primitives = max_primitives;
             self.s.mesh = Some(mesh);
         }
         let e = self.s.entry;
@@ -5243,6 +5498,26 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
+        // Merged geometry stages keep vertices in LDS: a geometry program
+        // reads its input primitive's there, and an export or geometry
+        // program writes its outputs there (I/O raising names both).
+        if let Some(&reads) = self.gs_reads.get(&(b, i)) {
+            let reg = dst_reg.ok_or("a geometry input read result")?;
+            for &(n, from) in reads {
+                let (id, col) = self
+                    .find_input(from.row, from.channel)
+                    .ok_or("a geometry input the signature lacks")?;
+                let x = self.load_gs_input(id, col, from.vertex)?;
+                self.write(inst, Reg::V(reg + n), x, guard);
+            }
+            return Ok(());
+        }
+        if let Some(&writes) = self.lds_outputs.get(&(b, i)) {
+            if self.gs_outputs.is_some() {
+                return Ok(());
+            }
+            return self.store_lds_outputs(writes, guard);
+        }
         if self.s.lds_dwords == 0 {
             return Err("LDS the program does not allocate");
         }
@@ -5588,6 +5863,7 @@ impl<'a> Lower<'a> {
             || name.contains("store")
             || name.contains("atomic")
             || name == "s_barrier"
+            || self.gs_ops.contains_key(&(b, i))
             || matches!(inst.fields, Fields::Ds { .. })
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
@@ -5636,6 +5912,7 @@ impl<'a> Lower<'a> {
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
                 Ok(())
             }
+            Fields::Sopp { .. } if self.gs_ops.contains_key(&(b, i)) => self.gs_op(b, i),
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
@@ -5777,6 +6054,81 @@ impl<'a> Lower<'a> {
                         if matches!(g.src.first(), Some(&Operand::Vector { reg, .. })
                             if fl.read(Reg::V(reg)) == lanes))
             })
+    }
+
+    /// A geometry program's stream message: the vertex its output writes
+    /// made is emitted, the strip cut.
+    fn store_lds_outputs(&mut self, writes: &[LdsOutput], guard: Option<V>) -> Result<(), Why> {
+        // Dwords of rows the signature lacks are padding.
+        let mut stores = Vec::new();
+        for out in writes {
+            let found = self.s.outputs.iter().position(|o| {
+                o.row == Some(u32::from(out.row))
+                    && out.channel >= o.col
+                    && out.channel < o.col + o.cols
+            });
+            let Some(id) = found else { continue };
+            if self.s.outputs[id].half {
+                // shortcut: 16-bit outputs (as `export` packs them) are
+                // not followed into LDS.
+                return Err("a 16-bit output of a merged geometry stage");
+            }
+            let x = self.i32_of(out.value)?;
+            stores.push((id, out.channel - self.s.outputs[id].col, out.value, x));
+        }
+        let at = self.begin_guarded(guard);
+        for (id, col, value, x) in stores {
+            let el = &mut self.s.outputs[id];
+            el.usage |= 1 << col;
+            let (suffix, x) = match el.comp {
+                9 => {
+                    let f = match self.floats.get(&value) {
+                        Some(&f) => f,
+                        None => self.as_float(x),
+                    };
+                    (".f32", f)
+                }
+                _ => (".i32", x),
+            };
+            let (id, zero) = (self.s.m.i32(id as u32), self.s.m.i32(0));
+            let args = [id, zero, self.s.m.i8(col), x];
+            let void = self.s.t.void;
+            let name = format!("storeOutput{suffix}");
+            self.s.op(self.cur, &name, Attr::NoUnwind, void, 5, &args);
+        }
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    fn gs_op(&mut self, b: usize, i: usize) -> Result<(), Why> {
+        let (name, opcode, stream) = match self.gs_ops[&(b, i)] {
+            GsOp::Emit(s) => ("emitStream", 97, s),
+            GsOp::Cut(s) => ("cutStream", 98, s),
+            GsOp::EmitCut(s) => ("emitThenCutStream", 99, s),
+            // The end of the program's output: nothing on the host.
+            GsOp::Done => return Ok(()),
+        };
+        if stream != 0 {
+            // The signature and state declare stream 0 alone.
+            return Err("a geometry output stream other than 0");
+        }
+        let guard = self.guard(b, i)?;
+        if let Some(outputs) = self.gs_outputs.and_then(|plan| plan.get(&(b, i))) {
+            if guard.is_some() {
+                return Err("a lane-guarded emit from a batched GS ring");
+            }
+            for &((wb, wi), ref writes) in outputs {
+                // The original lane mask is part of the ring write.
+                let write_guard = self.guard(wb, wi)?;
+                self.store_lds_outputs(writes, write_guard)?;
+            }
+        }
+        let at = self.begin_guarded(guard);
+        let (stream, void) = (self.s.m.i8(0), self.s.t.void);
+        self.s
+            .op(self.cur, name, Attr::NoUnwind, void, opcode, &[stream]);
+        self.end_guarded(at, &[]);
+        Ok(())
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -6404,6 +6756,11 @@ impl<'a> Lower<'a> {
         let name = inst.name();
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
+        }
+        // The console's vertex ring offsets: the accesses they address are
+        // raised to inputs and outputs, so nothing with an effect reads them.
+        if self.scalar.get(&site).is_some_and(|a| a.param == GS_TABLE) {
+            return Err("the geometry stage's own table");
         }
         if self.scalar.get(&site).is_some_and(|a| a.param == MEMORY) {
             return self.memory_smem(inst);
@@ -12711,6 +13068,10 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
+                if super::loop_notes() {
+                    let cut = self.negated(ok);
+                    self.note_cut(t, cut);
+                }
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -12749,9 +13110,20 @@ impl<'a> Lower<'a> {
                 // AMD driver.)
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
+                    if super::loop_notes() {
+                        // (the loop would go on and the limit stops it)
+                        let over = self.negated(ok);
+                        let cut = self.s.m.bin(self.cur, Bin::And, cond, over);
+                        self.note_cut(taken, cut);
+                    }
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
+                    if super::loop_notes() {
+                        let goes_on = self.negated(cond);
+                        let cut = self.s.m.bin(self.cur, Bin::And, goes_on, stop);
+                        self.note_cut(not_taken, cut);
+                    }
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -12781,6 +13153,9 @@ impl<'a> Lower<'a> {
                 }
                 Term::Ret
             }
+            // An export program ends by jumping to the geometry half of its
+            // wave (`s_setpc_b64`): the host's next stage.
+            LaneExit::Indirect if self.x.native.stage == HwStage::Es => Term::Ret,
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
         let _ = Exit::End;
@@ -12795,6 +13170,118 @@ impl<'a> Lower<'a> {
             let z = self.s.m.i32(0);
             incoming.push((z, via));
         }
+    }
+
+    /// `VICTORY_LOOP_WHY=1`: one line on stderr for each loop (see [`super::loop_why`]): its
+    /// number, the header's offset, the stage and the limit in force, how many iterations a
+    /// constant bound allows, and what the body reads from memory (`glc`: a load that waits
+    /// on what other groups write).
+    fn list_loops(&self, order: &[usize]) {
+        let p = self.x.p;
+        let limit = match super::loop_limit() {
+            LOOP_LIMIT if self.s.pixel => 1 << 7,
+            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+            LOOP_LIMIT => 1 << 12,
+            named => named,
+        };
+        let stage = if self.s.pixel {
+            "ps"
+        } else if self.s.mesh.is_some() {
+            "ms"
+        } else if self.s.threads.is_some() {
+            "cs"
+        } else {
+            "vs"
+        };
+        for &h in order.iter().filter(|h| self.counters.contains_key(h)) {
+            let mut body = HashSet::from([h]);
+            let mut backs: Vec<usize> = p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[h] <= self.rpo[q])
+                .collect();
+            let tails = backs.clone();
+            while let Some(n) = backs.pop() {
+                if body.insert(n) {
+                    backs.extend(p.blocks[n].preds.iter().copied().filter(|&q| self.block[q].is_some()));
+                }
+            }
+            let (mut loads, mut glc) = (0, 0);
+            for &n in &body {
+                for i in &p.blocks[n].insts {
+                    let name = i.name();
+                    let load = match &i.fields {
+                        Fields::Smem { .. } => true,
+                        Fields::Buffer { .. } | Fields::Image { .. } => name.contains("load") || name.contains("sample"),
+                        Fields::Flat { .. } => name.contains("load"),
+                        _ => false,
+                    };
+                    loads += usize::from(load);
+                    glc += usize::from(load && matches!(&i.fields, Fields::Buffer { cache, .. } if cache.glc));
+                }
+            }
+            // The bound: what the last compare of a block that closes the loop holds against a
+            // register ("const" when one operand is a constant).
+            let mut bound = "none".to_string();
+            for &t in &tails {
+                let cmp = p.blocks[t].insts.iter().rev().find(|i| {
+                    let n = i.name();
+                    n.starts_with("s_cmp") || n.starts_with("v_cmp")
+                });
+                let Some(cmp) = cmp else { continue };
+                let src: &[Operand] = match &cmp.fields {
+                    Fields::Sop { src, .. } => src,
+                    Fields::Valu(v) => &v.src,
+                    _ => continue,
+                };
+                bound = match src.iter().find_map(|o| match o {
+                    Operand::Literal(n) => Some(u64::from(*n)),
+                    Operand::Const(c) if (128..=192).contains(c) => Some(u64::from(*c - 128)),
+                    _ => None,
+                }) {
+                    Some(n) if n > u64::from(limit) => format!("const {n} (over the limit)"),
+                    Some(n) => format!("const {n}"),
+                    None => "register".to_string(),
+                };
+                break;
+            }
+            let id = self.loop_number(h);
+            eprintln!(
+                "LOOP program={:07x} id={id} offset={:#x} stage={stage} limit={limit} bound={bound} loads={loads} glc={glc} blocks={}",
+                PROGRAM_TAG.get() & 0x0FFF_FFFF,
+                p.blocks[h].offset,
+                body.len()
+            );
+        }
+    }
+
+    fn negated(&mut self, x: V) -> V {
+        let t = self.s.m.bool(true);
+        self.s.m.bin(self.cur, Bin::Xor, x, t)
+    }
+
+    /// The number of loop header `to` among the program's (by the order of the blocks).
+    fn loop_number(&self, to: usize) -> u32 {
+        self.counters.keys().filter(|&&h| self.rpo[h] < self.rpo[to]).count() as u32
+    }
+
+    /// Where the faults buffer says that loop `to` reached its iteration limit, when `cut`
+    /// (dword 0 is the sink for the lanes that did not). `VICTORY_LOOP_NOTES=1`.
+    fn note_cut(&mut self, to: usize, cut: V) {
+        let tag = PROGRAM_TAG.get();
+        if tag == 0 {
+            return;
+        }
+        let c = self.cur;
+        let value = LOOP_NOTE | (tag >> 8 & 0x000F_FFFF) << 8 | (self.loop_number(to) & 0xFF);
+        let faults = self.s.root_uav_handle(super::shader::SLOT_FAULTS);
+        let at = self.s.m.i32((1 + value % (super::shader::MEMORY_FAULTS - 1)) * 4);
+        let zero = self.s.m.i32(0);
+        let place = self.s.m.select(c, cut, at, zero);
+        let (value, iu) = (self.s.m.i32(value), self.s.m.undef(self.s.t.i32));
+        let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
+        self.s.op(c, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, value, iu, iu, iu, mask, align]);
     }
 
     /// A back edge to header `to` (a back edge keeps its block, no
@@ -13191,6 +13678,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
         .map(|_| ())
     }
@@ -13241,6 +13729,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            geometry: None,
         })
     }
 
@@ -13411,7 +13900,9 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
-        }).unwrap();
+            geometry: None,
+        })
+        .unwrap();
 
         let container =
             crate::Container::parse(&emitted.dxil).unwrap();

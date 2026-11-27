@@ -550,6 +550,17 @@ fn record(
     reads: &[(&ID3D12Resource, u64, u64, u64)],
     writes: &[(&ID3D12Resource, u64, u64, u64)],
 ) {
+    let (reads_joined, writes_joined);
+    let (reads, writes) = if merge_on() {
+        let same = |a: &&ID3D12Resource, b: &&ID3D12Resource| a.as_raw() == b.as_raw();
+        reads_joined = joined_copies(reads, same);
+        writes_joined = joined_copies(writes, same);
+        JOINED[0].fetch_add((reads.len() + writes.len()) as u64, Ordering::Relaxed);
+        JOINED[1].fetch_add((reads_joined.len() + writes_joined.len()) as u64, Ordering::Relaxed);
+        (&reads_joined[..], &writes_joined[..])
+    } else {
+        (reads, writes)
+    };
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     let mut sources: Vec<&ID3D12Resource> = Vec::new();
@@ -595,6 +606,31 @@ fn record(
             list.ResourceBarrier(&done);
         }
     }
+}
+
+/// Whether copies that continue each other, in the buffer and in the one
+/// between, are one copy (`VICTORY_STEP_MERGE=1`, off by default).
+fn merge_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STEP_MERGE").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: the copies recorded as planned, and as joined.
+static JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `copies` (buffer, offset in it, offset between, bytes), in the order
+/// given, each that begins where the one before ended, in the same buffer and
+/// between, one with it: the same bytes, fewer calls (the planned fills of the
+/// world's constants are 1,300 of 480 bytes a frame, from one copy).
+fn joined_copies<T: Copy>(copies: &[(T, u64, u64, u64)], same: impl Fn(&T, &T) -> bool) -> Vec<(T, u64, u64, u64)> {
+    let mut out: Vec<(T, u64, u64, u64)> = Vec::with_capacity(copies.len());
+    for &(buffer, offset, at, len) in copies {
+        match out.last_mut() {
+            Some(last) if same(&last.0, &buffer) && last.1 + last.3 == offset && last.2 + last.3 == at => last.3 += len,
+            _ => out.push((buffer, offset, at, len)),
+        }
+    }
+    out
 }
 
 /// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
@@ -913,6 +949,14 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    if merge_on() {
+        let j: Vec<f64> = JOINED.iter().map(|j| j.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "copies recorded for steps done on the card per frame (VICTORY_STEP_MERGE=1): {:.0} planned, {:.0} recorded after joining those that continue each other",
+            j[0],
+            j[1],
+        );
+    }
     #[cfg(feature = "diagnostics")]
     {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
@@ -1330,5 +1374,32 @@ mod tests {
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));
         assert!(done >= 20, "only {done} copies were done on the card");
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::joined_copies;
+
+    /// Copies that continue each other (same buffer, next offset, next place
+    /// between) are one; others stay as they are, in their order.
+    #[test]
+    fn copies_that_continue_each_other_are_joined() {
+        let same = |a: &u32, b: &u32| a == b;
+        let planned = [
+            (1u32, 0u64, 0u64, 16u64),
+            (1, 16, 16, 16),
+            (1, 32, 32, 8),
+            // Another buffer; the offset in the buffer jumps; the place between jumps.
+            (2, 40, 40, 8),
+            (2, 100, 48, 8),
+            (2, 108, 60, 8),
+            (2, 116, 68, 4),
+        ];
+        assert_eq!(joined_copies(&planned, same), vec![(1, 0, 0, 40), (2, 40, 40, 8), (2, 100, 48, 8), (2, 108, 60, 12)]);
+        assert!(joined_copies::<u32>(&[], same).is_empty());
+        // The same bytes: the sum of the lengths.
+        let total = |v: &[(u32, u64, u64, u64)]| v.iter().map(|c| c.3).sum::<u64>();
+        assert_eq!(total(&joined_copies(&planned, same)), total(&planned));
     }
 }

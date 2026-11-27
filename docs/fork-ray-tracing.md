@@ -159,7 +159,7 @@ fork's constant.
 | `VICTORY_AMBIENT=<share>,floor:<level>` | the estimate, and nowhere less than the constant (the estimate is the mean of what visible surfaces send out, so a room only a sun patch lights stays near black) |
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
-| `VICTORY_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `VICTORY_AMBIENT_AIR=<multiple>[,max:<level>]` | what the air scatters is bounded by a multiple of the light around (and by the constant `<level>`: the multiple alone grows with the room) (off: the brown veil in the day room stays with it, light-14) |
 
 It is off while the builder runs.
 

@@ -1,5 +1,6 @@
-//! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
-//! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
+//! DXIL emission (decision 0003, step 3): a console vertex, geometry, pixel,
+//! compute or mesh shader as a PC DXIL container (SM 6.6) that host D3D12
+//! accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it.
@@ -79,6 +80,20 @@
 //!   geometry shader of ours between the translated vertex and pixel
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
+//! * **Merged geometry stages** ([`HwStage::Es`], [`HwStage::Gs`]): the
+//!   console runs a vertex shader that feeds a geometry shader, and that
+//!   geometry shader, as the two halves of one wave, the vertices between
+//!   them in LDS. The export program is a plain vertex shader on the host
+//!   (`vs_6_6`: its LDS writes are its outputs); the geometry program a
+//!   geometry shader (`gs_6_6`): its LDS reads are its input primitive's
+//!   vertices, its LDS writes the outputs of the vertex its next stream
+//!   message emits. Input primitive and output topology are the console
+//!   container's (`PSV0`), the vertex maximum and the instance count the
+//!   stage data's; one output stream, no 16-bit values. A container with
+//!   both a vertex and an export program translates as the vertex program,
+//!   which feeds the geometry shader just as well. The host has one
+//!   geometry stage: a pipeline with such a shader and a rectangle-list
+//!   topology gets no host pipeline.
 
 #[cfg(all(test, windows))]
 mod bench_tests;
@@ -88,6 +103,8 @@ mod container;
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod geometry_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -102,6 +119,8 @@ mod shader;
 mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
+mod mesh_size_tests;
+#[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
 mod size_tests;
@@ -109,6 +128,8 @@ mod size_tests;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+#[cfg(all(test, windows))]
+mod loop_note_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
@@ -119,7 +140,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{PAIR_NOTE, host_settings, set_host_lds_bytes, set_host_max_wave, set_host_rdna};
+pub use lower::{
+    LOOP_NOTE, PAIR_NOTE, host_mesh_output_bytes, host_settings, set_host_lds_bytes, set_host_max_wave,
+    set_host_mesh_output_bytes, set_host_rdna, set_program_tag,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -183,6 +207,27 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// With `VICTORY_LOOP_NOTES=1` a translated loop that reaches its iteration limit
+/// (`loop_limit`) leaves a note in the faults buffer, which the host says once for each
+/// program and loop and counts by frames; off (the default) the translation is what it was.
+/// Part of the translation: the shader cache keys on it.
+pub fn loop_notes() -> bool {
+    #[cfg(test)]
+    if lower::TEST_LOOP_NOTES.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_NOTES").is_some_and(|v| v == "1"))
+}
+
+/// With `VICTORY_LOOP_WHY=1` the translator prints one line to stderr for each loop of each
+/// program it translates (`LOOP program=<7 hex> id=<n> ...`): the stage, the limit in force,
+/// the bound its exit compares with (a constant, or a register), the loads in its body.
+pub fn loop_why() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_WHY").is_some_and(|v| v == "1"))
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
@@ -384,8 +429,8 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, geometry, pixel, compute or mesh program of a
+/// console shader container.
 ///
 /// A program refused because the first half of an interpolation is read as
 /// data is translated once more with first halves evaluated as the pair
@@ -409,17 +454,22 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
+    // A vertex shader compiled for a geometry shader's pipelines is an
+    // export program; where its container has the plain vertex program
+    // too, that one feeds the host's geometry stage just as well.
+    let mut programs = crate::native_programs(dxil.data)?;
+    let translated = |p: &NativeProgram| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
+        )
+    };
+    let native = (programs.iter().position(translated))
+        .or_else(|| programs.iter().position(|p| p.stage == HwStage::Es))
+        .map(|i| programs.swap_remove(i))
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, geometry, pixel, compute or mesh program",
         })?;
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
@@ -550,7 +600,8 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1")
+            || wide_first(c, wide_first_names(std::env::var("VICTORY_WAVE_WIDE_FIRST").ok().as_deref()));
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -696,6 +747,38 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+}
+
+/// The programs that take the wave-wide form first unless `VICTORY_WAVE_WIDE_FIRST` says
+/// otherwise: the title's lens flare scans, which build a work queue from a ballot and a lane
+/// count (the approximate form of each half writes the queue's same slots, and a bright
+/// source then fills the picture with garbage flares until the camera cuts). They ran
+/// through the wave-wide form in the pilot's runs without a lost card.
+const WIDE_FIRST: &str = "CS_ScanMip";
+
+/// The names `VICTORY_WAVE_WIDE_FIRST` asks for: the variable's value (empty or `none`: no
+/// program), or [`WIDE_FIRST`] where it is not set.
+fn wide_first_names(set: Option<&str>) -> &str {
+    match set.map(str::trim) {
+        None => WIDE_FIRST,
+        Some("none") => "",
+        Some(names) => names,
+    }
+}
+
+/// Whether the comma-separated `names` (as the containers carry them)
+/// name this program: its per-lane branches are then taken wave-wide ([`widen`], exact, at
+/// group barriers) before any approximate local-wave form, which gives each host wave its own
+/// counts and sums (a queue built from a ballot and a lane count then has half the slots, and
+/// both halves write the same ones). Only for the programs named ([`WIDE_FIRST`] unless the
+/// variable says otherwise): the barriers this form puts inside branches lost the card for two
+/// programs the approximate forms ran.
+fn wide_first(c: &Container, names: &str) -> bool {
+    names
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .any(|n| c.parts.iter().any(|part| part.data.windows(n.len()).any(|w| w == n.as_bytes())))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -880,6 +963,38 @@ fn emit_program(
         }
         _ => 0,
     };
+    // A geometry program's primitives are in PSV0 (its limits in the stage
+    // data): without them, triangles in and triangle strips out.
+    let gs = match &native.io {
+        crate::native::StageIo::Gs(gs) => {
+            let psv = c
+                .part(FourCC::PSV0)
+                .map(|p| p.data)
+                .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 16));
+            let word = |k: usize| {
+                psv.and_then(|d| crate::dxbc::u32_at(d, 4 + 4 * k).ok())
+                    .filter(|&v| v != 0)
+            };
+            let (input, topology) = (word(0).unwrap_or(3), word(1).unwrap_or(5));
+            let what = if word(2).is_some_and(|streams| streams != 1) {
+                Some("geometry output streams other than 0")
+            } else if !matches!(input, 1 | 2 | 3 | 6 | 7) || !matches!(topology, 1 | 3 | 5) {
+                Some("a geometry shader's primitive kind")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                return Err(ShaderError::Unsupported { offset: 0, what });
+            }
+            Some(shader::Geometry {
+                input,
+                topology,
+                max_vertices: gs.max_vertices.max(1),
+                instances: gs.invocations.max(1),
+            })
+        }
+        _ => None,
+    };
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -890,6 +1005,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        geometry: gs,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1075,6 +1191,25 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn wide_first_names_a_program_by_a_word_in_its_container() {
+        use crate::dxbc::{Container, FourCC};
+        let bytes = crate::dxbc::build(&[(FourCC(*b"ILDN"), b"\x10\0\0\0queue:CS_Scan_Four\0".as_slice())]);
+        let c = Container::parse(&bytes).unwrap();
+        assert!(super::wide_first(&c, "CS_Scan"));
+        assert!(super::wide_first(&c, "other, queue:CS_Scan_Four ,more"));
+        assert!(!super::wide_first(&c, "CS_Scan_Five"));
+        assert!(!super::wide_first(&c, ""));
+        assert!(!super::wide_first(&c, " , ,"));
+        // The default list, `none`, and an empty value.
+        let scan_bytes = crate::dxbc::build(&[(FourCC(*b"ILDN"), b"\x10\0\0\0queue:CS_ScanMip3_ab\0".as_slice())]);
+        let scan = Container::parse(&scan_bytes).unwrap();
+        assert!(super::wide_first(&scan, super::wide_first_names(None)));
+        assert!(!super::wide_first(&scan, super::wide_first_names(Some("none"))));
+        assert!(!super::wide_first(&scan, super::wide_first_names(Some(""))));
+        assert!(super::wide_first(&scan, super::wide_first_names(Some("CS_Scan"))));
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.
@@ -2349,6 +2484,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
@@ -2506,6 +2642,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap();
         let mut dxil = l.dxil;

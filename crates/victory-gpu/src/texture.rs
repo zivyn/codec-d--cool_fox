@@ -86,6 +86,14 @@ pub(crate) struct Staging {
     /// others), and what that was judged by ([`Staging::judgement`]).
     detiled: std::sync::atomic::AtomicU32,
     judged: [std::sync::atomic::AtomicU64; 2],
+    /// With `VICTORY_UPLOAD_HELD_ONLY=1` (GPU1): what the last recording of
+    /// the upload judged, and the levels it recorded a copy for (a bit a
+    /// level; `u32::MAX`: all, as before). The detiling that follows goes by
+    /// the same judgement, so a level that was not recorded is not the
+    /// title's there either.
+    rec_judged: [std::sync::atomic::AtomicU64; 2],
+    rec_mask: std::sync::atomic::AtomicU32,
+    rec_on: std::sync::atomic::AtomicBool,
     /// For such a texture: when an upload last left a held level without
     /// tiles (`crate::host::moment`, never 0; 0: none did). The upload is
     /// recorded again about a second later if the card has room by then
@@ -733,6 +741,17 @@ pub(crate) fn digest(bytes: &[u8]) -> Digest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Digest(u128);
 
+/// Whether an upload of a texture made level by level records copies only into
+/// the levels the title holds (`VICTORY_UPLOAD_HELD_ONLY=1`; off by default).
+fn held_only_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_HELD_ONLY").is_some_and(|v| v == "1"))
+}
+
+/// Copy commands of uploads recorded, left out for levels the title does not
+/// hold, and the bytes of those (what the bus did not carry).
+pub(crate) static UPLOAD_COPIES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// [`upload`] of the levels from `first` on, the ones a view shows: of a
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
@@ -860,6 +879,20 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         };
         staging.expected.store(there, Relaxed);
     }
+    if held_only_copies() && staging.on_demand && !baking {
+        // Levels on demand: copies only into the levels the title holds as far
+        // as the views and the next texture say; the rest are zeros that the
+        // card drops, and 4096 x 4096 level 0 of a texture the title holds
+        // from level 3 on was 16 MB read over the bus to be dropped.
+        let judged = staging.judgement();
+        staging.rec_judged[0].store(judged[0], Relaxed);
+        staging.rec_judged[1].store(judged[1], Relaxed);
+        staging.rec_mask.store(staging.levels_by(judged, |from, to| to > from && to <= judged[1]), Relaxed);
+        staging.rec_on.store(true, Relaxed);
+    } else {
+        staging.rec_mask.store(u32::MAX, Relaxed);
+        staging.rec_on.store(false, Relaxed);
+    }
     record_upload(list, resource, texture, &staging, &staging.buffer, staging.base);
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
@@ -936,8 +969,17 @@ fn record_upload(
         unsafe { list.list.ResourceBarrier(&[aliasing]) };
     }
     crate::list::ensure_state(list, resource, COPY_DEST);
+    let mask = staging.rec_mask.load(Relaxed);
     // The staging/plane upload buffer lives until the list is reset.
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        let (mip, _) = staging.part(i);
+        let len = u64::from(footprint.Footprint.RowPitch) * u64::from(staging.rows[i]) * u64::from(footprint.Footprint.Depth);
+        if mip < 32 && mask & (1 << mip) == 0 {
+            UPLOAD_COPIES[1].fetch_add(1, Relaxed);
+            UPLOAD_COPIES[2].fetch_add(len, Relaxed);
+            continue;
+        }
+        UPLOAD_COPIES[0].fetch_add(1, Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -1202,30 +1244,29 @@ impl Staging {
     /// levels from the smallest up, level 0 last:
     /// `victory_formats::texture::Layout`.) A texture this cannot tell
     /// the levels of holds them all.
-    fn held_levels(&self, [first, limit]: [u64; 2]) -> u32 {
+    fn held_levels(&self, judged: [u64; 2]) -> u32 {
+        let limit = judged[1];
+        self.levels_by(judged, |from, to| {
+            to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
+        })
+    }
+
+    /// [`Staging::held_levels`] with `there` saying whether the bytes `[from,
+    /// to)` of the texture's memory are the title's.
+    fn levels_by(&self, [first, _limit]: [u64; 2], there: impl Fn(u64, u64) -> bool) -> u32 {
         let mips = &self.layout.mips;
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
         }
-        let tail = (self.layout.first_tail_mip as usize).min(mips.len());
-        let there = |from: u64, to: u64| {
-            to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
-        };
-        let mut held = 0u32;
-        for (level, m) in mips.iter().enumerate().take(tail) {
-            let end = if level == 0 { self.layout.slice_size } else { mips[level - 1].offset };
-            if level as u64 >= first && there(m.offset, end) {
-                held |= 1 << level;
-            }
-        }
-        if tail < mips.len() && there(0, self.layout.alignment.min(self.layout.slice_size)) {
-            for level in tail..mips.len() {
-                if level as u64 >= first {
-                    held |= 1 << level;
-                }
-            }
-        }
-        held
+        let offsets: Vec<u64> = mips.iter().map(|m| m.offset).collect();
+        levels_in(
+            &offsets,
+            self.layout.slice_size,
+            self.layout.first_tail_mip as usize,
+            self.layout.alignment,
+            first,
+            there,
+        )
     }
 
     /// Forgets what the staging buffer was last filled from: the next
@@ -1522,10 +1563,11 @@ impl Staging {
         // that gives levels their memory goes by this answer.
         let held = if self.on_demand {
             use std::sync::atomic::Ordering::Relaxed;
-            let judged = self.judgement();
+            let on = self.rec_on.load(Relaxed);
+            let judged = if on { [self.rec_judged[0].load(Relaxed), self.rec_judged[1].load(Relaxed)] } else { self.judgement() };
             self.judged[0].store(judged[0], Relaxed);
             self.judged[1].store(judged[1], Relaxed);
-            let held = self.held_levels(judged);
+            let held = self.held_levels(judged) & if on { self.rec_mask.load(Relaxed) } else { u32::MAX };
             self.detiled.store(held, Relaxed);
             held
         } else {
@@ -1565,6 +1607,80 @@ impl Staging {
                 return;
             }
         }
+    }
+}
+
+/// The levels (a bit each) of a texture whose mips lie at `offsets` in its
+/// memory (the console layout: the block of the smallest levels first, from
+/// `tail` on, then the others from the smallest up, level 0 last) that are the
+/// title's: from `first` on, and with the bytes `there` says are.
+fn levels_in(
+    offsets: &[u64],
+    slice_size: u64,
+    tail: usize,
+    alignment: u64,
+    first: u64,
+    there: impl Fn(u64, u64) -> bool,
+) -> u32 {
+    let tail = tail.min(offsets.len());
+    let mut held = 0u32;
+    for (level, &offset) in offsets.iter().enumerate().take(tail) {
+        let end = if level == 0 { slice_size } else { offsets[level - 1] };
+        if level as u64 >= first && there(offset, end) {
+            held |= 1 << level;
+        }
+    }
+    if tail < offsets.len() && there(0, alignment.min(slice_size)) {
+        for level in tail..offsets.len() {
+            if level as u64 >= first {
+                held |= 1 << level;
+            }
+        }
+    }
+    held
+}
+
+#[cfg(test)]
+mod level_tests {
+    use super::levels_in;
+
+    /// Six levels, the last two in the first block: 64 KiB for the block,
+    /// then levels 3, 2, 1 and 0 from the smallest up.
+    const OFFSETS: [u64; 6] = [786_432, 262_144, 131_072, 65_536, 0, 0];
+    const SIZE: u64 = 3_145_728;
+
+    fn held(first: u64, limit: u64) -> u32 {
+        levels_in(&OFFSETS, SIZE, 4, 65_536, first, |from, to| to > from && to <= limit)
+    }
+
+    #[test]
+    fn every_level_is_the_titles_when_nothing_cuts_it() {
+        assert_eq!(held(0, u64::MAX), 0b11_1111);
+    }
+
+    #[test]
+    fn levels_above_the_first_viewed_are_not() {
+        // A view from level 2 on: level 0 and 1 are not the title's, and
+        // are not copied (the 4096 x 4096 one of a texture seen from level 3).
+        assert_eq!(held(2, u64::MAX), 0b11_1100);
+        assert_eq!(held(6, u64::MAX), 0);
+    }
+
+    #[test]
+    fn levels_that_reach_the_next_texture_are_not() {
+        // The next texture starts at 262,144: level 1 ends at 786,432.
+        assert_eq!(held(0, 262_144), 0b11_1100);
+        // Not even the block of the small levels.
+        assert_eq!(held(0, 1000), 0);
+    }
+
+    #[test]
+    fn a_partly_mapped_texture_keeps_the_levels_in_the_mapped_prefix() {
+        let mapped = 262_144u64;
+        let held = levels_in(&OFFSETS, SIZE, 4, 65_536, 0, |from, to| to > from && to <= mapped);
+        assert_eq!(held, 0b11_1100);
+        // Never a level whose bytes the closure does not give, whatever the first.
+        assert_eq!(levels_in(&OFFSETS, SIZE, 4, 65_536, 0, |_, _| false), 0);
     }
 }
 
@@ -1964,6 +2080,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         on_demand,
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+        rec_judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
+        rec_mask: std::sync::atomic::AtomicU32::new(u32::MAX),
+        rec_on: std::sync::atomic::AtomicBool::new(false),
         waiting: std::sync::atomic::AtomicU64::new(0),
         waiting_cap: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),

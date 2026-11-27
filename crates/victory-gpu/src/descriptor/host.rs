@@ -157,6 +157,10 @@ pub(crate) struct HostHeap {
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    /// With `VICTORY_KEEP_FAST=1`: the address of what each slot of `kept` holds, written under its lock, so that
+    /// the draw that shows a slot what it shows already finds that out without taking the lock and touching the
+    /// slot's own line (the lock took 3 to 4 % of the list threads' time: nearly every ask is for the same again).
+    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1647,6 +1651,9 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept_raw: (0..if keep_fast() { count + extra } else { 0 })
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -3049,16 +3056,21 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        use windows::core::Interface;
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
+        let raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        if self.shows_already(index, raw) {
+            return;
+        }
         let old = {
-            use windows::core::Interface;
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             // The same again: nothing to retire.
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
             }
+            self.shown(index, raw);
             std::mem::replace(&mut *slot, resource)
         };
         // A running submission may still read the old resource through
@@ -3076,15 +3088,36 @@ impl HostHeap {
         let Some(slot) = self.kept.get(index as usize) else {
             return;
         };
+        let raw = resource.as_ref().map_or(0, |r| r.as_raw() as usize);
+        if self.shows_already(index, raw) {
+            return;
+        }
         let old = {
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
             if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
                 return;
             }
+            self.shown(index, raw);
             std::mem::replace(&mut *slot, resource.clone())
         };
         if let Some(old) = old {
             crate::host::retire_resource(old);
+        }
+    }
+
+    /// Whether slot `index` holds the resource at `raw` (0: none), as the last change under its lock left it: a
+    /// slot that is changed at the same time by another thread ends up as one of the two writes made it, as with
+    /// the lock. Always false without `VICTORY_KEEP_FAST=1`.
+    #[inline]
+    fn shows_already(&self, index: u32, raw: usize) -> bool {
+        self.kept_raw.get(index as usize).is_some_and(|r| r.load(std::sync::atomic::Ordering::Relaxed) == raw)
+    }
+
+    /// Slot `index` holds the resource at `raw` from now on (under its lock).
+    #[inline]
+    fn shown(&self, index: u32, raw: usize) {
+        if let Some(r) = self.kept_raw.get(index as usize) {
+            r.store(raw, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -6125,6 +6158,20 @@ pub(crate) fn copies_flush() {
     });
 }
 
+/// Whether a slot's kept resource is looked at without its lock when it is the same again (`VICTORY_KEEP_FAST=1`;
+/// off by default).
+fn keep_fast() -> bool {
+    #[cfg(test)]
+    if TEST_KEEP_FAST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FAST").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+static TEST_KEEP_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// What was made for one record: shared by the recording's map and, for a buffer view, [`Over`].
 struct ListMade {
     view: View,
@@ -6692,5 +6739,81 @@ mod batched_copy_tests {
         }
         // Nothing is left held: the next copy is made at once.
         assert!(COPIES.with(|c| c.borrow().1.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod keep_fast_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+
+    fn buffer() -> Option<ID3D12Resource> {
+        Some(host()?.shared_buffer(256)?.0)
+    }
+
+    /// A slot that shows the resource already does not take another hold on it, with the lock or without; and a
+    /// slot given another lets go of the first (to be retired).
+    #[test]
+    fn a_slot_that_shows_the_resource_takes_no_other_hold() {
+        TEST_KEEP_FAST.store(true, Relaxed);
+        let (Some(heap), Some(a), Some(b)) = (HostHeap::new(false, 8), buffer(), buffer()) else {
+            return; // no host GPU
+        };
+        let before = crate::host::references(&a);
+        heap.keep_ref(3, &Some(a.clone()));
+        let held = crate::host::references(&a);
+        assert_eq!(held, before + 1);
+        // Again, by reference and by value (the value is the caller's own hold, which goes at the end of the call).
+        heap.keep_ref(3, &Some(a.clone()));
+        heap.keep(3, Some(a.clone()));
+        assert_eq!(crate::host::references(&a), held);
+        assert_eq!(heap.kept_in(3).map(|r| r.as_raw()), Some(a.as_raw()));
+        assert!(heap.shows_already(3, a.as_raw() as usize));
+        assert!(!heap.shows_already(3, b.as_raw() as usize));
+        // Another resource: the first is let go of by the slot, and the fast look follows.
+        heap.keep_ref(3, &Some(b.clone()));
+        assert!(heap.shows_already(3, b.as_raw() as usize));
+        assert!(!heap.shows_already(3, a.as_raw() as usize));
+        assert_eq!(heap.kept_in(3).map(|r| r.as_raw()), Some(b.as_raw()));
+        // Nothing: the slot is empty.
+        heap.keep(3, None);
+        assert!(heap.shows_already(3, 0));
+        assert!(heap.kept_in(3).is_none());
+        // A slot nobody wrote shows nothing.
+        assert!(heap.shows_already(4, 0));
+        assert!(!heap.shows_already(4, a.as_raw() as usize));
+    }
+
+    /// Threads that write the same slots with the same two resources: each slot ends as one of the writes left it, and what
+    /// is looked at without the lock is what the slot holds.
+    #[test]
+    fn slots_written_by_threads_agree_with_what_is_looked_at_without_the_lock() {
+        TEST_KEEP_FAST.store(true, Relaxed);
+        let (Some(heap), Some(a), Some(b)) = (HostHeap::new(false, 8), buffer(), buffer()) else {
+            return; // no host GPU
+        };
+        let ours = [Some(a.clone()), Some(b.clone()), None];
+        std::thread::scope(|s| {
+            for t in 0..4usize {
+                let (heap, ours) = (&heap, &ours);
+                s.spawn(move || {
+                    for i in 0..4000usize {
+                        let slot = ((i * 7 + t) % 8) as u32;
+                        let r = &ours[(i + t) % 3];
+                        if i % 2 == 0 {
+                            heap.keep_ref(slot, r);
+                        } else {
+                            heap.keep(slot, r.clone());
+                        }
+                    }
+                });
+            }
+        });
+        for slot in 0..8u32 {
+            let held = heap.kept_in(slot).map_or(0, |r| r.as_raw() as usize);
+            assert!([0, a.as_raw() as usize, b.as_raw() as usize].contains(&held));
+            assert!(heap.shows_already(slot, held), "slot {slot}");
+        }
     }
 }

@@ -304,6 +304,103 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// Hashes of the compute programs whose dispatches are left out
+/// (`VICTORY_SKIP_BVH_SKINNING=1`: the file `skip-bvh-skinning.txt` beside the
+/// executable; `=@path`: that file; off by default). One 16-digit hash a
+/// line, blank lines and `#` comments allowed. The list is the user's and is
+/// not in the repository: it names programs of the title.
+#[cfg(any(windows, test))]
+fn bvh_skin_hashes() -> &'static std::collections::HashSet<String> {
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        if !crate::switch::on("VICTORY_SKIP_BVH_SKINNING") {
+            return Default::default();
+        }
+        let value = std::env::var("VICTORY_SKIP_BVH_SKINNING").unwrap_or_default();
+        let text = match value.trim().strip_prefix('@') {
+            Some(path) => std::fs::read_to_string(path),
+            None => std::env::current_exe()
+                .and_then(|exe| std::fs::read_to_string(exe.with_file_name("skip-bvh-skinning.txt"))),
+        };
+        let hashes = match text {
+            Ok(text) => parse_hash_lines(&text),
+            Err(e) => {
+                tracing::warn!(error = %e, "VICTORY_SKIP_BVH_SKINNING is on and its list of hashes could not be read: nothing is skipped");
+                Vec::new()
+            }
+        };
+        tracing::info!(count = hashes.len(), "dispatches of the skinning for the structure builder are left out (VICTORY_SKIP_BVH_SKINNING)");
+        hashes.into_iter().collect()
+    })
+}
+
+/// 16-digit shader hashes, one a line, with blank lines and `#` comments
+/// left out; anything else on a line is not a hash and is ignored.
+#[cfg(any(windows, test))]
+fn parse_hash_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Whether `shaders` are one compute program the list names. Only a single
+/// compute program: a pipeline with more stages is never skipped.
+#[cfg(windows)]
+fn skin_listed(shaders: &[Arc<Shader>]) -> bool {
+    let hashes = bvh_skin_hashes();
+    !hashes.is_empty()
+        && matches!(shaders, [shader] if shader.stage == "compute" && hashes.contains(&shader.hash))
+}
+
+/// Dispatches left out since the last line, by program.
+#[cfg(windows)]
+static SKIPPED: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Whether the title's pipeline `this` is a compute program of the skinning
+/// for the structure builder that the list names; a dispatch of it is counted
+/// and left out.
+#[cfg(windows)]
+pub(crate) fn is_bvh_skinning_skipped(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.bvh_skin {
+        return false;
+    }
+    if let Some(shader) = p.shaders.first() {
+        *SKIPPED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .entry(shader.hash.clone())
+            .or_insert(0) += 1;
+    }
+    true
+}
+
+/// The line: the dispatches left out per frame, by program.
+#[cfg(windows)]
+pub(crate) fn skipped_line(frames: f64) {
+    let Some(skipped) = SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    if frames <= 0.0 {
+        return;
+    }
+    let mut all: Vec<_> = skipped.into_iter().collect();
+    all.sort_by_key(|(hash, n)| (std::cmp::Reverse(*n), hash.clone()));
+    let total: u64 = all.iter().map(|a| a.1).sum();
+    let by: Vec<String> = all.iter().take(8).map(|(hash, n)| format!("{hash} {:.1}", *n as f64 / frames)).collect();
+    tracing::info!(
+        "dispatches of skinning for the structure builder left out per frame (VICTORY_SKIP_BVH_SKINNING): {:.1}; by program: {}",
+        total as f64 / frames,
+        by.join(", ")
+    );
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -418,6 +515,11 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A compute program of the title's skinning for the structure builder,
+    /// by the list `VICTORY_SKIP_BVH_SKINNING` names: its dispatches are left
+    /// out ([`is_bvh_skinning_skipped`]).
+    #[cfg(windows)]
+    bvh_skin: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -567,8 +669,14 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
+    // Skinning for the structure builder, which is off: no host pipeline is
+    // made for it (its translation and compile are CPU for nothing).
     #[cfg(windows)]
-    make::early(&host);
+    let bvh_skin = skin_listed(&shaders);
+    #[cfg(windows)]
+    if !bvh_skin {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -585,6 +693,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        bvh_skin,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -791,6 +901,22 @@ pub fn save_pipeline_cache() {
 #[cfg(test)]
 mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
+    /// The list of hashes: one a line, comments and blanks left out, case
+    /// folded, what is not a full hash ignored.
+    #[test]
+    fn the_list_of_skinning_hashes_reads_one_hash_a_line() {
+        assert!(super::parse_hash_lines("").is_empty());
+        assert!(super::parse_hash_lines("# a comment\n\n   \n").is_empty());
+        assert_eq!(
+            super::parse_hash_lines("# skinning\n0123456789ABCDEF\n\n0011223344556677 # velocity\ntooshort\n0123456789abcdeg\n"),
+            ["0123456789abcdef", "0011223344556677"]
+        );
+        // Off by default: nothing is listed and nothing is skipped.
+        if std::env::var_os("VICTORY_SKIP_BVH_SKINNING").is_none() {
+            assert!(super::bvh_skin_hashes().is_empty());
+        }
+    }
+
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());

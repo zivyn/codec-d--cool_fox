@@ -32,6 +32,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
+use super::replay;
 use crate::descriptor::RtvRecord;
 use crate::draw::{IndexView, VertexView};
 use windows::Win32::Foundation::RECT;
@@ -66,6 +67,8 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// What the list is, for pricing its reuse (`VICTORY_REPLAY_COUNT`).
+    priced: replay::Hashes,
 }
 
 impl Drop for Front {
@@ -92,6 +95,7 @@ impl Front {
         self.recording = Some(Arc::new(Recording::new(kind)));
         self.closed = false;
         self.submitted = false;
+        self.priced.clear();
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -99,6 +103,9 @@ impl Front {
     fn put(&mut self, op: u64, args: &[u64]) {
         if self.closed || self.recording.is_none() {
             return;
+        }
+        if replay::on() {
+            self.priced.add(op, args, is_address(op), op == UPLOAD, is_draw(op));
         }
         self.words.push(op | (args.len() as u64) << 16);
         self.words.extend_from_slice(args);
@@ -125,6 +132,9 @@ impl Front {
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
+        if replay::on() {
+            self.priced.add(op, &self.words[at + 1..], false, false, false);
+        }
         if self.words.len() >= CHUNK {
             self.hand_over();
         }
@@ -155,8 +165,27 @@ impl Front {
         }
         self.put(CLOSE, &[]);
         self.closed = true;
+        if replay::on() {
+            replay::done(&mut self.priced);
+        }
         self.hand_over();
     }
+}
+
+/// Whether a call names a place that is another one in each list (a root view's address).
+fn is_address(op: u64) -> bool {
+    op == Plain::GRAPHICS_VIEW as u64 || op == Plain::COMPUTE_VIEW as u64
+}
+
+/// Whether a call draws or dispatches.
+fn is_draw(op: u64) -> bool {
+    op == Plain::DRAW as u64
+        || op == Plain::DRAW_INDEXED as u64
+        || op == Plain::DISPATCH as u64
+        || op == Plain::DISPATCH_X as u64
+        || op == Plain::DISPATCH_MESH as u64
+        || op == Plain::DISPATCH_MESH_X as u64
+        || op == Plain::EXECUTE_INDIRECT as u64
 }
 
 /// Streams' memory to use again.
@@ -358,6 +387,8 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    crate::descriptor::host::view_cache_line(frames);
+    super::replay::line(frames);
 }
 
 #[inline]

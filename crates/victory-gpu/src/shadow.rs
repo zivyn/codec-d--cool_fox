@@ -3100,7 +3100,11 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !gone.is_empty() {
+            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -5237,6 +5241,24 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
 /// How often [`BUFFERS`] was taken to be changed.
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
+/// How often a window outside buffers ([`LOOSE`]) or a copy of a view's own bytes ([`EXACT`]) came or went. Bumped
+/// under the map's lock, after the change.
+static WINDOWS_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+/// A change of [`world`], for a test.
+#[cfg(test)]
+pub(crate) fn changed_for_test() {
+    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A number that grows whenever the copy a title address range is found on can be another one: a buffer came, went or
+/// got its copy ([`BUFFERS`]), a window or a copy of a view's own bytes came or went. What was made from the answer
+/// of [`find`] while it had a value is as good as then while it has it still
+/// (`crate::descriptor::host` `VICTORY_VIEW_CACHE`). Read it before the ask it stamps.
+pub(crate) fn world() -> u64 {
+    BUFFERS_CHANGED.load(Ordering::SeqCst) + WINDOWS_CHANGED.load(Ordering::SeqCst)
+}
+
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
@@ -5335,6 +5357,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if !gone.is_empty() {
+            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
@@ -5847,6 +5872,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -5860,6 +5886,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -5897,6 +5924,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
     Some(shadow)
 }
 
@@ -5947,9 +5975,13 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if map.len() >= MANY {
         // Held by the map alone (no list), its buffer by the copy alone (no
         // slot shows it), and not asked for lately.
+        let before = map.len();
         map.retain(|_, (shadow, used)| {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
+        if map.len() != before {
+            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
@@ -5957,6 +5989,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
+    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)

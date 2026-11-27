@@ -177,6 +177,13 @@ pub(crate) struct HostHeap {
     too_long: std::sync::atomic::AtomicU32,
     /// The most dynamic slots taken at once so far (logged as it climbs).
     peak: std::sync::atomic::AtomicU32,
+    /// Title slots past `count` that hold a view record the title copied in
+    /// as bytes, and the record each was made from: they are pinned in the
+    /// dynamic slot of the same index, which no table is given any more
+    /// ([`HostHeap::pin_tail`]). Taken after `next`'s lock, never before.
+    tail: Mutex<std::collections::BTreeMap<u32, u64>>,
+    /// Title slots past `count` that wait for a dynamic slot a table holds.
+    tail_want: Mutex<Vec<u32>>,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1516,6 +1523,31 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// peak taken is logged (`HostHeap::dynamic`). `VICTORY_DYNAMIC_SLOTS` sets it.
 const CAPPED_DYNAMIC: u32 = 254_976;
 
+/// The most title slots past a capped host heap's title slots that are pinned
+/// in dynamic slots ([`HostHeap::pin_tail`]): the title copied about five
+/// there, and no table is given a slot while it holds one.
+const TAIL_MAX: usize = 4096;
+
+/// Whether title slots past the host's are pinned in dynamic slots
+/// (`VICTORY_TITLE_TAIL=0`: not, they read what a table put there).
+fn tail_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_TAIL").is_none_or(|v| v != "0"))
+}
+
+/// What [`HostHeap::pin_tail`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TailPin {
+    /// Pinned and made from the record.
+    Done,
+    /// The record holds no view (any more): the slot is free.
+    Gone,
+    /// A table holds the dynamic slot: try again later.
+    Busy,
+    /// No dynamic slot of that index, none to spare, or switched off.
+    Out,
+}
+
 /// How many dynamic slots a heap of `count` title slots whose null slot is
 /// `null` (0: none) has. On a capped host heap ([`CAPPED_DYNAMIC`]) the
 /// title slots are what is left of it; `VICTORY_DYNAMIC_SLOTS=<n>` sets the
@@ -1648,6 +1680,8 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             peak: std::sync::atomic::AtomicU32::new(0),
+            tail: Mutex::default(),
+            tail_want: Mutex::default(),
             strides,
             structures: Slots::new(count as usize),
             buffers: Slots::new(count as usize),
@@ -2882,12 +2916,99 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
+        // Pinned title slots ([`HostHeap::pin_tail`]) stay taken.
+        let pinned: Vec<usize> = self
+            .tail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(self.count + at..self.count + end as u32)
+            .map(|(&index, _)| (index - self.count) as usize)
+            .collect();
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+            let given = slots.iter().filter(|taken| **taken).count() as u32 - pinned.len() as u32;
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
+            for slot in pinned {
+                guard.1[slot] = true;
+            }
         }
+    }
+
+    /// Makes title slot `index`, one past `count` (the title copied its
+    /// record in as bytes: no host slot mirrors it), a view of the dynamic
+    /// slot of that index, which no table is given while the record is a
+    /// view's: a shader that picks the view by an index it computes reads it
+    /// there, not a null slot or a table's entry. Called again when the
+    /// record changes; [`TailPin::Gone`] when it holds no view any more (the
+    /// slot is given back), [`TailPin::Busy`] when a table holds the slot
+    /// now (asked again with the next [`HostHeap::tail_sync`]), and
+    /// [`TailPin::Out`] when no dynamic slot has that index (or too many are
+    /// pinned). `VICTORY_TITLE_TAIL=0`: none is pinned.
+    pub(crate) fn pin_tail(&self, index: u32, handle: u64) -> TailPin {
+        let Some(at) = index.checked_sub(self.count).filter(|&at| !self.sampler && at < self.dynamic && tail_on()) else {
+            return TailPin::Out;
+        };
+        let key = record_key(handle);
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        if key == 0 {
+            if tail.remove(&index).is_some() {
+                guard.1[at as usize] = false;
+                self.free.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+                drop((tail, guard));
+                self.make_null(index);
+            }
+            return TailPin::Gone;
+        }
+        match tail.get(&index) {
+            Some(&made) if made == key => return TailPin::Done,
+            Some(_) => {}
+            None if tail.len() >= TAIL_MAX => return TailPin::Out,
+            None if guard.1[at as usize] => return TailPin::Busy,
+            None => {
+                guard.1[at as usize] = true;
+                self.free.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        tail.insert(index, key);
+        drop((tail, guard));
+        match view_at(key as u32, (key >> 32) as u32) {
+            Some(view) => self.make_at(index, &view),
+            None => self.make_null(index),
+        }
+        TailPin::Done
+    }
+
+    /// Pins the slots in `found` that lie past `count` ([`HostHeap::pin_tail`])
+    /// and looks again at those pinned or waiting (`start` is the title
+    /// heap's first record, `step` the bytes of one). `found` is sorted; the
+    /// slots of it that could not be pinned.
+    pub(crate) fn tail_sync(&self, start: u64, step: u64, found: &[u32]) -> Vec<u32> {
+        if found.is_empty()
+            && self.tail.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.tail_want.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        {
+            return Vec::new();
+        }
+        let mut todo: std::collections::BTreeSet<u32> = found.iter().copied().collect();
+        todo.extend(self.tail.lock().unwrap_or_else(|e| e.into_inner()).keys());
+        todo.extend(std::mem::take(&mut *self.tail_want.lock().unwrap_or_else(|e| e.into_inner())));
+        let mut out = Vec::new();
+        for index in todo {
+            match self.pin_tail(index, start + u64::from(index) * step) {
+                TailPin::Busy => self.tail_want.lock().unwrap_or_else(|e| e.into_inner()).push(index),
+                TailPin::Out if found.binary_search(&index).is_ok() => out.push(index),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// How many title slots past `count` are pinned.
+    pub(crate) fn tail_pinned(&self) -> usize {
+        self.tail.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3325,6 +3446,9 @@ impl HostHeap {
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
         if index >= self.count {
+            if self.pin_tail(index, handle) != TailPin::Out {
+                return None;
+            }
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -5908,6 +6032,80 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A view record the title copied past the title slots the host has
+    /// (a capped host view heap) is pinned in the dynamic slot of its index:
+    /// no table is given the slot, and giving back a range around it keeps
+    /// it; a record that goes unpins it; a slot a table holds waits.
+    #[test]
+    fn title_views_past_the_host_slots_are_pinned_in_dynamic_slots() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let step = 32usize;
+        // Eight records of a title heap whose first four slots the host has.
+        let mut title = vec![0u32; 8 * step / 4];
+        let base = title.as_mut_ptr() as u64;
+        let at = |slot: usize| base + (slot * step) as u64;
+        let put = |slot: usize, on: bool| {
+            let at = at(slot) as *mut [u32; 3];
+            // SAFETY: inside `title`, whose records are 32 bytes.
+            unsafe {
+                if on {
+                    crate::descriptor::record(at as u64, View::Constant(0x1000 * (slot as u64 + 1), 256));
+                } else {
+                    at.write_unaligned([0; 3]);
+                }
+            }
+        };
+        let free = heap.free.load(std::sync::atomic::Ordering::Relaxed);
+        // Slots the host has, and views there that are not past, are not its.
+        put(2, true);
+        assert_eq!(heap.pin_tail(2, at(2)), TailPin::Out);
+        assert_eq!(heap.pin_tail(heap.count + heap.dynamic, at(2)), TailPin::Out);
+        // Slot 6 holds a view: pinned in dynamic slot 6 - 4 = 2.
+        put(6, true);
+        assert_eq!(heap.pin_tail(6, at(6)), TailPin::Done);
+        assert_eq!(heap.pin_tail(6, at(6)), TailPin::Done, "the same record: nothing to do again");
+        assert_eq!(heap.tail_pinned(), 1);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 1);
+        // A table asking for all the dynamic slots finds that run broken at 6,
+        // and one for the first two gets them.
+        assert_eq!(heap.dynamic(heap.dynamic), None);
+        assert_eq!(heap.dynamic(2), Some(4));
+        // Giving back the whole range leaves the pin taken, and the search
+        // (which goes on from where it was) steps over it.
+        heap.release(4, heap.dynamic);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 1);
+        assert_eq!(heap.dynamic(2), Some(7), "slot 6 is skipped");
+        heap.release(7, 2);
+        // A record that holds no view any more gives the slot back.
+        put(6, false);
+        assert_eq!(heap.pin_tail(6, at(6)), TailPin::Gone);
+        assert_eq!(heap.tail_pinned(), 0);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free);
+        // A slot a table holds waits, and is pinned by the next sync.
+        let table = heap.dynamic(heap.dynamic).unwrap();
+        assert_eq!(table, 4);
+        put(5, true);
+        assert_eq!(heap.pin_tail(5, at(5)), TailPin::Busy);
+        assert_eq!(heap.tail_sync(at(0), step as u64, &[5, 7]), []);
+        assert_eq!(heap.tail_pinned(), 0, "still held, and the other record is none");
+        heap.release(table, heap.dynamic);
+        put(7, true);
+        assert_eq!(heap.tail_sync(at(0), step as u64, &[7]), []);
+        assert_eq!(heap.tail_pinned(), 2, "7 found, 5 waited");
+        // Another record in a pinned slot is made again, not pinned twice.
+        put(7, true);
+        assert_eq!(heap.pin_tail(7, at(7)), TailPin::Done);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 2);
+        // SAFETY: the second word of the record of slot 7, in `title`.
+        unsafe { (at(7) as *mut u32).add(1).write(77) };
+        assert_eq!(heap.pin_tail(7, at(7)), TailPin::Done);
+        assert_eq!(heap.tail_pinned(), 2);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 2);
+        assert_eq!(title.len(), 8 * step / 4);
     }
 
     #[test]

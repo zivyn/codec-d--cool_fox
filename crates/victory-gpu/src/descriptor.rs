@@ -431,6 +431,7 @@ fn sync_round(early: bool) -> bool {
         let due_at = frame + u64::from(early);
         let before = host.copied_before(due_at);
         let (mut past, mut past_highest) = (0u64, None::<u32>);
+        let mut past_slots: Vec<u32> = Vec::new();
         found |= !before.is_empty();
         let began = std::time::Instant::now();
         let (of_tables, made, left) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0), std::sync::Mutex::new(Vec::new()));
@@ -493,7 +494,8 @@ fn sync_round(early: bool) -> bool {
                 out.bytes += (to - from) as u64;
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 if !samplers {
-                    let (n, highest) = views_past(&page_bytes, from - start as usize, step, mirrored_count);
+                    let (n, highest) =
+                        views_past(&page_bytes, from - start as usize, step, mirrored_count, &mut out.past_slots);
                     out.past += n;
                     out.past_highest = out.past_highest.max(highest);
                 }
@@ -568,6 +570,7 @@ fn sync_round(early: bool) -> bool {
             later += part.wait.len() as u64;
             past += part.past;
             past_highest = past_highest.max(part.past_highest);
+            past_slots.append(&mut part.past_slots);
             mirrored += part.make.len() as u64;
             wait.append(&mut part.wait);
             make.append(&mut part.make);
@@ -584,7 +587,23 @@ fn sync_round(early: bool) -> bool {
         });
         spent[2] += since(began);
         if let Some(highest) = past_highest {
-            note_views_past(past, highest, heap.desc.count, host.count());
+            // The title's views past the host's title slots are pinned in the
+            // dynamic slots of their indices; those that are not are noted.
+            past_slots.sort_unstable();
+            past_slots.dedup();
+            if past_log() {
+                for &slot in &past_slots {
+                    log_past(slot, start + u64::from(slot) * step, host.count());
+                }
+            }
+            let left = host.tail_sync(start, step, &past_slots);
+            if let Some(&highest) = left.last() {
+                note_views_past(left.len() as u64, highest, heap.desc.count, host.count());
+            }
+            note_views_pinned(host.tail_pinned(), past);
+        } else if !samplers {
+            // (Records that went, and slots a table held, meanwhile.)
+            host.tail_sync(start, step, &[]);
         }
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
@@ -627,6 +646,8 @@ struct SyncPart {
     /// the highest slot of them ([`views_past`]).
     past: u64,
     past_highest: Option<u32>,
+    /// Those slots (up to [`PAST_SLOTS`] a part), for pinning them.
+    past_slots: Vec<u32>,
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -724,11 +745,12 @@ fn changed_slots(
 /// How many view records lie in the bytes of one changed page of a title view
 /// heap past the first `mirrored_count` slots (those the host heap has no slot
 /// for: it holds at most 1,000,000 views on NVIDIA, fewer title slots than the
-/// title's heap), and the highest slot of them. `page_from` is the page's
-/// offset in the heap. A shader that picks one of these by an index it
-/// computes reads a null view.
+/// title's heap), and the highest slot of them; the first [`PAST_SLOTS`] of
+/// them are added to `slots`. `page_from` is the page's offset in the heap.
+/// A shader that picks one of these by an index it computes reads a null view
+/// unless it is pinned ([`host::HostHeap::pin_tail`]).
 #[cfg(windows)]
-fn views_past(page: &[u8], page_from: usize, step: u64, mirrored_count: u32) -> (u64, Option<u32>) {
+fn views_past(page: &[u8], page_from: usize, step: u64, mirrored_count: u32, slots: &mut Vec<u32>) -> (u64, Option<u32>) {
     let step = step as usize;
     if step < 4 {
         return (0, None);
@@ -740,9 +762,61 @@ fn views_past(page: &[u8], page_from: usize, step: u64, mirrored_count: u32) -> 
         let Some(record) = page.get(at..at + step) else { break };
         if u32::from_le_bytes([record[0], record[1], record[2], record[3]]) == VIEW_TAG {
             found = (found.0 + 1, Some(slot as u32));
+            if slots.len() < PAST_SLOTS {
+                slots.push(slot as u32);
+            }
         }
     }
     found
+}
+
+/// The most slots [`views_past`] keeps a part.
+#[cfg(windows)]
+const PAST_SLOTS: usize = 4096;
+
+/// Whether each slot of the title past the host heap's is logged once, with
+/// what its record names (`VICTORY_PAST_LOG=1`): the first 256 of them.
+#[cfg(windows)]
+fn past_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAST_LOG").is_some_and(|v| v == "1"))
+}
+
+/// Says what the record at `handle`, title slot `slot`, names, once for the
+/// slot ([`past_log`]).
+#[cfg(windows)]
+fn log_past(slot: u32, handle: u64, count: u32) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<u32>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() >= 256 || !seen.insert(slot) {
+        return;
+    }
+    drop(seen);
+    let Some([_, i, generation]) = record_at(handle) else { return };
+    let kind = match generation >> KIND_SHIFT {
+        0 => "table entry",
+        CONSTANT => "constant buffer view",
+        PLACED => "placed view",
+        _ => "unknown",
+    };
+    let view = view_at(i, generation).map_or_else(|| "gone".to_owned(), |v| format!("{v:?}").chars().take(300).collect());
+    tracing::info!(
+        slot,
+        past = slot - count.min(slot),
+        block = slot / 4096,
+        in_block = slot % 4096,
+        "title view past the host heap: {kind}: {view}"
+    );
+}
+
+/// Says (a few times) that title views past the host heap's title slots are
+/// pinned in dynamic slots.
+#[cfg(windows)]
+fn note_views_pinned(pinned: usize, past: u64) {
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if pinned != 0 && SEEN.swap(pinned, std::sync::atomic::Ordering::Relaxed) != pinned {
+        tracing::info!(pinned, past, "title views past the host heap's title slots are pinned in the dynamic slots of their indices");
+    }
 }
 
 /// Says (a few times) that the title wrote views to slots the host heap has
@@ -1762,12 +1836,14 @@ mod tests {
         for slot in 10..18u32 {
             page.extend(record(if matches!(slot, 12 | 14 | 17) { VIEW_TAG } else { 0 }));
         }
-        assert_eq!(views_past(&page, 10 * step, step as u64, 14), (2, Some(17)));
-        assert_eq!(views_past(&page, 10 * step, step as u64, 18), (0, None));
-        assert_eq!(views_past(&page, 10 * step, step as u64, 0), (3, Some(17)));
+        let mut slots = Vec::new();
+        assert_eq!(views_past(&page, 10 * step, step as u64, 14, &mut slots), (2, Some(17)));
+        assert_eq!(slots, [14, 17]);
+        assert_eq!(views_past(&page, 10 * step, step as u64, 18, &mut Vec::new()), (0, None));
+        assert_eq!(views_past(&page, 10 * step, step as u64, 0, &mut Vec::new()), (3, Some(17)));
         // A page that does not start on a record: the first whole one counts
         // and a cut-off last one does not.
-        assert_eq!(views_past(&page[8..page.len() - 8], 10 * step + 8, step as u64, 0), (2, Some(14)));
+        assert_eq!(views_past(&page[8..page.len() - 8], 10 * step + 8, step as u64, 0, &mut Vec::new()), (2, Some(14)));
     }
 
     /// A round covers every ask made before it began, and only those.

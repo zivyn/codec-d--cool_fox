@@ -410,7 +410,9 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1
+            || !matches!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -468,7 +470,10 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // A volume's slices follow each other (a slice is `Height` rows): the volume is read as
+        // `Depth * Height` rows, so its census (a color-grading table's, say) covers every slice.
+        let slices = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { usize::from(d.DepthOrArraySize) } else { 1 };
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize * slices);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -489,8 +494,9 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows);
-        target_stats(frame, i, resource, d, f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows, rgba.as_deref());
+        let height = f.Height as usize * slices;
+        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, height, pitch, rows);
+        target_stats(frame, i, resource, d, f.Format.0 as u32, f.Width as usize, height, pitch, rows, rgba.as_deref());
         if stats_only() {
             buffer.Unmap(0, None);
             return;
@@ -500,7 +506,7 @@ fn dump_one(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, height as u32, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
@@ -590,9 +596,10 @@ fn target_stats(
             .len()
     });
     let line = format!(
-        "{i}	{resource:?}	{}x{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}",
+        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}",
         d.Width,
         d.Height,
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { format!("x{}", d.DepthOrArraySize) } else { String::new() },
         format,
         d.MipLevels,
         w * h,

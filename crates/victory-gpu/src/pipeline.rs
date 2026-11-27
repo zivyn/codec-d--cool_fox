@@ -313,7 +313,8 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
 fn bvh_skin_hashes() -> &'static std::collections::HashSet<String> {
     static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
-        if !crate::switch::on("VICTORY_SKIP_BVH_SKINNING") {
+        // The structure builder (`VICTORY_BVH_BUILDER=1`) needs that skinning: nothing is left out then.
+        if !crate::switch::on("VICTORY_SKIP_BVH_SKINNING") || std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
             return Default::default();
         }
         let value = std::env::var("VICTORY_SKIP_BVH_SKINNING").unwrap_or_default();

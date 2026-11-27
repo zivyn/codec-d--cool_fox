@@ -69,6 +69,7 @@ fn build() -> [u8; 32] {
             "VICTORY_PAIR_SYNC",
             "VICTORY_PAIR_CLAMP",
             "VICTORY_PAIR_LEAN",
+            "VICTORY_UNIFORM_LOADS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",

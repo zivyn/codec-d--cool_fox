@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -183,11 +184,25 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| {
+            // A failed translation must complete this queue entry and wake its waiters:
+            // a panic left `made` empty for ever and the worker thread gone with it.
+            match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -645,6 +660,27 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A panic inside a build must not take the worker thread with it, nor
+    /// leave the queue entry open for ever.
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None));
+        let good = Arc::new(Pending::new(Vec::new(), None));
+        let failed = bad.clone();
+        let next = good.clone();
+        let worker = std::thread::spawn(move || {
+            failed.make_with(|| panic!("synthetic pipeline build panic"));
+            next.make_with(|| None);
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+
+        bad.make_with(|| panic!("the refused pipeline should stay complete"));
+        assert!(matches!(bad.made.get(), Some(None)));
     }
 
     /// A pipeline left out on purpose (a ray-tracing resolve without the structure builder)

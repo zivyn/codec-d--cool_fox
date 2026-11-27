@@ -482,7 +482,28 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// A program refused because a mask is read as data where its lanes are elsewhere is emitted once
+/// more with scalar operations on numbers that the structure takes for masks computed
+/// (`lower::with_mask_numbers`), and only such a program: with that on for every program, 66
+/// programs of the title that already translated came out changed.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    match emit_forms(c, native, p, st, io, res) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_numbers(|| emit_forms(c, native, p, st, io, res))
+        }
+        other => other,
+    }
+}
+
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

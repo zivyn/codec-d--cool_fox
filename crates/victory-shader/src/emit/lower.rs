@@ -477,6 +477,8 @@ struct Lower<'a> {
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
+    /// The code offset of the instruction being lowered, for `VICTORY_MASK_WHY`.
+    at_offset: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -1455,6 +1457,23 @@ pub(super) fn host_rdna() -> u32 {
 pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
 
 thread_local! {
+    /// Whether scalar operations on numbers the structure takes for masks are computed
+    /// ([`with_mask_numbers`]).
+    static MASK_NUMBERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with scalar operations the structure takes for masks computed where all they
+/// read are numbers: the translation of a program the first one refused for a mask read as data
+/// ([`MASK_ELSEWHERE`]), and only such a program: with that on for every program, 66 programs of
+/// the title that already translated came out changed.
+pub(super) fn with_mask_numbers<R>(translate: impl FnOnce() -> R) -> R {
+    let before = MASK_NUMBERS.replace(true);
+    let result = translate();
+    MASK_NUMBERS.set(before);
+    result
+}
+
+thread_local! {
     /// Whether first halves of interpolations are evaluated as the pair
     /// they start ([`with_first_half_pairs`]).
     static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -2169,6 +2188,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            at_offset: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -3189,6 +3209,13 @@ impl<'a> Lower<'a> {
             self.read_phis.insert(v);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        if let Some(&Val::Missing(why)) = self.vals.get(&v)
+            && is_mask
+            && self.mask_ok
+            && std::env::var_os("VICTORY_MASK_WHY").is_some()
+        {
+            eprintln!("MASK-WHY {v:?} has no value of its own ({why}) and is a mask: read as data at {:#x}", self.at_offset);
+        }
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
@@ -4041,6 +4068,80 @@ impl<'a> Lower<'a> {
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
+            }
+            if std::env::var_os("VICTORY_MASK_WHY").is_some() {
+                // (which mask, written where, read where: the lines to read the refusal by)
+                let writer = made.and_then(|b| {
+                    self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)).map(|i| (b, i.machine.offset, i.name()))
+                });
+                eprintln!(
+                    "MASK-WHY {lo:?} {} in block {made:?}, written by {writer:?}, read as data in IR block {} by the instruction at {:#x}",
+                    if high { "(high dword)" } else { "" },
+                    self.cur_ir,
+                    self.at_offset
+                );
+                // (what its writer read, and what those have, a few steps back: where the chain
+                // of missing values starts)
+                let mut work = vec![(lo, 0usize)];
+                while let Some((v, depth)) = work.pop() {
+                    let Some(&b) = self.def_block.get(&v) else {
+                        eprintln!("MASK-WHY {:indent$}{v:?} is a phi or an input", "", indent = depth * 2);
+                        if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+                            for &a in &self.x.p.blocks[pb].phis[pi].args {
+                                let state = match self.vals.get(&a) {
+                                    Some(Val::Missing(why)) => format!("missing ({why})"),
+                                    Some(_) => "a value".to_string(),
+                                    None => "not made".to_string(),
+                                };
+                                let kind = if self.x.st.masks.contains_key(&a) { "a mask" } else { "not a mask" };
+                                eprintln!(
+                                    "MASK-WHY {:indent$}  joins {a:?}: {kind}, {state}, written in {:?}",
+                                    "",
+                                    self.def_block.get(&a),
+                                    indent = depth * 2
+                                );
+                            }
+                        }
+                        continue;
+                    };
+                    let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)) else {
+                        if let Some(phi) = self.x.p.blocks[b].phis.iter().find(|p| p.value == v) {
+                            eprintln!("MASK-WHY {:indent$}{v:?} is a join in block {b} of {:?}", "", phi.reg, indent = depth * 2);
+                            for &a in &phi.args {
+                                let state = match self.vals.get(&a) {
+                                    Some(Val::Missing(why)) => format!("missing ({why})"),
+                                    Some(_) => "a value".to_string(),
+                                    None => "not made".to_string(),
+                                };
+                                let kind = if self.x.st.masks.contains_key(&a) { "a mask" } else { "not a mask" };
+                                let writer = self.def_block.get(&a).and_then(|&ab| {
+                                    self.x.p.blocks[ab].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == a)).map(|i| (i.name(), i.machine.offset))
+                                });
+                                eprintln!("MASK-WHY {:indent$}  joins {a:?}: {kind}, {state}, written by {writer:?}", "", indent = depth * 2);
+                            }
+                        }
+                        continue;
+                    };
+                    eprintln!("MASK-WHY {:indent$}{v:?} is written by {} at {:#x}", "", w.name(), w.machine.offset, indent = depth * 2);
+                    for &(reg, r) in &w.reads {
+                        let missing = match self.vals.get(&r) {
+                            Some(Val::Missing(why)) => Some(*why),
+                            _ => None,
+                        };
+                        let kind = if self.x.st.masks.contains_key(&r) { "a mask" } else { "not a mask" };
+                        eprintln!(
+                            "MASK-WHY {:indent$}{} at {:#x} read {reg:?} = {r:?}: {kind}, {}",
+                            "",
+                            w.name(),
+                            w.machine.offset,
+                            missing.map_or("a value".to_string(), |why| format!("missing ({why})")),
+                            indent = depth * 2
+                        );
+                        if (missing.is_some() || kind == "a mask") && depth < 6 {
+                            work.push((r, depth + 1));
+                        }
+                    }
+                }
             }
             return Err(MASK_ELSEWHERE);
         }
@@ -6013,6 +6114,7 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        self.at_offset = offset;
         let name = inst.name();
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
@@ -6116,6 +6218,9 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                if std::env::var_os("VICTORY_MASK_WHY").is_some() {
+                    eprintln!("MASK-WHY no value from {name} at {offset:#x}: {why}");
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -6310,6 +6415,25 @@ impl<'a> Lower<'a> {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
     }
 
+    /// Whether every scalar register `inst` reads holds a number here: a value of its own, none a
+    /// lane mask (EXEC, a compare's result) that has only its lanes. The trace programs keep node
+    /// numbers and lane masks on one stack, so the structure takes a register `s_and`ed with a
+    /// literal for a mask while the numbers it is made of are all there: the result is then the
+    /// number the hardware computes (the structure's own lanes for it stay for whatever reads it
+    /// as a mask).
+    fn reads_numbers(&self, inst: &Inst) -> bool {
+        // (only in the translation made for a program the first one refused for a mask read as
+        // data, [`with_mask_numbers`]; `VICTORY_MASK_NUMBERS=0` keeps the refusal)
+        if !MASK_NUMBERS.get() || std::env::var_os("VICTORY_MASK_NUMBERS").is_some_and(|v| v == "0") {
+            return false;
+        }
+        inst.reads.iter().all(|&(reg, v)| match reg {
+            Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
+            Reg::S(_) => matches!(self.vals.get(&v), Some(val) if !matches!(val, Val::Missing(_))),
+            _ => true,
+        })
+    }
+
     fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
@@ -6321,7 +6445,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !self.reads_numbers(inst) {
             return Err(LANE_MASK);
         }
         if matches!(

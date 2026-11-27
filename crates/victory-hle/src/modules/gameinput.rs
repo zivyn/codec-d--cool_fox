@@ -1241,30 +1241,40 @@ mod host {
         }
     }
 
+    /// A key by the name the debugging aids use: a letter, a digit, or
+    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the
+    /// stand-in pad's table maps them to buttons).
+    fn key_vk(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// time), with or without focus. Keys are named as in [`key_vk`].
+    /// `VICTORY_KEYS_FILE=<path>` is the live version for a driver program:
+    /// the keys named in that file (comma separated, rewritten whenever the
+    /// driver likes; empty or missing means none) are held right now, with
+    /// or without focus, so a script can press keys without ever taking the
+    /// keyboard from the user.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_vk(key)?;
                 let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
                 let (from, to) = match at.split_once('-') {
                     Some((from, to)) => (time(from)?, time(to)?),
@@ -1276,10 +1286,53 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut held: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        held.extend(file_keys());
+        held
+    }
+
+    /// The keys held by `VICTORY_KEYS_FILE`, read at most every 10 ms (the
+    /// title polls its pads and keys several times a frame).
+    fn file_keys() -> Vec<u8> {
+        static FILE: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+            std::env::var_os("VICTORY_KEYS_FILE")
+                .filter(|p| !p.is_empty())
+                .map(Into::into)
+        });
+        static LAST: Mutex<Option<(Instant, Vec<u8>)>> = Mutex::new(None);
+        let Some(path) = &*FILE else {
+            return Vec::new();
+        };
+        let mut last = lock(&LAST);
+        if let Some((at, keys)) = &*last {
+            if at.elapsed() < Duration::from_millis(10) {
+                return keys.clone();
+            }
+        }
+        // A read that fails (the driver is replacing the file) keeps the keys held so far: an empty
+        // reading would release a key for one poll and break a hold.
+        let keys: Vec<u8> = match std::fs::read_to_string(path) {
+            Ok(text) => text
+                .split([',', ' ', '\n', '\r', '\0'])
+                .filter_map(key_vk)
+                .collect(),
+            Err(_) => last
+                .as_ref()
+                .map(|(_, keys)| keys.clone())
+                .unwrap_or_default(),
+        };
+        if last
+            .as_ref()
+            .map_or(!keys.is_empty(), |(_, old)| *old != keys)
+        {
+            tracing::info!(keys = ?keys, "key file");
+        }
+        *last = Some((Instant::now(), keys.clone()));
+        keys
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1290,6 +1343,15 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn key_names_map_to_virtual_keys() {
+        assert_eq!(key_vk("Enter"), Some(0x0D));
+        assert_eq!(key_vk(" w "), Some(b'W'));
+        assert_eq!(key_vk("7"), Some(b'7'));
+        assert_eq!(key_vk(""), None);
+        assert_eq!(key_vk("Shift"), None);
     }
 
     #[test]

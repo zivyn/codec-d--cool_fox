@@ -1,5 +1,18 @@
 # VIctory on NVIDIA
 
+> **Before you play**
+>
+> - **You must install DLSS yourself:** run `Get-NVIDIA-DLSS.cmd` once (it is
+>   in this folder; a double click does it), or have your AI assistant run it
+>   for you. It downloads NVIDIA's DLSS and frame generation files, about 70 MB,
+>   from NVIDIA's own GitHub; they are not part of this repository. Without
+>   them there is no DLSS and no frame generation, and the picture is only
+>   stretched to the screen.
+> - **F1 in the game brings up the settings menu** (arrow keys pick and
+>   change, Enter does it). F3 shows the numbers panel.
+>
+> The steps are under [How to run it](#how-to-run-it).
+
 ## Built from many projects
 
 This repository did not come from one place. Over several weeks we built, ran

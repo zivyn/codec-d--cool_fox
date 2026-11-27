@@ -984,6 +984,7 @@ fn create() -> windows::core::Result<Host> {
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
         tracing::info!("host D3D12 device ready");
+        crate::upload::reserve_early();
         Ok(Host {
             device,
             queue,

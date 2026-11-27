@@ -336,6 +336,16 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Bytes of title memory the host copies alive stand for (the vram line).
+pub(crate) fn live_bytes() -> u64 {
+    LIVE[1].load(Ordering::Relaxed)
+}
+
+/// Bytes of card copies of title buffers alive (the vram line).
+pub(crate) fn card_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed)
+}
+
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
 /// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).

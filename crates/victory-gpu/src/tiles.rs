@@ -154,6 +154,9 @@ pub(crate) fn spare() -> u64 {
 struct Heap {
     heap: ID3D12Heap,
     free: Vec<(u32, u32)>,
+    /// With every tile free and kept: when that began (ms) and the
+    /// submissions begun then, for [`trim`].
+    idle: Option<(u64, u64)>,
 }
 
 // SAFETY: a heap of the device, named only in queue and device calls, which
@@ -198,9 +201,14 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 tracing::warn!(error = %e, "no heap for texture levels given on demand: those levels stay empty");
                 return None;
             }
+            let made = made?;
+            // The tiles of a heap are read in part and sparsely: after the
+            // blocks of textures when the system must move some.
+            crate::vram::prioritize(device, &made, u64::from(HEAP_TILES) * TILE, crate::vram::Class::Low);
             let fresh = Heap {
-                heap: made?,
+                heap: made,
                 free: vec![(0, HEAP_TILES)],
+                idle: None,
             };
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
@@ -216,6 +224,7 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         }
     };
     let h = pool[index].as_mut()?;
+    h.idle = None;
     let mut runs = Vec::new();
     let mut left = count;
     while left > 0 {
@@ -267,10 +276,54 @@ fn give_back_with(index: usize, runs: &[(u32, u32)], release: bool) {
     }
     h.free = joined;
     let all_free = h.free_tiles() == HEAP_TILES;
+    if all_free && !release && h.idle.is_none() {
+        h.idle = Some((crate::host::now_ms(), crate::host::submissions().0));
+    }
     if release && all_free && pool.iter().flatten().count() > 1 {
         pool[index] = None;
         STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
         STATS[8].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The bytes of the pool's heaps and of the tiles given out of them (the vram
+/// line).
+pub(crate) fn bytes() -> (u64, u64) {
+    (STATS[3].load(Ordering::Relaxed), STATS[2].load(Ordering::Relaxed))
+}
+
+/// The pool's heaps by how free they are ([`crate::vram::occupancy`]).
+pub(crate) fn occupancy() -> [u32; 4] {
+    let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    crate::vram::occupancy(pool.iter().flatten().map(|h| (h.free_tiles(), HEAP_TILES)))
+}
+
+/// Gives back to the card the heaps that have had no tile in them for a while
+/// (`VICTORY_TILE_TRIM=1`): the card's memory the system counts against us
+/// and nothing reads. Tiles taken out of live textures keep their heap
+/// ([`give_back_with`]); the null mappings that emptied it are in the queue
+/// ahead of any submission begun after they were sent, so a heap goes only
+/// after one of those has finished ([`crate::vram::trim_ready`]). Once a
+/// texture pass.
+fn trim() {
+    if !crate::vram::trim_on() {
+        return;
+    }
+    let (now, finished) = (crate::host::now_ms(), crate::host::submissions().1);
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut count = pool.iter().flatten().count();
+    for place in pool.iter_mut() {
+        let ready = place
+            .as_ref()
+            .is_some_and(|h| h.idle.is_some_and(|since| crate::vram::trim_ready(since, now, finished, count)));
+        if ready {
+            *place = None;
+            count -= 1;
+            STATS[3].fetch_sub(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+            STATS[8].fetch_add(1, Ordering::Relaxed);
+            crate::vram::TRIMMED[0].fetch_add(1, Ordering::Relaxed);
+            crate::vram::TRIMMED[1].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1059,6 +1112,7 @@ pub(crate) fn pass(headroom: i64) {
         return;
     }
     finish_retired();
+    trim();
     let need = reclaim_need(headroom, STATS[17].load(Ordering::Relaxed));
     let window = {
         let mut track = TRACK.lock().unwrap_or_else(|e| e.into_inner());

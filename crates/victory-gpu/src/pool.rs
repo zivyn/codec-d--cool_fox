@@ -362,6 +362,16 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
+/// Bytes of the blocks of textures, and of the blocks of staging buffers (the
+/// PC's memory), for the vram line.
+pub(crate) fn texture_bytes() -> u64 {
+    lock(&TEXTURES).blocks() as u64 * BLOCK
+}
+
+pub(crate) fn staging_bytes() -> u64 {
+    lock(&STAGING).blocks() as u64 * BLOCK
+}
+
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
@@ -540,6 +550,10 @@ pub(crate) unsafe fn texture(
         {
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
+        }
+        if let Some(h) = &heap {
+            // Blocks hold the render targets and the textures made whole.
+            crate::vram::prioritize(device, h, BLOCK, crate::vram::Class::High);
         }
         heap
     })?;

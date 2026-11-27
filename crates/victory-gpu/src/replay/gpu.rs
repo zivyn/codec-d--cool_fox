@@ -23,6 +23,15 @@ pub(super) struct Worker {
 // at a time (`&mut self`).
 unsafe impl Send for Worker {}
 
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // SAFETY: our event.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.event);
+        }
+    }
+}
+
 impl Worker {
     pub(super) fn new(device: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<Worker> {
         // SAFETY: plain object creation.

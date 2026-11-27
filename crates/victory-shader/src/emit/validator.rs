@@ -187,7 +187,11 @@ impl Validator {
             let mut status = 0;
             let get_status: unsafe extern "system" fn(Object, *mut Hresult) -> Hresult =
                 method(result, 3);
-            get_status(result, &mut status);
+            let got = get_status(result, &mut status);
+            if got < 0 {
+                release(result);
+                return Err(format!("GetStatus failed: {got:#x}"));
+            }
             let mut text = String::new();
             if status < 0 {
                 let mut errors: Object = std::ptr::null_mut();
@@ -196,7 +200,12 @@ impl Validator {
                 if get_errors(result, &mut errors) >= 0 && !errors.is_null() {
                     let ptr: unsafe extern "system" fn(Object) -> *const u8 = method(errors, 3);
                     let len: unsafe extern "system" fn(Object) -> usize = method(errors, 4);
-                    let bytes = std::slice::from_raw_parts(ptr(errors), len(errors));
+                    let (at, n) = (ptr(errors), len(errors));
+                    let bytes: &[u8] = if at.is_null() {
+                        &[]
+                    } else {
+                        std::slice::from_raw_parts(at, n)
+                    };
                     text = String::from_utf8_lossy(bytes)
                         .trim_end_matches('\0')
                         .trim()

@@ -117,6 +117,10 @@ pub(super) fn put(kind: Kind, name: &'static str, t: (u64, u64), a: u64, b: u64,
 
 /// Records an event of `thread`.
 fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: u64, b: u64, stack: u32) {
+    // After `end`, a place would be one of the next recording's.
+    if !on() {
+        return;
+    }
     let slots = SLOTS.load(Ordering::Acquire);
     if slots.is_null() {
         return;
@@ -138,6 +142,9 @@ fn put_of(thread: u32, kind: Kind, name: &'static str, (t0, t1): (u64, u64), a: 
 
 /// The caller's stack: its place, plus one.
 fn stack() -> u32 {
+    if !on() {
+        return 0;
+    }
     let stacks = STACK.load(Ordering::Acquire);
     if stacks.is_null() {
         return 0;

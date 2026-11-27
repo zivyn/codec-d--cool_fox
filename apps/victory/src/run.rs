@@ -421,7 +421,7 @@ fn watch(base: usize, size: usize) {
     let rvas: Vec<usize> = list
         .split(',')
         .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
-        .filter(|&rva| rva + 4 <= size)
+        .filter(|&rva| rva.checked_add(4).is_some_and(|end| end <= size))
         .collect();
     std::thread::spawn(move || {
         let mut seen = vec![None; rvas.len()];

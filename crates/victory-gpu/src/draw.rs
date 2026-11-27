@@ -3986,9 +3986,6 @@ impl State {
         }
     }
 
-    /// What a draw's shaders read, one line per used resource (diagnostics
-    /// builds).
-    #[cfg(feature = "diagnostics")]
     /// For a compute pipeline's first dispatches (`VICTORY_PLACEMENT=1`): where the buffers its tables name live, in
     /// the card's memory or the PC's (a shader reading the PC's memory crosses the bus at each access, ~1 to 2 us
     /// a dependent load), by view: kind, bytes, residence.
@@ -4043,6 +4040,9 @@ impl State {
         );
     }
 
+    /// What a draw's shaders read, one line per used resource (diagnostics
+    /// builds).
+    #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];

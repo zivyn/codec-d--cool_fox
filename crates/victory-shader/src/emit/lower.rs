@@ -3924,6 +3924,22 @@ impl<'a> Lower<'a> {
                 while let Some((v, depth)) = work.pop() {
                     let Some(&b) = self.def_block.get(&v) else {
                         eprintln!("MASK-WHY {:indent$}{v:?} is a phi or an input", "", indent = depth * 2);
+                        if let Some(&(pb, pi)) = self.phi_at.get(&v) {
+                            for &a in &self.x.p.blocks[pb].phis[pi].args {
+                                let state = match self.vals.get(&a) {
+                                    Some(Val::Missing(why)) => format!("missing ({why})"),
+                                    Some(_) => "a value".to_string(),
+                                    None => "not made".to_string(),
+                                };
+                                let kind = if self.x.st.masks.contains_key(&a) { "a mask" } else { "not a mask" };
+                                eprintln!(
+                                    "MASK-WHY {:indent$}  joins {a:?}: {kind}, {state}, written in {:?}",
+                                    "",
+                                    self.def_block.get(&a),
+                                    indent = depth * 2
+                                );
+                            }
+                        }
                         continue;
                     };
                     let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)) else { continue };
@@ -3941,7 +3957,7 @@ impl<'a> Lower<'a> {
                             missing.map_or("a value".to_string(), |why| format!("missing ({why})")),
                             indent = depth * 2
                         );
-                        if missing.is_some() && depth < 8 {
+                        if (missing.is_some() || kind == "a mask") && depth < 6 {
                             work.push((r, depth + 1));
                         }
                     }
@@ -6196,6 +6212,10 @@ impl<'a> Lower<'a> {
     /// number the hardware computes (the structure's own lanes for it stay for whatever reads it
     /// as a mask).
     fn reads_numbers(&self, inst: &Inst) -> bool {
+        // (`VICTORY_MASK_NUMBERS=0` keeps the refusal)
+        if std::env::var_os("VICTORY_MASK_NUMBERS").is_some_and(|v| v == "0") {
+            return false;
+        }
         inst.reads.iter().all(|&(reg, v)| match reg {
             Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
             Reg::S(_) => matches!(self.vals.get(&v), Some(val) if !matches!(val, Val::Missing(_))),

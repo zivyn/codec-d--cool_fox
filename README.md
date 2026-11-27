@@ -63,8 +63,9 @@
   The file is checked against Microsoft's signature and the tested SHA-256.
   Windows 11 keeps using its own runtime. A `D3D12` folder that is already
   there, for example from a repack or another guide (1.618, 1.620), is used
-  at the version of its `D3D12Core.dll`. Before v2026.11.27.4 that version
-  had to be 1.614, or Windows refused Direct3D 12 with `0x887E0003`.
+  at the version of its `D3D12Core.dll`. Before v2026.11.27.6 that version
+  had to be 1.614, or Windows refused Direct3D 12 with `0x887E0003` (the
+  fix in .4 and .5 did not take effect).
 - C: drive full? Set `VICTORY_HOME` to another folder, once, in a command
   prompt: `setx VICTORY_HOME D:\victory`. Then start victory.exe from a new
   window. Settings, saves, caches, logs and the downloads all go there

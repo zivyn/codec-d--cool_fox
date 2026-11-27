@@ -3622,6 +3622,7 @@ struct RelayFetch {
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
     crate::cores::keep_on_fast_cores("victory-relay");
+    crate::threadcpu::register("relay");
     crate::cores::prioritize("victory-relay", crate::cores::Role::Helper);
     let Some(host) = host() else {
         return;
@@ -3884,6 +3885,24 @@ fn late_line(frames: f64) {
         );
     }
     card_steps::log(frames);
+    {
+        let r: Vec<f64> = REFRESH_SIZE.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let [ranges, bytes, pages, with] = crate::shadow::under_stats().map(|n| n as f64 / frames);
+        let mb = |v: f64| v / (1 << 20) as f64;
+        if r[0] + r[3] + ranges > 0.0 {
+            tracing::info!(
+                "the refreshes' work per frame: {:.0} spans in front of the lists' steps ({:.0} MB of range; {:.0} left after those known to copy nothing), {:.0} before shader writes ({:.0} MB of range); what the steps refer to, each byte once (VICTORY_REFRESH_SIZING=1): {:.0} MB in {:.0} refreshes; under flights' writes: {ranges:.0} declared ranges ({:.0} MB), {pages:.0} stale pages of 64 KiB in {with:.0} of them",
+                r[0],
+                mb(r[1]),
+                r[2],
+                r[3],
+                mb(r[4]),
+                mb(r[5]),
+                r[6],
+                mb(bytes),
+            );
+        }
+    }
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -4061,6 +4080,60 @@ fn join_copies() -> bool {
 /// Since the last frame-rate line: title buffer copies recorded, and those
 /// that continue the one before ([`join_copies`]).
 static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Since the last frame-rate line: the spans of the refreshes in front of the
+/// lists' steps and their bytes, those left after the prune, then those due
+/// before shader writes and their bytes.
+static REFRESH_SIZE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Whether the refreshes in front count what the steps really refer to, next
+/// to the span they are refreshed as (`VICTORY_REFRESH_SIZING=1`, off by
+/// default: a sort of the touches of each flush).
+fn refresh_sizing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_SIZING").is_some_and(|v| v == "1"))
+}
+
+/// The bytes the refreshes among `touches` refer to, each byte once per copy
+/// (what a span per copy, from the lowest to the highest, is far wider than),
+/// and how many refreshes there are.
+fn referenced_bytes(touches: &[Touch]) -> (u64, u64) {
+    let mut ranges: Vec<(usize, usize, usize)> =
+        touches.iter().filter_map(|t| if let Touch::Refresh(copy, from, to) = t { Some((*copy, *from, *to)) } else { None }).collect();
+    let count = ranges.len() as u64;
+    ranges.sort_unstable();
+    let (mut bytes, mut open): (u64, Option<(usize, usize, usize)>) = (0, None);
+    for (copy, from, to) in ranges {
+        match &mut open {
+            Some((c, _, end)) if *c == copy && from <= *end => *end = (*end).max(to),
+            _ => {
+                if let Some((_, a, b)) = open.take() {
+                    bytes += (b - a) as u64;
+                }
+                open = Some((copy, from, to));
+            }
+        }
+    }
+    if let Some((_, a, b)) = open {
+        bytes += (b - a) as u64;
+    }
+    (bytes, count)
+}
+
+/// Whether the spans of a flush that are left go to the threads longest first
+/// (`VICTORY_REFRESH_LPT=1`, off by default): the last piece of work that a
+/// thread begins is a short one, and the submitting thread, which waits for
+/// all of them, waits less.
+fn refresh_lpt() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_LPT").is_some_and(|v| v == "1"))
+}
+
+/// `spans` (anything with a range) with the longest first; equal ones in the
+/// order they were.
+fn longest_first<T>(spans: &mut [(T, usize, usize)]) {
+    spans.sort_by_key(|s| std::cmp::Reverse(s.2 - s.1));
+}
 
 /// Whether the copy `next` (destination, source, bytes) goes on exactly
 /// where `last` ended, source and destination both, and the two as one do
@@ -8237,7 +8310,29 @@ fn written_spans(steps: impl Iterator<Item = Touch>) -> Vec<(usize, usize, usize
 
 #[cfg(test)]
 mod written_spans_tests {
-    use super::{Touch, front_spans, split, written_spans};
+    use super::{Touch, front_spans, longest_first, referenced_bytes, split, written_spans};
+
+    /// What the steps refer to is the bytes of the joined ranges of each copy; the
+    /// span per copy is from the lowest to the highest.
+    #[test]
+    fn referenced_bytes_are_the_joined_ranges_of_each_copy() {
+        use Touch::{Nothing, Refresh, Write};
+        let touches = [Refresh(1, 0, 100), Refresh(1, 50, 120), Nothing, Refresh(1, 1000, 1010), Refresh(2, 0, 10), Write(1), Refresh(2, 10, 20), Refresh(2, 5, 6)];
+        // Copy 1: 0..120 and 1000..1010 (130); copy 2: 0..20.
+        assert_eq!(referenced_bytes(&touches), (150, 6));
+        let found = front_spans(touches.into_iter());
+        let span: usize = found.iter().map(|s| s.2 - s.1).sum();
+        assert!(span > 1000, "the spans are wider: {found:?}");
+        assert_eq!(referenced_bytes(&[]), (0, 0));
+    }
+
+    /// The longest span goes first, equal ones in the order they were.
+    #[test]
+    fn spans_go_longest_first_and_equal_ones_keep_their_order() {
+        let mut spans = vec![("a", 0, 10), ("b", 0, 100), ("c", 5, 15), ("d", 0, 50)];
+        longest_first(&mut spans);
+        assert_eq!(spans.iter().map(|s| s.0).collect::<Vec<_>>(), ["b", "d", "a", "c"]);
+    }
 
     #[test]
     fn everything_is_refreshed_in_front_but_what_a_part_gave_its_shaders() {
@@ -8450,6 +8545,11 @@ impl Batch {
                 }
             }
         }
+        if refresh_sizing() {
+            let (bytes, count) = referenced_bytes(&touches);
+            REFRESH_SIZE[5].fetch_add(bytes, Ordering::Relaxed);
+            REFRESH_SIZE[6].fetch_add(count, Ordering::Relaxed);
+        }
         let spans: Vec<_> = front_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
@@ -8464,6 +8564,8 @@ impl Batch {
             FLUSHES[1].fetch_add(spans.len() as u64, Ordering::Relaxed);
         }
         let _flush = crate::timeline::span("refreshes of copies");
+        REFRESH_SIZE[0].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        REFRESH_SIZE[1].fetch_add(spans.iter().map(|s| (s.2 - s.1) as u64).sum(), Ordering::Relaxed);
         let started = std::time::Instant::now();
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
@@ -8491,6 +8593,10 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         Self::lap(&mut lap, crate::copystat::C::FlushPruneNs);
+        REFRESH_SIZE[2].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        if refresh_lpt() {
+            longest_first(&mut spans);
+        }
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
@@ -8557,6 +8663,8 @@ impl Batch {
         for (shadow, from, to) in &due {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        REFRESH_SIZE[3].fetch_add(due.len() as u64, Ordering::Relaxed);
+        REFRESH_SIZE[4].fetch_add(due.iter().map(|s| (s.2 - s.1) as u64).sum(), Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
@@ -9364,6 +9472,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::threadcpu::line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

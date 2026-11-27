@@ -1881,6 +1881,7 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                crate::threadcpu::register("wide");
                 crate::cores::prioritize("victory-wide", crate::cores::Role::Helper);
                 let workers = WORKERS.get().expect("made above");
                 loop {
@@ -2406,6 +2407,17 @@ fn back_piece(
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: the
+/// declared ranges of flights it looked at, their bytes, the pages of them that
+/// were stale (the title wrote them since the copy took them), and the ranges
+/// that had any.
+static UNDER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`UNDER`], taken.
+pub(crate) fn under_stats() -> [u64; 4] {
+    std::array::from_fn(|i| UNDER[i].swap(0, Ordering::Relaxed))
+}
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -4121,9 +4133,13 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            UNDER[0].fetch_add(1, Ordering::Relaxed);
+            UNDER[1].fetch_add((e - a) as u64, Ordering::Relaxed);
+            UNDER[2].fetch_add(stale.len() as u64, Ordering::Relaxed);
             if stale.is_empty() {
                 continue;
             }
+            UNDER[3].fetch_add(1, Ordering::Relaxed);
             // The lock of the copy's reference (the snapshot, or the
             // CPU's side of a copy in the card's memory), from before
             // title memory is read until the title's bytes are in: with

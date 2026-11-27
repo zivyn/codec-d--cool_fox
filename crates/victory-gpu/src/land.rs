@@ -391,6 +391,12 @@ impl Pool {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
                 crate::cores::prioritize(name, crate::cores::Role::Helper);
+                crate::threadcpu::register(match name {
+                    "victory-land" => "land",
+                    "victory-land-tail" => "land-tail",
+                    "victory-under" => "under",
+                    _ => "pool",
+                });
                 pool.help()
             });
         }

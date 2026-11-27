@@ -102,6 +102,8 @@ pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
 #[cfg(windows)]
+mod threadcpu;
+#[cfg(windows)]
 mod readprobe;
 #[cfg(windows)]
 mod watch;

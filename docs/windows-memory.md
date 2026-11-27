@@ -76,12 +76,14 @@ gave these results during the opening cutscene:
 | Internal upscaler from #68, default 3,072 MiB target reserve | Black picture with subtitles |
 | Internal upscaler, 1,536 MiB target reserve | Black picture even after the unused target reserve went to zero |
 | Internal upscaler, 1,536 MiB target reserve, `VICTORY_THIN=0`, `VICTORY_JOIN_PARTS=1` | 3D street scene visible, with dark areas and the texture queue still waiting for room |
+| DLSS Balanced, 1,536 MiB target reserve, `VICTORY_THIN=0`, `VICTORY_JOIN_PARTS=1` | Black picture returned. DLSS dispatches continued to succeed |
 
-The last two runs used the same build and save, with a cache that warmed
-between runs. Synchronous recording is a candidate for reproducing visible
-output; the test does not isolate it from that cache history. The Windows
-commit peak in the visible run was approximately 32 GiB. Later gameplay and
-DLSS with synchronous recording have yet to be verified.
+The internal-upscaler runs with the smaller reserve used the same build and
+save, with a cache that warmed between runs. Synchronous recording is a
+candidate for reproducing visible output; the test does not isolate it from
+that cache history. The Windows commit peak in the visible run was about
+32 GiB. The texture queue still reported pressure and later gameplay remains
+unverified.
 
 ## Related work
 

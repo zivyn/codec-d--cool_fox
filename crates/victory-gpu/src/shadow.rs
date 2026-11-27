@@ -6601,13 +6601,35 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    // `VICTORY_MEMORY_CARD_OVER=1`: the card's budget is not asked (the
+    // layer keeps below it so that the system does not move its resources
+    // about; a card that is over it already, as the title's own copies can
+    // leave an 8 GiB one, then has every copy by address in the PC's memory,
+    // read over the bus with every step of every ray).
+    static OVER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let over = *OVER.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CARD_OVER").is_some_and(|v| v == "1"));
+    let video = host.video_memory();
+    let room = over || video.is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
     };
+    if on_card.is_none() {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::warn!(
+                start = format_args!("{start:#x}"),
+                len,
+                room,
+                on_card_mb = USED.load(Ordering::Relaxed) >> 20,
+                most_mb = most >> 20,
+                budget_used_mb = ?video.map(|[budget, used, ..]| (budget >> 20, used >> 20)),
+                "title memory by address: a copy is in the PC's memory, not on the card: the shaders read it over the bus (`VICTORY_MEMORY_CARD_OVER=1` leaves out the card's budget, `VICTORY_MEMORY_CARD_MB` the most)"
+            );
+        }
+    }
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,

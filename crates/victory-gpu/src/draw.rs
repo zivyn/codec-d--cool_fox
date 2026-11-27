@@ -3402,7 +3402,7 @@ impl State {
             && let Some(role) = stage.shader.ambient
             && crate::ambient::wanted()
         {
-            let outcome = if crate::pipeline::builder_runs() {
+            let outcome = if crate::pipeline::builder_lights() {
                 Err(crate::ambient::BUILDER_RUNS)
             } else {
                 self.ambient(list, p, role)

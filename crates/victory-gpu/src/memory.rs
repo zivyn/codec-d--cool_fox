@@ -103,11 +103,34 @@ const BUILT: u64 = 4 << 20;
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// pages there are in the first seconds (run light-4). The total was 2,048 for
+/// the whole run, and a run that reached the world had it spent within
+/// seconds, with the shaders then reading zeros for every page they found empty
+/// afterwards: it is 8,192 (512 MiB) now, and `VICTORY_MEMORY_FAULT_PAGES=<n>`
+/// sets it (2048: as it was).
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 2048;
+const FAULTS_ALL: usize = 8192;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+
+/// The most pages taken from faults in all: `VICTORY_MEMORY_FAULT_PAGES`, a
+/// number of pages, else [`FAULTS_ALL`].
+fn fault_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        fault_limit_from(std::env::var("VICTORY_MEMORY_FAULT_PAGES").ok().as_deref())
+    })
+}
+
+fn fault_limit_from(value: Option<&str>) -> usize {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
+}
+
+/// Whether a page the shaders found empty may be taken now: `made` pages were
+/// taken this frame and `faulted` in all, `limit` the most in all.
+fn takes_fault(made: usize, faulted: usize, limit: usize) -> bool {
+    made < FAULTS && faulted < limit
+}
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -191,6 +214,9 @@ struct Stats {
     from: Option<(std::time::Instant, u64)>,
     uses: [u64; 2],
     faults: u64,
+    /// Pages the limit on pages taken from faults turned away (above 4 GiB:
+    /// the ones below are not memory of the title).
+    starved: u64,
     unknown: u64,
     back: u64,
     /// Pages looked at, bytes that changed, packed structures sent.
@@ -793,16 +819,35 @@ impl Memory {
         if pages.is_empty() {
             return;
         }
+        // Several threads find the same page empty: a page counts once.
         pages.sort_unstable();
+        pages.dedup();
+        let limit = fault_limit();
         let mut made = 0;
+        let mut starved = 0;
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
-                made += 1;
-                self.faulted += 1;
-                self.bring(page, page + 1);
+            if takes_fault(made, self.faulted, limit) {
+                if self.copy_of(page).is_none() && self.map(page) {
+                    made += 1;
+                    self.faulted += 1;
+                    self.bring(page, page + 1);
+                }
+            } else if self.faulted >= limit && page >= 0x1_0000 && self.copy_of(page).is_none() {
+                starved += 1;
             }
         }
         self.stats.faults += pages.len() as u64;
+        self.stats.starved += starved;
+        if starved > 0 {
+            static LIMIT_SAID: std::sync::Once = std::sync::Once::new();
+            LIMIT_SAID.call_once(|| {
+                tracing::warn!(
+                    frame = self.frame,
+                    limit,
+                    "title memory by address: the pages taken from faults reached their limit; a page found empty after it reads zeros (`VICTORY_MEMORY_FAULT_PAGES` raises it)"
+                );
+            });
+        }
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -883,9 +928,9 @@ impl Memory {
         let s = std::mem::take(&mut self.stats);
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
-             {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
+             {:.1} pages that had no copy, {:.1} pages turned down, {:.1} turned away for the limit on faults, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} (of {})",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -894,6 +939,7 @@ impl Memory {
             s.uses[1] as f64 / frames,
             s.faults as f64 / frames,
             s.unknown as f64 / frames,
+            s.starved as f64 / frames,
             s.back as f64 / frames,
             s.looked as f64 / frames,
             s.changed as f64 / 1024.0 / frames,
@@ -907,7 +953,8 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            fault_limit()
         );
         self.stats.from = Some((now, self.frame));
     }
@@ -1408,6 +1455,21 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+    }
+
+    #[test]
+    fn the_fault_limit_is_a_number_of_pages() {
+        assert_eq!(fault_limit_from(None), FAULTS_ALL);
+        assert_eq!(fault_limit_from(Some("2048")), 2048);
+        assert_eq!(fault_limit_from(Some(" 100 ")), 100);
+        assert_eq!(fault_limit_from(Some("many")), FAULTS_ALL);
+        assert_eq!(fault_limit_from(Some("")), FAULTS_ALL);
+        // The limit is on the whole run: a page found empty is taken while both it and the frame's have room.
+        assert!(takes_fault(0, 0, 8192));
+        assert!(takes_fault(FAULTS - 1, 8191, 8192));
+        assert!(!takes_fault(FAULTS, 0, 8192));
+        assert!(!takes_fault(0, 8192, 8192));
+        assert!(!takes_fault(0, 0, 0));
     }
 
     #[test]

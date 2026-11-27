@@ -44,14 +44,14 @@ Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and
 mesh shader support. The first run builds shader pipelines and stutters;
 `victory warm --used` makes them ahead.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
-Measured on the integration branch `integ/validation-2`, in the prologue cell,
-one PC with an 8 GB RTX 4060. A frame took about 410 ms at the start of the day;
-it now takes 168-175 ms (looking at a window) and 178-185 ms (dark cell).
+Measured on `integ/validation-3` to `-6`, in the prologue cell, one PC with an 8 GB
+RTX 4060. A frame took about 410 ms at the start of the day; it now takes
+114-135 ms looking at the window, and up to 177 ms in the cell's worst spots.
 
-Only on the integration branches so far (not yet on `main`; `main` is still the
-codec_d build):
+On `main` (integrations #2, #3 and #6 are merged, so `main` and the `build-main`
+download have all of this):
 
 - FSR4's shared working buffer lives in video memory: its passes went from
   about 215 ms to about 24 ms in a microbenchmark, close to free on the card.
@@ -60,17 +60,34 @@ codec_d build):
 - The title's own hang watchdog no longer ends a session during our long stalls.
 - Wave64 programs are lowered for NVIDIA's 32-lane waves.
 - The descriptor heap stays under NVIDIA's 1,000,000-descriptor limit.
-- 25,582 of 26,096 shader programs validate with the DXIL validator; the test
-  branches validate more.
+- The heap sync and the refreshes of copies skip work that has nothing to do
+  (heap wait 26 to 16-22 ms, refreshes 52 to 40-45 ms). A copy on the card of
+  a buffer the title's CPU cannot write is not taken whole again until a write
+  is announced (window spot 158 to 142.7 ms, the submit thread 153.6 to 135.8 ms).
+- The ambient stand-in for the title's indirect light: the dark cell now
+  matches the console frames, and the window shows the rippled glass and the
+  chain-link.
+- A lower mip is shown instead of a black texture when the card is short of
+  room, and textures are made level by level on demand.
+- More shader programs validate (`shaders/validator-clean`,
+  `shaders/rt-shadow-view-addresses`); 25,582 of 26,096 validated with the DXIL
+  validator before these two.
+- The helper threads a submission waits for run above the title's threads, and a
+  submission's parts and lists are joined (16 parts, 96 lists): the window spot
+  went from about 152 to 114-135 ms. Threads that wait for new card memory at the
+  same time share one `MakeResident` (peaks of 11.3 s a frame became 1.7 s), a
+  title buffer's copy is made with the buffer map free, and big copies of title
+  buffers get their card room first.
+- `victory warm --used --compute` makes the pipelines before playing (476 s on the
+  test PC): launching with it first removes the frozen minutes of a cold cache.
+- The shader translator also builds on Linux (`victory-translate`, with the
+  validator as `libdxil.so`); 26,515 programs came out identical to the Windows
+  build's.
 
 ## Known wrong
 
-- Rooms are too dark. The title's ray-traced indirect light has no data without
-  the ray tracing path; an ambient stand-in is being fixed (test branch).
-- Textures are black or missing on 8 GB; a fix that shows a lower mip is under test.
 - Glass is grainy and colours band in some runs with a warm cache; being investigated.
-- The CPU thread that submits the frame is now the main cost, about 150 of the
-  175 ms.
+- The CPU thread that submits the frame is still the main cost.
 - The title caps itself at 30 frames a second; lifting that without breaking
   physics, animation and cutscenes is the second half of the goal.
 
@@ -81,6 +98,12 @@ build tools and a Windows SDK, then:
 
 ```powershell
 cargo build --release --locked -p victory
+
+# with the diag build, to have the pipelines made ahead:
+target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
+target\diag\victory.exe warm --used --compute --now       # the pipelines earlier runs drew with (VICTORY_PIPELINE_BOOK=1 writes
+                                                          # them down) and every compute pipeline of shaders.rpf, into the
+                                                          # pipeline library; `warm --verify` asks the library for them
 ```
 
 `Play-VIctory.cmd` finds `target\release\victory.exe`. The diagnostics build is

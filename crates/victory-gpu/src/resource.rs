@@ -1761,8 +1761,13 @@ pub(crate) fn level_cap_for(headroom: i64) -> u64 {
 /// any size while there is room, none without (as before).
 #[cfg(windows)]
 pub(crate) fn level_cap(memory: Option<[u64; 4]>) -> u64 {
+    cap_at(headroom(memory))
+}
+
+/// [`level_cap`] for a card with `headroom` bytes left to its line.
+#[cfg(windows)]
+fn cap_at(headroom: i64) -> u64 {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let headroom = headroom(memory);
     if *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SQUEEZE").is_none_or(|v| v != "0")) {
         level_cap_for(headroom)
     } else if headroom > 0 {
@@ -1771,6 +1776,37 @@ pub(crate) fn level_cap(memory: Option<[u64; 4]>) -> u64 {
         0
     }
 }
+
+/// The cap of everyone ([`level_cap`]) and the cap a hot texture gets
+/// ([`crate::priority::hot_cap`]) for a card with `memory`.
+#[cfg(windows)]
+pub(crate) fn hot_level_cap(memory: Option<[u64; 4]>) -> (u64, u64) {
+    let headroom = headroom(memory);
+    let cap = cap_at(headroom);
+    (cap, crate::priority::hot_cap(cap, headroom, crate::priority::Heat::Hot))
+}
+
+/// Whether a hot texture left short of levels under `cap` may be uploaded
+/// again now: the card takes larger levels for it than it did
+/// ([`crate::priority::hot_cap`]).
+#[cfg(windows)]
+pub(crate) fn may_retry_hot(cap: u64) -> bool {
+    crate::priority::enabled() && {
+        let headroom = headroom_lately();
+        crate::priority::hot_cap(level_cap_lately(), headroom, crate::priority::Heat::Hot) > cap
+    }
+}
+
+/// The room left to the card's line as it was at most a tenth of a second ago
+/// ([`level_cap_lately`] makes it).
+#[cfg(windows)]
+pub(crate) fn headroom_lately() -> i64 {
+    level_cap_lately();
+    LATE_HEADROOM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+static LATE_HEADROOM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
 
 /// Whether more host copies of textures may be made now: with levels on
 /// demand while the card takes any level at all ([`level_cap_for`]: what
@@ -1812,7 +1848,9 @@ pub(crate) fn level_cap_lately() -> u64 {
     if AT.load(Relaxed) == tenth {
         return CAP.load(Relaxed);
     }
-    let cap = level_cap(crate::host::host().and_then(|h| h.video_memory()));
+    let headroom = headroom(crate::host::host().and_then(|h| h.video_memory()));
+    let cap = cap_at(headroom);
+    LATE_HEADROOM.store(headroom, Relaxed);
     CAP.store(cap, Relaxed);
     AT.store(tenth, Relaxed);
     cap
@@ -2717,7 +2755,13 @@ impl OnDemand {
     /// [`may_retry`] says the card takes more.
     pub(crate) fn uploaded(&self, held: u32, memory: u64) -> Option<u64> {
         let tiled = self.0.tiled.as_ref()?;
-        let cap = level_cap(crate::host::host().and_then(|h| h.video_memory()));
+        let (mut cap, hot) = hot_level_cap(crate::host::host().and_then(|h| h.video_memory()));
+        // A texture draws read through a table is given levels as if the
+        // card had more room (`crate::priority`).
+        if hot > cap && crate::priority::enabled() && tiled.heat() == crate::priority::Heat::Hot {
+            cap = hot;
+            crate::tiles::STATS[16].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let (changed, waiting) = tiled.uploaded(&self.0.texture, held, cap);
         if changed {
             crate::descriptor::host::levels_changed(memory);
@@ -2726,6 +2770,18 @@ impl OnDemand {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         waiting.then_some(cap)
+    }
+
+    /// The texture has had an upload: [`crate::tiles::pass`] looks at it
+    /// from now on; `memory` as above.
+    pub(crate) fn track(&self, memory: u64) {
+        crate::tiles::track(memory, &self.0);
+    }
+
+    /// Its handle for the list of textures waiting for levels
+    /// ([`crate::descriptor::host::levels_waiting`]).
+    pub(crate) fn weak(&self) -> std::sync::Weak<HostTexture> {
+        std::sync::Arc::downgrade(&self.0)
     }
 
     /// [`crate::tiles::Tiled::card_wrote`]; `memory` as above.
@@ -2848,7 +2904,10 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        // A default heap (or a custom one without CPU pages): no CPU of the
+        // title writes the buffer, only shaders and our own copies.
+        let gpu_only = heap.kind == 1 || (heap.kind == 4 && heap.cpu_pages == 1);
+        crate::shadow::register(at, resource.data() as u64, desc.width, gpu_only);
         // The big ones are named with how they were made: heap type, CPU page
         // property, pool, flags (what the title could write from the CPU).
         if desc.width >= 16 << 20 {

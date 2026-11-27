@@ -95,6 +95,9 @@ jobs:
         run: |
           mkdir -p dist
           cp target/diag/victory.exe dist/victory-diag.exe
+          # The symbols of this exe, to read a VICTORY_PROFILE file (module+rva) taken with it.
+          cp target/diag/victory.pdb dist/victory-diag.pdb
+          sha256sum dist/victory-diag.exe | tee dist/victory-diag.sha256
       - uses: actions/upload-artifact@v5
         with:
           name: victory-diag
@@ -125,13 +128,9 @@ jobs:
 
   # Includes xtask's repository_passes_policy (the asset-policy check).
   #
-  # Skipped, because the software adapter (WARP) on the runner answers
-  # differently from a hardware GPU (the first two also fail on NVIDIA and
-  # are fixed on fix/indirect-tests-nvidia, not on main yet):
-  #   indirect::tests::host_list_budget_starts_empty_at_each_submission
-  #   indirect::tests::warp_batch_charges_every_execution
+  # Skipped, because the software adapter (WARP) on the runner has no depth
+  # bounds test:
   #   pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws
-  #     (WARP has no depth bounds test)
   test-rest:
     if: ${{ inputs.test_rest }}
     runs-on: windows-latest
@@ -146,8 +145,6 @@ jobs:
         run: |
           set -o pipefail
           cargo test --workspace --exclude victory-shader --locked --no-fail-fast -- \
-            --skip indirect::tests::host_list_budget_starts_empty_at_each_submission \
-            --skip indirect::tests::warp_batch_charges_every_execution \
             --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws \
             2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Summary
@@ -207,7 +204,7 @@ jobs:
           notes="Rolling build of \`${BRANCH}\` at ${GITHUB_SHA}, from ${run_url}. Files: $(ls dist | xargs). Replaced by the next published run."
           if gh api "repos/${GH_REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
             gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${tag}" -f sha="${GITHUB_SHA}" -F force=true >/dev/null
-            gh release edit "$tag" --prerelease --title "Build ${BRANCH}" --notes "$notes"
+            gh release edit "$tag" --prerelease --target "${GITHUB_SHA}" --title "Build ${BRANCH}" --notes "$notes"
           else
             gh release create "$tag" --prerelease --target "${GITHUB_SHA}" --title "Build ${BRANCH}" --notes "$notes"
           fi

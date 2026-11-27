@@ -75,13 +75,13 @@ download have all of this):
 - The helper threads a submission waits for run above the title's threads, and a
   submission's parts and lists are joined (16 parts, 96 lists): the window spot
   went from about 152 to 114-135 ms. Threads that wait for new card memory at the
-  same time share one MakeResident (peaks of 11.3 s a frame became 1.7 s), a
+  same time share one `MakeResident` (peaks of 11.3 s a frame became 1.7 s), a
   title buffer's copy is made with the buffer map free, and big copies of title
   buffers get their card room first.
-- ictory warm --used --compute makes the pipelines before playing (476 s on the
+- `victory warm --used --compute` makes the pipelines before playing (476 s on the
   test PC): launching with it first removes the frozen minutes of a cold cache.
-- The shader translator also builds on Linux (ictory-translate, with the
-  validator as libdxil.so); 26,515 programs came out identical to the Windows
+- The shader translator also builds on Linux (`victory-translate`, with the
+  validator as `libdxil.so`); 26,515 programs came out identical to the Windows
   build's.
 
 ## Known wrong

@@ -1098,3 +1098,89 @@ fn a_meeting_of_the_host_waves_costs_this_much() {
         );
     }
 }
+
+/// 64 threads in one console wave walk a chain through a buffer: thread t first stores the offset
+/// of its successor, `(t + 5) & 63` dwords on, at its own dword; after a barrier every thread
+/// follows the chain from offset 0 for `s1` steps (a load at the scalar offset, then
+/// `v_readfirstlane` of what it found, the step the title's heap walks make), and gives the offset
+/// it ends at in out[64 + t]. The `v_readlane` makes the console wave need both its host waves.
+fn chain_walk() -> NativeProgram {
+    let words = [
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A08_0085, // v_add_nc_u32 v4, 5, v0
+        0x3608_08BF, // v_and_b32 v4, 63, v4
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xE070_1000, // buffer_store_dword v4, v3, s[8:11], 0 offen
+        0x8002_0403,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBBFD_0000, // s_waitcnt_vscnt null, 0
+        0xBF8A_0000, // s_barrier
+        0xBE93_0380, // s_mov_b32 s19, 0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        // loop:
+        0xE030_0000, // buffer_load_dword v6, v0, s[8:11], s19
+        0x1302_0600,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E26_0506, // v_readfirstlane_b32 s19, v6
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0xBF0A_0115, // s_cmp_lt_u32 s21, s1
+        0xBF85_FFF9, // s_cbranch_scc1 loop
+        0x7E0E_0213, // v_mov_b32 v7, s19
+        0xE070_1100, // buffer_store_dword v7, v3, s[8:11], 0 offen offset:256
+        0x8002_0703,
+        0xD760_0016, // v_readlane_b32 s22, v0, 63
+        0x0001_7F00,
+    ];
+    native(&words)
+}
+
+/// The walk is the same with the loads' values taken for alike in every lane (`VICTORY_UNIFORM_LOADS`
+/// 2) as without, and the first-lane reads of them make no exchange of the two host waves: less code.
+#[test]
+fn a_walk_down_a_chain_gives_the_same_ends_when_its_loads_are_taken_for_alike() {
+    let native = chain_walk();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let build = |level: u32| {
+        let was = lower::TEST_UNIFORM_LOADS.replace(Some(level));
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+        lower::TEST_UNIFORM_LOADS.set(was);
+        shader.expect("lower")
+    };
+    let (plain, alike) = (build(0), build(2));
+    assert!(alike.dxil.len() < plain.dxil.len(), "{} and {} bytes", alike.dxil.len(), plain.dxil.len());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for shader in [&plain, &alike] {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    for shader in [&plain, &alike] {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else { return };
+        for steps in [1u32, 2, 7, 64, 100] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, 1) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = steps;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(128)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            for t in 0..64usize {
+                assert_eq!(out[0][64 + t], (5 * steps & 63) * 4, "{steps} steps, thread {t}");
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: the ends of the walk, as taken and as taken for alike");
+}

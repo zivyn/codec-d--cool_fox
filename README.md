@@ -49,7 +49,8 @@ mesh shader support. The first run builds shader pipelines and stutters;
 Measured on `integ/validation-3` to `-10`, in the prologue cell, one PC with an 8 GB
 RTX 4060. A frame took about 410 ms at the start of the day; it now takes
 88-91 ms looking at the window (about 11 frames a second), with the card
-working about 67 ms of it (95-113 ms before the card-copy changes) and the CPU
+working about 55 ms of it (95-113 ms before the card-copy changes, 67 ms before the
+lean pair meetings) and the CPU
 about 770 ms of thread time a frame (940-990 before).
 
 On `main` (integrations #2, #3, #6, #8 and #10 are merged, so `main` and the `build-main`
@@ -92,6 +93,11 @@ download have all of this):
 - The shader translator also builds on Linux (`victory-translate`, with the
   validator as `libdxil.so`); 26,515 programs came out identical to the Windows
   build's.
+- The defragmentation pass takes 8.4 ms a frame instead of 13.2 (the two host waves of
+  a console wave meet by lean counters), and all GPU commands 54.6 ms instead of 59.7.
+  The frame time is the same within noise, because the submit thread is the limit.
+  Switches for heap sync, join ramp, merged step reads, a holder index and landing
+  threads exist (all off); they showed no gain.
 - Card copies of title buffers of 1 MiB and more get the big copies' margin
   (the "medium" buffers), which took about 29 ms (23 %) off a frame; the AVX2
   compare of copies against their snapshots and the re-marking of kept snapshot

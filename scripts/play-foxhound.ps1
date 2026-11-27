@@ -31,12 +31,22 @@ param(
     # Frame generation is made ready at every start with Streamline, on or off, so that the F1 menu switches it
     # and changes its amount while playing. -NoFrameGenReady: only with -FrameGen, as before.
     [switch]$NoFrameGenReady,
+    # Which frame generation: auto (DLSS Frame Generation where it runs, else AMD's FSR 3), dlss, or fsr (FSR 3
+    # even on an RTX 40/50; 2X only). FSR 3 needs AMD's FidelityFX DLLs (VICTORY_FIDELITYFX_DIR, else
+    # amd-sdk\FidelityFX\bin here) and, on Series X, DLSS for the upscaling (the title's own takes Series S sizes).
+    [ValidateSet('auto', 'dlss', 'fsr')][string]$FgType = 'auto',
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
     [ValidateRange(1, 1000)][int]$Fps = 1000,
+    # Every shader and the loading pipelines made first (`victory preload`), then the game; the F1 menu's
+    # PRELOAD SHADERS starts this again with it.
+    [switch]$Preload,
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
+# The F1 menu's "PRELOAD SHADERS" restarts this with -Preload (and VICTORY_PRELOAD=1, read here before the
+# switches below are cleared).
+$preload = $Preload -or $env:VICTORY_PRELOAD -eq '1'
 # What the F1 menu saved: its own choices (VICTORY_MENU_...) stand in for this script's options, and its
 # switches go over the settings below. An empty value unsets a switch.
 $menuFile = Join-Path $repo 'victory-settings.txt'
@@ -56,6 +66,7 @@ if ($menu.Contains('VICTORY_MENU_FRAMEGEN')) {
     $FrameGen = $menu['VICTORY_MENU_FRAMEGEN'] -match '^[1-6]$'
     if ($menu['VICTORY_MENU_FRAMEGEN'] -match '^[2-6]$') { $timesWanted = [int]$menu['VICTORY_MENU_FRAMEGEN'] }
 }
+if ($menu['VICTORY_MENU_FG_TYPE'] -in 'auto', 'dlss', 'fsr') { $FgType = $menu['VICTORY_MENU_FG_TYPE'] }
 if ($menu['VICTORY_MENU_FPS'] -match '^\d+$' -and [int]$menu['VICTORY_MENU_FPS'] -ge 1 -and [int]$menu['VICTORY_MENU_FPS'] -le 1000) { $fpsWanted = [int]$menu['VICTORY_MENU_FPS'] }
 $settings = @{
     # Submission and copy machinery
@@ -104,6 +115,18 @@ if ($Dlss -ne 'off') {
         Write-Host "repository folder fetches them from NVIDIA once (about 70 MB); VICTORY_STREAMLINE_DIR names another folder."
     }
 }
+# AMD FSR 3 frame generation: made ready as DLSS Frame Generation is (on, or ready and off for the F1 menu).
+# auto: the layer uses it only where DLSS Frame Generation does not run; fsr: DLSS Frame Generation is not asked.
+if ($FgType -ne 'dlss' -and ($FrameGen -or -not $NoFrameGenReady)) {
+    $fx = if ($env:VICTORY_FIDELITYFX_DIR) { $env:VICTORY_FIDELITYFX_DIR } else { Join-Path $repo 'amd-sdk\FidelityFX\bin' }
+    # Asked whatever is here: the layer checks the files and the card, and the start's notice (on the picture for
+    # its first 30 s, and in this window) says what runs and why not. On Series X without DLSS it stays off: the
+    # title's own upscaling, which it needs, takes the Series S sizes only.
+    $settings.VICTORY_FSR_FRAMEGEN = '1'; $settings.VICTORY_FIDELITYFX_DIR = $fx
+    if ($FgType -eq 'fsr') { $settings.Remove('VICTORY_FRAMEGEN') }
+    if (-not $settings.VICTORY_FRAMEGEN_X) { $settings.VICTORY_FRAMEGEN_X = if ($FrameGen) { [string]$timesWanted } else { '0' } }
+    if (-not $settings.VICTORY_TEXTURE_ROOM_PERCENT) { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }
+}
 if ($fpsWanted -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $fpsWanted) }
 foreach ($k in $menu.Keys) {
     if ($k -like 'VICTORY_MENU_*') { continue }
@@ -116,7 +139,8 @@ $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 $settings.VICTORY_MENU_CONSOLE = $console
 $settings.VICTORY_MENU_RES = $Res
 $settings.VICTORY_MENU_DLSS = if ($settings.VICTORY_DLSS -eq '1') { $Dlss } else { 'off' }
-$settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
+$settings.VICTORY_MENU_FRAMEGEN = if ($settings.VICTORY_FRAMEGEN -eq '1' -or $settings.VICTORY_FSR_FRAMEGEN -eq '1') { [string]$settings.VICTORY_FRAMEGEN_X } else { '0' }
+$settings.VICTORY_MENU_FG_TYPE = $FgType
 $settings.VICTORY_MENU_FPS = [string]$fpsWanted
 $settings.VICTORY_MENU_FILE = $menuFile
 $settings.VICTORY_MENU_PLAY = $MyInvocation.MyCommand.Path
@@ -136,15 +160,29 @@ if (-not (Test-Path $victory)) {
 }
 if (-not (Test-Path -LiteralPath $Exe)) { Write-Host "No $Exe."; return }
 # Switches left over in this window are cleared; path settings stay (victory.toml gives them otherwise).
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_STREAMLINE_DIR', 'VICTORY_FIDELITYFX_DIR'
 Get-ChildItem Env:VICTORY_* -ErrorAction SilentlyContinue | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 
 $logs = Join-Path $env:LOCALAPPDATA 'victory\logs'; New-Item -ItemType Directory -Force $logs | Out-Null
-$log = Join-Path $logs ('foxhound-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
+$log = Join-Path $logs ('victory-nvidia-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
 $writer = [IO.StreamWriter]::new($log, $false, [Text.UTF8Encoding]::new($false)); $writer.AutoFlush = $true
-$writer.WriteLine("# console=$console build=$Build switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))
+$writer.WriteLine("# console=$console build=$Build preload=$preload switches: " + (($settings.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' '))
 Write-Host "Log: $log"
 Push-Location $repo   # victory.toml is read from here
+try {
+    if ($preload) {
+        # With this start's switches (the translations depend on them); its lines go to the log too.
+        Write-Host 'Preloading shaders before the game starts. This takes a while (see the lines below).'
+        $began = Get-Date
+        # (Split-Path -LiteralPath with -Parent: no such parameter set in Windows PowerShell 5.1.)
+        & $victory preload ([IO.Path]::GetDirectoryName($Exe)) 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine("# preload: $line"); $line }
+        $how = if ($LASTEXITCODE -eq 0) { 'done' } else { "ended with code $LASTEXITCODE" }
+        $said = 'Preload {0} after {1:N1} min. Starting the game.' -f $how, ((Get-Date) - $began).TotalMinutes
+        $writer.WriteLine("# $said"); Write-Host $said
+    }
+}
+finally { Pop-Location }
+Push-Location $repo
 try { & $victory run $Exe --console $console --execute 2>&1 | ForEach-Object { $line = "$_"; $writer.WriteLine($line); $line } }
 finally { Pop-Location; $writer.Dispose() }

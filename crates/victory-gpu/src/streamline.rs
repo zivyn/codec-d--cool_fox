@@ -79,6 +79,16 @@ pub struct Asked {
     /// our swap chain is Streamline's proxy of it, so that Streamline sees
     /// the presents (its bookkeeping per frame).
     pub present_hook: bool,
+    /// `VICTORY_FSR_FRAMEGEN=1`: AMD FSR 3 frame generation where DLSS Frame
+    /// Generation does not run ([`fsr`]), from `fidelityfx_dir`
+    /// (`VICTORY_FIDELITYFX_DIR`).
+    pub fsr_framegen: bool,
+    pub fidelityfx_dir: PathBuf,
+    /// The Series S profile (the caller sets it; from the environment,
+    /// `VICTORY_MENU_CONSOLE=series-s`). Without DLSS the title's own
+    /// FidelityFX upscales, made for the Series S sizes only: FSR 3 frame
+    /// generation, which needs that upscaling, runs on Series X with DLSS only.
+    pub series_s: bool,
 }
 
 impl Asked {
@@ -87,12 +97,13 @@ impl Asked {
         let var = |name: &str| std::env::var(name).ok();
         let on = |name: &str| var(name).is_some_and(|v| v.trim() == "1");
         let framegen = on("VICTORY_FRAMEGEN");
+        let fsr_framegen = fsr::asked_from_env();
         let mode = match var("VICTORY_DLSS_MODE") {
             Some(name) => Mode::from_name(&name).ok_or_else(|| {
                 format!("VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, performance, ultraperformance")
             })?,
             // Frame generation alone keeps the scene at the output's size.
-            None if framegen && !on("VICTORY_DLSS") => Mode::Dlaa,
+            None if (framegen || fsr_framegen) && !on("VICTORY_DLSS") => Mode::Dlaa,
             None => Mode::Quality,
         };
         let preset = match var("VICTORY_DLSS_PRESET") {
@@ -112,6 +123,9 @@ impl Asked {
             log_dir: var("VICTORY_STREAMLINE_LOG").filter(|v| !v.trim().is_empty() && v.trim() != "0").map(PathBuf::from),
             hudless: var("VICTORY_FRAMEGEN_HUDLESS").is_none_or(|v| v.trim() != "0"),
             present_hook: on("VICTORY_STREAMLINE_PRESENT"),
+            fsr_framegen,
+            fidelityfx_dir: fsr::dir_from_env(),
+            series_s: var("VICTORY_MENU_CONSOLE").is_some_and(|c| c.trim() == "series-s"),
         })
     }
 
@@ -126,6 +140,9 @@ impl Asked {
 pub struct Available {
     pub dlss: bool,
     pub framegen: bool,
+    /// AMD's DLLs for FSR 3 frame generation are in (it runs if DLSS Frame
+    /// Generation does not).
+    pub fsr_framegen: bool,
 }
 
 /// One upscaling the title asked for: a FidelityFX `ffxDispatch` of an
@@ -173,6 +190,8 @@ macro_rules! once {
         ONCE.call_once(|| tracing::$level!($($arg)*));
     }};
 }
+
+pub(crate) mod fsr;
 
 struct Library(windows_sys::Win32::Foundation::HMODULE);
 
@@ -302,19 +321,156 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// title's imports are bound. Fails soft: what is not there is logged and
 /// left off.
 pub fn init(asked: &Asked) -> Available {
-    if !asked.any() {
-        return Available::default();
-    }
-    match load_and_init(asked, true) {
-        Ok(available) => available,
-        Err(why) => {
-            tracing::warn!(
-                folder = %asked.dir.display(),
-                "Streamline: {why}; DLSS and frame generation stay off, the title's own upscaling and our present run"
-            );
-            Available::default()
+    let mut files_missing = false;
+    let available = if !asked.any() {
+        Available::default()
+    } else {
+        match load_and_init(asked, true) {
+            Ok(available) => available,
+            Err(why) => {
+                tracing::warn!(
+                    folder = %asked.dir.display(),
+                    "Streamline: {why}; DLSS and frame generation stay off, the title's own upscaling and our present run"
+                );
+                files_missing = true;
+                Available::default()
+            }
         }
+    };
+    let no_dlss = if available.dlss {
+        None
+    } else if !asked.dlss {
+        Some(NoDlss::TurnedOff)
+    } else if files_missing {
+        Some(NoDlss::FilesMissing)
+    } else {
+        Some(NoDlss::Card)
+    };
+    // FSR 3 frame generation needs the title's upscaling to run: on Series X that is DLSS's
+    // (the title's own FidelityFX takes the Series S sizes only, and the title fails without it).
+    let fsr_needs_series_s = asked.fsr_framegen && !asked.series_s && !available.dlss;
+    if fsr_needs_series_s {
+        tracing::warn!(
+            "FSR 3 frame generation stays off: on Series X it needs DLSS for the upscaling, which this card or these files do not give; the Series S profile runs it"
+        );
     }
+    let fsr_framegen = asked.fsr_framegen && !fsr_needs_series_s && fsr::init(&asked.fidelityfx_dir);
+    let _ = FACTS.set(Facts {
+        adapter: default_adapter().map(|a| a.0).unwrap_or_default(),
+        series_s: asked.series_s,
+        no_dlss,
+        files_missing,
+        dlss_fg_asked: asked.framegen,
+        dlss_fg_supported: available.framegen,
+        fsr_asked: asked.fsr_framegen,
+        fsr_loaded: fsr_framegen,
+        fsr_needs_series_s,
+    });
+    Available { fsr_framegen, ..available }
+}
+
+/// What the start found out about frame generation on this card ([`notice`]).
+struct Facts {
+    adapter: String,
+    series_s: bool,
+    /// Why DLSS upscaling is not running (`None`: it runs).
+    no_dlss: Option<NoDlss>,
+    /// Streamline's files did not load (nothing is known of the card).
+    files_missing: bool,
+    dlss_fg_asked: bool,
+    dlss_fg_supported: bool,
+    fsr_asked: bool,
+    fsr_loaded: bool,
+    fsr_needs_series_s: bool,
+}
+
+/// Why DLSS upscaling is not running: the notice must not blame a card that
+/// has DLSS when it was only turned off or its files were not found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NoDlss {
+    /// Not asked (F1 > DLSS > OFF, or VICTORY_DLSS unset).
+    TurnedOff,
+    /// Asked, but Streamline's files did not load.
+    FilesMissing,
+    /// Asked and loaded, and the card does not support it.
+    Card,
+}
+
+static FACTS: OnceLock<Facts> = OnceLock::new();
+
+/// What this card does for frame generation, in a few lines of at most 52
+/// characters: printed at the start and shown on the picture for its first
+/// seconds. Nothing if no frame generation was asked or made ready.
+pub fn notice() -> Vec<String> {
+    let Some(f) = FACTS.get() else { return Vec::new() };
+    notice_of(f, FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire), fsr::live_swap_chain())
+}
+
+/// [`notice`] as it is expected at the start, before the swap chain is made
+/// (DLSS Frame Generation where it is supported, else FSR 3 if loaded).
+pub fn notice_at_start() -> Vec<String> {
+    let Some(f) = FACTS.get() else { return Vec::new() };
+    notice_of(f, f.dlss_fg_supported, f.fsr_loaded && !f.dlss_fg_supported)
+}
+
+fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
+    if !f.dlss_fg_asked && !f.fsr_asked {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    if !f.adapter.is_empty() {
+        // (Only what the picture's font draws: "Intel(R) Arc(TM)" and the like keep their letters.)
+        let name: String = f.adapter.trim().chars().filter(|c| c.is_ascii_alphanumeric() || " .,:()/-+".contains(*c)).collect();
+        let mut gpu = format!("GPU: {}", name.to_ascii_uppercase());
+        gpu.truncate(52);
+        lines.push(gpu);
+    }
+    // A card DLSS Frame Generation was asked of and did not run on.
+    let no_dlss_fg = f.dlss_fg_asked && !f.dlss_fg_supported;
+    if no_dlss_fg {
+        lines.push(if f.files_missing {
+            "DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND"
+        } else {
+            "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)"
+        }.into());
+    }
+    if dlss_live {
+        lines.push("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)".into());
+        lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
+    } else if fsr_live {
+        lines.push(if no_dlss_fg {
+            "USING AMD FSR 3 FRAME GEN INSTEAD: 2X AT MOST".into()
+        } else {
+            "FRAME GEN: AMD FSR 3 (CHOSEN IN F1), 2X AT MOST".into()
+        });
+        if !f.series_s {
+            lines.push("SERIES X WITH FSR 3 NEEDS DLSS UPSCALING (ON)".into());
+        } else if f.no_dlss.is_some() {
+            lines.push("SERIES S MODE: FSR 3 RUNS WITHOUT DLSS".into());
+        }
+    } else if f.fsr_needs_series_s {
+        lines.push("FRAME GEN OFF: FSR 3 ON SERIES X NEEDS DLSS ON".into());
+        lines.push(match f.no_dlss {
+            Some(NoDlss::FilesMissing) => "NVIDIA DLSS FILES NOT FOUND (VICTORY_STREAMLINE_DIR)",
+            Some(NoDlss::Card) => "THIS CARD HAS NO DLSS UPSCALING",
+            _ => "DLSS UPSCALING IS OFF: TURN IT ON IN F1 > DLSS",
+        }.into());
+        lines.push(if f.no_dlss == Some(NoDlss::Card) {
+            "USE F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
+        } else {
+            "OR F1 > CONSOLE > SERIES S (THE GAME RESTARTS)"
+        }.into());
+    } else if f.fsr_asked && !f.fsr_loaded {
+        lines.push("FRAME GEN OFF: AMD FSR 3 FILES NOT FOUND".into());
+        lines.push("(AMD FIDELITYFX DLLS, VICTORY_FIDELITYFX_DIR)".into());
+    } else if no_dlss_fg {
+        lines.push("F1 > FRAME GEN TYPE > FSR 3 GIVES 2X ON THIS CARD".into());
+    } else if f.dlss_fg_supported {
+        lines.push("FRAME GEN: DLSS DID NOT START (SEE THE LOG)".into());
+    } else {
+        return Vec::new();
+    }
+    lines
 }
 
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
@@ -401,7 +557,7 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         "Streamline loaded (manual hooking, no downloads)"
     );
     let _ = PLAN.set(Plan { asked: asked.clone(), dlss, framegen });
-    Ok(Available { dlss, framegen })
+    Ok(Available { dlss, framegen, fsr_framegen: false })
 }
 
 /// Logs whether a feature is supported, with its requirements; whether it is.
@@ -561,7 +717,7 @@ fn load(path: &Path) -> Result<Sl, String> {
 /// Whether the title's FidelityFX calls are to be served (DLSS or frame
 /// generation is on): `victory_hle` then puts its own in front of them.
 pub fn serving() -> bool {
-    PLAN.get().is_some_and(|p| p.dlss || p.framegen)
+    PLAN.get().is_some_and(|p| p.dlss || p.framegen) || fsr::noting()
 }
 
 /// Whether DLSS is to take the title's upscale dispatches (`VICTORY_DLSS=1`
@@ -782,13 +938,16 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
 /// its inputs are noted there for the present); the title's own runs
 /// otherwise.
 pub fn upscale(up: &Upscale) -> Taken {
-    let Some(plan) = PLAN.get() else {
-        return Taken::No("Streamline is not loaded");
-    };
-    let dlss = plan.dlss && DLSS_READY.load(Acquire);
-    let framegen = plan.framegen && FG_READY.load(Acquire);
+    let plan = PLAN.get();
+    let dlss = plan.is_some_and(|p| p.dlss) && DLSS_READY.load(Acquire);
+    // (FSR 3 frame generation reads the same inputs at the present.)
+    let framegen = plan.is_some_and(|p| p.framegen) && FG_READY.load(Acquire) || fsr::noting();
     if !dlss && !framegen {
-        return Taken::No("Streamline has no device yet, or its features did not start");
+        return Taken::No(if plan.is_none() {
+            "Streamline is not loaded"
+        } else {
+            "Streamline has no device yet, or its features did not start"
+        });
     }
     if [COLOUR, DEPTH, MOTION, OUTPUT].iter().any(|&i| up.resources[i].0.is_null()) {
         return Taken::No("a required texture (colour, depth, motion vectors, output) is missing");
@@ -857,7 +1016,7 @@ fn note(host: &crate::host::HostList, up: &Upscale, id: u64) {
     };
     let mut pending = pending();
     pending.retain(|n| id.saturating_sub(n.id) < 16);
-    pending.push(Noted { id, depth: Source::Host(depth), motion: Source::Host(motion), camera: up.camera });
+    pending.push(Noted { id, depth: Source::Host(depth), motion: Source::Host(motion), camera: up.camera, frame_ms: up.frame_ms });
     drop(pending);
     host.mark_upscale(id);
 }
@@ -868,6 +1027,34 @@ struct Noted {
     depth: Source,
     motion: Source,
     camera: plan::Camera,
+    frame_ms: f32,
+}
+
+/// What FSR 3 frame generation reads at a present ([`fresh_inputs`]): depth
+/// and motion vectors with the D3D12 states they are in then.
+pub(crate) struct Inputs {
+    pub(crate) depth: (ID3D12Resource, u32),
+    pub(crate) motion: (ID3D12Resource, u32),
+    pub(crate) camera: plan::Camera,
+    pub(crate) frame_ms: f32,
+}
+
+impl Source {
+    fn current(&self) -> (ID3D12Resource, u32) {
+        match self {
+            Source::Host(t) => (t.texture.clone(), t.state.load(Relaxed)),
+            Source::Fixed(t, state) => (t.clone(), *state),
+        }
+    }
+}
+
+/// The latest upscaling submitted since the last present that took one, if
+/// any (and from now on the last taken).
+pub(crate) fn fresh_inputs() -> Option<Inputs> {
+    let latest = SUBMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    let n = latest.as_ref().filter(|n| n.id > PRESENTED_ID.load(Relaxed))?;
+    PRESENTED_ID.store(n.id, Relaxed);
+    Some(Inputs { depth: n.depth.current(), motion: n.motion.current(), camera: n.camera, frame_ms: n.frame_ms })
 }
 
 /// A texture frame generation reads at the present, and the state it is in
@@ -1605,19 +1792,30 @@ fn framegen_wanted() -> u32 {
 /// Whether frame generation can be switched and changed while the title runs: it was planned
 /// at the start, so our swap chain is Streamline's proxy (the F1 menu asks).
 pub(crate) fn framegen_live() -> bool {
-    FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)
+    FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire) || fsr::live_swap_chain()
 }
 
-/// Asks frame generation off (0) or for `times` frames shown for each one rendered (2..6),
-/// from the next present on.
+/// Which frame generation the presents have: DLSS's, AMD's FSR 3, or none.
+pub(crate) fn framegen_kind() -> Option<&'static str> {
+    if FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire) {
+        Some("DLSS")
+    } else if fsr::live_swap_chain() {
+        Some("FSR 3")
+    } else {
+        None
+    }
+}
+
+/// Asks frame generation off (0) or for `times` frames shown for each one rendered (2..6;
+/// FSR 3 frame generation shows 2 for any of them), from the next present on.
 pub(crate) fn set_framegen(times: u32) {
     FG_WANTED.store(if times == 0 { 0 } else { times.clamp(2, 6) }, Relaxed);
-    tracing::info!(times, "DLSS Frame Generation: asked from the settings menu");
+    tracing::info!(times, kind = framegen_kind().unwrap_or("none"), "frame generation: asked from the settings menu");
 }
 
 /// For the frame-rate texts: frames shown for each one rendered (1 without frame generation).
 pub(crate) fn shown_per_frame() -> u32 {
-    FG_PER.load(Relaxed).max(1)
+    fsr::shown_per_frame().unwrap_or_else(|| FG_PER.load(Relaxed).max(1))
 }
 
 /// After our swap chain's Present: the frame's last marker, the next
@@ -1869,6 +2067,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
                 depth: Source::Fixed(depth.clone(), SHADER_READ),
                 motion: Source::Fixed(motion.clone(), SHADER_READ),
                 camera,
+                frame_ms: 16.7,
             });
             if let Some(copy) = &copy {
                 lock(&HUD_SUBMITTED).push(Copied { id: frame, target: base.as_raw() as usize, texture: copy.clone() });
@@ -1930,6 +2129,11 @@ fn texture(
 
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
+    if let Some((on, off, failed, hudless)) = fsr::line_counts() {
+        tracing::info!(
+            "FSR 3 frame generation: {on} presents with it on ({hudless} with the colour without the interface), {off} off, {failed} prepare dispatches failed"
+        );
+    }
     let Some(plan) = PLAN.get() else { return };
     let [done, failed, forwarded, on, off, shown] =
         [&EVALUATED, &FAILED, &FORWARDED, &FG_ON, &FG_OFF, &FG_SHOWN].map(|c| c.swap(0, Relaxed));

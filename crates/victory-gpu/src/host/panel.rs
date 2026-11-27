@@ -62,9 +62,19 @@ fn pressed() -> bool {
     process == std::process::id()
 }
 
+/// A box's characters in a line, and lines.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) struct Shape {
+    columns: u32,
+    lines: u32,
+}
+
+/// The numbers panel's box.
+const PANEL: Shape = Shape { columns: COLUMNS, lines: LINES };
+
 /// The box's size in pixels, a dot being `scale` of them each way.
-const fn size(scale: u32) -> (u32, u32) {
-    ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + 2 * RIM) * scale)
+const fn size(shape: Shape, scale: u32) -> (u32, u32) {
+    ((shape.columns * CELL.0 + 2 * RIM) * scale, (shape.lines * CELL.1 + 2 * RIM) * scale)
 }
 
 /// Pixels to a dot for a picture that high: a 720-line screenshot of it
@@ -74,11 +84,11 @@ fn scale(height: u32) -> u32 {
 }
 
 /// Whether a dot of the picture of `lines` is white.
-fn lit(lines: &[String], x: u32, y: u32) -> bool {
+fn lit(lines: &[String], shape: Shape, x: u32, y: u32) -> bool {
     let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
         return false;
     };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
+    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= shape.columns {
         return false;
     }
     let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
@@ -88,14 +98,14 @@ fn lit(lines: &[String], x: u32, y: u32) -> bool {
 }
 
 /// The box as rows of `pitch` bytes.
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(scale);
+fn painted(lines: &[String], shape: Shape, scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
+    let (width, height) = size(shape, scale);
     let bytes = colours[0].len();
     let mut out = vec![0; pitch * height as usize];
     for y in 0..height / scale {
         let top = pitch * (y * scale) as usize;
         for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
+            let colour = colours[usize::from(lit(lines, shape, x, y))];
             for i in 0..scale {
                 let at = top + (x * scale + i) as usize * bytes;
                 out[at..at + bytes].copy_from_slice(colour);
@@ -199,6 +209,7 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
 
 /// The buffers of a box that size and format.
 struct Buffers {
+    shape: Shape,
     format: DXGI_FORMAT,
     scale: u32,
     pitch: u32,
@@ -214,8 +225,8 @@ struct Buffers {
 unsafe impl Send for Buffers {}
 
 impl Buffers {
-    fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
+    fn new(host: &Host, shape: Shape, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
+        let (width, height) = size(shape, scale);
         let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
         let bytes = u64::from(pitch) * u64::from(height);
         let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
@@ -240,16 +251,55 @@ impl Buffers {
                 .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
                 .ok()?;
         }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
+        Some(Buffers { shape, format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
     }
 
     fn write(&mut self, lines: &[String]) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
+        let picture = painted(lines, self.shape, self.scale, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
         self.fresh = true;
+    }
+
+    /// Records the copy of the box onto `back` (of `width` x `height`, in the
+    /// state to be copied into), its upper left corner at `at`.
+    fn copy(&mut self, list: &ID3D12GraphicsCommandList, back: &ID3D12Resource, at: (u32, u32), (width, height): (u32, u32)) {
+        let (w, h) = size(self.shape, self.scale);
+        if at.0 >= width || at.1 >= height {
+            return;
+        }
+        // SAFETY: an open list and live resources; the box lies within both.
+        unsafe {
+            if std::mem::take(&mut self.fresh) {
+                list.CopyResource(&self.card, &self.uploads[self.turn].0);
+                list.ResourceBarrier(&[transition(&self.card, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&self.card),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: self.format,
+                            Width: w,
+                            Height: h,
+                            Depth: 1,
+                            RowPitch: self.pitch,
+                        },
+                    },
+                },
+            };
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(back),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let part = D3D12_BOX { left: 0, top: 0, front: 0, right: w.min(width - at.0), bottom: h.min(height - at.1), back: 1 };
+            list.CopyTextureRegion(&to, at.0, at.1, 0, &from, Some(&part));
+        }
     }
 }
 
@@ -341,7 +391,7 @@ impl Panel {
         if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
             // (What the card may still read stays: a picture's size changes once or twice in a run.)
             std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, format, scale);
+            self.buffers = Buffers::new(host, PANEL, format, scale);
             self.failed = self.buffers.is_none();
             self.changed = true;
         }
@@ -349,50 +399,68 @@ impl Panel {
         if std::mem::take(&mut self.changed) {
             buffers.write(&self.lines);
         }
-        let (w, h) = size(scale);
-        let list = &list.list;
-        // SAFETY: an open list and live resources; the box lies within both.
-        unsafe {
-            if std::mem::take(&mut buffers.fresh) {
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(
-                    &buffers.card,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-            }
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&buffers.card),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: format,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: buffers.pitch,
-                        },
-                    },
-                },
-            };
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let part = D3D12_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w.min(width),
-                bottom: h.min(height),
-                back: 1,
-            };
-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
-        }
+        buffers.copy(&list.list, back, (0, 0), (width, height));
         self.cost += began.elapsed();
+    }
+}
+
+/// How long the start's notice stays.
+const NOTICE_FOR: Duration = Duration::from_secs(30);
+/// The longest notice line, in characters.
+const NOTICE_COLUMNS: u32 = 52;
+
+/// What this card does for frame generation, said at the top of the picture
+/// for the first [`NOTICE_FOR`] of a run (`crate::streamline::notice`); in
+/// every build, nothing without a notice.
+pub(super) struct Notice {
+    lines: Vec<String>,
+    shape: Shape,
+    since: Option<Instant>,
+    buffers: Option<Buffers>,
+    written: bool,
+    done: bool,
+}
+
+impl Notice {
+    pub(super) fn new() -> Notice {
+        let lines: Vec<String> = crate::streamline::notice().into_iter().map(|l| l.to_ascii_uppercase()).collect();
+        let columns = lines.iter().map(|l| l.len() as u32).max().unwrap_or(0).min(NOTICE_COLUMNS);
+        let shape = Shape { columns, lines: lines.len() as u32 };
+        Notice { done: lines.is_empty(), lines, shape, since: None, buffers: None, written: false }
+    }
+
+    /// Records the copy of the notice onto `back` (as [`Panel::draw`]), at
+    /// the top in the middle, while it is due.
+    pub(super) fn draw(&mut self, host: &Host, list: &HostList, back: &ID3D12Resource, (width, height): (u32, u32), format: DXGI_FORMAT) {
+        if self.done {
+            return;
+        }
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() > NOTICE_FOR {
+            // (Its buffers stay: the card may still read them.)
+            std::mem::forget(self.buffers.take());
+            self.done = true;
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        let _ours = crate::replay::record::unrecorded();
+        let scale = scale(height);
+        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
+            std::mem::forget(self.buffers.take());
+            self.buffers = Buffers::new(host, self.shape, format, scale);
+            self.written = false;
+            if self.buffers.is_none() {
+                self.done = true;
+                return;
+            }
+        }
+        let Some(buffers) = &mut self.buffers else { return };
+        if !std::mem::replace(&mut self.written, true) {
+            buffers.write(&self.lines);
+        }
+        let (w, _) = size(self.shape, scale);
+        let at = (width.saturating_sub(w) / 2, 24 * scale);
+        buffers.copy(&list.list, back, at, (width, height));
     }
 }
 
@@ -426,10 +494,10 @@ mod tests {
     fn a_box_is_painted() {
         let lines = vec!["I".to_owned(), " i".to_owned()];
         for scale in [1, 2, 4] {
-            let (width, height) = size(scale);
+            let (width, height) = size(PANEL, scale);
             let pitch = (width * 4).next_multiple_of(256) as usize;
             let colours = colours(DXGI_FORMAT_R10G10B10A2_UNORM).unwrap();
-            let picture = painted(&lines, scale, colours, pitch);
+            let picture = painted(&lines, PANEL, scale, colours, pitch);
             assert_eq!(picture.len(), pitch * height as usize);
             let at = |x: u32, y: u32| &picture[y as usize * pitch + x as usize * 4..][..4];
             // The rim is black, the first letter's top row lit in its middle.

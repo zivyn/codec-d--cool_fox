@@ -129,6 +129,17 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Preload: `shaders` and then `warm` over the title's folder, and the
+    /// pipelines a run makes while it loads stored in the pipeline library
+    /// the runs start with; what they say is shown as they go (the F1 menu's "PRELOAD SHADERS" has the
+    /// launcher do this before the title starts). A while, maybe long on
+    /// slower hardware; an update of the translator or the driver needs it
+    /// again. Stopped, it goes on where it was the next time.
+    #[cfg(windows)]
+    Preload {
+        /// The title's folder (default: the configured game folder).
+        paths: Vec<PathBuf>,
+    },
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
     /// title's `game_scarlett_master.exe`). F1 in the game is the settings
@@ -213,7 +224,12 @@ fn main() -> Result<()> {
     // before anything else is set up.
     #[cfg(windows)]
     if let Command::Play(options) = &cli.command {
+        // (Read before `prepare` clears the `VICTORY_...` variables: the menu's restart sets it.)
+        let preload = options.preload || std::env::var_os("VICTORY_PRELOAD").is_some_and(|v| v == "1");
         let done = play::prepare(options).and_then(|ready| {
+            if preload {
+                play::preload(&ready.exe);
+            }
             victory_core::logging::init("info");
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
             run::run(&ready.exe, Unimplemented::Trap, false, true, console)
@@ -268,6 +284,13 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Preload { paths } => {
+            play::explain_preload();
+            translate::precompile(paths, None)?;
+            warm::run(None, None, false, false, None)?;
+            warm::into_library(None)
+        }
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
         #[cfg(windows)]

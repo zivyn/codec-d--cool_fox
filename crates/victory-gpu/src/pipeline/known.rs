@@ -214,6 +214,19 @@ pub fn use_translations(dir: PathBuf) {
     crate::shader_cache::use_shader_cache(dir);
 }
 
+/// The translations and the host pipeline library of a run are in the cache
+/// folder `shaders`'s neighbours: what [`make`] makes from now on is stored in
+/// that library (`victory preload`), which the runs load at their start.
+pub fn use_library(shaders: PathBuf) {
+    super::library::use_pipeline_cache(shaders.with_file_name("pipelines"));
+    crate::shader_cache::use_shader_cache(shaders);
+}
+
+/// Writes the library [`use_library`] filled.
+pub fn keep_library() {
+    super::library::save(true);
+}
+
 /// Makes the host pipelines of those of `which` (numbers in the file) and
 /// lets each go again: the driver's cache on disk keeps them. `each` is told
 /// the number before, and what came of it after: milliseconds and whether

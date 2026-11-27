@@ -1,6 +1,9 @@
 //! The F1 settings menu. F1 shows and hides it while our window has the
 //! focus; Up/Down pick a setting, Left/Right change it, Enter runs the line
-//! picked (save, save and restart, reset, close), Esc closes. While it is
+//! picked (save, save and restart, preload shaders, reset, close), Esc
+//! closes. Preloading saves, ends this run and has the launcher make every
+//! shader before the title starts again (`VICTORY_PRELOAD=1`, `victory
+//! preload`); it asks for a second Enter first. While it is
 //! shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the
 //! input module); a pad still works.
 //!
@@ -35,9 +38,21 @@ const GLYPH: (u32, u32) = (5, 7);
 const CELL: (u32, u32) = (6, 9);
 const COLUMNS: u32 = 60;
 /// Lines of the box: a title, a help line, a blank, the settings shown, a
-/// blank and a note.
+/// blank, what the line picked does (`ABOUT`, else blank), a note and the
+/// repository's link.
 const ROWS: usize = 20;
-const LINES: u32 = ROWS as u32 + 5;
+const LINES: u32 = ROWS as u32 + 9;
+/// The action that preloads shaders, and what is said of it while it is picked.
+const PRELOAD: usize = 2;
+const ABOUT_PRELOAD: [&str; 3] = [
+    "MAKES EVERY SHADER AHEAD, THEN STARTS THE GAME AGAIN.",
+    "TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.",
+    "A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.",
+];
+/// The note after the first Enter on it: the second one does it.
+const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
+/// The last line of the box: where this build comes from.
+const REPO: &str = "GITHUB.COM/TRUSTNO1-CODER/VICTORY-NVIDIA";
 const RIM: u32 = 4;
 const UPLOADS: usize = 4;
 
@@ -60,6 +75,8 @@ const ITEMS: &[Item] = &[
     // The launcher's own choices.
     Item { var: "VICTORY_MENU_DLSS", label: "DLSS", values: &[("quality", "QUALITY"), ("balanced", "BALANCED"), ("performance", "PERFORMANCE"), ("dlaa", "DLAA (NATIVE)"), ("off", "OFF")], live: false },
     Item { var: "VICTORY_MENU_FRAMEGEN", label: "FRAME GENERATION", values: &[("0", "OFF"), ("2", "2X"), ("3", "3X"), ("4", "4X"), ("5", "5X"), ("6", "6X (MOST)")], live: false },
+    // DLSS Frame Generation where it runs (RTX 40 and later), else AMD's FSR 3 (2X only).
+    Item { var: "VICTORY_MENU_FG_TYPE", label: "FRAME GEN TYPE", values: &[("auto", "AUTO"), ("dlss", "DLSS"), ("fsr", "FSR 3 (OLDER CARDS)")], live: false },
     Item { var: "VICTORY_MENU_FPS", label: "FRAME RATE CAP", values: &[("1000", "NONE"), ("120", "120"), ("60", "60"), ("30", "30 (THE GAME)")], live: false },
     Item { var: "VICTORY_FPS_LINE", label: "FPS AT THE TOP", values: &[("1", "ON"), ("0", "OFF")], live: true },
     Item { var: "VICTORY_PANEL", label: "STATS PANEL (F3)", values: &[("0", "OFF"), ("1", "ON")], live: true },
@@ -87,10 +104,50 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 4] = ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
+const ACTIONS: [&str; 5] =
+    ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "PRELOAD SHADERS (RESTARTS THE GAME)", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
+}
+
+/// Starts `command_line` in a console window of its own, with that console's input and output.
+/// (`std::process::Command` always hands its child this process's standard handles: the restarted
+/// launcher then wrote into the old launcher's pipe and log, not its own window, and kept the old
+/// launcher waiting on that pipe.)
+fn new_console(command_line: &str) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{CREATE_NEW_CONSOLE, CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
+    let mut line: Vec<u16> = command_line.encode_utf16().chain(Some(0)).collect();
+    // SAFETY: plain structs, zero is their empty value.
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `line` is a writable, terminated UTF-16 string; no handles inherited; this
+    // process's environment and folder.
+    let made = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_NEW_CONSOLE,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if made == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the two handles CreateProcessW gave, closed once.
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
 }
 
 /// Whether a change of `item` shows at once. Frame generation does when this run started with
@@ -129,6 +186,17 @@ fn fps_line() -> Option<String> {
 /// itself, at the end).
 fn index_of(item: &Item, value: &str) -> Option<usize> {
     item.values.iter().position(|(v, _)| *v == value)
+}
+
+/// What the menu shows for `value`: its label, an unknown value as itself,
+/// and a value the launcher did not set (a start without play.ps1) as
+/// "NOT SET" rather than a blank.
+fn shown_value(item: &Item, value: &str) -> String {
+    match index_of(item, value) {
+        Some(i) => item.values[i].1.to_owned(),
+        None if value.is_empty() => "NOT SET".to_owned(),
+        None => value.to_ascii_uppercase(),
+    }
 }
 
 /// Keys pressed, gathered on a thread of their own every 10 ms: a frame
@@ -294,7 +362,7 @@ impl Menu {
             let cursor = if row == self.at { '>' } else { ' ' };
             let line = if let Some(item) = ITEMS.get(row) {
                 let value = &self.values[row];
-                let shown = index_of(item, value).map_or(value.to_ascii_uppercase(), |i| item.values[i].1.to_owned());
+                let shown = shown_value(item, value);
                 let mark = if *value != self.started[row] { if live(item) { " *LIVE" } else { " *" } } else if live(item) { " LIVE" } else { "" };
                 format!("{cursor} {:<27} < {shown} >{mark}", item.label)
             } else {
@@ -306,7 +374,10 @@ impl Menu {
             out.push(String::new());
         }
         out.push(String::new());
+        let about = if self.at == ITEMS.len() + PRELOAD { ABOUT_PRELOAD } else { [""; 3] };
+        out.extend(about.iter().map(|l| (*l).to_owned()));
         out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        out.push(REPO.to_owned());
         out
     }
 
@@ -384,23 +455,18 @@ impl Menu {
     }
 
     /// Starts the launcher again in a new console, a few seconds on, and ends this run.
-    fn restart(&mut self) {
-        use std::os::windows::process::CommandExt;
+    /// `preload`: the launcher makes every shader first (its `-Preload`, for that start alone).
+    fn restart(&mut self, preload: bool) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
             self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
             return;
         };
         let play = play.to_string_lossy().replace('\'', "''");
         let args = get("VICTORY_MENU_ARGS");
-        let command = format!("Start-Sleep 3; & '{play}' {args}");
-        const CREATE_NEW_CONSOLE: u32 = 0x10;
-        match std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &command])
-            .creation_flags(CREATE_NEW_CONSOLE)
-            .spawn()
-        {
-            Ok(_) => {
-                tracing::info!(command, "settings menu: restarting");
+        let command = format!("Start-Sleep 3; & '{play}' {args}{}", if preload { " -Preload" } else { "" });
+        match new_console(&format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""))) {
+            Ok(()) => {
+                tracing::info!(command, preload, "settings menu: restarting");
                 // Ended at once: std::process::exit runs the DLLs' unloading, which with
                 // Streamline loaded did not come back (a windowless leftover process).
                 // SAFETY: this process, with nothing of its own left to save.
@@ -443,6 +509,11 @@ impl Menu {
             if !open {
                 continue;
             }
+            // Only an Enter right after the first one starts a preload.
+            let confirmed = self.note == CONFIRM_PRELOAD;
+            if confirmed {
+                self.note.clear();
+            }
             match vk {
                 VK_UP => self.at = (self.at + total - 1) % total,
                 VK_DOWN => self.at = (self.at + 1) % total,
@@ -452,13 +523,19 @@ impl Menu {
                 VK_RETURN => match self.at - ITEMS.len() {
                     0 => {
                         if self.save() {
-                            self.restart();
+                            self.restart(false);
                         }
                     }
                     1 => {
                         self.save();
                     }
-                    2 => self.reset(),
+                    PRELOAD if !confirmed => self.note = CONFIRM_PRELOAD.to_owned(),
+                    PRELOAD => {
+                        if self.save() {
+                            self.restart(true);
+                        }
+                    }
+                    3 => self.reset(),
                     _ => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
                 },
                 _ => {}
@@ -553,6 +630,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_link_is_always_right_under_the_note() {
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        menu.started = menu.values.clone();
+        for note in ["", "SAVED"] {
+            menu.note = note.to_owned();
+            for at in 0..ITEMS.len() + ACTIONS.len() {
+                menu.at = at;
+                let lines = menu.lines();
+                assert_eq!(lines.len(), LINES as usize);
+                let n = lines.len();
+                assert!(lines[n - 2].starts_with("* = CHANGED") || lines[n - 2] == note, "{}", lines[n - 2]);
+                assert_eq!(lines[n - 1], REPO);
+                // What a preload costs is said while it is picked, and only then.
+                let about = &lines[n - 5..n - 2];
+                if at == ITEMS.len() + PRELOAD {
+                    assert_eq!(about, ABOUT_PRELOAD);
+                } else {
+                    assert!(about.iter().all(String::is_empty), "{about:?}");
+                }
+            }
+        }
+        assert_eq!(ACTIONS[PRELOAD], "PRELOAD SHADERS (RESTARTS THE GAME)");
+        assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
     }
 
     #[test]

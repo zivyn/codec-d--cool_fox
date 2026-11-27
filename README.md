@@ -1,5 +1,24 @@
 # VIctory on NVIDIA
 
+## Frame generation: what your card supports
+
+| Your card | Frame generation | Limits |
+| --- | --- | --- |
+| GeForce RTX 40 and RTX 50 | **DLSS frame generation** | 2x on RTX 40; more than 2x (up to 6x) needs an RTX 50 |
+| GeForce RTX 20 and RTX 30 | **AMD FSR 3 frame generation** (DLSS frame generation needs an RTX 40 or later) | **2x at most**. DLSS upscaling still works on these cards, so the Series X profile is fine |
+| Other cards (no DLSS) | **AMD FSR 3 frame generation** | **2x at most, Series S profile only** (F1 menu, CONSOLE): without DLSS the game's own upscaler, which FSR 3 needs, only takes the Series S sizes. Not tested here |
+
+- **At every start the game tells you** which one your card runs, and why
+  not if it can't, at the top of the picture for the first 30 seconds (and
+  in the console window).
+- **F1 menu, FRAME GEN TYPE**: AUTO (DLSS where the card has it, else FSR 3),
+  DLSS, or FSR 3 (also on an RTX 40/50, if you prefer it). FRAME GENERATION
+  switches it off or on.
+- FSR 3 needs AMD's FidelityFX DLLs (`amd_fidelityfx_loader_dx12.dll` and
+  `amd_fidelityfx_framegeneration_dx12.dll`, from AMD's FidelityFX SDK). They
+  are AMD's and not part of this program: put them in a `fidelityfx` folder
+  next to `victory.exe`, or name their folder with `VICTORY_FIDELITYFX_DIR`.
+
 ## Quick start: how to run it
 
 **The easy way: one file, nothing to build**
@@ -260,6 +279,7 @@ fork has always had; its options:
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
 | `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
+| `-FgType auto` / `dlss` / `fsr` | which frame generation (see the top of this page); FSR 3's DLLs from `VICTORY_FIDELITYFX_DIR`, else `amd-sdk\FidelityFX\bin` here |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |
 

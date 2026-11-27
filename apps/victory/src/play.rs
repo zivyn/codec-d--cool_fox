@@ -88,8 +88,11 @@ const KEPT: &[&str] = &[
     "VICTORY_CACHE_DIR",
     "VICTORY_DATA_DIR",
     "VICTORY_STREAMLINE_DIR",
+    "VICTORY_FIDELITYFX_DIR",
     "VICTORY_LOG",
 ];
+
+const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
 const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
@@ -116,12 +119,55 @@ pub(crate) struct Play {
     /// Frame generation not made ready at the start.
     #[arg(long)]
     no_framegen_ready: bool,
+    /// Which frame generation: auto (DLSS frame generation where the card has
+    /// it, RTX 40 and later, else AMD FSR 3), dlss, or fsr (2X at most). FSR 3
+    /// needs AMD's FidelityFX DLLs (`VICTORY_FIDELITYFX_DIR`, else a
+    /// `fidelityfx` folder beside this program) and, on Series X, DLSS.
+    #[arg(long, default_value = "auto", value_parser = FG_TYPES)]
+    fg_type: String,
     /// Frames a second at most (30: the title's own rate; 1000: no cap).
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=1000))]
     fps: u32,
     /// Add or override a switch, as often as needed: `--set VICTORY_X=1`.
     #[arg(long = "set", value_name = "NAME=VALUE")]
     more: Vec<String>,
+    /// Make every shader before the title starts (`victory preload`, as the
+    /// F1 menu's "PRELOAD SHADERS" does): a while, maybe long.
+    #[arg(long)]
+    pub(crate) preload: bool,
+}
+
+/// What a preload is, said before it begins.
+pub(crate) fn explain_preload() {
+    println!();
+    println!("Preloading shaders: every shader of the title is translated, then the pipelines the game");
+    println!("made in earlier runs are built, and those it needs while loading are stored where it loads");
+    println!("them from at the start, so it does not stop to make them while you play.");
+    println!("This takes a while, and possibly a long time, depending on your hardware (CPU above all).");
+    println!("What is done is kept: stopped (close this window), the next preload goes on from there.");
+    println!("A later update of this build, or a new graphics driver, may need a new preload.");
+    println!();
+}
+
+/// Runs `victory preload` over the title's folder with this start's settings
+/// (the translations depend on them), then lets the start go on, whatever came of it.
+pub(crate) fn preload(exe: &Path) {
+    let folder = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    let began = std::time::Instant::now();
+    let done = std::env::current_exe().and_then(|program| {
+        std::process::Command::new(program)
+            .arg("preload")
+            .arg(&folder)
+            // Its own lines in this window; the start's log is the title's.
+            .env_remove("VICTORY_LOG_FILE")
+            .status()
+    });
+    let minutes = began.elapsed().as_secs_f64() / 60.0;
+    match done {
+        Ok(s) if s.success() => println!("Shaders preloaded in {minutes:.1} min. Starting the game."),
+        Ok(s) => println!("The preload stopped ({s}) after {minutes:.1} min; what it did is kept. Starting the game."),
+        Err(e) => println!("The preload did not start ({e}). Starting the game."),
+    }
 }
 
 /// `%LOCALAPPDATA%\victory`.
@@ -177,6 +223,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             times = n;
         }
     }
+    let fg_type = saved("VICTORY_MENU_FG_TYPE").filter(|t| FG_TYPES.contains(t)).unwrap_or(&o.fg_type);
     let fps = saved("VICTORY_MENU_FPS")
         .and_then(|f| f.parse::<u32>().ok())
         .filter(|f| (1..=1000).contains(f))
@@ -213,6 +260,22 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
             set("VICTORY_TEXTURE_ROOM_PERCENT", if framegen { "80" } else { "86" });
         }
     }
+    // AMD FSR 3 frame generation, made ready as DLSS frame generation is: auto, the layer uses
+    // it only where DLSS frame generation does not run; fsr, DLSS frame generation is not asked.
+    // The layer checks the files and the card and says at the start what runs and why not.
+    if fg_type != "dlss" && (framegen || !o.no_framegen_ready) {
+        set("VICTORY_FSR_FRAMEGEN", "1");
+        if fg_type == "fsr" {
+            s.remove("VICTORY_FRAMEGEN");
+        }
+        let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
+        let x = *framegen_x.get_or_insert(if framegen { times } else { 0 });
+        set("VICTORY_FRAMEGEN_X", &x.to_string());
+        if !s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT") {
+            s.insert("VICTORY_TEXTURE_ROOM_PERCENT".to_owned(), if framegen { "80" } else { "86" }.to_owned());
+        }
+    }
+    let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
     for (k, v) in menu.iter().filter(|(k, _)| !k.starts_with("VICTORY_MENU_")) {
         if v.is_empty() {
@@ -230,6 +293,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     set("VICTORY_MENU_RES", res);
     set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
     set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
+    set("VICTORY_MENU_FG_TYPE", fg_type);
     set("VICTORY_MENU_FPS", &fps.to_string());
     (s, series_s)
 }
@@ -260,15 +324,20 @@ fn log_file(logs: &Path) -> Result<PathBuf> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("play-")))
+        // ("play-": the name before 2026-11-27; it sorts first, so goes first.)
+        .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(LOG_PREFIX) || n.to_string_lossy().starts_with("play-")))
         .collect();
     old.sort();
     for gone in old.iter().rev().skip(9) {
         let _ = std::fs::remove_file(gone);
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    Ok(logs.join(format!("play-{}-{}.log", stamp(now), std::process::id())))
+    Ok(logs.join(format!("{LOG_PREFIX}{}-{}.log", stamp(now), std::process::id())))
 }
+
+/// The start of the built-in launcher's log names (scripts\play-foxhound.ps1's
+/// are `victory-nvidia-<date>-<time>.log`, kept apart from these).
+const LOG_PREFIX: &str = "victory-nvidia-play-";
 
 /// Runs the fetcher: NVIDIA's files from NVIDIA's GitHub into `to`.
 fn fetch(to: &Path) -> Result<()> {
@@ -416,8 +485,10 @@ mod tests {
             dlss: "quality".to_owned(),
             framegen: None,
             no_framegen_ready: false,
+            fg_type: "auto".to_owned(),
             fps: 1000,
             more: Vec::new(),
+            preload: false,
         }
     }
 
@@ -444,9 +515,29 @@ mod tests {
     #[test]
     fn without_nvidias_files_there_is_no_dlss() {
         let (s, _) = settings(&options(), &[], None);
+        let get = |k: &str| s.get(k).map(String::as_str);
         assert!(!s.contains_key("VICTORY_DLSS") && !s.contains_key("VICTORY_FRAMEGEN"));
-        assert!(!s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT"));
-        assert_eq!(s.get("VICTORY_MENU_DLSS").map(String::as_str), Some("off"));
+        assert_eq!(get("VICTORY_MENU_DLSS"), Some("off"));
+        // FSR 3 frame generation is made ready instead (the layer says whether it can run)
+        assert_eq!((get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("0")));
+        assert_eq!(get("VICTORY_TEXTURE_ROOM_PERCENT"), Some("86"));
+        assert_eq!(get("VICTORY_MENU_FG_TYPE"), Some("auto"));
+    }
+
+    #[test]
+    fn fsr_chosen_leaves_dlss_frame_generation_unasked() {
+        let mut o = options();
+        o.framegen = Some(3);
+        let menu = parse_menu("VICTORY_MENU_FG_TYPE=fsr\r\n");
+        let (s, _) = settings(&o, &menu, Some(Path::new("x")));
+        let get = |k: &str| s.get(k).map(String::as_str);
+        assert_eq!((get("VICTORY_DLSS"), get("VICTORY_FRAMEGEN")), (Some("1"), None));
+        assert_eq!((get("VICTORY_FSR_FRAMEGEN"), get("VICTORY_FRAMEGEN_X")), (Some("1"), Some("3")));
+        assert_eq!((get("VICTORY_MENU_FG_TYPE"), get("VICTORY_MENU_FRAMEGEN")), (Some("fsr"), Some("3")));
+        // dlss: no FSR 3
+        o.fg_type = "dlss".to_owned();
+        let (s, _) = settings(&o, &[], Some(Path::new("x")));
+        assert_eq!((s.get("VICTORY_FRAMEGEN").map(String::as_str), s.get("VICTORY_FSR_FRAMEGEN")), (Some("1"), None));
     }
 
     #[test]

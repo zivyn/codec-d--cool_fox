@@ -9,7 +9,7 @@
 #        3 Series S + DLSS Quality + frame generation 2x (faster, softer)
 #        4 Series X 1440p + DLSS Performance + frame generation 2x
 param(
-    [ValidateSet('1', '2', '3', '4', '5')][string]$Mode = '1',
+    [ValidateSet('1', '2', '3', '4', '5', '6')][string]$Mode = '1',
     [string]$GameDir = '',
     [switch]$Check,
     [switch]$NoBackup
@@ -49,6 +49,7 @@ switch ($Mode) {
     '3' { $opts = @{ SeriesS = $true; FrameGen = $true }; $what = 'Series S, DLSS Quality, frame generation 2x' }
     '4' { $opts = @{ Dlss = 'performance'; FrameGen = $true }; $what = 'Series X 2560x1440, DLSS Performance, frame generation 2x' }
     '5' { $opts = @{ SeriesS = $true; Dlss = 'performance'; FrameGen = $true; Fps = 1000 }; $what = 'EXTREME: Series S, DLSS Performance, frame generation 2x, no cap, big pools, High priority' }
+    '6' { $opts = @{ Dlss = 'performance'; FrameGen = $true; Fps = 1000 }; $what = 'EXTREME: Series X 2560x1440, DLSS Performance, frame generation 2x, no cap, big pools, High priority' }
 }
 $sl = Join-Path $repo 'nvidia-sdk\Streamline\bin\x64'
 $victory = Join-Path $repo 'target\release\victory.exe'
@@ -107,11 +108,20 @@ $more = @{ VICTORY_PLACED_ORDER = '1' }
 if ($cpus -ge 24) { $more.VICTORY_THIN_THREADS = '12'; $more.VICTORY_UNDER_THREADS = '8'; $more.VICTORY_LAND_THREADS = '8' }
 elseif ($cpus -ge 16) { $more.VICTORY_THIN_THREADS = '12'; $more.VICTORY_UNDER_THREADS = '8'; $more.VICTORY_LAND_THREADS = '6' }
 # Extreme: the landing pool sat full at 8 (x6.1-6.6 of 8 in AnyXboxX's heavy scenes), one more pipeline worker.
-if ($Mode -eq '5' -and $cpus -ge 24) { $more.VICTORY_LAND_THREADS = '12'; $more.VICTORY_PIPELINE_WORKERS = '4' }
+if (($Mode -in @('5', '6')) -and $cpus -ge 24) { $more.VICTORY_LAND_THREADS = '12'; $more.VICTORY_PIPELINE_WORKERS = '4' }
 if ($env:title_NO_TUNE -eq '1') { $more = @{}; Write-Host 'title_NO_TUNE=1: foxhound defaults (no pool or placed-order tuning).' }
 else { Write-Host ("Tuning for {0} logical CPUs: {1}" -f $cpus, (($more.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ' ')) }
 $opts.More = $more
-if ($Mode -eq '5') {
+# RTX 50 cards do multi frame generation: 4x there (the layer asks the driver and gives no more than it does).
+# PLAY_FRAMEGEN_X=2..6 overrides. RTX 40 stays at 2x.
+$gpuName = (Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1).Name
+if ($opts.FrameGen) {
+    if ($env:PLAY_FRAMEGEN_X -match '^[2-6]$') { $opts.FrameGenX = [int]$env:PLAY_FRAMEGEN_X }
+    elseif ($gpuName -match 'RTX\s*50\d\d') { $opts.FrameGenX = 4 }
+    $fgx = if ($opts.FrameGenX) { $opts.FrameGenX } else { 2 }
+    Write-Host ('GPU: {0}; frame generation {1}x' -f $gpuName, $fgx)
+}
+if ($Mode -in @('5', '6')) {
     # Raise the game to High priority once it is up (the submitting thread is the limit).
     $null = Start-Job -ArgumentList $repo -ScriptBlock {
         param($r)

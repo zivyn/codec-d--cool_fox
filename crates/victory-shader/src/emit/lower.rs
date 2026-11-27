@@ -7060,7 +7060,7 @@ impl<'a> Lower<'a> {
                 }
                 None => self.handle(site, src, false, (11, 0))?,
             };
-            if Self::wide_loads() {
+            if count > 1 && Self::wide_loads() {
                 for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                     self.write(inst, Reg::S(code + k as u8), x, None);
                 }

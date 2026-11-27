@@ -274,12 +274,9 @@ static SYNC_ROUND_COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 #[cfg(windows)]
 pub(crate) struct SyncedHeaps(Option<u64>);
 
+/// Starts the thread that makes the rounds, once: whether there is one.
 #[cfg(windows)]
-pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
-    if !sync_aside() {
-        sync_heaps();
-        return SyncedHeaps(None);
-    }
+fn sync_thread() -> bool {
     static STARTED: std::sync::Once = std::sync::Once::new();
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
@@ -341,7 +338,45 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
     });
-    if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
+    THREAD.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A round asked for ahead of a submission's preparing (`VICTORY_HEAPS_EARLY`):
+/// the number to wait for ([`SyncedHeaps::asked`]), or 0 if the rounds are not
+/// made by a thread of ours. It is asked when the title's call is in the
+/// line: a round that begins after it sees all the title wrote before the
+/// call, which is all the submission needs, and is made while the thread
+/// prepares what is before it.
+#[cfg(windows)]
+pub(crate) fn ask_round() -> u64 {
+    if !sync_aside() || !sync_thread() {
+        return 0;
+    }
+    let mine = {
+        let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+        SYNC_ASKED.store(true, std::sync::atomic::Ordering::Release);
+        rounds.ask()
+    };
+    SYNC_ROUNDS.1.notify_all();
+    mine
+}
+
+#[cfg(windows)]
+impl SyncedHeaps {
+    /// What a round asked for ahead ([`ask_round`]) is waited for as one begun
+    /// now would be.
+    pub(crate) fn asked(mine: u64) -> Self {
+        SyncedHeaps(Some(mine))
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
+    if !sync_aside() {
+        sync_heaps();
+        return SyncedHeaps(None);
+    }
+    if !sync_thread() {
         sync_heaps();
         return SyncedHeaps(None);
     }

@@ -658,6 +658,7 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
+        let mut peeked: Vec<u32> = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
@@ -705,10 +706,32 @@ impl Memory {
                 }
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
+            } else if page >= victory_shader::emit::PEEK_NOTE {
+                // Not a page: a value a program was asked to show (`VICTORY_PEEK`), 16 bits of it.
+                peeked.push(page);
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
             } else if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
+            }
+        }
+        if !peeked.is_empty() {
+            // The values (offset number, register number: 32 bits from two notes), said for the
+            // first few frames that have them.
+            static PEEKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if PEEKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                let mut values: std::collections::BTreeMap<(u32, u32), [u32; 2]> = Default::default();
+                for note in peeked {
+                    let (k, r, half) = (note >> 24 & 0xF, note >> 20 & 0xF, note >> 16 & 1);
+                    values.entry((k, r)).or_default()[half as usize] = note & 0xFFFF;
+                }
+                let shown: Vec<String> = values
+                    .iter()
+                    .map(|(&(k, r), h)| format!("offset#{k} reg#{r} = {:#010x}", h[1] << 16 | h[0]))
+                    .collect();
+                tracing::warn!(frame = self.frame, values = ?shown, "values a program was asked to show (VICTORY_PEEK)");
             }
         }
         if pages.is_empty() {

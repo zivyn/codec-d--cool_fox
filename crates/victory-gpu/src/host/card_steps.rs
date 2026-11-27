@@ -392,8 +392,71 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+    holder_among(writers.iter().filter(|w| meet((w.from, w.to), (from, to))), from, to)
+}
+
+/// [`holder`] when `index` stands for the first `index.len` of `writers`
+/// (`VICTORY_HOLDER_INDEX=1`): the writers that meet `[from, to)` are found
+/// without looking at all of them, and are looked at in the same order.
+fn holder_indexed(index: &WriterIndex, writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+    let mut at = index.meeting(|i| (writers[i].from, writers[i].to), from, to);
+    at.extend((index.len..writers.len()).filter(|&i| meet((writers[i].from, writers[i].to), (from, to))));
+    holder_among(at.into_iter().map(|i| &writers[i]), from, to)
+}
+
+/// The writers' places by address, to find those that meet a range: indices
+/// sorted by where they begin, and the furthest end of any up to each.
+struct WriterIndex {
+    len: usize,
+    by_from: Vec<usize>,
+    reach: Vec<usize>,
+}
+
+impl WriterIndex {
+    fn new(len: usize, place: impl Fn(usize) -> (usize, usize)) -> WriterIndex {
+        let mut by_from: Vec<usize> = (0..len).collect();
+        by_from.sort_by_key(|&i| (place(i).0, i));
+        let mut reach = Vec::with_capacity(len);
+        let mut far = 0;
+        for &i in &by_from {
+            far = far.max(place(i).1);
+            reach.push(far);
+        }
+        WriterIndex { len, by_from, reach }
+    }
+
+    /// The indices of those that meet `[from, to)`, in order.
+    fn meeting(&self, place: impl Fn(usize) -> (usize, usize), from: usize, to: usize) -> Vec<usize> {
+        let end = self.by_from.partition_point(|&i| place(i).0 < to);
+        let mut out = Vec::new();
+        for k in (0..end).rev() {
+            if self.reach[k] <= from {
+                break;
+            }
+            let i = self.by_from[k];
+            if meet(place(i), (from, to)) {
+                out.push(i);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Whether the writers are found through a [`WriterIndex`]
+/// (`VICTORY_HOLDER_INDEX=1`; off by default).
+fn holder_index_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLDER_INDEX").is_some_and(|v| v == "1"))
+}
+
+fn holder_among<'a>(
+    writers: impl Iterator<Item = &'a Writer>,
+    from: usize,
+    to: usize,
+) -> Result<Arc<Shadow>, &'static str> {
     let mut found: Option<&Arc<Shadow>> = None;
-    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
+    for w in writers {
         match (&w.shadow, found) {
             (None, _) => return Err("a read-back or a value behind a flight is written there"),
             (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
@@ -537,6 +600,43 @@ enum To {
     Buffer(ID3D12Resource),
 }
 
+/// Whether the reads of a level that lie together are one copy
+/// (`VICTORY_STEPS_MERGE_READS=1`; off by default).
+fn merge_reads_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STEPS_MERGE_READS").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: reads of levels, the copies made of them, and
+/// the bytes of gaps they took along.
+static READS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The most bytes between two reads that are still one copy: the places lie
+/// at multiples of 256 in `between`, and a constant buffer of 480 bytes
+/// leaves 32.
+const MERGE_GAP: u64 = 256;
+
+/// Which of `reads` (buffer, offset in it, offset in `between`, bytes) go in
+/// one copy with the one before: the same buffer, the next bytes of it where
+/// `between` has the next ones too, at most `gap` bytes apart. Returns the
+/// first read of each copy and its bytes. Reads are in the order of their
+/// places in `between`.
+fn merged_reads(reads: &[(usize, u64, u64, u64)], gap: u64) -> Vec<(usize, u64)> {
+    let mut out: Vec<(usize, u64)> = Vec::new();
+    for (i, &(buffer, offset, at, len)) in reads.iter().enumerate() {
+        if let Some(last) = out.last_mut() {
+            let (b, o, a, _) = reads[last.0];
+            let end = a + last.1;
+            if b == buffer && at >= end && at - end <= gap && offset >= o && offset - o == at - a {
+                last.1 = at + len - a;
+                continue;
+            }
+        }
+        out.push((i, len));
+    }
+    out
+}
+
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
 /// are copied into `between` (source, offset in it, offset in `between`,
 /// bytes), then `writes` out of it (destination, offset in it, offset in
@@ -595,8 +695,24 @@ fn record(
         } else {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
-        for &(buffer, offset, at, len) in reads {
-            list.CopyBufferRegion(between, at, buffer, offset, len);
+        if merge_reads_on() && reads.len() > 1 {
+            // Places of one host copy that lie together there and in `between`
+            // are one copy of the bytes from the first to the last (what lies
+            // between them in `between` is nobody's).
+            let keys: Vec<(usize, u64, u64, u64)> =
+                reads.iter().map(|&(b, offset, at, len)| (b.as_raw() as usize, offset, at, len)).collect();
+            let copies = merged_reads(&keys, MERGE_GAP);
+            READS[0].fetch_add(reads.len() as u64, Ordering::Relaxed);
+            READS[1].fetch_add(copies.len() as u64, Ordering::Relaxed);
+            READS[2].fetch_add(copies.iter().map(|c| c.1).sum::<u64>() - reads.iter().map(|r| r.3).sum::<u64>(), Ordering::Relaxed);
+            for (first, len) in copies {
+                let (buffer, offset, at, _) = reads[first];
+                list.CopyBufferRegion(between, at, buffer, offset, len);
+            }
+        } else {
+            for &(buffer, offset, at, len) in reads {
+                list.CopyBufferRegion(between, at, buffer, offset, len);
+            }
         }
         list.ResourceBarrier(&barriers);
         for &(buffer, offset, at, len) in writes {
@@ -739,6 +855,13 @@ impl Host {
             }));
             all
         };
+        // The writers that exist now, found by address (`VICTORY_HOLDER_INDEX`);
+        // the copies' destinations pushed below are looked at one by one.
+        let index = holder_index_on().then(|| WriterIndex::new(writers.len(), |i| (writers[i].from, writers[i].to)));
+        let holder_of = |writers: &Vec<Writer>, from: usize, to: usize| match &index {
+            Some(index) => holder_indexed(index, writers, from, to),
+            None => holder(writers, from, to),
+        };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
@@ -761,7 +884,7 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = holder_of(&writers, src, src + len)?;
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -784,7 +907,7 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
+                    let to = holder_of(&writers, dst, dst + len)?;
                     if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
@@ -955,6 +1078,15 @@ pub(super) fn log(frames: f64) {
             "copies recorded for steps done on the card per frame (VICTORY_STEP_MERGE=1): {:.0} planned, {:.0} recorded after joining those that continue each other",
             j[0],
             j[1],
+        );
+    }
+    if merge_reads_on() {
+        let r: Vec<f64> = READS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "reads of steps done on the card per frame (VICTORY_STEPS_MERGE_READS=1): {:.0} places read, {:.0} copies after joining those a few bytes apart, {:.1} KB of gaps read with them",
+            r[0],
+            r[1],
+            r[2] / 1024.0,
         );
     }
     #[cfg(feature = "diagnostics")]
@@ -1187,6 +1319,98 @@ mod tests {
         assert!(!elsewhere(&does, 7, 100, 200));
         assert!(elsewhere(&does, 8, 199, 300));
         assert!(!elsewhere(&does, 8, 200, 300));
+    }
+
+    /// The writers found through the index are those a linear look finds, in
+    /// the same order, and `holder_indexed` answers as `holder` does (the
+    /// same host copy, or the same refusal) for any set of writers and ranges.
+    #[test]
+    fn the_index_of_writers_finds_what_a_look_at_all_of_them_finds() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m) as usize
+        };
+        let data: &'static mut [u8] = Box::leak(vec![0u8; 0x10000].into_boxed_slice());
+        let shadows = [
+            Shadow::unbacked(0x1000, data.as_mut_ptr(), 0x10000, false),
+            Shadow::unbacked(0x1000, data.as_mut_ptr(), 0x10000, false),
+        ];
+        for round in 0..40 {
+            let n = next(60) + 1;
+            let mut writers: Vec<Writer> = (0..n)
+                .map(|_| {
+                    let from = 0x1000 + next(0xf000);
+                    let len = if next(8) == 0 { next(0x8000) } else { next(0x200) };
+                    Writer {
+                        shadow: match next(10) {
+                            0 => None,
+                            k if k < 8 => Some(shadows[0].clone()),
+                            _ => Some(shadows[1].clone()),
+                        },
+                        from,
+                        to: from + len,
+                        copy: next(3) == 0,
+                    }
+                })
+                .collect();
+            let index = WriterIndex::new(writers.len(), |i| (writers[i].from, writers[i].to));
+            // Some pushed after the index was made, as the copies' destinations are.
+            for _ in 0..next(5) {
+                let from = 0x1000 + next(0xf000);
+                writers.push(Writer { shadow: Some(shadows[0].clone()), from, to: from + 1 + next(0x400), copy: true });
+            }
+            for _ in 0..200 {
+                let from = 0x1000 + next(0xf000);
+                let to = (from + 1 + if next(6) == 0 { next(0x4000) } else { next(0x100) }).min(0x11000);
+                let slow = holder(&writers, from, to);
+                let fast = holder_indexed(&index, &writers, from, to);
+                match (slow, fast) {
+                    (Ok(a), Ok(b)) => assert!(Arc::ptr_eq(&a, &b), "round {round}: {from:#x}..{to:#x}"),
+                    (Err(a), Err(b)) => assert_eq!(a, b, "round {round}: {from:#x}..{to:#x}"),
+                    (a, b) => panic!("round {round}: {from:#x}..{to:#x}: {:?} against {:?}", a.is_ok(), b.is_ok()),
+                }
+                let all: Vec<usize> = (0..index.len).filter(|&i| meet((writers[i].from, writers[i].to), (from, to))).collect();
+                assert_eq!(index.meeting(|i| (writers[i].from, writers[i].to), from, to), all);
+            }
+        }
+    }
+
+    /// Reads that lie together in their host copy and in the buffer between
+    /// are one copy; nothing else is, and the bytes the copies read cover
+    /// every byte the reads did, and only gaps of at most 256 more.
+    #[test]
+    fn reads_that_lie_together_are_one_copy() {
+        // (buffer, offset in it, offset in between, bytes): constants of 480
+        // bytes in a ring at multiples of 512, then one elsewhere, then another buffer.
+        let reads = [
+            (1usize, 4096u64, 0u64, 480u64),
+            (1, 4608, 512, 480),
+            (1, 5120, 1024, 480),
+            (1, 9000, 1536, 480), // other place of the buffer: not the next bytes
+            (2, 5632, 2048, 480), // another buffer
+            (2, 6144, 2560, 480),
+            (2, 8192, 3072, 100), // between is next, the buffer's offset is not
+        ];
+        let merged = merged_reads(&reads, 256);
+        assert_eq!(merged, [(0, 1504), (3, 480), (4, 992), (6, 100)]);
+        // What was read is read, and what is added lies in the gaps.
+        let covered = |at: u64| merged.iter().any(|&(i, len)| at >= reads[i].2 && at < reads[i].2 + len);
+        for &(_, _, at, len) in &reads {
+            assert!((at..at + len).all(|x| covered(x)));
+        }
+        let bytes: u64 = merged.iter().map(|m| m.1).sum();
+        let wanted: u64 = reads.iter().map(|r| r.3).sum();
+        assert!(bytes - wanted <= 256 * (reads.len() as u64 - merged.len() as u64));
+        // A gap past the limit, a place behind the last, and nothing.
+        assert_eq!(merged_reads(&[(1, 0, 0, 100), (1, 1000, 1000, 100)], 256).len(), 2);
+        assert_eq!(merged_reads(&[(1, 0, 100, 100), (1, 0, 0, 100)], 256).len(), 2);
+        assert!(merged_reads(&[], 256).is_empty());
+        // Without gaps allowed only touching reads join.
+        assert_eq!(merged_reads(&reads[..3], 0).len(), 3);
+        assert_eq!(merged_reads(&[(1, 0, 0, 512), (1, 512, 512, 512)], 0), [(0, 1024)]);
     }
 
     /// A value written behind a flight, or a read-back, is in no host copy

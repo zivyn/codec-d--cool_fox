@@ -3637,6 +3637,9 @@ fn relay_worker() {
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
+                // Nothing behind them, and the title is told something: the
+                // landing its next frame waits for ([`crate::land::tail`]).
+                let tail = line.line.is_empty() && items.iter().any(|l| matches!(l, Late::Signal(..)));
                 line.in_hand = items
                     .iter()
                     .filter_map(|l| match l {
@@ -3647,11 +3650,11 @@ fn relay_worker() {
                 if card_steps::stage() > 0 {
                     line.landing = card_steps::writers(&items);
                 }
-                break Ok(items);
+                break Ok((items, tail));
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok((items, tail)) => host.relay_land(items, tail, &mut fetch),
             Err(target) => {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
@@ -5149,8 +5152,10 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    fn relay_land(&self, items: Vec<Late>, tail: bool, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
+        let _tail = crate::land::tail(tail);
+        let (mut card_us, mut pc_us) = (0u64, 0u64);
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
             let flights: Vec<&Flight> = items
@@ -5185,14 +5190,18 @@ impl Host {
                 }
                 let mut hand_back = relay_hand_back(&back);
                 stage.next("landing: copies in the card's memory");
+                let began = std::time::Instant::now();
                 self.relay_card_back(&plans, fetch, &mut || {
                     if crate::land::on() {
                         let _looking = crate::timeline::span("landing: looking through copies, beside the fetch");
                         hand_back.look(crate::land::stat::SCAN_BESIDE);
                     }
                 });
+                card_us = began.elapsed().as_micros() as u64;
                 stage.next("landing: copies in the PC's memory");
+                let began = std::time::Instant::now();
                 hand_back.merge();
+                pc_us = began.elapsed().as_micros() as u64;
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
@@ -5250,6 +5259,13 @@ impl Host {
         self.log_messages();
         crate::land::spent(crate::land::stat::REST, telling);
         RELAY_STATS[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if tail {
+            use crate::land::{count, stat};
+            count(stat::TAIL_N, 1);
+            count(stat::TAIL_US, landing.elapsed().as_micros() as u64);
+            count(stat::TAIL_CARD_US, card_us);
+            count(stat::TAIL_PC_US, pc_us);
+        }
         {
             let mut line = line();
             let Line {
@@ -5806,6 +5822,9 @@ impl Host {
         // what they write.
         // Or the reads are done on the card, behind the flights.
         let own = if late { self.card_steps(runs) } else { None };
+        // A round of the heaps' records asked for as the submission came into
+        // the line (`VICTORY_HEAPS_EARLY`), unless it has to wait for flights.
+        let mut early = if late { crate::queue::heaps_round() } else { 0 };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -5814,6 +5833,8 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            // What the flights land may be descriptors: a round after it.
+            early = 0;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -5828,7 +5849,11 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        let heaps_synced = if early > 0 {
+            crate::descriptor::SyncedHeaps::asked(early)
+        } else {
+            crate::descriptor::begin_sync_heaps()
+        };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {

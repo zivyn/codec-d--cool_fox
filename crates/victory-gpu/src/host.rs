@@ -2840,6 +2840,12 @@ fn flying() -> bool {
 /// runs steps of ours that may read or write it anywhere; what the
 /// flights' shaders write is not there yet.
 fn late_blocked(runs: &[&HostList]) -> Option<usize> {
+    late_blocked_counted(runs, true)
+}
+
+/// [`late_blocked`]; `count` whether the kind of read is counted for the
+/// frame line (not when only asking, as [`blocked_cut`] does).
+fn late_blocked_counted(runs: &[&HostList], count: bool) -> Option<usize> {
     let (written, copies) = {
         let line = line();
         if line.written.is_empty() {
@@ -2847,7 +2853,83 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), card_steps::copies(&line))
     };
-    blocked_by(&written, runs, true).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+    blocked_by(&written, runs, count).or_else(|| card_steps::copied_read(&copies, runs).then_some(WHY_READ))
+}
+
+/// What to do with a submission of several parts ([`joins`]) when preparing
+/// it would wait for flights ([`late_blocked`]): `VICTORY_SPLIT_BLOCKED=1`
+/// sends the parts in front of the first that waits, prepared and sent at
+/// once, and then the rest; `=2` only counts what it would do (the frame
+/// line says), for a run to compare with. Off by default.
+///
+/// Why: a joined submission waits for the flights its worst part reads from
+/// before it does anything (profile sub1, cell, two of four frames: one
+/// submission of 36 lists stood 61 and 117 ms at the start, the card running
+/// the flights it waited for, and then took 55 ms of the thread's work while
+/// the card ran its other work: the two never overlapped). The parts in
+/// front of that one read nothing the flights write; sent first, their
+/// preparing goes on while the flights run, and the card has their lists
+/// sooner.
+///
+/// What it does not change: the order of the lists on the queue (the parts
+/// are the same ones, in the same order, in calls of their own as they were
+/// before they were joined), and the waits (the part that reads from flights
+/// waits for the same ones; the parts before it do not write what it reads,
+/// [`joinable`] saw to that).
+fn split_blocked() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_SPLIT_BLOCKED").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Since the last frame-rate line: submissions of several parts that waited
+/// for flights and had parts in front of the wait (split, or in `=2` only
+/// counted), the lists of those parts, and all the lists of those
+/// submissions.
+static BLOCKED_SPLITS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Takes [`BLOCKED_SPLITS`] for the frame-rate line.
+pub(crate) fn take_blocked_splits() -> Option<[u64; 3]> {
+    (split_blocked() > 0).then(|| [0, 1, 2].map(|i| BLOCKED_SPLITS[i].swap(0, Ordering::Relaxed)))
+}
+
+/// Of the places `parts` of a submission begin at (in `order`, ascending, the
+/// first part beginning at 0), the last at which what comes before does not
+/// wait (`waits` of the first `n` places of the order), if the whole of
+/// `len` places waits. What waits only grows with the places taken, so the
+/// parts in front of the first that waits are found by a bisection.
+fn cut_before_wait(parts: &[usize], len: usize, waits: impl Fn(usize) -> bool) -> Option<usize> {
+    if parts.is_empty() || !waits(len) {
+        return None;
+    }
+    let free = parts.partition_point(|&at| !waits(at));
+    free.checked_sub(1).map(|i| parts[i])
+}
+
+/// Where a submission of `lists` run in `order`, joined from the parts that
+/// begin at `parts`, is to be cut ([`split_blocked`]), if it is.
+fn blocked_cut(lists: &[crate::list::Detached], order: &[usize], parts: &[usize]) -> Option<usize> {
+    let mode = split_blocked();
+    if mode == 0 || parts.is_empty() || !flying() {
+        return None;
+    }
+    let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
+    let cut = cut_before_wait(parts, runs.len(), |n| late_blocked_counted(&runs[..n], false).is_some())?;
+    BLOCKED_SPLITS[0].fetch_add(1, Ordering::Relaxed);
+    BLOCKED_SPLITS[1].fetch_add(cut as u64, Ordering::Relaxed);
+    BLOCKED_SPLITS[2].fetch_add(runs.len() as u64, Ordering::Relaxed);
+    (mode == 1).then_some(cut)
+}
+
+/// The places at which parts begin in the two halves of a submission cut at
+/// `cut` (a place where a part begins, which begins the second half).
+fn parts_around(parts: &[usize], cut: usize) -> (Vec<usize>, Vec<usize>) {
+    let first = parts.iter().copied().filter(|&p| p < cut).collect();
+    let second = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+    (first, second)
 }
 
 /// Whether a small fill of upload memory, or copy of a title buffer, goes on without waiting for
@@ -3768,7 +3850,57 @@ pub(crate) use stamps::{timeline_ready, timeline_restart, timeline_stamps};
 
 #[cfg(test)]
 mod late_tests {
-    use super::{continues, join_ranges, touches};
+    use super::{continues, cut_before_wait, join_ranges, parts_around, split, touches};
+
+    /// Parts of a joined submission (lists 0..12, parts beginning at 3, 5, 9)
+    /// are cut in front of the first that waits, and only if the whole does.
+    #[test]
+    fn a_joined_submission_is_cut_in_front_of_the_part_that_waits() {
+        let parts = [3, 5, 9];
+        // What waits grows with the lists taken: from the list `from` on.
+        let waits = |from: usize| move |n: usize| n > from;
+        // The part at 9 reads from flights (a list at 10): cut at 9.
+        assert_eq!(cut_before_wait(&parts, 12, waits(9)), Some(9));
+        // The part at 5 (list 6): the parts before it go, cut at 5.
+        assert_eq!(cut_before_wait(&parts, 12, waits(5)), Some(5));
+        // The first part itself (a list at 1 or 2): nothing in front of it.
+        assert_eq!(cut_before_wait(&parts, 12, waits(1)), None);
+        assert_eq!(cut_before_wait(&parts, 12, waits(2)), None);
+        // The list at 3 is the first of the second part: the first part
+        // (lists 0..3) goes alone.
+        assert_eq!(cut_before_wait(&parts, 12, waits(3)), Some(3));
+        assert_eq!(cut_before_wait(&parts, 12, waits(4)), Some(3));
+        // Nothing waits, or one part only: no cut.
+        assert_eq!(cut_before_wait(&parts, 12, |_| false), None);
+        assert_eq!(cut_before_wait(&[], 12, |_| true), None);
+        // Waiting from the first list on: nothing is in front of it.
+        assert_eq!(cut_before_wait(&parts, 12, |n| n > 0), None);
+    }
+
+    /// Cut at a place where a part begins, the two halves have the parts
+    /// that begin in them, and the lists they run are the whole's, in order.
+    #[test]
+    fn the_halves_of_a_cut_submission_run_the_same_lists_in_the_same_order() {
+        let lists = vec!['a', 'b', 'c', 'd', 'e', 'f'];
+        // The order runs list 4, then 0, 1, 2, 3, 5; parts begin at 2, 4.
+        let order = vec![4, 0, 1, 2, 3, 5];
+        let parts = [2, 4];
+        let cut = 4;
+        let (first, second) = parts_around(&parts, cut);
+        assert_eq!(first, [2]);
+        assert!(second.is_empty());
+        let Ok([(la, oa), (lb, ob)]) = split(lists.clone(), order.clone(), cut) else {
+            panic!("no cut");
+        };
+        let run = |lists: &[char], order: &[usize]| order.iter().map(|&i| lists[i]).collect::<Vec<_>>();
+        let mut both = run(&la, &oa);
+        both.extend(run(&lb, &ob));
+        assert_eq!(both, run(&lists, &order));
+        assert_eq!(run(&la, &oa), ['e', 'a', 'b', 'c']);
+        // A cut in the middle of the parts keeps the later ones, from 0.
+        let (first, second) = parts_around(&[2, 4, 7, 9], 4);
+        assert_eq!((first, second), (vec![2], vec![3, 5]));
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5230,6 +5362,17 @@ impl Host {
                 Ok([(lists, order), (more, behind)]) => {
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+                    self.execute_parts(lists, order, &first);
+                    self.execute_parts(more, behind, &second);
+                }
+                Err((lists, order)) => self.send_late(lists, order, parts),
+            }
+            return;
+        }
+        if let Some(cut) = blocked_cut(&lists, &order, parts) {
+            match split(lists, order, cut) {
+                Ok([(lists, order), (more, behind)]) => {
+                    let (first, second) = parts_around(parts, cut);
                     self.execute_parts(lists, order, &first);
                     self.execute_parts(more, behind, &second);
                 }

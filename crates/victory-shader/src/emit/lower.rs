@@ -1356,6 +1356,8 @@ thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`super::legacy_assume`], for its thread only.
+    pub(super) static TEST_LEGACY_ASSUME: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -4345,6 +4347,24 @@ impl<'a> Lower<'a> {
     /// `0 × anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
+        if super::legacy_assume() {
+            // The product differs from the host's only where a zero meets an infinity
+            // or a NaN: a factor the program makes none of is a number (`inf_prone`).
+            let (pa, pb) = (self.s.m.inf_prone(a, 8), self.s.m.inf_prone(b, 8));
+            let not_zero = |l: &Self, x: V| l.s.m.float_k(x).is_some_and(|k| k != 0.0 && k.is_finite());
+            if a == b || !pa && !pb || not_zero(self, a) || not_zero(self, b) {
+                return self.s.m.bin(c, Bin::Mul, a, b);
+            }
+            // One of them a number: it is the one a zero decides by (a zero in the other
+            // gives a product of zero, though maybe of the other sign).
+            if !pa || !pb {
+                let m = self.s.m.bin(c, Bin::Mul, a, b);
+                let zero = self.s.m.f32(0);
+                let number = if pa { b } else { a };
+                let z = self.s.m.cmp(c, pred::OEQ, number, zero);
+                return self.s.m.select(c, z, zero, m);
+            }
+        }
         if host_rdna() & super::rdna::LEGACY != 0 {
             let m = self.s.m.bin(c, Bin::Mul, a, b);
             let zero = self.s.m.f32(0);

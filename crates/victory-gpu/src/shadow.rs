@@ -4448,6 +4448,15 @@ impl Shadow {
         self.card.is_some() && self.gpu_only.load(Ordering::Acquire)
     }
 
+    /// Whether what a landing puts into 64 KiB block `block` of title memory
+    /// may be guarded again after it ([`crate::land::reguard_on`]): as
+    /// [`Shadow::unwatched_landing`], and the block lies in the buffer whole,
+    /// so that no other memory shares it.
+    pub(crate) fn reguardable_block(&self, block: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        self.unwatched_landing() && start <= block * 65536 && (block + 1) * 65536 <= end
+    }
+
     /// What to do with the landing of what shaders wrote to this copy, now
     /// ([`crate::land::quiet`]; called once per copy and landing, by the
     /// thread that lands).

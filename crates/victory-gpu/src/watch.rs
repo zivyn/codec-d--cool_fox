@@ -1632,19 +1632,91 @@ pub(crate) fn kernel_reset(at: usize, len: usize) {
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
-    {
-        let frame = crate::frame::current();
-        let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
-        (first..=last).for_each(|page| LANDED.note(page, frame));
-        for (block, others) in elsewhere(at, len) {
-            let block = block / KERNEL_PAGE;
-            let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
-            for other in others {
-                here.clone().for_each(|page| LANDED.note(page - block + other / KERNEL_PAGE, frame));
-            }
+    note_landing(at, len);
+    open_for_writing(at, len);
+}
+
+fn note_landing(at: usize, len: usize) {
+    let frame = crate::frame::current();
+    let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);
+    (first..=last).for_each(|page| LANDED.note(page, frame));
+    for (block, others) in elsewhere(at, len) {
+        let block = block / KERNEL_PAGE;
+        let here = first.max(block)..=last.min(block + BLOCK / KERNEL_PAGE - 1);
+        for other in others {
+            here.clone().for_each(|page| LANDED.note(page - block + other / KERNEL_PAGE, frame));
         }
     }
-    open_for_writing(at, len);
+}
+
+/// [`landing`] of what a landing will put back as it was ([`landed_reguard`]):
+/// returns the blocks of `[at, at + len)` that were guarded, clean (nothing
+/// written in them since a copy took them), shown at no other address and
+/// not written by the kernel now, and are open now.
+pub(crate) fn landing_open(at: usize, len: usize) -> Vec<usize> {
+    note_landing(at, len);
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    if !light() || !PROTECTED.any(first, last) {
+        open_for_writing(at, len);
+        return Vec::new();
+    }
+    let clean: Vec<usize> = {
+        let mut g = guards_timed();
+        let clean = g
+            .clean
+            .range(first..last)
+            .filter(|&b| g.protected.contains(b) && !g.aliased.contains(b) && !g.left_alone(b))
+            .collect();
+        open(&mut g, at, at.saturating_add(len));
+        clean
+    };
+    // A placed texture there changes with no descriptor written.
+    crate::descriptor::host::remapped(at, len);
+    clean
+}
+
+/// What a landing put into `blocks` (opened by [`landing_open`], noted to the
+/// journal as a landing's) is put back as it was before: read-only, clean and
+/// known by its bit, so that the next asking does not tell the blocks written
+/// and the refresh does not take them whole. A block someone guarded in the
+/// meantime, or that the kernel writes now, is left as it is. The title's CPU
+/// cannot write what the caller asks this for (buffers of default heaps; the
+/// blocks lie in them whole): what the kernel or DirectStorage write there is
+/// told by [`kernel_writing`] and [`writing`], which open the block again.
+pub(crate) fn landed_reguard(blocks: &[usize]) {
+    let mut again: Vec<usize> = Vec::with_capacity(blocks.len());
+    {
+        let mut g = guards_timed();
+        for &block in blocks {
+            if !g.protected.contains(block) && !g.left_alone(block) && !g.absent.contains(block) {
+                again.push(block);
+            }
+        }
+        let mut run: Option<(usize, usize)> = None;
+        for &block in &again {
+            match run {
+                Some((from, to)) if to == block => run = Some((from, block + 1)),
+                Some((from, to)) => {
+                    protect_here(&mut g, from, to);
+                    run = Some((block, block + 1));
+                }
+                None => run = Some((block, block + 1)),
+            }
+        }
+        if let Some((from, to)) = run {
+            protect_here(&mut g, from, to);
+        }
+    }
+    publish(&again);
+}
+
+/// Whether every block of `[at, at + len)` is read-only by our hand and clean
+/// (for the tests).
+#[cfg(test)]
+pub(crate) fn clean_now(at: usize, len: usize) -> bool {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let g = guards();
+    (first..last).all(|b| g.protected.contains(b) && g.clean.contains(b))
 }
 
 

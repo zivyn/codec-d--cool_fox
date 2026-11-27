@@ -504,6 +504,7 @@ impl Work for Job {
 
     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
         let (most, most_lists) = crate::host::joins();
+        let most = ramp_parts(most);
         if most < 2 {
             return Err(next);
         }
@@ -582,6 +583,7 @@ impl Work for Job {
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
             Job::Run(queue, lists, order) => {
                 let _ = queue;
+                ramp_grow();
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
                 match crate::host::host() {
@@ -592,6 +594,7 @@ impl Work for Job {
             }
             Job::Joined(queue, lists, order, parts, signals) => {
                 let _ = queue;
+                ramp_grow();
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
@@ -614,6 +617,7 @@ impl Work for Job {
                 }
             }
             Job::Present(texture, overlay, shown) => {
+                ramp_reset();
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
@@ -642,7 +646,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
-static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -655,6 +659,67 @@ const BUSY: usize = 8;
 const FORCED: usize = 9;
 /// Parts prepared together with the one before them.
 const JOINED: usize = 10;
+/// Submissions that took fewer parts along than they might have
+/// ([`ramp_parts`]).
+const RAMPED: usize = 11;
+
+/// How many parts the next submission of the line may take along
+/// (`VICTORY_JOIN_RAMP=1`; off by default): after a present only its own,
+/// then twice as many for each submission done, up to [`crate::host::joins`]
+/// (`VICTORY_JOIN_RAMP_FIRST=<n>`: the first's).
+///
+/// Why: after the frame's last submission the card stood idle 30 ms (a
+/// profile of the window spot: 131.7 to 162.1 ms) while the thread prepared
+/// one submission of the next frame's first parts, joined from what was in
+/// the line, for 35 ms. Joined parts are all sent when the last of them is
+/// prepared; with the card idle, the first part sent alone puts it to work
+/// 30 ms sooner, and the rest is prepared while it runs. Later in the frame
+/// the card has work in the air and the joins are whole.
+static RAMP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+fn ramp_first() -> Option<usize> {
+    static FIRST: OnceLock<Option<usize>> = OnceLock::new();
+    *FIRST.get_or_init(|| {
+        (std::env::var_os("VICTORY_JOIN_RAMP").is_some_and(|v| v == "1"))
+            .then(|| number("VICTORY_JOIN_RAMP_FIRST").unwrap_or(1).max(1))
+    })
+}
+
+/// The parts a submission may take with a ramp at `ramp`, of `most`.
+fn ramped(ramp: usize, most: usize) -> usize {
+    ramp.min(most)
+}
+
+/// The ramp after a submission went.
+fn ramp_next(ramp: usize) -> usize {
+    ramp.saturating_mul(2)
+}
+
+/// `most` parts, or fewer while the ramp is on and low.
+fn ramp_parts(most: usize) -> usize {
+    if ramp_first().is_none() {
+        return most;
+    }
+    let ramp = ramped(RAMP.load(Relaxed), most);
+    if ramp < most {
+        STATS[RAMPED].fetch_add(1, Relaxed);
+    }
+    ramp
+}
+
+/// A present went: the next submissions begin the ramp again.
+fn ramp_reset() {
+    if let Some(first) = ramp_first() {
+        RAMP.store(first, Relaxed);
+    }
+}
+
+/// A submission went: the next may take twice as many.
+fn ramp_grow() {
+    if ramp_first().is_some() {
+        RAMP.store(ramp_next(RAMP.load(Relaxed)), Relaxed);
+    }
+}
 
 /// How many submissions may be in the line when a submit call returns
 /// (`VICTORY_SUBMIT_DEPTH`; 64: about two frames of the title's).
@@ -882,7 +947,7 @@ pub(super) fn line(frames: f64) {
         "submissions prepared by a thread of ours, per frame (VICTORY_ASYNC_SUBMIT): {:.1} in {:.1} presents, {:.1} in the line \
          when one was added (at most {:.0}); that thread worked {:.1} ms; threads of the title waited {:.1} ms for room in the \
          line, {:.1} ms at presents, {:.1} ms in {:.1} drains; waits not met at a present {:.2}; {:.1} of the \
-         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS)",
+         submissions were prepared together with the one before them (VICTORY_JOIN_PARTS); {:.1} attempts to join were cut short to fewer parts by the ramp after a present (VICTORY_JOIN_RAMP)",
         s[RUNS] / frames,
         s[PRESENTS] / frames,
         s[DEPTH] / s[RUNS].max(1.0),
@@ -893,7 +958,8 @@ pub(super) fn line(frames: f64) {
         ms(DRAINING),
         s[DRAINS] / frames,
         s[FORCED] / frames,
-        s[JOINED] / frames
+        s[JOINED] / frames,
+        s[RAMPED] / frames
     );
     if let Some([splits, before, lists]) = crate::host::take_blocked_splits() {
         tracing::info!(
@@ -1041,6 +1107,28 @@ mod tests {
         let mut done = false;
         lane.push_behind(1, false, T::Signal(f, 2, log.clone()), || done = true);
         assert!(done);
+    }
+
+    /// After a present a submission takes one part (or the first's), then two,
+    /// four, up to what joins allow; a ramp not begun lets all be joined.
+    #[test]
+    fn the_ramp_after_a_present_doubles_up_to_the_joins() {
+        let (mut ramp, most) = (1usize, 8usize);
+        let mut sent = Vec::new();
+        for _ in 0..6 {
+            sent.push(ramped(ramp, most));
+            ramp = ramp_next(ramp);
+        }
+        assert_eq!(sent, [1, 2, 4, 8, 8, 8]);
+        assert_eq!(ramped(usize::MAX, 8), 8);
+        assert_eq!(ramp_next(usize::MAX), usize::MAX);
+        // A first of 3 goes 3, 6, then all that are allowed.
+        let (mut ramp, mut sent) = (3usize, Vec::new());
+        for _ in 0..3 {
+            sent.push(ramped(ramp, 8));
+            ramp = ramp_next(ramp);
+        }
+        assert_eq!(sent, [3, 6, 8]);
     }
 
     /// A submission is done with the round of the heaps' records asked for the

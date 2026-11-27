@@ -401,9 +401,73 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// The buffers (title address, bytes) the captured operations write through
+/// UAVs, up to 4 MiB each ([`dump_uavs`]).
+static UAV_BUFFERS: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes a buffer a listed operation writes through a UAV, for
+/// `VICTORY_CAPTURE_UAVS=1`.
+pub(crate) fn note_uav_buffer(range: Option<(u64, u64)>) {
+    let Some((at, len)) = range else { return };
+    if len == 0 || len > 4 << 20 || !crate::switch::on("VICTORY_CAPTURE_UAVS") {
+        return;
+    }
+    let mut buffers = UAV_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    if buffers.len() < 256 && !buffers.contains(&(at, len)) {
+        buffers.push((at, len));
+    }
+}
+
+/// `VICTORY_CAPTURE_UAVS=1` (with a capture): at the dump, one line per buffer
+/// the captured operations write through UAVs, to `frame-<n>-uavs.tsv`: what
+/// the title's memory holds of it now (all the submissions have run and
+/// landed: what the title's CPU would read), and what its copy is. The
+/// terrain's feedback list (`VICTORY_CAPTURE_UAVS` and the ops file name it by
+/// address) is read this way: a list that is all zeros with the feedback
+/// passes running means nothing was asked for, or never landed.
+/// Columns: address, bytes, mapped, nonzero dwords, nonzero dwords in each
+/// 64 KiB, the first 12 nonzero dwords as `index=hex`, the copy.
+fn dump_uavs(frame: u64, folder: &std::path::Path) {
+    let buffers = std::mem::take(&mut *UAV_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
+    if buffers.is_empty() {
+        return;
+    }
+    let mut text = String::new();
+    for (at, len) in buffers {
+        let (p, n) = (at as *const u8, len as usize);
+        let mapped = crate::texture::mapped_bytes(p, n);
+        let mut line = format!("{at:#x}	{len}	{mapped}");
+        if mapped == len && n.is_multiple_of(4) {
+            // SAFETY: `n` committed bytes of title memory.
+            let words = unsafe { std::slice::from_raw_parts(at as *const u32, n / 4) };
+            let per_block: Vec<usize> =
+                words.chunks(16 << 10).map(|c| c.iter().filter(|&&w| w != 0).count()).collect();
+            let first: Vec<String> = words
+                .iter()
+                .enumerate()
+                .filter(|&(_, &w)| w != 0)
+                .take(12)
+                .map(|(i, w)| format!("{i}={w:x}"))
+                .collect();
+            line += &format!("	{}	{:?}	[{}]", per_block.iter().sum::<usize>(), per_block, first.join(" "));
+        } else {
+            line += "	not all mapped	-	-";
+        }
+        line += &format!("	{}
+", crate::shadow::describe_copy(at, len));
+        text += &line;
+    }
+    let _ = std::fs::write(folder.join(format!("frame-{frame}-uavs.tsv")), text);
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    if crate::switch::on("VICTORY_CAPTURE_UAVS")
+        && let Some(folder) = folder()
+    {
+        dump_uavs(frame, folder);
+    }
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {

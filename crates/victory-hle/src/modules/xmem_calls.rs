@@ -41,6 +41,11 @@ static VIEWS: [AtomicU64; 3] = zeros();
 static LOCKED: [AtomicU64; 2] = zeros();
 /// By host call (unmap, split, map, commit): count, ns, longest ns.
 static HOST: [AtomicU64; 12] = zeros();
+/// Of the changes of mapping done page by page: ns before the host calls
+/// (what is noted and told of each page), in them (the wall time of the
+/// group's host calls), after them; and pages left alone because they showed
+/// what was asked already (`VICTORY_ALIAS_FAST`).
+static PHASES: [AtomicU64; 4] = zeros();
 static LAST: AtomicU64 = AtomicU64::new(0);
 static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
@@ -113,6 +118,7 @@ struct Window {
     views: Vec<u64>,
     locked: Vec<u64>,
     host: Vec<u64>,
+    phases: Vec<u64>,
 }
 
 fn take(of: &[AtomicU64]) -> Vec<u64> {
@@ -147,15 +153,17 @@ fn report_if_due() {
         views: take(&VIEWS),
         locked: take(&LOCKED),
         host: take(&HOST),
+        phases: take(&PHASES),
     };
     if on() && window.calls.iter().any(|&n| n > 0) {
         let (calls, host) = (by_call(&window), host_calls(&window));
         tracing::info!(
-            "title memory calls, last {seconds:.1} s (VICTORY_MEMORY_STATS){calls}; waited for the views' lock {} times {:.0} ms (longest {:.1}); {}; host calls under them: {host}",
+            "title memory calls, last {seconds:.1} s (VICTORY_MEMORY_STATS){calls}; waited for the views' lock {} times {:.0} ms (longest {:.1}); {}; host calls under them: {host}; page by page: {}",
             window.views[0],
             ms(window.views[1]),
             ms(window.views[2]),
             readers_line(&window, &readers),
+            phases_line(&window),
         );
     }
 }
@@ -175,6 +183,28 @@ fn by_call(w: &Window) -> String {
         );
     }
     text
+}
+
+/// A group of pages changed: the time before its host calls, in them and after.
+pub(super) fn phases(before: u64, host: u64, after: u64) {
+    PHASES[0].fetch_add(before, Ordering::Relaxed);
+    PHASES[1].fetch_add(host, Ordering::Relaxed);
+    PHASES[2].fetch_add(after, Ordering::Relaxed);
+}
+
+/// Pages that showed what was asked already, left alone.
+pub(super) fn left_alone(pages: u64) {
+    PHASES[3].fetch_add(pages, Ordering::Relaxed);
+}
+
+fn phases_line(w: &Window) -> String {
+    format!(
+        "{:.0} ms noting and telling before the host calls, {:.0} ms in them, {:.0} ms after, {} pages left alone",
+        ms(w.phases[0]),
+        ms(w.phases[1]),
+        ms(w.phases[2]),
+        w.phases[3]
+    )
 }
 
 fn host_calls(w: &Window) -> String {
@@ -231,6 +261,7 @@ pub(super) fn describe(calls: u64, pages: u64, ns: u64, longest: u64) -> String 
         views: vec![0; 3],
         locked: vec![0; 2],
         host: vec![0; 12],
+        phases: vec![0; 4],
     };
     (w.calls[0], w.pages[0], w.ns[0], w.longest[0]) = (calls, pages, ns, longest);
     by_call(&w)

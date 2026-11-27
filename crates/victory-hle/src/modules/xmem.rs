@@ -538,7 +538,7 @@ struct Pages {
 struct Shown {
     /// The addresses that show a page, by the page's section and index.
     /// Views of more than [`SHORT`] pages are in `long`.
-    pages: HashMap<(usize, usize), Vec<usize>>,
+    pages: HashMap<(usize, usize), victory_gpu::addrset::AddressSet>,
     /// Address, bytes, section, first page.
     long: Vec<(usize, usize, usize, usize)>,
 }
@@ -574,7 +574,7 @@ impl Shown {
         for k in 0..len / PAGE {
             let key = (section, slice.index + k);
             if let Some(at) = self.pages.get_mut(&key) {
-                at.retain(|&at| at != base + k * PAGE);
+                at.remove(base + k * PAGE);
                 if at.is_empty() {
                     self.pages.remove(&key);
                 }
@@ -586,7 +586,7 @@ impl Shown {
     fn at(&self, slice: &Slice) -> Vec<(usize, usize)> {
         let section = Arc::as_ptr(&slice.section) as usize;
         let mut out: Vec<(usize, usize)> =
-            self.pages.get(&(section, slice.index)).into_iter().flatten().map(|&at| (at, PAGE)).collect();
+            self.pages.get(&(section, slice.index)).into_iter().flat_map(|at| at.iter()).map(|at| (at, PAGE)).collect();
         for &(base, len, of, index) in &self.long {
             if of == section && (index..index + len / PAGE).contains(&slice.index) {
                 out.push((base + (slice.index - index) * PAGE, PAGE));
@@ -1284,6 +1284,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
         calls::waited_for_views(asked.elapsed());
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
+        let mut left = 0u64;
         for &(to, from) in &pages[at..] {
             // A page the group changes already, or one it would be mapped
             // from: after it.
@@ -1292,15 +1293,60 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             }
             let slice = from.map(|from| physical.slice_at(from));
             ok &= !matches!(slice, Some(None));
+            at += 1;
+            if alias_fast() && shows_already(&physical, to, slice.as_ref()) {
+                left += 1;
+                continue;
+            }
             touched.insert(to);
             ops.push(Op::new(to, slice.flatten()));
-            at += 1;
+        }
+        calls::left_alone(left);
+        if ops.is_empty() {
+            continue;
         }
         let _changing = changing(fresh_maps() && ops.iter().all(|op| no_view(&physical, op.at, PAGE)));
         ok &= change(&mut physical, ops);
     }
     ok
 }
+
+/// Whether the page at `to` is as a mapping to `slice` (`None`: unmapped)
+/// would make it: the same physical page already, or nothing there to take
+/// away. A source that is not mapped (`Some(None)`) is for the mapping to
+/// report, not to skip.
+fn shows_already(physical: &Physical, to: usize, slice: Option<&Option<Slice>>) -> bool {
+    match (physical.slice_at(to), slice) {
+        (None, None) => true,
+        (Some(now), Some(Some(wanted))) => Arc::ptr_eq(&now.section, &wanted.section) && now.index == wanted.index,
+        _ => false,
+    }
+}
+
+/// Whether the page-by-page changes of mapping skip pages that show what is
+/// asked, and do small groups themselves (`VICTORY_ALIAS_FAST=1`; off:
+/// every page is unmapped and mapped again, and a group of three or more
+/// goes to the threads that map).
+///
+/// The title's tiled heaps are set to one page of zeros, and parts of them to
+/// the pages that stream in, again and again, a thousand calls and 4,000
+/// pages a second, 90 us a page (unmap, split, map, each waiting for the
+/// process's address-space lock). A page that shows the page it is to show
+/// changes nothing for the title or the GPU side; one that is unmapped and
+/// is to be unmapped has nothing to do (and keeps its placeholder, which
+/// the next mapping would otherwise split anew).
+fn alias_fast() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_ALIAS_FAST").is_some_and(|v| v == "1"));
+    #[cfg(test)]
+    if ALIAS.load(Ordering::Relaxed) == 2 {
+        return true;
+    }
+    *ON
+}
+
+/// Tests turn it on for a while (2).
+#[cfg(test)]
+static ALIAS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Maps (page number not 0) or unmaps each address; false if a page is not
 /// the title's or the host refuses one.
@@ -1483,6 +1529,7 @@ impl Op {
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+    let began = std::time::Instant::now();
     for op in &mut ops {
         let there = physical
             .views
@@ -1517,7 +1564,9 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             op.own = true;
         }
     }
+    let before = began.elapsed();
     let done = pool::all(ops);
+    let hosted = began.elapsed();
     let mut ok = true;
     for (op, done) in done {
         match op.slice {
@@ -1534,6 +1583,8 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             _ => ok &= done,
         }
     }
+    let ns = |d: std::time::Duration| d.as_nanos() as u64;
+    calls::phases(ns(before), ns(hosted - before), ns(began.elapsed() - hosted));
     ok
 }
 
@@ -1615,8 +1666,10 @@ mod pool {
 
     /// Runs `ops`; each with whether the host did it.
     pub(super) fn all(ops: Vec<Op>) -> Vec<(Op, bool)> {
-        // Waking the others takes longer than a few quick calls.
-        if ops.len() < 3 {
+        // Waking the others takes longer than a few quick calls (and the host
+        // does them one at a time whoever calls: `VICTORY_ALIAS_FAST` takes
+        // up to 8 so).
+        if ops.len() < if super::alias_fast() { 8 } else { 3 } {
             return ops
                 .into_iter()
                 .map(|op| {
@@ -2504,6 +2557,103 @@ mod tests {
         let line = calls::describe(4, 8, 2_000_000, 1_500_000);
         assert!(line.contains("map pages 4 calls, 8 pages, 2 ms (500 us a call, longest 1.5 ms)"), "{line}");
         assert!(!line.contains("unmap pages"), "{line}");
+    }
+
+    /// `VICTORY_ALIAS_FAST`: a page that shows what it is to show is left
+    /// alone (the two-page view it is in stays one view), an unmapped one
+    /// that is to be unmapped keeps its hole, and the rest is what it was.
+    #[test]
+    fn pages_that_show_what_is_asked_are_left_alone() {
+        ALIAS.store(2, Ordering::Relaxed);
+        let pages = allocate(3);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 8 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        let (a, b) = (reserve(), reserve());
+        let ptr = |at: usize| at as *mut c_void;
+        // `a` shows pages 0 and 1 as one view; `b` shows page 0 again.
+        assert_eq!(XMemMapPhysicalPages(ptr(a), 2, pages.as_ptr()), ptr(a));
+        assert_eq!(XMemMapPhysicalPages(ptr(b), 1, pages.as_ptr()), ptr(b));
+        // SAFETY: mapped read-write.
+        unsafe { (a as *mut u8).write(7) };
+        let view_len = |at: usize| physical().views.get(&at).map(|v| v.0);
+        // Asked to show at `a` what `b` shows (page 0): it does; the view stays whole.
+        assert!(map_aliases(&[(a as u64, b as u64, PAGE as u64)]));
+        assert_eq!(view_len(a), Some(2 * PAGE));
+        // Page 1 at `a + PAGE` is not what `b` shows: mapped anew, alone.
+        assert!(map_aliases(&[((a + PAGE) as u64, b as u64, PAGE as u64)]));
+        assert_eq!(view_len(a), Some(PAGE));
+        assert_eq!(view_len(a + PAGE), Some(PAGE));
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { ((a + PAGE) as *const u8).read() }, 7);
+        // An unmapped page asked to be unmapped keeps the hole it had.
+        assert_eq!(XMemMapPhysicalPages(ptr(b), 1, std::ptr::null()), ptr(b));
+        assert!(physical().holes.contains_key(&b));
+        assert!(map_aliases(&[(b as u64, 0, PAGE as u64)]));
+        assert!(physical().holes.contains_key(&b), "left alone");
+        // A mapped one asked to be unmapped is unmapped.
+        assert!(map_aliases(&[(a as u64, 0, PAGE as u64)]));
+        assert_eq!(query(a as *const c_void).host.State, MEM_RESERVE);
+        ALIAS.store(0, Ordering::Relaxed);
+        for at in [a, b] {
+            assert_eq!(XMemMapPhysicalPages(ptr(at), 8, std::ptr::null()), ptr(at));
+        }
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// A tiled heap set to one page at 150 addresses (more than a group of
+    /// 64 and a group of 8) shows the same bytes at all of them, takes
+    /// others, and is unmapped again, with or without the fast path.
+    #[test]
+    fn one_page_at_many_addresses_and_back() {
+        const N: usize = 150;
+        for fast in [0, 2] {
+            ALIAS.store(fast, Ordering::Relaxed);
+            let pages = allocate(3);
+            let heap = XMemVirtualAlloc(std::ptr::null_mut(), N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+            let pool = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+            assert!(heap != 0 && pool != 0);
+            assert_eq!(XMemMapPhysicalPages(pool as *mut c_void, 3, pages.as_ptr()), pool as *mut c_void);
+            for k in 0..3 {
+                // SAFETY: mapped read-write.
+                unsafe { ((pool + k * PAGE) as *mut u8).write(10 + k as u8) };
+            }
+            let each = |k: usize| ((heap + k * PAGE) as u64, pool as u64, PAGE as u64);
+            let all: Vec<(u64, u64, u64)> = (0..N).map(each).collect();
+            assert!(map_aliases(&all));
+            // The same call again changes nothing anyone sees.
+            assert!(map_aliases(&all));
+            for k in (0..N).step_by(7) {
+                // SAFETY: mapped read-write.
+                assert_eq!(unsafe { ((heap + k * PAGE) as *const u8).read() }, 10, "page {k}");
+            }
+            // Some of them to the pool's other pages, a run of them unmapped.
+            let mixed = [
+                ((heap + 3 * PAGE) as u64, (pool + PAGE) as u64, PAGE as u64),
+                ((heap + 4 * PAGE) as u64, (pool + 2 * PAGE) as u64, PAGE as u64),
+                ((heap + 5 * PAGE) as u64, 0, 20 * PAGE as u64),
+            ];
+            assert!(map_aliases(&mixed));
+            // SAFETY: mapped read-write.
+            unsafe {
+                assert_eq!(((heap + 3 * PAGE) as *const u8).read(), 11);
+                assert_eq!(((heap + 4 * PAGE) as *const u8).read(), 12);
+                assert_eq!(((heap + 2 * PAGE) as *const u8).read(), 10);
+                // Writes show through every address of a page.
+                ((heap + 30 * PAGE) as *mut u8).write(99);
+                assert_eq!(((heap + 100 * PAGE) as *const u8).read(), 99);
+                assert_eq!((pool as *const u8).read(), 99);
+            }
+            for k in [5, 12, 24] {
+                let info = query((heap + k * PAGE) as *const c_void);
+                assert_eq!(info.host.State, MEM_RESERVE, "page {k} unmapped");
+            }
+            assert_eq!(query((heap + 25 * PAGE) as *const c_void).host.State, MEM_COMMIT);
+            let unmap_all = [(heap as u64, 0, (N * PAGE) as u64)];
+            assert!(map_aliases(&unmap_all));
+            assert_eq!(query(heap as *const c_void).host.State, MEM_RESERVE);
+            assert_eq!(XMemMapPhysicalPages(pool as *mut c_void, 3, std::ptr::null()), pool as *mut c_void);
+            assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        }
+        ALIAS.store(0, Ordering::Relaxed);
     }
 
     /// What a title that maps and unmaps pages all the time costs the

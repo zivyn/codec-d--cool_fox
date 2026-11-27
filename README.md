@@ -21,7 +21,58 @@ tuned for **NVIDIA RTX** cards.
 > by the title's developer or publisher, nor by NVIDIA. See
 > [docs/asset-policy.md](docs/asset-policy.md).
 
-## New on 2026-11-26: foxhound is the base
+## Built from many projects, and from running every one of them
+
+This repository did not come from one place, and the base it stands on today
+is the end of a long comparison, not the start of the work. Over several weeks
+we built, ran and measured many projects on the same NVIDIA PC: fork-l,
+[Marvisak's VIctory](https://github.com/Marvisak/VIctory),
+[fxceless's fork](https://github.com/fxceless/victory-fork),
+[the 7900 XTX fork](https://github.com/avatarmanz/VIctory-7900XTX),
+[Belobug's](https://github.com/Belobug/VIctory-Belobug-AMD),
+[DexNom's](https://github.com/DexNom/VIctory),
+[CGBJ's cool_fox](https://github.com/codec-d/cool_fox), Kelvaroq's, Neptune,
+xcl (another layer for the same title) and then
+[foxhound](https://github.com/readmet3xt-lab/foxhound). On each we found what
+stopped it on an RTX card, fixed or worked around it, measured the result, and
+carried what we learned to the next. Every pull request sent here was built
+and run on the same card before it was merged. No single project got here
+alone, and choosing the base that runs best was only one result of that work.
+
+What that work produced on the bases this fork had before (all of it is in
+this repository's history):
+
+- **Draws no longer skipped on NVIDIA**: the pool of descriptor slots for
+  NVIDIA's capped view heap. Before it the screen rarely updated and the
+  character jumped from place to place.
+- **Memory compares on the card**: 11 to about 22 frames a second on the base
+  of the time.
+- **Menus, loading screens and subtitles shown on Series S** (the interface
+  plane laid over the game) and **faces that move**, ported from fxceless's
+  pull requests 1189 and 927.
+- **The intro video without flicker**, and **black blobs gone** (a NaN a
+  shader writes made 0 before blur and the upscaler spread it).
+- **Ray tracing understood**: why rooms went white with the title's structure
+  builder off, which passes can be skipped without glitter, that the builder
+  does run on NVIDIA on CGBJ's renderer (draws dropped for it went from
+  thousands a frame to one), and that it does not go together with frame
+  generation yet.
+- **DLSS in place of the title's upscaler**, **DLSS frame generation** through
+  NVIDIA Streamline with more than one generated frame, **the F1 settings
+  menu**, and the finding that the 30 frames a second were the title's own
+  frame interval, which can be lifted.
+- Launchers with the settings measured on this card, a graphics card picker,
+  and the files NVIDIA's licence does not let a repository carry fetched from
+  NVIDIA instead.
+
+The foxhound line carries several of these in its own form (the descriptor
+slots, the compares on the card, the interface plane, the face network). This
+fork's own that are in this tree today are listed under "What this fork adds on
+top" below. The rest of ours that this base does not have (the black-blob
+scrub, the graphics card picker, the ray-tracing builder path among them) stay
+in the history, to be brought over where this base turns out to need them.
+
+### The base since 2026-11-26: foxhound
 
 On 2026-11-26 this fork moved onto
 [readmet3xt-lab/foxhound](https://github.com/readmet3xt-lab/foxhound)

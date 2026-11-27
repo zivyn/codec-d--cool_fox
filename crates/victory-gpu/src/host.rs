@@ -816,6 +816,19 @@ pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::
 /// their bytes.
 pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// The bytes of the two buffers what shaders wrote comes down to (the relay
+/// thread's, and the one behind the submission lock), and how often either
+/// was made smaller again ([`crate::lean::fetch_trim`]).
+pub(crate) static FETCH_BYTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub(crate) static FETCH_TRIMMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// For the memory line: the buffers kept for the next submission to send up
+/// with, their bytes, and the most bytes that are kept.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn send_spare() -> [u64; 3] {
+    send::spare_kept()
+}
+
 /// About host lists, for the memory line: lists made by the host since the
 /// start; preludes made (a list's second allocator and list, made when it
 /// first needs one, [`lazy_prelude`]); and, in diagnostics builds, the
@@ -2008,6 +2021,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
                 } else {
                     SPARE_MOST
                 };
+                // (`VICTORY_SCRATCH_SPARE_MB`, `VICTORY_RAM_LEAN`: less.)
+                let limit = crate::lean::scratch_spare_mb(limit >> 20) << 20;
                 spare.give(chunk, size, limit)
             } else {
                 Some(chunk)
@@ -2068,6 +2083,8 @@ struct CardWork {
     differs: (ID3D12Resource, usize, u64),
     /// Where the pieces that differ are fetched to: PC memory, mapped.
     fetched: Option<(ID3D12Resource, usize, u64)>,
+    /// When `fetched` is made smaller again ([`crate::lean::fetch_trim`]).
+    fetched_trim: crate::lean::Trim,
     /// The dwords of `differs` taken by plans whose results were not read
     /// yet.
     taken: u32,
@@ -3589,6 +3606,8 @@ struct RelayFetch {
     sent: u64,
     /// Buffer, mapping, bytes.
     buffer: Option<(ID3D12Resource, usize, u64)>,
+    /// When `buffer` is made smaller again ([`crate::lean::fetch_trim`]).
+    trim: crate::lean::Trim,
     /// Pieces caught while a later flight was writing them.
     suspects: torn::Suspects,
     /// What earlier fetches brought of flights not landed yet.
@@ -4492,6 +4511,7 @@ impl Host {
                 pso,
                 differs: (differs, data as usize, RESULTS),
                 fetched: None,
+                fetched_trim: crate::lean::Trim::new(),
                 taken: 0,
                 out: 0,
             })
@@ -4844,6 +4864,7 @@ impl Host {
                 event,
                 sent: 0,
                 buffer: None,
+                trim: crate::lean::Trim::new(),
                 suspects: torn::Suspects::default(),
                 had: crate::land::Had::default(),
             })
@@ -5015,10 +5036,21 @@ impl Host {
         let Some(f) = fetch.as_mut() else {
             fail(format_args!("no list, fence or event to fetch what shaders wrote to the card's memory (VICTORY_RELAY=1)"));
         };
+        // A buffer that a minute of fetches never needed a quarter of is made
+        // again at what they needed (`VICTORY_FETCH_TRIM`).
+        let mut size = total.next_multiple_of(16 << 20);
+        if crate::lean::fetch_trim()
+            && let Some(have) = f.buffer.as_ref().map(|b| b.2)
+            && let Some(smaller) = f.trim.ask(have, total, 16 << 20)
+        {
+            size = size.max(smaller);
+            f.buffer = None;
+            FETCH_TRIMMED.fetch_add(1, Ordering::Relaxed);
+        }
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
-            let size = total.next_multiple_of(16 << 20);
             f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
         }
+        FETCH_BYTES[0].store(f.buffer.as_ref().map_or(0, |b| b.2), Ordering::Relaxed);
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
@@ -5416,10 +5448,19 @@ impl Host {
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
+            let mut size = total.next_multiple_of(16 << 20);
+            if crate::lean::fetch_trim()
+                && let Some(have) = work.fetched.as_ref().map(|f| f.2)
+                && let Some(smaller) = work.fetched_trim.ask(have, total, 16 << 20)
+            {
+                size = size.max(smaller);
+                work.fetched = None;
+                FETCH_TRIMMED.fetch_add(1, Ordering::Relaxed);
+            }
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
-                let size = total.next_multiple_of(16 << 20);
                 work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
             }
+            FETCH_BYTES[1].store(work.fetched.as_ref().map_or(0, |f| f.2), Ordering::Relaxed);
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
             };
@@ -9023,7 +9064,9 @@ impl Host {
         }
     }
 
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let at = std::panic::Location::caller();
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -9069,7 +9112,11 @@ impl Host {
             crate::book::made(b, || "an upload buffer".into());
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::sites::made(&buffer, crate::sites::UPLOAD, size, at);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 crate::residency::allocation_error(&e);
                 tracing::warn!(error = %e, size, "no upload buffer");
@@ -9971,7 +10018,9 @@ impl Host {
     /// it is fast too) and shaders read and write: for host copies of title
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        let at = std::panic::Location::caller();
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -10021,7 +10070,11 @@ impl Host {
             crate::book::made(b, || "a shared buffer".into());
         }
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::sites::made(&buffer, crate::sites::SHARED, size, at);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None

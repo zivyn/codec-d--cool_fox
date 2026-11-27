@@ -735,6 +735,33 @@ fn log_memory_map() {
         groups.len(),
         biggest.join("; ")
     );
+    // The mappings at host addresses of 8 MB or more committed, by file (the
+    // pipeline library, the driver's caches, our own sections), in MB.
+    use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut mapped: HashMap<usize, u64> = HashMap::new();
+    for r in regions.iter().filter(|r| r.3 && r.4 == MEM_MAPPED && r.0 >= HOST) {
+        *mapped.entry(r.0).or_default() += r.2 as u64;
+    }
+    let mut files: HashMap<String, (u64, u64)> = HashMap::new();
+    for (&base, &bytes) in mapped.iter().filter(|m| *m.1 >= 8 << 20) {
+        let mut name = [0u16; 520];
+        // SAFETY: our own process, a buffer of that many characters.
+        let n = unsafe { K32GetMappedFileNameW(GetCurrentProcess(), base as *mut _, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let text = if n == 0 {
+            "no file (memory of the page file)".to_owned()
+        } else {
+            let full = String::from_utf16_lossy(&name[..n]);
+            full.rsplit('\\').next().unwrap_or(&full).to_owned()
+        };
+        let entry = files.entry(text).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
+    let mut files: Vec<(String, (u64, u64))> = files.into_iter().collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.1.1));
+    let text: Vec<String> = files.iter().take(12).map(|(name, (n, bytes))| format!("{name}: {n} of them {} MB", bytes >> 20)).collect();
+    tracing::info!("memory map, mappings at host addresses of 8 MB and more committed, by file: {}", text.join("; "));
 }
 
 /// Logs where the memory is: the process and the PC, then what this crate
@@ -949,6 +976,57 @@ fn log_memory() {
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+    );
+    // Round 4: which lines of code hold the PC's memory the card reaches,
+    // and what is kept for reuse (what `VICTORY_RAM_LEAN` caps).
+    let totals = crate::sites::totals();
+    let biggest: Vec<String> = crate::sites::alive()
+        .iter()
+        .take(14)
+        .map(|s| {
+            format!(
+                "{}:{} {} {} alive {:.0} MB (made {}, {:.0} MB)",
+                s.file.rsplit(['/', '\\']).next().unwrap_or(s.file),
+                s.line,
+                if s.kind == crate::sites::UPLOAD { "upload" } else { "shared" },
+                s.alive,
+                mb(s.alive_bytes),
+                s.made,
+                mb(s.made_bytes),
+            )
+        })
+        .collect();
+    tracing::info!(
+        "memory, buffers of the PC's memory alive, by the line that made them: upload (write-combined)          {} alive {:.0} MB of {} made {:.0} MB; shared (write-back) {} alive {:.0} MB of {} made {:.0} MB;          the biggest: {}",
+        totals[0][0],
+        mb(totals[0][1]),
+        totals[0][2],
+        mb(totals[0][3]),
+        totals[1][0],
+        mb(totals[1][1]),
+        totals[1][2],
+        mb(totals[1][3]),
+        biggest.join("; "),
+    );
+    let snapshots = crate::shadow::kept_snapshots();
+    let send = crate::host::send_spare();
+    let staging = crate::pool::staging_empty();
+    let fetch: Vec<u64> = crate::host::FETCH_BYTES.iter().map(|b| b.load(Relaxed)).collect();
+    tracing::info!(
+        "memory, kept for reuse (VICTORY_RAM_LEAN={}): snapshots of copies {:.0} MB of at most {:.0} MB;          memory the submissions send up with, {} buffers {:.0} MB of at most {:.0} MB; lists' scratch chunks          nothing holds {:.0} MB; texture staging {} blocks, {} empty (at most {} kept); the buffers the          fetches come down to: {:.0} MB (relay) and {:.0} MB, made smaller again {} times          (VICTORY_FETCH_TRIM)",
+        crate::lean::level(),
+        mb(snapshots[0]),
+        mb(snapshots[1]),
+        send[0],
+        mb(send[1]),
+        mb(send[2]),
+        mb(crate::host::ALIVE[4].load(Relaxed)),
+        staging[0],
+        staging[1],
+        crate::lean::staging_spare(8),
+        mb(fetch[0]),
+        mb(fetch[1]),
+        crate::host::FETCH_TRIMMED.load(Relaxed),
     );
 }
 

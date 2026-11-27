@@ -48,31 +48,126 @@ pub(crate) fn listed(n: u64) -> bool {
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
     named
+        || in_window(n)
         || n == TRIGGERED.load(std::sync::atomic::Ordering::Relaxed)
         || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
-/// The frame a trigger file asked for (`VICTORY_CAPTURE_TRIGGER`), or `u64::MAX`.
+/// The frame a trigger file asked for, or `u64::MAX` (no longer set: a
+/// trigger opens a window, [`triggered`]; only the frames of
+/// `VICTORY_CAPTURE_FRAMES` and the world's are single frames).
 static TRIGGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// `VICTORY_CAPTURE_TRIGGER=<file>` (with `VICTORY_CAPTURE`): when the file
-/// appears it is deleted, and the frame two presents on is captured as the
-/// frames of `VICTORY_CAPTURE_FRAMES` are (picture, `-ops.txt`, and with
-/// `VICTORY_DUMP_TARGETS` its targets and `-targets.tsv`). The file can be
-/// made again for another frame. Called at every present.
-fn triggered(frame: u64) {
+/// The first and last present of the window a trigger opened ([`triggered`]);
+/// 1 and 0 when none is open.
+static WINDOW_AT: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(1), std::sync::atomic::AtomicU64::new(0)];
+
+/// The number its files are named by: the window's last present when it
+/// opened (the window may be extended; the name stays).
+static WINDOW_NAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the open window counted.
+static WINDOW: std::sync::Mutex<Option<crate::capture_window::Window>> = std::sync::Mutex::new(None);
+
+fn in_window(n: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
+    n >= WINDOW_AT[0].load(Relaxed) && n <= WINDOW_AT[1].load(Relaxed)
+}
+
+/// The number in an environment variable, or `default`.
+fn env_number(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// `VICTORY_CAPTURE_TRIGGER=<file>` (with `VICTORY_CAPTURE`): when the file
+/// appears it is deleted and a window opens: from the next present, for
+/// `VICTORY_CAPTURE_WINDOW` presents (4), every operation of every list of
+/// every queue goes to `frame-<last present>-ops.txt` (with a `PRESENT n` line
+/// at each present) and the targets and values are dumped at the last present
+/// ([`dump_due`]). The window must hold whole frames (`VICTORY_CAPTURE_MIN_OPS`
+/// operations, 5000, and each pass of `VICTORY_CAPTURE_REQUIRE`, the grade
+/// pass `6318f669`): if not it is extended up to three times, and the dump
+/// says it is partial if it still is. The file can be made again for another
+/// window. Called at every present.
+fn triggered(frame: u64) {
     static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let Some(file) = FILE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_TRIGGER").map(PathBuf::from)) else {
         return;
     };
-    let pending = TRIGGERED.load(Relaxed);
-    if pending != u64::MAX && pending >= frame || !file.exists() {
+    if in_window(frame + 1) || WINDOW.lock().unwrap_or_else(|e| e.into_inner()).is_some() || !file.exists() {
         return;
     }
     if std::fs::remove_file(file).is_ok() {
-        TRIGGERED.store(frame + 2, Relaxed);
-        tracing::info!(frame = frame + 2, "capture trigger found: this frame is captured");
+        use std::sync::atomic::Ordering::Relaxed;
+        let required: Vec<String> = std::env::var("VICTORY_CAPTURE_REQUIRE")
+            .unwrap_or_else(|_| "6318f669".to_owned())
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect();
+        let window = crate::capture_window::Window::armed(frame, env_number("VICTORY_CAPTURE_WINDOW", 4), &required);
+        WINDOW_AT[0].store(window.start, Relaxed);
+        WINDOW_AT[1].store(window.end, Relaxed);
+        WINDOW_NAME.store(window.end, Relaxed);
+        tracing::info!(start = window.start, end = window.end, "capture trigger found: the window is open");
+        *WINDOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(window);
+    }
+}
+
+/// At the present of `frame`: whether the frame's targets are dumped now: a
+/// frame named by `VICTORY_CAPTURE_FRAMES` or the world's, or the last
+/// present of a trigger's window if the window holds whole frames (else it
+/// is extended, up to three times, and dumped as partial).
+pub(crate) fn dump_due(frame: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !in_window(frame) {
+        return listed(frame);
+    }
+    if frame < WINDOW_AT[1].load(Relaxed) {
+        return false;
+    }
+    let mut guard = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(window) = guard.as_mut() else {
+        return false;
+    };
+    let min_ops = env_number("VICTORY_CAPTURE_MIN_OPS", 5000);
+    match window.verdict(min_ops) {
+        crate::capture_window::Verdict::Partial(why) if window.retries < 3 => {
+            window.extend();
+            WINDOW_AT[1].store(window.end, Relaxed);
+            tracing::warn!(why, now = %window.summary(), "frame looks partial: the window is extended");
+            false
+        }
+        verdict => {
+            match verdict {
+                crate::capture_window::Verdict::Complete => {
+                    tracing::info!(frame, "frame complete: {}", window.summary());
+                }
+                crate::capture_window::Verdict::Partial(why) => {
+                    tracing::warn!(frame, why, "frame PARTIAL after the extensions: {}", window.summary());
+                }
+            }
+            true
+        }
+    }
+}
+
+/// The number the files of the dump at the present of `frame` are named by.
+pub(crate) fn dump_name(frame: u64) -> u64 {
+    if in_window(frame) { WINDOW_NAME.load(std::sync::atomic::Ordering::Relaxed) } else { frame }
+}
+
+/// After the dump at the present of `frame`: closes the window if that was its last.
+pub(crate) fn window_done(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if frame >= WINDOW_AT[1].load(Relaxed)
+        && in_window(frame)
+        && WINDOW.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    {
+        WINDOW_AT[0].store(1, Relaxed);
+        WINDOW_AT[1].store(0, Relaxed);
+        *WINDOW.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -118,18 +213,34 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     let Some(folder) = folder() else {
         return;
     };
-    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
     let what = what();
+    // In a trigger's window every operation goes to the one file of its last present.
+    let name = if in_window(frame) {
+        if let Some(window) = WINDOW.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            window.note(list, &what);
+        }
+        WINDOW_NAME.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        frame
+    };
+    write_ops_line(folder, name, &format!("list {list:#x} {what}"));
+}
+
+/// One numbered line of `frame-<name>-ops.txt`.
+#[cfg(feature = "diagnostics")]
+fn write_ops_line(folder: &std::path::Path, name: u64, line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
     let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
-    if file.as_ref().is_none_or(|f| f.0 != frame) {
-        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
+    if file.as_ref().is_none_or(|f| f.0 != name) {
+        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{name}-ops.txt"))) else {
             return;
         };
-        *file = Some((frame, 0, made));
+        *file = Some((name, 0, made));
     }
     if let Some((_, n, f)) = file.as_mut() {
         *n += 1;
-        let _ = writeln!(f, "{n} list {list:#x} {what}");
+        let _ = writeln!(f, "{n} {line}");
     }
 }
 
@@ -155,6 +266,12 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     triggered(frame);
+    #[cfg(feature = "diagnostics")]
+    if in_window(frame)
+        && let Some(folder) = folder()
+    {
+        write_ops_line(folder, WINDOW_NAME.load(Relaxed), &format!("PRESENT {frame} draws {drawn}"));
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -782,7 +899,7 @@ fn target_stats(
     );
     // Small targets (exposure and tone tables, a 4096-entry curve, light parameters): every
     // texel as the card holds it, in hex, in `frame-<n>-values.tsv`, to compare processes.
-    if w * h <= 8192 {
+    if w * h <= 65536 && bytes <= 16 {
         let mut values = String::new();
         for y in 0..h {
             for x in 0..w {

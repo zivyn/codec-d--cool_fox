@@ -224,9 +224,42 @@ fn resolve_card_limits(
 /// Title buffers turned down by [`card_limits`]' second number, since the start.
 static CARD_CAPPED: AtomicU64 = AtomicU64::new(0);
 
+/// The bytes of those, and the buffers (and bytes) turned down by the line
+/// of the card's use ([`CARD_REFUSED`]) from [`big_copy`] on, for the vram
+/// line: what stays in the PC's memory.
+static CARD_LEFT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+pub(crate) fn left_in_pc() -> [u64; 4] {
+    [
+        CARD_CAPPED.load(Ordering::Relaxed),
+        CARD_LEFT[0].load(Ordering::Relaxed),
+        CARD_REFUSED[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+    ]
+}
+
 /// The size from which a copy may go past the most bytes of copies
 /// ([`within_cap`]): 16 MiB.
 const BIG_COPY: u64 = 16 << 20;
+
+/// [`BIG_COPY`] or what `VICTORY_CARD_MEDIUM_KB` says (GPU1), from 64 KiB:
+/// copies from that size on get the big copies' margin ([`within_cap`]),
+/// their line ([`copy_line`]) and their reserve ([`big_reserve`]).
+///
+/// At the window spot of run I8 the first 1,239 copies of under 64 KiB took
+/// the 512 MB of an 8 GB card before the title buffers of 1 to 16 MiB came
+/// (3,072 turned down by the limit): they stay in the PC's memory, the
+/// shaders that write them (157 MB of ranges a frame) go over the bus, and
+/// the CPU compares the ranges (171 MB a frame, 23 ms finding nothing that
+/// differs). All of them together are some 176 MB.
+fn big_copy() -> u64 {
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| big_copy_from(std::env::var("VICTORY_CARD_MEDIUM_KB").ok().as_deref()))
+}
+
+fn big_copy_from(kib: Option<&str>) -> u64 {
+    kib.and_then(|v| v.trim().parse::<u64>().ok()).map_or(BIG_COPY, |kib| (kib.max(64) << 10).min(BIG_COPY))
+}
 
 /// Whether a copy of `size` bytes may be made when copies hold `held` bytes
 /// and at most `most` are allowed ([`card_limits`]). A copy of [`BIG_COPY`]
@@ -243,7 +276,7 @@ const BIG_COPY: u64 = 16 << 20;
 /// each is read by whole passes, so they get a margin the many small ones
 /// do not.
 fn within_cap(held: u64, size: u64, most: u64) -> bool {
-    let allowed = if size >= BIG_COPY {
+    let allowed = if size >= big_copy() {
         most.saturating_add(most / 2)
     } else {
         most
@@ -276,17 +309,23 @@ const BIG_RESERVE: u64 = 64 << 20;
 /// start (the reserve is used up by either).
 static CARD_BIG: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// [`BIG_RESERVE`], three times that when the big copies start lower
+/// ([`big_copy`]): there are some 100 of 1 to 16 MiB.
+fn reserve() -> u64 {
+    if big_copy() < BIG_COPY { 3 * BIG_RESERVE } else { BIG_RESERVE }
+}
+
 /// What is left of [`BIG_RESERVE`] when `made` bytes of big copies were made
 /// and `refused` turned down.
 fn big_reserve(made: u64, refused: u64) -> u64 {
-    BIG_RESERVE.saturating_sub(made.saturating_add(refused))
+    reserve().saturating_sub(made.saturating_add(refused))
 }
 
 /// The part of the card's budget, in hundredths, a copy of `size` bytes may
 /// be made up to: 97 with the room kept for copies (a big one, 100, when
 /// they come first), else 80.
 fn copy_line(size: u64, room_kept: bool, big_first: bool) -> u64 {
-    match (room_kept, big_first && size >= BIG_COPY) {
+    match (room_kept, big_first && size >= big_copy()) {
         (true, true) => 100,
         (true, false) => 97,
         (false, _) => 80,
@@ -508,7 +547,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         // 32nd.
         let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
-        if size >= BIG_COPY {
+        if size >= big_copy() {
             CARD_BIG[1].fetch_add(size, Ordering::Relaxed);
         }
         if n <= 64 || n.is_multiple_of(32) {
@@ -533,6 +572,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         // Said: with no line, a buffer left in the PC's memory by the cap
         // looks like any other (the first 16, then every 64th).
+        CARD_LEFT[0].fetch_add(size, Ordering::Relaxed);
         let n = CARD_CAPPED.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 16 || n.is_multiple_of(64) {
             tracing::info!(
@@ -549,7 +589,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-    } else if size >= BIG_COPY {
+    } else if size >= big_copy() {
         CARD_BIG[0].fetch_add(size, Ordering::Relaxed);
     }
     buffer
@@ -655,6 +695,19 @@ fn windows_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
 }
 
+/// The part of the budget, in hundredths, up to which a window's card side is
+/// made: 80, or `VICTORY_CARD_WINDOWS_LINE` (50 to 100). On an 8 GB card the
+/// use stands at 97 to 105 hundredths from the world's load on, so with 80
+/// no window ever goes (GPU1).
+fn window_line_from(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse::<u64>().ok()).map_or(80, |n| n.clamp(50, 100))
+}
+
+fn window_line() -> u64 {
+    static LINE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LINE.get_or_init(|| window_line_from(std::env::var("VICTORY_CARD_WINDOWS_LINE").ok().as_deref()))
+}
+
 /// [`window_card_for`] in the card's own memory.
 fn window_room_for(size: u64) -> Option<ID3D12Resource> {
     let most = window_card_most();
@@ -666,7 +719,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_line()
     {
         return None;
     }
@@ -6032,6 +6085,18 @@ mod window_tests {
         assert_eq!(copy_line(BIG_COPY, true, true), 100);
         assert_eq!(copy_line(BIG_COPY, false, true), 80);
         // Room kept until a big copy is made or turned down.
+        // GPU1: the threshold moves down to 1 MiB, never above 16 MiB, never under 64 KiB.
+        use super::big_copy_from;
+        assert_eq!(big_copy_from(None), BIG_COPY);
+        assert_eq!(big_copy_from(Some("1024")), MIB);
+        assert_eq!(big_copy_from(Some("1")), 64 << 10);
+        assert_eq!(big_copy_from(Some("999999")), BIG_COPY);
+        assert_eq!(big_copy_from(Some("x")), BIG_COPY);
+        use super::window_line_from;
+        assert_eq!(window_line_from(None), 80);
+        assert_eq!(window_line_from(Some("100")), 100);
+        assert_eq!(window_line_from(Some("250")), 100);
+        assert_eq!(window_line_from(Some("10")), 50);
         assert_eq!(big_reserve(0, 0), BIG_RESERVE);
         assert_eq!(big_reserve(21 * MIB, 0), BIG_RESERVE - 21 * MIB);
         assert_eq!(big_reserve(40 * MIB, 40 * MIB), 0);

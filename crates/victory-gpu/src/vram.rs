@@ -241,6 +241,7 @@ pub(crate) fn log() {
     let heat = crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed);
     let filled = crate::resource::KINDS[1].load(Ordering::Relaxed);
     let [free, three, half, fewer] = crate::tiles::occupancy();
+    let left = crate::shadow::left_in_pc();
     tracing::info!(
         "vram (VICTORY_RESIDENCY_PRIORITY={}, VICTORY_TILE_TRIM={}): the card {} MB in use of a budget of {} MB ({} over); \
          tile heaps {} MB ({} MB given as tiles; {} heaps wholly free, {} 3/4 free, {} half free, {} less), \
@@ -249,7 +250,7 @@ pub(crate) fn log() {
          idle (read by nothing, the system moves it first) {} MB, so {} MB over that something reads, {} MB to fall to leave 256 MB under the budget; \
          the PC's memory shared with the card {} MB in use ({} MB host copies and staging we know of, {} not); \
          moves seen (the card's use fell 64 MB or more while the PC's rose 32 MB or more between lines): {} ({} MB, {} MB){}; \
-         priorities set: {} high ({} MB), {} low ({} MB), {} failed; tile heaps given back by the trim: {} ({} MB)",
+         title buffers left in the PC's memory: {} by the cap of copies ({} MB), {} by the line of the card's use ({} MB);          priorities set: {} high ({} MB), {} low ({} MB), {} failed; tile heaps given back by the trim: {} ({} MB)",
         u8::from(priorities()),
         u8::from(trim_on()),
         parts.used / MB,
@@ -277,6 +278,10 @@ pub(crate) fn log() {
         MOVES[1].load(Ordering::Relaxed) / MB,
         MOVES[2].load(Ordering::Relaxed) / MB,
         moved.map_or(String::new(), |m| format!(", one just now: card -{} MB, PC +{} MB", m.local / MB, m.shared / MB)),
+        left[0],
+        left[1] / MB,
+        left[2],
+        left[3] / MB,
         SET[0][0].load(Ordering::Relaxed),
         SET[0][1].load(Ordering::Relaxed) / MB,
         SET[1][0].load(Ordering::Relaxed),

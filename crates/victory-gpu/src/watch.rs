@@ -1604,6 +1604,32 @@ impl std::hash::Hasher for PageHash {
     }
 }
 
+/// Whether the kernel's write watch holds no written page of 64 KiB block
+/// `block`: `Some(true)`; `Some(false)` if it holds one (the title wrote
+/// and nobody asked); `None` if the block is not memory the kernel watches
+/// (a view of pages, another reservation, memory that is not there). Does not
+/// reset anything.
+pub(crate) fn kernel_block_clean(block: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let mut found = [0usize; BLOCK / KERNEL_PAGE];
+    let (mut count, mut granularity) = (found.len(), 0);
+    // SAFETY: the answer buffer holds `count` entries.
+    let failed = unsafe {
+        GetWriteWatch(0, (block * BLOCK) as *const _, BLOCK, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+    } != 0;
+    (!failed).then_some(count == 0)
+}
+
+/// Takes `[at, at + len)` (whole kernel pages) off the kernel's write watch:
+/// what is written there from now on is told written by the next asking, and
+/// what was is not. Only for what we wrote ourselves in a block that was clean
+/// ([`kernel_block_clean`]); a page that is not watched is left as it is.
+pub(crate) fn kernel_reset(at: usize, len: usize) {
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    // SAFETY: a plain call; the kernel refuses what it does not watch.
+    unsafe { ResetWriteWatch(at as *const _, len) };
+}
+
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
     {

@@ -4336,6 +4336,13 @@ impl Shadow {
         self.gpu_only.store(true, Ordering::Release);
     }
 
+    /// Whether what a landing puts into this copy's title memory may be taken
+    /// off the kernel's write watch ([`crate::land::unwatch_on`]): a copy in
+    /// the card's memory of a buffer in a heap the title's CPU cannot write.
+    pub(crate) fn unwatched_landing(&self) -> bool {
+        self.card.is_some() && self.gpu_only.load(Ordering::Acquire)
+    }
+
     /// What to do with the landing of what shaders wrote to this copy, now
     /// ([`crate::land::quiet`]; called once per copy and landing, by the
     /// thread that lands).
@@ -5263,7 +5270,13 @@ impl Shadow {
     /// came that is not noted yet. Looked at after the note, whatever comes
     /// later has a number above it: a write of the title's takes the block's
     /// bit, until an asking has noted it.
-    pub(crate) fn landed(&self, block: usize, before: u64, now: u64) -> bool {
+    ///
+    /// `clean`: the block is of write-watched memory whose kernel bits were
+    /// clear before the landing and are reset after it
+    /// ([`crate::land::unwatch_on`]): nothing of the title's is unnoted there
+    /// (as the bits say of view memory), whatever [`crate::watch::block_published`]
+    /// says.
+    pub(crate) fn landed(&self, block: usize, before: u64, now: u64, clean: bool) -> bool {
         let Some(page) = block.checked_sub(self.start as usize / PAGE) else {
             return false;
         };
@@ -5271,7 +5284,7 @@ impl Shadow {
         let Some(at) = copied.get_mut(page) else {
             return false;
         };
-        let held = *at != 0 && *at >= before && crate::watch::block_published(block);
+        let held = *at != 0 && *at >= before && (clean || crate::watch::block_published(block));
         if held {
             *at = (*at).max(now);
         }

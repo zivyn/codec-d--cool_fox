@@ -842,3 +842,135 @@ fn a_lane_branch_that_writes_and_reads_lds_translates_wave_wide_as_a_last_resort
         }
     }
 }
+
+/// `lds_read_after_write_in_a_lane_branch` for `threads` threads, `threads / 64` console waves:
+/// each wave reads inside the branch what its own lanes wrote (the lane 16 above, in the wave),
+/// and `out[threads + t]` is what the wave's count `n` came to (1 if the wave entered the branch).
+fn lds_in_a_lane_branch_per_console_wave(threads: u32, lds_units: u32) -> NativeProgram {
+    let words = [
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xD760_0016, // v_readlane_b32 s22, v0, 3 (a lane read: the console wave's lanes are in step)
+        0x0001_0700,
+        0x7E08_02C1, // v_mov_b32 v4, -1
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | 16, // s_cbranch_execz past the body
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0x4A0C_0090, // v_add_nc_u32 v6, 16, v0
+        0x360C_0CBF, // v_and_b32 v6, 63, v6
+        0x2C12_0086, // v_lshrrev_b32 v9, 6, v0
+        0x3412_1286, // v_lshlrev_b32 v9, 6, v9 (the first thread of the console wave)
+        0x380C_1306, // v_or_b32 v6, v6, v9
+        0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000, // ds_read_b32 v7, v6
+        0x0700_0006,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000, // buffer_store_dword v7, v3, s[8:11], 0 offen
+        0x8002_0703,
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x7E10_0214, // v_mov_b32 v8, s20
+        0xE070_1000 | (threads * 4), // buffer_store_dword v8, v3, s[8:11], 0 offen offset:threads*4
+        0x8002_0803,
+    ];
+    let mut native = native_of(&words, true, threads);
+    if let StageIo::Cs(cs) = &mut native.io {
+        // 4 bytes of LDS per thread, in units of 512 (or `lds_units` of them, if more)
+        cs.rsrc2 |= (threads * 4).div_ceil(512).max(lds_units) << 15;
+    }
+    native
+}
+
+/// Console waves of a group that take a branch around LDS accesses on their own. Wave 0 enters
+/// it (and its two host waves meet there to see each other's writes) while wave 1 skips it and
+/// goes on to the end, and the other way round: a group barrier inside the branch would wait
+/// for threads of the wave that is not there. Each console wave's halves meet by counters of
+/// their own ([`lower`]'s `pair_wait`) instead.
+#[test]
+fn console_waves_of_a_group_take_a_lane_branch_with_lds_on_their_own() {
+    console_waves_branching(&[128, 192, 256], 0, 32768);
+}
+
+/// The same for programs that use all the 32 KiB: the exchange of the halves lies above them,
+/// where an NVIDIA card runs shared memory that D3D12 does not promise (48 KiB per group).
+#[test]
+fn console_waves_of_a_group_that_fills_the_shared_memory_still_meet() {
+    console_waves_branching(&[256, 512], 64, 49152);
+}
+
+fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
+    for &threads in sizes {
+        let native = lds_in_a_lane_branch_per_console_wave(threads, lds_units);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let container = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&container).unwrap();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let lds = lower::TEST_HOST_LDS.replace(Some(host_lds));
+        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        lower::TEST_HOST_LDS.set(lds);
+        let shader = shader.unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        if host_lds <= 32768
+            && let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // (WARP refuses waves of 32: the card only)
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 device; not run");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            eprintln!("the device does not take this program (waves of 32?); not run");
+            continue;
+        };
+        // (the lanes below s0 take the branch: only the first console wave, only the second,
+        // both, or one lane of the last)
+        // (each case a few times over: the halves' order of arrival varies from run to run)
+        for below in [threads, 64, 48, 20, 2, 0, threads - 8, threads - 1].into_iter().cycle().take(8 * 20) {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = below;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(2 * threads)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            for t in 0..threads {
+                let wave = t / 64;
+                let entered = (wave * 64..(wave * 64 + 64).min(threads)).any(|u| u < below);
+                assert_eq!(out[0][(threads + t) as usize], u32::from(entered), "{threads} threads, {below} below, wave of thread {t}");
+                let from = (wave * 64) + ((t % 64 + 16) & 63);
+                let expected = match (t < below, from < below) {
+                    (false, _) => 0,
+                    (true, true) => from + 1,
+                    (true, false) => u32::MAX,
+                };
+                assert_eq!(out[0][t as usize], expected, "{threads} threads, {below} below, thread {t}");
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: console waves branching on their own");
+}

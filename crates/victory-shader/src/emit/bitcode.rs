@@ -391,6 +391,33 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// Moves what `block` holds so far (its phis and instructions) into a new block, which has
+    /// no terminator yet, and sends every branch that went to `block` there. `block` goes on
+    /// empty, so code that is still being added to it follows whatever the caller puts
+    /// between the two (a loop that waits, say) without anyone's block number changing.
+    /// Not for block 0, the entry.
+    pub fn split_before(&mut self, block: usize) -> usize {
+        assert_ne!(block, 0, "the entry block stays first");
+        let head = self.new_block();
+        self.blocks[head].phis = std::mem::take(&mut self.blocks[block].phis);
+        self.blocks[head].body = std::mem::take(&mut self.blocks[block].body);
+        for b in &mut self.blocks {
+            match &mut b.term {
+                Some(Term::Br(t)) if *t == block => *t = head,
+                Some(Term::CondBr(_, t, f)) => {
+                    if *t == block {
+                        *t = head;
+                    }
+                    if *f == block {
+                        *f = head;
+                    }
+                }
+                _ => {}
+            }
+        }
+        head
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,

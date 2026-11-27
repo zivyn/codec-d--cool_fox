@@ -3918,6 +3918,20 @@ impl<'a> Lower<'a> {
                     self.cur_ir,
                     self.at_offset
                 );
+                // (what its writer read, and what those have: where the chain starts)
+                if let Some(b) = made
+                    && let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo))
+                {
+                    for &(reg, v) in &w.reads {
+                        let state = match self.vals.get(&v) {
+                            Some(Val::Missing(why)) => format!("missing ({why})"),
+                            Some(_) => "a value".to_string(),
+                            None => "not made".to_string(),
+                        };
+                        let kind = if self.x.st.masks.contains_key(&v) { "a mask" } else { "not a mask" };
+                        eprintln!("MASK-WHY   it read {reg:?} = {v:?}: {kind}, {state}, written in {:?}", self.def_block.get(&v));
+                    }
+                }
             }
             return Err(MASK_ELSEWHERE);
         }

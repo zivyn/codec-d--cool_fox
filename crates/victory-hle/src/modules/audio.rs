@@ -492,8 +492,9 @@ impl Xma {
         wake_decoder();
     }
 
-    /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    /// Fills every enabled context's output as far as it has room; the
+    /// voices that were enabled and how long it took.
+    fn pump(&self) -> (u32, std::time::Duration) {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
@@ -508,6 +509,7 @@ impl Xma {
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        (active, took)
     }
 }
 
@@ -691,8 +693,10 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    let mut stats = DecodeStats::new();
                     loop {
-                        xma().pump();
+                        let (active, took) = xma().pump();
+                        stats.pass(active, took);
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
                         std::thread::park_timeout(std::time::Duration::from_millis(2));
                     }
@@ -700,6 +704,56 @@ fn wake_decoder() {
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
         })
         .unpark();
+}
+
+/// What the XMA decoder thread costs, said every 5 s while voices play
+/// (`VICTORY_STREAM_STATS=0`: not said). The console's audio block decodes
+/// for nothing; here one thread of ours does, and this is how much of a core.
+struct DecodeStats {
+    since: Instant,
+    busy: std::time::Duration,
+    longest: std::time::Duration,
+    passes: u32,
+    slow: u32,
+    voices: u32,
+}
+
+impl DecodeStats {
+    fn new() -> DecodeStats {
+        DecodeStats {
+            since: Instant::now(),
+            busy: Default::default(),
+            longest: Default::default(),
+            passes: 0,
+            slow: 0,
+            voices: 0,
+        }
+    }
+
+    /// One pass over the voices; says the line when 5 s have passed.
+    fn pass(&mut self, active: u32, took: std::time::Duration) {
+        self.passes += 1;
+        self.busy += took;
+        self.longest = self.longest.max(took);
+        self.slow += u32::from(took.as_millis() >= 4);
+        self.voices = self.voices.max(active);
+        let elapsed = self.since.elapsed();
+        if elapsed.as_secs() < 5 {
+            return;
+        }
+        if self.voices > 0 && std::env::var_os("VICTORY_STREAM_STATS").is_none_or(|v| v != "0") {
+            tracing::info!(
+                voices = self.voices,
+                cores = format_args!("{:.3}", self.busy.as_secs_f64() / elapsed.as_secs_f64()),
+                passes = self.passes,
+                longest_ms = format_args!("{:.1}", self.longest.as_secs_f64() * 1e3),
+                over_4_ms = self.slow,
+                "XMA decoder: last {:.1} s (VICTORY_STREAM_STATS)",
+                elapsed.as_secs_f64()
+            );
+        }
+        *self = DecodeStats::new();
+    }
 }
 
 /// Runs an XMA command; false for one this does not know.
@@ -952,6 +1006,22 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_stats_count_a_window_and_start_the_next() {
+        use std::time::Duration;
+        let mut stats = DecodeStats::new();
+        stats.pass(3, Duration::from_millis(1));
+        stats.pass(5, Duration::from_millis(6));
+        stats.pass(2, Duration::from_millis(2));
+        assert_eq!((stats.passes, stats.slow, stats.voices), (3, 1, 5));
+        assert_eq!(stats.busy, Duration::from_millis(9));
+        assert_eq!(stats.longest, Duration::from_millis(6));
+        // Five seconds on: the window is said and begun again.
+        stats.since = Instant::now() - Duration::from_secs(6);
+        stats.pass(1, Duration::from_millis(1));
+        assert_eq!((stats.passes, stats.slow, stats.voices), (0, 0, 0));
+    }
 
     #[test]
     fn heap_maps_every_byte_of_a_block() {

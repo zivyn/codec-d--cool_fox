@@ -176,6 +176,13 @@ fn waterfall_on_32_lanes(half_exit: bool) -> Result<HostShader, crate::ShaderErr
     let shader = super::emit(&c, &native, &p, &st, &io, &res);
     lower::TEST_HALF_EXIT.set(false);
     lower::TEST_HOST_WAVE.set(was);
+    // (`VICTORY_TEST_DUMP=<folder outside the repository>`: the program as it was translated)
+    if let (Some(dir), Ok(s)) = (std::env::var_os("VICTORY_TEST_DUMP"), &shader) {
+        let _ = std::fs::write(
+            std::path::Path::new(&dir).join(format!("waterfall-halves-{half_exit}.dxil")),
+            &s.dxil,
+        );
+    }
     shader
 }
 

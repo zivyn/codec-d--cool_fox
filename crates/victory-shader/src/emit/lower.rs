@@ -4736,6 +4736,9 @@ impl<'a> Lower<'a> {
         if small || self.local || self.pair_meet {
             return;
         }
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("HALF-EXIT: block {} leaves its loop by {leaving}, slot {slot}", self.cur_ir);
+        }
         let c = self.cur;
         let i1t = self.s.t.i1;
         let any = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[goes_on]);

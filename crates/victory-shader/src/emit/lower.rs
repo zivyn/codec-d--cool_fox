@@ -4721,6 +4721,17 @@ impl<'a> Lower<'a> {
         cl
     }
 
+    /// Whether IR block `b` lies in a loop: after a header and before the end of a back edge to it.
+    fn in_loop(&self, b: usize) -> bool {
+        self.counters.keys().any(|&h| {
+            self.rpo[h] <= self.rpo[b]
+                && self.x.p.blocks[h]
+                    .preds
+                    .iter()
+                    .any(|&q| self.block[q].is_some() && self.rpo[q] >= self.rpo[b])
+        })
+    }
+
     /// `VICTORY_HALF_EXIT=1`: when no lane of this host wave goes round a loop again, the
     /// block `leaving` (on the loop's way out) clears this half's exchange dword, which says
     /// "nothing here" to the other half in the rounds it still has to make. Without it the
@@ -9718,7 +9729,12 @@ impl<'a> Lower<'a> {
                         return Err("a first-lane read where not every lane runs");
                     }
                     let c = self.cur;
-                    if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
+                    // (inside a loop the lanes still in it are the ones EXEC holds, and the lower half
+                    // may have none of them: `VICTORY_HALF_EXIT` asks which half has one)
+                    if guard.is_none()
+                        && super::shader_opt() & super::bitcode::opt::FIRST != 0
+                        && !(half_exit() && self.in_loop(self.cur_ir))
+                    {
                         // Every lane is in EXEC: the console's first lane is
                         // lane 0, which the lower half of every console wave
                         // has. No half needs to ask the other whether it has

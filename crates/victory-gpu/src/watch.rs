@@ -213,6 +213,58 @@ fn waited<T>(_: usize, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Since the last line: the protection changes of guarding (calls, nanoseconds,
+/// the longest, those over half a millisecond, and their blocks), made with the
+/// guards' lock held.
+static PROTECTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn protected_for(blocks: usize, began: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let ns = began.elapsed().as_nanos() as u64;
+    PROTECTS[0].fetch_add(1, Relaxed);
+    PROTECTS[1].fetch_add(ns, Relaxed);
+    PROTECTS[2].fetch_max(ns, Relaxed);
+    if ns > 500_000 {
+        PROTECTS[3].fetch_add(1, Relaxed);
+        PROTECTS[4].fetch_add(blocks as u64, Relaxed);
+    }
+}
+
+/// The blocks `[from, to)` cut in pieces of `step` blocks, in order (`step` 0:
+/// one piece).
+fn chunks_of(from: usize, to: usize, step: usize) -> Vec<(usize, usize)> {
+    if step == 0 || to - from <= step {
+        return vec![(from, to)];
+    }
+    (from..to).step_by(step).map(|a| (a, (a + step).min(to))).collect()
+}
+
+/// How many blocks a protection change of guarding covers while the guards'
+/// lock is held (`VICTORY_GUARD_CHUNK=<blocks>`, 0 (off): a run is one call): a
+/// run of 2,800 blocks, the title's whole heap, is one call of milliseconds,
+/// and the threads that fault on the heap's blocks, or ask about them, wait
+/// for the lock all of that time.
+fn guard_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_GUARD_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// [`protect`] of `[from, to)`, in pieces of [`guard_chunk`] blocks with the
+/// lock let go and taken again between them (a block no piece has reached is
+/// as it was: not clean, told written at the next asking).
+fn protect_chunked(mut g: std::sync::MutexGuard<'static, Guards>, from: usize, to: usize) -> std::sync::MutexGuard<'static, Guards> {
+    let pieces = chunks_of(from, to, guard_chunk());
+    let last = pieces.len() - 1;
+    for (i, (a, b)) in pieces.into_iter().enumerate() {
+        protect(&mut g, a, b);
+        if i < last {
+            drop(g);
+            g = guards_timed();
+        }
+    }
+    g
+}
+
 /// [`WAITS`], taken, for the log: per frame.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn lock_waits(frames: f64) -> String {
@@ -220,7 +272,20 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         let [n, ns] = [0, 1].map(|i| WAITS[what][i].swap(0, std::sync::atomic::Ordering::Relaxed));
         format!("{:.0} {:.2} ms", n as f64 / frames, ns as f64 / 1e6 / frames)
     };
-    format!("ranges held {}, journal read {}, journal noted in {}, guards {}", of(0), of(1), of(2), of(3))
+    let [calls, ns, longest, slow, blocks] = [0, 1, 2, 3, 4].map(|i| PROTECTS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    format!(
+        "ranges held {}, journal read {}, journal noted in {}, guards {}; protection changes with the lock held: {:.0} calls {:.2} ms, the longest {:.2} ms, {:.1} over 0.5 ms ({:.0} blocks) (VICTORY_GUARD_CHUNK={})",
+        of(0),
+        of(1),
+        of(2),
+        of(3),
+        calls as f64 / frames,
+        ns as f64 / 1e6 / frames,
+        longest as f64 / 1e6,
+        slow as f64 / frames,
+        blocks as f64 / frames,
+        guard_chunk()
+    )
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -1940,7 +2005,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         if let Some((from, to)) = run
             && to != block
         {
-            protect(&mut g, from, to);
+            g = protect_chunked(g, from, to);
             run = None;
             // Faults of the title's wait for the lock: each block is done on
             // its own, and looked at anew below.
@@ -1956,7 +2021,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             // because one could not be made so. (Or clean, and bytes were put
             // in beside the guard: it stays.)
             if let Some((from, to)) = run.take() {
-                protect(&mut g, from, to);
+                g = protect_chunked(g, from, to);
             }
             if g.clean.contains(block) {
                 continue;
@@ -1967,11 +2032,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         } else if !g.foreign.contains(&block) && !g.left_alone(block) && !g.rests(block, rest) {
             run = Some((run.map_or(block, |r| r.0), block + 1));
         } else if let Some((from, to)) = run.take() {
-            protect(&mut g, from, to);
+            g = protect_chunked(g, from, to);
         }
     }
     if let Some((from, to)) = run {
-        protect(&mut g, from, to);
+        g = protect_chunked(g, from, to);
     }
     drop(g);
     #[cfg(feature = "diagnostics")]
@@ -2129,6 +2194,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let timing = std::time::Instant::now();
         // SAFETY: title view memory; only its protection changes.
         let mut done = unsafe {
             VirtualProtect(
@@ -2138,6 +2204,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 &mut old,
             ) != 0
         };
+        protected_for(to - from, timing);
         if done && !matches!(old & !PAGE_GUARD, PAGE_READWRITE | PAGE_READONLY) {
             // What is there is not for us to guard (code, or memory the
             // title protects itself): as it was.
@@ -4970,5 +5037,22 @@ mod many_askers_tests {
         BITS.clear(511);
         assert!(!BITS.all(300, 700) && BITS.all(300, 511) && BITS.all(512, 700));
         assert!(!BITS.all(1 << 40, (1 << 40) + 1), "outside the address space");
+    }
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::chunks_of;
+
+    /// A run is cut in pieces of the size asked, in order, none lost, and is
+    /// one piece when it is not asked or fits.
+    #[test]
+    fn a_run_is_cut_in_pieces_in_order_and_whole_when_not_asked() {
+        assert_eq!(chunks_of(10, 20, 0), [(10, 20)]);
+        assert_eq!(chunks_of(10, 20, 4), [(10, 14), (14, 18), (18, 20)]);
+        assert_eq!(chunks_of(10, 14, 4), [(10, 14)]);
+        assert_eq!(chunks_of(0, 1, 1), [(0, 1)]);
+        let all: Vec<usize> = chunks_of(3, 103, 7).into_iter().flat_map(|(a, b)| a..b).collect();
+        assert_eq!(all, (3..103).collect::<Vec<_>>());
     }
 }

@@ -2414,10 +2414,12 @@ static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// declared ranges of flights it looked at, their bytes, the pages of them that
 /// were stale (the title wrote them since the copy took them), and the ranges
 /// that had any.
-static UNDER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static UNDER: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
-/// [`UNDER`], taken.
-pub(crate) fn under_stats() -> [u64; 4] {
+/// [`UNDER`], taken: ranges, their bytes, stale pages, ranges with any, then
+/// the nanoseconds of finding what is stale, of getting the copy's locks, of
+/// comparing and putting the pages in, and of noting what goes up.
+pub(crate) fn under_stats() -> [u64; 8] {
     std::array::from_fn(|i| UNDER[i].swap(0, Ordering::Relaxed))
 }
 
@@ -4218,6 +4220,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
+            let detecting = std::time::Instant::now();
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
                 note_stale(1);
                 return true;
@@ -4226,6 +4229,7 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
+            UNDER[4].fetch_add(detecting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             UNDER[0].fetch_add(1, Ordering::Relaxed);
             UNDER[1].fetch_add((e - a) as u64, Ordering::Relaxed);
             UNDER[2].fetch_add(stale.len() as u64, Ordering::Relaxed);
@@ -4241,8 +4245,11 @@ impl Shadow {
             // reference under the same lock, and a page read before
             // such a merge and compared after it would take the card's
             // bytes for the title's.
+            let locking = std::time::Instant::now();
             let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            UNDER[5].fetch_add(locking.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let merged = std::time::Instant::now();
             let held = if self.card.is_some() {
                 self.data as usize
             } else {
@@ -4282,6 +4289,8 @@ impl Shadow {
                 (0..stale.len()).for_each(one);
             }
             *runs_left = left.into_inner().max(0) as usize;
+            UNDER[6].fetch_add(merged.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let putting = std::time::Instant::now();
             let mut taken = Vec::new();
             for (i, runs) in done.into_iter().enumerate() {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
@@ -4308,6 +4317,7 @@ impl Shadow {
                     }
                 }
             }
+            UNDER[7].fetch_add(putting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if over.into_inner() {
                 note_stale(2);
                 return true;

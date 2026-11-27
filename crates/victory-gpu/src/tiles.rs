@@ -55,9 +55,16 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::host;
+use crate::resource::HostTexture;
 
 /// The card's tile: 64 KiB.
 const TILE: u64 = 64 << 10;
+
+/// Milliseconds since the start, plus one: 0 is never, in the stamps of
+/// [`Tiled`].
+fn stamp_now() -> u64 {
+    crate::host::coarse_ms() + 1
+}
 
 /// Tiles in one heap of the pool (64 MiB). The largest level given is a
 /// 4096x4096 one of one byte a texel: 256 tiles.
@@ -70,8 +77,11 @@ const HEAP_TILES: u32 = 1024;
 /// uploads that left a held level without tiles (the card had no room, or
 /// no heap could be had); uploads recorded again for such a level; uploads
 /// that held a level back for its size ([`Tiled::uploaded`]'s `cap`) and
-/// the levels they held back.
-pub(crate) static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+/// the levels they held back; levels taken back that the title no longer
+/// held; levels taken back from cold textures ([`crate::priority`]); the
+/// bytes of tiles those two took back; hot textures given levels past the
+/// cap of everyone; the bytes of shortfall hot textures wait with now.
+pub(crate) static STATS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
@@ -256,8 +266,9 @@ struct Given {
     levels: Vec<bool>,
     /// Whether the small levels the card packs together have theirs.
     packed: bool,
-    /// The runs taken: the heap's place, first tile, tiles.
-    runs: Vec<(usize, u32, u32)>,
+    /// The runs taken: the subresource they map, the heap's place, first
+    /// tile, tiles.
+    runs: Vec<(u32, usize, u32, u32)>,
 }
 
 /// A host texture made without memory, and the tiles its levels have been
@@ -284,6 +295,21 @@ pub(crate) struct Tiled {
     /// The levels a recorded list of the card's own writes has already
     /// written with zeros first ([`Tiled::claim`]).
     claimed: AtomicU32,
+    /// The levels being taken back ([`Tiled::retire`]): they keep their
+    /// tiles until the views that show them have been made again, but are
+    /// not shown, and not counted as having tiles by a view.
+    retiring: AtomicU32,
+    /// Milliseconds since the start, plus one, when a draw last read the
+    /// texture through a table ([`Tiled::note_sampled`]), when an upload last
+    /// came, and when tiles were last given (0: never).
+    sampled: AtomicU64,
+    touched: AtomicU64,
+    given_at: AtomicU64,
+    /// The cap (plus one; 0: not short) under which a held level was left
+    /// without tiles, and when it was last asked again
+    /// ([`Tiled::retry_hot`]).
+    short: AtomicU64,
+    short_at: AtomicU64,
 }
 
 impl Tiled {
@@ -350,6 +376,12 @@ impl Tiled {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            retiring: AtomicU32::new(0),
+            sampled: AtomicU64::new(0),
+            touched: AtomicU64::new(0),
+            given_at: AtomicU64::new(0),
+            short: AtomicU64::new(0),
+            short_at: AtomicU64::new(0),
         })
     }
 
@@ -410,11 +442,15 @@ impl Tiled {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
+        self.touched.store(stamp_now(), Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
         let may = self.fitting(named, cap) | card;
+        // A level on its way back that the title holds again, and the cap
+        // takes, stays: this upload writes it.
+        self.retiring.fetch_and(!(named & may), Ordering::Relaxed);
         let kept = self.without_locked(&given, named & !may);
         if kept != 0 {
             STATS[11].fetch_add(1, Ordering::Relaxed);
@@ -422,6 +458,7 @@ impl Tiled {
         }
         let changed = self.give_locked(&mut given, queue, device, texture, named, may);
         let missing = self.without_locked(&given, named) != 0;
+        self.short.store(if missing { cap.saturating_add(1) } else { 0 }, Ordering::Relaxed);
         (changed, missing)
     }
 
@@ -449,6 +486,7 @@ impl Tiled {
     ) -> bool {
         let levels = levels & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        self.touched.store(stamp_now(), Ordering::Relaxed);
         let prev = self.card.load(Ordering::Relaxed);
         let changed = self.give_locked(
             &mut given,
@@ -558,7 +596,6 @@ impl Tiled {
         named: u32,
         may: u32,
     ) -> bool {
-        let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
         let first_packed = self.standard.len() as u32;
         // (subresource, tiles, the level if it has tiles of its own) to map now.
@@ -616,19 +653,28 @@ impl Tiled {
                 None => given.packed = true,
             }
             for &(start, count) in &runs {
-                given.runs.push((index, start, count));
+                given.runs.push((subresource, index, start, count));
             }
+            self.given_at.store(stamp_now(), Ordering::Relaxed);
             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
         }
+        self.reshown(given, named)
+    }
+
+    /// The first level a view may show, from the levels named (the title's
+    /// or the card's own) that have tiles and are not on their way back;
+    /// whether it changed.
+    fn reshown(&self, given: &Given, named: u32) -> bool {
+        let first_packed = self.standard.len() as u32;
+        let retiring = self.retiring.load(Ordering::Relaxed);
         let with_tiles = |level: u32| {
-            if level < first_packed {
-                given.levels[level as usize]
-            } else {
-                given.packed
-            }
+            retiring & (1 << level.min(31)) == 0
+                && if level < first_packed { given.levels[level as usize] } else { given.packed }
         };
-        let shown = (0..self.levels).find(|&level| has(level) && with_tiles(level)).unwrap_or(u32::MAX);
+        let shown = (0..self.levels)
+            .find(|&level| level < 32 && named & (1 << level) != 0 && with_tiles(level))
+            .unwrap_or(u32::MAX);
         self.shown.swap(shown, Ordering::Relaxed) != shown
     }
 
@@ -665,7 +711,220 @@ impl Tiled {
     /// The bytes of the tiles it has now.
     pub(crate) fn given_bytes(&self) -> u64 {
         let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        given.runs.iter().map(|run| u64::from(run.2) * TILE).sum()
+        given.runs.iter().map(|run| u64::from(run.3) * TILE).sum()
+    }
+
+    /// A list read the texture through a table: it is looked at.
+    pub(crate) fn note_sampled(&self) {
+        let now = stamp_now();
+        if self.sampled.load(Ordering::Relaxed) != now {
+            self.sampled.store(now, Ordering::Relaxed);
+        }
+    }
+
+    /// How the texture stands ([`crate::priority::heat`]).
+    pub(crate) fn heat(&self) -> crate::priority::Heat {
+        let now = stamp_now();
+        let sampled = self.sampled.load(Ordering::Relaxed);
+        crate::priority::heat(
+            crate::priority::mode(),
+            (sampled != 0).then(|| now.saturating_sub(sampled)),
+            now.saturating_sub(self.touched.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// Milliseconds since a list read it through a table, else since an
+    /// upload came.
+    fn idle_ms(&self, now: u64) -> u64 {
+        let sampled = self.sampled.load(Ordering::Relaxed);
+        now.saturating_sub(if sampled != 0 { sampled } else { self.touched.load(Ordering::Relaxed) })
+    }
+
+    /// The bytes of tiles the held levels that have none would take.
+    pub(crate) fn deficit(&self) -> u64 {
+        let held = self.held.load(Ordering::Relaxed);
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let first_packed = self.standard.len() as u32;
+        let mut tiles = 0u64;
+        for (level, &n) in self.standard.iter().enumerate() {
+            if held & (1 << level) != 0 && !given.levels[level] {
+                tiles += u64::from(n);
+            }
+        }
+        if self.packed > 0 && !given.packed && held & self.packed_levels(first_packed) != 0 {
+            tiles += u64::from(self.packed);
+        }
+        tiles * TILE
+    }
+
+    /// The bits of the levels the card packs together.
+    fn packed_levels(&self, first_packed: u32) -> u32 {
+        self.every_level() & !((1u32 << first_packed) - 1)
+    }
+
+    /// The levels that have tiles and are not on their way back.
+    fn with_tiles_locked(&self, given: &Given) -> u32 {
+        let first_packed = self.standard.len() as u32;
+        let mut have = 0;
+        for level in 0..first_packed {
+            if given.levels[level as usize] {
+                have |= 1 << level;
+            }
+        }
+        if given.packed {
+            have |= self.packed_levels(first_packed);
+        }
+        have & !self.retiring.load(Ordering::Relaxed)
+    }
+
+    /// The levels that have tiles although the title no longer holds them
+    /// and the card did not write them: dead weight (hidden by the views,
+    /// written with zeros at the next upload).
+    pub(crate) fn dead(&self) -> u32 {
+        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let first_packed = self.standard.len() as u32;
+        let mut dead = self.with_tiles_locked(&given) & !named;
+        // The packed levels go together, and only when none is named.
+        let packed = self.packed_levels(first_packed);
+        if dead & packed != packed {
+            dead &= !packed;
+        }
+        dead
+    }
+
+    /// The levels with tiles of more than `keep` bytes that the card did not
+    /// write, and the bytes they hold.
+    pub(crate) fn big_given(&self, keep: u64) -> (u32, u64) {
+        let card = self.card.load(Ordering::Relaxed);
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let retiring = self.retiring.load(Ordering::Relaxed);
+        let (mut mask, mut bytes) = (0u32, 0u64);
+        for (level, &n) in self.standard.iter().enumerate() {
+            let size = u64::from(n) * TILE;
+            if given.levels[level] && size > keep && (card | retiring) & (1 << level) == 0 {
+                mask |= 1 << level;
+                bytes += size;
+            }
+        }
+        (mask, bytes)
+    }
+
+    /// Begins taking back the levels of `levels` that have tiles: they are
+    /// no longer shown from now on, so the views made again by the caller
+    /// (`levels_changed`) do not read them, and [`Tiled::unmap`] takes their
+    /// tiles once the lists that may still read them have run. Returns the
+    /// levels begun and whether the first level a view may show changed.
+    pub(crate) fn retire(&self, levels: u32) -> (u32, bool) {
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let mask = levels & self.with_tiles_locked(&given);
+        if mask == 0 {
+            return (0, false);
+        }
+        self.retiring.fetch_or(mask, Ordering::Relaxed);
+        let named = self.held.load(Ordering::Relaxed) | self.card.load(Ordering::Relaxed);
+        (mask, self.reshown(&given, named))
+    }
+
+    /// Takes the tiles of the levels of `levels` that are still on their way
+    /// back ([`Tiled::retire`]) out of `texture`: the mapping is made null on
+    /// `queue`, ahead of the lists submitted after it, and the tiles go to
+    /// the pool. A level put back by an upload since stays. Returns the bytes
+    /// of tiles given back.
+    pub(crate) fn unmap(&self, queue: &ID3D12CommandQueue, texture: &ID3D12Resource, levels: u32) -> u64 {
+        let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let mask = levels & self.retiring.load(Ordering::Relaxed);
+        let first_packed = self.standard.len() as u32;
+        // (subresource, tiles) of what has tiles and goes.
+        let mut going: Vec<(u32, u32)> = Vec::new();
+        for level in 0..first_packed {
+            if mask & (1 << level) != 0 && given.levels[level as usize] {
+                going.push((level, self.standard[level as usize]));
+            }
+        }
+        if self.packed > 0 && given.packed && mask & self.packed_levels(first_packed) != 0 {
+            going.push((first_packed, self.packed));
+        }
+        let mut freed = 0u64;
+        for (subresource, tiles) in going {
+            let at = D3D12_TILED_RESOURCE_COORDINATE {
+                X: 0,
+                Y: 0,
+                Z: 0,
+                Subresource: subresource,
+            };
+            let size = D3D12_TILE_REGION_SIZE {
+                NumTiles: tiles,
+                ..Default::default()
+            };
+            let flag = D3D12_TILE_RANGE_FLAG_NULL;
+            let start = 0u32;
+            // SAFETY: a live reserved texture; one region of the
+            // subresource's `tiles` tiles, on one null range of that many
+            // (no heap is named: every range is null).
+            unsafe {
+                queue.UpdateTileMappings(
+                    texture,
+                    1,
+                    Some(&raw const at),
+                    Some(&raw const size),
+                    None::<&ID3D12Heap>,
+                    1,
+                    Some(&raw const flag),
+                    Some(&raw const start),
+                    Some(&raw const tiles),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+            given.runs.retain(|&(sub, index, first, count)| {
+                if sub == subresource {
+                    by_heap.entry(index).or_default().push((first, count));
+                    false
+                } else {
+                    true
+                }
+            });
+            for (index, runs) in by_heap {
+                give_back(index, &runs);
+            }
+            if subresource < first_packed {
+                given.levels[subresource as usize] = false;
+            } else {
+                given.packed = false;
+            }
+            freed += u64::from(tiles) * TILE;
+        }
+        STATS[2].fetch_sub(freed, Ordering::Relaxed);
+        self.retiring.fetch_and(!mask, Ordering::Relaxed);
+        // What the card writes into them next is zeroed first again.
+        self.claimed.fetch_and(!mask, Ordering::Relaxed);
+        freed
+    }
+
+    /// Marks the texture short of levels under `cap` (a cold texture whose
+    /// large levels were taken back).
+    fn set_short(&self, cap: u64) {
+        self.short.store(cap.saturating_add(1), Ordering::Relaxed);
+        self.short_at.store(stamp_now(), Ordering::Relaxed);
+    }
+
+    /// For a texture a draw reads through a table: whether it is hot, is short
+    /// of levels under a cap `may` says the card takes more than now, and was
+    /// not asked about in the last second. The caller uploads it again.
+    pub(crate) fn retry_hot(&self, may: impl Fn(u64) -> bool) -> bool {
+        let short = self.short.load(Ordering::Relaxed);
+        if short == 0 {
+            return false;
+        }
+        let now = stamp_now();
+        let at = self.short_at.load(Ordering::Relaxed);
+        if at != 0 && now.saturating_sub(at) < 1000 {
+            return false;
+        }
+        self.short_at.store(now, Ordering::Relaxed);
+        self.heat() == crate::priority::Heat::Hot && may(short - 1)
     }
 }
 
@@ -674,7 +933,7 @@ impl Drop for Tiled {
         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
         let mut bytes = 0;
         let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
-        for &(index, start, tiles) in &given.runs {
+        for &(_, index, start, tiles) in &given.runs {
             by_heap.entry(index).or_default().push((start, tiles));
             bytes += u64::from(tiles) * TILE;
         }
@@ -724,6 +983,201 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
     }
 }
 
+/// The textures made level by level that have had an upload, by where their
+/// title memory starts: [`pass`] walks them. (Weak: a copy let go leaves.)
+static TRACK: Mutex<std::collections::BTreeMap<u64, std::sync::Weak<HostTexture>>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// Where the next [`pass`] starts in [`TRACK`].
+static CURSOR: AtomicU64 = AtomicU64::new(0);
+
+/// Levels begun to be taken back ([`Tiled::retire`]): the submission begun
+/// when they were, the time (stamp) from which their tiles may go, the
+/// texture, the levels.
+static RETIRING: Mutex<Vec<(u64, u64, std::sync::Arc<HostTexture>, u32)>> = Mutex::new(Vec::new());
+
+/// How long the views that showed a level taken back have to be made again
+/// (the next texture pass makes them) before its tiles go.
+const RETIRE_DELAY_MS: u64 = 1000;
+
+/// How long the title has to hold the same levels before the tiles of the
+/// ones it let go are taken back: a title that moves a texture in its
+/// streaming memory unmaps it before it maps it again.
+const DEAD_GRACE_MS: u64 = 5000;
+
+/// `texture`, whose title memory starts at `start`, has had an upload: [`pass`]
+/// looks at it from now on.
+pub(crate) fn track(start: u64, texture: &std::sync::Arc<HostTexture>) {
+    let mut track = TRACK.lock().unwrap_or_else(|e| e.into_inner());
+    if track.get(&start).is_some_and(|w| std::ptr::eq(w.as_ptr(), std::sync::Arc::as_ptr(texture))) {
+        return;
+    }
+    track.insert(start, std::sync::Arc::downgrade(texture));
+}
+
+/// The bytes of tiles hot textures lack, as the last look at the textures
+/// waiting for levels found ([`crate::priority::reclaim_need`]).
+pub(crate) fn set_hot_want(bytes: u64) {
+    STATS[17].store(bytes, Ordering::Relaxed);
+}
+
+/// Once for each texture pass (`draw.rs` `heap_textures`), with the card's
+/// room (`resource::headroom_lately`): gives back what the policy of
+/// [`crate::priority`] says. Bounded: the tiles of the levels begun earlier
+/// whose time has come, then [`crate::priority::SCAN_A_PASS`] textures, in
+/// turn, and no more than [`crate::priority::RECLAIM_PASS_BYTES`] of cold
+/// textures' tiles. The levels the title no longer holds go whichever the
+/// texture; a cold texture's large levels only while hot textures wait and the
+/// card is short of room.
+pub(crate) fn pass(headroom: i64) {
+    use crate::priority::{
+        Holder, KEEP_BYTES, RECLAIM_PASS_BYTES, SCAN_A_PASS, enabled, reclaim_need, reclaim_plan,
+    };
+    if !enabled() {
+        return;
+    }
+    finish_retired();
+    let need = reclaim_need(headroom, STATS[17].load(Ordering::Relaxed));
+    let window = {
+        let mut track = TRACK.lock().unwrap_or_else(|e| e.into_inner());
+        let from = CURSOR.load(Ordering::Relaxed);
+        let mut window = Vec::with_capacity(SCAN_A_PASS);
+        let mut gone = Vec::new();
+        let mut seen = 0;
+        let mut last = from;
+        for (&start, weak) in track.range(from..).take(SCAN_A_PASS) {
+            seen += 1;
+            last = start;
+            match weak.upgrade() {
+                Some(texture) => window.push((start, texture)),
+                None => gone.push(start),
+            }
+        }
+        for start in gone {
+            track.remove(&start);
+        }
+        CURSOR.store(if seen < SCAN_A_PASS { 0 } else { last.saturating_add(1) }, Ordering::Relaxed);
+        window
+    };
+    let now = stamp_now();
+    let mut holders = Vec::new();
+    for (start, texture) in &window {
+        let Some(tiled) = texture.tiled.as_ref() else {
+            continue;
+        };
+        if now.saturating_sub(tiled.touched.load(Ordering::Relaxed)) >= DEAD_GRACE_MS {
+            let dead = tiled.dead();
+            if dead != 0 {
+                begin_retire(*start, texture, dead, false);
+            }
+        }
+        if need > 0 {
+            let (big, bytes) = tiled.big_given(KEEP_BYTES);
+            if big != 0 {
+                holders.push(Holder {
+                    id: *start,
+                    heat: tiled.heat(),
+                    idle: tiled.idle_ms(now),
+                    given_ago: now.saturating_sub(tiled.given_at.load(Ordering::Relaxed)),
+                    big: bytes,
+                });
+            }
+        }
+    }
+    if need == 0 {
+        return;
+    }
+    let (chosen, _) = reclaim_plan(&mut holders, need, RECLAIM_PASS_BYTES);
+    for id in chosen {
+        let Ok(at) = window.binary_search_by_key(&id, |w| w.0) else {
+            continue;
+        };
+        let texture = &window[at].1;
+        if let Some(tiled) = texture.tiled.as_ref() {
+            let (big, _) = tiled.big_given(KEEP_BYTES);
+            begin_retire(id, texture, big, true);
+        }
+    }
+}
+
+/// Begins taking back `levels` of `texture` (title memory at `start`): not
+/// shown from now on, tiles gone in [`finish_retired`]. A cold texture is
+/// asked for again when the card has room (`levels_waiting`).
+fn begin_retire(start: u64, texture: &std::sync::Arc<HostTexture>, levels: u32, cold: bool) {
+    let Some(tiled) = texture.tiled.as_ref() else {
+        return;
+    };
+    let (mask, changed) = tiled.retire(levels);
+    if mask == 0 {
+        return;
+    }
+    if changed {
+        crate::descriptor::host::levels_changed(start);
+    }
+    STATS[if cold { 14 } else { 13 }].fetch_add(u64::from(mask.count_ones()), Ordering::Relaxed);
+    if cold {
+        tiled.set_short(crate::priority::KEEP_BYTES);
+        crate::descriptor::host::levels_waiting(
+            start,
+            crate::priority::KEEP_BYTES,
+            std::sync::Arc::downgrade(texture),
+        );
+    }
+    RETIRING.lock().unwrap_or_else(|e| e.into_inner()).push((
+        crate::host::submissions().0,
+        stamp_now() + RETIRE_DELAY_MS,
+        texture.clone(),
+        mask,
+    ));
+}
+
+/// Takes the tiles of the levels [`begin_retire`] began with, once the
+/// submissions begun by then have finished and the views have had their time
+/// to be made again.
+fn finish_retired() {
+    let ready: Vec<_> = {
+        let mut retiring = RETIRING.lock().unwrap_or_else(|e| e.into_inner());
+        if retiring.is_empty() {
+            return;
+        }
+        let finished = crate::host::submissions().1;
+        let now = stamp_now();
+        let (ready, later): (Vec<_>, Vec<_>) =
+            retiring.drain(..).partition(|(after, from, _, _)| *after <= finished && now >= *from);
+        *retiring = later;
+        ready
+    };
+    let Some(host) = host() else {
+        return;
+    };
+    for (_, _, texture, mask) in ready {
+        if let Some(tiled) = texture.tiled.as_ref() {
+            let bytes = tiled.unmap(host.queue(), &texture.texture, mask);
+            STATS[15].fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+}
+
+/// For the log: the textures [`pass`] looks at by heat: how many, the bytes of
+/// tiles they hold, and of them the bytes in large levels.
+fn census() -> [(u64, u64, u64); 3] {
+    let all: Vec<_> = {
+        let track = TRACK.lock().unwrap_or_else(|e| e.into_inner());
+        track.values().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    let mut out = [(0u64, 0u64, 0u64); 3];
+    for texture in all {
+        let Some(tiled) = texture.tiled.as_ref() else {
+            continue;
+        };
+        let entry = &mut out[tiled.heat() as usize];
+        entry.0 += 1;
+        entry.1 += tiled.given_bytes();
+        entry.2 += tiled.big_given(crate::priority::KEEP_BYTES).1;
+    }
+    out
+}
+
 /// For the log, with the texture queue's line: what this saves, and what
 /// the mapping calls cost since the line before.
 pub(crate) fn status() {
@@ -732,6 +1186,7 @@ pub(crate) fn status() {
     if s[4] == 0 {
         return;
     }
+    let heat = if crate::priority::enabled() { census() } else { [(0, 0, 0); 3] };
     let calls = s[6] - BEFORE[0].swap(s[6], Ordering::Relaxed);
     let micros = s[7] - BEFORE[1].swap(s[7], Ordering::Relaxed);
     tracing::info!(
@@ -739,7 +1194,10 @@ pub(crate) fn status() {
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
          the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
          UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; {} uploads left a held \
-         level without memory (no room on the card, or no heap), {} uploads were recorded again for one;          {} uploads held {} levels back for their size, the card being short of room",
+         level without memory (no room on the card, or no heap), {} uploads were recorded again for one;          {} uploads held {} levels back for their size, the card being short of room; \
+         tile priority (VICTORY_TEXTURE_PRIORITY, {}): hot textures (read through a table within 10 s) {} with {} MB of tiles ({} MB in large levels), \
+         not read through a table lately {} with {} MB ({} MB large), cold {} with {} MB ({} MB large); hot textures lack {} MB of tiles; \
+         taken back so far: {} levels the title no longer held, {} levels of cold textures, {} MB in all; {} uploads of hot textures went past the cap of everyone",
         s[0],
         s[4],
         s[2] >> 20,
@@ -756,6 +1214,21 @@ pub(crate) fn status() {
         s[10],
         s[11],
         s[12],
+        crate::priority::mode(),
+        heat[0].0,
+        heat[0].1 >> 20,
+        heat[0].2 >> 20,
+        heat[1].0,
+        heat[1].1 >> 20,
+        heat[1].2 >> 20,
+        heat[2].0,
+        heat[2].1 >> 20,
+        heat[2].2 >> 20,
+        s[17] >> 20,
+        s[13],
+        s[14],
+        s[15] >> 20,
+        s[16],
     );
 }
 
@@ -1528,7 +2001,103 @@ void look() {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            retiring: AtomicU32::new(0),
+            sampled: AtomicU64::new(0),
+            touched: AtomicU64::new(0),
+            given_at: AtomicU64::new(0),
+            short: AtomicU64::new(0),
+            short_at: AtomicU64::new(0),
         }
+    }
+
+    /// `four_levels` with every level given its tiles, by hand.
+    fn four_levels_given() -> Tiled {
+        let tiled = four_levels();
+        {
+            let mut given = tiled.given.lock().unwrap();
+            given.levels = vec![true; 4];
+            given.packed = true;
+        }
+        tiled
+    }
+
+    #[test]
+    fn levels_the_title_let_go_are_dead_weight_and_retiring_hides_them() {
+        let tiled = four_levels_given();
+        let every = tiled.every_level();
+        tiled.held.store(every, Ordering::Relaxed);
+        assert_eq!(tiled.dead(), 0, "all held: nothing is dead");
+        {
+            let given = tiled.given.lock().unwrap();
+            tiled.reshown(&given, every);
+        }
+        assert_eq!(tiled.first_shown(), Some(0));
+        // The title lets go of levels 0 and 1.
+        tiled.held.store(every & !0b11, Ordering::Relaxed);
+        assert_eq!(tiled.dead(), 0b11);
+        // The card's own write of level 0 keeps it.
+        tiled.card.store(0b1, Ordering::Relaxed);
+        assert_eq!(tiled.dead(), 0b10);
+        tiled.card.store(0, Ordering::Relaxed);
+        // Retiring them: not shown at once, begun only once.
+        let (begun, changed) = tiled.retire(0b11);
+        assert_eq!((begun, changed), (0b11, true));
+        assert_eq!(tiled.first_shown(), Some(2));
+        assert_eq!(tiled.retire(0b11), (0, false), "not begun twice");
+        assert_eq!(tiled.dead(), 0, "on their way back already");
+        // The packed levels are dead together, and only when none is held.
+        tiled.held.store(0b0000_1100, Ordering::Relaxed);
+        assert_eq!(tiled.dead(), 0b111_0000);
+        tiled.held.store(0b0100_1100, Ordering::Relaxed);
+        assert_eq!(tiled.dead(), 0, "one packed level held keeps the block");
+    }
+
+    #[test]
+    fn a_level_the_title_holds_again_is_not_hidden_by_a_pending_retire() {
+        let tiled = four_levels_given();
+        tiled.held.store(tiled.every_level(), Ordering::Relaxed);
+        let (begun, _) = tiled.retire(0b1);
+        assert_eq!(begun, 0b1);
+        assert_eq!(tiled.retiring.load(Ordering::Relaxed), 0b1);
+        // What `uploaded_on` does for a level it names and the cap takes.
+        tiled.retiring.fetch_and(!(tiled.every_level() & tiled.fitting(tiled.every_level(), u64::MAX)), Ordering::Relaxed);
+        assert_eq!(tiled.retiring.load(Ordering::Relaxed), 0);
+        assert_eq!(tiled.big_given(256 << 10), (0b11, 5 << 20), "levels of 4 MiB and 1 MiB are the large ones");
+    }
+
+    #[test]
+    fn the_shortfall_counts_the_tiles_of_the_held_levels_without_any() {
+        let tiled = four_levels();
+        tiled.held.store(0b1111, Ordering::Relaxed);
+        assert_eq!(tiled.deficit(), (64 + 16 + 4 + 1) * TILE);
+        tiled.given.lock().unwrap().levels[0] = true;
+        assert_eq!(tiled.deficit(), (16 + 4 + 1) * TILE);
+        // The packed block counts once, when any of its levels is held.
+        tiled.held.store(0b0111_1111, Ordering::Relaxed);
+        assert_eq!(tiled.deficit(), (16 + 4 + 1 + 1) * TILE);
+        tiled.given.lock().unwrap().packed = true;
+        assert_eq!(tiled.deficit(), (16 + 4 + 1) * TILE);
+    }
+
+    #[test]
+    fn a_hot_texture_short_of_levels_is_asked_again_once_a_second_when_the_card_takes_more() {
+        let tiled = four_levels();
+        // Not short: never.
+        assert!(!tiled.retry_hot(|_| true));
+        tiled.set_short(256 << 10);
+        // Just asked: not again yet.
+        assert!(!tiled.retry_hot(|_| true));
+        tiled.short_at.store(0, Ordering::Relaxed);
+        // Not read through a table: not hot.
+        assert!(!tiled.retry_hot(|_| true));
+        tiled.short_at.store(0, Ordering::Relaxed);
+        tiled.note_sampled();
+        assert_eq!(tiled.heat(), crate::priority::Heat::Hot);
+        // The card does not take more than the cap it was short under.
+        assert!(!tiled.retry_hot(|cap| cap < 256 << 10));
+        tiled.short_at.store(0, Ordering::Relaxed);
+        assert!(tiled.retry_hot(|cap| cap == 256 << 10));
+        assert!(!tiled.retry_hot(|_| true), "once a second");
     }
 
     #[test]

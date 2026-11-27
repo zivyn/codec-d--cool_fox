@@ -2589,6 +2589,9 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::may_make(memory);
+        // Tiles taken back from levels the title let go and from cold
+        // textures, for the hot ones that wait (`crate::priority`).
+        crate::tiles::pass(crate::resource::headroom_lately());
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2622,9 +2625,10 @@ impl State {
         // textures whose upload left a held level without the card's memory
         // are uploaded again (under the same cap the same levels would be
         // left out again).
-        if room {
-            host.texture_slots_waiting(frame);
-        }
+        // (Also without room: a texture draws read through a table may be
+        // asked for again past the line, and what hot textures lack is
+        // counted, `crate::priority`.)
+        host.texture_slots_waiting(frame);
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)

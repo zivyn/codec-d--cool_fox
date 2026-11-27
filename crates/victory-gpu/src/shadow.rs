@@ -70,6 +70,10 @@ pub(crate) struct Shadow {
     /// units ([`current::Current::seq`]) when a compare last found what
     /// shaders wrote ([`Shadow::note_found`]).
     found_seq: AtomicU64,
+    /// Whether a thread of the title was seen to read or write this copy's
+    /// buffer while its landing was owed ([`crate::land::owed`]) or by the
+    /// probe: its pieces are landed at once from then on.
+    title_read: std::sync::atomic::AtomicBool,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -3528,6 +3532,7 @@ impl Shadow {
             quiet_window: AtomicU64::new(0),
             quiet_landing: Default::default(),
             found_seq: AtomicU64::new(0),
+            title_read: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -4095,6 +4100,8 @@ impl Shadow {
         let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
         for (a, e) in busy {
+            // What is owed there is landed before the lock is taken alone.
+            crate::land::owed::land_range(a, e - a);
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
@@ -4442,6 +4449,55 @@ impl Shadow {
     pub(crate) fn mark_gpu_only(&self) {
         crate::watch::quiet_mark(self.start as usize, (self.start + self.len) as usize);
         self.gpu_only.store(true, Ordering::Release);
+    }
+
+    /// Whether the title was seen to read this copy's buffer.
+    pub(crate) fn title_read(&self) -> bool {
+        self.title_read.load(Ordering::Relaxed) || {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            crate::readprobe::on() && crate::readprobe::touched_in(start, end).is_some() && {
+                self.title_read.store(true, Ordering::Relaxed);
+                true
+            }
+        }
+    }
+
+    /// The title touched the copy while a landing of it was owed.
+    pub(crate) fn note_title_read(&self) {
+        self.title_read.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a landing of this copy's pieces may be left owed
+    /// ([`crate::land::owed`]): a copy in the card's memory of a buffer in a
+    /// default heap that the title was not seen to read.
+    pub(crate) fn lazy_landing(&self) -> bool {
+        self.unwatched_landing() && !self.title_read()
+    }
+
+    /// For the tests of the owed set: the lock of landings, held alone.
+    #[cfg(test)]
+    pub(crate) fn hold_merging(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.merging.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The shared lock of landings, taken by a thread that may be in the way
+    /// of one that holds it alone (the thread of a handler lands what a copy
+    /// owes while holding what it holds): for a little while, then not at all.
+    fn merging_patient(&self) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
+        let began = std::time::Instant::now();
+        loop {
+            match self.merging.try_read() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if began.elapsed() > std::time::Duration::from_millis(250) {
+                        tracing::warn!(start = format_args!("{:#x}", self.start), "a landing owed went on without the copy's lock (its holder waits for it)");
+                        return None;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     /// Whether what a landing puts into this copy's title memory may be taken
@@ -4970,6 +5026,8 @@ impl Shadow {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
+        // What is owed there is landed before the lock is taken alone.
+        crate::land::owed::land_range(address, bytes.len());
         CAUSES[4].fetch_add(bytes.len() as u64, Ordering::Relaxed);
         CAUSES[5].fetch_add(1, Ordering::Relaxed);
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
@@ -5296,11 +5354,27 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        // SAFETY: the caller's.
+        unsafe { self.land_card_with(pieces, fetched_after, notes, false) }
+    }
+
+    /// [`Shadow::land_card`]; `patient`: the lock is waited for only a while
+    /// ([`Shadow::merging_patient`]).
+    ///
+    /// # Safety
+    /// [`Shadow::land_card`]'s.
+    pub(crate) unsafe fn land_card_with(
+        &self,
+        pieces: &[(usize, usize, usize)],
+        fetched_after: u64,
+        notes: &mut crate::land::Notes,
+        patient: bool,
+    ) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
         let waiting = std::time::Instant::now();
-        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        let _merging = if patient { self.merging_patient() } else { Some(self.merging.read().unwrap_or_else(|e| e.into_inner())) };
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {

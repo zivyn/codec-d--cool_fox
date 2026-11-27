@@ -110,6 +110,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
+mod store_fence_tests;
+#[cfg(all(test, windows))]
 mod wave64_tests;
 mod wave;
 
@@ -183,6 +185,25 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether a compute program that waits on flags other groups write (a loop with a `glc` load
+/// of a raw UAV buffer: the look-back passes of the title's upscaler) fences its stores
+/// before the wait for them and at the loops' exits (`VICTORY_STORE_FENCES=0`: it does not).
+/// The console orders a wave's stores with its `s_waitcnt`; the host orders nothing between
+/// two addresses without a fence. Part of the translation: the shader cache keys on it.
+pub fn store_fences() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STORE_FENCES").is_none_or(|v| v != "0"))
+}
+
+/// Whether those waiting loops of a compute program run to [`lower::SPIN_LIMIT`] iterations
+/// where other compute loops stop at 4,096 (`VICTORY_SPIN_LIMIT=0`: they stop there too). A
+/// lane that leaves the loop early leaves the program, and its tile of the output is not
+/// written. Part of the translation: the shader cache keys on it.
+pub fn spin_limit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPIN_LIMIT").is_none_or(|v| v != "0"))
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between

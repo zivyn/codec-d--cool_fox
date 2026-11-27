@@ -65,6 +65,11 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Loops that wait on flags other groups write, and the fences placed for them.
+    #[cfg(test)]
+    pub spin_loops: usize,
+    #[cfg(test)]
+    pub store_fences: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -396,6 +401,19 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// IR blocks with a `glc` load of a coherent raw UAV buffer ([`Lower::coherent`]).
+    coherent_loads: HashSet<usize>,
+    /// Buffer atomics (by site) of a coherent buffer: what publishes the stores before them.
+    fence_sites: HashSet<(usize, usize)>,
+    /// Headers of loops that wait on flags other groups write (compute, `store_fences`), and
+    /// the blocks they are left to, where what the waited-for groups wrote is fenced.
+    spin_heads: HashSet<usize>,
+    spin_exits: HashSet<usize>,
+    /// A program with such loops: a store since the last fence is published by the next wait.
+    protocol: bool,
+    pending_store: bool,
+    /// Fences emitted for them.
+    store_fences: u32,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -406,6 +424,10 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// The iteration limit of a compute loop that waits on a flag other groups write (twice the
+/// 65,536 the title's own waits of this kind allow themselves).
+pub(super) const SPIN_LIMIT: u32 = 1 << 17;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -1723,6 +1745,13 @@ impl<'a> Lower<'a> {
             read_phis: HashSet::new(),
             stale: HashSet::new(),
             coherent: HashSet::new(),
+            coherent_loads: HashSet::new(),
+            fence_sites: HashSet::new(),
+            spin_heads: HashSet::new(),
+            spin_exits: HashSet::new(),
+            protocol: false,
+            pending_store: false,
+            store_fences: 0,
             root_copy: None,
             page_there: None,
             ordered: if x.native.stage == HwStage::Ps {
@@ -2473,6 +2502,7 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        self.find_spins();
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2509,6 +2539,10 @@ impl<'a> Lower<'a> {
             }
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
+            }
+            if self.spin_exits.contains(&b) {
+                // what the groups waited for wrote is read after the wait
+                self.publish();
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
@@ -2547,6 +2581,10 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            spin_loops: self.spin_heads.len(),
+            #[cfg(test)]
+            store_fences: self.store_fences,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3090,6 +3128,77 @@ impl<'a> Lower<'a> {
             .filter_map(|d| self.entry(&d.source))
             .collect();
         self.coherent.extend(found);
+        if self.s.threads.is_none() || self.s.pixel || self.s.mesh.is_some() || !super::store_fences() {
+            return;
+        }
+        // Compute: where the loads of a coherent buffer are, and the atomics on it.
+        let (mut loads, mut atomics) = (Vec::new(), Vec::new());
+        for d in &self.x.res.descriptors {
+            let i = &self.x.p.blocks[d.site.0].insts[d.site.1];
+            let Fields::Buffer { cache, .. } = &i.fields else { continue };
+            let Some(e) = self.entry(&d.source) else { continue };
+            if !self.coherent.contains(&e) {
+                continue;
+            }
+            if cache.glc && i.name().starts_with("buffer_load_dword") {
+                loads.push(d.site.0);
+            } else if i.name().starts_with("buffer_atomic") {
+                atomics.push(d.site);
+            }
+        }
+        self.coherent_loads.extend(loads);
+        self.fence_sites.extend(atomics);
+    }
+
+    /// Loops that wait on flags other groups write ([`Lower::spin_heads`]): natural loops with
+    /// a `glc` load of a coherent buffer. Needs the blocks' order.
+    fn find_spins(&mut self) {
+        if self.coherent_loads.is_empty() {
+            return;
+        }
+        let p = self.x.p;
+        for b in 0..p.blocks.len() {
+            if self.block[b].is_none() {
+                continue;
+            }
+            let mut body = HashSet::from([b]);
+            let mut stack: Vec<usize> = p.blocks[b]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q])
+                .collect();
+            if stack.is_empty() {
+                continue;
+            }
+            while let Some(n) = stack.pop() {
+                if body.insert(n) {
+                    stack.extend(p.blocks[n].preds.iter().copied().filter(|&q| self.block[q].is_some()));
+                }
+            }
+            if !body.iter().any(|n| self.coherent_loads.contains(n)) {
+                continue;
+            }
+            self.spin_heads.insert(b);
+            for &n in &body {
+                for t in p.blocks[n].exit.successors() {
+                    if !body.contains(&t) {
+                        self.spin_exits.insert(t);
+                    }
+                }
+            }
+        }
+        self.protocol = !self.spin_heads.is_empty();
+    }
+
+    /// The count a wait for the stores before it (`s_waitcnt` to no outstanding `vmcnt`,
+    /// `s_waitcnt_vscnt` or `_vmcnt` of 0) stands for.
+    fn waits_for_stores(inst: &Inst) -> bool {
+        match (&inst.fields, inst.name()) {
+            (Fields::Sopp { imm }, "s_waitcnt") => (imm & 0xF) | (imm >> 14 & 3) << 4 == 0,
+            (Fields::Sop { imm: Some(n), .. }, "s_waitcnt_vscnt" | "s_waitcnt_vmcnt") => *n == 0,
+            _ => false,
+        }
     }
 
     /// The kind of a view no instruction uses (in this program, or through
@@ -5565,6 +5674,13 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        if self.protocol
+            && self.pending_store
+            && (Self::waits_for_stores(inst) || self.fence_sites.contains(&(b, i)))
+        {
+            // the stores before a wait or an atomic that publishes them are seen first
+            self.publish();
+        }
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
             || name.starts_with("v_mbcnt_");
@@ -5651,7 +5767,12 @@ impl<'a> Lower<'a> {
                     .map_err(|why| unsupported(offset, why));
             }
             Fields::Image { .. } => self.image(inst, b, i),
-            Fields::Buffer { .. } => self.buffer(inst, b, i),
+            Fields::Buffer { .. } => {
+                if self.protocol && (name.contains("store") || name.starts_with("buffer_atomic")) {
+                    self.pending_store = true;
+                }
+                self.buffer(inst, b, i)
+            }
             Fields::Exp { .. } => self.export(b, i),
             Fields::Ds { .. } => self.ds(inst, b, i),
             Fields::Flat { .. } if name.starts_with("global_") => self.flat(inst, b, i),
@@ -5670,6 +5791,13 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
         }
+    }
+
+    /// A fence of the store-fence form ([`super::store_fences`]).
+    fn publish(&mut self) {
+        self.memory_fence();
+        self.pending_store = false;
+        self.store_fences += 1;
     }
 
     /// Writes to buffers made before are seen, by every group, before those made after.
@@ -12819,6 +12947,7 @@ impl<'a> Lower<'a> {
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
         let limit = match super::loop_limit() {
+            LOOP_LIMIT if self.spin_heads.contains(&to) && super::spin_limit() => SPIN_LIMIT,
             LOOP_LIMIT if self.s.pixel => 1 << 7,
             LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
             LOOP_LIMIT => 1 << 12,

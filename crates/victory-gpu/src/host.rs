@@ -1004,6 +1004,11 @@ fn create() -> windows::core::Result<Host> {
             // goes above the 32 KiB some programs use whole.)
             if crate::indirect::nvidia(&device) {
                 victory_shader::emit::set_host_lds_bytes(48 * 1024);
+                // (and mesh shaders whose outputs pass the 32 KiB the DXIL validator allows are
+                // made and drawn right: `mesh_output_limit_probe`)
+                victory_shader::emit::set_host_mesh_output_bytes(
+                    crate::indirect::NVIDIA_MESH_OUTPUT_BYTES,
+                );
             }
         }
         let messages = debug

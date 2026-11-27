@@ -1139,10 +1139,18 @@ fn own_bits_on() -> bool {
 }
 
 /// What the translator was told of the host, for a cache's key: the widest
-/// wave, the view heap's limit, where the raw twins of its views start, and
-/// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 5] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), host_lds_bytes()]
+/// wave, the view heap's limit, where the raw twins of its views start,
+/// what it writes for the console's own hardware, the shared memory of a group and the output
+/// of a mesh shader.
+pub fn host_settings() -> [u32; 6] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        host_lds_bytes(),
+        host_mesh_output_bytes(),
+    ]
 }
 
 thread_local! {
@@ -1169,6 +1177,25 @@ static HOST_LDS_BYTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 /// 32 KiB unless the host's GPU runs more (NVIDIA's take 48 KiB).
 pub fn set_host_lds_bytes(bytes: u32) {
     HOST_LDS_BYTES.store(bytes.max(32768), std::sync::atomic::Ordering::Relaxed);
+}
+
+static HOST_MESH_OUTPUT_BYTES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(super::container::MESH_OUTPUT_LIMIT as u32);
+
+/// Tells the translator how much output (vertex plus primitive, as the DXIL validator measures
+/// it) a mesh shader may have on the host: D3D12's 32 KiB unless the host's GPU takes more
+/// (NVIDIA's drivers, checked on an RTX 4060). A mesh program that still passes it after its
+/// maxima come down to its lanes is refused with a reason.
+pub fn set_host_mesh_output_bytes(bytes: u32) {
+    HOST_MESH_OUTPUT_BYTES.store(
+        bytes.max(super::container::MESH_OUTPUT_LIMIT as u32),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The output of a mesh shader the host allows ([`set_host_mesh_output_bytes`]).
+pub fn host_mesh_output_bytes() -> u32 {
+    HOST_MESH_OUTPUT_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -4860,22 +4887,19 @@ impl<'a> Lower<'a> {
         // D3D12 caps the outputs of the declared maxima at 32 KiB. Lane n
         // writes only vertex n and primitive n, so maxima past the lanes are
         // never reached: they come down to the lane count when the outputs
-        // do not fit.
-        use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
-        let (outputs, prims) = (&self.s.outputs, &self.s.prims);
-        let fits = |m: super::shader::Mesh| {
-            mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
-        };
-        if !fits(mesh) {
-            mesh.max_vertices = mesh.max_vertices.min(threads);
-            mesh.max_primitives = mesh.max_primitives.min(threads);
-            // shortcut: outputs past the cap even at the lane count are
-            // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
-            // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
-                return Err("a mesh shader whose outputs pass the host's 32 KiB");
-            }
+        // do not fit. What still passes the limit of the host's driver
+        // ([`set_host_mesh_output_bytes`]) is refused.
+        let (max_vertices, max_primitives) = super::container::mesh_maxima(
+            &self.s.outputs,
+            &self.s.prims,
+            (mesh.max_vertices, mesh.max_primitives),
+            threads,
+            u64::from(host_mesh_output_bytes()),
+        )
+        .ok_or("a mesh shader whose outputs pass the host's mesh output limit")?;
+        if (max_vertices, max_primitives) != (mesh.max_vertices, mesh.max_primitives) {
+            mesh.max_vertices = max_vertices;
+            mesh.max_primitives = max_primitives;
             self.s.mesh = Some(mesh);
         }
         let e = self.s.entry;

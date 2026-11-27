@@ -100,7 +100,6 @@ mod rect;
 mod sampler;
 mod shader;
 mod threading;
-#[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
 mod probe_tests;

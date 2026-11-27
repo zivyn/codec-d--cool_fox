@@ -1,0 +1,21 @@
+[package]
+name = "victory-translate"
+description = "The offline shader batch (`translate`, `shader-info`) without the Windows-only parts, so it builds and runs on Linux."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+victory-core.workspace = true
+victory-shader.workspace = true
+victory-game.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+memchr.workspace = true
+clap.workspace = true
+walkdir.workspace = true
+
+[lints]
+workspace = true

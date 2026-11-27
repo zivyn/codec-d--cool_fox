@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
@@ -149,13 +150,25 @@ struct Checks {
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
+}
+
+impl Checks {
+    /// Whether host pipelines are made (never without the D3D12 host).
+    fn has_host(&self) -> bool {
+        #[cfg(windows)]
+        return self.host.is_some();
+        #[cfg(not(windows))]
+        false
+    }
 }
 
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
 /// translating each at its first use.
+#[cfg(windows)]
 pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()> {
     // `--warm all`: every container found, whatever its hash.
     let all = file.as_os_str() == "all";
@@ -240,6 +253,8 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
+    #[cfg(not(windows))]
+    anyhow::ensure!(!pipelines, "--pipelines needs the D3D12 host (Windows)");
     // Dumped shaders and validator reports are game-derived (rule #1).
     if let Some(dir) = std::env::var_os("VICTORY_EMIT_DUMP") {
         victory_core::ensure_outside_repo(Path::new(&dir))?;
@@ -261,6 +276,7 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
+    #[cfg(windows)]
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
@@ -300,6 +316,7 @@ pub fn run(
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
+                            #[cfg(windows)]
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
@@ -362,6 +379,9 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    #[cfg(not(windows))]
+    anyhow::ensure!(pairs.is_empty(), "VICTORY_PAIRS needs the D3D12 host (Windows)");
+    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -394,6 +414,7 @@ pub fn run(
 }
 
 /// Every shader found into the cache runs translate from.
+#[cfg(windows)]
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -704,6 +725,7 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -722,7 +744,7 @@ fn check(
         }
     }
     let Some(v) = checks.validator.as_mut() else {
-        if t.list && checks.host.is_none() {
+        if t.list && !checks.has_host() {
             t.lines.push(format!("{}  emitted", label()));
         }
         return;

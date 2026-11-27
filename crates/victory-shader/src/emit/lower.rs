@@ -13413,6 +13413,9 @@ impl<'a> Lower<'a> {
                     None
                 };
                 if half_exit()
+                    && self.exchange.as_ref().is_some_and(|e| !e.1)
+                    && !self.local
+                    && !self.pair_meet
                     && let Some(header) = header
                     && self.exchanged > self.loop_exchanged.get(&header).copied().unwrap_or(u32::MAX)
                 {

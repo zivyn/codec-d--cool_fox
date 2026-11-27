@@ -5782,6 +5782,20 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// What the copy of a title buffer is, in a few words (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn describe_copy(address: u64, len: u64) -> String {
+    match peek(address, len) {
+        None => "no copy".into(),
+        Some(shadow) => format!(
+            "copy card={} gpu_only={} quiet_landing_on={}",
+            shadow.card.is_some(),
+            shadow.gpu_only.load(Ordering::Acquire),
+            crate::land::quiet::on()
+        ),
+    }
+}
+
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;

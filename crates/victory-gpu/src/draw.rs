@@ -4898,10 +4898,11 @@ fn describe(view: Option<&View>) -> String {
             .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
         Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
             Some(t) => format!("uav texture {t}"),
-            None => format!(
-                "uav resource {r:#x} buffer {:?}",
-                crate::descriptor::host::buffer_range(v)
-            ),
+            None => {
+                let range = crate::descriptor::host::buffer_range(v);
+                crate::capture::note_uav_buffer(range);
+                format!("uav resource {r:#x} buffer {range:?}")
+            }
         },
         Some(View::Placed(u, r, d)) => format!(
             "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",

@@ -21,7 +21,6 @@
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
@@ -782,6 +781,7 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        stats::waited(job.note.submitted.map(|t| started.saturating_duration_since(t)));
         let traced = Traced::start(&job);
         let reading = victory_gpu::timeline::span("streaming: a request");
         let result = execute(&job.request);
@@ -812,25 +812,22 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        stats::request(&job.request);
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
-            let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
-            tracing::debug!(
-                requests = *requests,
-                mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
-                busy_workers = format_args!("{:.2}", busy.as_secs_f64() / elapsed.as_secs_f64()),
-                reading_workers = format_args!("{:.2}", reading / elapsed.as_secs_f64()),
-                staging_waits = std::mem::take(&mut self.refused),
-                bcpack_mb = self.bcpack.0 / 1_000_000,
-                bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+            let (requests, bytes, busy) = std::mem::take(&mut self.done);
+            let bcpack = std::mem::take(&mut self.bcpack);
+            stats::report(
+                elapsed,
+                requests,
+                bytes,
+                busy,
+                bcpack.0,
+                std::mem::take(&mut self.refused),
                 waiting,
-                "dstorage: last {:.1} s",
-                elapsed.as_secs_f64()
             );
-            self.done = Default::default();
-            self.bcpack = Default::default();
             self.since = None;
         }
     }
@@ -1086,9 +1083,8 @@ impl Note {
 
     fn submitted(&mut self, request: &Request, early: bool) {
         self.early = early;
-        if trace() > 0 || stream_log::on() {
-            self.submitted = Some(std::time::Instant::now());
-        }
+        // Always: the statistics' wait for a worker runs from here.
+        self.submitted = Some(std::time::Instant::now());
         if trace() > 0 {
             self.at_submit = list_hash(request);
         }
@@ -1410,18 +1406,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
-        let mut packed = vec![0; request.intermediate_size as usize];
+        let mut packed = Scratch::take(1, request.intermediate_size as usize);
+        let started = std::time::Instant::now();
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
+        stats::add(&stats::INFLATE, started);
         packed.truncate(n);
-        Cow::Owned(packed)
+        Source::Held(packed)
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, size, |out| {
+        let started = std::time::Instant::now();
+        let done = match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        };
+        stats::add(if tables.is_some() { &stats::BCPACK } else { &stats::INFLATE }, started);
+        done
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),
@@ -1519,22 +1522,259 @@ fn load_bcpack_tables() -> Result<Tables, String> {
     Tables::parse(&bytes).map_err(|e| e.to_string())
 }
 
-/// A compressed request's source: borrowed from memory, or read from the
-/// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+/// A compressed request's source: the title's memory as it is, or what was
+/// read from the file.
+enum Source {
+    Memory(&'static [u8]),
+    Held(Scratch),
+}
+
+impl std::ops::Deref for Source {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Source::Memory(bytes) => bytes,
+            Source::Held(held) => held,
+        }
+    }
+}
+
+fn read_source(request: &Request) -> Result<Source, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
-        let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(Source::Memory(unsafe {
+            std::slice::from_raw_parts(request.source.cast(), size)
+        }));
     }
-    let mut bytes = vec![0; size];
+    let mut bytes = Scratch::take(0, size);
     read_into(request, &mut bytes)?;
-    Ok(Cow::Owned(bytes))
+    Ok(Source::Held(bytes))
 }
 
-/// Nanoseconds workers spent reading files, for the debug summary.
-static READING: AtomicU64 = AtomicU64::new(0);
+/// A buffer a worker takes for a request and gives back for the next
+/// (`VICTORY_STREAM_REUSE=0`: made and freed each time, as before). A
+/// request's source and its zlib output are blocks of up to a megabyte or
+/// more, which the host's heap takes from the address space (the one lock
+/// every mapping call of the title waits for) and zeroes on the first touch;
+/// a worker that keeps one skips both. Bigger than [`KEPT`] is not kept, so
+/// that the workers together hold 24 of these at most.
+struct Scratch {
+    bytes: Vec<u8>,
+    len: usize,
+    slot: usize,
+    keep: bool,
+}
+
+/// The most a worker keeps in one buffer.
+const KEPT: usize = 4 << 20;
+
+thread_local! {
+    static KEEPING: std::cell::RefCell<[Vec<u8>; 2]> =
+        const { std::cell::RefCell::new([Vec::new(), Vec::new()]) };
+}
+
+fn reusing() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_REUSE").is_none_or(|v| v != "0"))
+}
+
+impl Scratch {
+    /// `len` bytes (not zeroed: what was there before, or zeros), from the
+    /// worker's buffer in `slot` (0 or 1) when it keeps them.
+    fn take(slot: usize, len: usize) -> Scratch {
+        Scratch::take_as(slot, len, reusing())
+    }
+
+    fn take_as(slot: usize, len: usize, keep: bool) -> Scratch {
+        let mut bytes = if keep {
+            KEEPING.with_borrow_mut(|kept| std::mem::take(&mut kept[slot]))
+        } else {
+            Vec::new()
+        };
+        bytes.resize(len, 0);
+        Scratch { bytes, len, slot, keep }
+    }
+
+    /// Only the first `len` bytes are the buffer's.
+    fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl std::ops::DerefMut for Scratch {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes[..self.len]
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.keep && self.bytes.capacity() <= KEPT {
+            let bytes = std::mem::take(&mut self.bytes);
+            // A worker's thread-local may be gone at its exit: then it is freed.
+            let _ = KEEPING.try_with(|kept| {
+                if let Ok(mut kept) = kept.try_borrow_mut() {
+                    kept[self.slot] = bytes;
+                }
+            });
+        }
+    }
+}
+
+/// Where the workers' time goes, summed up every 5 s in a line of the log
+/// (`VICTORY_STREAM_STATS=0`: at debug level, which release builds drop).
+/// The console does this work in the decompression block and the disk's
+/// DMA; here the workers' threads do it, so the line is the cost of that
+/// part of the machine: CPU-seconds per second (`workers`) by phase, the
+/// time a submitted request waited for a worker, and the bytes.
+pub(crate) mod stats {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::time::{Duration, Instant};
+
+    /// Nanoseconds in each phase, since the line before: reading the
+    /// request's bytes from the file (or memory), inflating, BCPack.
+    pub(super) static READ: AtomicU64 = AtomicU64::new(0);
+    pub(super) static INFLATE: AtomicU64 = AtomicU64::new(0);
+    pub(super) static BCPACK: AtomicU64 = AtomicU64::new(0);
+    /// Requests that waited for a worker, their waits' sum and longest, ns.
+    pub(super) static WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static WAITED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static LONGEST: AtomicU64 = AtomicU64::new(0);
+    /// Bytes read from files or memory, since the line before.
+    pub(super) static SOURCE: AtomicU64 = AtomicU64::new(0);
+    /// Requests done since the process began.
+    pub(crate) static DONE: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn add(phase: &AtomicU64, since: Instant) {
+        phase.fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+    }
+
+    /// A request left the line for a worker after `wait`.
+    pub(super) fn waited(wait: Option<Duration>) {
+        let Some(wait) = wait else { return };
+        let ns = wait.as_nanos() as u64;
+        WAITS.fetch_add(1, Relaxed);
+        WAITED.fetch_add(ns, Relaxed);
+        LONGEST.fetch_max(ns, Relaxed);
+    }
+
+    pub(super) fn request(request: &Request) {
+        DONE.fetch_add(1, Relaxed);
+        SOURCE.fetch_add(u64::from(request.source_size), Relaxed);
+    }
+
+    pub(super) fn on() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_STATS").is_none_or(|v| v != "0"))
+    }
+
+    /// The numbers of a line, as they are worked out.
+    pub(super) struct Line {
+        pub seconds: f64,
+        pub requests: u64,
+        pub source_mb: f64,
+        pub output_mb: f64,
+        pub busy: f64,
+        pub reading: f64,
+        pub inflating: f64,
+        pub bcpack: f64,
+        /// Running a request but in none of the phases above: placing the
+        /// bytes (page windows, the guards of title memory), waiting for a view.
+        pub placing: f64,
+        pub waits: u64,
+        pub wait_mean_ms: f64,
+        pub wait_max_ms: f64,
+    }
+
+    impl Line {
+        pub(super) fn of(
+            elapsed: Duration,
+            requests: u64,
+            output: u64,
+            busy: Duration,
+            phases: [u64; 3],
+            waits: (u64, u64, u64),
+            source: u64,
+        ) -> Line {
+            let seconds = elapsed.as_secs_f64().max(1e-9);
+            let per = |ns: u64| ns as f64 / 1e9 / seconds;
+            let busy = busy.as_secs_f64() / seconds;
+            let [reading, inflating, bcpack] = phases.map(per);
+            Line {
+                seconds,
+                requests,
+                source_mb: source as f64 / 1e6,
+                output_mb: output as f64 / 1e6,
+                busy,
+                reading,
+                inflating,
+                bcpack,
+                placing: (busy - reading - inflating - bcpack).max(0.0),
+                waits: waits.0,
+                wait_mean_ms: match waits.0 {
+                    0 => 0.0,
+                    n => waits.1 as f64 / n as f64 / 1e6,
+                },
+                wait_max_ms: waits.2 as f64 / 1e6,
+            }
+        }
+    }
+
+    pub(super) fn report(
+        elapsed: Duration,
+        requests: u64,
+        output: u64,
+        busy: Duration,
+        bcpack_bytes: u64,
+        staging_waits: u64,
+        waiting: usize,
+    ) {
+        let phases = [&READ, &INFLATE, &BCPACK].map(|c| c.swap(0, Relaxed));
+        let waits = (WAITS.swap(0, Relaxed), WAITED.swap(0, Relaxed), LONGEST.swap(0, Relaxed));
+        let source = SOURCE.swap(0, Relaxed);
+        let line = Line::of(elapsed, requests, output, busy, phases, waits, source);
+        macro_rules! say {
+            ($level:ident) => {
+                tracing::$level!(
+                    requests = line.requests,
+                    source_mb = format_args!("{:.0}", line.source_mb),
+                    output_mb = format_args!("{:.0}", line.output_mb),
+                    mb_per_s = format_args!("{:.0}", line.output_mb / line.seconds),
+                    bcpack_mb = bcpack_bytes / 1_000_000,
+                    busy_workers = format_args!("{:.2}", line.busy),
+                    reading_workers = format_args!("{:.2}", line.reading),
+                    inflating_workers = format_args!("{:.2}", line.inflating),
+                    bcpack_workers = format_args!("{:.2}", line.bcpack),
+                    placing_workers = format_args!("{:.2}", line.placing),
+                    waited_for_a_worker = line.waits,
+                    wait_mean_ms = format_args!("{:.1}", line.wait_mean_ms),
+                    wait_max_ms = format_args!("{:.0}", line.wait_max_ms),
+                    staging_waits,
+                    waiting,
+                    "dstorage: last {:.1} s (VICTORY_STREAM_STATS)",
+                    line.seconds
+                )
+            };
+        }
+        if on() {
+            say!(info);
+        } else {
+            say!(debug);
+        }
+    }
+}
+
 
 /// How often a read the host refuses is tried again (about 0.25 s in all).
 const READ_RETRIES: u32 = 8;
@@ -1583,7 +1823,7 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         tries += 1;
         victory_gpu::kernel_will_write(out.as_ptr() as usize + done, out.len() - done);
     };
-    READING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    stats::add(&stats::READ, started);
     result
 }
 
@@ -2320,6 +2560,101 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, bc4_blocks());
+    }
+
+    /// The buffers workers keep give the bytes of a request that is bigger
+    /// or smaller than the one before, in order, with ordering and
+    /// completion as without them.
+    #[test]
+    fn many_sizes_of_zlib_requests_give_the_same_bytes_with_kept_buffers() {
+        // Sizes up and down, across the 4 MiB a worker does not keep.
+        let sizes = [70_000usize, 300, 5_000_000, 1, 65_536, 2_000_000, 128, 900_000, 2, 4096];
+        let plains: Vec<Vec<u8>> = sizes.iter().map(|&n| pattern(n)).collect();
+        let packs: Vec<Vec<u8>> = plains.iter().map(|p| compress_zlib(p)).collect();
+        let mut contents = Vec::new();
+        let offsets: Vec<u64> = packs
+            .iter()
+            .map(|p| {
+                let at = contents.len() as u64;
+                contents.extend_from_slice(p);
+                at
+            })
+            .collect();
+        let (_dir, file) = file_with(&contents);
+        let (queue, array) = (new_queue(0), status_array(sizes.len() as u32));
+        let mut outs: Vec<Vec<u8>> = plains.iter().map(|p| vec![0xa5; p.len()]).collect();
+        for round in 0..3 {
+            for (i, out) in outs.iter_mut().enumerate() {
+                out.fill(0xa5);
+                let (at, size) = (offsets[i], packs[i].len());
+                let r = request(ZLIB, out.as_mut_ptr().cast(), out.len(), file, at, size);
+                enqueue(queue, &r);
+                enqueue_status(queue, array, i as u32);
+            }
+            void(queue, 0x30);
+            // Completion in the order enqueued: the last entry done, all done.
+            assert_eq!(wait(array, sizes.len() as u32 - 1), S_OK, "round {round}");
+            for (i, out) in outs.iter().enumerate() {
+                assert_eq!(result(array, i as u32), S_OK, "round {round} request {i}");
+                assert_eq!(out, &plains[i], "round {round} request {i}");
+            }
+        }
+        assert!(stats::DONE.load(Ordering::Relaxed) >= 3 * sizes.len() as u64);
+    }
+
+    #[test]
+    fn a_scratch_buffer_is_kept_up_to_its_limit_and_by_slot() {
+        // Not kept: always new, zeros.
+        let mut a = Scratch::take_as(0, 1000, false);
+        a.fill(7);
+        drop(a);
+        assert!(Scratch::take_as(0, 1000, false).iter().all(|&b| b == 0));
+        // Kept: the next one is the same block, the length the one asked for.
+        let mut a = Scratch::take_as(0, 100_000, true);
+        a.fill(9);
+        let at = a.as_ptr() as usize;
+        drop(a);
+        let b = Scratch::take_as(0, 50_000, true);
+        assert_eq!((b.as_ptr() as usize, b.len()), (at, 50_000));
+        // The other slot is another block, and a shorter view hides the rest.
+        let mut c = Scratch::take_as(1, 10, true);
+        c.fill(1);
+        assert_ne!(c.as_ptr() as usize, at);
+        c.truncate(4);
+        assert_eq!(c.len(), 4);
+        c.truncate(100);
+        assert_eq!(c.len(), 4, "truncate never grows");
+        drop(c);
+        drop(b);
+        // Bigger than a worker keeps: freed, so the next is empty again.
+        drop(Scratch::take_as(0, KEPT + 1, true));
+        KEEPING.with_borrow(|kept| assert_eq!(kept[0].capacity(), 0));
+        // Taken and not given back: the next is made anew, not shared.
+        let first = Scratch::take_as(0, 8, true);
+        let second = Scratch::take_as(0, 8, true);
+        assert_ne!(first.as_ptr(), second.as_ptr());
+    }
+
+    #[test]
+    fn the_stats_line_adds_up() {
+        use std::time::Duration;
+        let line = stats::Line::of(
+            Duration::from_secs(5),
+            10,
+            50_000_000,
+            Duration::from_secs(10),
+            [2_500_000_000, 5_000_000_000, 0],
+            (4, 8_000_000, 6_000_000),
+            20_000_000,
+        );
+        assert_eq!((line.busy, line.reading, line.inflating, line.bcpack), (2.0, 0.5, 1.0, 0.0));
+        assert_eq!(line.placing, 0.5, "the busy time in none of the phases");
+        assert_eq!((line.wait_mean_ms, line.wait_max_ms, line.waits), (2.0, 6.0, 4));
+        assert_eq!((line.source_mb, line.output_mb), (20.0, 50.0));
+        // Phases cannot add up to more than the busy time reads.
+        let (second, tenth) = (Duration::from_secs(1), Duration::from_millis(100));
+        let over = stats::Line::of(second, 1, 0, tenth, [1_000_000_000, 0, 0], (0, 0, 0), 0);
+        assert_eq!(over.placing, 0.0);
     }
 
     /// BCPack tables we made (uniform models; BC4 index pairs: low 3 bits,

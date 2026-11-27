@@ -48,14 +48,25 @@ fn build() -> [u8; 32] {
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        if victory_shader::emit::loop_limit_is_named() {
             tracing::warn!(
                 limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+                "VICTORY_SHADER_LOOP_LIMIT: every translated loop has this limit, whatever its stage"
+            );
+        }
+        if let Some(table) = std::env::var("VICTORY_LOOP_LIMITS")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            tracing::warn!(
+                table,
+                "VICTORY_LOOP_LIMITS: translated loops of these programs and stages stop later"
             );
         }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
         bytes.extend_from_slice(&limit.to_le_bytes());
+        // (naming the default number is not naming none)
+        bytes.push(u8::from(victory_shader::emit::loop_limit_is_named()));
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:
@@ -79,6 +90,8 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_LOOP_NOTES",
             "VICTORY_LOOP_WHY",
+            "VICTORY_LOOP_LIMITS",
+            "VICTORY_HALF_EXIT",
             "VICTORY_PEEK",
             "VICTORY_MASK_NUMBERS",
             "VICTORY_BVH_BOUNDS",

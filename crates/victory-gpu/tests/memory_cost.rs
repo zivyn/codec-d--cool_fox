@@ -286,113 +286,273 @@ fn what_lists_and_buffers_cost() {
     }
 }
 
-/// What of the freed upload memory the driver keeps, and what makes it let go.
+/// Sizes the host makes upload buffers of in a run: scratch chunks of 256 KiB
+/// and 4 MiB, memory submissions send up with (8 MiB and more), texture
+/// staging of every size.
+const SIZES: [u64; 9] = [
+    256 << 10,
+    4 << 20,
+    8 << 20,
+    16 << 20,
+    256 << 10,
+    1 << 20,
+    4 << 20,
+    512 << 10,
+    2 << 20,
+];
+
+/// A queue run to idle: a fence signalled and reached.
+struct Idle {
+    queue: ID3D12CommandQueue,
+    fence: ID3D12Fence,
+    value: u64,
+}
+
+impl Idle {
+    fn new(device: &ID3D12Device) -> Idle {
+        // SAFETY: plain creation.
+        unsafe {
+            let queue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            Idle {
+                queue,
+                fence,
+                value: 0,
+            }
+        }
+    }
+
+    fn wait(&mut self) {
+        self.value += 1;
+        // SAFETY: a live queue and fence.
+        unsafe {
+            self.queue.Signal(&self.fence, self.value).unwrap();
+            while self.fence.GetCompletedValue() < self.value {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+fn start(what: &str) -> Memory {
+    let now = memory();
+    println!(
+        "[{what}] start: private {:.1} MB, working set {:.1} MB, {:.1} MB write-combined in {} allocations",
+        now.private as f64 / MB,
+        now.working as f64 / MB,
+        now.combined as f64 / MB,
+        now.allocations
+    );
+    now
+}
+
+/// A buffer of `size` bytes placed at `at` in `heap`, mapped and written.
+fn placed(
+    device: &ID3D12Device,
+    heap: &ID3D12Heap,
+    at: u64,
+    size: u64,
+    fill: u8,
+) -> ID3D12Resource {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: size,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: placed inside the heap, nothing else lies there.
+    unsafe {
+        device
+            .CreatePlacedResource(
+                heap,
+                at,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut made,
+            )
+            .unwrap();
+        let made = made.unwrap();
+        let mut data = std::ptr::null_mut();
+        made.Map(0, None, Some(&mut data)).unwrap();
+        std::ptr::write_bytes(data.cast::<u8>(), fill, size as usize);
+        made
+    }
+}
+
+/// What of the freed upload memory the driver keeps, and what makes it let
+/// go. `COST_SCENARIO` (each in a process of its own, as the driver's pools
+/// would carry from one to the next): `churn` (buffers made and let go,
+/// then what is tried to free the pools), `placed` (the same through
+/// buffers placed in a heap of ours), `ring` (the same through one buffer
+/// cut in pieces by us), `trim` (does the device have `Trim`), `steady`
+/// (churn for a long time: do the pools grow or settle).
 #[test]
 #[ignore = "needs a card: prints what the driver keeps of freed upload buffers, and what frees it"]
 fn what_frees_the_upload_memory_the_driver_keeps() {
+    let scenario = std::env::var("COST_SCENARIO").unwrap_or_else(|_| "churn".into());
+    let rounds = number("COST_ROUNDS", 600);
     let mut device: Option<ID3D12Device> = None;
     // SAFETY: plain creation.
     unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap() };
     let device = device.unwrap();
-    // SAFETY: plain creation.
-    let queue: ID3D12CommandQueue = unsafe {
-        device
-            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            })
-            .unwrap()
-    };
-    // SAFETY: plain creation.
-    let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
-    let mut value = 0u64;
-    let mut idle = || {
-        value += 1;
-        // SAFETY: a live queue and fence; the wait is on this thread's own event.
-        unsafe {
-            queue.Signal(&fence, value).unwrap();
-            while fence.GetCompletedValue() < value {
-                std::thread::yield_now();
-            }
+    let mut idle = Idle::new(&device);
+    let mut last = start(&scenario);
+    let mut keep: std::collections::VecDeque<Box<dyn std::any::Any>> =
+        std::collections::VecDeque::new();
+    match scenario.as_str() {
+        "trim" => {
+            use windows::Win32::Graphics::Dxgi::IDXGIDevice3;
+            use windows::core::Interface;
+            println!(
+                "device as an IDXGIDevice3 (for Trim): {}",
+                device.cast::<IDXGIDevice3>().is_ok()
+            );
         }
-    };
-
-    // The sizes of what the host makes in a run: scratch chunks of 256 KiB
-    // and 4 MiB, memory the submissions send up (8 MiB and more), blocks of
-    // staging (64 MiB), made and let go in turns, a tenth of them kept.
-    let mut last = memory();
-    println!(
-        "start: private {:.1} MB, working set {:.1} MB, {:.1} MB write-combined in {} allocations",
-        last.private as f64 / MB,
-        last.working as f64 / MB,
-        last.combined as f64 / MB,
-        last.allocations
-    );
-    let sizes = [
-        256u64 << 10,
-        4 << 20,
-        8 << 20,
-        16 << 20,
-        256 << 10,
-        1 << 20,
-        4 << 20,
-    ];
-    let mut kept = Vec::new();
-    let rounds = number("COST_ROUNDS", 600);
-    for i in 0..rounds {
-        let size = sizes[i % sizes.len()];
-        let made = buffer(&device, D3D12_HEAP_TYPE_UPLOAD, size);
-        if i % 10 == 0 {
-            kept.push(made);
-        } else if i % 3 == 0 {
-            // Held for a few more rounds, as a list's scratch is.
-            kept.push(made);
-            if kept.len() > 40 {
-                kept.remove(1);
+        "ring" => {
+            // One buffer of 256 MiB, pieces of the sizes cut from it in a
+            // ring, as the host would cut scratch and send memory.
+            let (big, data) = buffer(&device, D3D12_HEAP_TYPE_UPLOAD, 256 << 20);
+            last = report("one upload buffer of 256 MiB, written", last, 1);
+            let mut at = 0u64;
+            for i in 0..rounds * 20 {
+                let size = SIZES[i % SIZES.len()];
+                if at + size > 256 << 20 {
+                    at = 0;
+                }
+                // SAFETY: inside the mapping.
+                unsafe { std::ptr::write_bytes(data.add(at as usize), i as u8, size as usize) };
+                at += size;
             }
+            last = report(
+                &format!("{} pieces cut and written in a ring", rounds * 20),
+                last,
+                1,
+            );
+            drop(big);
+            let _ = report("the buffer dropped", last, 1);
         }
+        "placed" => {
+            // A heap of upload memory of ours, buffers placed in it.
+            let heap_size = 256u64 << 20;
+            let desc = D3D12_HEAP_DESC {
+                SizeInBytes: heap_size,
+                Properties: D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_UPLOAD,
+                    ..Default::default()
+                },
+                Alignment: 0,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+            };
+            let mut heap: Option<ID3D12Heap> = None;
+            // SAFETY: plain creation.
+            unsafe { device.CreateHeap(&desc, &mut heap).unwrap() };
+            let heap = heap.unwrap();
+            last = report("a heap of upload memory of 256 MiB", last, 1);
+            let mut at = 0u64;
+            for i in 0..rounds * 4 {
+                let size = SIZES[i % SIZES.len()];
+                if at + size > heap_size {
+                    at = 0;
+                    keep.clear();
+                }
+                keep.push_back(Box::new(placed(&device, &heap, at, size, i as u8)));
+                if keep.len() > 40 {
+                    keep.pop_front();
+                }
+                at += size;
+            }
+            last = report(
+                &format!("{} buffers placed in it and let go", rounds * 4),
+                last,
+                1,
+            );
+            keep.clear();
+            last = report("... all let go", last, 1);
+            idle.wait();
+            last = report("... the queue idle", last, 1);
+            drop(heap);
+            let _ = report("the heap dropped", last, 1);
+        }
+        "churn" | "steady" => {
+            let rounds = if scenario == "steady" {
+                rounds * 8
+            } else {
+                rounds
+            };
+            for i in 0..rounds {
+                let size = SIZES[i % SIZES.len()];
+                let made = buffer(&device, D3D12_HEAP_TYPE_UPLOAD, size);
+                // Held a few rounds, as a list's scratch is; a tenth for long.
+                keep.push_back(Box::new(made));
+                if keep.len() > 40 {
+                    let old = keep.pop_front().unwrap();
+                    if i % 10 == 0 {
+                        keep.push_back(old);
+                    }
+                }
+                if scenario == "steady" && (i + 1) % (rounds / 8) == 0 {
+                    last = report(
+                        &format!("after {} rounds, {} alive", i + 1, keep.len()),
+                        last,
+                        1,
+                    );
+                    if (i + 1) / (rounds / 8) % 2 == 0 {
+                        idle.wait();
+                    }
+                }
+            }
+            last = report(
+                &format!(
+                    "{rounds} upload buffers made of mixed sizes, {} alive",
+                    keep.len()
+                ),
+                last,
+                1,
+            );
+            idle.wait();
+            last = report(
+                "... the queue idle (a fence signalled and reached)",
+                last,
+                1,
+            );
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            last = report("... 3 s later", last, 1);
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            last = report("... 13 s later", last, 1);
+            for size in [1u64 << 20, 4 << 20, 16 << 20, 32 << 20, 64 << 20, 256 << 20] {
+                drop(buffer(&device, D3D12_HEAP_TYPE_UPLOAD, size));
+                last = report(
+                    &format!(
+                        "... one upload buffer of {} MiB made and dropped",
+                        size >> 20
+                    ),
+                    last,
+                    1,
+                );
+                idle.wait();
+                last = report("... the queue idle", last, 1);
+            }
+            keep.clear();
+            last = report("the buffers kept dropped", last, 1);
+            idle.wait();
+            let _ = report("... the queue idle", last, 1);
+        }
+        other => panic!("COST_SCENARIO {other}?"),
     }
-    last = report(
-        &format!(
-            "{rounds} upload buffers made of mixed sizes, most let go, {} alive",
-            kept.len()
-        ),
-        last,
-        1,
-    );
-    idle();
-    last = report(
-        "... the queue idle (a fence signalled and reached)",
-        last,
-        1,
-    );
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    last = report("... 3 s later", last, 1);
-    for size in [1u64 << 20, 4 << 20, 16 << 20, 32 << 20, 64 << 20] {
-        drop(buffer(&device, D3D12_HEAP_TYPE_UPLOAD, size));
-        last = report(
-            &format!(
-                "... one upload buffer of {} MiB made and dropped",
-                size >> 20
-            ),
-            last,
-            1,
-        );
-        idle();
-        last = report("... the queue idle", last, 1);
-    }
-    let (from, _) = buffer(&device, D3D12_HEAP_TYPE_DEFAULT, 1 << 20);
-    drop(from);
-    last = report("... one default buffer made and dropped", last, 1);
-    drop(kept);
-    last = report("the buffers kept dropped", last, 1);
-    idle();
-    last = report("... the queue idle", last, 1);
-    for size in [64u64 << 20, 64 << 20] {
-        drop(buffer(&device, D3D12_HEAP_TYPE_UPLOAD, size));
-        last = report("... one upload buffer of 64 MiB made and dropped", last, 1);
-    }
-    let _ = last;
 }
 
 /// Where the cost of a list and its allocator lies.

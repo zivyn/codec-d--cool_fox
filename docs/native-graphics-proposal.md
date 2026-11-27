@@ -28,6 +28,54 @@ renderer, so its native control still needs integration and a title run.
 The first integration exercises one VIctory-owned setting. Restored stock
 rows are outside that test.
 
+## Rust sketch
+
+The launcher already resolves the SDK directory and sets
+`VICTORY_STREAMLINE_DIR`. Keep using that path for the signed
+`sl.interposer.dll`, `sl.dlss_g.dll`, `nvngx_dlssg.dll` and the rest of their
+dependencies. [Existing DLL setup](dlss.md#setup)
+
+Use the same option values for the native row and F1. Place the commit
+handler in `victory-gpu` so it can call the existing Streamline helpers. The
+save callback below represents the shared settings helper to extract from
+F1's save path.
+
+```rust
+use std::io;
+
+const FRAMEGEN_KEY: &str = "VICTORY_MENU_FRAMEGEN";
+const FRAMEGEN_OPTIONS: &[(&str, u32)] = &[
+    ("Off", 0),
+    ("2×", 2),
+    ("3×", 3),
+    ("4×", 4),
+    ("5×", 5),
+    ("6×", 6),
+];
+
+// The proposed shared setter updates F1's state and the same settings file.
+fn commit_framegen(
+    picked: usize,
+    save_shared_choice: impl FnOnce(&str, &str) -> io::Result<()>,
+) -> io::Result<()> {
+    let &(_, multiplier) = FRAMEGEN_OPTIONS
+        .get(picked)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid frame generation choice"))?;
+    save_shared_choice(FRAMEGEN_KEY, &multiplier.to_string())?;
+
+    if crate::streamline::framegen_live() {
+        crate::streamline::set_framegen(multiplier);
+    }
+    Ok(())
+}
+```
+
+If the Streamline swap-chain proxy is ready, the new multiplier takes
+effect from the next present. Otherwise, the launcher uses the saved
+choice next time. The existing Streamline code checks the GPU's maximum
+and caps the request. For example, 6× requests five generated frames for
+each rendered frame.
+
 [F1 menu implementation](../crates/victory-gpu/src/host/menu.rs) ·
 [Upstream prototype](https://github.com/Marvisak/VIctory/pull/2863) ·
 [Native Graphics design discussion](https://github.com/Marvisak/VIctory/issues/2862)

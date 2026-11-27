@@ -85,6 +85,12 @@ build tools and a Windows SDK, then:
 
 ```powershell
 cargo build --release --locked -p victory
+
+# with the diag build, to have the pipelines made ahead:
+target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
+target\diag\victory.exe warm --used --compute --now       # the pipelines earlier runs drew with (VICTORY_PIPELINE_BOOK=1 writes
+                                                          # them down) and every compute pipeline of shaders.rpf, into the
+                                                          # pipeline library; `warm --verify` asks the library for them
 ```
 
 `Play-VIctory.cmd` finds `target\release\victory.exe`. The diagnostics build is

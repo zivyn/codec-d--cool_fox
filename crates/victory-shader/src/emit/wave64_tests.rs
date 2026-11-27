@@ -670,7 +670,7 @@ fn a_number_made_of_a_joined_stack_entry_is_computed_where_its_sources_are_numbe
     ];
     let native = native_of(&words, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    // (as `translate` makes it for a program the first translation refused for a mask read as data)
+    // (as `emit` makes it for a program the first translation refused for a mask read as data)
     let shader = lower::with_mask_numbers(|| lowered(&native, &p, &HashSet::new())).expect("lower");
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

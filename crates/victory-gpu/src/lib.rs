@@ -90,7 +90,7 @@ mod sites;
 mod tiles;
 pub mod signature;
 mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod ab;
 #[cfg(windows)]
 mod tdr;

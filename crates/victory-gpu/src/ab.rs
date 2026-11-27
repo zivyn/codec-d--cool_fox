@@ -27,6 +27,9 @@
 //! [`live_value!`] (or [`pick`] and [`bit`] by hand): see `docs/ab-switches.md`
 //! for each one and why it may change at any instant.
 
+// Without diagnostics only the macros below are used (the switches then go by their variables alone).
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code, unused_imports))]
+
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};

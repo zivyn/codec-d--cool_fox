@@ -2862,6 +2862,13 @@ mod stamp_tests {
 
 #[cfg(test)]
 mod tests {
+    // Tests run in parallel in one process, and address space freed by one is
+    // mapped by another at once. A change of mapping notes the range it
+    // unmaps until it is over (`Guards::changing`), whatever lies there by
+    // then: a view of another test mapped meanwhile is left alone by the
+    // guard and not made read-only (`kernel_reads_into_guarded_blocks_after_
+    // opening` failed so). The runtime maps under the same lock
+    // (`title_memory_remapping`), so the tests that map do too.
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -2916,6 +2923,7 @@ mod tests {
         };
         // SAFETY: a pagefile section of two blocks, mapped read-write.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -2972,6 +2980,7 @@ mod tests {
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
         // SAFETY: a fresh placeholder, split.
         unsafe {
+            let _map = title_memory_remapping();
             let p = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -3028,6 +3037,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of two blocks, mapped read-write.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -3118,6 +3128,7 @@ mod tests {
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of a block, mapped read-write.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section =
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
             assert!(!section.is_null());
@@ -3270,6 +3281,7 @@ mod tests {
         // SAFETY: a pagefile section of two blocks, mapped read-write; the
         // view holds it.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
@@ -3323,6 +3335,7 @@ mod tests {
         // SAFETY: a new reserved pagefile section. The view holds its own
         // reference after we close the handle, including on assertion failure.
         let view = unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
@@ -3375,6 +3388,7 @@ mod tests {
         // SAFETY: a fresh placeholder of three blocks and a pagefile
         // section of three; the middle block is mapped first.
         let (p, section) = unsafe {
+            let _map = title_memory_remapping();
             let p = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -3467,6 +3481,7 @@ mod tests {
         // section of two; block 0 shows the section's first block, as the
         // runtime maps physical pages.
         let (p, section) = unsafe {
+            let _map = title_memory_remapping();
             let p = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -3548,6 +3563,7 @@ mod tests {
         // SAFETY: a fresh pagefile section, mapped twice; the views keep
         // the section alive and the handle is closed by the caller.
         unsafe {
+            let _map = title_memory_remapping();
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
@@ -4172,6 +4188,7 @@ mod many_askers_tests {
         const THREADS: usize = 8;
         // SAFETY: views of a section of our own.
         let (section, all): (usize, [usize; VIEWS]) = unsafe {
+            let _map = super::title_memory_remapping();
             let section = CreateFileMappingW(
                 -1isize as _,
                 std::ptr::null(),
@@ -4203,6 +4220,7 @@ mod many_askers_tests {
                         // SAFETY (all): a view of one page of the section,
                         // this thread's alone.
                         let one = unsafe {
+                            let _map = super::title_memory_remapping();
                             MapViewOfFile(section as _, FILE_MAP_WRITE, 0, (page * PAGE) as u32, PAGE).Value as usize
                         };
                         assert_ne!(one, 0);
@@ -4323,6 +4341,7 @@ mod many_askers_tests {
         const BLOCKS: usize = 8;
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
+            let _map = super::title_memory_remapping();
             let at = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -4409,6 +4428,7 @@ mod many_askers_tests {
         const BLOCKS: usize = 12;
         // SAFETY (all): a placeholder and a section of our own, which stay.
         let (at, section) = unsafe {
+            let _map = super::title_memory_remapping();
             let at = VirtualAlloc2(
                 GetCurrentProcess(),
                 std::ptr::null(),
@@ -4497,6 +4517,7 @@ mod many_askers_tests {
     fn bits_go_with_the_guard() {
         // SAFETY: a view of a section of our own, which stays.
         let at = unsafe {
+            let _map = super::title_memory_remapping();
             let section =
                 CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * PAGE) as u32, std::ptr::null());
             MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * PAGE).Value as usize

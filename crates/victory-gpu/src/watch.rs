@@ -136,6 +136,31 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Askings of whole submissions that stand side by side
+    /// ([`ask_standing`]), each with the ranges it asked about: `writes`
+    /// answers for a range inside one of them from the journal, as for
+    /// `ahead`. Empty unless something asks that way.
+    standing: Vec<Stood>,
+}
+
+/// One standing asking's ranges (page ranges) and its number.
+struct Stood {
+    id: u64,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl Journal {
+    /// Whether the pages `[first, last)` lie in a range asked ahead, by an
+    /// asking in turn ([`ask_ahead`]) or by one that stands.
+    fn covers(&self, first: usize, last: usize) -> bool {
+        let inside = |ranges: &[(usize, usize)]| ranges.iter().any(|&(a, b)| a <= first && last <= b);
+        inside(&self.ahead) || self.standing.iter().any(|s| inside(&s.ranges))
+    }
+
+    /// Whether an asking of a whole submission stands, of either kind.
+    fn standing_any(&self) -> bool {
+        self.kept || !self.standing.is_empty()
+    }
 }
 
 /// Read by many threads at once (a submission's refreshes run on several),
@@ -150,6 +175,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    standing: Vec::new(),
 });
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
@@ -328,7 +354,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     pieces.sort_unstable();
     // The submission's one asking stands ([`ask_once`]): what it does not
     // hold is left to `writes`.
-    if journal().kept {
+    if journal().standing_any() {
         return;
     }
     let _all = Asking::hold_all();
@@ -589,12 +615,111 @@ pub(crate) fn ask_once_end() {
     }
 }
 
+/// A submission's asking that stands beside others ([`ask_standing`]).
+#[derive(Debug)]
+pub(crate) struct Standing(u64);
+
+static STANDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// As [`ask_once`], but the asking is one of several that may stand at the
+/// same time (`VICTORY_ASK_TOKENS=1`): the journal answers for the ranges of
+/// each until it is ended with its own [`Standing`], and neither asking nor
+/// ending one touches the others. `replace`: a standing asking of the
+/// caller's own that this one takes the place of (a submission asks again
+/// after it waited for flights).
+///
+/// What the stamps say is as for one asking: pages found written carry the
+/// number of the asking that found them, numbers only grow, and the answer
+/// for a range is the journal's `ahead_asked` at the time it is read, which
+/// is never later than the memory read after it. A refresh that reads under
+/// one asking while another is made finds the pages the other found as newer
+/// than its own copy, and copies them again: more, never less, than with one
+/// asking after the other.
+pub(crate) fn ask_standing(ranges: &[(usize, usize)], replace: Option<Standing>) -> Standing {
+    // One asking at a time holds every range, as `ask_ahead` and `ask_rest`
+    // do, so no other thread's asking comes between the two parts.
+    let _all = Asking::hold_all();
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    let (mut asked, mut found) = (Vec::new(), Vec::new());
+    if pieces.len() >= 2 {
+        pieces.sort_unstable();
+        let mut i = 0;
+        while i < pieces.len() {
+            let first = pieces[i].0;
+            let mut last = pieces[i].1;
+            let mut k = i + 1;
+            while k < pieces.len() && pieces[k].0 <= last + AHEAD_GAP && last.max(pieces[k].1) - first <= AHEAD_MAX {
+                last = last.max(pieces[k].1);
+                k += 1;
+            }
+            ask_run(&pieces[i..k], &mut asked, &mut found);
+            i = k;
+        }
+    }
+    note_hot(&found);
+    // The first part's pages are noted under a number of their own, the rest
+    // under another (as `ask_once`'s two parts).
+    if !found.is_empty() {
+        let mut j = journal_mut();
+        let first = next_asking();
+        j.ahead_asked = first;
+        for (page, parts) in std::mem::take(&mut found) {
+            j.note(page, parts, first);
+        }
+    }
+    let mut alone = Vec::new();
+    for &(start, end) in ranges {
+        if start >= end || published(start, end) {
+            continue;
+        }
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        if !asked.iter().any(|&(a, b)| a <= first && last <= b)
+            && let Some(pages) = kernel_written(first, last)
+        {
+            alone.extend(pages);
+            asked.push((first, last));
+        }
+    }
+    note_hot(&alone);
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in alone {
+        j.note(page, parts, now);
+    }
+    if let Some(Standing(old)) = replace {
+        j.standing.retain(|s| s.id != old);
+    }
+    let id = STANDING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !asked.is_empty() {
+        j.standing.push(Stood { id, ranges: asked });
+    }
+    Standing(id)
+}
+
+/// The asking `standing` stands no longer: the others do.
+pub(crate) fn end_standing(standing: Standing) {
+    let mut j = journal_mut();
+    j.standing.retain(|s| s.id != standing.0);
+}
+
+/// No asking that stands answers any longer: title memory was written in a
+/// way the journal was not told (what [`ask_once_end`] says for the one
+/// asking).
+pub(crate) fn end_standing_all() {
+    journal_mut().standing.clear();
+}
+
 /// We wrote title memory `[at, at + len)` while a submission's one asking
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
     let mut j = journal_mut();
-    if !j.kept || len == 0 {
+    if !j.standing_any() || len == 0 {
         return;
     }
     let now = next_asking();
@@ -649,9 +774,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    j.covers(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -664,7 +787,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.covers(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -748,7 +871,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !j.covers(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -2816,6 +2939,7 @@ mod parts_tests {
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
+            standing: Vec::new(),
         };
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
@@ -2867,6 +2991,7 @@ mod stamp_tests {
             ahead: Vec::new(),
             ahead_asked: 0,
             kept: false,
+            standing: Vec::new(),
         };
         j.note(first + 1, WHOLE, 5);
         assert!(!untouched_since(start, end, after));
@@ -3306,6 +3431,88 @@ mod tests {
         let last = journal().written.get(&(p / PAGE + 1)).copied();
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Askings of submissions that stand side by side answer each for its
+    /// own ranges, ending one leaves the other, and a replaced one is gone.
+    #[test]
+    fn askings_that_stand_side_by_side_end_alone() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 12 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let at = |n: usize| p + n * PAGE;
+        let a = [(at(0), at(2)), (at(2), at(3))];
+        let b = [(at(4), at(5)), (at(5), at(6))];
+        let c = [(at(8), at(9)), (at(9), at(10))];
+        let first = ask_standing(&a, None);
+        let second = ask_standing(&b, None);
+        assert!(asked(at(0), at(3)).is_some() && asked(at(4), at(6)).is_some());
+        // Not asked about, and not between the two.
+        assert!(asked(at(7), at(8)).is_none() && asked(at(3), at(5)).is_none());
+        end_standing(first);
+        assert!(asked(at(0), at(3)).is_none(), "the first ended");
+        assert!(asked(at(4), at(6)).is_some(), "the second stands");
+        // A submission that asks again takes the place of its own asking only.
+        let third = ask_standing(&c, None);
+        let again = ask_standing(&[(at(10), at(11)), (at(11), at(12))], Some(third));
+        assert!(asked(at(8), at(10)).is_none(), "the replaced one is gone");
+        assert!(asked(at(10), at(12)).is_some() && asked(at(4), at(6)).is_some());
+        end_standing(second);
+        end_standing(again);
+        assert!(asked(at(4), at(6)).is_none() && asked(at(10), at(12)).is_none());
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A page the title writes after one asking and before the next is found
+    /// by the next, with a number higher than the first's, whichever of the
+    /// two stands: an older asking's refresh copies it again, never skips it.
+    #[test]
+    fn a_later_asking_finds_what_is_written_after_an_earlier_one_that_stands() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let at = |n: usize| p + n * PAGE;
+        let first = ask_standing(&[(at(0), at(2)), (at(2), at(4))], None);
+        let (first_number, _) = asked(at(0), at(4)).expect("stands");
+        // SAFETY: committed pages of ours.
+        unsafe { (at(1) as *mut u8).write_volatile(7) };
+        let second = ask_standing(&[(at(4), at(6)), (at(6), at(8))], None);
+        // The second asking covers other ranges: the page of the first is
+        // not in what it found, and is found by the first's own next asking.
+        let again = ask_standing(&[(at(0), at(2)), (at(2), at(4))], Some(first));
+        let (now, pages) = asked(at(0), at(4)).expect("stands");
+        let found = pages.iter().find(|&&(page, _)| page == at(1) / PAGE).map(|&(_, number)| number);
+        assert!(now > first_number, "numbers only grow: {now} after {first_number}");
+        assert!(found.is_some_and(|found| found > first_number), "{found:?} after {first_number}");
+        end_standing(second);
+        end_standing(again);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Our own writes into title memory are told while only a standing
+    /// asking stands, and not otherwise.
+    #[test]
+    fn our_writes_are_noted_while_an_asking_stands() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let page = (p + PAGE) / PAGE;
+        let standing = ask_standing(&[(p, p + 2 * PAGE), (p + 2 * PAGE, p + 3 * PAGE)], None);
+        let before = journal().written.get(&page).copied();
+        wrote(p + PAGE, 8);
+        let after = journal().written.get(&page).copied();
+        assert!(after > before, "{after:?} is not after {before:?}");
+        end_standing(standing);
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

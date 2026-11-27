@@ -432,6 +432,8 @@ enum Job {
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
         Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>,
         super::Shown,
+        // When the title's call put it in the line.
+        Instant,
     ),
 }
 
@@ -616,8 +618,9 @@ impl Work for Job {
                     crate::fence::set(fence as This, value);
                 }
             }
-            Job::Present(texture, overlay, shown) => {
+            Job::Present(texture, overlay, shown, called) => {
                 ramp_reset();
+                STATS[LAG].fetch_add(called.elapsed().as_micros() as u64, Relaxed);
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
                     // presented: the state they left it in.)
@@ -646,7 +649,7 @@ static QUEUED: AtomicU64 = AtomicU64::new(0);
 /// threads of the title waited, in microseconds, for room in the line, at a
 /// present, and for a drain, and the drains; what our thread worked; waits
 /// not met at a present.
-static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 const RUNS: usize = 0;
 const PRESENTS: usize = 1;
 const DEPTH: usize = 2;
@@ -662,6 +665,10 @@ const JOINED: usize = 10;
 /// Submissions that took fewer parts along than they might have
 /// ([`ramp_parts`]).
 const RAMPED: usize = 11;
+/// Microseconds from the title's present call to the moment our thread did
+/// it: how far behind the title the line is (the title may be one frame ahead,
+/// `VICTORY_SUBMIT_FRAMES`).
+const LAG: usize = 12;
 
 /// How many parts the next submission of the line may take along
 /// (`VICTORY_JOIN_RAMP=1`; off by default): after a present only its own,
@@ -933,7 +940,7 @@ pub(super) fn present(
 ) {
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
-    LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
+    LANE.push(this as usize, [Job::Present(texture, overlay, shown, Instant::now())]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
@@ -962,6 +969,12 @@ pub(super) fn line(frames: f64) {
         s[JOINED] / frames,
         s[RAMPED] / frames
     );
+    if s[PRESENTS] > 0.0 {
+        tracing::info!(
+            "the line behind the title, per present: {:.1} ms from the title's present call to the present done by our thread              (VICTORY_SUBMIT_FRAMES lets the title be that many frames ahead)",
+            s[LAG] / 1000.0 / s[PRESENTS]
+        );
+    }
     if let Some([splits, before, lists]) = crate::host::take_blocked_splits() {
         tracing::info!(
             "joined submissions that waited for flights, per frame (VICTORY_SPLIT_BLOCKED): {:.2} with parts in front of the wait \

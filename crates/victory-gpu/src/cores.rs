@@ -69,6 +69,58 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// `VICTORY_THREAD_PRIORITY`: 0: every thread of ours at the title's own
+/// priority, as before; 1 (the default): the helpers a submission's preparing
+/// or a landing waits for run above it, like the thread that prepares (and
+/// before the title's threads, and the ones that translate its lists, when
+/// all the processors are busy); 2: the threads that translate lists run
+/// below it as well.
+///
+/// The frame is bound by the thread that prepares and sends submissions, but
+/// the process keeps some 7 of the 12 logical processors busy (a 6 core
+/// processor's worth, with the second threads of its cores): whenever more
+/// threads want to run than there are processors, the helpers that thread
+/// waits for stand in the same line as the 8 threads that translate lists
+/// (440 ms of work a frame, none of it waited for) and the title's own.
+fn priority_stage() -> u32 {
+    static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STAGE.get_or_init(|| std::env::var("VICTORY_THREAD_PRIORITY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+}
+
+/// What a thread's priority is set to at `stage` (the switch's value) for
+/// its `role`: `None`, as it is.
+fn priority_for(stage: u32, role: Role) -> Option<i32> {
+    use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL};
+    match role {
+        Role::Helper if stage >= 1 => Some(THREAD_PRIORITY_ABOVE_NORMAL),
+        Role::Translator if stage >= 2 => Some(THREAD_PRIORITY_BELOW_NORMAL),
+        _ => None,
+    }
+}
+
+/// What a thread of ours does for the frame.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Role {
+    /// Work that the thread preparing submissions, or the landing of flights,
+    /// waits for.
+    Helper,
+    /// Work ahead of the frame's critical path, never waited for at a
+    /// processor's expense.
+    Translator,
+}
+
+/// Sets the calling thread's priority for its `role` (`VICTORY_THREAD_PRIORITY`).
+pub(crate) fn prioritize(what: &str, role: Role) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
+    let Some(level) = priority_for(priority_stage(), role) else {
+        return;
+    };
+    // SAFETY: this thread's own priority.
+    if unsafe { SetThreadPriority(GetCurrentThread(), level) } == 0 {
+        tracing::warn!(what, error = %std::io::Error::last_os_error(), "the thread's priority could not be set");
+    }
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
     if stage() < from {
@@ -95,6 +147,33 @@ fn ask(what: &str, from: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn priorities_follow_the_switch_and_the_role() {
+        use windows_sys::Win32::System::Threading::{THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_BELOW_NORMAL};
+        assert_eq!(priority_for(0, Role::Helper), None);
+        assert_eq!(priority_for(0, Role::Translator), None);
+        assert_eq!(priority_for(1, Role::Helper), Some(THREAD_PRIORITY_ABOVE_NORMAL));
+        assert_eq!(priority_for(1, Role::Translator), None);
+        assert_eq!(priority_for(2, Role::Helper), Some(THREAD_PRIORITY_ABOVE_NORMAL));
+        assert_eq!(priority_for(2, Role::Translator), Some(THREAD_PRIORITY_BELOW_NORMAL));
+    }
+
+    #[test]
+    fn a_helper_thread_runs_above_normal_with_the_default() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+        if priority_stage() == 0 {
+            return;
+        }
+        let level = std::thread::spawn(|| {
+            prioritize("test", Role::Helper);
+            // SAFETY: this thread's own.
+            unsafe { GetThreadPriority(GetCurrentThread()) }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(level, THREAD_PRIORITY_ABOVE_NORMAL);
+    }
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {

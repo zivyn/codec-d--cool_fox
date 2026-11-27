@@ -1693,6 +1693,7 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                crate::cores::prioritize("victory-wide", crate::cores::Role::Helper);
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {

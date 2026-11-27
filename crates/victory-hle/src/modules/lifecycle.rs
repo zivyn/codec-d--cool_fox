@@ -97,8 +97,10 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
 
+/// Fullscreen, the English keyboard and the mouse capture are asked for
+/// (`=1`, or the F1 menu): left unset, the window and input stay as before.
 pub(super) fn enabled(name: &str) -> bool {
-    std::env::var_os(name).is_none_or(|v| v != "0")
+    std::env::var_os(name).is_some_and(|v| v == "1")
 }
 
 fn fullscreen(hwnd: HWND) {

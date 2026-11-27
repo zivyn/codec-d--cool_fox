@@ -909,6 +909,16 @@ mod tests {
         rtx40.adapter = "NVIDIA GeForce RTX 4070".into();
         let rtx40 = lines(rtx40, true, false);
         assert!(rtx40.contains("FRAME GEN: DLSS, SUPPORTED") && !rtx40.contains("MOD"), "{rtx40}");
+        // A supported card can still be rejected for an OS or driver requirement (for
+        // example, HAGS being disabled); do not misreport that as incompatible hardware.
+        let mut rtx40_unavailable = facts(true, false, false, false);
+        rtx40_unavailable.adapter = "NVIDIA GeForce RTX 4080".into();
+        let rtx40_unavailable = lines(rtx40_unavailable, false, false);
+        assert!(
+            rtx40_unavailable.contains("UNAVAILABLE (CHECK HAGS AND LOG)")
+                && !rtx40_unavailable.contains("NOT ON THIS CARD"),
+            "{rtx40_unavailable}"
+        );
         // RTX 20/30 with DLSS frame generation running: a mod unlocked it (MFG Unlocker).
         let unlocked = lines(facts(true, true, true, false), true, false);
         assert!(unlocked.contains("UNLOCKED BY A MOD") && !unlocked.contains("SUPPORTED HERE"), "{unlocked}");

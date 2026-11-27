@@ -470,6 +470,8 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
     if no_dlss_fg {
         lines.push(if f.files_missing {
             "DLSS FRAME GEN: NVIDIA DLSS FILES NOT FOUND"
+        } else if dlss_framegen_card(&f.adapter) {
+            "DLSS FRAME GEN: UNAVAILABLE (CHECK HAGS AND LOG)"
         } else {
             "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)"
         }.into());

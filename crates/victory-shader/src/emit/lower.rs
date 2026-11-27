@@ -3918,18 +3918,32 @@ impl<'a> Lower<'a> {
                     self.cur_ir,
                     self.at_offset
                 );
-                // (what its writer read, and what those have: where the chain starts)
-                if let Some(b) = made
-                    && let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo))
-                {
-                    for &(reg, v) in &w.reads {
-                        let state = match self.vals.get(&v) {
-                            Some(Val::Missing(why)) => format!("missing ({why})"),
-                            Some(_) => "a value".to_string(),
-                            None => "not made".to_string(),
+                // (what its writer read, and what those have, a few steps back: where the chain
+                // of missing values starts)
+                let mut work = vec![(lo, 0usize)];
+                while let Some((v, depth)) = work.pop() {
+                    let Some(&b) = self.def_block.get(&v) else {
+                        eprintln!("MASK-WHY {:indent$}{v:?} is a phi or an input", "", indent = depth * 2);
+                        continue;
+                    };
+                    let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)) else { continue };
+                    for &(reg, r) in &w.reads {
+                        let missing = match self.vals.get(&r) {
+                            Some(Val::Missing(why)) => Some(*why),
+                            _ => None,
                         };
-                        let kind = if self.x.st.masks.contains_key(&v) { "a mask" } else { "not a mask" };
-                        eprintln!("MASK-WHY   it read {reg:?} = {v:?}: {kind}, {state}, written in {:?}", self.def_block.get(&v));
+                        let kind = if self.x.st.masks.contains_key(&r) { "a mask" } else { "not a mask" };
+                        eprintln!(
+                            "MASK-WHY {:indent$}{} at {:#x} read {reg:?} = {r:?}: {kind}, {}",
+                            "",
+                            w.name(),
+                            w.machine.offset,
+                            missing.map_or("a value".to_string(), |why| format!("missing ({why})")),
+                            indent = depth * 2
+                        );
+                        if missing.is_some() && depth < 8 {
+                            work.push((r, depth + 1));
+                        }
                     }
                 }
             }

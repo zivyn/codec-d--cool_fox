@@ -81,13 +81,15 @@ fn leave_out() -> &'static [String] {
 /// boats, along shores and under bridges, and take about 15 ms of the card a frame (RTX 5070,
 /// runs r_water1 and r_water3 of 2026-11-26: 25 fps with them, 30 without, the blocks gone;
 /// fxceless/victory-fork's README of 2026-11-27 names the same two programs and form). Left
-/// out there, the water has no light of its own depth (darker, bluer) and no blocks;
-/// `VICTORY_WATER_LIGHT=1` runs them as before.
+/// out there, the water has no light of its own depth (darker, bluer) and no blocks.
+/// foxhound 0.2.0-pre.3 fixed the blocks (64-lane programs on 32-lane waves:
+/// `VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`), so they run now unless
+/// `VICTORY_WATER_LIGHT=0` (an empty value, an earlier version's saved OFF, runs them too).
 const WATER_LIGHT: [&str; 2] = ["5dc3b25986622949", "6f225b641c5b0708"];
 
 fn water_light_left_out(shaders: &[Arc<Shader>]) -> bool {
     static ASKED: OnceLock<bool> = OnceLock::new();
-    !*ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "1"))
+    *ASKED.get_or_init(|| std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "0"))
         && victory_shader::emit::host_settings()[0] == 32
         && shaders.iter().any(|s| WATER_LIGHT.contains(&s.hash.as_str()))
 }
@@ -97,7 +99,7 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
         return Some("named in VICTORY_LEAVE_OUT, left out");
     }
     if water_light_left_out(shaders) {
-        return Some("the water's tiled light on a host of 32-lane waves (dark blocks; VICTORY_WATER_LIGHT=1 runs it), left out");
+        return Some("the water's tiled light on a host of 32-lane waves, left out (VICTORY_WATER_LIGHT=0)");
     }
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
@@ -112,14 +114,15 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
+    // The screen probes' ray activation runs without the structure builder
+    // too: left out, the probes kept stale values and surfaces lit mostly by
+    // them took a magenta or violet cast (papers on a wall, irises), at no
+    // frame-rate gain (bisected and measured by a tester, issue #2 of the
+    // public repository, 2026-11-27). `VICTORY_ACTIVATE_RAYS=0`: left out,
+    // as before.
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
+    let skip_activate =
+        *SKIP_ACTIVATE_RAYS.get_or_init(|| std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0"));
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }

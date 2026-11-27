@@ -69,6 +69,12 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_UPLOAD_AHEAD", "1"),
     ("VICTORY_SHOW_AFTER", "1"),
     ("VICTORY_MAP_THREADS", "1"),
+    // A frame's texture passes within 8 ms together; helpers woken at each submission's start
+    // (foxhound 0.2.0-pre.4, from its PR #13; its launcher sets 8 and 1)
+    ("VICTORY_TEXSPK_PASS_MS", "8"),
+    ("VICTORY_PASSES_HOT", "1"),
+    // The layer's threads a frame waits for, above normal priority (foxhound: cutscene worst second 74.8 -> 63.8 ms)
+    ("VICTORY_HELPER_PRIORITY", "1"),
     // Shader writes into big write-combined copies stay on the card
     ("VICTORY_WC_NO_BACK", "1"),
     ("VICTORY_WC_NO_BACK_MIN_KB", "1024"),
@@ -747,7 +753,7 @@ fn mod_dlls(here: &Path) -> Vec<String> {
 }
 
 /// How long the first start of a new victory.exe plays before it restarts.
-const WARMUP_SECONDS: u32 = 20;
+const WARMUP_SECONDS: u32 = 30;
 
 /// The file that says this victory.exe (its bytes) had its warm-up start:
 /// `%LOCALAPPDATA%\victory\warmed\<hash>`. `None`: the exe could not be read.
@@ -839,8 +845,8 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         && let Some(mark) = warmup_mark(&home, &program)
         && !mark.exists()
     {
-        println!("First start of this version of victory.exe: the game restarts by itself after {WARMUP_SECONDS} seconds,");
-        println!("once (a new version's first run otherwise stays at about 14 fps).");
+        println!("First start of this version of victory.exe: the game restarts by itself {WARMUP_SECONDS} seconds after it");
+        println!("loads into the game (press A at the title screen), once (a new version's first run otherwise stays at about 14 fps).");
         s.insert("VICTORY_WARMUP_RESTART".to_owned(), WARMUP_SECONDS.to_string());
         s.insert("VICTORY_WARMUP_MARK".to_owned(), mark.to_string_lossy().into_owned());
     }

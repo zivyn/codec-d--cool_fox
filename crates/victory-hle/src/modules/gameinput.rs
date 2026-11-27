@@ -1,5 +1,7 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3) and, in the slots XInput leaves empty, from HID
+//! ([`playstation`]: DualShock 4, DualSense, DualSense Edge); while none is
+//! connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -21,9 +23,20 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
-// PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy).
+// PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy);
+// PS4 pads (DualShock 4) and rumble from FrancescoGelosoEterea/VIscosity (d8db7a0).
 #[cfg(any(windows, test))]
-mod dualsense;
+mod playstation;
+
+/// Stops the motors of the PlayStation pads read over HID, before the
+/// process ends (XInput pads stop by themselves when it does).
+pub(crate) fn stop_rumble() {
+    #[cfg(windows)]
+    if playstation::stop_rumble() {
+        // Their readers send it with their next report.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1266,14 +1279,15 @@ mod host {
             Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            // XInput first; HID PS5 pads take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
+            // XInput first; HID PlayStation pads (PS4 and PS5) take the slots XInput leaves free
+            // (`VICTORY_DUALSENSE`: 0 off, 1 both).
             if slot == 0 {
                 let xinput = std::array::from_fn(|slot| self.xinput(slot));
-                self.pads = super::dualsense::slots(
-                    super::dualsense::mode(),
+                self.pads = super::playstation::slots(
+                    super::playstation::mode(),
                     xinput,
                     &mut self.hid_slots,
-                    super::dualsense::pads,
+                    super::playstation::pads,
                 );
             }
             #[allow(unused_mut)]
@@ -1321,6 +1335,11 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            // A slot a HID pad has is one XInput left empty.
+            if let Some(id) = self.hid_slots[slot] {
+                super::playstation::rumble(id, low, high);
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,

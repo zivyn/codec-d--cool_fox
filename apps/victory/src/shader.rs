@@ -98,6 +98,13 @@ struct Totals {
 pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let mut t = Totals::default();
+    // `VICTORY_SHADER_ONLY=<hash>,<hash>`: only the containers with these hashes (the 16
+    // digits a run's log names a shader by); `VICTORY_SHADER_SAVE=<folder>`: each one's
+    // bytes written there as `<hash>.bin`.
+    let only: Option<Vec<String>> = std::env::var("VICTORY_SHADER_ONLY")
+        .ok()
+        .map(|v| v.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect());
+    let save = std::env::var_os("VICTORY_SHADER_SAVE").map(PathBuf::from);
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -120,6 +127,16 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     eprintln!("corrupt record {}{}", path.display(), source.label());
                     continue;
                 };
+                if let Some(only) = &only {
+                    let hash = blake3::hash(&bytes).to_hex();
+                    if !only.iter().any(|h| h == &hash[..16]) {
+                        continue;
+                    }
+                    if let Some(dir) = &save {
+                        std::fs::create_dir_all(dir)?;
+                        std::fs::write(dir.join(format!("{}.bin", &hash[..16])), &bytes)?;
+                    }
+                }
                 let Ok(container) = Container::parse(&bytes) else {
                     continue;
                 };

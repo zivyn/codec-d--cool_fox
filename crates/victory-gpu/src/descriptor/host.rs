@@ -1002,6 +1002,27 @@ const COPIED_GRACE: u64 = 4;
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
+/// Whether a slot's table stamp ([`HostHeap::tabled`]: the frame a draw's
+/// table last showed it, plus one, in 31 bits; 0 never) is later than frame
+/// `cutoff`, seen from frame `frame`. A stamp without [`TABLED_READ`] counts
+/// too (a table showed the slot; whether the shader read it then is not
+/// known): the answer errs toward "used". For slot eviction
+/// (`crate::resource::slot_evict`; memory stack by skornuta,
+/// skornuta/victory-memory-stack 57fb136, GPL-3.0).
+pub(crate) fn seen_since(stamp: u32, cutoff: u64, frame: u64) -> bool {
+    let stamp = stamp & !TABLED_READ;
+    if stamp == 0 {
+        return false;
+    }
+    let mask = !TABLED_READ;
+    let now = (frame as u32).wrapping_add(1) & mask;
+    let cut = (cutoff as u32).wrapping_add(1) & mask;
+    // Ages back from now, in the stamps' 31 bits.
+    let age = now.wrapping_sub(stamp) & mask;
+    let limit = now.wrapping_sub(cut) & mask;
+    age < limit
+}
+
 /// Since the start: writes of texture views into slots that count as a
 /// table's (due later), and slots that left the queue because a draw read
 /// them through a table; of the latter, those a draw read again in the
@@ -3102,6 +3123,58 @@ impl HostHeap {
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
         flipped + late_flipped
+    }
+
+    /// For `crate::resource::slot_evict` (`VICTORY_SLOT_EVICT=1`; memory
+    /// stack by skornuta, skornuta/victory-memory-stack 57fb136, GPL-3.0):
+    /// every slot (title or dynamic) showing one of the host textures `raws`
+    /// (raw pointers), as (index, raw, whether letting it go is safe, whether
+    /// a draw's table showed it after frame `cutoff`). Safe: a title slot a
+    /// draw read through a table lately, which that draw makes again by
+    /// itself (`HostHeap::mirror_after`). Slots only shaders pick by index
+    /// (nothing would make them again) and dynamic ones (a list not yet
+    /// reset) are not. The second answer is the slot's table stamp
+    /// ([`seen_since`]): a texture a draw reads through a table every frame
+    /// never asks for its host copy again, so its last use says nothing of
+    /// that.
+    pub(crate) fn slots_showing(
+        &self,
+        raws: &std::collections::HashSet<usize>,
+        frame: u64,
+        cutoff: u64,
+    ) -> Vec<(u32, usize, bool, bool)> {
+        self.kept
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| {
+                // (A lock to a slot: see `kept`.)
+                let raw = {
+                    let r = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    windows::core::Interface::as_raw(r.as_ref()?) as usize
+                };
+                raws.contains(&raw).then(|| {
+                    let i = i as u32;
+                    let ok = i < self.count && !self.sampler && self.tabled_lately(i, frame);
+                    (i, raw, ok, seen_since(self.tabled_stamp(i), cutoff, frame))
+                })
+            })
+            .collect()
+    }
+
+    /// Title slot `index` goes back to null at once, its host copy about to
+    /// be let go by `crate::resource::slot_evict` (memory stack by skornuta,
+    /// skornuta/victory-memory-stack 57fb136, GPL-3.0): as
+    /// [`HostHeap::texture_slot_gone`] without its wait, for the copy is
+    /// there and goes now. True if the slot was made.
+    pub(crate) fn texture_slot_evicted(&self, index: u32) -> bool {
+        let _made = self.made.lock(index);
+        if self.made.get(index).is_none_or(|key| key == 0) {
+            return false;
+        }
+        // (A wait of `texture_slot_gone` begun for this slot is over.)
+        self.texture_slot_here(index);
+        self.unmake(index);
+        true
     }
 
     /// The memory of the texture title slot `index` views is there (again):

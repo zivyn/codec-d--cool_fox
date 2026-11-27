@@ -501,6 +501,8 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // A pad left rumbling would run on until it is switched off.
+    crate::modules::gameinput::stop_rumble();
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

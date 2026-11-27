@@ -837,6 +837,162 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         v
     };
+    // Whether the region a skip of `b` leaves out (`inside`, from `first` to `target`) holds a
+    // loop that never ends once no lane of the wave is left in it. The console never runs the
+    // region so; without the skip the lanes do, and a loop that finds its end in a block
+    // behind an inner `s_cbranch_execz` (the compare's SCC; on the way around that block SCC is
+    // the inner mask operation's "no lane") turns for ever. The lowering's bound on a loop's
+    // turns then ends the program before what follows the region. Such a skip stays: taken
+    // wave-wide ([`crate::emit`]'s `widen`) it is the console's.
+    // Seen in `water_shading:CS_TransmissionVolumetrics_Tiled` (the game, build 1.0.2.1, capture
+    // water4, RTX 4070 SUPER): the skip at 0x2da8 around the loop at 0x2e60, which writes the
+    // slices up to the tile's farthest and compares its counter behind the skip at 0x2e6c. A
+    // tile none of whose lanes took the long path ended at the bound and its 64 pixels got no
+    // output: 59 of 3,364 water tiles in one frame, most along the horizon, other ones each
+    // frame (dark tiles that flicker).
+    // Followed here: what is known with EXEC empty where the region starts (masks saved from
+    // it and narrowed from it are empty, SCC of such a narrowing is clear), along the branches
+    // that decides; a chain of decided branches that comes back to where it was, knowing the
+    // same, never ends.
+    let stalls = |b: usize, target: usize, first: usize, inside: &[bool]| -> bool {
+        use std::collections::{BTreeMap, BTreeSet};
+        // (dwords known to hold no lane, SCC values known)
+        type Facts = (BTreeSet<Value>, BTreeMap<Value, bool>);
+        // (block, the block come from, what is known on the way in)
+        type State = (usize, usize, Facts);
+        let exec = |r: &(Reg, Value)| matches!(r.0, Reg::S(c) if c == EXEC || c == EXEC + 1);
+        let none_left = |inst: &Inst, facts: &Facts| {
+            let mut dwords = inst.reads.iter().filter(|r| exec(r)).peekable();
+            dwords.peek().is_some() && dwords.all(|r| facts.0.contains(&r.1))
+        };
+        let Some(branch) = p.blocks[b].insts.last() else {
+            return false;
+        };
+        let mut facts: Facts = Default::default();
+        facts.0.extend(branch.reads.iter().filter(|r| exec(r)).map(|r| r.1));
+        if facts.0.is_empty() {
+            return false;
+        }
+        // The states after (block, from, facts): one if the block's exit is decided (none if
+        // it leaves the region), else each way on.
+        let step = |(x, from, mut facts): State| -> (bool, Vec<State>) {
+            let block = &p.blocks[x];
+            let at = block.preds.iter().position(|&q| q == from);
+            let merged: Vec<(Value, bool, Option<bool>)> = block
+                .phis
+                .iter()
+                .map(|phi| match at.and_then(|at| phi.args.get(at)) {
+                    Some(a) => (phi.value, facts.0.contains(a), facts.1.get(a).copied()),
+                    None => (phi.value, false, None),
+                })
+                .collect();
+            let set = |facts: &mut Facts, v: Value, empty: bool, scc: Option<bool>| {
+                if empty {
+                    facts.0.insert(v);
+                } else {
+                    facts.0.remove(&v);
+                }
+                match scc {
+                    Some(s) => {
+                        facts.1.insert(v, s);
+                    }
+                    None => {
+                        facts.1.remove(&v);
+                    }
+                }
+            };
+            for (v, empty, scc) in merged {
+                set(&mut facts, v, empty, scc);
+            }
+            for inst in &block.insts {
+                let name = inst.name();
+                let none = none_left(inst, &facts);
+                let mut empty = vec![false; inst.writes.len()];
+                let mut scc = None;
+                if matches!(name, "s_mov_b32" | "s_mov_b64")
+                    && inst.reads.len() == inst.writes.len()
+                    && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(_)))
+                {
+                    for (e, r) in empty.iter_mut().zip(&inst.reads) {
+                        *e = facts.0.contains(&r.1);
+                    }
+                } else if none && name.contains("saveexec") {
+                    // (the old EXEC is saved; `and` and `andn1` keep lanes of it only)
+                    let narrows = name.starts_with("s_and_saveexec") || name.starts_with("s_andn1_saveexec");
+                    for (e, w) in empty.iter_mut().zip(&inst.writes) {
+                        *e = match w.0 {
+                            Reg::S(_) if exec(w) => narrows,
+                            Reg::S(_) => true,
+                            _ => false,
+                        };
+                    }
+                    scc = narrows.then_some(false);
+                } else if none && name.starts_with("v_cmpx") {
+                    empty.fill(true);
+                }
+                for (e, w) in empty.into_iter().zip(&inst.writes) {
+                    set(&mut facts, w.1, e, if w.0 == Reg::Scc { scc } else { None });
+                }
+            }
+            let on = |t: usize, facts: Facts| (t != target && inside[t]).then_some((t, x, facts));
+            match block.exit {
+                Exit::Jump(t) => (true, on(t, facts).into_iter().collect()),
+                Exit::Branch { taken, not_taken } => {
+                    let decided = block.insts.last().and_then(|last| match last.name() {
+                        "s_cbranch_execz" => none_left(last, &facts).then_some(taken),
+                        "s_cbranch_execnz" => none_left(last, &facts).then_some(not_taken),
+                        name @ ("s_cbranch_scc0" | "s_cbranch_scc1") => last
+                            .read(Reg::Scc)
+                            .and_then(|v| facts.1.get(&v))
+                            .map(|&s| if s == (name == "s_cbranch_scc1") { taken } else { not_taken }),
+                        _ => None,
+                    });
+                    match decided {
+                        Some(t) => (true, on(t, facts).into_iter().collect()),
+                        None => (
+                            false,
+                            on(taken, facts.clone()).into_iter().chain(on(not_taken, facts)).collect(),
+                        ),
+                    }
+                }
+                Exit::End | Exit::Indirect => (false, Vec::new()),
+            }
+        };
+        let mut seen: HashSet<State> = HashSet::new();
+        let mut work = vec![(first, b, facts)];
+        // (states followed in all; past that the region is taken not to stall, as before)
+        let mut budget = 20_000u32;
+        while let Some(start) = work.pop() {
+            if !seen.insert(start.clone()) {
+                continue;
+            }
+            let mut chain = vec![start.clone()];
+            let mut at = start;
+            loop {
+                budget -= 1;
+                if budget == 0 {
+                    return false;
+                }
+                let (decided, next) = step(at);
+                if !decided {
+                    work.extend(next);
+                    break;
+                }
+                let Some(next) = next.into_iter().next() else {
+                    break;
+                };
+                if chain.contains(&next) {
+                    return true;
+                }
+                if !seen.insert(next.clone()) {
+                    break;
+                }
+                chain.push(next.clone());
+                at = next;
+            }
+        }
+        false
+    };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -883,6 +1039,15 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         // together with an outer one) change nothing in that: the lanes that would have
         // skipped arrive from the region instead, with the same scalars.
         if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
+            return None;
+        }
+        if stalls(b, target, first, &inside) {
+            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                eprintln!(
+                    "WAVE64-SKIP kept at {:#x}: a loop behind it does not end with no lane left",
+                    p.blocks[target].offset.min(p.blocks[first].offset)
+                );
+            }
             return None;
         }
         Some(inside)

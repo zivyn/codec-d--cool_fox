@@ -1,5 +1,5 @@
 //! The title's frame rate (`VICTORY_FRAME_INTERVAL_MS`, off without it): the
-//! rate Grand Theft Auto VI asks for is a setting of its own, and two
+//! rate the game asks for is a setting of its own, and two
 //! places in its code are changed at load to read another.
 //!
 //! What the title does (game_scarlett_master.exe 1.0.2.1, image offsets):
@@ -38,8 +38,9 @@
 //! own limiter follow the rate asked for, and +0x2241fd0 returns the rate
 //! too (1000 for no limit), so the shortest step follows; the setting
 //! itself is left as it is. Each site's bytes, from the load to the store of the frame time, are
-//! compared before anything is written; a site whose bytes differ is left
-//! alone and said so (another build of the title).
+//! compared before anything is written, by their length and BLAKE3 hash (no
+//! bytes of the title are kept here); a site whose bytes differ is left alone
+//! and said so (another build of the title).
 
 /// The switch: the interval in milliseconds our frame clock ticks at
 /// (`victory-gpu`'s `frame`), 0 for no wait at all. `None` if unset or
@@ -89,11 +90,13 @@ pub fn title_interval_us(rate: u32, display_120: bool) -> u32 {
 }
 
 /// A read of the setting to change: its offset in the image, what it is,
-/// and the bytes there (compared first; the replacement goes at the start).
+/// and the length and BLAKE3 hash (hex) of the bytes there, compared first;
+/// the replacement goes at the start.
 pub struct Site {
     pub at: usize,
     pub kind: Kind,
-    pub bytes: &'static [u8],
+    pub len: usize,
+    pub hash: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,30 +118,22 @@ pub const SITES: [Site; 3] = [
     Site {
         at: 0x1e0fc62,
         kind: Kind::Load,
-        bytes: &[
-            0x8b, 0x87, 0x10, 0x02, 0x00, 0x00, 0xba, 0xe8, 0x03, 0x00, 0x00, 0xc5, 0xfa, 0x10, 0x0d, 0x9f, 0xa1, 0x34, 0x04, 0xb9, 0xe8,
-            0x03, 0x00, 0x00, 0x3d, 0xe8, 0x03, 0x00, 0x00, 0x0f, 0x42, 0xd0, 0x85, 0xc0, 0x0f, 0x44, 0xd1, 0xc5, 0xea, 0x2a, 0xc2, 0xc5,
-            0xf2, 0x5e, 0xc0, 0xc4, 0xe1, 0xfa, 0x2c, 0xc0, 0x89, 0x05, 0x12, 0x88, 0xae, 0x07,
-        ],
+        len: 56,
+        hash: "cd1788fdbef9991dd4f69d96f68c438bd9b739b149e532c4839db140f95ad6e7",
     },
     // +0x22434a0: mov eax, [rsi+210h] ... mov [+0x98f84ac], eax
     Site {
         at: 0x224359a,
         kind: Kind::Load,
-        bytes: &[
-            0x8b, 0x86, 0x10, 0x02, 0x00, 0x00, 0xba, 0xe8, 0x03, 0x00, 0x00, 0xc5, 0xfa, 0x10, 0x0d, 0x67, 0x68, 0xf1, 0x03, 0xb9, 0xe8,
-            0x03, 0x00, 0x00, 0x3d, 0xe8, 0x03, 0x00, 0x00, 0x0f, 0x42, 0xd0, 0x85, 0xc0, 0x0f, 0x44, 0xd1, 0xb1, 0xff, 0xc5, 0xea, 0x2a,
-            0xc2, 0xc5, 0xf2, 0x5e, 0xc0, 0xc4, 0xe1, 0xfa, 0x2c, 0xc0, 0x89, 0x05, 0xd8, 0x4e, 0x6b, 0x07,
-        ],
+        len: 58,
+        hash: "dbf806417dd47b8d671825844b93516843e04d5c43cc3bc157cd473d9b905e50",
     },
     // +0x2241fd0: cmp dword [rax+210h], 0 ; je ; call ; mov eax, [rax+210h] ; vcvtsi2ss xmm0, xmm0, rax
     Site {
         at: 0x2241fdb,
         kind: Kind::SimRate,
-        bytes: &[
-            0x83, 0xb8, 0x10, 0x02, 0x00, 0x00, 0x00, 0x74, 0x12, 0xe8, 0xc7, 0xa1, 0xe0, 0x02, 0x8b, 0x80, 0x10, 0x02, 0x00, 0x00, 0xc4,
-            0xe1, 0xfa, 0x2a, 0xc0,
-        ],
+        len: 25,
+        hash: "8f23569c5501b2bf3c68aab953ce563647a47e6d2c872e4273b51a9d7f2365f1",
     },
 ];
 
@@ -191,13 +186,13 @@ pub unsafe fn apply(base: usize, size: usize, rate: u32, sites: &[Site]) -> Vec<
             let code = replacement(site.kind, rate);
             let len = code.len();
             let done = (|| {
-                if site.bytes.len() < len || site.at.checked_add(site.bytes.len()).is_none_or(|end| end > size) {
+                if site.len < len || site.at.checked_add(site.len).is_none_or(|end| end > size) {
                     return Patched::Failed("outside the image");
                 }
                 let at = base + site.at;
                 // SAFETY: inside the mapped image (checked above).
-                let there = unsafe { std::slice::from_raw_parts(at as *const u8, site.bytes.len()) };
-                if there != site.bytes {
+                let there = unsafe { std::slice::from_raw_parts(at as *const u8, site.len) };
+                if blake3::hash(there).to_hex().as_str() != site.hash {
                     return Patched::Differs;
                 }
                 let mut old = 0;
@@ -267,59 +262,49 @@ mod tests {
 
 
     #[test]
-    fn the_sites_are_reads_of_the_setting() {
-        for site in SITES.iter().filter(|s| s.kind == Kind::Load) {
-            // mov eax, [rdi/rsi+210h]
-            assert_eq!(site.bytes[0], 0x8b);
-            assert!(matches!(site.bytes[1], 0x86 | 0x87));
-            assert_eq!(&site.bytes[2..6], &[0x10, 0x02, 0x00, 0x00]);
-            // mov edx, 1000 follows; the window ends with the store of eax.
-            assert_eq!(&site.bytes[6..11], &[0xba, 0xe8, 0x03, 0x00, 0x00]);
-            assert_eq!(&site.bytes[site.bytes.len() - 6..site.bytes.len() - 4], &[0x89, 0x05]);
-            // RIP-relative: the store is of +0x98f84ac.
-            let disp = i32::from_le_bytes(site.bytes[site.bytes.len() - 4..].try_into().unwrap());
-            let end = site.at + site.bytes.len();
-            assert_eq!(end as i64 + i64::from(disp), FRAME_US as i64);
-        }
-        let sim = SITES.iter().find(|s| s.kind == Kind::SimRate).unwrap();
-        // cmp dword [rax+210h], 0 ; ... ; mov eax, [rax+210h] at 14 ; vcvtsi2ss at 20
-        assert_eq!(&sim.bytes[..7], &[0x83, 0xb8, 0x10, 0x02, 0x00, 0x00, 0x00]);
-        assert_eq!(&sim.bytes[14..20], &[0x8b, 0x80, 0x10, 0x02, 0x00, 0x00]);
-        assert_eq!(&sim.bytes[20..], &[0xc4, 0xe1, 0xfa, 0x2a, 0xc0]);
+    fn the_replacements_load_the_rate_and_the_sites_are_hashes() {
         let code = replacement(Kind::SimRate, 60);
-        assert_eq!(code.len() + usize::from(code[6]), 20, "the jump lands on the vcvtsi2ss");
+        assert_eq!(code.len() + usize::from(code[6]), 20, "the jump lands 20 bytes on (the title's vcvtsi2ss)");
         assert_eq!(replacement(Kind::Load, 60), [0xb8, 60, 0, 0, 0, 0x90]);
         assert_eq!(replacement(Kind::SimRate, 0)[1..5], 1000u32.to_le_bytes());
+        for site in &SITES {
+            assert!(site.hash.len() == 64 && site.hash.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(site.len >= replacement(site.kind, 60).len());
+        }
     }
 
     #[cfg(windows)]
     #[test]
     fn sites_take_the_rate_and_others_are_left_alone() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc, VirtualFree};
+        let site = |at: usize, kind: Kind, bytes: &[u8]| Site {
+            at,
+            kind,
+            len: bytes.len(),
+            hash: Box::leak(blake3::hash(bytes).to_hex().to_string().into_boxed_str()),
+        };
         // SAFETY: fresh memory of our own, written and run inside it.
         unsafe {
             let place = VirtualAlloc(std::ptr::null(), 0x10000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as *mut u8;
             assert!(!place.is_null());
-            let bytes = SITES[0].bytes;
+            // Windows of bytes of our own (int3s): one as expected, one that differs.
+            let bytes: Vec<u8> = (0..56).map(|n| if n % 7 == 0 { 0x90 } else { 0xcc }).collect();
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), place.add(0x100), bytes.len());
-            let mut other = SITES[1].bytes.to_vec();
-            other[2] = 0x14; // [rsi+214h]
+            let mut other = bytes.clone();
+            other[2] = 0x14;
             std::ptr::copy_nonoverlapping(other.as_ptr(), place.add(0x200), other.len());
-            // The simulation's rate as a function: rax = settings (+0x210 = 30),
-            // the window, ret.
-            let settings = [30u32; 0x100];
-            let sim = SITES[2].bytes;
-            let mut f = vec![0x48, 0xb8];
-            f.extend((settings.as_ptr() as u64).to_le_bytes());
-            let window_at = f.len();
-            f.extend(sim);
+            // The simulation's rate as a function: 20 bytes, then vcvtsi2ss
+            // xmm0, xmm0, rax and ret; the replacement jumps over the 20.
+            let mut sim = vec![0xcc_u8; 20];
+            sim.extend([0xc4, 0xe1, 0xfa, 0x2a, 0xc0]);
+            let mut f = sim.clone();
             f.push(0xc3);
             std::ptr::copy_nonoverlapping(f.as_ptr(), place.add(0x300), f.len());
             let mine = [
-                Site { at: 0x100, kind: Kind::Load, bytes },
-                Site { at: 0x200, kind: Kind::Load, bytes: SITES[1].bytes },
-                Site { at: 0x300 + window_at, kind: Kind::SimRate, bytes: sim },
-                Site { at: 0xfff0, kind: Kind::Load, bytes },
+                site(0x100, Kind::Load, &bytes),
+                Site { at: 0x200, ..site(0x200, Kind::Load, &bytes) },
+                site(0x300, Kind::SimRate, &sim),
+                site(0xfff0, Kind::Load, &bytes),
             ];
             let done = apply(place as usize, 0x10000, 60, &mine);
             assert_eq!(done[..3], [Patched::Done, Patched::Differs, Patched::Done]);
@@ -334,3 +319,4 @@ mod tests {
         }
     }
 }
+

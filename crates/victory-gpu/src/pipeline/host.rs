@@ -573,6 +573,7 @@ impl HostPipeline {
                     });
                 }
             }
+            super::samplers::know(&t.static_samplers);
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),

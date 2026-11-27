@@ -1,4 +1,4 @@
-//! A 2560x1440 SDR display for the supported Series X retail image (the title
+//! A 2560x1440 SDR display for the supported Series X retail image (the game,
 //! 1.0.2.1): the title presents at 3840x2160 on Series X, its scene drawn at
 //! 2560x1440 and scaled up by its own temporal pass. With 1440p asked for
 //! (`VICTORY_NATIVE_1440P=1`, or `VICTORY_RENDER_1080P=1` for a 1920x1080
@@ -16,11 +16,18 @@ use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
 use victory_hle::streamline::Mode;
 use victory_loader::PreparedImage;
 
-const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
+/// Whether `bytes` are the stock ones whose BLAKE3 hash (hex) is `hash`.
+/// The stock bytes of each place patched are kept as their hash only: no
+/// bytes of the title are in this repository.
+fn same(bytes: &[u8], hash: &str) -> bool {
+    blake3::hash(bytes).to_hex().as_str() == hash
+}
+
+pub(super) const RETAIL_BUILD: &str = "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93";
 pub(super) const WIDTH: u32 = 2560;
 pub(super) const HEIGHT: u32 = 1440;
 const SDR_MODE: u32 = 0x0615_c100;
-const STOCK_SDR_MODE: [u8; 16] = [0, 15, 0, 0, 112, 8, 0, 0, 60, 0, 0, 0, 1, 0, 0, 0];
+const STOCK_SDR_MODE: &str = "abfb5438d8153b6a0b8d08f33f4f0066e5383925b55aacc5f669131f3f51d4cf";
 const SCANOUT_RESERVATION: u32 = 0x0247_ad4a;
 const TEMPORAL_SCALE: u32 = 0x028f_1e7e;
 const UI_VIEWPORT_LOAD: u32 = 0x0580_48d4;
@@ -34,7 +41,7 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
     );
 
     let mode = field::<16>(image, SDR_MODE)?;
-    ensure!(*mode == STOCK_SDR_MODE, "unexpected Series X SDR mode");
+    ensure!(same(&mode[..], STOCK_SDR_MODE), "unexpected Series X SDR mode");
     mode[..4].copy_from_slice(&WIDTH.to_le_bytes());
     mode[4..8].copy_from_slice(&HEIGHT.to_le_bytes());
 
@@ -79,18 +86,18 @@ pub(super) fn prepare(image: &mut PreparedImage, render_1080p: bool) -> Result<(
 /// title's own temporal pass, or on Series S with the upscaler there the
 /// FidelityFX path, 7).
 const RENDERER_SELECTION: u32 = 0x007e_9421;
-const STOCK_RENDERER_SELECTION: [u8; 8] = [0xb8, 6, 0, 0, 0, 0x0f, 0x45, 0xc1];
+const STOCK_RENDERER_SELECTION: &str = "f0633abf37df17124108b1e37be64645bd4b2412b0524c2f89334f22bd948464";
 /// The FidelityFX path's render size: the console check's result (Series S)
 /// is noted as the FidelityFX quality mode and picks the scaled branch
 /// (`movzx eax, al; mov [r14+0x90], eax; test al, al; jne`), whose scale
 /// multiplies the output size.
 const UPSCALER_SIZING: u32 = 0x028e_f69a;
-const STOCK_UPSCALER_SIZING: [u8; 14] = [0x0f, 0xb6, 0xc0, 0x41, 0x89, 0x86, 0x90, 0, 0, 0, 0x84, 0xc0, 0x75, 0x0a];
+const STOCK_UPSCALER_SIZING: &str = "2ae2ac102d12ca003cb218413ef018e4dba68fc2003654a30c1743e13a820ffd";
 /// The native branch's load of 1.0, and the scaled branch's of the scale.
 const NATIVE_LOAD: u32 = 0x028e_f6a8;
-const STOCK_NATIVE_LOAD: [u8; 10] = [0xc5, 0xfa, 0x10, 0x05, 0x28, 0x78, 0x6d, 0x03, 0xeb, 0x08];
+const STOCK_NATIVE_LOAD: &str = "2579c24601d173b086a8136edf54ffd82720e6bf186f9139274bb09a45ddadf5";
 const SCALED_LOAD: u32 = 0x028e_f6b2;
-const STOCK_SCALED_LOAD: [u8; 8] = [0xc5, 0xfa, 0x10, 0x05, 0xa2, 0xe2, 0x86, 0x03];
+const STOCK_SCALED_LOAD: &str = "e218882c95d2e16163a409d55b3451519414eb87c4d6220785dc09852d4e14f4";
 /// The scale the scaled branch loads (shared with other code: not written).
 const UPSCALER_SCALE: u32 = 0x0615_d95c;
 
@@ -112,10 +119,10 @@ pub(super) fn prepare_upscaler(image: &mut PreparedImage, mode: Mode) -> Result<
         image.original_hash.to_hex().as_str() == RETAIL_BUILD,
         "the upscaler path is only known for the retail build {RETAIL_BUILD}"
     );
-    ensure!(*field::<8>(image, RENDERER_SELECTION)? == STOCK_RENDERER_SELECTION, "unexpected renderer selection");
-    ensure!(*field::<14>(image, UPSCALER_SIZING)? == STOCK_UPSCALER_SIZING, "unexpected upscaler render size selection");
-    ensure!(*field::<10>(image, NATIVE_LOAD)? == STOCK_NATIVE_LOAD, "unexpected upscaler native scale load");
-    ensure!(*field::<8>(image, SCALED_LOAD)? == STOCK_SCALED_LOAD, "unexpected upscaler scaled load");
+    ensure!(same(&field::<8>(image, RENDERER_SELECTION)?[..], STOCK_RENDERER_SELECTION), "unexpected renderer selection");
+    ensure!(same(&field::<14>(image, UPSCALER_SIZING)?[..], STOCK_UPSCALER_SIZING), "unexpected upscaler render size selection");
+    ensure!(same(&field::<10>(image, NATIVE_LOAD)?[..], STOCK_NATIVE_LOAD), "unexpected upscaler native scale load");
+    ensure!(same(&field::<8>(image, SCALED_LOAD)?[..], STOCK_SCALED_LOAD), "unexpected upscaler scaled load");
     ensure!(*field::<4>(image, UPSCALER_SCALE)? == (2.0f32 / 3.0).to_le_bytes(), "unexpected upscaler scale");
     let temporal = f32::from_le_bytes(*field::<4>(image, TEMPORAL_SCALE)?);
     ensure!(

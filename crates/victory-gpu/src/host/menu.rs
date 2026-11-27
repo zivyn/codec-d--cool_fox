@@ -7,7 +7,8 @@
 //! shown the title sees no keyboard (`crate::SETTINGS_MENU_OPEN`, read by the
 //! input module); a pad still works.
 //!
-//! The settings are read once at start, so a change is saved to the file
+//! The settings are read once at start, so a change is saved at once (as well as by the save
+//! lines) to the file
 //! `VICTORY_MENU_FILE` names (`scripts\play-foxhound.ps1` sets it to
 //! `victory-settings.txt` in the repository's folder and applies it at every
 //! start) and takes effect at the next start; "SAVE AND RESTART" starts the
@@ -100,7 +101,9 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
     Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
-    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "OFF (NO DARK BLOCKS)"), ("1", "ON (GREEN, DARK BLOCKS)")], live: false },
+    // On unless "0": a file saved by an earlier version holds an empty value (its OFF) or "1",
+    // and both start it on, so nobody keeps it off from before by accident (2026-11-27).
+    Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "ON"), ("0", "OFF")], live: false },
     Item { var: "VICTORY_LEAVE_OUT", label: "HEAT HAZE AND DECAL DEFRAG", values: &[("02384a60fda6f2d0,731a39171b568298", "LEFT OUT"), ("", "RUN (SLOWER, SMEARS)")], live: false },
     Item { var: "VICTORY_EARLY_DEPTH", label: "EARLY DEPTH TEST", values: ON_UNSET, live: false },
     Item { var: "VICTORY_WC_NO_BACK", label: "SKIP BIG COPY-BACKS", values: ON_UNSET, live: false },
@@ -120,6 +123,16 @@ fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
 }
 
+/// Where the menu saves: the file `VICTORY_MENU_FILE` names (`victory play` sets it); else,
+/// however the game was started (a script, another launcher), the one `victory play` reads at
+/// every start, `victory-settings.txt` in `VICTORY_HOME` or `%LOCALAPPDATA%\victory`.
+fn settings_file() -> Option<std::path::PathBuf> {
+    let set = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    set("VICTORY_MENU_FILE")
+        .or_else(|| set("VICTORY_HOME").map(|home| home.join("victory-settings.txt")))
+        .or_else(|| set("LOCALAPPDATA").map(|base| base.join("victory").join("victory-settings.txt")))
+}
+
 /// The first start of a new victory.exe: the seconds it plays before it starts
 /// again by itself (`VICTORY_WARMUP_RESTART`, set by the launcher while the exe
 /// has no mark under `%LOCALAPPDATA%\victory\warmed`). On the RTX 5070, every
@@ -127,6 +140,11 @@ fn get(var: &str) -> String {
 /// it ran, and every later run was normal (27-29 fps), even after a first run of
 /// 45 seconds; a copy of an exe already run was fast at once (2026-11-27). Likely
 /// the driver's cache of the program; not ours to fix, so it is run through once.
+/// Draws in a frame from which the warm-up's time counts: the game's scenes
+/// (loading into the world: about 300, in the world: thousands), not its
+/// title screen and menus (about 10).
+const SCENE_DRAWS: u64 = 100;
+
 pub(crate) fn warmup_seconds() -> Option<u64> {
     get("VICTORY_WARMUP_RESTART").parse().ok().filter(|s| *s > 0)
 }
@@ -135,7 +153,8 @@ pub(crate) fn warmup_seconds() -> Option<u64> {
 pub(crate) fn warmup_notice(seconds: u64) -> Vec<String> {
     vec![
         "FIRST START OF THIS VERSION: A ONE-TIME WARM-UP".to_owned(),
-        format!("THE GAME RESTARTS BY ITSELF IN ABOUT {seconds} SECONDS"),
+        format!("THE GAME RESTARTS BY ITSELF {seconds} SECONDS AFTER IT"),
+        "LOADS INTO THE GAME (PRESS A AT THE TITLE SCREEN)".to_owned(),
         "THIS HAPPENS ONCE PER NEW VERSION, AND IS NEEDED:".to_owned(),
         "WITHOUT IT THE FIRST RUN STAYS AT ABOUT 14 FPS".to_owned(),
         String::new(),
@@ -455,10 +474,13 @@ impl Menu {
 
     /// Writes the changed values over those in the settings file.
     fn save(&mut self) -> bool {
-        let Some(path) = std::env::var_os("VICTORY_MENU_FILE") else {
-            self.note = "NO SETTINGS FILE: START WITH VICTORY PLAY".to_owned();
+        let Some(path) = settings_file() else {
+            self.note = "NO FOLDER FOR THE SETTINGS FILE".to_owned();
             return false;
         };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
         let mut kept: Vec<(String, String)> = std::fs::read_to_string(&path)
             .unwrap_or_default()
             .lines()
@@ -478,9 +500,16 @@ impl Menu {
         }
         match std::fs::write(&path, text) {
             Ok(()) => {
-                tracing::info!(path = %std::path::Path::new(&path).display(), "settings menu: saved");
+                tracing::info!(path = %path.display(), "settings menu: saved");
                 self.started = self.values.clone();
-                self.note = "SAVED. APPLIES AT THE NEXT START".to_owned();
+                self.note = if std::env::var_os("VICTORY_MENU_FILE").is_some() {
+                    "SAVED. APPLIES AT THE NEXT START"
+                } else {
+                    // Started some other way (a script, another launcher): the file `victory play`
+                    // reads at every start, which this start did not.
+                    "SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME"
+                }
+                .to_owned();
                 true
             }
             Err(e) => {
@@ -527,13 +556,24 @@ impl Menu {
         }
     }
 
-    /// The warm-up start ([`warmup_seconds`]): once its time is up, this exe is
-    /// marked as warmed up (`VICTORY_WARMUP_MARK`) and the game starts again.
+    /// The warm-up start ([`warmup_seconds`]): once the game has drawn whole
+    /// scenes for that long, this exe is marked as warmed up
+    /// (`VICTORY_WARMUP_MARK`) and the game starts again. The time counts
+    /// from the first frame of [`SCENE_DRAWS`] draws or more, not from the
+    /// start: a player who waited on the title screen ("press A", about ten
+    /// draws a frame) was restarted after 20 seconds and still had the 14 fps
+    /// first run after it (2026-11-27).
     fn warmup(&mut self) {
         static BEGAN: OnceLock<std::time::Instant> = OnceLock::new();
         static DONE: AtomicBool = AtomicBool::new(false);
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let Some(seconds) = warmup_seconds() else { return };
         if DONE.load(Ordering::Relaxed) {
+            return;
+        }
+        let ever = crate::list::draws_ever();
+        let this_frame = ever.saturating_sub(LAST.swap(ever, Ordering::Relaxed));
+        if BEGAN.get().is_none() && this_frame < SCENE_DRAWS {
             return;
         }
         if BEGAN.get_or_init(std::time::Instant::now).elapsed() < Duration::from_secs(seconds) {
@@ -553,10 +593,19 @@ impl Menu {
 
     /// Removes the settings file: the launcher's own settings at the next start.
     fn reset(&mut self) {
-        if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
+        if let Some(path) = settings_file() {
             let _ = std::fs::remove_file(path);
         }
         self.note = "RESET. PLAY DEFAULTS AT THE NEXT START".to_owned();
+    }
+
+    /// Changes a setting and saves it at once: many players changed settings and closed the
+    /// menu without the save lines, and lost them. The save lines stay (and restart, preload).
+    fn change_and_save(&mut self, i: usize, step: isize) {
+        self.change(i, step);
+        if self.save() && live(&ITEMS[i]) {
+            self.note = "SAVED. ON NOW".to_owned();
+        }
     }
 
     /// A frame was presented: the keys pressed since the last one.
@@ -586,9 +635,9 @@ impl Menu {
             match vk {
                 VK_UP => self.at = (self.at + total - 1) % total,
                 VK_DOWN => self.at = (self.at + 1) % total,
-                VK_LEFT if self.at < ITEMS.len() => self.change(self.at, -1),
-                VK_RIGHT if self.at < ITEMS.len() => self.change(self.at, 1),
-                VK_RETURN if self.at < ITEMS.len() => self.change(self.at, 1),
+                VK_LEFT if self.at < ITEMS.len() => self.change_and_save(self.at, -1),
+                VK_RIGHT if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
+                VK_RETURN if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
                 VK_RETURN => match self.at - ITEMS.len() {
                     0 => {
                         if self.save() {
@@ -685,6 +734,30 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_is_saved_at_once_however_the_game_was_started() {
+        let home = std::env::temp_dir().join(format!("victory-menu-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // SAFETY: no other test in this crate reads these two.
+        unsafe {
+            std::env::remove_var("VICTORY_MENU_FILE");
+            std::env::set_var("VICTORY_HOME", &home);
+        }
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        menu.started = menu.values.clone();
+        let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
+        menu.change_and_save(dlss, 1);
+        let text = std::fs::read_to_string(home.join("victory-settings.txt")).expect("saved without a save line");
+        assert!(text.contains("VICTORY_MENU_DLSS=quality"), "{text}");
+        assert_eq!(menu.note, "SAVED. APPLIES WHEN VICTORY.EXE STARTS THE GAME");
+        // Every note fits the box and has its letters.
+        for note in [menu.note.as_str(), "SAVED. ON NOW", "SAVED. APPLIES AT THE NEXT START", "NO FOLDER FOR THE SETTINGS FILE"] {
+            assert!(note.len() <= COLUMNS as usize, "{note}");
+            assert!(note.bytes().all(|c| glyph(c) != glyph(b'#')), "{note}");
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {

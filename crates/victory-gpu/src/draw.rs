@@ -3207,6 +3207,19 @@ impl State {
             )
         };
 
+        // A frame's runs of the pass (its own and the early ones, not those
+        // before a bake) within `VICTORY_TEXSPK_PASS_MS` together
+        // ([`texspk_pass_ms`]).
+        let frame_pass = !required && !baking && sync.is_none();
+        let span = match texspk_pass_ms() {
+            Some(cap) if frame_pass => {
+                if PASS_FRAME.swap(frame, Ordering::Relaxed) != frame {
+                    PASS_FRAME_NANOS.store(0, Ordering::Relaxed);
+                }
+                pass_span_left(span, cap, PASS_FRAME_NANOS.load(Ordering::Relaxed))
+            }
+            _ => span,
+        };
         let began = std::time::Instant::now();
         HEAP_TEXTURE_REST[7].fetch_add(began.duration_since(entered).as_nanos() as u64, Ordering::Relaxed);
         // The frame's pass, the early one, or the one before a bake.
@@ -3642,6 +3655,9 @@ impl State {
         let took = began.elapsed().as_nanos() as u64;
         HEAP_TEXTURE_NANOS[4].fetch_add(took, Ordering::Relaxed);
         HEAP_TEXTURE_PASSES[3 + kind].fetch_add(took, Ordering::Relaxed);
+        if frame_pass && texspk_pass_ms().is_some() {
+            PASS_FRAME_NANOS.fetch_add(took, Ordering::Relaxed);
+        }
         served
     }
 
@@ -3791,7 +3807,10 @@ impl State {
         // depth read is the opaque one behind them; outdoors on water that is
         // the bottom, the reflected direction is wrong and the estimate dark
         // (play session 2026-11-27: dark patches on the water around a boat).
-        let alpha_too = std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "1");
+        // On again by default (2026-11-27): those dark patches were water tiles the tile
+        // list had dropped (`VICTORY_LOOPS_WAVE`), not this; without it glass in a dark room
+        // mirrors the bright sky (run fix2, spectacles 75 s into the opening). `=0`: off.
+        let alpha_too = !std::env::var("VICTORY_AMBIENT_SPECULAR_ALPHA").is_ok_and(|v| v.trim() == "0");
         if role == Role::Miss
             && !(layer == crate::ambient::MISS_OPAQUE || (alpha_too && layer == crate::ambient::MISS_ALPHA))
         {
@@ -3938,6 +3957,56 @@ impl State {
                             d.Width.abs_diff(w * 2) <= 1 && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1
                         })
                 })
+            })
+            .or_else(|| {
+                // In the opening's cutscenes the miss program's own places hold no depth of
+                // the picture (its usual place a 1x1 texture; run loops1: no stand-in for 80 s,
+                // reflections of the bright sky in dark rooms and on eyes). The picture's
+                // depth is still in the frame's table, at a place this program does not read
+                // (capture haze2: place 752 of table 0, the depth plane of the depth-stencil
+                // target; place 448 its stencil plane). So: every place of that table, the
+                // depth-stencil target's depth plane first, then any 32-bit depth of that size.
+                use windows::Win32::Graphics::Dxgi::Common::{
+                    DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+                    DXGI_FORMAT_R32G8X24_TYPELESS,
+                };
+                let (w, h) = image.as_ref().map(|(d, _)| (d.Width, d.Height))?;
+                let Some(Root::Table(table)) = self.roots_ref(true).first() else { return None };
+                let start = match self.ambient_tables.iter().find(|m| m.0 == 0) {
+                    Some(m) => m.1,
+                    None => self.user_value(true, 0, RootType::Table, 0),
+                };
+                let mut plain = None;
+                for offset in (0..1600u32).step_by(8) {
+                    let Some(view) = crate::descriptor::view(table + u64::from(offset) * 4) else { continue };
+                    if stencil_view(Some(view.clone())) {
+                        continue;
+                    }
+                    let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+                    let View::Shader(resource, _) = view else { continue };
+                    let Some(host) = crate::resource::host_resource(resource as This) else { continue };
+                    // SAFETY: a live resource.
+                    let d = unsafe { host.GetDesc() };
+                    let fits = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                        && d.Width.abs_diff(w * 2) <= 1
+                        && u64::from(d.Height).abs_diff(u64::from(h) * 2) <= 1;
+                    if !fits {
+                        continue;
+                    }
+                    let found = (d, heap.gpu_handle((start + offset * 4) / 32));
+                    match d.Format {
+                        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+                            static WIDE: AtomicU64 = AtomicU64::new(0);
+                            if WIDE.fetch_add(1, Ordering::Relaxed) == 0 {
+                                tracing::info!(offset, "reflections stand-in: the picture's depth taken from the frame's table, a place the miss program does not read (counted once)");
+                            }
+                            return Some(found);
+                        }
+                        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT if plain.is_none() => plain = Some(found),
+                        _ => {}
+                    }
+                }
+                plain
             }),
             Role::Radiance | Role::Air => image,
         };
@@ -5848,6 +5917,45 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     }
 }
 
+/// The frame [`PASS_FRAME_NANOS`] counts for, and the nanoseconds its runs
+/// of the pass over textures picked by index took ([`texspk_pass_ms`]).
+static PASS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+static PASS_FRAME_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// The milliseconds a frame's runs of the pass over textures picked by index
+/// take together at most (`VICTORY_TEXSPK_PASS_MS=<n>`, 1 to 1000; unset or
+/// 0: each run within `VICTORY_TEXTURE_STAGE_MS` alone, as before). The
+/// slots left wait for the next frame's runs, as those past a run's time do
+/// now; runs before a bake keep their own budget.
+///
+/// The pass runs several times a frame (its own, the early one at the
+/// frame's first draw, 16 ms each in the launcher): walking through the
+/// world it took 2.2-2.7 s of each 5 seconds in the stretches with frames
+/// over 50 ms (3,000 uploads a second, every one through a staging buffer
+/// made for it and detiled whole), 0.6-0.9 s in calm ones. With 8 ms (RTX
+/// 4090, Ryzen 9 7950X3D, DLSS Quality, no frame cap, the walking route
+/// through the first boat mission) the mean went from 39.4 to 47.0 fps.
+/// What changes for the picture: a texture picked by index may show a frame
+/// or more later in such a burst (its slot shows what it showed until then,
+/// `VICTORY_SHOW_NEW_LATER`).
+fn texspk_pass_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXSPK_PASS_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| ms.min(1000))
+    })
+}
+
+/// A run's time within the frame's cap of `cap_ms` milliseconds when the
+/// frame's runs took `spent_ns` nanoseconds already: no more than `span`.
+fn pass_span_left(span: std::time::Duration, cap_ms: u64, spent_ns: u64) -> std::time::Duration {
+    let cap = std::time::Duration::from_millis(cap_ms);
+    span.min(cap.saturating_sub(std::time::Duration::from_nanos(spent_ns)))
+}
+
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
 /// budget (`None` keeps the 192 MiB 12 GiB baseline).
 fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
@@ -5864,6 +5972,20 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    #[test]
+    fn a_frames_pass_runs_share_the_texspk_cap() {
+        use super::pass_span_left;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        // The first run of a frame: the run's own time, or the cap if less.
+        assert_eq!(pass_span_left(ms(16), 8, 0), ms(8));
+        assert_eq!(pass_span_left(ms(4), 8, 0), ms(4));
+        // Later runs: what the frame has left.
+        assert_eq!(pass_span_left(ms(16), 8, 5_000_000), ms(3));
+        // Spent: nothing (the run stops at its first slot).
+        assert_eq!(pass_span_left(ms(16), 8, 9_000_000), Duration::ZERO);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {

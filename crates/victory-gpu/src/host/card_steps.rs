@@ -103,6 +103,111 @@ fn placed_order() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_ORDER"))
 }
 
+/// Whether a fill behind a copy at its place in a list that reads only bytes the copy writes is
+/// done on the card out of the bytes the copy reads (`VICTORY_PLACED_READS=1`; off: the
+/// submission is refused for it, [`BEHIND_PLACED`], and waits until the flights have landed).
+///
+/// In the boat cutscene of the opening this was the one reason submissions were refused for:
+/// 0.2 to 0.5 of them a frame, each a wait of about 30 ms for the card, 9 to 14 ms of every
+/// frame of the submitting thread (runs v2q and cloud4, 2026-11-27, RTX 4070 SUPER: 37.9 ms a
+/// frame where the title asks for 33.3).
+fn placed_reads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_READS"))
+}
+
+/// Fills of `does` that stand behind a copy at its place, read nothing but bytes it writes and
+/// would have to be done on the card (flights write what the copy reads or writes, or what
+/// the fill reads): they are made to read the same bytes where the copy takes them from.
+/// Returns how many.
+///
+/// A fill done on the card is done in front of all the lists, the copy at its place in one:
+/// the fill would read the destination as it was before the copy. What the copy puts there
+/// is its source as the submission finds it (so the CPU does it too, when the submission
+/// waits: [`place::Placed`] puts the source's bytes into title memory, the fill reads them
+/// there), and that the card holds in front of the lists.
+///
+/// Left as it is, and refused as before: a fill that reads more than the copy wrote, one
+/// whose memory cannot be given bytes on the card, and one with a buffer copy between the
+/// copy at its place and itself that writes what either of them reads.
+fn read_behind_placed(does: &mut [Does], written: &[(usize, usize)]) -> usize {
+    let placed: Vec<(usize, (usize, usize), usize)> = does
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| match *d {
+            Does::Placed { dst, src, len } => Some((i, (dst, dst + len), src)),
+            _ => None,
+        })
+        .collect();
+    if placed.is_empty() {
+        return 0;
+    }
+    let mut moved = 0;
+    for i in 0..does.len() {
+        let Does::Fill { src, len, asked, to: true } = does[i] else {
+            continue;
+        };
+        // From the fill back: each copy at its place whose bytes it reads (a copy may read
+        // what one ahead of it wrote).
+        let (mut at, mut before, mut waits) = (src, i, asked);
+        let found = loop {
+            let Some(&(p, to, from)) = placed.iter().rev().find(|&&(p, to, _)| p < before && meet(to, (at, at + len))) else {
+                break before < i;
+            };
+            let copies = &does[p + 1..before];
+            let between =
+                |range: (usize, usize)| copies.iter().any(|d| matches!(*d, Does::Copy { dst, len: n, .. } if meet((dst, dst + n), range)));
+            if at < to.0 || at + len > to.1 || between((at, at + len)) {
+                break false;
+            }
+            waits |= touches(written, to.0, to.1) || touches(written, from, from + (to.1 - to.0));
+            (at, before) = (from + (at - to.0), p);
+            if between((at, at + len)) {
+                break false;
+            }
+        };
+        // (Nothing in the air writes any of it: title memory has the copy's bytes, the CPU's
+        // fill reads them there.)
+        if found && waits {
+            does[i] = Does::Fill { src: at, len, asked: true, to: true };
+            moved += 1;
+        }
+    }
+    if moved > 0 {
+        DONE[4].fetch_add(moved as u64, Ordering::Relaxed);
+    }
+    moved
+}
+
+/// Why a submission whose fills read where a copy at its place does ([`read_behind_placed`]) is
+/// refused all the same.
+const PLACED_READER: &str = "a step other than a fill done on the card reads what a copy at its place writes";
+
+/// Whether a step reads the destination of a copy at its place whose source or destination
+/// flights may write: title memory does not hold that copy's bytes until they have landed
+/// (`place::Placed`), so a texture, expanded vertices, a buffer copy or a fill that reads them
+/// there reads what was there before. Without [`read_behind_placed`] the fills behind the copy
+/// had the submission refused, and it waited; with them out of the way nothing did.
+/// Seen as one character's skin drawn as coloured noise for some seconds in the opening (runs
+/// d1 and rel2b of 2026-11-27, not in v5q and v6q with the same switches).
+fn placed_read_on_cpu(does: &[Does], written: &[(usize, usize)]) -> bool {
+    does.iter().enumerate().any(|(p, d)| {
+        let Does::Placed { dst, src, len } = *d else {
+            return false;
+        };
+        if !touches(written, src, src + len) && !touches(written, dst, dst + len) {
+            return false;
+        }
+        let to = (dst, dst + len);
+        does.iter().enumerate().any(|(i, r)| match *r {
+            Does::Read { from, to: end, .. } => meet((from, end), to),
+            Does::Copy { src, len: n, .. } | Does::Fill { src, len: n, .. } => meet((src, src + n), to),
+            Does::Placed { src, len: n, .. } => i != p && meet((src, src + n), to),
+            _ => false,
+        })
+    })
+}
+
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
 
@@ -612,8 +717,9 @@ unsafe impl Send for Own {}
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: fills and copies done on the card, their
-/// bytes, and submissions that waited instead, refused by a check.
-static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// bytes, submissions that waited instead, refused by a check, and fills that read where a
+/// copy at its place ahead of them takes its bytes from ([`read_behind_placed`]).
+static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -678,6 +784,7 @@ impl Host {
             Ok(taken) => taken,
             Err(why) => {
                 DONE[3].fetch_add(1, Ordering::Relaxed);
+                count_refusal(why);
                 #[cfg(feature = "diagnostics")]
                 refused(why);
                 let _ = why;
@@ -688,8 +795,12 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let (mut does, steps) = does_of(written, runs);
+        let by_source = placed_reads() && read_behind_placed(&mut does, written) > 0;
+        if by_source && placed_read_on_cpu(&does, written) {
+            return Err(PLACED_READER);
+        }
+        let chosen = plan(&does, stage(), placed_order() || by_source, &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -898,20 +1009,37 @@ fn noted(ops: &[Op]) {
     }
 }
 
+/// Why submissions were refused since the last line, and how often (few a frame: a list is enough).
+static REFUSALS: std::sync::Mutex<Vec<(&'static str, u32)>> = std::sync::Mutex::new(Vec::new());
+
+fn count_refusal(why: &'static str) {
+    let mut all = REFUSALS.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|(w, _)| std::ptr::eq(*w, why)) {
+        Some((_, n)) => *n += 1,
+        None => all.push((why, 1)),
+    }
+}
+
 /// For the frame-rate line.
 pub(super) fn log(frames: f64) {
     if stage() == 0 {
         return;
     }
+    let refusals = std::mem::take(&mut *REFUSALS.lock().unwrap_or_else(|e| e.into_inner()));
+    if !refusals.is_empty() {
+        let all: Vec<String> = refusals.iter().map(|(why, n)| format!("{:.2} {why}", f64::from(*n) / frames)).collect();
+        tracing::info!("submissions refused for the card's steps, per frame: {}", all.join("; "));
+    }
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} fills read where a copy at its place takes its bytes \n         from (VICTORY_PLACED_READS)",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        d[4],
     );
     #[cfg(feature = "diagnostics")]
     {
@@ -1116,6 +1244,44 @@ mod tests {
 
     /// What cannot be done on the card refuses the lot, where it stands in
     /// the way.
+    #[test]
+    fn a_fill_behind_a_copy_at_its_place_reads_where_the_copy_does() {
+        let fill = |src| Does::Fill { src, len: 0x100, asked: true, to: true };
+        let mut does = vec![
+            fill(0x1000),
+            Does::Placed { dst: 0x1000, src: 0x9000, len: 0x200 },
+            fill(0x1080),
+            fill(0x1180),
+        ];
+        // Ahead of the copy: as it was. Behind it and inside: from the source. Partly outside: as it was.
+        assert_eq!(read_behind_placed(&mut does, &[(0x1000, 0x1200)]), 1);
+        assert!(matches!(does[0], Does::Fill { src: 0x1000, .. }));
+        assert!(matches!(does[2], Does::Fill { src: 0x9080, .. }));
+        assert!(matches!(does[3], Does::Fill { src: 0x1180, .. }));
+        // The one partly outside is still in the copy's way; without it nothing is.
+        assert_eq!(plan(&does, 2, true, &mut None), Err(BEHIND_PLACED));
+        does.pop();
+        assert!(plan(&does, 2, true, &mut None).is_ok());
+        // A buffer copy between them that writes what the fill reads: left alone.
+        let mut does = vec![
+            Does::Placed { dst: 0x1000, src: 0x9000, len: 0x200 },
+            Does::Copy { dst: 0x1040, src: 0x5000, len: 0x80, asked: false },
+            fill(0x1080),
+        ];
+        assert_eq!(read_behind_placed(&mut does, &[(0x1000, 0x1200)]), 0);
+        // Nothing in the air writes any of it: the CPU's fill is right.
+        let mut does = vec![Does::Placed { dst: 0x1000, src: 0x9000, len: 0x200 }, Does::Fill { src: 0x1080, len: 0x100, asked: false, to: true }];
+        assert_eq!(read_behind_placed(&mut does, &[(0x4000, 0x5000)]), 0);
+        // Two copies in a row: the bytes are followed back through both.
+        let mut does = vec![
+            Does::Placed { dst: 0x9000, src: 0x7000, len: 0x200 },
+            Does::Placed { dst: 0x1000, src: 0x9000, len: 0x200 },
+            fill(0x1080),
+        ];
+        assert_eq!(read_behind_placed(&mut does, &[(0x1000, 0x1200)]), 1);
+        assert!(matches!(does[2], Does::Fill { src: 0x7080, .. }));
+    }
+
     #[test]
     fn steps_in_the_way_are_refused() {
         let taken = copy(1000, 5000, 100, true);

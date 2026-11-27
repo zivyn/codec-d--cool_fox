@@ -1,6 +1,6 @@
 ﻿//! Two presented planes as one image: the console's display puts the second
 //! (the interface) over the first (the scene), each scaled to the screen.
-//! Grand Theft Auto VI presents so on Series S.
+//! The game presents so on Series S.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;

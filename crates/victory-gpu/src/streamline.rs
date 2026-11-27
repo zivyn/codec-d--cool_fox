@@ -636,9 +636,13 @@ pub fn dlss_framegen_card(name: &str) -> bool {
     model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
 }
 
-/// The adapter a device made with no adapter named is on (the first), its
-/// name and LUID.
+/// The card the host device is made on (`hardware_adapter`; else the first
+/// adapter, where a device made with no adapter named is), its name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
+    if let Some((adapter, name, _)) = victory_shader::emit::host::hardware_adapter() {
+        // SAFETY: a plain DXGI query.
+        return unsafe { adapter.GetDesc1() }.ok().map(|d| (name, d.AdapterLuid));
+    }
     // SAFETY: plain DXGI queries.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;

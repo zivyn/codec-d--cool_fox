@@ -280,10 +280,10 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and when it was put there ([`idle_trim`]).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, u64);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -309,6 +309,37 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+// Idle-list trim: memory stack by skornuta (skornuta/victory-memory-stack 57fb136, GPL-3.0),
+// patch 13 (and the idle trim of its base).
+
+/// Idle lists destroyed by [`idle_trim`] since the start.
+#[cfg(windows)]
+pub(crate) static TRIMMED_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// After how many seconds an idle list nobody took is destroyed, with its
+/// command allocators: `VICTORY_LIST_POOL_IDLE_S=<seconds>`, or with
+/// `VICTORY_ALLOCATOR_TRIM=1` its time (`crate::host::allocator_trim`);
+/// neither: never, as before. The pool is last in, first out, so the
+/// oldest entries are the surplus of a spike.
+#[cfg(windows)]
+fn idle_trim() -> Option<u64> {
+    static S: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("VICTORY_LIST_POOL_IDLE_S")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&s| s > 0)
+            .or_else(crate::host::allocator_trim)
+    })
+}
+
+/// How many of the first of `pushed_at` (oldest first) are older than
+/// `max_age` at `now`.
+#[cfg(windows)]
+fn stale(pushed_at: impl Iterator<Item = u64>, now: u64, max_age: u64) -> usize {
+    pushed_at.take_while(|&t| now.saturating_sub(t) > max_age).count()
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -324,13 +355,13 @@ fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
 }
@@ -348,7 +379,12 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) {
+            continue;
+        }
+        if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+            // Its submission has run: its prelude serves another list.
+            host.give_prelude();
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -357,8 +393,21 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            let now = crate::host::now_ms();
+            idle.0.push(Idle(host, bytes, now));
             idle.1 += bytes;
+            // With `VICTORY_ALLOCATOR_TRIM=1` (memory stack by skornuta,
+            // skornuta/victory-memory-stack 57fb136, GPL-3.0): lists the
+            // frames did not need for that long are destroyed, with their
+            // allocators. Their submissions have run, as every idle list's.
+            if let Some(secs) = idle_trim() {
+                let n = stale(idle.0.iter().map(|i| i.2), now, secs * 1000);
+                let gone: Vec<Idle> = idle.0.drain(..n).collect();
+                idle.1 -= gone.iter().map(|i| i.1).sum::<u64>();
+                TRIMMED_LISTS.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                drop(idle);
+                drop(gone);
+            }
         }
     }
 }
@@ -1932,6 +1981,15 @@ mod state {
 
 fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DRAWS_EVER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Every draw recorded since the start (the warm-up start watches it).
+static DRAWS_EVER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Draws recorded since the start, any kind ([`take_counts`] empties its own count).
+pub(crate) fn draws_ever() -> u64 {
+    DRAWS_EVER.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
@@ -2451,6 +2509,18 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Only the oldest idle lists, those past the age, are stale (memory
+    /// stack by skornuta, skornuta/victory-memory-stack 57fb136, GPL-3.0).
+    #[cfg(windows)]
+    #[test]
+    fn only_the_oldest_idle_lists_are_stale() {
+        assert_eq!(stale([10, 20, 900, 950].into_iter(), 1000, 100), 2);
+        assert_eq!(stale([950u64].into_iter(), 1000, 100), 0);
+        assert_eq!(stale(std::iter::empty(), 1000, 100), 0);
+        // A clock that reads earlier than a push does not make it stale.
+        assert_eq!(stale([2000u64].into_iter(), 1000, 100), 0);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

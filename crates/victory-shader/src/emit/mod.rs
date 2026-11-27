@@ -550,7 +550,8 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1")
+            || wide_first(c, &std::env::var("VICTORY_WAVE_WIDE_FIRST").unwrap_or_default());
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -696,6 +697,20 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+}
+
+/// Whether `VICTORY_WAVE_WIDE_FIRST` (comma-separated names, as the containers carry them)
+/// names this program: its per-lane branches are then taken wave-wide ([`widen`], exact, at
+/// group barriers) before any approximate local-wave form, which gives each host wave its own
+/// counts and sums (a queue built from a ballot and a lane count then has half the slots, and
+/// both halves write the same ones). Off for every program unless asked for: the barriers this
+/// form puts inside branches lost the card for two programs the approximate forms ran.
+fn wide_first(c: &Container, names: &str) -> bool {
+    names
+        .split(',')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .any(|n| c.parts.iter().any(|part| part.data.windows(n.len()).any(|w| w == n.as_bytes())))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -1075,6 +1090,18 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    #[test]
+    fn wide_first_names_a_program_by_a_word_in_its_container() {
+        use crate::dxbc::{Container, FourCC};
+        let bytes = crate::dxbc::build(&[(FourCC(*b"ILDN"), b"\x10\0\0\0queue:CS_Scan_Four\0".as_slice())]);
+        let c = Container::parse(&bytes).unwrap();
+        assert!(super::wide_first(&c, "CS_Scan"));
+        assert!(super::wide_first(&c, "other, queue:CS_Scan_Four ,more"));
+        assert!(!super::wide_first(&c, "CS_Scan_Five"));
+        assert!(!super::wide_first(&c, ""));
+        assert!(!super::wide_first(&c, " , ,"));
+    }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc
     /// is installed.

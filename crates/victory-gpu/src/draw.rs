@@ -3998,7 +3998,15 @@ impl State {
                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
-                        describe(crate::descriptor::view(handle).as_ref())
+                        let view = crate::descriptor::view(handle);
+                        let mut text = describe(view.as_ref());
+                        if u.kind == ResourceType::Cbv
+                            && let Some(View::Constant(address, size)) = view
+                            && cbv_listed(&stage.shader.hash)
+                        {
+                            text.push_str(&constants_text(address, size));
+                        }
+                        text
                     }
                     (root, _) => format!("{root:?}"),
                 };
@@ -4837,6 +4845,38 @@ fn view_state(view: Option<&View>) -> String {
         }
         Some(v) => format!("{v:?}").chars().take(80).collect(),
     }
+}
+
+/// `VICTORY_CAPTURE_CBV=<16-digit program hashes>`: the programs whose constant buffers
+/// the frame listing prints whole (every dword that is not 0), not just the first four floats.
+#[cfg(feature = "diagnostics")]
+fn cbv_listed(hash: &str) -> bool {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let set = std::env::var("VICTORY_CAPTURE_CBV").unwrap_or_default();
+        set.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect()
+    });
+    list.iter().any(|h| h == hash)
+}
+
+/// The dwords of a constant buffer that are not 0, as ` nonzero [index=value ...]` (a float
+/// that is a plain number as it reads, anything else as `#<hex>`; at most 400 of them).
+#[cfg(feature = "diagnostics")]
+fn constants_text(address: u64, size: u32) -> String {
+    use std::fmt::Write;
+    let size = size.min(1 << 16) as usize & !3;
+    if size == 0 || !crate::texture::committed(address as *const u8, size) {
+        return " nonzero [not committed]".into();
+    }
+    // SAFETY: `size` committed bytes of title memory.
+    let words = unsafe { std::slice::from_raw_parts(address as *const u32, size / 4) };
+    let mut text = String::from(" nonzero [");
+    for (i, &w) in words.iter().enumerate().filter(|(_, w)| **w != 0).take(400) {
+        let f = f32::from_bits(w);
+        let _ = if f.is_finite() && (1e-30..1e30).contains(&f.abs()) { write!(text, "{i}={f} ") } else { write!(text, "{i}=#{w:x} ") };
+    }
+    text.push(']');
+    text
 }
 
 /// A view in a few words (diagnostics builds).

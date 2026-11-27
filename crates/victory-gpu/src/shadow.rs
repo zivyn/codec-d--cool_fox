@@ -3362,11 +3362,11 @@ pub(crate) fn let_go_idle() {
             // held first, or finds this number moved.
             WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
         }
-        let gone: Vec<Arc<Shadow>> = idle
+        let idle: Vec<(u64, u64)> = idle
             .into_iter()
             .filter(|key| map.get(key).is_some_and(|s| Arc::strong_count(s) == 1))
-            .filter_map(|key| map.remove(&key))
             .collect();
+        let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
         if !gone.is_empty() {
             WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
         }

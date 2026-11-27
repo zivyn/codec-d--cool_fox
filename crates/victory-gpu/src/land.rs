@@ -198,6 +198,7 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    crate::readprobe::log();
     if quiet::on() || s[stat::QUIET_PIECES] > 0.0 {
         tracing::info!(
             "left out of landing per frame (VICTORY_LAND_QUIET={}: copies of {} KiB or more in heaps the title's CPU cannot reach, nothing told written there): {:.0} pieces {:.1} MB, not fetched and not merged",

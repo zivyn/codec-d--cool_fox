@@ -44,6 +44,9 @@ enum State {
     /// Left out; nothing was told written since this number
     /// (`crate::watch::tick`).
     Quiet(u64),
+    /// A read of the title's was seen: the next landing brings the whole
+    /// copy.
+    Woken,
     /// Landing as before, for good.
     Off,
 }
@@ -90,11 +93,24 @@ impl Quiet {
             State::Draining(n) if n + 1 < DRAIN => (State::Draining(n + 1), Verdict::Left),
             State::Draining(_) => (State::Quiet(tick()), Verdict::Left),
             State::Quiet(since) if quiet_since(since) => (State::Quiet(since), Verdict::Left),
-            State::Quiet(_) => (State::Off, Verdict::Whole),
+            State::Quiet(_) | State::Woken => (State::Off, Verdict::Whole),
             State::Off => (State::Off, Verdict::Land),
         };
         *state = next;
         verdict
+    }
+
+    /// A thread of the title was seen reading the copy (`crate::readprobe`):
+    /// if it is left out, it comes whole at the next landing and lands as
+    /// before from then on.
+    /// Whether it was left out.
+    pub(crate) fn wake(&self) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let left_out = matches!(*state, State::Draining(_) | State::Quiet(_));
+        if left_out {
+            *state = State::Woken;
+        }
+        left_out
     }
 
     /// Whether the copy is left out now.
@@ -198,6 +214,27 @@ mod tests {
             assert_eq!(quiet.landing(true, || 1, |_| true), Verdict::Land);
         }
         assert_eq!(quiet.landing(true, || 1, |_| true), Verdict::Left);
+    }
+
+    /// A copy woken by a read lands whole once, whether it was draining or
+    /// quiet, and then as before; one not left out is not woken.
+    #[test]
+    fn a_read_wakes_a_copy_that_is_left_out() {
+        let quiet = Quiet::default();
+        quiet.wake();
+        assert_eq!(
+            quiet.landing(true, || 1, |_| true),
+            Verdict::Land,
+            "not left out: nothing to wake"
+        );
+        for _ in 0..WARM {
+            quiet.landing(true, || 1, |_| true);
+        }
+        assert!(quiet.is_left_out());
+        quiet.wake();
+        assert!(!quiet.is_left_out());
+        assert_eq!(quiet.landing(true, || 1, |_| true), Verdict::Whole);
+        assert_eq!(quiet.landing(true, || 1, |_| true), Verdict::Land);
     }
 
     /// The tick is read once, at the end of the drain, and not before.

@@ -4838,7 +4838,7 @@ impl Host {
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                     let verdict = *verdicts.entry(copy).or_insert_with(|| {
-                        let verdict = if land::quiet::on() { r.shadow.landing_verdict() } else { land::quiet::Verdict::Land };
+                        let verdict = if land::quiet::on() || crate::readprobe::on() { r.shadow.landing_verdict() } else { land::quiet::Verdict::Land };
                         if verdict == land::quiet::Verdict::Whole {
                             whole.push(r.shadow.clone());
                         }

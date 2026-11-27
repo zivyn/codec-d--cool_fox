@@ -1961,7 +1961,7 @@ fn find_pieces_with(
                             std::slice::from_raw_parts((before + at) as *const u8, n),
                         )
                     };
-                    if now != old {
+                    if !crate::safecopy::same(now, old) {
                         pieces.push((at, n));
                         if refine {
                             current::differing_units(start + at, now, old, at, &mut dirty);
@@ -3636,7 +3636,7 @@ impl Shadow {
                 // SAFETY: inside the mapping, which nothing writes while a
                 // submission's results are compared.
                 let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
-                if host != &before[at - from..at - from + n] {
+                if !crate::safecopy::same(host, &before[at - from..at - from + n]) {
                     found.push((at, n));
                 }
                 at += n;
@@ -4185,12 +4185,23 @@ impl Shadow {
     /// thread that lands).
     pub(crate) fn landing_verdict(&self) -> crate::land::quiet::Verdict {
         use crate::land::quiet;
-        let eligible = quiet::on()
-            && self.card.is_some()
-            && self.gpu_only.load(Ordering::Acquire)
-            && self.len >= quiet::min_bytes()
-            && quiet_on();
+        let may = self.card.is_some() && self.gpu_only.load(Ordering::Acquire) && self.len >= quiet::min_bytes() && quiet_on();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        if may && crate::readprobe::on() {
+            // A thread of the title touched a page of it: it lands again.
+            crate::readprobe::drain();
+            if let Some(page) = crate::readprobe::touched_in(start, end)
+                && self.quiet_landing.wake()
+            {
+                tracing::warn!(
+                    start = format_args!("{start:#x}"),
+                    page = format_args!("{page:#x}"),
+                    "a buffer left out of landing was touched by the title's CPU: it lands whole once and as before (VICTORY_READ_PROBE)"
+                );
+            }
+            crate::readprobe::arm(start, end);
+        }
+        let eligible = may && quiet::on();
         self.quiet_landing.landing(eligible, crate::watch::tick, |since| crate::watch::quiet_since(start, end, since))
     }
 

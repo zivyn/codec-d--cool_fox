@@ -3227,6 +3227,22 @@ impl Shadow {
         list.defer_refresh(self, address as usize, len as usize);
     }
 
+    /// Where shaders read and write it: `card` (its buffer is in the card's own memory), `card-mapped` (the card's memory,
+    /// filled by the CPU through the bus), `pc-in-place` (the title's own memory opened as a buffer) or `pc` (a buffer in
+    /// the PC's memory: every access a shader makes crosses the bus).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn residence(&self) -> &'static str {
+        if self.card.is_some() {
+            "card"
+        } else if self.mapped {
+            "card-mapped"
+        } else if self.place.is_some() {
+            "pc-in-place"
+        } else {
+            "pc"
+        }
+    }
+
     /// The bytes of the host buffer.
     pub(crate) fn width(&self) -> u64 {
         // SAFETY: a live buffer.

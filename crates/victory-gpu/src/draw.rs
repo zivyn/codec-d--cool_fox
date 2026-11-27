@@ -3198,6 +3198,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
+        self.placement_line(&p.name, [x, y, z]);
+        #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_builder(self.pipeline as This) {
             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
             self.list_dropped_roots([x, y, z]);
@@ -3987,6 +3989,60 @@ impl State {
     /// What a draw's shaders read, one line per used resource (diagnostics
     /// builds).
     #[cfg(feature = "diagnostics")]
+    /// For a compute pipeline's first dispatches (`VICTORY_PLACEMENT=1`): where the buffers its tables name live, in
+    /// the card's memory or the PC's (a shader reading the PC's memory crosses the bus at each access, ~1 to 2 us
+    /// a dependent load), by view: kind, bytes, residence.
+    #[cfg(feature = "diagnostics")]
+    fn placement_line(&self, name: &str, groups: [u32; 3]) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLACEMENT").is_some_and(|v| v == "1")) {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        static SAID: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+        {
+            let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+            match said.iter_mut().find(|(k, _)| *k == self.pipeline) {
+                Some((_, n)) if *n >= 3 => return,
+                Some((_, n)) => *n += 1,
+                None => said.push((self.pipeline, 1)),
+            }
+        }
+        let (mut card, mut pc) = ([0u64; 2], [0u64; 2]);
+        let mut views = Vec::new();
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let (RootType::Table, Some(Root::Table(table))) = (u.root, self.roots_ref(true).get(usize::from(u.slot))) else {
+                    continue;
+                };
+                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                    continue;
+                };
+                let Some((shadow, _, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    continue;
+                };
+                let tally = if shadow.residence().starts_with("card") { &mut card } else { &mut pc };
+                tally[0] += 1;
+                tally[1] += len;
+                views.push(format!("{:?} {} B {}", u.kind, len, shadow.residence()));
+            }
+        }
+        tracing::info!(
+            "compute {name} {:?} groups {}x{}x{}: {} views in the card's memory ({} KiB), {} in the PC's ({} KiB): {}",
+            p.stages.first().map(|s| s.shader.hash.clone()),
+            groups[0],
+            groups[1],
+            groups[2],
+            card[0],
+            card[1] >> 10,
+            pc[0],
+            pc[1] >> 10,
+            views.join("; ")
+        );
+    }
+
     fn reads(&self, compute: bool) -> Vec<String> {
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             return vec!["no host pipeline".into()];
@@ -4842,6 +4898,16 @@ fn view_state(view: Option<&View>) -> String {
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
+    let text = describe_view(view);
+    // Where a buffer view's copy lives: what a shader reads through the PC's memory crosses the bus.
+    match view.and_then(crate::descriptor::host::buffer_copy) {
+        Some((shadow, _, len)) => format!("{text} [{} {len} B]", shadow.residence()),
+        None => text,
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+fn describe_view(view: Option<&View>) -> String {
     let texture = |r: This| {
         crate::resource::host_made(r).map(|t| {
             // SAFETY: a live resource.

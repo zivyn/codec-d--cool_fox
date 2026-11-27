@@ -286,6 +286,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             use std::sync::atomic::Ordering::Relaxed;
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            crate::cores::prioritize("victory-heap-sync", crate::cores::Role::Helper);
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends: the asks it began with are met.
             struct Over(u64);

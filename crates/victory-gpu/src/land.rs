@@ -243,6 +243,7 @@ impl Pool {
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
+                crate::cores::prioritize(name, crate::cores::Role::Helper);
                 pool.help()
             });
         }

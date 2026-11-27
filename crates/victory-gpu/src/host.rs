@@ -3407,6 +3407,7 @@ struct RelayFetch {
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
     crate::cores::keep_on_fast_cores("victory-relay");
+    crate::cores::prioritize("victory-relay", crate::cores::Role::Helper);
     let Some(host) = host() else {
         return;
     };

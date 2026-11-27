@@ -94,7 +94,7 @@ pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgr
 }
 
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
-fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
+pub(super) fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
     lowered_on(native, p, wide, 32)
 }
 
@@ -587,7 +587,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
-fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
+pub(super) fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;

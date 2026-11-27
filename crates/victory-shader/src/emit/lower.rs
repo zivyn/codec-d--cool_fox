@@ -1482,6 +1482,8 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's `VICTORY_LOOP_LIMITS`, for its thread only.
+    pub(super) static TEST_LOOP_LIMITS: std::cell::RefCell<Option<super::LoopLimits>> = const { std::cell::RefCell::new(None) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
@@ -13356,21 +13358,7 @@ impl<'a> Lower<'a> {
     /// on what other groups write).
     fn list_loops(&self, order: &[usize]) {
         let p = self.x.p;
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
-        let stage = if self.s.pixel {
-            "ps"
-        } else if self.s.mesh.is_some() {
-            "ms"
-        } else if self.s.threads.is_some() {
-            "cs"
-        } else {
-            "vs"
-        };
+        let stage = self.loop_stage().name();
         for &h in order.iter().filter(|h| self.counters.contains_key(h)) {
             let mut body = HashSet::from([h]);
             let mut backs: Vec<usize> = p.blocks[h]
@@ -13413,11 +13401,23 @@ impl<'a> Lower<'a> {
                     Fields::Valu(v) => &v.src,
                     _ => continue,
                 };
-                bound = match src.iter().find_map(|o| match o {
-                    Operand::Literal(n) => Some(u64::from(*n)),
-                    Operand::Const(c) if (128..=192).contains(c) => Some(u64::from(*c - 128)),
+                let limit = self.loop_limit_of(h);
+                // (a SOPK compare, `s_cmpk_*`, holds its constant in the instruction: the
+                // counter of a loop of the title's own compiler, which counts by one or by
+                // the unroll's steps, so over the limit means over it in iterations too)
+                let imm = match &cmp.fields {
+                    Fields::Sop { imm: Some(n), .. } => Some(u64::from(*n)),
                     _ => None,
-                }) {
+                };
+                bound = match src
+                    .iter()
+                    .find_map(|o| match o {
+                        Operand::Literal(n) => Some(u64::from(*n)),
+                        Operand::Const(c) if (128..=192).contains(c) => Some(u64::from(*c - 128)),
+                        _ => None,
+                    })
+                    .or(imm)
+                {
                     Some(n) if n > u64::from(limit) => format!("const {n} (over the limit)"),
                     Some(n) => format!("const {n}"),
                     None => "register".to_string(),
@@ -13425,6 +13425,7 @@ impl<'a> Lower<'a> {
                 break;
             }
             let id = self.loop_number(h);
+            let limit = self.loop_limit_of(h);
             eprintln!(
                 "LOOP program={:07x} id={id} offset={:#x} stage={stage} limit={limit} bound={bound} loads={loads} glc={glc} blocks={}",
                 PROGRAM_TAG.get() & 0x0FFF_FFFF,
@@ -13437,6 +13438,24 @@ impl<'a> Lower<'a> {
     fn negated(&mut self, x: V) -> V {
         let t = self.s.m.bool(true);
         self.s.m.bin(self.cur, Bin::Xor, x, t)
+    }
+
+    /// The stage of this program as its loops' limits are set per stage.
+    fn loop_stage(&self) -> super::LoopStage {
+        if self.s.pixel {
+            super::LoopStage::Pixel
+        } else if self.s.mesh.is_some() {
+            super::LoopStage::Mesh
+        } else if self.s.threads.is_some() {
+            super::LoopStage::Compute
+        } else {
+            super::LoopStage::Vertex
+        }
+    }
+
+    /// The iteration limit of the loop whose header is `to` ([`super::loop_limit_for`]).
+    fn loop_limit_of(&self, to: usize) -> u32 {
+        super::loop_limit_for(self.loop_stage(), PROGRAM_TAG.get(), || self.loop_number(to))
     }
 
     /// The number of loop header `to` among the program's (by the order of the blocks).
@@ -13519,12 +13538,8 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
+        // (`VICTORY_LOOP_LIMITS` raises the loops that are really that long, by program and loop)
+        let limit = self.loop_limit_of(to);
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)

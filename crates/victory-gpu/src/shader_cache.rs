@@ -54,8 +54,19 @@ fn build() -> [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        if let Some(table) = std::env::var("VICTORY_LOOP_LIMITS")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            tracing::warn!(
+                table,
+                "VICTORY_LOOP_LIMITS: translated loops of these programs and stages stop later"
+            );
+        }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
         bytes.extend_from_slice(&limit.to_le_bytes());
+        // (naming the default number is not naming none)
+        bytes.push(u8::from(victory_shader::emit::loop_limit_is_named()));
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:
@@ -78,6 +89,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_LOOP_NOTES",
             "VICTORY_LOOP_WHY",
+            "VICTORY_LOOP_LIMITS",
             "VICTORY_PEEK",
             "VICTORY_BVH_BOUNDS",
         ] {

@@ -847,6 +847,7 @@ fn a_lane_branch_that_writes_and_reads_lds_translates_wave_wide_as_a_last_resort
 /// each wave reads inside the branch what its own lanes wrote (the lane 16 above, in the wave),
 /// and `out[threads + t]` is what the wave's count `n` came to (1 if the wave entered the branch).
 fn lds_in_a_lane_branch_per_console_wave(threads: u32, lds_units: u32) -> NativeProgram {
+    let declared_bytes = (threads * 4).div_ceil(512).max(lds_units) * 512;
     let words = [
         0xBE94_0380, // s_mov_b32 s20, 0
         0xD760_0016, // v_readlane_b32 s22, v0, 3 (a lane read: the console wave's lanes are in step)
@@ -855,6 +856,13 @@ fn lds_in_a_lane_branch_per_console_wave(threads: u32, lds_units: u32) -> Native
         0x3406_0082, // v_lshlrev_b32 v3, 2, v0
         0xD834_0000, // ds_write_b32 v3, v4
         0x0000_0403,
+        // a write past the program's shared memory, which the console drops
+        0x4A14_06FF, // v_add_nc_u32 v10, lit, v3
+        declared_bytes,
+        0x7E16_02FF, // v_mov_b32 v11, lit
+        0x0000_DEAD,
+        0xD834_0000, // ds_write_b32 v10, v11
+        0x0000_0B0A,
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
         0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
         0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
@@ -879,6 +887,12 @@ fn lds_in_a_lane_branch_per_console_wave(threads: u32, lds_units: u32) -> Native
         0x7E10_0214, // v_mov_b32 v8, s20
         0xE070_1000 | (threads * 4), // buffer_store_dword v8, v3, s[8:11], 0 offen offset:threads*4
         0x8002_0803,
+        // and a read past it, which gives 0
+        0xD8D8_0000, // ds_read_b32 v12, v10
+        0x0C00_000A,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000 | (threads * 8), // buffer_store_dword v12, v3, s[8:11], 0 offen offset:threads*8
+        0x8002_0C03,
     ];
     let mut native = native_of(&words, true, threads);
     if let StageIo::Cs(cs) = &mut native.io {
@@ -902,7 +916,7 @@ fn console_waves_of_a_group_take_a_lane_branch_with_lds_on_their_own() {
 /// where an NVIDIA card runs shared memory that D3D12 does not promise (48 KiB per group).
 #[test]
 fn console_waves_of_a_group_that_fills_the_shared_memory_still_meet() {
-    console_waves_branching(&[256, 512], 64, 49152);
+    console_waves_branching(&[256, 384], 64, 49152);
 }
 
 fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
@@ -914,6 +928,8 @@ fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
         let io = io::raise(&p, &native).expect("io::raise");
         let container = crate::dxbc::build(&[]);
         let c = crate::dxbc::Container::parse(&container).unwrap();
+        // (the waits that give up leave a note: the program asks for the list of faults)
+        lower::set_program_tag(&threads.to_le_bytes());
         let was = lower::TEST_HOST_WAVE.replace(Some(32));
         let lds = lower::TEST_HOST_LDS.replace(Some(host_lds));
         let shader = super::emit(&c, &native, &p, &st, &io, &res);
@@ -952,7 +968,7 @@ fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(2 * threads)],
+                        views: &[View::RawUav(3 * threads)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -969,6 +985,7 @@ fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
                     (true, false) => u32::MAX,
                 };
                 assert_eq!(out[0][t as usize], expected, "{threads} threads, {below} below, thread {t}");
+                assert_eq!(out[0][(2 * threads + t) as usize], 0, "{threads} threads, {below} below, the read past the memory, thread {t}");
             }
         }
     }

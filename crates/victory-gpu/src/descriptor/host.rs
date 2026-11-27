@@ -6551,14 +6551,21 @@ mod view_cache_tests {
         let s = heap.dynamic(4).unwrap();
 
         let counts = || LIST_VIEWS.with(|v| v.borrow().as_ref().unwrap().counts);
+        let delta = |was: [u64; 8]| {
+            let now = counts();
+            std::array::from_fn::<u64, 8, _>(|i| now[i] - was[i])
+        };
         TEST_VIEW_CACHE.store(2, Relaxed);
-        // (Recording numbers of this test alone.)
+        // (Recording numbers of this test alone.) The first ask makes the copy the view shows, which is a change
+        // of the copies: what was kept then is stale, so one recording goes before.
+        assert!(heap.make_listed(0xcafe_0000, words, s).is_some());
+        let before = counts();
         assert!(heap.make_listed(0xcafe_0001, words, s).is_some());
         assert!(heap.make_listed(0xcafe_0001, words, s + 1).is_some());
         assert!(heap.make_listed(0xcafe_0002, words, s + 2).is_some());
-        let c = counts();
+        let c = delta(before);
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
-        if c[3] == 0 {
+        if counts()[3] == 0 {
             // The view did not make on this adapter: nothing to keep.
             return;
         }
@@ -6569,7 +6576,7 @@ mod view_cache_tests {
         TEST_VIEW_CACHE.store(1, Relaxed);
         crate::shadow::changed_for_test();
         assert!(heap.make_listed(0xcafe_0003, words, s + 3).is_some());
-        let c = counts();
+        let c = delta(before);
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
         // (Or it was long enough ago for the kept ones to go, as old ones do: then it was not stale, but not there.)
         assert_eq!((c[1], c[3]), (1, 2), "{c:?}");

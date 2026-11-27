@@ -3904,6 +3904,7 @@ fn late_line(frames: f64) {
     if !late() {
         return;
     }
+    prefetch::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4039,6 +4040,7 @@ pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
 mod place;
+mod prefetch;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -4817,7 +4819,13 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    fn card_before(
+        &self,
+        declared: &[Declared],
+        picked: &crate::picked::Ranges,
+        flown: bool,
+        after_take: &mut dyn FnMut(),
+    ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4867,6 +4875,9 @@ impl Host {
         let taking = crate::timeline::span("copies in the card's memory: taken");
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        // What the card is sent is out of the copies: the next submission's
+        // refreshes may begin ([`prefetch`]).
+        after_take();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -5897,7 +5908,9 @@ impl Host {
                 Ok([(lists, order), (more, behind)]) => {
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
+                    let ahead = crate::queue::take_ahead();
                     self.execute_parts(lists, order, &first);
+                    crate::queue::restore_ahead(ahead);
                     self.execute_parts(more, behind, &second);
                 }
                 Err((lists, order)) => self.send_late(lists, order, parts),
@@ -5908,7 +5921,9 @@ impl Host {
             match split(lists, order, cut) {
                 Ok([(lists, order), (more, behind)]) => {
                     let (first, second) = parts_around(parts, cut);
+                    let ahead = crate::queue::take_ahead();
                     self.execute_parts(lists, order, &first);
+                    crate::queue::restore_ahead(ahead);
                     self.execute_parts(more, behind, &second);
                 }
                 Err((lists, order)) => self.send_late(lists, order, parts),
@@ -6235,6 +6250,11 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // The refreshes of this submission begun while the one before was sent
+        // are over before anything is asked or refreshed here.
+        if late {
+            prefetch::join();
+        }
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6450,7 +6470,23 @@ impl Host {
             }
             PendingFlight::register(ranges)
         });
-        let card = self.card_before(&declared, &picked, flown);
+        // The copies this submission still does something to after the card's
+        // plan is made: its title buffer copies' places.
+        let excluding: Vec<usize> = if prefetch::on() {
+            batch.placed.iter().map(|(shadow, ..)| std::sync::Arc::as_ptr(shadow) as usize).collect()
+        } else {
+            Vec::new()
+        };
+        let mut offered = false;
+        let card = self.card_before(&declared, &picked, flown, &mut || {
+            if !offered {
+                offered = true;
+                prefetch::offer(&excluding);
+            }
+        });
+        if !offered {
+            prefetch::offer(&excluding);
+        }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {

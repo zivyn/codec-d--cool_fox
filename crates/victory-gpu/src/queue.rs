@@ -467,6 +467,26 @@ pub(crate) fn heaps_round() -> u64 {
     behind::round()
 }
 
+/// Whether the refreshes of the submission that comes next are begun while
+/// the one being prepared is sent (`VICTORY_PIPELINE_PREPARE=1`).
+#[cfg(windows)]
+pub(crate) fn pipeline_prepare() -> bool {
+    behind::pipeline_prepare() && behind::on()
+}
+
+/// The host lists (addresses) of the submission that comes next after the one
+/// our thread is preparing, asked once ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn take_ahead() -> Option<Vec<usize>> {
+    behind::take_ahead()
+}
+
+/// Puts back what [`take_ahead`] took.
+#[cfg(windows)]
+pub(crate) fn restore_ahead(ahead: Option<Vec<usize>>) {
+    behind::restore_ahead(ahead);
+}
+
 /// Submissions the title made that the host has not begun ([`behind`]).
 #[cfg(windows)]
 pub(crate) fn queued() -> u64 {

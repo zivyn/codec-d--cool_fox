@@ -88,6 +88,12 @@ pub(super) trait Work: Send {
     fn round(&self) -> u64 {
         0
     }
+    /// What the entry that is done after the one being done now is, as the
+    /// addresses of its host lists in the order they run, if it is a
+    /// submission whose lists are known ([`pipeline_prepare`]).
+    fn peek(&self) -> Option<Vec<usize>> {
+        None
+    }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
 }
@@ -122,6 +128,42 @@ thread_local! {
     /// asked for it (and for what was taken along with it), 0 if none.
     static ROUND: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
+
+thread_local! {
+    /// On our thread, while it does an entry: the host lists of the entry
+    /// that comes next of its queue, as addresses, if it is a submission.
+    static AHEAD: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The host lists of the submission that comes next after the one being
+/// prepared (taken: asked once), as addresses valid until our thread has
+/// done with the entry it is at: nothing but our thread takes an entry out
+/// of the line or changes what it holds.
+pub(super) fn take_ahead() -> Option<Vec<usize>> {
+    AHEAD.with(|a| a.borrow_mut().take())
+}
+
+/// Puts back what [`take_ahead`] took (a submission prepared in two halves
+/// gives it to the second).
+pub(super) fn restore_ahead(ahead: Option<Vec<usize>>) {
+    AHEAD.with(|a| *a.borrow_mut() = ahead);
+}
+
+/// Whether the refreshes of the submission that comes next are begun, by a
+/// thread of ours, while the one being prepared is sent
+/// (`VICTORY_PIPELINE_PREPARE=1`; off by default): see `crate::host`.
+pub(super) fn pipeline_prepare() -> bool {
+    #[cfg(test)]
+    if FORCE_PIPELINE.load(Relaxed) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_PREPARE").is_some_and(|v| v == "1"))
+}
+
+/// Tests: the pipeline's questions answer yes.
+#[cfg(test)]
+static FORCE_PIPELINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The round of the heaps' records asked for ahead for what our thread does
 /// now ([`Work::round`]); 0 if none, or if not on our thread.
@@ -395,7 +437,17 @@ impl<W: Work> Lane<W> {
             }
         }
         ROUND.set(entry.round);
+        let ahead = if pipeline_prepare() {
+            // (Its place does not change before our thread is done with this
+            // one; only titles' threads add to the end.)
+            let state = self.lock();
+            state.items.iter().find(|e| e.queue == entry.queue).and_then(|e| e.what.peek())
+        } else {
+            None
+        };
+        AHEAD.with(|a| *a.borrow_mut() = ahead);
         entry.what.go(forced);
+        AHEAD.with(|a| a.borrow_mut().take());
         ROUND.set(0);
         {
             let mut state = self.lock();
@@ -502,6 +554,13 @@ impl Work for Job {
 
     fn round(&self) -> u64 {
         if self.runs() && heaps_early() { crate::descriptor::ask_round() } else { 0 }
+    }
+
+    fn peek(&self) -> Option<Vec<usize>> {
+        match self {
+            Job::Run(_, lists, order) => Some(order.iter().map(|&i| std::ptr::from_ref(lists[i].host()) as usize).collect()),
+            _ => None,
+        }
     }
 
     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
@@ -1007,6 +1066,9 @@ mod tests {
         /// A submission that was given a round of the heaps' records as it
         /// came in; takes others of its kind along.
         Round(&'static str, u64, Log),
+        /// A submission that says what it is to the one before it in its
+        /// queue ([`Work::peek`]) and logs what the one before it saw.
+        Peek(&'static str, Log),
     }
 
     impl Work for T {
@@ -1024,7 +1086,13 @@ mod tests {
             matches!(self, T::Present(..))
         }
         fn runs(&self) -> bool {
-            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Round(..))
+            matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Round(..) | T::Peek(..))
+        }
+        fn peek(&self) -> Option<Vec<usize>> {
+            match self {
+                T::Peek(name, _) => Some(vec![name.len(), name.as_bytes()[0] as usize]),
+                _ => None,
+            }
         }
         fn round(&self) -> u64 {
             match self {
@@ -1061,6 +1129,12 @@ mod tests {
                 }
                 T::Run(name, log) | T::Present(name, log) => log.lock().unwrap().push(name.into()),
                 T::Round(name, _, log) => log.lock().unwrap().push(format!("{name} round {}", round())),
+                T::Peek(name, log) => {
+                    let next = take_ahead();
+                    log.lock().unwrap().push(format!("{name} saw {next:?}"));
+                    // Asked once: it is gone.
+                    assert!(take_ahead().is_none());
+                }
                 T::Slow(name, log, gate) => {
                     let mut open = gate.0.lock().unwrap();
                     while !*open {
@@ -1159,6 +1233,32 @@ mod tests {
         look(&lane);
         assert_eq!(*log.lock().unwrap(), ["a round 9", "c round 3"]);
         assert_eq!(round(), 0);
+    }
+
+    /// What a submission is told of the one that comes next is the next of ITS
+    /// queue, whatever other queues hold, nothing of what is not a submission
+    /// it can name, and it is told once.
+    #[test]
+    fn a_submission_sees_the_next_of_its_own_queue_and_only_once() {
+        FORCE_PIPELINE.store(true, Relaxed);
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        lane.push(1, [T::Peek("a", log.clone()), T::Peek("bb", log.clone()), T::Run("plain", log.clone())]);
+        lane.push(2, [T::Peek("cc", log.clone())]);
+        look(&lane);
+        // `a` sees `bb`, the next of queue 1 (not `cc`, which queue 2 holds);
+        // `bb` is followed by a submission that names nothing; `cc` is last.
+        assert_eq!(
+            *log.lock().unwrap(),
+            [format!("a saw {:?}", Some(vec![2usize, b'b' as usize])), "bb saw None".to_string(), "plain".into(), "cc saw None".into()]
+        );
+        // A split submission: the first half gives what it was told to the
+        // second.
+        restore_ahead(Some(vec![7]));
+        let held = take_ahead();
+        assert!(take_ahead().is_none());
+        restore_ahead(held);
+        assert_eq!(take_ahead(), Some(vec![7]));
     }
 
     /// A submission takes what follows it in its queue along, up to what it

@@ -9627,6 +9627,31 @@ struct Presenter {
 /// line at the top of the picture (`menu.rs`).
 pub(crate) static METER_FPS_TENTHS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Logs how even the frames since the last line were: the median, the 95th
+/// and 99th percentile and the longest interval between presents, and how
+/// many took over 50 and over 100 ms (a frame rate of 30 with every frame
+/// at 33 ms plays smoothly; one with frames of 20 and 80 ms stutters).
+fn frame_times_line(intervals: &mut Vec<f32>) {
+    if intervals.is_empty() {
+        return;
+    }
+    intervals.sort_unstable_by(f32::total_cmp);
+    let at = |q: f32| intervals[((intervals.len() - 1) as f32 * q).round() as usize];
+    let over = |ms: f32| intervals.iter().filter(|&&t| t > ms).count();
+    tracing::info!(
+        target: "victory_gpu::frame_times",
+        "frame times: {} frames, median {:.1} ms, p95 {:.1}, p99 {:.1}, longest {:.1}; {} over 50 ms, {} over 100 ms",
+        intervals.len(),
+        at(0.5),
+        at(0.95),
+        at(0.99),
+        intervals[intervals.len() - 1],
+        over(50.0),
+        over(100.0)
+    );
+    intervals.clear();
+}
+
 struct Meter {
     since: std::time::Instant,
     frames: u32,
@@ -9634,6 +9659,10 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// The last present counted, and the intervals between presents since
+    /// the last frame-rate line, in ms: what the average hides (stutter).
+    last: std::time::Instant,
+    intervals: Vec<f32>,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -9648,6 +9677,8 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            last: now,
+            intervals: Vec::with_capacity(512),
             caption: None,
         }
     }
@@ -9668,10 +9699,14 @@ impl Meter {
         {
             self.copy_stats_frames += 1;
         }
+        let now = std::time::Instant::now();
+        self.intervals.push((now - self.last).as_secs_f32() * 1000.0);
+        self.last = now;
         let elapsed = self.since.elapsed();
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        frame_times_line(&mut self.intervals);
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();

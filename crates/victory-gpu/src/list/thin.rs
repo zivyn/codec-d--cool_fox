@@ -358,6 +358,7 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    crate::descriptor::host::view_cache_line(frames);
 }
 
 #[inline]

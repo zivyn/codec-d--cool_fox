@@ -5510,7 +5510,20 @@ mod tests {
             return; // no host GPU here
         };
         let memory = vec![0u64; 1 << 13];
-        let start = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let first = (memory.as_ptr() as u64).next_multiple_of(4096);
+        // A view 8 bytes in is off 456-byte elements unless its place in the
+        // copy it lies in is a multiple of 456 (then it is at one, and its
+        // buffer's copy serves, rightly): where the heap is decides, for one
+        // address of 57. Start where it is not, with the view's range and the
+        // page after it in one copy.
+        let start = (0..14)
+            .map(|page| first + page * 4096)
+            .find(|&at| {
+                let copy = crate::shadow::find(at + 8, 4 * 456);
+                copy.as_ref().is_some_and(|c| c.offset(at + 8) % 456 != 0)
+                    && copy.zip(crate::shadow::find(at, 4096)).is_some_and(|(a, b)| std::sync::Arc::ptr_eq(&a, &b))
+            })
+            .expect("a page of the heap off 456-byte elements");
         // SAFETY: a plain CPU-side heap of one view.
         let cpu: ID3D12DescriptorHeap = unsafe {
             host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {

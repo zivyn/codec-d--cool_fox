@@ -1,5 +1,6 @@
-//! DXIL emission (decision 0003, step 3): a console vertex, pixel, compute
-//! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
+//! DXIL emission (decision 0003, step 3): a console vertex, geometry, pixel,
+//! compute or mesh shader as a PC DXIL container (SM 6.6) that host D3D12
+//! accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
 //! size (`WaveSize`), so the host device must support it.
@@ -79,6 +80,20 @@
 //!   geometry shader of ours between the translated vertex and pixel
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
+//! * **Merged geometry stages** ([`HwStage::Es`], [`HwStage::Gs`]): the
+//!   console runs a vertex shader that feeds a geometry shader, and that
+//!   geometry shader, as the two halves of one wave, the vertices between
+//!   them in LDS. The export program is a plain vertex shader on the host
+//!   (`vs_6_6`: its LDS writes are its outputs); the geometry program a
+//!   geometry shader (`gs_6_6`): its LDS reads are its input primitive's
+//!   vertices, its LDS writes the outputs of the vertex its next stream
+//!   message emits. Input primitive and output topology are the console
+//!   container's (`PSV0`), the vertex maximum and the instance count the
+//!   stage data's; one output stream, no 16-bit values. A container with
+//!   both a vertex and an export program translates as the vertex program,
+//!   which feeds the geometry shader just as well. The host has one
+//!   geometry stage: a pipeline with such a shader and a rectangle-list
+//!   topology gets no host pipeline.
 
 #[cfg(all(test, windows))]
 mod bench_tests;
@@ -88,6 +103,8 @@ mod container;
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(all(test, windows))]
+mod geometry_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -384,8 +401,8 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Translates the vertex, pixel, compute or mesh program of a console
-/// shader container.
+/// Translates the vertex, geometry, pixel, compute or mesh program of a
+/// console shader container.
 ///
 /// A program refused because the first half of an interpolation is read as
 /// data is translated once more with first halves evaluated as the pair
@@ -409,17 +426,22 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
-            )
-        })
+    // A vertex shader compiled for a geometry shader's pipelines is an
+    // export program; where its container has the plain vertex program
+    // too, that one feeds the host's geometry stage just as well.
+    let mut programs = crate::native_programs(dxil.data)?;
+    let translated = |p: &NativeProgram| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms | HwStage::Gs
+        )
+    };
+    let native = (programs.iter().position(translated))
+        .or_else(|| programs.iter().position(|p| p.stage == HwStage::Es))
+        .map(|i| programs.swap_remove(i))
         .ok_or(ShaderError::Unsupported {
             offset: 0,
-            what: "a container without a vertex, pixel, compute or mesh program",
+            what: "a container without a vertex, geometry, pixel, compute or mesh program",
         })?;
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
@@ -880,6 +902,38 @@ fn emit_program(
         }
         _ => 0,
     };
+    // A geometry program's primitives are in PSV0 (its limits in the stage
+    // data): without them, triangles in and triangle strips out.
+    let gs = match &native.io {
+        crate::native::StageIo::Gs(gs) => {
+            let psv = c
+                .part(FourCC::PSV0)
+                .map(|p| p.data)
+                .filter(|d| crate::dxbc::u32_at(d, 0).is_ok_and(|n| n >= 16));
+            let word = |k: usize| {
+                psv.and_then(|d| crate::dxbc::u32_at(d, 4 + 4 * k).ok())
+                    .filter(|&v| v != 0)
+            };
+            let (input, topology) = (word(0).unwrap_or(3), word(1).unwrap_or(5));
+            let what = if word(2).is_some_and(|streams| streams != 1) {
+                Some("geometry output streams other than 0")
+            } else if !matches!(input, 1 | 2 | 3 | 6 | 7) || !matches!(topology, 1 | 3 | 5) {
+                Some("a geometry shader's primitive kind")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                return Err(ShaderError::Unsupported { offset: 0, what });
+            }
+            Some(shader::Geometry {
+                input,
+                topology,
+                max_vertices: gs.max_vertices.max(1),
+                instances: gs.invocations.max(1),
+            })
+        }
+        _ => None,
+    };
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -890,6 +944,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        geometry: gs,
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -2349,6 +2404,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap();
         // The calls that read the SRV: 28 a dword, 7 with four a call.
@@ -2506,6 +2562,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            geometry: None,
         })
         .unwrap();
         let mut dxil = l.dxil;

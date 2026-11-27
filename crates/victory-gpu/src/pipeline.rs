@@ -9,9 +9,10 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
+//! shortcut: only vertex (with or without a geometry stage) or mesh plus
+//! pixel pipelines from streams and compute pipelines get host pipelines;
+//! tessellation stages, and the plain graphics description, keep their
+//! containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -198,7 +199,7 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
+    use victory_shader::{Container, FourCC};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
@@ -213,14 +214,10 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    // The program that was translated: the first of its stage.
     let used = programs
         .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
+        .find(|p| p.stage == host.stage)
         .map(|p| p.used)
         .unwrap_or_default();
     let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);

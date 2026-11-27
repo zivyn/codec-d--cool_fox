@@ -174,22 +174,18 @@ impl Front {
 
 /// Whether a call names a place that is another one in each list (a root view's address).
 fn is_address(op: u64) -> bool {
-    [Plain::GRAPHICS_VIEW, Plain::COMPUTE_VIEW].iter().any(|&p| p as u64 == op)
+    op == Plain::GRAPHICS_VIEW as u64 || op == Plain::COMPUTE_VIEW as u64
 }
 
 /// Whether a call draws or dispatches.
 fn is_draw(op: u64) -> bool {
-    [
-        Plain::DRAW,
-        Plain::DRAW_INDEXED,
-        Plain::DISPATCH,
-        Plain::DISPATCH_X,
-        Plain::DISPATCH_MESH,
-        Plain::DISPATCH_MESH_X,
-        Plain::EXECUTE_INDIRECT,
-    ]
-    .iter()
-    .any(|&p| p as u64 == op)
+    op == Plain::DRAW as u64
+        || op == Plain::DRAW_INDEXED as u64
+        || op == Plain::DISPATCH as u64
+        || op == Plain::DISPATCH_X as u64
+        || op == Plain::DISPATCH_MESH as u64
+        || op == Plain::DISPATCH_MESH_X as u64
+        || op == Plain::EXECUTE_INDIRECT as u64
 }
 
 /// Streams' memory to use again.

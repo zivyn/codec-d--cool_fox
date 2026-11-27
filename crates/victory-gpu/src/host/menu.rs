@@ -111,6 +111,28 @@ fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
 }
 
+/// The first start of a new victory.exe: the seconds it plays before it starts
+/// again by itself (`VICTORY_WARMUP_RESTART`, set by the launcher while the exe
+/// has no mark under `%LOCALAPPDATA%\victory\warmed`). On the RTX 5070, every
+/// new build's first run stayed at a flat 14 fps (Present ~40 ms) for as long as
+/// it ran, and every later run was normal (27-29 fps), even after a first run of
+/// 45 seconds; a copy of an exe already run was fast at once (2026-11-27). Likely
+/// the driver's cache of the program; not ours to fix, so it is run through once.
+pub(crate) fn warmup_seconds() -> Option<u64> {
+    get("VICTORY_WARMUP_RESTART").parse().ok().filter(|s| *s > 0)
+}
+
+/// The start's notice lines for the warm-up start ([`warmup_seconds`]).
+pub(crate) fn warmup_notice(seconds: u64) -> Vec<String> {
+    vec![
+        "FIRST START OF THIS VERSION: A ONE-TIME WARM-UP".to_owned(),
+        format!("THE GAME RESTARTS BY ITSELF IN ABOUT {seconds} SECONDS"),
+        "THIS HAPPENS ONCE PER NEW VERSION, AND IS NEEDED:".to_owned(),
+        "WITHOUT IT THE FIRST RUN STAYS AT ABOUT 14 FPS".to_owned(),
+        String::new(),
+    ]
+}
+
 /// Starts `command_line` in a console window of its own, with that console's input and output.
 /// (`std::process::Command` always hands its child this process's standard handles: the restarted
 /// launcher then wrote into the old launcher's pipe and log, not its own window, and kept the old
@@ -455,7 +477,7 @@ impl Menu {
     }
 
     /// Starts the launcher again in a new console, a few seconds on, and ends this run.
-    /// `preload`: the launcher makes every shader first (its `-Preload`, for that start alone).
+    /// `preload`: the launcher makes every shader first (`VICTORY_PRELOAD=1`, for that start alone).
     fn restart(&mut self, preload: bool) {
         let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
             self.note = "SAVED. START THE LAUNCHER AGAIN YOURSELF".to_owned();
@@ -463,7 +485,14 @@ impl Menu {
         };
         let play = play.to_string_lossy().replace('\'', "''");
         let args = get("VICTORY_MENU_ARGS");
-        let command = format!("Start-Sleep 3; & '{play}' {args}{}", if preload { " -Preload" } else { "" });
+        // The preload is asked by VICTORY_PRELOAD=1, which both launchers read (victory.exe's is
+        // `--preload`, the script's `-Preload`: the script's flag given to victory.exe was refused,
+        // and the window closed before it could be read, 2026-11-27). A launcher that fails keeps
+        // its window until Enter.
+        let command = format!(
+            "Start-Sleep 3; {}& '{play}' {args}; if ($LASTEXITCODE) {{ Read-Host 'The start failed (see above). Press Enter to close this window' }}",
+            if preload { "$env:VICTORY_PRELOAD='1'; " } else { "" }
+        );
         match new_console(&format!("powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"{}\"", command.replace('"', "\\\""))) {
             Ok(()) => {
                 tracing::info!(command, preload, "settings menu: restarting");
@@ -483,6 +512,30 @@ impl Menu {
         }
     }
 
+    /// The warm-up start ([`warmup_seconds`]): once its time is up, this exe is
+    /// marked as warmed up (`VICTORY_WARMUP_MARK`) and the game starts again.
+    fn warmup(&mut self) {
+        static BEGAN: OnceLock<std::time::Instant> = OnceLock::new();
+        static DONE: AtomicBool = AtomicBool::new(false);
+        let Some(seconds) = warmup_seconds() else { return };
+        if DONE.load(Ordering::Relaxed) {
+            return;
+        }
+        if BEGAN.get_or_init(std::time::Instant::now).elapsed() < Duration::from_secs(seconds) {
+            return;
+        }
+        DONE.store(true, Ordering::Relaxed);
+        let mark = std::path::PathBuf::from(get("VICTORY_WARMUP_MARK"));
+        if !mark.as_os_str().is_empty() {
+            if let Some(dir) = mark.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&mark, "this victory.exe was warmed up (its first start, then a restart)\r\n");
+        }
+        tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
+        self.restart(false);
+    }
+
     /// Removes the settings file: the launcher's own settings at the next start.
     fn reset(&mut self) {
         if let Some(path) = std::env::var_os("VICTORY_MENU_FILE") {
@@ -493,6 +546,7 @@ impl Menu {
 
     /// A frame was presented: the keys pressed since the last one.
     pub(super) fn frame(&mut self) {
+        self.warmup();
         let pressed = std::mem::take(&mut *keys().lock().unwrap_or_else(|e| e.into_inner()));
         if pressed.is_empty() {
             return;

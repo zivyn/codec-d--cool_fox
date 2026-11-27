@@ -906,7 +906,13 @@ mod tests {
             l.join("|")
         };
         // RTX 40/50: DLSS frame generation.
-        assert!(lines(facts(true, true, true, false), true, false).contains("FRAME GEN: DLSS"));
+        let mut rtx40 = facts(true, true, true, false);
+        rtx40.adapter = "NVIDIA GeForce RTX 4070".into();
+        let rtx40 = lines(rtx40, true, false);
+        assert!(rtx40.contains("FRAME GEN: DLSS, SUPPORTED") && !rtx40.contains("MOD"), "{rtx40}");
+        // RTX 20/30 with DLSS frame generation running: a mod unlocked it (MFG Unlocker).
+        let unlocked = lines(facts(true, true, true, false), true, false);
+        assert!(unlocked.contains("UNLOCKED BY A MOD") && !unlocked.contains("SUPPORTED HERE"), "{unlocked}");
         // RTX 20/30 on Series X with DLSS: FSR 3 instead, 2X.
         let rtx30 = lines(facts(true, false, true, false), false, true);
         assert!(rtx30.contains("NOT ON THIS CARD") && rtx30.contains("FSR 3") && rtx30.contains("2X"));

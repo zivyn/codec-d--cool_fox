@@ -423,7 +423,10 @@ pub(super) struct Notice {
 
 impl Notice {
     pub(super) fn new() -> Notice {
-        let lines: Vec<String> = crate::streamline::notice().into_iter().map(|l| l.to_ascii_uppercase()).collect();
+        // The first start of a new victory.exe says first that it restarts by itself (menu.rs).
+        let warmup = super::menu::warmup_seconds().map(super::menu::warmup_notice).unwrap_or_default();
+        let lines: Vec<String> =
+            warmup.into_iter().chain(crate::streamline::notice()).map(|l| l.to_ascii_uppercase()).collect();
         let columns = lines.iter().map(|l| l.len() as u32).max().unwrap_or(0).min(NOTICE_COLUMNS);
         let shape = Shape { columns, lines: lines.len() as u32 };
         Notice { done: lines.is_empty(), lines, shape, since: None, buffers: None, written: false }

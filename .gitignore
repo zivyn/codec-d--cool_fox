@@ -79,6 +79,8 @@ Thumbs.db
 
 # NVIDIA's own files (Get-NVIDIA-DLSS.cmd fetches them from NVIDIA; never part of this repository)
 /nvidia-sdk/
+# AMD's own files (Get-AMD-FSR.cmd fetches them from AMD; never part of this repository)
+/amd-sdk/
 # What the F1 menu saved
 /victory-settings.txt
 /victory-settings.*.txt

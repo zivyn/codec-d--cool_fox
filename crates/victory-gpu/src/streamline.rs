@@ -434,7 +434,12 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
             "DLSS FRAME GEN: NOT ON THIS CARD (RTX 40 AND UP)"
         }.into());
     }
-    if dlss_live {
+    if dlss_live && !f.adapter.is_empty() && !dlss_framegen_card(&f.adapter) {
+        // An RTX 20 or 30 with DLSS Frame Generation: a mod beside victory.exe (MFG Unlocker,
+        // as winmm.dll) answers for the card; how many frames it gives, Streamline says.
+        lines.push("FRAME GEN: DLSS, UNLOCKED BY A MOD (F1 MENU: 2X-6X)".into());
+        lines.push("NVIDIA DOES NOT SUPPORT IT: IF IT FAILS, REMOVE IT".into());
+    } else if dlss_live {
         lines.push("FRAME GEN: DLSS, SUPPORTED HERE (F1 MENU: 2X-6X)".into());
         lines.push("MORE THAN 2X NEEDS AN RTX 50 CARD".into());
     } else if fsr_live {
@@ -623,6 +628,21 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
 }
 
+/// The name of the card the title will run on (the launcher asks whether to
+/// fetch AMD's FSR 3 files only where DLSS Frame Generation will not run).
+pub fn adapter_name() -> Option<String> {
+    default_adapter().map(|a| a.0)
+}
+
+/// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
+/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU").
+pub fn dlss_framegen_card(name: &str) -> bool {
+    let name = name.to_ascii_uppercase();
+    let Some(at) = name.find("RTX") else { return false };
+    let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
+    model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
+}
+
 /// The adapter a device made with no adapter named is on (the first), its
 /// name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
@@ -633,6 +653,61 @@ fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))
+    }
+}
+
+/// The translated shaders' shader model (6.6, `ResourceDescriptorHeap[]`).
+pub const SHADER_MODEL_NEEDED: (u32, u32) = (6, 6);
+
+/// The highest shader model `device` runs, as (major, minor). Asked from 6.9
+/// down: a runtime that does not know a model refuses the question.
+pub fn device_shader_model(device: &ID3D12Device) -> Option<(u32, u32)> {
+    (0x60..=0x69).rev().find_map(|v| {
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL { HighestShaderModel: D3D_SHADER_MODEL(v) };
+        // SAFETY: writes `model` of the given size.
+        let ok = unsafe {
+            device.CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut model).cast(), size_of_val(&model) as u32)
+        }
+        .is_ok();
+        let m = model.HighestShaderModel.0 as u32;
+        ok.then_some((m >> 4, m & 0xF))
+    })
+    .or(Some((5, 1)))
+}
+
+/// The highest shader model of the default adapter (the one the title's device is
+/// on), from a device made for the question; `None` without one. Windows 10's own
+/// Direct3D 12 stops at 6.5; Microsoft's newer runtime (`D3D12\D3D12Core.dll`
+/// beside the program, which victory.exe asks for) runs 6.6. Made in a process of
+/// its own (`victory shader-model`), since a process keeps the first runtime it loads.
+pub fn highest_shader_model() -> Option<(u32, u32)> {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    // SAFETY: plain DXGI and D3D12 calls with owned results.
+    let device = unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+        device?
+    };
+    device_shader_model(&device)
+}
+
+/// The file of the Direct3D 12 runtime this process loaded (`D3D12Core.dll`:
+/// Windows' own in System32, or Microsoft's newer one from `D3D12\` beside the
+/// program); `None` before a device is made.
+pub fn d3d12_core_path() -> Option<PathBuf> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+    let name = wide(Path::new("D3D12Core.dll"));
+    // SAFETY: a module of this process by name, its file name into a buffer of the given size.
+    unsafe {
+        let module = GetModuleHandleW(name.as_ptr());
+        if module.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 1024];
+        let len = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) as usize;
+        (len > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len])))
     }
 }
 

@@ -20,6 +20,33 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The Direct3D 12 runtime this program asks Windows for: Microsoft's D3D12
+/// Agility SDK 1.614, from `D3D12\D3D12Core.dll` beside victory.exe where it
+/// is there (exported by build.rs). Windows uses it only where its own is
+/// older: Windows 10's stops at shader model 6.5, and the translated shaders
+/// are 6.6 (`victory play` fetches it there; 2026-11-27, an RTX 3060 on
+/// Windows 10 22H2 had every pipeline refused). Without the folder, nothing changes.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKVersion: u32 = 614;
+
+/// `D3D12SDKPath`'s value: a pointer to a C string.
+#[cfg(windows)]
+#[repr(transparent)]
+pub struct SdkPath(*const std::ffi::c_char);
+// SAFETY: it points at a string literal, never written.
+#[cfg(windows)]
+unsafe impl Sync for SdkPath {}
+
+/// Where `D3D12Core.dll` is, from victory.exe's folder.
+#[cfg(windows)]
+#[unsafe(no_mangle)]
+#[used]
+#[allow(non_upper_case_globals)]
+pub static D3D12SDKPath: SdkPath = SdkPath(c".\\D3D12\\".as_ptr());
+
 #[derive(Parser)]
 #[command(
     name = "victory",
@@ -150,6 +177,22 @@ enum Command {
     /// (about 70 MB) to where `play` looks for them.
     #[cfg(windows)]
     GetDlss,
+    /// Fetch AMD's FSR 3 frame generation files from AMD's GitHub (about
+    /// 30 MB) to where `play` looks for them: frame generation on cards
+    /// without DLSS frame generation.
+    #[cfg(windows)]
+    GetFsr,
+    /// Fetch Microsoft's newer Direct3D 12 runtime (D3D12Core.dll, about
+    /// 22 MB from nuget.org) into `D3D12` beside this program: Windows 10,
+    /// whose own Direct3D 12 does not run the translated shaders. `play`
+    /// does it by itself where it is needed.
+    #[cfg(windows)]
+    GetD3d12,
+    /// Print the highest shader model the default GPU runs here (`play`
+    /// asks it in a process of its own).
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ShaderModel,
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
         exe: PathBuf,
@@ -295,6 +338,22 @@ fn main() -> Result<()> {
         Command::Play(_) => unreachable!("handled above"),
         #[cfg(windows)]
         Command::GetDlss => play::get_dlss(),
+        #[cfg(windows)]
+        Command::GetFsr => play::get_fsr(),
+        #[cfg(windows)]
+        Command::GetD3d12 => play::get_d3d12(),
+        #[cfg(windows)]
+        Command::ShaderModel => {
+            let model = victory_hle::streamline::highest_shader_model();
+            if let Some(core) = victory_hle::streamline::d3d12_core_path() {
+                println!("runtime {}", core.display());
+            }
+            match model {
+                Some((major, minor)) => println!("{major}.{minor}"),
+                None => println!("none"),
+            }
+            Ok(())
+        }
         Command::Run {
             exe,
             unimplemented,

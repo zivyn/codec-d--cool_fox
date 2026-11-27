@@ -33,7 +33,7 @@ param(
     [switch]$NoFrameGenReady,
     # Which frame generation: auto (DLSS Frame Generation where it runs, else AMD's FSR 3), dlss, or fsr (FSR 3
     # even on an RTX 40/50; 2X only). FSR 3 needs AMD's FidelityFX DLLs (VICTORY_FIDELITYFX_DIR, else
-    # amd-sdk\FidelityFX\bin here) and, on Series X, DLSS for the upscaling (the title's own takes Series S sizes).
+    # amd-sdk\FidelityFX\bin here, where Get-AMD-FSR.cmd puts them) and, on Series X, DLSS for the upscaling (the title's own takes Series S sizes).
     [ValidateSet('auto', 'dlss', 'fsr')][string]$FgType = 'auto',
     # Frames begin every 1/Fps s whatever the title asks (it asks 1/30). 1000, the default: no cap, a frame
     # begins as soon as the last is done. 30: the title's own rate.
@@ -123,6 +123,10 @@ if ($FgType -ne 'dlss' -and ($FrameGen -or -not $NoFrameGenReady)) {
     # its first 30 s, and in this window) says what runs and why not. On Series X without DLSS it stays off: the
     # title's own upscaling, which it needs, takes the Series S sizes only.
     $settings.VICTORY_FSR_FRAMEGEN = '1'; $settings.VICTORY_FIDELITYFX_DIR = $fx
+    if (-not (Test-Path (Join-Path $fx 'amd_fidelityfx_framegeneration_dx12.dll'))) {
+        Write-Host "No AMD FSR 3 files in ${fx}: Get-AMD-FSR.cmd in the repository's folder fetches them from AMD (about"
+        Write-Host '30 MB, once). Needed only on cards without DLSS frame generation, or with FSR 3 chosen in F1.'
+    }
     if ($FgType -eq 'fsr') { $settings.Remove('VICTORY_FRAMEGEN') }
     if (-not $settings.VICTORY_FRAMEGEN_X) { $settings.VICTORY_FRAMEGEN_X = if ($FrameGen) { [string]$timesWanted } else { '0' } }
     if (-not $settings.VICTORY_TEXTURE_ROOM_PERCENT) { $settings.VICTORY_TEXTURE_ROOM_PERCENT = if ($FrameGen) { '80' } else { '86' } }

@@ -95,11 +95,39 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
-fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
-    if was {
-        physical < 5 * GIB || commit < 6 * GIB
+/// `VICTORY_PRESSURE_LEGACY=1`: the bounds of a PC of 32 GiB ([`physical_bounds`])
+/// on every PC.
+fn legacy_bounds() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESSURE_LEGACY").is_some_and(|v| v == "1"))
+}
+
+/// The free physical memory at or below which the pressure state is entered
+/// and at or above which it is left, in bytes, for a PC with `total` bytes.
+///
+/// 3 GiB and 5 GiB suit a PC of 32 GiB or less. On one of 40 GiB with the
+/// title at 22 GiB and the user's own programs at 12-14 GiB, the free memory
+/// of the cutscene stall (V3a-V3d, four runs) fell to 2.7-3.0 GiB, then
+/// stood at 3.3-4.9 GiB for the next six minutes: the state was entered in
+/// every run and never left (the exit asks for 5 GiB), and for all that time
+/// the texture queue was held to 64 MiB a frame while its backlog of 4,000
+/// slots lasted. (`available` memory includes the standby list, which is
+/// given back on demand: the system pages only when it is near an end.) The
+/// bounds grow with the PC from 2 and 3 GiB at 40 GiB (5 % and 7.5 % of it)
+/// to the old ones at 64 GiB.
+fn physical_bounds(total: u64, legacy: bool) -> (u64, u64) {
+    if legacy || total <= 32 * GIB {
+        (3 * GIB, 5 * GIB)
     } else {
-        physical <= 3 * GIB || commit <= 4 * GIB
+        ((total / 20).clamp(2 * GIB, 3 * GIB), (total / 40 * 3).clamp(3 * GIB, 5 * GIB))
+    }
+}
+
+fn next_pressure(was: bool, physical: u64, commit: u64, (enter, leave): (u64, u64)) -> bool {
+    if was {
+        physical < leave || commit < 6 * GIB
+    } else {
+        physical <= enter || commit <= 4 * GIB
     }
 }
 
@@ -109,7 +137,8 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let pressure = next_pressure(was, physical, commit);
+    let bounds = physical_bounds(status.ullTotalPhys, legacy_bounds());
+    let pressure = next_pressure(was, physical, commit, bounds);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -179,12 +208,59 @@ mod tests {
 
     #[test]
     fn either_constraint_enters_pressure_and_both_must_recover() {
-        assert!(next_pressure(false, 12 * GIB, 4 * GIB));
-        assert!(next_pressure(false, 3 * GIB, 16 * GIB));
-        assert!(next_pressure(true, 4 * GIB, 7 * GIB));
-        assert!(next_pressure(true, 6 * GIB, 5 * GIB));
-        assert!(!next_pressure(true, 5 * GIB, 6 * GIB));
-        assert!(!next_pressure(false, 4 * GIB, 5 * GIB));
+        let old = (3 * GIB, 5 * GIB);
+        assert!(next_pressure(false, 12 * GIB, 4 * GIB, old));
+        assert!(next_pressure(false, 3 * GIB, 16 * GIB, old));
+        assert!(next_pressure(true, 4 * GIB, 7 * GIB, old));
+        assert!(next_pressure(true, 6 * GIB, 5 * GIB, old));
+        assert!(!next_pressure(true, 5 * GIB, 6 * GIB, old));
+        assert!(!next_pressure(false, 4 * GIB, 5 * GIB, old));
+    }
+
+    #[test]
+    fn bounds_follow_the_size_of_the_pc() {
+        let old = (3 * GIB, 5 * GIB);
+        for total in [8 * GIB, 16 * GIB, 31 * GIB, 32 * GIB] {
+            assert_eq!(physical_bounds(total, false), old);
+        }
+        assert_eq!(physical_bounds(40 * GIB, false), (2 * GIB, 3 * GIB));
+        assert_eq!(physical_bounds(40 * GIB - 100 * MIB, false), (2 * GIB, 3 * GIB));
+        // 5 % and 7.5 % between those, to a few bytes of rounding.
+        let near = |a: u64, b: u64| a.abs_diff(b) < 16;
+        let (enter, leave) = physical_bounds(48 * GIB, false);
+        assert!(near(enter, 12 * GIB / 5) && near(leave, 18 * GIB / 5));
+        let (enter, leave) = physical_bounds(64 * GIB, false);
+        assert!(enter == 3 * GIB && near(leave, 24 * GIB / 5));
+        assert_eq!(physical_bounds(128 * GIB, false), (3 * GIB, 5 * GIB));
+        // The switch gives every PC the old bounds.
+        assert_eq!(physical_bounds(40 * GIB, true), old);
+        // They never cross: leaving asks for more than entering.
+        for total in (33..=256).map(|g| g * GIB) {
+            let (enter, leave) = physical_bounds(total, false);
+            assert!(enter < leave && enter >= 2 * GIB && leave <= 5 * GIB, "{total}");
+        }
+    }
+
+    #[test]
+    fn a_40_gib_pc_leaves_pressure_at_the_free_memory_the_cutscene_runs_left_it_at() {
+        let bounds = physical_bounds(40 * GIB, false);
+        // Free memory of run V3d: 2.7 GiB at the stall, then 3.3 to 4.9 GiB.
+        let mut state = false;
+        let mut seen = Vec::new();
+        let frees = [10 * GIB, 5 * GIB, 2 * GIB - 1, 3 * GIB / 2, 3 * GIB + 300 * MIB, 4 * GIB, 4 * GIB + 900 * MIB];
+        for free in frees {
+            state = next_pressure(state, free, 13 * GIB, bounds);
+            seen.push(state);
+        }
+        assert_eq!(seen, [false, false, true, true, false, false, false]);
+        // With the old bounds the state is entered at 3 GiB and stays until 5.
+        let old = physical_bounds(40 * GIB, true);
+        let mut state = false;
+        let frees = [10 * GIB, 2 * GIB + 700 * MIB, 3 * GIB + 300 * MIB, 4 * GIB, 4 * GIB + 900 * MIB];
+        for free in frees {
+            state = next_pressure(state, free, 13 * GIB, old);
+        }
+        assert!(state);
     }
 
     #[test]

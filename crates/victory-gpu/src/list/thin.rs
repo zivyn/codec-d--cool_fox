@@ -304,6 +304,7 @@ fn start() {
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
+            crate::cores::prioritize("victory-list", crate::cores::Role::Translator);
             crate::queue::no_drain_here();
             loop {
                 let recording = {

@@ -664,7 +664,22 @@ impl Memory {
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
-            if page != 0 {
+            if page >= victory_shader::emit::PAIR_NOTE {
+                // Not a page: the two host waves of a console wave in some program waited for
+                // each other until they gave up (`pair_wait`), and went on without what the
+                // other was to give. Said once for each program.
+                static SAID_PAIR: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+                let mut said = SAID_PAIR.lock().unwrap_or_else(|e| e.into_inner());
+                if !said.contains(&page) {
+                    said.push(page);
+                    tracing::warn!(
+                        program = format!("{:07x}", page & 0x0FFF_FFFF),
+                        "the two host waves of a console wave gave up waiting for each other in a shader (hash starts with `program`)"
+                    );
+                }
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            } else if page != 0 {
                 pages.push(u64::from(page));
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };

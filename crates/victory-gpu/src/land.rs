@@ -437,7 +437,7 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     static WIDE: OnceLock<&'static Pool> = OnceLock::new();
     if goes_wide(TAIL.get(), tail_threads(), threads(), count) {
-        count(stat::TAIL_WIDE, 1);
+        crate::land::count(stat::TAIL_WIDE, 1);
         WIDE.get_or_init(|| Pool::new("victory-land-tail", tail_threads())).each(count, f);
         return;
     }

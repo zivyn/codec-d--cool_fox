@@ -6189,6 +6189,20 @@ impl<'a> Lower<'a> {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
     }
 
+    /// Whether every scalar register `inst` reads holds a number here: a value of its own, none a
+    /// lane mask (EXEC, a compare's result) that has only its lanes. The trace programs keep node
+    /// numbers and lane masks on one stack, so the structure takes a register `s_and`ed with a
+    /// literal for a mask while the numbers it is made of are all there: the result is then the
+    /// number the hardware computes (the structure's own lanes for it stay for whatever reads it
+    /// as a mask).
+    fn reads_numbers(&self, inst: &Inst) -> bool {
+        inst.reads.iter().all(|&(reg, v)| match reg {
+            Reg::S(c) if c == EXEC || c == EXEC + 1 => false,
+            Reg::S(_) => matches!(self.vals.get(&v), Some(val) if !matches!(val, Val::Missing(_))),
+            _ => true,
+        })
+    }
+
     fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
@@ -6200,7 +6214,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !self.reads_numbers(inst) {
             return Err(LANE_MASK);
         }
         if matches!(

@@ -1,12 +1,44 @@
 # VIctory on NVIDIA
 
-> **Before you play**
->
-> - **F1 in the game brings up the settings menu** (arrow keys pick and
->   change, Enter does it). **F3 shows the stats panel** (frame rate, frame
->   generation, draws, GPU and memory numbers).
->
-> The steps are under [How to run it](#how-to-run-it).
+## Quick start: how to run it
+
+**1. Have these first**
+
+- Windows 10 or 11, 32 GB of RAM or more, an SSD, and an NVIDIA GeForce RTX
+  card with a recent driver.
+- [Rust](https://rustup.rs) and the
+  [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
+  with "Desktop development with C++" (the layer is built on your PC the
+  first time you start it).
+- **Your own dump** of the title's Xbox Series build v1.0.2.1: the folder
+  with `game_scarlett_master.exe`. This repository contains no game files.
+
+**2. Run these in PowerShell**
+
+```powershell
+git clone https://github.com/trustno1-coder/VIctory-NVIDIA
+cd VIctory-NVIDIA
+.\Get-NVIDIA-DLSS.cmd
+powershell -ExecutionPolicy Bypass -File scripts\play-nvidia.ps1 -Exe 'D:\Games\MyDump\game_scarlett_master.exe'
+```
+
+- Put the path to **your** `game_scarlett_master.exe` in the last line.
+- `Get-NVIDIA-DLSS.cmd` is needed once. It downloads NVIDIA's DLSS and frame
+  generation files (about 70 MB) from NVIDIA's own GitHub; they are NVIDIA's
+  and are not part of this repository. Skip it and the game still runs, with
+  its own upscaling and no frame generation.
+- The first start builds the layer, which takes a few minutes. After that the
+  last line alone starts the game.
+
+**3. In the game**
+
+- **F1** brings up the settings menu (arrow keys pick and change, Enter does
+  it): DLSS, frame generation, frame rate cap and more.
+- **F3** shows the stats panel (frame rate, frame generation, draws, GPU and
+  memory numbers).
+
+Options, requirements in full and the details are under
+[How to run it](#how-to-run-it).
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files **you** supply,

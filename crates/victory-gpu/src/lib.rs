@@ -58,6 +58,8 @@ mod popwatch;
 mod primitive;
 #[cfg(windows)]
 mod priority;
+#[cfg(windows)]
+mod vram;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]

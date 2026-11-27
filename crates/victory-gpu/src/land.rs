@@ -501,6 +501,9 @@ pub(crate) struct Notes {
     /// Per piece put beside the guards, all of it: its 64 KiB block and the
     /// copy it was landed through (which the job holds until the flush).
     landed: Vec<(usize, *const crate::shadow::Shadow)>,
+    /// Pages of 4 KiB, over all the pieces of the job, where title memory
+    /// could not be read or written (the pieces' bytes were not all put).
+    pub(crate) missing: u64,
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -689,6 +692,7 @@ unsafe fn piece_at(
     count(stat::NEW_BLOCKS, blocks);
     count(stat::DWORDS, dwords);
     count(stat::MISSING, missing);
+    notes.missing += missing;
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     dwords * 4

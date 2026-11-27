@@ -18,7 +18,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "victory-translate", version, about = "The offline shader batch")]
+#[command(
+    name = "victory-translate",
+    version,
+    about = "The offline shader batch"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -67,15 +71,19 @@ fn main() -> Result<()> {
             jobs,
         } => {
             // As `victory translate` does.
-            if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = env_number("VICTORY_VIEW_LIMIT") {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
+            if let Some(n) = env_number("VICTORY_HOST_WAVE") {
                 victory_shader::emit::set_host_max_wave(n);
             }
             translate::run(paths, validate, false, list, jobs)
         }
     }
+}
+
+fn env_number<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
 /// Paths given on the command line, or the configured game + test titles.

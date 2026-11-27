@@ -48,8 +48,21 @@ system commit while 7,620 MiB of physical RAM was still available. Its next
 reported failure was a 2,228,240-byte allocation. Turning off `VICTORY_THIN`
 and setting `VICTORY_JOIN_PARTS=1` also reached the commit limit and exited.
 The last in-process report before the original exit showed approximately
-1,380 MiB of local GPU memory used against a 7,256 MiB budget. The same scene
-load with an active page file remains to be tested.
+1,380 MiB of local GPU memory used against a 7,256 MiB budget.
+
+After enabling automatic paging and restarting, Windows reported an active
+2,048 MiB page file and a system commit limit of 34,734 MiB. With two pipeline
+workers, the same build loaded past the previous crash point and reached the
+opening cutscene with audio and subtitles. The highest sampled commit was
+30,716 MiB, leaving 4,018 MiB available. The restart also reduced background
+commit, so the run measures the combined effect of the restart and paging.
+
+The 3D picture remained black during the observed cutscene. The log reported
+over 1,200 pipelines pending and a texture queue blocked by its VRAM budget.
+In one sample, 1,815 MiB was reserved for future render targets, while the
+driver reported about 4,844 MiB used out of a 4,923 MiB local budget. The run
+ended when the window was closed. This result verifies progress past the
+allocation failure. Rendering in the cutscene still needs testing.
 
 ## Related work
 
@@ -67,3 +80,8 @@ load with an active page file remains to be tested.
   different 8 GB GPU. Matching the failure signature helps separate that
   issue from Windows commit exhaustion.
   [Report #104](https://github.com/DexNom/VIctory/pull/104)
+- Two open proposals on VIctory-NVIDIA address the Series S upscaler and the
+  VRAM kept for future render targets. Both can be evaluated separately from
+  Windows paging.
+  [Upscaler #68](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/68),
+  [render target reserve #76](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/76)

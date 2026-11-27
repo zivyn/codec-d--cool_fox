@@ -123,6 +123,26 @@ struct MouseState {
 }
 const _: () = assert!(size_of::<MouseState>() == 40);
 
+/// Applies one captured mouse sample. While the F1 settings menu is open,
+/// motion deltas are discarded and button bits are cleared while keeping the
+/// virtual mouse connected at its last position (so closing the menu causes
+/// no camera jump and no disconnect/reconnect churn).
+fn apply_mouse_sample(
+    mouse: &mut MouseState,
+    (dx, dy): (i64, i64),
+    buttons: u32,
+    menu_open: bool,
+) -> MouseState {
+    if menu_open {
+        mouse.buttons = 0;
+    } else {
+        mouse.position_x += dx;
+        mouse.position_y += dy;
+        mouse.buttons = buttons;
+    }
+    *mouse
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     fn mouse(&mut self) -> Option<MouseState> { None }
@@ -1234,13 +1254,16 @@ mod host {
 
     impl Source for Host {
         fn mouse(&mut self) -> Option<MouseState> {
-            let (dx, dy) = crate::modules::lifecycle::captured_mouse_delta()?;
-            self.mouse.position_x += dx;
-            self.mouse.position_y += dy;
-            self.mouse.buttons = [0x01, 0x02, 0x04, 0x05, 0x06].into_iter().enumerate()
-                // SAFETY: virtual-key state query.
-                .fold(0, |bits, (i, vk)| bits | ((unsafe { GetAsyncKeyState(vk) } < 0) as u32) << i);
-            Some(self.mouse)
+            let delta = crate::modules::lifecycle::captured_mouse_delta()?;
+            let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+            let buttons = if menu_open {
+                0
+            } else {
+                [0x01, 0x02, 0x04, 0x05, 0x06].into_iter().enumerate()
+                    // SAFETY: virtual-key state query.
+                    .fold(0, |bits, (i, vk)| bits | ((unsafe { GetAsyncKeyState(vk) } < 0) as u32) << i)
+            };
+            Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             // XInput first; HID PS5 pads take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
@@ -1666,6 +1689,21 @@ mod tests {
             assert_eq!(current(hub, MOUSE_KIND, MOUSE), Err(DEVICE_DISCONNECTED));
             assert_eq!(*log.lock().unwrap(), [(MOUSE, STATUS_CONNECTED, 0), (MOUSE, 0, STATUS_CONNECTED)]);
         }
+    }
+
+    #[test]
+    fn mouse_motion_and_buttons_are_suppressed_while_settings_menu_is_open() {
+        let mut mouse = MouseState::default();
+        let active = apply_mouse_sample(&mut mouse, (12, -5), 0b11, false);
+        assert_eq!(active, MouseState { position_x: 12, position_y: -5, buttons: 0b11, ..Default::default() });
+
+        // Opening the F1 menu drops motion deltas and clears buttons while keeping position.
+        let paused = apply_mouse_sample(&mut mouse, (40, 25), 0b01, true);
+        assert_eq!(paused, MouseState { position_x: 12, position_y: -5, buttons: 0, ..Default::default() });
+
+        // Closing the F1 menu resumes cleanly from the preserved position with no jump.
+        let resumed = apply_mouse_sample(&mut mouse, (3, 4), 0b10, false);
+        assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, buttons: 0b10, ..Default::default() });
     }
 
     #[test]

@@ -343,6 +343,10 @@ delete that file to go back to them. Full screen: start the game, then run
 `.\scripts\fullscreen.ps1` in another window. Logs go to
 `%LOCALAPPDATA%\victory\logs`, saves to `%LOCALAPPDATA%\victory\data`.
 
+If the menu works but loading a scene closes the game, see the
+[Windows memory troubleshooting guide](docs/windows-memory.md). It shows how
+to check memory on systems with 32 GB of RAM or GPUs with 8 GB of VRAM.
+
 ## How it works, and the findings
 
 - [docs/README-foxhound.md](docs/README-foxhound.md): foxhound's own README

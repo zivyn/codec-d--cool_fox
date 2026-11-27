@@ -66,6 +66,10 @@ pub(crate) struct Shadow {
     quiet_window: AtomicU64,
     /// Whether its landings are left out ([`crate::land::quiet`]).
     quiet_landing: crate::land::quiet::Quiet,
+    /// With [`keep_remark`]: the last change number of the kept snapshot's
+    /// units ([`current::Current::seq`]) when a compare last found what
+    /// shaders wrote ([`Shadow::note_found`]).
+    found_seq: AtomicU64,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -1904,6 +1908,9 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             for &(from, to) in runs {
                 shadow.changed(from, to);
             }
+            // After the changes it noted itself: the merge that follows
+            // reads the copy later than this.
+            shadow.note_found();
         }
     }
     found
@@ -2028,6 +2035,14 @@ static BACK_CLASS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    if keep_remark() {
+        let r: Vec<f64> = REMARKED.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "kept snapshots per frame (VICTORY_KEEP_REMARK=1): {:.1} MB of units made current again after {:.0} pieces landed, which the next submission does not take again",
+            r[0] / (1 << 20) as f64,
+            r[1],
+        );
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -2827,6 +2842,31 @@ fn keeps() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_KEEP_SNAPSHOTS").map_or(!cfg!(test), |v| v == "1"))
 }
 
+/// `VICTORY_KEEP_REMARK=1` (off by default): with [`keeps`], the units of a
+/// kept snapshot that a landing made equal to the copy are current again.
+///
+/// The compare after a submission marks every 4 KiB unit it finds different
+/// from the copy as not current ([`Shadow::changed`]), so that the next
+/// submission that declares it takes the snapshot again: 29.6 MB a frame of
+/// the 172 MB compared in the cell, 10 ms of the wide threads and 6 ms of the
+/// submitting thread. But the landing that follows ([`Shadow::land_back`])
+/// merges into the snapshot every 32 bytes in which the copy differs from it,
+/// so that the two are the same there, as the copy was read; where the
+/// merge was not stopped by title memory that is not there, the units that lie
+/// whole in the piece are current again, unless a refresh wrote the copy
+/// after the compare ([`current::Current::recurrent`]). Where the shaders
+/// of a later flight wrote the copy after the merge read it, the next compare
+/// finds the difference, as it does with a fresh snapshot.
+/// `VICTORY_KEEP_CHECK=1` counts what this takes wrong.
+fn keep_remark() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| keeps() && std::env::var_os("VICTORY_KEEP_REMARK").is_some_and(|v| v == "1"))
+}
+
+/// With [`keep_remark`], since the last frame line: bytes of units made
+/// current again, and the pieces landed whole that they were in.
+static REMARKED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// `VICTORY_KEEP_CHECK=1`: [`keeps`] verifies what it does not take.
 fn keep_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3290,6 +3330,7 @@ impl Shadow {
             gpu_only: Default::default(),
             quiet_window: AtomicU64::new(0),
             quiet_landing: Default::default(),
+            found_seq: AtomicU64::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3734,6 +3775,27 @@ impl Shadow {
             return;
         }
         self.kept.lock().unwrap_or_else(|e| e.into_inner()).0.changed(from, to);
+    }
+
+    /// With [`keep_remark`]: a compare found what shaders wrote, and noted
+    /// the units as changed; the landing that follows reads the copy after
+    /// this ([`Shadow::land_back`]).
+    fn note_found(&self) {
+        if keep_remark() {
+            let seq = self.kept.lock().unwrap_or_else(|e| e.into_inner()).0.seq();
+            self.found_seq.fetch_max(seq, Ordering::SeqCst);
+        }
+    }
+
+    /// With [`keep_remark`]: `[from, to)` of the copy was merged into its
+    /// snapshot whole (`missing` says it was), so that the two are the same:
+    /// the units in it are current again, if nothing changed them after the
+    /// compare.
+    fn remark(&self, from: usize, to: usize) {
+        let since = self.found_seq.load(Ordering::SeqCst);
+        let bytes = self.kept.lock().unwrap_or_else(|e| e.into_inner()).0.recurrent(from, to, since);
+        REMARKED[0].fetch_add(bytes as u64, Ordering::Relaxed);
+        REMARKED[1].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether shaders of a submission not yet copied back may be writing
@@ -5062,6 +5124,7 @@ impl Shadow {
         let Some(held) = self.before.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(Vec::as_mut_ptr) else {
             return 0;
         };
+        let missing = notes.missing;
         // SAFETY: inside the copy's mapping (checked above), which only the
         // card writes there, and inside the snapshot's allocation, which
         // holds the copy's length (`writing`): these offsets are in a range
@@ -5069,7 +5132,14 @@ impl Shadow {
         // keeps out what else writes them. Title memory that is not there
         // is looked at again when the next flight that declared the range
         // lands.
-        unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) }
+        let put =
+            unsafe { crate::land::piece(self.start as usize + at, self.data.add(at), held.add(at), &[(0, n)], false, notes, self) };
+        // Merged all of it: the snapshot holds what the copy held when it was
+        // read. A page that was not there is not (its blocks stay as they were).
+        if keep_remark() && notes.missing == missing {
+            self.remark(at, at + n);
+        }
+        put
     }
 
     /// What shaders wrote in 64 KiB block `block` (of title memory) of this

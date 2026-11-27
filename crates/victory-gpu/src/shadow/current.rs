@@ -16,6 +16,10 @@ pub(super) struct Current {
     start: usize,
     len: usize,
     units: Vec<bool>,
+    /// Per unit, the number of the last [`Current::changed`] that held it
+    /// (0: none), and the last number given.
+    stamps: Vec<u64>,
+    seq: u64,
 }
 
 impl Current {
@@ -26,6 +30,8 @@ impl Current {
                 start,
                 len,
                 units: vec![false; (start + len.max(1) - 1) / UNIT - start / UNIT + 1],
+                stamps: vec![0; (start + len.max(1) - 1) / UNIT - start / UNIT + 1],
+                seq: 0,
             };
         }
     }
@@ -33,6 +39,34 @@ impl Current {
     /// Forgets all: nothing is current.
     pub(super) fn clear(&mut self) {
         self.units.clear();
+        self.stamps.clear();
+    }
+
+    /// The number of the last change noted: what [`Current::recurrent`]
+    /// takes as `since`.
+    pub(super) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// A landing put the copy's bytes at offsets `[from, to)` into the
+    /// snapshot, so that the two are equal there: the units that lie whole
+    /// in the range are current again, unless something changed them after
+    /// change number `since` (a refresh that wrote the copy after the
+    /// landing read it). Returns the bytes of the units made current.
+    pub(super) fn recurrent(&mut self, from: usize, to: usize, since: u64) -> usize {
+        let to = to.min(self.len);
+        if from >= to || self.units.is_empty() {
+            return 0;
+        }
+        let mut bytes = 0;
+        for i in self.units(from, to) {
+            let (lo, hi) = self.unit(i);
+            if from <= lo && hi <= to && !self.units[i] && self.stamps[i] <= since {
+                self.units[i] = true;
+                bytes += hi - lo;
+            }
+        }
+        bytes
     }
 
     /// The units that hold offsets `[from, to)` (`from < to`).
@@ -88,7 +122,9 @@ impl Current {
             return;
         }
         let units = self.units(from, to);
-        self.units[units].fill(false);
+        self.units[units.clone()].fill(false);
+        self.seq += 1;
+        self.stamps[units].fill(self.seq);
     }
 }
 
@@ -153,6 +189,49 @@ mod tests {
             assert_eq!(c.plan(0, len, None), vec![(lo, hi)], "{start}");
             assert_eq!(c.plan(0, len, None), vec![], "{start}");
         }
+    }
+
+    /// Units a landing made equal to the snapshot are current again, whole
+    /// ones only, and not those a change touched after the landing read them.
+    #[test]
+    fn units_are_current_again_unless_something_changed_them_since() {
+        let mut c = tracked(0, 8 * UNIT);
+        c.plan(0, 8 * UNIT, None);
+        // The shaders wrote units 1, 2, 3 and part of 5: found, not current.
+        c.changed(UNIT, 4 * UNIT);
+        c.changed(5 * UNIT + 10, 5 * UNIT + 20);
+        let since = c.seq();
+        // A refresh wrote unit 2 after the landing read it.
+        c.changed(2 * UNIT + 1, 2 * UNIT + 2);
+        // The landing merged offsets [UNIT + 7, 6 * UNIT): units 2 to 5 lie
+        // whole in it, unit 1 does not (unit 4 was current all along).
+        assert_eq!(
+            c.recurrent(UNIT + 7, 6 * UNIT, since),
+            2 * UNIT,
+            "units 3 and 5: unit 2 changed since, unit 4 was current, unit 1 is cut"
+        );
+        let mut kept = Vec::new();
+        let taken = c.plan(0, 8 * UNIT, Some(&mut kept));
+        assert_eq!(
+            taken,
+            vec![(UNIT, 3 * UNIT)],
+            "unit 1 (part) and unit 2 (changed since) are taken again"
+        );
+        assert_eq!(
+            c.recurrent(0, 8 * UNIT, since),
+            0,
+            "what is current stays, nothing is stale"
+        );
+    }
+
+    /// A copy that is not tracked has nothing to make current.
+    #[test]
+    fn nothing_is_made_current_in_a_copy_not_tracked() {
+        let mut c = Current::default();
+        assert_eq!(c.recurrent(0, UNIT, 0), 0);
+        let mut c = tracked(0, 2 * UNIT);
+        c.clear();
+        assert_eq!(c.recurrent(0, 2 * UNIT, 0), 0);
     }
 
     /// Changed bytes spanning units take all of them, and two units apart

@@ -325,8 +325,27 @@ impl Host {
         self.pipeline_with_gs(root, vs, None, ps)
     }
 
+    /// A graphics pipeline from a vertex, a geometry and a pixel shader
+    /// (user data of the vertex stage is root parameter 0, the geometry
+    /// stage's 1, the pixel stage's 2).
+    pub fn geometry_pipeline(
+        &self,
+        vs: &HostShader,
+        gs: &HostShader,
+        ps: &HostShader,
+    ) -> Result<(ID3D12RootSignature, ID3D12PipelineState), String> {
+        let root = self.root_signature_for(&[
+            (vs, D3D12_SHADER_VISIBILITY_VERTEX),
+            (gs, D3D12_SHADER_VISIBILITY_GEOMETRY),
+            (ps, D3D12_SHADER_VISIBILITY_PIXEL),
+        ])?;
+        let pso = self.pipeline_with_gs(&root, &vs.dxil, Some(&gs.dxil), &ps.dxil)?;
+        Ok((root, pso))
+    }
+
     /// As [`Host::pipeline_with`], with a geometry shader between the two
-    /// (the rectangle stage, `rect_list_gs`).
+    /// (the rectangle stage, `rect_list_gs`, or a title's), whose input
+    /// primitive sets the topology type.
     pub fn pipeline_with_gs(
         &self,
         root: &ID3D12RootSignature,
@@ -380,7 +399,15 @@ impl Host {
                 pInputElementDescs: layout.as_ptr(),
                 NumElements: layout.len() as u32,
             },
-            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            // `PSV0` starts with a geometry shader's input primitive.
+            PrimitiveTopologyType: match gs
+                .and_then(|gs| Container::parse(gs).ok())
+                .and_then(|c| crate::dxbc::u32_at(c.part(FourCC::PSV0)?.data, 4).ok())
+            {
+                Some(1) => D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+                Some(2 | 6) => D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+                _ => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            },
             SampleDesc: DXGI_SAMPLE_DESC {
                 Count: 1,
                 Quality: 0,

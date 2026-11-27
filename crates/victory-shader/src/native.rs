@@ -115,6 +115,13 @@ const VS_INPUTS: usize = 0x24;
 const VS_INPUT_COUNT: usize = 0xc4;
 const VS_OUTPUTS: usize = 0xc8;
 const VS_OUTPUT_COUNT: usize = 0x188;
+const ES_VERTEX_DWORDS: usize = 0x1ac;
+const GS_OUTPUTS: usize = 0x150;
+const GS_OUTPUT_COUNT: usize = 0x210;
+const GS_RING_DWORDS: usize = 0x27c;
+const GS_INVOCATIONS: usize = 0x280;
+const GS_MAX_VERTICES: usize = 0x284;
+const GS_VERTEX_DWORDS: usize = 0x28c;
 const CS_RSRC2: usize = 0x24;
 const CS_THREADS: usize = 0x28;
 const RECORD_LDS: usize = 0x4c;
@@ -270,6 +277,14 @@ pub enum StageIo {
         inputs: Vec<VsInput>,
         outputs: Vec<VsOutput>,
     },
+    /// Export stage (vertex shader compiled to feed a geometry shader via ES->GS LDS).
+    Es {
+        inputs: Vec<VsInput>,
+        outputs: Vec<VsOutput>,
+        /// Dwords written per vertex into ES->GS LDS.
+        vertex_dwords: u32,
+    },
+    Gs(GsIo),
     Ps {
         inputs: Vec<PsInput>,
         /// `SPI_PS_INPUT_ADDR`: which system values arrive in VGPRs.
@@ -280,6 +295,23 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+}
+
+/// A geometry shader's outputs and ring-buffer limits. It runs as the GS half
+/// of a merged ES+GS wave, reading input vertices from ES->GS LDS and writing
+/// emitted vertices to GSVS LDS before `s_sendmsg(MSG_GS)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GsIo {
+    /// Parameter outputs (`OSG1` rows beyond `SV_Position`).
+    pub outputs: Vec<VsOutput>,
+    /// Total GSVS ring dwords per invocation (`max_vertices * vertex_dwords`).
+    pub ring_dwords: u32,
+    /// GS invocations per input primitive (`[instance(N)]`).
+    pub invocations: u32,
+    /// Maximum output vertices per invocation (`[maxvertexcount(N)]`).
+    pub max_vertices: u32,
+    /// Dwords per emitted vertex in GSVS LDS.
+    pub vertex_dwords: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -717,6 +749,8 @@ fn programs(fssm: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
         let io = match stage {
             HwStage::Ps => ps_io(stage_data, code.len())?,
             HwStage::Vs => vs_io(stage_data)?,
+            HwStage::Es => es_io(stage_data)?,
+            HwStage::Gs => gs_io(stage_data)?,
             HwStage::Cs => StageIo::Cs(ComputeIo {
                 rsrc2: u32_at(stage_data, CS_RSRC2)?,
                 threads: [
@@ -800,7 +834,11 @@ fn ps_io(data: &[u8], code_len: usize) -> Result<StageIo, ShaderError> {
 }
 
 fn vs_outputs(data: &[u8]) -> Result<Vec<VsOutput>, ShaderError> {
-    Ok(semantics(data, VS_OUTPUTS, 6, VS_OUTPUT_COUNT)?
+    vs_outputs_at(data, VS_OUTPUTS, VS_OUTPUT_COUNT)
+}
+
+fn vs_outputs_at(data: &[u8], at: usize, count_at: usize) -> Result<Vec<VsOutput>, ShaderError> {
+    Ok(semantics(data, at, 6, count_at)?
         .as_chunks::<6>()
         .0
         .iter()
@@ -828,6 +866,29 @@ fn vs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
         .collect();
     let outputs = vs_outputs(data)?;
     Ok(StageIo::Vs { inputs, outputs })
+}
+
+fn es_io(data: &[u8]) -> Result<StageIo, ShaderError> {
+    let StageIo::Vs { inputs, outputs } = vs_io(data)? else {
+        unreachable!()
+    };
+    let vertex_dwords = u32_at(data, ES_VERTEX_DWORDS)?;
+    Ok(StageIo::Es {
+        inputs,
+        outputs,
+        vertex_dwords,
+    })
+}
+
+fn gs_io(data: &[u8]) -> Result<StageIo, ShaderError> {
+    let outputs = vs_outputs_at(data, GS_OUTPUTS, GS_OUTPUT_COUNT)?;
+    Ok(StageIo::Gs(GsIo {
+        outputs,
+        ring_dwords: u32_at(data, GS_RING_DWORDS)?,
+        invocations: u32_at(data, GS_INVOCATIONS)?,
+        max_vertices: u32_at(data, GS_MAX_VERTICES)?,
+        vertex_dwords: u32_at(data, GS_VERTEX_DWORDS)?,
+    }))
 }
 
 fn ms_io(data: &[u8], lds_bytes: u32) -> Result<StageIo, ShaderError> {
@@ -1180,6 +1241,63 @@ mod tests {
             threads: [8, 8, 1],
         };
         assert_eq!(cs.initialized_sgprs(), 11);
+    }
+
+    #[test]
+    fn reads_es_and_gs_stage_data() {
+        let mut es_blob = fssm(&[(HwStage::Es, &VS_CODE)]);
+        let e = stage_data_at(&es_blob, HwStage::Es);
+        es_blob[e + VS_INPUTS..][..5].copy_from_slice(&[6, 0, 7, 9, 2]);
+        es_blob[e + VS_INPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        es_blob[e + VS_OUTPUTS..][..6].copy_from_slice(&[6, 1, 0, 0, 0, 0]);
+        es_blob[e + VS_OUTPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        es_blob[e + ES_VERTEX_DWORDS..][..4].copy_from_slice(&8u32.to_le_bytes());
+        let es = &native_programs(&part(&[(KIND_NATIVE, &xbch(&es_blob))])).unwrap()[0];
+        assert_eq!(
+            es.io,
+            StageIo::Es {
+                inputs: vec![VsInput {
+                    usage: Usage::Generic,
+                    row: 0,
+                    mask: 7,
+                    vgpr: 9,
+                }],
+                outputs: vec![VsOutput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+                vertex_dwords: 8,
+            }
+        );
+
+        let mut gs_blob = fssm(&[(HwStage::Gs, &VS_CODE)]);
+        let g = stage_data_at(&gs_blob, HwStage::Gs);
+        gs_blob[g + GS_OUTPUTS..][..6].copy_from_slice(&[6, 1, 0, 0, 0, 0]);
+        gs_blob[g + GS_OUTPUT_COUNT..][..4].copy_from_slice(&1u32.to_le_bytes());
+        gs_blob[g + GS_RING_DWORDS..][..4].copy_from_slice(&24u32.to_le_bytes());
+        gs_blob[g + GS_INVOCATIONS..][..4].copy_from_slice(&1u32.to_le_bytes());
+        gs_blob[g + GS_MAX_VERTICES..][..4].copy_from_slice(&3u32.to_le_bytes());
+        gs_blob[g + GS_VERTEX_DWORDS..][..4].copy_from_slice(&8u32.to_le_bytes());
+        let gs = &native_programs(&part(&[(KIND_NATIVE, &xbch(&gs_blob))])).unwrap()[0];
+        assert_eq!(
+            gs.io,
+            StageIo::Gs(GsIo {
+                outputs: vec![VsOutput {
+                    usage: Usage::Generic,
+                    row: 1,
+                    param: 0,
+                    fp16: false,
+                    pack2: false,
+                }],
+                ring_dwords: 24,
+                invocations: 1,
+                max_vertices: 3,
+                vertex_dwords: 8,
+            })
+        );
     }
 
     #[test]

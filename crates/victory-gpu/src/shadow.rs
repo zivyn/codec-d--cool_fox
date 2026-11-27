@@ -5435,71 +5435,158 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
-    if entry.shadow.is_none() {
-        let len = entry.end - key.0;
-        // Rounded up so that views ending in the buffer's last 256 bytes fit.
-        // Shaders write some buffers (unordered access), so not upload memory.
-        let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && (size >= card_limits().0 || card_all());
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
-            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
-            return entry.shadow.clone();
-        }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: buffer,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            None => (buffer, None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
-        }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        if entry.gpu_only && shadow.card.is_some() {
-            shadow.mark_gpu_only();
-        }
-        let shadow = Arc::new(shadow);
-        if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
-        }
-        entry.shadow = Some(shadow);
+    if entry.shadow.is_some() {
+        return entry.shadow.clone();
     }
+    let (end_of, blen, gpu_only) = (entry.end, entry.end - key.0, entry.gpu_only);
+    // Rounded up so that views ending in the buffer's last 256 bytes fit.
+    // Shaders write some buffers (unordered access), so not upload memory.
+    let size = blen.next_multiple_of(1 << 16);
+    // In place, if asked for and the memory can be opened
+    // (`crate::inplace::place_for`): the buffer is the title's own
+    // memory. Not the big ones `cards` puts in the card's memory: those
+    // are read too often to stay in the PC's.
+    let big = cards() && (size >= card_limits().0 || card_all());
+    if !big && let Some(placed) = crate::inplace::place_for(key.0, blen, false) {
+        entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, blen, false)));
+        return entry.shadow.clone();
+    }
+    if !made_aside() {
+        let shadow = make_copy(key.0, blen, size, gpu_only)?;
+        entry.shadow = Some(shadow);
+        return entry.shadow.clone();
+    }
+    // The copy's buffers are made with the map free (`made_aside`): the map is
+    // taken for writing here, and a thread that holds it while the system makes
+    // memory (a MakeResident of 3 to 5 ms with the card at its budget, twice a
+    // buffer) keeps every ask of every thread, the title's own included, waiting.
+    // Whoever asks for the same buffer meanwhile waits for it.
+    let mut held = Some(map);
+    let Some(_claim) = MAKING.claim(key, || drop(held.take())) else {
+        return lookup(address, len, any);
+    };
+    drop(held);
+    let made = make_copy(key.0, blen, size, gpu_only);
+    let mut map = buffers();
+    let entry = map.get_mut(&key)?;
+    if entry.shadow.is_none() && entry.end == end_of {
+        entry.shadow = made;
+    }
+    // (A copy that lost its place, if the buffer was registered anew, is let go
+    // here and takes its bytes out of the counts.)
     entry.shadow.clone()
+}
+
+/// Whether a title buffer's copy is made with the buffer map free
+/// (`VICTORY_MAKE_ASIDE=0`: under its lock, as before).
+fn made_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAKE_ASIDE").is_none_or(|v| v != "0"))
+}
+
+/// The buffers whose copies are being made ([`made_aside`]).
+static MAKING: Making = Making::new();
+
+/// Who is making what: a buffer's copy is made by one thread at a time.
+struct Making {
+    keys: Mutex<Vec<(u64, usize)>>,
+    done: std::sync::Condvar,
+}
+
+/// A buffer's claim on its copy's making, given back when it is dropped
+/// however the making ended.
+struct Claim<'a>(&'a Making, (u64, usize));
+
+impl Making {
+    const fn new() -> Making {
+        Making { keys: Mutex::new(Vec::new()), done: std::sync::Condvar::new() }
+    }
+
+    /// The claim on `key`, if nobody is making it. If somebody is, `release`
+    /// runs (what the maker might need is given up), this waits until the
+    /// maker is done, and the answer is `None`: the copy is there to be found,
+    /// or the asker makes it.
+    fn claim(&self, key: (u64, usize), release: impl FnOnce()) -> Option<Claim<'_>> {
+        let mut keys = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+        if keys.contains(&key) {
+            release();
+            while keys.contains(&key) {
+                keys = self.done.wait(keys).unwrap_or_else(|e| e.into_inner());
+            }
+            return None;
+        }
+        keys.push(key);
+        Some(Claim(self, key))
+    }
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0.keys.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| *k != self.1);
+        self.0.done.notify_all();
+    }
+}
+
+/// A copy of a buffer in a heap the title's CPU cannot write, with a copy on
+/// the card, is one whose whole refreshes are skipped until a write is
+/// announced ([`Shadow::mark_gpu_only`]).
+fn keep_quiet(shadow: &Shadow, gpu_only: bool) {
+    if gpu_only && shadow.card.is_some() {
+        shadow.mark_gpu_only();
+    }
+}
+
+/// The copy of the title buffer at `start` (`len` bytes, `size` of them
+/// rounded up to 64 KiB in the PC's memory), in the PC's memory and, when
+/// [`card_for`] gives one, in the card's.
+fn make_copy(start: u64, len: u64, size: u64, gpu_only: bool) -> Option<Arc<Shadow>> {
+    let (buffer, data) = host()?.shared_buffer(size)?;
+    crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", start));
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match card_for(size) {
+        Some(on_card) => {
+            crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", start));
+            tracing::info!(
+                start = format_args!("{:#x}", start),
+                len,
+                "a buffer's host copy is in the card's memory"
+            );
+            let card = Card {
+                staging: buffer,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                touched: Default::default(),
+                size,
+            };
+            (on_card, Some(card))
+        }
+        None => (buffer, None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{:#x}", start),
+            len,
+            "large buffer copied to the host"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{:#x}", start),
+            len,
+            "buffer copied to the host"
+        );
+    }
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.card = card;
+    keep_quiet(&shadow, gpu_only);
+    let shadow = Arc::new(shadow);
+    if shadow.card.is_some() {
+        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    }
+    Some(shadow)
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -6200,5 +6287,121 @@ mod quiet_tests {
         title[3 << 20] ^= 0xff;
         assert_eq!(shadow.update(start, LEN), LEN);
         assert_eq!(held, title);
+    }
+
+    /// What `make_copy` does with a buffer `register` said is in a heap the
+    /// title's CPU cannot write (kept apart from the making of the copy, which
+    /// moved out of the map's lock): the copy skips its whole refreshes.
+    #[test]
+    fn a_copy_made_for_a_gpu_only_buffer_skips_its_refreshes() {
+        let mut title: Vec<u8> = (0..LEN).map(|i| (i % 239) as u8).collect();
+        let mut held = vec![0u8; LEN];
+        let start = title.as_ptr() as usize;
+        let quiet = Shadow::unbacked(start as u64, held.as_mut_ptr(), LEN as u64, true);
+        super::keep_quiet(&quiet, true);
+        assert_eq!(quiet.update(start, LEN), LEN);
+        title[3 << 20] ^= 0xff;
+        assert_eq!(quiet.update(start, LEN), 0, "left out: the skip path is reached");
+        // Not marked, or without a copy on the card: never skipped.
+        let mut held2 = vec![0u8; LEN];
+        let open = Shadow::unbacked(start as u64, held2.as_mut_ptr(), LEN as u64, true);
+        super::keep_quiet(&open, false);
+        assert_eq!(open.update(start, LEN), LEN);
+        title[1 << 20] ^= 1;
+        assert_eq!(open.update(start, LEN), LEN);
+        let mut held3 = vec![0u8; LEN];
+        let bare = Shadow::unbacked(start as u64, held3.as_mut_ptr(), LEN as u64, false);
+        super::keep_quiet(&bare, true);
+        assert_eq!(bare.update(start, LEN), LEN);
+        title[1 << 20] ^= 1;
+        assert_eq!(bare.update(start, LEN), LEN);
+    }
+}
+
+#[cfg(test)]
+mod making_tests {
+    use super::Making;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_buffer_is_made_by_one_thread_and_the_others_wait_for_it() {
+        let making = Arc::new(Making::new());
+        let claim = making.claim((1, 1), || unreachable!("nobody is making it")).expect("free");
+        let released = Arc::new(AtomicUsize::new(0));
+        let waiter = {
+            let (making, released) = (making.clone(), released.clone());
+            std::thread::spawn(move || {
+                let began = Instant::now();
+                let got = making.claim((1, 1), || {
+                    released.fetch_add(1, Ordering::SeqCst);
+                });
+                (got.is_none(), began.elapsed())
+            })
+        };
+        // The waiter has let go of what it held, and still waits.
+        let until = Instant::now() + Duration::from_secs(5);
+        while released.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "waits while the copy is being made");
+        drop(claim);
+        let (none, waited) = waiter.join().unwrap();
+        assert!(none, "an asker that waited does not make it again");
+        assert!(waited >= Duration::from_millis(50));
+        // Done: the next asker may make it (a copy that failed is tried again).
+        assert!(making.claim((1, 1), || unreachable!()).is_some());
+    }
+
+    #[test]
+    fn other_buffers_are_made_at_the_same_time() {
+        let making = Making::new();
+        let a = making.claim((1, 1), || unreachable!()).expect("a");
+        // Same address, another resource; another address.
+        let b = making.claim((1, 2), || unreachable!()).expect("b");
+        let c = making.claim((2, 1), || unreachable!()).expect("c");
+        drop(b);
+        // A claim that ends any way (a failed making drops it too) frees the key.
+        assert!(making.claim((1, 2), || unreachable!()).is_some());
+        drop((a, c));
+        assert!(making.keys.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn many_askers_of_the_same_buffer_make_it_once() {
+        let making = Arc::new(Making::new());
+        let made = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (making, made, done) = (making.clone(), made.clone(), done.clone());
+                std::thread::spawn(move || {
+                    // As `lookup` does: the one that claims makes, the others ask again
+                    // and find it.
+                    loop {
+                        if done.load(Ordering::SeqCst) == 1 {
+                            return;
+                        }
+                        if let Some(claim) = making.claim((7, 7), || {}) {
+                            // (Looked at again under the claim, as `lookup` looks at the map.)
+                            if done.load(Ordering::SeqCst) == 0 {
+                                made.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(20));
+                                done.store(1, Ordering::SeqCst);
+                            }
+                            drop(claim);
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(made.load(Ordering::SeqCst), 1);
     }
 }

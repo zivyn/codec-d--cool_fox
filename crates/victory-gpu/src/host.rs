@@ -245,11 +245,63 @@ unsafe impl Send for Aside {}
 /// that: run n11 was lost as n08 was with it alone.) Best done off a hot
 /// path: a tenth of a millisecond to some.
 pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
-    static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     if !wait_resident() {
         return Ok(());
     }
     let started = std::time::Instant::now();
+    if batch_residency() {
+        // One round trip serves every thread that asks while another runs
+        // (`combine`): each of them still returns only after a round trip that
+        // began after its memory was made.
+        MAPPED_GROUP.join((), |items| match map_round_trip(device) {
+            Ok(()) => {
+                MAPPED_BATCHES.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            }
+            Err(e) => items.iter().map(|(id, _)| (*id, e.clone())).collect(),
+        })?;
+    } else {
+        map_round_trip(device)?;
+    }
+    let us = started.elapsed().as_micros() as u64;
+    MAPPED[0].fetch_add(1, Ordering::Relaxed);
+    MAPPED[1].fetch_add(us, Ordering::Relaxed);
+    MAPPED[2].fetch_max(us, Ordering::Relaxed);
+    let n = MAPPED[0].load(Ordering::Relaxed);
+    if n == 1 || n.is_multiple_of(200) {
+        tracing::info!(
+            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
+            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
+        );
+    }
+    Ok(())
+}
+
+/// Whether threads that ask for new memory to be made resident or mapped at
+/// the same time are served by one call (on by default;
+/// `VICTORY_RESIDENT_BATCH=0`: a call or round trip for each).
+fn batch_residency() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENT_BATCH").is_none_or(|v| v != "0"))
+}
+
+/// What a batch of [`resident`] calls holds: a heap or resource of the device's.
+struct Pageable(ID3D12Pageable);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Pageable {}
+
+static RESIDENT_GROUP: combine::Combine<Pageable> = combine::Combine::new();
+static MAPPED_GROUP: combine::Combine<()> = combine::Combine::new();
+
+/// Batches run (one call or round trip each), counted by the frame line.
+static MAPPED_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static RESIDENT_BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One round trip through the system's mapping queue: a copy of a few bytes
+/// on a queue of ours, waited for. (The body of [`mapped`] as it was.)
+fn map_round_trip(device: &ID3D12Device) -> windows::core::Result<()> {
+    static ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: plain object creation; the objects the list names are kept.
     unsafe {
@@ -303,18 +355,6 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             WaitForSingleObject(a.event, INFINITE);
         }
     }
-    let us = started.elapsed().as_micros() as u64;
-    MAPPED[0].fetch_add(1, Ordering::Relaxed);
-    MAPPED[1].fetch_add(us, Ordering::Relaxed);
-    MAPPED[2].fetch_max(us, Ordering::Relaxed);
-    let n = MAPPED[0].load(Ordering::Relaxed);
-    if n == 1 || n.is_multiple_of(200) {
-        tracing::info!(
-            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
-            MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
-            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
-        );
-    }
     Ok(())
 }
 
@@ -328,8 +368,28 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
     }
     let started = std::time::Instant::now();
     let object: ID3D12Pageable = object.cast()?;
-    // SAFETY: a live heap or resource of the device's.
-    let made = unsafe { device.MakeResident(&[Some(object)]) };
+    let made = if batch_residency() {
+        // One call for everything asked while another runs (`combine`): the
+        // system makes a set of objects resident in one pass, where a call
+        // for each waits for the ones before it.
+        RESIDENT_GROUP.join(Pageable(object), |items| {
+            RESIDENT_BATCHES.fetch_add(1, Ordering::Relaxed);
+            let all: Vec<Option<ID3D12Pageable>> = items.iter().map(|(_, o)| Some(o.0.clone())).collect();
+            // SAFETY: live heaps and resources of the device's.
+            if items.len() == 1 || unsafe { device.MakeResident(&all) }.is_err() {
+                // Alone, or the set was refused: each says for itself.
+                return items
+                    .iter()
+                    // SAFETY: as above.
+                    .filter_map(|(id, o)| unsafe { device.MakeResident(&[Some(o.0.clone())]) }.err().map(|e| (*id, e)))
+                    .collect();
+            }
+            Vec::new()
+        })
+    } else {
+        // SAFETY: a live heap or resource of the device's.
+        unsafe { device.MakeResident(&[Some(object)]) }
+    };
     let us = started.elapsed().as_micros() as u64;
     RESIDENT[0].fetch_add(1, Ordering::Relaxed);
     RESIDENT[1].fetch_add(us, Ordering::Relaxed);
@@ -3679,6 +3739,7 @@ fn late_line(frames: f64) {
 }
 
 pub(crate) mod aside;
+mod combine;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
@@ -8802,6 +8863,34 @@ impl Meter {
                      is refreshing, {asking:.1} ms asking the write watch and the guards, {still:.1} ms waiting for title memory to \
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
+            }
+            // New memory waited for ([`resident`], [`mapped`]): their totals since the start are said every
+            // 1,000 and 200 calls, which tells nothing of one stretch of the run; the stall of a scene's first
+            // seconds is where they cost 3 to 5 ms a call against 0.3 before it (V3d, card at its budget).
+            {
+                static SAID: [std::sync::atomic::AtomicU64; 4] =
+                    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+                let now = [
+                    RESIDENT[0].load(Ordering::Relaxed),
+                    RESIDENT[1].load(Ordering::Relaxed),
+                    MAPPED[0].load(Ordering::Relaxed),
+                    MAPPED[1].load(Ordering::Relaxed),
+                ];
+                let [made, made_us, mapped_n, mapped_us] = std::array::from_fn(|i| {
+                    now[i].saturating_sub(SAID[i].swap(now[i], Ordering::Relaxed))
+                });
+                if made + mapped_n > 0 {
+                    let [made_batches, mapped_batches] = [&RESIDENT_BATCHES, &MAPPED_BATCHES]
+                        .map(|b| b.swap(0, Ordering::Relaxed) as f64 / frames);
+                    tracing::info!(
+                        "new card memory waited for per frame, all threads (VICTORY_WAIT_RESIDENT=0: not; VICTORY_RESIDENT_BATCH=0: no batches,                          now {}): {:.1} MakeResident calls in {made_batches:.1} batches {:.1} ms, {:.1} waits for the mapping in {mapped_batches:.1} round trips {:.1} ms",
+                        if batch_residency() { "on" } else { "off" },
+                        made as f64 / frames,
+                        made_us as f64 / 1000.0 / frames,
+                        mapped_n as f64 / frames,
+                        mapped_us as f64 / 1000.0 / frames
+                    );
+                }
             }
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);

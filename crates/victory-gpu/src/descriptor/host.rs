@@ -2997,6 +2997,12 @@ impl HostHeap {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
         let Some(host) = host() else { return };
+        if COPIES.with(|c| {
+            let mut c = c.borrow_mut();
+            c.0 .then(|| c.1.push((self.cpu(to), from))).is_some()
+        }) {
+            return;
+        }
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
     }
@@ -6083,6 +6089,42 @@ pub(crate) struct Listed {
     pub(crate) tabled: Option<(u32, bool)>,
 }
 
+thread_local! {
+    /// While a table is made (`crate::draw::State::tables`, with `VICTORY_STATE_FILTER`): whether the descriptors of its views
+    /// are copied together at its end, and those to copy: where to, where from.
+    static COPIES: std::cell::RefCell<(bool, Vec<(D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_CPU_DESCRIPTOR_HANDLE)>)> =
+        const { std::cell::RefCell::new((false, Vec::new())) };
+}
+
+/// Descriptors copied together, and the calls that did it, since the last frame line.
+pub(crate) static BATCHED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The copies of the views of the table that is made now are held back (or no longer are) until [`copies_flush`].
+pub(crate) fn copies_hold(on: bool) {
+    COPIES.with(|c| c.borrow_mut().0 = on);
+}
+
+/// Makes the copies held back, in one call.
+pub(crate) fn copies_flush() {
+    COPIES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.1.is_empty() {
+            return;
+        }
+        if let Some(host) = host() {
+            let (to, from): (Vec<_>, Vec<_>) = c.1.iter().copied().unzip();
+            let n = to.len() as u32;
+            // SAFETY: slots of our heap and of this thread's heap, one descriptor to each range.
+            unsafe {
+                host.device.CopyDescriptors(n, to.as_ptr(), None, n, from.as_ptr(), None, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+            };
+            BATCHED[0].fetch_add(u64::from(n), std::sync::atomic::Ordering::Relaxed);
+            BATCHED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        c.1.clear();
+    });
+}
+
 /// What was made for one record: shared by the recording's map and, for a buffer view, [`Over`].
 struct ListMade {
     view: View,
@@ -6604,5 +6646,51 @@ mod view_cache_tests {
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
         crate::shadow::pin_world_for_test(None);
         assert_eq!((c[1], c[2], c[3], c[7]), (1, 1, 2, 0), "{c:?}");
+    }
+}
+
+#[cfg(test)]
+mod batched_copy_tests {
+    use super::*;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    /// The descriptors of a table's views copied together are those copied one by one.
+    #[test]
+    fn copies_held_and_made_together_are_the_copies_made_one_by_one() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let memory = vec![0u64; 1 << 11];
+        let addr = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let resource: [u32; 14] = [1, 0, 0, 0, 4096, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[10, 1, 0, 0, 64, 0, 0, 0, 0, 0]);
+        (desc[10], desc[11]) = (addr as u32, (addr >> 32) as u32);
+        let mut slot_mem = [0u32; 8];
+        crate::descriptor::record(slot_mem.as_mut_ptr() as u64, View::Placed(true, resource, desc));
+        let words = [slot_mem[0], slot_mem[1], slot_mem[2]];
+        let s = heap.dynamic(4).unwrap();
+        let recording = 0xbeef_0001;
+        if heap.make_listed(recording, words, s).is_none() {
+            return; // the view does not make on this adapter
+        }
+        let before = BATCHED[1].load(Relaxed);
+        copies_hold(true);
+        // (The second ask in the recording copies the descriptor of the first.)
+        let held = heap.make_listed(recording, words, s + 1).is_some() && heap.make_listed(recording, words, s + 2).is_some();
+        copies_flush();
+        copies_hold(false);
+        assert!(held);
+        assert!(BATCHED[1].load(Relaxed) > before, "one call for the copies of the two slots");
+        let bytes = |i: u32| {
+            let mut b = [0u8; 32];
+            crate::host::read_into(heap.cpu(i).ptr as *const u8, &mut b).then_some(b)
+        };
+        if let (Some(a), Some(b), Some(c)) = (bytes(s), bytes(s + 1), bytes(s + 2)) {
+            assert_eq!(a, b);
+            assert_eq!(a, c);
+        }
+        // Nothing is left held: the next copy is made at once.
+        assert!(COPIES.with(|c| c.borrow().1.is_empty()));
     }
 }

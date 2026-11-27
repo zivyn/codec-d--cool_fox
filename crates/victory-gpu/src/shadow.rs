@@ -3359,7 +3359,7 @@ pub(crate) fn let_go_idle() {
             .collect();
         let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
         if !gone.is_empty() {
-            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            moved(5);
         }
         gone
     };
@@ -5598,6 +5598,43 @@ static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 /// under the map's lock, after the change.
 static WINDOWS_CHANGED: AtomicU64 = AtomicU64::new(0);
 
+/// What moved [`world`], per frame for the line: buffers registered, unregistered, taken out in place, copies made
+/// (two kinds of ask), windows let go of, taken out in place, made, copies of a view's own bytes.
+static WORLD_BY: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// A window or a copy of a view's own bytes came or went (`source` an index of [`WORLD_BY`]).
+fn moved(source: usize) {
+    WORLD_BY[source].fetch_add(1, Ordering::Relaxed);
+    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// [`buffers`], for the count of what moved [`world`].
+fn buffers_for(source: usize) -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    WORLD_BY[source].fetch_add(1, Ordering::Relaxed);
+    buffers()
+}
+
+/// For the frame line: how often and by what [`world`] moved per frame over `frames`.
+pub(crate) fn world_line(frames: f64) {
+    let c: Vec<f64> = WORLD_BY.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if c.iter().sum::<f64>() == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "what moved the state of the copies of title memory per frame ({:.2} in all): buffers registered {:.2}, unregistered {:.2}, taken out in place {:.2}, copies of buffers made {:.2} ({:.2} on a second ask), windows let go of {:.2}, windows taken out in place {:.2}, windows made {:.2}, copies of views' own bytes made or let go {:.2}",
+        c.iter().sum::<f64>(),
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        c[6],
+        c[7],
+        c[8]
+    );
+}
+
 /// A number that grows whenever the copy a title address range is found on can be another one: a buffer came, went or
 /// got its copy ([`BUFFERS`]), a window or a copy of a view's own bytes came or went. What was made from the answer
 /// of [`find`] while it had a value is as good as then while it has it still
@@ -5678,7 +5715,7 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
-    buffers().insert(
+    buffers_for(0).insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -5690,7 +5727,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    buffers_for(1).remove(&(start, resource));
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5721,12 +5758,12 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
         if !gone.is_empty() {
-            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            moved(6);
         }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers();
+        let mut map = buffers_for(2);
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
@@ -5812,7 +5849,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
         }
     }
-    let mut map = buffers();
+    let mut map = buffers_for(3);
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -5856,7 +5893,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     };
     drop(held);
     let made = make_copy(key.0, blen, size, gpu_only);
-    let mut map = buffers();
+    let mut map = buffers_for(4);
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() && entry.end == end_of {
         entry.shadow = made;
@@ -6235,7 +6272,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
-        WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        moved(7);
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -6249,7 +6286,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
-        WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        moved(7);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6287,7 +6324,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
-    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    moved(7);
     Some(shadow)
 }
 
@@ -6343,7 +6380,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
         if map.len() != before {
-            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            moved(8);
         }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
@@ -6352,7 +6389,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
-    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    moved(8);
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)

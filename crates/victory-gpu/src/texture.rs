@@ -91,6 +91,10 @@ pub(crate) struct Staging {
     /// recorded again about a second later if the card has room by then
     /// ([`upload`]).
     waiting: std::sync::atomic::AtomicU64,
+    /// With `waiting`: the cap on levels' tiles that upload was made under
+    /// ([`crate::resource::level_cap`]); it is recorded again when the card
+    /// takes more ([`crate::resource::may_retry`]).
+    waiting_cap: std::sync::atomic::AtomicU64,
     /// Recorded for a one-shot decoration bake (`BAKING`): submission-time
     /// refresh must wait for title memory to stop remapping
     /// (`title_memory_reading`) instead of taking `no_wait()` /
@@ -762,6 +766,15 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     use std::sync::atomic::Ordering::Relaxed;
     let baking = BAKING.get();
+    // A draw reads the texture through a table (not the pass over textures
+    // picked by index, not a bake): it is looked at, which tells its tiles
+    // from those of textures nobody reads (`crate::priority`).
+    if !baking
+        && PICKING.get().is_none()
+        && let Some(tiled) = &copy.tiled
+    {
+        tiled.note_sampled();
+    }
     if baking {
         staging.exact.store(true, Relaxed);
     }
@@ -786,9 +799,19 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // once a second, and only when the card has room; the staging buffer
     // still holds the level's bytes.
     if staging.on_demand {
+        // A hot texture short of levels the card now takes more of for it
+        // (`crate::priority`): upload it again, once a second at most.
+        if let Some(tiled) = &copy.tiled
+            && !staging.dirty.load(Relaxed)
+            && crate::priority::enabled()
+            && tiled.retry_hot(crate::resource::may_retry_hot)
+        {
+            staging.dirty.store(true, Relaxed);
+            crate::tiles::STATS[10].fetch_add(1, Relaxed);
+        }
         let since = staging.waiting.load(Relaxed);
         if since != 0 && crate::host::long_ago(since, 1000, 2) {
-            if crate::resource::level_cap_lately() == u64::MAX {
+            if crate::resource::may_retry(staging.waiting_cap.load(Relaxed)) {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
@@ -862,6 +885,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // given here is written whole by it (the rest are copies into no
     // memory, which the card drops).
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
+    if let Some(on_demand) = &on_demand {
+        on_demand.track(staging.memory as u64);
+    }
     let Some(on_demand) = on_demand else {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
@@ -872,11 +898,12 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     list.defer_texture(staging.clone());
     list.defer_host(move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
-        staging.waiting.store(if waiting { crate::host::moment().max(1) } else { 0 }, Relaxed);
+        staging.waiting_cap.store(waiting.unwrap_or(0), Relaxed);
+        staging.waiting.store(if waiting.is_some() { crate::host::moment().max(1) } else { 0 }, Relaxed);
         // A texture picked by index has no staging buffer after this
         // upload: its slots are made due again by the texture pass.
-        if waiting {
-            crate::descriptor::host::levels_waiting(staging.memory as u64);
+        if let Some(cap) = waiting {
+            crate::descriptor::host::levels_waiting(staging.memory as u64, cap, on_demand.weak());
         }
     });
 }
@@ -1938,6 +1965,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         detiled: std::sync::atomic::AtomicU32::new(0),
         judged: [const { std::sync::atomic::AtomicU64::new(0) }; 2],
         waiting: std::sync::atomic::AtomicU64::new(0),
+        waiting_cap: std::sync::atomic::AtomicU64::new(0),
         exact: std::sync::atomic::AtomicBool::new(BAKING.get()),
     });
     map.insert(resource as usize, s.clone());

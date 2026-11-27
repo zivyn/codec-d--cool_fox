@@ -76,6 +76,8 @@ fn build() -> [u8; 32] {
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
+            "VICTORY_LOOP_NOTES",
+            "VICTORY_LOOP_WHY",
             "VICTORY_BVH_BOUNDS",
         ] {
             bytes.extend_from_slice(name.as_bytes());

@@ -1,8 +1,8 @@
 @echo off
 rem One-click the title on VIctory-NVIDIA (DLSS + frame generation). ASCII only.
-rem   PLAY_FRAMEGEN.bat          menu
-rem   PLAY_FRAMEGEN.bat 1..6     start that mode directly
-rem   PLAY_FRAMEGEN.bat check    only show paths and what is ready
+rem   PLAY_FRAMEGEN.cmd          menu
+rem   PLAY_FRAMEGEN.cmd 1..6     start that mode directly
+rem   PLAY_FRAMEGEN.cmd check    only show paths and what is ready
 setlocal
 set "PS1=%~dp0scripts\play-framegen.ps1"
 set "PSH=powershell"

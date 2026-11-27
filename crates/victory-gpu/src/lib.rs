@@ -56,6 +56,8 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod priority;
 pub mod query;
 pub mod queue;
 #[cfg(all(windows, feature = "diagnostics"))]

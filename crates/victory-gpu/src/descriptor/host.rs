@@ -506,8 +506,10 @@ fn record_key(handle: u64) -> u64 {
 /// room, or no heap could be had), and when (`crate::host::moment`). A
 /// texture pass makes their slots due again once the card has room
 /// ([`HostHeap::texture_slots_waiting`]); with the cap their upload was made
-/// under ([`crate::resource::may_retry`]).
-static WAITING: Mutex<std::collections::BTreeMap<u64, (u64, u64)>> = Mutex::new(std::collections::BTreeMap::new());
+/// under ([`crate::resource::may_retry`]), and the host copy (to say how hot
+/// it is and what it lacks, [`crate::priority`]).
+static WAITING: Mutex<std::collections::BTreeMap<u64, (u64, u64, std::sync::Weak<crate::resource::HostTexture>)>> =
+    Mutex::new(std::collections::BTreeMap::new());
 
 /// The last upload of the placed texture at `start` left a held level
 /// without tiles. A texture picked by index is uploaded once and then
@@ -516,8 +518,8 @@ static WAITING: Mutex<std::collections::BTreeMap<u64, (u64, u64)>> = Mutex::new(
 /// blurred, or black if no level had tiles) for as long as the title left
 /// its memory alone, where a texture refused for want of room is tried
 /// again.
-pub(crate) fn levels_waiting(start: u64, cap: u64) {
-    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, (crate::host::moment(), cap));
+pub(crate) fn levels_waiting(start: u64, cap: u64, texture: std::sync::Weak<crate::resource::HostTexture>) {
+    WAITING.lock().unwrap_or_else(|e| e.into_inner()).insert(start, (crate::host::moment(), cap, texture));
 }
 
 /// Placed textures (by the start of their memory) filled while the runtime
@@ -2182,14 +2184,50 @@ impl HostHeap {
         let starts: Vec<u64> = {
             let mut waiting = WAITING.lock().unwrap_or_else(|e| e.into_inner());
             if waiting.is_empty() {
+                crate::tiles::set_hot_want(0);
                 return 0;
             }
-            let starts: Vec<u64> = waiting
-                .iter()
-                .filter(|&(_, &(since, cap))| crate::host::long_ago(since, 1000, 2) && crate::resource::may_retry(cap))
-                .map(|(&start, _)| start)
-                .take(Self::WAITING_A_PASS)
-                .collect();
+            // By priority ([`crate::priority`]): the textures draws read
+            // through a table lately first, the largest shortfall first;
+            // what hot textures lack is what the reclaim works toward. A
+            // hot texture may be asked again when the card takes larger
+            // levels for it than for everyone.
+            let priority = crate::priority::enabled();
+            let (mut hot_want, mut gone) = (0u64, Vec::new());
+            let mut eligible: Vec<crate::priority::Waiting> = Vec::new();
+            for (&start, (since, cap, texture)) in waiting.iter() {
+                let (heat, deficit) = if priority {
+                    let Some(texture) = texture.upgrade() else {
+                        gone.push(start);
+                        continue;
+                    };
+                    match texture.tiled.as_ref() {
+                        Some(tiled) => (tiled.heat(), tiled.deficit()),
+                        None => (crate::priority::Heat::Unknown, 0),
+                    }
+                } else {
+                    (crate::priority::Heat::Unknown, 0)
+                };
+                if heat == crate::priority::Heat::Hot {
+                    hot_want += deficit;
+                }
+                let may = crate::resource::may_retry(*cap)
+                    || (heat == crate::priority::Heat::Hot && crate::resource::may_retry_hot(*cap));
+                if crate::host::long_ago(*since, 1000, 2) && may {
+                    eligible.push(crate::priority::Waiting { id: start, heat, deficit });
+                }
+            }
+            for start in gone {
+                waiting.remove(&start);
+            }
+            crate::tiles::set_hot_want(hot_want);
+            let taken = if priority {
+                crate::priority::upgrade_order(&mut eligible);
+                crate::priority::upgrade_batch(&eligible, Self::WAITING_A_PASS, crate::priority::UPGRADE_PASS_BYTES)
+            } else {
+                eligible.len().min(Self::WAITING_A_PASS)
+            };
+            let starts: Vec<u64> = eligible[..taken].iter().map(|w| w.id).collect();
             for start in &starts {
                 waiting.remove(start);
             }

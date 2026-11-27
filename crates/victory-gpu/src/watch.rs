@@ -1799,6 +1799,14 @@ pub(crate) fn landed_lately(at: usize, len: usize, frames: u64) -> bool {
     (at / 4096..=(at + len.max(1) - 1) / 4096).any(|page| LANDED.since(page, now.saturating_sub(frames), now))
 }
 
+/// How many pages of 4 KiB of `[at, at + len)` shaders' writes went into in the
+/// last `frames` frames.
+pub(crate) fn landed_pages(at: usize, len: usize, frames: u64) -> usize {
+    let now = crate::frame::current();
+    let from = now.saturating_sub(frames);
+    (at / 4096..=(at + len.max(1) - 1) / 4096).filter(|&page| LANDED.since(page, from, now)).count()
+}
+
 /// Whether every block of `[at, at + len)` is view memory written since a
 /// host copy last took it: guarded then, and the guard is off. (Written by
 /// the title, or by us putting a flight's shader writes into it, if not

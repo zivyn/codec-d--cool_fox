@@ -52,6 +52,11 @@ pub(super) fn line(frames: f64) {
         mb(crate::shadow::ECHO[1].swap(0, std::sync::atomic::Ordering::Relaxed)),
     );
     tracing::info!(
+        "ranges of card copies taken whole per frame (VICTORY_LAND_ECHO_ALL): {:.1} MB, of them {:.1} MB in pages that shaders' writes went into in the last two frames",
+        mb(crate::shadow::ECHO[2].swap(0, std::sync::atomic::Ordering::Relaxed)),
+        mb(crate::shadow::ECHO[3].swap(0, std::sync::atomic::Ordering::Relaxed)),
+    );
+    tracing::info!(
         "bytes of host copies over the bus per frame: {:.1} MB up ({:.1} of copies nothing was fetched from), {:.1} MB fetched \
          ({:.1} of copies nothing was sent up to), {} copies; the most:",
         mb(sum(UP)),

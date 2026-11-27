@@ -2478,8 +2478,23 @@ fn land_echo() -> bool {
 }
 
 /// Since the last frame-rate line: bytes found to be a landing's alone, and
-/// bytes a landing was noted in that were the title's too.
-pub(crate) static ECHO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// bytes a landing was noted in that were the title's too; then the bytes a
+/// card copy took whole, which went up ([`Shadow::copy`]), and of them those in
+/// pages of 4 KiB that shaders' writes went into in the last two frames
+/// (whatever copy they were landed through).
+pub(crate) static ECHO: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Whether a card copy takes pages that a landing put bytes into 4 KiB at a
+/// time, by comparison, wherever it takes them (`VICTORY_LAND_ECHO_ALL=1`, off
+/// by default): [`Shadow::take_landed`] does it for the pages a copy noted
+/// its own landings in, and every other way of taking a range whole
+/// ([`Shadow::copy`]: pages no landing was noted in for this copy, ranges of
+/// memory that is not watched) sent up the pages the landing had given the
+/// copy and title memory alike.
+fn echo_all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ECHO_ALL").is_some_and(|v| v == "1"))
+}
 
 /// Whether a refresh of a copy in the card's memory takes, and sends up,
 /// the dwords that title memory changed and no others
@@ -3180,6 +3195,48 @@ fn by_parts(runs: Vec<(usize, usize, bool)>, pages: &[(usize, u64)], parts: &[u1
 #[cfg(test)]
 mod landing_tests {
     use super::{KERNEL_PAGE, Shadow};
+
+    /// A card copy that takes a range whole where a landing wrote (the pages
+    /// the watch notes, whatever copy they were landed through) sends up only
+    /// the pages that are not the same: a title write after the landing
+    /// still goes up, one before it too, and a page no landing touched is
+    /// taken as any other.
+    #[test]
+    fn a_range_taken_whole_sends_up_only_what_a_landing_did_not_give_it() {
+        const PAGES: usize = 8;
+        let room = vec![7u8; (PAGES + 1) * KERNEL_PAGE];
+        let title = (room.as_ptr() as usize).next_multiple_of(KERNEL_PAGE);
+        let mut side = vec![7u8; PAGES * KERNEL_PAGE];
+        let copy = Shadow::unbacked(title as u64, side.as_mut_ptr(), side.len() as u64, true);
+        let write = |page: usize, byte: u8| {
+            // SAFETY: in `room`.
+            unsafe { ((title + page * KERNEL_PAGE + 9) as *mut u8).write_volatile(byte) }
+        };
+        let part = |a: usize, b: usize| (a * KERNEL_PAGE, b * KERNEL_PAGE);
+        // The landing put bytes into pages 1 to 4 of title memory and the copy
+        // alike (a copy of another buffer, or one that noted nothing).
+        crate::watch::landing(title + KERNEL_PAGE, 4 * KERNEL_PAGE);
+        // The title wrote page 3 after it, and page 6 (no landing there).
+        write(3, 8);
+        write(6, 9);
+        let before = crate::watch::landed_pages(title, PAGES * KERNEL_PAGE, 2);
+        assert!(before >= 4, "{before}");
+        copy.copy_compared(title, title + PAGES * KERNEL_PAGE);
+        let mut dirty = copy.take_dirty();
+        dirty.sort_unstable();
+        // Page 3 (the title's, after the landing) and page 6 go up; pages 1, 2, 4
+        // (the landing's alone) do not; pages 0, 5, 7 were not landed in: whole,
+        // as before (those the landing's pages are not between them).
+        let up = super::joined(dirty);
+        let has = |a: usize, b: usize| up.iter().any(|&(x, y)| x <= a * KERNEL_PAGE && b * KERNEL_PAGE <= y);
+        assert!(has(3, 4), "{up:?}");
+        assert!(has(6, 7), "{up:?}");
+        assert!(!has(1, 2) && !has(2, 3) && !has(4, 5), "{up:?}");
+        assert_eq!(side[3 * KERNEL_PAGE + 9], 8);
+        assert_eq!(side[6 * KERNEL_PAGE + 9], 9);
+        let _ = part;
+        drop(room);
+    }
 
     /// A page that only a landing wrote is not sent up again; one the title
     /// wrote too is, and so is every page no landing was noted in.
@@ -4881,6 +4938,14 @@ impl Shadow {
         let (from, to) = (from.max(start), to.min(end));
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
+        if self.card.is_some() && from < to && to - from < WHOLE_LONG && !crate::host::upcheck::on() {
+            let landed = crate::watch::landed_pages(from, to - from, 2);
+            ECHO[2].fetch_add((to - from) as u64, Ordering::Relaxed);
+            ECHO[3].fetch_add((landed * KERNEL_PAGE) as u64, Ordering::Relaxed);
+            if landed > 0 && echo_all() && land_echo() {
+                return self.copy_compared(from, to);
+            }
+        }
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
             for_pieces_of(from - start, to - start, |a, b| {
                 let was = self.card_held(a, b - a);
@@ -4904,6 +4969,64 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        to - from
+    }
+
+    /// [`Shadow::copy`] of `[from, to)` (inside the buffer) of a copy in the
+    /// card's memory, where the pages that shaders' writes went into in the last
+    /// two frames are looked at 4 KiB at a time: one that title memory and the
+    /// CPU's side have alike is left as it is and sent nothing; one that is not
+    /// the same is taken whole and sent, as every other page is
+    /// ([`echo_all`]).
+    fn copy_compared(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        // Runs of pages landed in, and not.
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut at = from;
+        while at < to {
+            let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+            let landed = crate::watch::landed_pages(at, next - at, 2) > 0;
+            match runs.last_mut() {
+                Some(last) if last.2 == landed => last.1 = next,
+                _ => runs.push((at, next, landed)),
+            }
+            at = next;
+        }
+        TITLE.with_borrow_mut(|title| {
+            for (from, to, landed) in runs {
+                if !landed {
+                    // SAFETY: inside the mapping.
+                    crate::host::copy_mapped(unsafe { self.data.add(from - start) }, from as *const u8, to - from, false);
+                    self.changed(from - start, to - start);
+                    self.card_changed(from - start, to - start);
+                    continue;
+                }
+                title.resize(to - from, 0);
+                // (Pages that are not there read as zeros.)
+                crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+                let mut at = from;
+                while at < to {
+                    let next = ((at / KERNEL_PAGE + 1) * KERNEL_PAGE).min(to);
+                    let title = &title[at - from..next - from];
+                    // SAFETY: inside the mapping of the copy's CPU side, which
+                    // nothing else reads or writes there: no shader's range
+                    // holds it, and the parts of a refresh lie apart.
+                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), next - at) };
+                    if title == held {
+                        ECHO[0].fetch_add((next - at) as u64, Ordering::Relaxed);
+                    } else {
+                        ECHO[1].fetch_add((next - at) as u64, Ordering::Relaxed);
+                        held.copy_from_slice(title);
+                        self.changed(at - start, next - start);
+                        self.card_changed(at - start, next - start);
+                    }
+                    at = next;
+                }
+            }
+        });
         to - from
     }
 

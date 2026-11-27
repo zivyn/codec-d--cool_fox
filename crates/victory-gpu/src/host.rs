@@ -4684,6 +4684,10 @@ impl Host {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
+            // Copies of buffers only shaders touch, left out of this landing
+            // (`land::quiet`), and those that are brought whole.
+            let mut verdicts: std::collections::HashMap<usize, land::quiet::Verdict> = std::collections::HashMap::new();
+            let mut whole: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
@@ -4701,6 +4705,24 @@ impl Host {
                 let fetched = flagged_pieces(&flags);
                 for r in plan.ranges.iter().filter(|r| !r.picked) {
                     let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                    let verdict = *verdicts.entry(copy).or_insert_with(|| {
+                        let verdict = if land::quiet::on() || crate::readprobe::on() { r.shadow.landing_verdict() } else { land::quiet::Verdict::Land };
+                        if verdict == land::quiet::Verdict::Whole {
+                            whole.push(r.shadow.clone());
+                        }
+                        verdict
+                    });
+                    if verdict == land::quiet::Verdict::Left {
+                        for p in 0..r.span.pieces {
+                            if fetched.binary_search(&(copy, r.span.first + p)).is_ok() {
+                                let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                                land::count(land::stat::QUIET_PIECES, u64::from(lo < hi));
+                                land::count(land::stat::QUIET_BYTES, hi.saturating_sub(lo) as u64);
+                            }
+                        }
+                        crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                        continue;
+                    }
                     if upcheck::on() {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
@@ -4728,6 +4750,24 @@ impl Host {
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                 }
+            }
+            // A copy that was left out and has been told written in: all of
+            // it comes down (merged as any piece is, only what differs from
+            // the CPU's side goes into title memory).
+            for shadow in &whole {
+                let copy = std::sync::Arc::as_ptr(shadow) as usize;
+                let before = pieces.len();
+                for (lo, hi) in shadow.whole_pieces() {
+                    if seen.insert((copy, lo, hi)) {
+                        pieces.push((shadow.clone(), lo, hi, total));
+                        total += (hi - lo) as u64;
+                    }
+                }
+                tracing::warn!(
+                    start = format_args!("{:#x}", shadow.span().0),
+                    pieces = pieces.len() - before,
+                    "a copy left out of landing (VICTORY_LAND_QUIET) was told written in: it lands whole once and as any other from now on"
+                );
             }
         }
         if land::on() {

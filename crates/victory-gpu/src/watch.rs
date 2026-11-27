@@ -2495,10 +2495,14 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    std::time::Instant,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        mapping_stats::held(self.1.elapsed());
         // The change is done: what is there now may be guarded.
         if CHANGING.replace((false, false)).1 {
             guards().changing.clear();
@@ -2652,31 +2656,148 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    let asked = std::time::Instant::now();
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    mapping_stats::waited(asked.elapsed());
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, std::time::Instant::now())
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(
+    #[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>,
+    std::time::Instant,
+    &'static std::panic::Location<'static>,
+);
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        mapping_stats::read(self.2, self.1.elapsed());
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
+#[track_caller]
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    let site = std::panic::Location::caller();
+    let asked = std::time::Instant::now();
+    let guard = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    mapping_stats::read_waited(asked.elapsed());
+    Reading(guard, std::time::Instant::now(), site)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
+#[track_caller]
 pub fn title_memory_reading_now() -> Option<Reading> {
+    let site = std::panic::Location::caller();
+    let held = |guard| Some(Reading(guard, std::time::Instant::now(), site));
     match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+        Ok(guard) => held(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => held(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            mapping_stats::refused();
+            None
+        }
+    }
+}
+
+/// What the lock of [`title_memory_remapping`] and [`title_memory_reading`]
+/// cost, for the runtime's line about the title's memory calls: how long
+/// those that change a mapping waited for the readers, how long they held it,
+/// and who the readers were and for how long (by the place that took the
+/// lock). Counted always: a few atomics a call.
+pub mod mapping_stats {
+    use std::panic::Location;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Duration;
+
+    static WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static HELD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static READ_WAITS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    /// Readers by the place that took the lock: count, ns held, longest ns.
+    static SITES: Mutex<Vec<(&'static Location<'static>, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+    fn add(of: &[AtomicU64; 3], d: Duration) {
+        let ns = d.as_nanos() as u64;
+        of[0].fetch_add(1, Relaxed);
+        of[1].fetch_add(ns, Relaxed);
+        of[2].fetch_max(ns, Relaxed);
+    }
+
+    /// A change of mapping waited `d` for the readers.
+    pub(super) fn waited(d: Duration) {
+        add(&WAITS, d);
+    }
+
+    /// A change of mapping held the lock for `d`.
+    pub(super) fn held(d: Duration) {
+        add(&HELD, d);
+    }
+
+    /// A reader waited `d` for the lock (for a change of mapping).
+    pub(super) fn read_waited(d: Duration) {
+        add(&READ_WAITS, d);
+    }
+
+    /// A reader that would not wait was turned away.
+    pub(super) fn refused() {
+        REFUSED.fetch_add(1, Relaxed);
+    }
+
+    /// A reader held the lock for `d`.
+    pub(super) fn read(site: &'static Location<'static>, d: Duration) {
+        let ns = d.as_nanos() as u64;
+        let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+        match sites.iter_mut().find(|s| std::ptr::eq(s.0, site)) {
+            Some(s) => {
+                s.1 += 1;
+                s.2 += ns;
+                s.3 = s.3.max(ns);
+            }
+            None => sites.push((site, 1, ns, ns)),
+        }
+    }
+
+    /// Since the last asking.
+    #[derive(Default, Debug)]
+    pub struct Taken {
+        /// Count, total ns and longest ns of: changes of mapping waiting for
+        /// readers; their holds; readers waiting for a change; and the
+        /// readers turned away.
+        pub change_waits: [u64; 3],
+        pub change_holds: [u64; 3],
+        pub reader_waits: [u64; 3],
+        pub refused: u64,
+        /// Readers by place: `file:line`, holds, ns, longest ns; the longest
+        /// total first.
+        pub readers: Vec<(String, u64, u64, u64)>,
+    }
+
+    pub fn take() -> Taken {
+        let n = |of: &[AtomicU64; 3]| [of[0].swap(0, Relaxed), of[1].swap(0, Relaxed), of[2].swap(0, Relaxed)];
+        let mut readers: Vec<(String, u64, u64, u64)> = std::mem::take(&mut *SITES.lock().unwrap_or_else(|e| e.into_inner()))
+            .into_iter()
+            .map(|(at, n, ns, max)| {
+                let file = at.file().replace(std::path::MAIN_SEPARATOR, "/");
+                (format!("{}:{}", file.rsplit('/').next().unwrap_or(&file), at.line()), n, ns, max)
+            })
+            .collect();
+        readers.sort_by_key(|r| std::cmp::Reverse(r.2));
+        Taken {
+            change_waits: n(&WAITS),
+            change_holds: n(&HELD),
+            reader_waits: n(&READ_WAITS),
+            refused: REFUSED.swap(0, Relaxed),
+            readers,
+        }
     }
 }
 
@@ -4314,6 +4435,39 @@ mod mapping_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    /// What the lock costs is counted: who read, for how long, and how long
+    /// a change waited for them (the only test that takes the counts).
+    #[test]
+    fn reads_and_changes_are_counted_by_where_they_were_taken() {
+        use super::mapping_stats;
+        let line = line!() + 1;
+        let reading = title_memory_reading();
+        let (go, wait) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let change = {
+            let (go, wait) = (go.clone(), wait.clone());
+            std::thread::spawn(move || {
+                go.store(true, Ordering::SeqCst);
+                let _changing = title_memory_remapping();
+                wait.store(true, Ordering::SeqCst);
+            })
+        };
+        while !go.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        std::thread::sleep(Duration::from_millis(60));
+        drop(reading);
+        change.join().unwrap();
+        assert!(wait.load(Ordering::SeqCst));
+        let taken = mapping_stats::take();
+        let site = format!("watch.rs:{line}");
+        let ours = taken.readers.iter().find(|r| r.0 == site).unwrap_or_else(|| panic!("{site} in {:?}", taken.readers));
+        assert!(ours.1 >= 1 && ours.2 >= 50_000_000 && ours.3 >= 50_000_000, "{ours:?}");
+        assert!(taken.change_waits[0] >= 1 && taken.change_waits[1] >= 10_000_000, "{taken:?}");
+        assert!(taken.change_holds[0] >= 1, "{taken:?}");
+        // Taken: counted from nothing again.
+        assert!(mapping_stats::take().readers.iter().all(|r| r.0 != site));
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.

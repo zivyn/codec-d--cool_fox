@@ -17,5 +17,8 @@ memchr.workspace = true
 clap.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+victory-hle.workspace = true
+
 [lints]
 workspace = true

@@ -757,6 +757,7 @@ dependencies = [
  "memchr",
  "victory-core",
  "victory-game",
+ "victory-hle",
  "victory-shader",
  "walkdir",
 ]

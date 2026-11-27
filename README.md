@@ -39,38 +39,85 @@ carried what we learned to the next. Every pull request sent here was built
 and run on the same card before it was merged. No single project got here
 alone, and choosing the base that runs best was only one result of that work.
 
-What that work produced on the bases this fork had before (all of it is in
-this repository's history):
+### What this fork brings
 
-- **Draws no longer skipped on NVIDIA**: the pool of descriptor slots for
-  NVIDIA's capped view heap. Before it the screen rarely updated and the
-  character jumped from place to place.
-- **Memory compares on the card**: 11 to about 22 frames a second on the base
-  of the time.
-- **Menus, loading screens and subtitles shown on Series S** (the interface
-  plane laid over the game) and **faces that move**, ported from fxceless's
-  pull requests 1189 and 927.
-- **The intro video without flicker**, and **black blobs gone** (a NaN a
-  shader writes made 0 before blur and the upscaler spread it).
-- **Ray tracing understood**: why rooms went white with the title's structure
-  builder off, which passes can be skipped without glitter, that the builder
-  does run on NVIDIA on CGBJ's renderer (draws dropped for it went from
-  thousands a frame to one), and that it does not go together with frame
-  generation yet.
-- **DLSS in place of the title's upscaler**, **DLSS frame generation** through
-  NVIDIA Streamline with more than one generated frame, **the F1 settings
-  menu**, and the finding that the 30 frames a second were the title's own
-  frame interval, which can be lifted.
-- Launchers with the settings measured on this card, a graphics card picker,
-  and the files NVIDIA's licence does not let a repository carry fetched from
-  NVIDIA instead.
+Not one fix but a long line of them: days of work, much of it around the clock,
+across every one of those codebases, more than 300 measured runs on the same
+RTX PC, and each fault chased towards its cause before the next build. In rendering, in
+speed, in the picture and in simply being able to play it:
 
-The foxhound line carries several of these in its own form (the descriptor
-slots, the compares on the card, the interface plane, the face network). This
-fork's own that are in this tree today are listed under "What this fork adds on
-top" below. The rest of ours that this base does not have (the black-blob
-scrub, the graphics card picker, the ray-tracing builder path among them) stay
-in the history, to be brought over where this base turns out to need them.
+**Rendering fixes**
+
+- **Draws no longer skipped on NVIDIA.** NVIDIA caps the view heap below what
+  the title asks for; thousands of draws a frame were dropped, the screen
+  rarely updated and the character jumped from place to place. The pool of
+  descriptor slots was reworked until almost none were.
+- **Menus, loading screens and subtitles on Series S**, black until then (the
+  interface plane laid over the game), and **faces that move** (their network
+  carried through as integers): ported from fxceless's pull requests 1189 and
+  927 and made to work on this card.
+- **The intro video without flicker**: its frames came out of order.
+- **Black blobs gone**: a single bad number from a shader, spread by blur and
+  the upscaler into patches on faces and in the air, is caught where it is
+  written.
+- **White, hazy rooms explained and tamed**: the title's ray tracing was
+  running with its structure builder off, so every ray missed. Which passes
+  can be left out without filling the picture with rainbow glitter was worked
+  out pass by pass.
+- **The ray-tracing structure builder running on NVIDIA**, on CGBJ's renderer:
+  the draws dropped for it went from thousands a frame to one.
+- **White-outs with black holes further into the game** followed up in frames
+  captured in play: thousands of draws a frame were being dropped there for
+  that same missing structure.
+
+**Speed**
+
+- **Memory compares moved to the card**: 11 to about 22 frames a second on the
+  base of the time.
+- **Settings measured, not guessed**: one switch at a time, on the same scene,
+  run after run.
+- **The base itself chosen by measurement**: the same rooms went from 15-17
+  frames a second to 26-30, at a higher resolution.
+- **The 30 frames a second were the title's own frame interval**, not the
+  layer's limit: found, and lifted.
+
+**Picture and frames**
+
+- **DLSS in place of the title's upscaler**, with its model and mode to choose.
+- **DLSS frame generation with up to six frames shown for each one rendered**,
+  switched and changed while playing, without a restart (foxhound's is 2x, set
+  at the start). By Streamline's own count it shows exactly 2, 4 and 6.
+- **Why frame generation showed nothing on a full 12 GB card**, found and
+  fixed: the card's memory is now shared out so that it has room.
+- **The frame rate at the top left of the picture**: frames rendered a second
+  and, with frame generation, frames shown (`FPS: 28.4  FG: 170.4`).
+
+**Playing it**
+
+- **The F1 settings menu**, in every build: DLSS, frame generation, frame rate
+  cap, console profile, picture size, the light estimates and the main speed
+  switches, saved to `victory-settings.txt` and applied at the next start
+  ("SAVE AND RESTART NOW" does that for you; lines marked LIVE change at once).
+- **One command to play**: the launcher builds the layer the first time and
+  applies what the menu saved.
+- **`Get-NVIDIA-DLSS.cmd`**: the eight NVIDIA files that are loaded, about
+  70 MB, taken out of NVIDIA's 263 MB release without downloading the rest.
+  NVIDIA's licence does not let a repository carry them, so they come from
+  NVIDIA.
+
+**Tested, not assumed**
+
+- Every pull request sent here was read line by line and, where it touched the
+  game, built and run on this card before it was merged: ten so far.
+
+Where each of these is today: this fork's own code in this tree is the F1
+menu, frame generation from 2x to 6x with its live switching and memory
+handling, the lifted frame rate cap, the frame rate line, the launcher and the
+NVIDIA file fetcher. The foxhound line carries the descriptor slots, the
+compares on the card, the interface plane and the face network in its own
+form. The black-blob scrub, the graphics card picker and the ray-tracing
+builder path are in this repository's history, and come over as this base
+turns out to need them.
 
 ### The base since 2026-11-26: foxhound
 
@@ -91,24 +138,8 @@ What foxhound brings:
 - an estimate of indirect light and of reflections in place of the title's ray
   tracing, and fewer stalls at scene cuts.
 
-What this fork adds on top:
-
-- **The F1 settings menu**, in every build: DLSS mode and model, frame
-  generation, frame rate cap, console profile, picture size, the light
-  estimates and the main speed switches. Changes are saved to
-  `victory-settings.txt` and apply at the next start; "SAVE AND RESTART NOW"
-  does that for you. Lines marked LIVE change at once.
-- **Frame generation from 2x to 6x**, switched and changed from the menu
-  while playing, without a restart (`VICTORY_FRAMEGEN_X`; foxhound's is 2x, set
-  at the start). No more is asked than the card and driver generate.
-- **No frame rate cap by default.** The title asks for 30 frames a second;
-  the menu's FRAME RATE CAP sets 120, 60 or the title's own 30 instead.
-- **The frame rate at the top left of the picture**: the frames rendered a
-  second, and with frame generation the frames shown (`FPS: 28.4  FG: 170.4`).
-  The window's title says both too.
-- **`Get-NVIDIA-DLSS.cmd`**: fetches only the eight NVIDIA files that are
-  loaded, about 70 MB, out of NVIDIA's 263 MB Streamline release.
-- The launcher builds the layer by itself the first time.
+What this fork has on top of it is under
+[What this fork brings](#what-this-fork-brings) above.
 
 ## Where it stands
 
@@ -120,7 +151,7 @@ rooms.
 | | |
 |---|---|
 | Opening rooms | mostly 26-30 frames a second rendered (33-38 ms a frame) |
-| Frame generation | 2x to 6x on top of that: in NVIDIA's own check, exactly 2, 4 and 6 frames shown for each one rendered |
+| Frame generation | 2x to 6x on top of that: by Streamline's own count, exactly 2, 4 and 6 frames shown for each one rendered |
 | Device losses, crashes | none in the measured runs |
 | Before this base (Series S, 720p to 1080p by DLSS) | 15-17 frames a second in the same rooms |
 

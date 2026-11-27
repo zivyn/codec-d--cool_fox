@@ -5964,6 +5964,9 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                if std::env::var_os("VICTORY_MASK_WHY").is_some() {
+                    eprintln!("MASK-WHY no value from {name} at {offset:#x}: {why}");
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }

@@ -198,7 +198,7 @@ mod tests {
         }
         // A whole array has every page; a sparse one only those written.
         assert!(whole.peek(PAGE + 1).is_some());
-        assert!(sparse.peek(PAGE + 1).is_none());
+        assert!(Pages::<usize>::new(3 * PAGE + 5, true).peek(PAGE + 1).is_none());
     }
 
     #[test]

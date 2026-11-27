@@ -3357,6 +3357,9 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
+        for key in &idle {
+            changed(key.0, key.0 + key.1);
+        }
         if !idle.is_empty() {
             // Before it looks at who holds them again: a thread that hands out what it remembers ([`LOOSE_FOUND`]) makes it
             // held first, or finds this number moved.
@@ -5656,6 +5659,40 @@ pub(crate) fn world() -> u64 {
     BUFFERS_CHANGED.load(Ordering::SeqCst) + WINDOWS_CHANGED.load(Ordering::SeqCst)
 }
 
+/// The changes of what asks about title memory are answered by, with the range of each (`crate::changes`).
+static CHANGES: crate::changes::ChangeLog = crate::changes::ChangeLog::new();
+
+/// Whether caches keep what they made while nothing changed in the address range it depends on, not while nothing changed
+/// at all (`VICTORY_RANGE_VALID=1`; off by default).
+fn range_valid() -> bool {
+    #[cfg(test)]
+    if TEST_RANGE_VALID.load(Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RANGE_VALID").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+static TEST_RANGE_VALID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A change of what is answered for addresses `[lo, hi)` (buffers and windows that came or went, copies of a view's own
+/// bytes): logged under the lock that makes it.
+fn changed(lo: u64, hi: u64) {
+    CHANGES.log(lo, hi);
+}
+
+/// What a cache stamps what it makes from the answers of [`find`] with: read before the ask.
+pub(crate) fn stamp() -> u64 {
+    if range_valid() { CHANGES.stamp() } else { world() }
+}
+
+/// Whether what was made from answers found on addresses `[lo, hi)` when [`stamp`] was `stamp` holds still: nothing
+/// changed (with `VICTORY_RANGE_VALID=1`: nothing in that range).
+pub(crate) fn still(stamp: u64, lo: u64, hi: u64) -> bool {
+    if range_valid() { !CHANGES.changed_since(stamp, lo, hi) } else { world() == stamp }
+}
+
 #[cfg(test)]
 thread_local! {
     /// What [`world`] says on this thread, for a test that must not see what tests on other threads change.
@@ -5720,16 +5757,29 @@ fn found_at(address: u64, len: u64) -> usize {
 
 /// What this thread remembers of an ask, if nothing changed since.
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
-    let shadow = FOUND.with(|f| {
+    let end = address.saturating_add(len.max(1));
+    let (shadow, stamp) = FOUND.with(|f| {
         let f = f.borrow();
         let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        if (*a, *n) != (address, len) || !found_still(*at, address, end) {
+            return None;
+        }
+        shadow.upgrade().map(|s| (s, *at))
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    found_still(stamp, address, end).then_some(shadow)
+}
+
+/// What [`FOUND`] stamps its answers with: the count of changes of [`BUFFERS`], or with `VICTORY_RANGE_VALID=1` of the log.
+fn found_stamp() -> u64 {
+    if range_valid() { CHANGES.stamp() } else { BUFFERS_CHANGED.load(Ordering::SeqCst) }
+}
+
+/// Whether an answer of [`FOUND`] for the ask `[lo, hi)` stamped with `stamp` holds still.
+fn found_still(stamp: u64, lo: u64, hi: u64) -> bool {
+    if range_valid() { !CHANGES.changed_since(stamp, lo, hi) } else { BUFFERS_CHANGED.load(Ordering::SeqCst) == stamp }
 }
 
 /// Remembers an answer given while `changed` was the count.
@@ -5750,7 +5800,8 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
-    buffers_for(0).insert(
+    let mut map = buffers_for(0);
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -5758,11 +5809,15 @@ pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
             gpu_only,
         },
     );
+    changed(start, start + len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers_for(1).remove(&(start, resource));
+    let mut map = buffers_for(1);
+    if let Some(entry) = map.remove(&(start, resource)) {
+        changed(start, entry.end);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5791,6 +5846,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        for key in &keys {
+            changed(key.0, key.0 + key.1);
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
         if !gone.is_empty() {
             moved(6);
@@ -5799,8 +5857,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers_for(2);
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        for (key, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+                changed(key.0, entry.end);
                 gone.extend(entry.shadow.take());
             }
         }
@@ -5873,7 +5932,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
                     // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, found_stamp(), shadow);
                 }
                 return Some(shadow.clone());
             }
@@ -6279,10 +6338,12 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         // (The number is read before the lock: see `crate::asked`.)
-        let stamp = world();
+        let stamp = stamp();
         let asked = ask_cache();
+        let (lo, hi) = (named.0, named.0.saturating_add(named.1));
         if asked
-            && let Some(shadow) = LOOSE_FOUND.with(|f| f.borrow().as_ref().and_then(|f| f.get(named.0, named.1, world)))
+            && let Some(shadow) =
+                LOOSE_FOUND.with(|f| f.borrow().as_ref().and_then(|f| f.get(named.0, named.1, |st| still(st, lo, hi))))
         {
             note(&shadow);
             return Some(shadow);
@@ -6324,6 +6385,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(&shadow);
         map.insert((start, len), shadow.clone());
         moved(7);
+        changed(start, start + len);
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -6338,6 +6400,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         note(&shadow);
         map.insert((start, len), shadow.clone());
         moved(7);
+        changed(start, start + len);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6376,6 +6439,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     note(&shadow);
     map.insert((start, len), shadow.clone());
     moved(7);
+    changed(start, start + len);
     Some(shadow)
 }
 
@@ -6432,6 +6496,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         });
         if map.len() != before {
             moved(8);
+            // (Which went is not looked at: all views' own copies are of memory in no buffer or window.)
+            changed(0, u64::MAX);
         }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
@@ -6441,6 +6507,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
     moved(8);
+    changed(address, address.saturating_add(len));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -6993,5 +7060,86 @@ mod ask_cache_tests {
                 });
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod range_valid_tests {
+    use super::*;
+
+    /// The tests that turn range validity on take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// With `VICTORY_RANGE_VALID` a buffer that comes or goes changes what is stamped for its own addresses and for no others.
+    #[test]
+    fn a_buffer_changes_the_stamps_of_its_addresses_only() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        TEST_RANGE_VALID.store(true, Ordering::Relaxed);
+        // Addresses no title memory has (tests on other threads log changes of their own memory at any time, and a log that
+        // has seen too many since a stamp cannot tell: the part about the range outside is tried again then).
+        let (a, len) = (0x7f10_0000_0000u64, 4096u64);
+        let (inside, outside) = ((a + 100, a + 200), (a + (64 << 20), a + (64 << 20) + 100));
+        let mut told = false;
+        for _ in 0..16 {
+            let at_start = stamp();
+            register(0x5eed_0001, a, len, false);
+            // A change inside always shows.
+            assert!(!still(at_start, inside.0, inside.1), "a buffer registered over the range");
+            let registered = stamp();
+            unregister(0x5eed_0001, a);
+            assert!(!still(registered, inside.0, inside.1), "a buffer unregistered from it");
+            if still(at_start, outside.0, outside.1) {
+                told = true;
+                break;
+            }
+        }
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+        assert!(told, "a range nobody changed was said to be changed 16 times");
+    }
+    /// Threads that ask for windows again and again while another changes things all over (but not there): the one window each
+    /// time, with the asks remembered by range.
+    #[test]
+    fn asks_remembered_by_range_give_the_one_window_while_others_change() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        TEST_RANGE_VALID.store(true, Ordering::Relaxed);
+        TEST_ASK_CACHE.store(true, Ordering::Relaxed);
+        let memory = vec![0u8; 64 << 10];
+        let at = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let Some(first) = find(at, 256) else {
+            TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+            return; // no host GPU
+        };
+        let expected: Vec<Arc<Shadow>> = (0..8u64).map(|k| find(at + k * 256, 256).expect("a window")).collect();
+        assert!(Arc::ptr_eq(&first, &expected[0]));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut i = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    // Buffers that come and go far from the window.
+                    register(0x5eed_1000 + i as usize % 4, 0x7f30_0000_0000 + i % 4 * 0x10_0000, 4096, false);
+                    unregister(0x5eed_1000 + i as usize % 4, 0x7f30_0000_0000 + i % 4 * 0x10_0000);
+                    i += 1;
+                    std::thread::yield_now();
+                }
+            });
+            let workers: Vec<_> = (0..4u64)
+                .map(|t| {
+                    let expected = &expected;
+                    s.spawn(move || {
+                        for i in 0..2000u64 {
+                            let k = ((i + t) % 8) as usize;
+                            let again = find(at + k as u64 * 256, 256).expect("the window is there");
+                            assert!(Arc::ptr_eq(&expected[k], &again));
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
     }
 }

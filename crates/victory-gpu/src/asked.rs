@@ -25,16 +25,16 @@ impl<T> Asked<T> {
         (h >> 40) as usize % self.slots.len()
     }
 
-    /// The answer to the ask `(a, b)` if it was made when the number was `now()` and still is.
-    pub(crate) fn get(&self, a: u64, b: u64, now: impl Fn() -> u64) -> Option<Arc<T>> {
-        let stamp = now();
-        let (ka, kb, kn, held) = &self.slots[self.at(a, b)];
-        if (*ka, *kb, *kn) != (a, b, stamp) {
+    /// The answer to the ask `(a, b)` if what it was stamped with still holds (`still(stamp)`: the number is as it was, or
+    /// nothing changed in the range of the answer since), before the hold was made strong and after.
+    pub(crate) fn get(&self, a: u64, b: u64, still: impl Fn(u64) -> bool) -> Option<Arc<T>> {
+        let (ka, kb, stamp, held) = &self.slots[self.at(a, b)];
+        if (*ka, *kb) != (a, b) || !still(*stamp) {
             return None;
         }
         let answer = held.upgrade()?;
         fence(Ordering::SeqCst);
-        (now() == stamp).then_some(answer)
+        still(*stamp).then_some(answer)
     }
 
     /// `answer` was given for the ask `(a, b)` while the number was `stamp` (read before the ask).
@@ -54,20 +54,21 @@ mod tests {
     fn an_answer_is_given_back_while_the_number_stays() {
         let mut asked: Asked<u32> = Asked::new(8);
         let answer = Arc::new(7u32);
-        assert!(asked.get(1, 2, || 5).is_none());
+        assert!(asked.get(1, 2, |st| st == 5).is_none());
         asked.put(1, 2, 5, &answer);
-        assert_eq!(asked.get(1, 2, || 5).as_deref(), Some(&7));
+        assert_eq!(asked.get(1, 2, |st| st == 5).as_deref(), Some(&7));
         // Another ask, another number: nothing.
-        assert!(asked.get(1, 3, || 5).is_none());
-        assert!(asked.get(1, 2, || 6).is_none());
+        assert!(asked.get(1, 3, |st| st == 5).is_none());
+        // (Another number: what is stamped is not what holds.)
+        assert!(asked.get(1, 2, |st| st == 6).is_none());
         // Nobody holds it any more: nothing (the weak hold is no hold).
         drop(answer);
-        assert!(asked.get(1, 2, || 5).is_none());
+        assert!(asked.get(1, 2, |st| st == 5).is_none());
         // The number moves while the hold is made strong: nothing.
         let answer = Arc::new(8u32);
         asked.put(1, 2, 5, &answer);
         let n = std::cell::Cell::new(5);
-        assert!(asked.get(1, 2, || n.replace(n.get() + 1)).is_none());
+        assert!(asked.get(1, 2, |st| st == n.replace(n.get() + 1)).is_none());
     }
 
     #[test]
@@ -76,8 +77,8 @@ mod tests {
         let (a, b) = (Arc::new(1u32), Arc::new(2u32));
         asked.put(1, 1, 0, &a);
         asked.put(2, 2, 0, &b);
-        assert!(asked.get(1, 1, || 0).is_none());
-        assert_eq!(asked.get(2, 2, || 0).as_deref(), Some(&2));
+        assert!(asked.get(1, 1, |st| st == 0).is_none());
+        assert_eq!(asked.get(2, 2, |st| st == 0).as_deref(), Some(&2));
     }
 
     /// Threads that ask while another changes what is answered and moves the number: never the answer of another
@@ -112,7 +113,7 @@ mod tests {
                         i = i.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                         let k = (i >> 33) % ASKS;
                         let now = || world.load(Ordering::SeqCst);
-                        let answer = match asked.get(k, 0, now) {
+                        let answer = match asked.get(k, 0, |st| st == now()) {
                             Some(a) => a,
                             None => {
                                 let stamp = now();
@@ -132,7 +133,7 @@ mod tests {
             let stamp = world.load(Ordering::SeqCst);
             let a = map.lock().unwrap()[k as usize].clone();
             asked.put(k, 0, stamp, &a);
-            let again = asked.get(k, 0, || world.load(Ordering::SeqCst)).unwrap();
+            let again = asked.get(k, 0, |st| st == world.load(Ordering::SeqCst)).unwrap();
             assert!(Arc::ptr_eq(&a, &again));
             assert_eq!(again.1, 399 + 0);
         }

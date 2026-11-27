@@ -6203,7 +6203,9 @@ impl ListView {
 /// [`Over::FLUSH_MS`] are used up (what it holds holds the host copies it shows, which are let go of when nothing
 /// shows them).
 struct Over<V> {
-    map: std::collections::HashMap<[u32; 3], (u64, V), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// By record: the stamp ([`crate::shadow::stamp`]) it was made at, the title addresses its host copy was found
+    /// on, and what was made.
+    map: std::collections::HashMap<[u32; 3], (u64, (u64, u64), V), std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     /// The next slot free of the first [`ListViews::KEEP_SLOTS`] (a view takes two).
     next: u32,
     since: u64,
@@ -6225,10 +6227,10 @@ impl<V> Over<V> {
         Over { map: Default::default(), next: 0, since: 0 }
     }
 
-    fn find(&self, words: &[u32; 3], world: u64, slot_of: impl Fn(&V) -> u32) -> Found<'_, V> {
+    fn find(&self, words: &[u32; 3], still: impl Fn(u64, u64, u64) -> bool, slot_of: impl Fn(&V) -> u32) -> Found<'_, V> {
         match self.map.get(words) {
-            Some((was, v)) if *was == world => Found::Hit(v),
-            Some((_, v)) => Found::Stale(slot_of(v)),
+            Some((stamp, (lo, hi), v)) if still(*stamp, *lo, *hi) => Found::Hit(v),
+            Some((_, _, v)) => Found::Stale(slot_of(v)),
             None => Found::Miss,
         }
     }
@@ -6387,10 +6389,10 @@ impl ListViews {
     fn make(&mut self, words: [u32; 3]) -> Option<ListView> {
         let cache = view_cache();
         // (Before anything is looked at: a change after it makes what is made stale at once.)
-        let world = crate::shadow::world();
+        let stamp = crate::shadow::stamp();
         let mut again = None;
         if cache != 0 {
-            match self.over.find(&words, world, |m| m.at) {
+            match self.over.find(&words, crate::shadow::still, |m| m.at) {
                 Found::Hit(made) => {
                     let made = made.clone();
                     if cache < 2 || self.same_as_new(&made) {
@@ -6439,7 +6441,15 @@ impl ListViews {
         });
         // (Only one that lies in the part of the heap that is kept.)
         if keep && at < Self::KEEP_SLOTS {
-            self.over.map.insert(words, (world, made.clone()));
+            // The addresses its copy was found on: the view's own, and the whole buffer it is of.
+            let (mut lo, mut hi) = (u64::MAX, 0u64);
+            for (at, len) in [buffer_range(&made.view), buffer_extent(&made.view)].into_iter().flatten() {
+                (lo, hi) = (lo.min(at), hi.max(at.saturating_add(len.max(1))));
+            }
+            if lo >= hi {
+                (lo, hi) = (0, u64::MAX);
+            }
+            self.over.map.insert(words, (stamp, (lo, hi), made.clone()));
         }
         Some(ListView::of(made))
     }
@@ -6608,13 +6618,24 @@ mod view_cache_tests {
     fn a_view_found_again_is_a_hit_until_the_copies_change() {
         let mut over: Over<u32> = Over::new();
         let words = [1, 2, 3];
-        assert!(matches!(over.find(&words, 7, |&at| at), Found::Miss));
+        let holds = |now: u64| move |stamp: u64, _: u64, _: u64| stamp == now;
+        assert!(matches!(over.find(&words, holds(7), |&at| at), Found::Miss));
         let at = over.slots(8).unwrap();
-        over.map.insert(words, (7, at));
-        assert!(matches!(over.find(&words, 7, |&at| at), Found::Hit(&0)));
+        over.map.insert(words, (7, (0, u64::MAX), at));
+        assert!(matches!(over.find(&words, holds(7), |&at| at), Found::Hit(&0)));
         // Another record is no hit, and the copies being others makes it stale, with its slot to make it in again.
-        assert!(matches!(over.find(&[1, 2, 4], 7, |&at| at), Found::Miss));
-        assert!(matches!(over.find(&words, 8, |&at| at), Found::Stale(0)));
+        assert!(matches!(over.find(&[1, 2, 4], holds(7), |&at| at), Found::Miss));
+        assert!(matches!(over.find(&words, holds(8), |&at| at), Found::Stale(0)));
+        // By range: what changed elsewhere does not make it stale, what changed in its range does.
+        over.map.insert(words, (7, (1000, 2000), at));
+        let log = crate::changes::ChangeLog::new();
+        let stamp = log.stamp();
+        over.map.insert(words, (stamp, (1000, 2000), at));
+        log.log(5000, 6000);
+        let in_range = |stamp: u64, lo: u64, hi: u64| !log.changed_since(stamp, lo, hi);
+        assert!(matches!(over.find(&words, in_range, |&at| at), Found::Hit(_)));
+        log.log(1500, 1501);
+        assert!(matches!(over.find(&words, in_range, |&at| at), Found::Stale(0)));
     }
 
     #[test]
@@ -6632,7 +6653,7 @@ mod view_cache_tests {
         // Nothing kept: nothing to begin again, the clock starts.
         assert!(!over.begin(1000, 8));
         let at = over.slots(8).unwrap();
-        over.map.insert([1, 2, 3], (7, at));
+        over.map.insert([1, 2, 3], (7, (0, u64::MAX), at));
         assert!(!over.begin(1000 + Over::<u32>::FLUSH_MS - 1, 8));
         assert_eq!(over.map.len(), 1);
         // Old.
@@ -6640,7 +6661,7 @@ mod view_cache_tests {
         assert!(over.map.is_empty());
         assert_eq!(over.slots(8), Some(0));
         // Full (the slots left are fewer than a view's).
-        over.map.insert([1, 2, 3], (7, 0));
+        over.map.insert([1, 2, 3], (7, (0, u64::MAX), 0));
         for _ in 0..3 {
             over.slots(8);
         }

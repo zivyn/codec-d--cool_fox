@@ -993,6 +993,45 @@ pub(crate) fn untouched_since(start: usize, end: usize, tick: u64) -> bool {
         && (first..last).all(|block| STAMPED[block % STAMPS].load(std::sync::atomic::Ordering::SeqCst) <= tick)
 }
 
+/// The blocks of buffers the title's CPU cannot write (a default heap) that
+/// a copy in the card's memory may skip refreshing ([`quiet_mark`]); set
+/// for good, so that a block shared by two buffers stays marked.
+static QUIET: Bits = Bits::new();
+
+/// Blocks of `[start, end)` are those of a buffer no CPU of the title
+/// writes: the announcements of writes to title memory ([`quiet_touched`])
+/// stamp them from now on.
+pub(crate) fn quiet_mark(start: usize, end: usize) {
+    for block in start / BLOCK..end.div_ceil(BLOCK) {
+        QUIET.set(block);
+    }
+}
+
+/// Title memory `[at, at + len)` is written by someone but the title's own
+/// CPU stores (the runtime, a file read, DirectStorage, our copies of the
+/// title's buffers, memory given up): what a copy noted of the marked blocks
+/// there is void.
+fn quiet_touched(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len.max(1)).div_ceil(BLOCK));
+    if !QUIET.any(first, last) {
+        return;
+    }
+    for block in first..last {
+        if QUIET.any(block, block + 1) {
+            stamp(block);
+        }
+    }
+}
+
+/// Whether nothing was announced written in `[start, end)` since `tick`
+/// (read ahead of the look the note stands for): of marked blocks.
+pub(crate) fn quiet_since(start: usize, end: usize, tick: u64) -> bool {
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    last - first < STAMPS
+        && QUIET.all(first, last)
+        && (first..last).all(|block| STAMPED[block % STAMPS].load(std::sync::atomic::Ordering::SeqCst) <= tick)
+}
+
 /// Clears `block`'s bit, noting that it was touched.
 fn unpublish(block: usize) {
     stamp(block);
@@ -1579,7 +1618,7 @@ pub(crate) fn landing(at: usize, len: usize) {
             }
         }
     }
-    writing(at, len);
+    open_for_writing(at, len);
 }
 
 
@@ -2087,6 +2126,13 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    quiet_touched(at, len);
+    open_for_writing(at, len);
+}
+
+/// [`writing`] without telling the copies that skip refreshes: the landing
+/// of what shaders wrote (it puts the same bytes into the copy's CPU side).
+fn open_for_writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
     let last = at.saturating_add(len).div_ceil(BLOCK);
     if !light() || PROTECTED.any(at / BLOCK, last) {
@@ -2114,6 +2160,7 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    quiet_touched(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
         let mut g = guards_timed();
@@ -2194,6 +2241,7 @@ pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::syn
 /// the texture pass.
 pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     use std::sync::atomic::Ordering::Relaxed;
+    quiet_touched(at, len);
     if len == 0 {
         return;
     }
@@ -2255,6 +2303,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// ([`views_mapped`]). What is guarded of its pages at other views is opened,
 /// and not guarded again before the change is done ([`Remapping`]).
 pub fn title_memory_splitting(at: usize, len: usize) {
+    quiet_touched(at, len);
     let others: Vec<usize> = elsewhere(at, len).into_iter().flat_map(|(_, others)| others).collect();
     if others.is_empty() {
         return;
@@ -2576,6 +2625,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
 fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+    quiet_touched(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2781,6 +2831,32 @@ mod stamp_tests {
         assert!(untouched_since(start + 2 * BLOCK, end, after));
         // Memory whose bits are not set is not known, whatever the stamps.
         assert!(!untouched_since(end, end + BLOCK, tick()));
+    }
+
+    #[test]
+    fn announced_writes_void_what_is_known_of_marked_blocks_and_landings_do_not() {
+        let first = 0x6100_0000usize;
+        let (start, end) = (first * BLOCK + 100, (first + 4) * BLOCK - 100);
+        // Not marked: nothing is known of it.
+        let before = tick();
+        assert!(!quiet_since(start, end, before));
+        quiet_mark(start, end);
+        assert!(quiet_since(start, end, before));
+        // A write beside the buffer, in no marked block, changes nothing.
+        quiet_touched((first + 8) * BLOCK, 64);
+        assert!(quiet_since(start, end, before));
+        // One inside a block of it, by whoever tells of it, voids the note.
+        quiet_touched((first + 2) * BLOCK + 5, 8);
+        assert!(!quiet_since(start, end, before));
+        assert!(quiet_since(start, (first + 2) * BLOCK, before));
+        let after = tick();
+        assert!(quiet_since(start, end, after));
+        // What shaders landed is the copy's own bytes put into title
+        // memory: it does not tell.
+        open_for_writing((first + 1) * BLOCK, 64);
+        assert!(quiet_since(start, end, after));
+        writing((first + 3) * BLOCK, 64);
+        assert!(!quiet_since(start, end, after));
     }
 }
 

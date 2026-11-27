@@ -56,6 +56,14 @@ pub(crate) struct Shadow {
     /// Ranges a look found nothing new in, and still holds
     /// ([`Shadow::nothing_new`]).
     settled: Settled,
+    /// Of a buffer in a heap the title's CPU cannot write: the one range
+    /// taken whole last, with the tick before it was
+    /// ([`Shadow::quiet_skip`]).
+    quiet: Mutex<Option<(usize, usize, u64)>>,
+    /// Whether the buffer is such ([`Shadow::mark_gpu_only`]).
+    gpu_only: std::sync::atomic::AtomicBool,
+    /// The next window of the range [`Shadow::quiet_skip`] compares.
+    quiet_window: AtomicU64,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -1363,6 +1371,14 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+/// Whether a copy in the card's memory of a buffer the title's CPU cannot
+/// write skips refreshing what nobody told of a write
+/// (`VICTORY_QUIET_COPIES=0`: its memory is copied whole at every refresh,
+/// 21 MB twice a frame for the FSR4 working buffer).
+fn quiet_on() -> bool {
+    crate::toggled!("VICTORY_QUIET_COPIES")
 }
 
 /// Whether a copy notes the ranges it found nothing new in, and takes them
@@ -3179,6 +3195,9 @@ impl Shadow {
             ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             settled: Settled::default(),
+            quiet: Mutex::default(),
+            gpu_only: Default::default(),
+            quiet_window: AtomicU64::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -4041,16 +4060,84 @@ impl Shadow {
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
+        if self.quiet_skip(from, to) {
+            return 0;
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         self.whole_check(from, to);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
+        let tick = crate::watch::tick();
         self.copy(from, to);
+        if self.quiet_able(from, to) {
+            *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) = Some((from, to, tick));
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// The buffer is in a heap the title's CPU cannot write (default, no CPU
+    /// pages): what it holds in title memory is what its copy's CPU side
+    /// holds, as shaders on the card and their landing keep it, until
+    /// someone tells of a write there (`crate::watch::quiet_touched`).
+    pub(crate) fn mark_gpu_only(&self) {
+        crate::watch::quiet_mark(self.start as usize, (self.start + self.len) as usize);
+        self.gpu_only.store(true, Ordering::Release);
+    }
+
+    /// Whether a refresh of `[from, to)` of memory that is not watched may
+    /// take whole copies for noted ([`Shadow::quiet_skip`]).
+    fn quiet_able(&self, from: usize, to: usize) -> bool {
+        self.card.is_some() && to - from >= WHOLE_LONG && self.gpu_only.load(Ordering::Acquire) && quiet_on()
+    }
+
+    /// Whether a whole copy of `[from, to)` is left out: the last was taken
+    /// of a range that holds it, nothing was told written there since, and a
+    /// window of the range (the next of its 256 KiB pieces each time) is
+    /// the same in title memory and in the copy. A window that differs
+    /// (what no announcement told of) forgets the note and the range is
+    /// taken whole. Such a copy took 42 MB and 11 ms a frame to be what it
+    /// was already (run V3b: no page differed in any copy of it).
+    fn quiet_skip(&self, from: usize, to: usize) -> bool {
+        if !self.quiet_able(from, to) {
+            return false;
+        }
+        let Some((a, b, tick)) = *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) else {
+            return false;
+        };
+        if a > from || to > b || !crate::watch::quiet_since(from, to, tick) {
+            return false;
+        }
+        const WINDOW: usize = 256 << 10;
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let windows = (to - from).div_ceil(WINDOW);
+        let at = from + (self.quiet_window.fetch_add(1, Ordering::Relaxed) as usize % windows) * WINDOW;
+        let n = WINDOW.min(to - at);
+        let same = TITLE.with_borrow_mut(|title| {
+            title.resize(n, 0);
+            // SAFETY: inside the copy's mapping (`update` cut the range).
+            let held = unsafe { std::slice::from_raw_parts(self.data.add(at - self.start as usize).cast_const(), n) };
+            crate::host::read_into(at as *const u8, title) && title[..] == *held
+        });
+        if !same {
+            *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+            if said.is_power_of_two() {
+                tracing::warn!(
+                    said,
+                    copy = self.id,
+                    at = format_args!("{at:#x}"),
+                    "a buffer that no CPU of the title writes differs from its copy where nothing told of a write: taken whole"
+                );
+            }
+        }
+        same
     }
 
     /// Diagnostic (`VICTORY_WHOLE_CHECK=1`; off by default): before a long
@@ -5075,6 +5162,8 @@ mod land_tests {
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
+    /// In a heap the title's CPU cannot write ([`Shadow::mark_gpu_only`]).
+    gpu_only: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -5148,12 +5237,13 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 }
 
 /// A title buffer exists at `start` (`len` bytes).
-pub(crate) fn register(resource: usize, start: u64, len: u64) {
+pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
+            gpu_only,
         },
     );
 }
@@ -5346,6 +5436,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
+        if entry.gpu_only && shadow.card.is_some() {
+            shadow.mark_gpu_only();
+        }
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
@@ -5985,5 +6078,53 @@ mod settled_tests {
         s.note(20, 30, 8, e);
         assert!(s.holds(20, 30, e, |tick| tick == 9));
         assert!(s.holds(40, 50, e, |_| true));
+    }
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::Shadow;
+
+    const LEN: usize = 5 << 20;
+    const WINDOW: usize = 256 << 10;
+
+    #[test]
+    fn a_buffer_no_cpu_writes_is_taken_whole_once_and_then_as_it_is_told() {
+        let mut title: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+        let mut held = vec![0u8; LEN];
+        let start = title.as_ptr() as usize;
+        let shadow = Shadow::unbacked(start as u64, held.as_mut_ptr(), LEN as u64, true);
+        shadow.mark_gpu_only();
+        // The first refresh takes it whole.
+        assert_eq!(shadow.update(start, LEN), LEN);
+        assert_eq!(held, title);
+        // A change nobody told of, outside the window looked at, is not
+        // seen: the refresh is left out and the copy is as it was.
+        title[3 << 20] ^= 0xff;
+        assert_eq!(shadow.update(start, LEN), 0);
+        assert_ne!(held[3 << 20], title[3 << 20]);
+        // Told (as the runtime, a file read, a copy of ours or an unmapping
+        // does), it is taken whole again.
+        crate::watch::writing(start + (3 << 20), 8);
+        assert_eq!(shadow.update(start, LEN), LEN);
+        assert_eq!(held, title);
+        // Left out again; and a change in the next window looked at is found
+        // by the compare, though nobody told, and the range is taken whole.
+        title[WINDOW + 100] ^= 0xff;
+        assert_eq!(shadow.update(start, LEN), LEN);
+        assert_eq!(held, title);
+        assert_eq!(shadow.update(start, LEN), 0);
+    }
+
+    #[test]
+    fn a_buffer_the_titles_cpu_may_write_is_taken_whole_every_time() {
+        let mut title: Vec<u8> = (0..LEN).map(|i| (i % 241) as u8).collect();
+        let mut held = vec![0u8; LEN];
+        let start = title.as_ptr() as usize;
+        let shadow = Shadow::unbacked(start as u64, held.as_mut_ptr(), LEN as u64, true);
+        assert_eq!(shadow.update(start, LEN), LEN);
+        title[3 << 20] ^= 0xff;
+        assert_eq!(shadow.update(start, LEN), LEN);
+        assert_eq!(held, title);
     }
 }

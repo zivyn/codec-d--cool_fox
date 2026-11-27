@@ -294,6 +294,14 @@ pub(super) fn fetched(copy: u64, at: usize) {
     known.entry(copy).or_default().fetched.insert(at / PIECE, crate::frame::current());
 }
 
+/// Keeps what is known of the copies `live` names and lets the rest go: an
+/// id is never given to another copy, so what was known of a copy that is
+/// gone is never asked for again.
+fn forget_gone(known: &mut BTreeMap<u64, Known>, live: impl IntoIterator<Item = u64>) {
+    let live: std::collections::HashSet<u64> = live.into_iter().collect();
+    known.retain(|copy, _| live.contains(copy));
+}
+
 fn known(copy: u64, at: usize) -> String {
     let all = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     let Some(known) = all.get(&copy) else {
@@ -511,8 +519,15 @@ fn run(host: &Host, f: impl FnOnce(&ID3D12GraphicsCommandList)) -> Option<()> {
 
 /// The words that differ.
 fn look(host: &Host) -> Option<u64> {
-    let pass = pass(host)?;
     let copies = crate::shadow::carded_copies();
+    // (Before anything that can fail. Nothing declares or fetches meanwhile:
+    // what is known of copies that are gone is let go, or `KNOWN` would keep
+    // an entry per copy ever written.)
+    {
+        let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+        forget_gone(&mut known, copies.iter().map(|s| s.id()));
+    }
+    let pass = pass(host)?;
     // (copy, offset, bytes)
     let mut pieces: Vec<(std::sync::Arc<Shadow>, usize, usize)> = Vec::new();
     for shadow in &copies {
@@ -665,6 +680,25 @@ mod tests {
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).remove(&u64::MAX).expect("noted");
         let [t] = &noted[..] else { panic!("one piece") };
         assert_eq!((t.at, &t.was[..], &t.new[..]), (8, &was[3..11], &new[3..11]));
+    }
+
+    #[test]
+    fn what_is_known_of_a_copy_that_is_gone_is_let_go() {
+        // (A map of its own: `KNOWN` is the process's.)
+        let mut known = BTreeMap::new();
+        for copy in [3u64, 5, 8] {
+            let of: &mut Known = known.entry(copy).or_default();
+            of.declared.push((0, 64));
+            of.fetched.insert(0, copy);
+        }
+        // 5 is gone; 13 lives and nothing is known of it.
+        forget_gone(&mut known, [8, 3, 13]);
+        assert_eq!(known.keys().copied().collect::<Vec<_>>(), [3, 8]);
+        for (copy, of) in &known {
+            assert_eq!((&of.declared[..], of.fetched.get(&0)), (&[(0, 64)][..], Some(copy)));
+        }
+        forget_gone(&mut known, []);
+        assert!(known.is_empty());
     }
 
     /// The tests below want processes of their own with the relay on: each

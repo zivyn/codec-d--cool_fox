@@ -185,7 +185,7 @@ pub(crate) struct HostHeap {
     /// With `VICTORY_KEEP_FAST=1`: the address of what each slot of `kept` holds, written under its lock, so that
     /// the draw that shows a slot what it shows already finds that out without taking the lock and touching the
     /// slot's own line (the lock took 3 to 4 % of the list threads' time: nearly every ask is for the same again).
-    kept: super::sparse::Pages<ID3D12Resource>,
+    kept_raw: Box<[std::sync::atomic::AtomicUsize]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,

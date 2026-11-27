@@ -207,6 +207,17 @@ pub(crate) fn warmup_seconds() -> Option<u64> {
     get("VICTORY_WARMUP_RESTART").parse().ok().filter(|s| *s > 0)
 }
 
+/// Marks this victory.exe as warmed up, whether it went down. Only a
+/// written mark can end the warm-up: the launcher arms a new one whenever
+/// none exists (`apps/victory/src/play.rs`, `warmup_mark`), so the write's
+/// result is what decides whether the restart is safe to do.
+fn mark_written(mark: &std::path::Path) -> bool {
+    if let Some(dir) = mark.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    std::fs::write(mark, "this victory.exe was warmed up (its first start, then a restart)\r\n").is_ok()
+}
+
 /// The start's notice lines for the warm-up start ([`warmup_seconds`]).
 pub(crate) fn warmup_notice(seconds: u64) -> Vec<String> {
     vec![
@@ -680,14 +691,17 @@ impl Menu {
         }
         DONE.store(true, Ordering::Relaxed);
         let mark = std::path::PathBuf::from(get("VICTORY_WARMUP_MARK"));
-        if !mark.as_os_str().is_empty() {
-            if let Some(dir) = mark.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(&mark, "this victory.exe was warmed up (its first start, then a restart)\r\n");
+        let marked = mark.as_os_str().is_empty() || mark_written(&mark);
+        if marked {
+            tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
+            self.restart(false);
+        } else {
+            // The launcher arms a warm-up whenever no mark exists: one the
+            // host could not write would have the game come back here for
+            // ever, so this start goes on at its slow pace instead.
+            tracing::warn!(mark = %mark.display(), "first start: the warmed mark could not be written; the game goes on, no restart");
+            self.note = "WARMED UP, BUT THE MARK WOULD NOT WRITE: THIS RUN GOES ON".to_owned();
         }
-        tracing::info!(seconds, mark = %mark.display(), "first start of this victory.exe: warmed up; the game starts again");
-        self.restart(false);
     }
 
     /// Reads which saves `Saves` holds, keeping the one picked if it is still there.
@@ -923,6 +937,19 @@ impl Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A mark that lands ends the warm-up; one that cannot (here, beside a
+    /// file of the same name) does not: the launcher arms a new warm-up
+    /// whenever no mark exists, and a restart without one would come back
+    /// here for ever.
+    #[test]
+    fn a_mark_that_cannot_be_written_does_not_end_the_warm_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("a file");
+        std::fs::write(&blocked, b"not a folder").unwrap();
+        assert!(mark_written(&dir.path().join("warmed").join("mark")));
+        assert!(!mark_written(&blocked.join("mark")));
+    }
 
     #[test]
     fn a_change_is_saved_at_once_however_the_game_was_started() {

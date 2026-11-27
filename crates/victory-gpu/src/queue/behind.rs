@@ -855,6 +855,15 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames
     );
+    if let Some([splits, before, lists]) = crate::host::take_blocked_splits() {
+        tracing::info!(
+            "joined submissions that waited for flights, per frame (VICTORY_SPLIT_BLOCKED): {:.2} with parts in front of the wait \
+             ({:.1} lists in those parts of {:.1} in all; with =1 they are prepared and sent before the wait, with =2 only counted)",
+            splits as f64 / frames,
+            before as f64 / frames,
+            lists as f64 / frames
+        );
+    }
 }
 
 #[cfg(test)]

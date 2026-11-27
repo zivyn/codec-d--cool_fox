@@ -3047,6 +3047,13 @@ impl<'a> Lower<'a> {
             self.read_phis.insert(v);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        if let Some(&Val::Missing(why)) = self.vals.get(&v)
+            && is_mask
+            && self.mask_ok
+            && std::env::var_os("VICTORY_MASK_WHY").is_some()
+        {
+            eprintln!("MASK-WHY {v:?} has no value of its own ({why}) and is a mask: read as data at {:#x}", self.at_offset);
+        }
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);

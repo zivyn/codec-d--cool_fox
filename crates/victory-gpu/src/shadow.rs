@@ -251,6 +251,48 @@ fn within_cap(held: u64, size: u64, most: u64) -> bool {
     held.saturating_add(size) <= allowed
 }
 
+/// Whether the big copies (a title buffer of [`BIG_COPY`] or more) come
+/// first (`VICTORY_CARD_BIG_FIRST=0`: as before): the texture queue keeps
+/// [`BIG_RESERVE`] free for them until one is made or turned down, and one
+/// is made up to the whole of the card's budget where the others stop at
+/// 97 hundredths ([`copy_line`]).
+///
+/// Run V4d (a warm start: the cache made the textures first): the card held
+/// 6,157 MB of a budget of 6,346 when the title's upscaler made its 21 MB
+/// working buffer, 97 hundredths were 6,155 MB, and the buffer stayed in the
+/// PC's memory: copied whole twice a frame and read over the bus by nine
+/// passes, 400 ms a frame against 165 with it on the card. The cap on the
+/// copies' bytes was not what turned it down ([`within_cap`] gives big copies
+/// half as much again); the line was, and the room kept for the copies was
+/// used up by the 1,200 small ones.
+fn big_first() -> bool {
+    crate::toggled!("VICTORY_CARD_BIG_FIRST")
+}
+
+/// The bytes of the card's memory kept for the big copies not made yet.
+const BIG_RESERVE: u64 = 64 << 20;
+
+/// The bytes of big copies made, and of big copies turned down, since the
+/// start (the reserve is used up by either).
+static CARD_BIG: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What is left of [`BIG_RESERVE`] when `made` bytes of big copies were made
+/// and `refused` turned down.
+fn big_reserve(made: u64, refused: u64) -> u64 {
+    BIG_RESERVE.saturating_sub(made.saturating_add(refused))
+}
+
+/// The part of the card's budget, in hundredths, a copy of `size` bytes may
+/// be made up to: 97 with the room kept for copies (a big one, 100, when
+/// they come first), else 80.
+fn copy_line(size: u64, room_kept: bool, big_first: bool) -> u64 {
+    match (room_kept, big_first && size >= BIG_COPY) {
+        (true, true) => 100,
+        (true, false) => 97,
+        (false, _) => 80,
+    }
+}
+
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
@@ -347,7 +389,14 @@ pub(crate) fn card_room_kept() -> u64 {
     // no texture was made any more with 5 GB of the card free (session
     // play-1125-0127: 1,453 passes refused, the ground and people black).
     const SEEN: u64 = 1 << 30;
-    card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    let kept = card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed));
+    // (The big ones' too, until one comes: the small ones used up all of the
+    // rest before it did.)
+    if big_first() {
+        kept + big_reserve(CARD_BIG[0].load(Ordering::Relaxed), CARD_BIG[1].load(Ordering::Relaxed))
+    } else {
+        kept
+    }
 }
 
 /// The copies in the card's memory.
@@ -440,7 +489,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     // shrinks by the copies' bytes, at most `card_limits`' second number.
     // (With `card_room_kept_on` the texture queue kept this copy's room
     // free, and the copy may go up to the queue's own line.)
-    let hundredths = if card_room_kept_on() { 97 } else { 80 };
+    let hundredths = copy_line(size, card_room_kept_on(), big_first());
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 100 * hundredths
     {
@@ -449,6 +498,9 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         // 32nd.
         let n = CARD_REFUSED[0].fetch_add(1, Ordering::Relaxed) + 1;
         let bytes = CARD_REFUSED[1].fetch_add(size, Ordering::Relaxed) + size;
+        if size >= BIG_COPY {
+            CARD_BIG[1].fetch_add(size, Ordering::Relaxed);
+        }
         if n <= 64 || n.is_multiple_of(32) {
             tracing::info!(
                 "no card copy for a title buffer of {} KiB: the card has {} MB in use of a budget of {} MB and a copy is made up to \
@@ -487,6 +539,8 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+    } else if size >= BIG_COPY {
+        CARD_BIG[0].fetch_add(size, Ordering::Relaxed);
     }
     buffer
 }
@@ -5863,6 +5917,26 @@ mod window_tests {
         // Just under big: no margin.
         assert!(!within_cap(515 * MIB, 16 * MIB - 1, most));
         assert!(within_cap(0, u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn a_big_copy_goes_up_to_the_whole_budget_and_has_room_kept() {
+        use super::{BIG_COPY, BIG_RESERVE, big_reserve, copy_line};
+        const MIB: u64 = 1 << 20;
+        // Run V4d: 6,157 MB in use of 6,346, a copy of 20,608 KiB.
+        let (budget, used, size) = (6346 * MIB, 6157 * MIB, 20608 << 10);
+        let fits = |line: u64| used + size <= budget / 100 * line;
+        assert!(!fits(copy_line(size, true, false)));
+        assert!(fits(copy_line(size, true, true)));
+        // The small ones keep their line, and without room kept all do.
+        assert_eq!(copy_line(64 << 10, true, true), 97);
+        assert_eq!(copy_line(BIG_COPY - 1, true, true), 97);
+        assert_eq!(copy_line(BIG_COPY, true, true), 100);
+        assert_eq!(copy_line(BIG_COPY, false, true), 80);
+        // Room kept until a big copy is made or turned down.
+        assert_eq!(big_reserve(0, 0), BIG_RESERVE);
+        assert_eq!(big_reserve(21 * MIB, 0), BIG_RESERVE - 21 * MIB);
+        assert_eq!(big_reserve(40 * MIB, 40 * MIB), 0);
     }
 
     #[test]

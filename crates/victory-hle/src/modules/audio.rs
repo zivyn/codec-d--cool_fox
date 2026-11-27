@@ -623,6 +623,24 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             return false;
         }
         voice.ended = false;
+        // With the overlap kept, a refill goes on from the decoder only soon
+        // after the input ran out: a later one is another sound's, and its
+        // start must not be joined to the old tail.
+        if overlap::enabled()
+            && let Some(ended) = voice.trace.ended_ms
+            && overlap::stale(
+                voice
+                    .trace
+                    .since
+                    .elapsed()
+                    .as_millis()
+                    .saturating_sub(ended),
+            )
+            && let Some(decoder) = &mut voice.decoder
+        {
+            decoder.reset();
+            COUNTERS.overlap(stats::Overlap::Reset);
+        }
         if context.field(2, 26, 5) == INPUT_INVALID {
             context.set_field(2, 26, 6, 0);
         }

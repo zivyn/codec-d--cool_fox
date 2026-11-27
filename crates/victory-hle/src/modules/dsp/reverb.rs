@@ -19,6 +19,8 @@ const DAMPING: f32 = 0.35;
 /// simulation, checked by the test).
 const INJECTION: f32 = 0.35;
 const ALLPASS_GAIN: f32 = 0.5;
+/// An output this large (or not a number) means the network ran away.
+const RUNAWAY: f32 = 1.0e6;
 /// Below this a float is flushed to zero, out of the denormals.
 const FLOOR: f32 = 1e-18;
 
@@ -39,7 +41,10 @@ impl Allpass {
         let delayed = self.buffer[self.at];
         let v = x - ALLPASS_GAIN * delayed;
         self.buffer[self.at] = v;
-        self.at = (self.at + 1) % self.buffer.len();
+        self.at += 1;
+        if self.at == self.buffer.len() {
+            self.at = 0;
+        }
         delayed + ALLPASS_GAIN * v
     }
 }
@@ -64,6 +69,15 @@ impl Reverb {
             gain: DELAYS.map(|d| 10f32.powf(-3.0 * d as f32 / (rt60 * SAMPLE_RATE))),
             diffusers: DIFFUSERS.map(Allpass::new),
             level,
+        }
+    }
+
+    /// Forgets everything the network holds.
+    fn reset(&mut self) {
+        self.lines.iter_mut().for_each(|l| l.fill(0.0));
+        self.damped = [0.0; LINES];
+        for d in &mut self.diffusers {
+            d.buffer.fill(0.0);
         }
     }
 
@@ -125,7 +139,10 @@ impl Reverb {
         let norm = 1.0 / (LINES as f32).sqrt();
         for i in 0..LINES {
             self.lines[i][self.at[i]] = taps[i] * norm + x;
-            self.at[i] = (self.at[i] + 1) % DELAYS[i];
+            self.at[i] += 1;
+            if self.at[i] == DELAYS[i] {
+                self.at[i] = 0;
+            }
         }
         (left * norm, right * norm)
     }
@@ -155,15 +172,30 @@ impl Reverb {
                 c * frames + n
             }
         };
+        // A sample that is not a number would stay in the network for good.
+        let (mut input_peak, mut output_peak, mut repaired) = (0f32, 0f32, false);
         for n in 0..frames {
             let mut sum = 0.0;
             if !input.is_null() {
                 for c in 0..channels {
                     // SAFETY: inside the block, per the contract.
-                    sum += unsafe { input.add(index(n, c)).read() };
+                    let v = unsafe { input.add(index(n, c)).read() };
+                    if v.is_finite() {
+                        input_peak = input_peak.max(v.abs());
+                        sum += v;
+                    } else {
+                        repaired = true;
+                    }
                 }
             }
-            let (left, right) = self.step(sum / channels as f32);
+            let (mut left, mut right) = self.step(sum / channels as f32);
+            // Passive: the loop gain is below one. Larger is a fault.
+            if !(left.abs() <= RUNAWAY && right.abs() <= RUNAWAY) {
+                self.reset();
+                (left, right) = (0.0, 0.0);
+                repaired = true;
+            }
+            output_peak = output_peak.max(left.abs()).max(right.abs());
             // SAFETY: as above; every input of this frame is read already.
             unsafe {
                 output.add(index(n, 0)).write(left * gains[0] * self.level);
@@ -172,6 +204,7 @@ impl Reverb {
                 }
             }
         }
+        crate::modules::audio::stats::COUNTERS.reverb_block(input_peak, output_peak, repaired);
     }
 }
 
@@ -309,5 +342,23 @@ mod tests {
         eprintln!("reverb: {took:?} per second of stereo audio");
         let budget = if cfg!(debug_assertions) { 1000 } else { 100 };
         assert!(took.as_millis() < budget, "{took:?}");
+    }
+
+    /// A sample that is not a number in the input does not stay in the
+    /// network: the output is finite after it, and the block counts as
+    /// repaired.
+    #[test]
+    fn a_sample_that_is_not_a_number_is_not_kept() {
+        let mut reverb = Reverb::new(2.0, 1.0);
+        let mut input = vec![0.1f32; 4096];
+        input[100] = f32::NAN;
+        input[200] = f32::INFINITY;
+        let out = run(&mut reverb, &input);
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert!(rms(&out[2048..]) > 0.0);
+        // Gone from the network too: silence in, silence out afterwards.
+        let quiet = run(&mut reverb, &vec![0f32; 48_000 * 6]);
+        assert!(quiet.iter().all(|v| v.is_finite()));
+        assert!(rms(&quiet[48_000 * 5..]) < 1e-6);
     }
 }

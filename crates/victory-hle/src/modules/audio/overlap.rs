@@ -13,9 +13,17 @@
 //! With the switch on, a context whose input runs out does not flush its
 //! tail either (the tail belongs to the frame that follows); a stream that
 //! really ends loses the last 5 ms of its fade.
+//!
+//! A state is used once and only soon after it was kept
+//! (`VICTORY_XMA_OVERLAP_MS`, 500): a title reuses overlap buffers and
+//! contexts for other sounds, and joining the start of another sound to an
+//! old tail is a click, not a seam.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::time::Instant;
+
+use super::stats::{COUNTERS, Overlap};
 
 use victory_formats::xma::Decoder;
 
@@ -32,7 +40,24 @@ pub fn enabled() -> bool {
     })
 }
 
+/// How long after it was kept a state may be used, in milliseconds.
+pub fn max_age_ms() -> u128 {
+    static AGE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *AGE.get_or_init(|| {
+        std::env::var("VICTORY_XMA_OVERLAP_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(500)
+    })
+}
+
+/// Whether `age_ms` is too long after a state was kept.
+pub fn stale(age_ms: u128) -> bool {
+    age_ms > max_age_ms()
+}
+
 struct Saved {
+    at: Instant,
     id: u64,
     rate: u32,
     decoder: Decoder,
@@ -76,24 +101,40 @@ pub fn save(buffer: &mut [u8], decoder: &Decoder, rate: u32) {
         table.saved.pop_front();
     }
     table.saved.push_back(Saved {
+        at: Instant::now(),
         id,
         rate,
         decoder: decoder.clone(),
     });
     drop(table);
+    COUNTERS.overlap(Overlap::Saved);
     buffer[..4].copy_from_slice(&MAGIC.to_le_bytes());
     buffer[4..12].copy_from_slice(&id.to_le_bytes());
     buffer[12..16].copy_from_slice(&check(id).to_le_bytes());
 }
 
 /// The decoder a buffer's token names, when it matches the stream
-/// (channels and sample rate). The state stays in the table: a title may
-/// copy one buffer to several contexts.
+/// (channels and sample rate) and was kept recently enough. It is used up:
+/// the next context to find the same token (a buffer left in place and
+/// reused) starts cold.
 pub fn restore(buffer: &[u8], channels: usize, rate: u32) -> Option<Decoder> {
+    restore_within(buffer, channels, rate, max_age_ms())
+}
+
+fn restore_within(buffer: &[u8], channels: usize, rate: u32, max_age_ms: u128) -> Option<Decoder> {
     let id = read_id(buffer)?;
-    let table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
-    let saved = table.saved.iter().find(|s| s.id == id)?;
-    (saved.decoder.channels() == channels && saved.rate == rate).then(|| saved.decoder.clone())
+    let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+    let at = table.saved.iter().position(|s| s.id == id)?;
+    let saved = table.saved.remove(at)?;
+    drop(table);
+    let fresh = saved.at.elapsed().as_millis() <= max_age_ms;
+    let same = saved.decoder.channels() == channels && saved.rate == rate;
+    COUNTERS.overlap(if fresh && same {
+        Overlap::Restored
+    } else {
+        Overlap::Refused
+    });
+    (fresh && same).then_some(saved.decoder)
 }
 
 #[cfg(test)]
@@ -110,15 +151,27 @@ mod tests {
         // The title copies the buffer to another context's.
         let copy = buffer.clone();
         assert!(restore(&copy, 2, 48_000).is_some());
-        // Another stream's shape does not match.
-        assert!(restore(&copy, 1, 48_000).is_none());
-        assert!(restore(&copy, 2, 44_100).is_none());
+        // Used up: a buffer left in place and reused starts cold.
+        assert!(restore(&copy, 2, 48_000).is_none());
+        // Another stream's shape does not match (and uses the state up).
+        save(&mut buffer, &decoder, 48_000);
+        assert!(restore(&buffer, 1, 48_000).is_none());
+        save(&mut buffer, &decoder, 48_000);
+        assert!(restore(&buffer, 2, 44_100).is_none());
         // A damaged token does not either.
-        let mut damaged = copy.clone();
+        save(&mut buffer, &decoder, 48_000);
+        let mut damaged = buffer.clone();
         damaged[5] ^= 1;
         assert!(restore(&damaged, 2, 48_000).is_none());
+        // Too long after it was kept, it is another sound's buffer.
+        save(&mut buffer, &decoder, 48_000);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(restore_within(&buffer, 2, 48_000, 5).is_none());
+        save(&mut buffer, &decoder, 48_000);
+        assert!(restore_within(&buffer, 2, 48_000, 5_000).is_some());
         // Saving again names a new state and forgets the old.
-        let first = read_id(&buffer);
+        save(&mut buffer, &decoder, 48_000);
+        let (first, copy) = (read_id(&buffer), buffer.clone());
         save(&mut buffer, &decoder, 48_000);
         assert_ne!(read_id(&buffer), first);
         assert!(restore(&copy, 2, 48_000).is_none());

@@ -182,6 +182,22 @@ pub fn helper_own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether `v_mul_legacy_f32` and the like (`0 × anything = 0`) are written as the host's
+/// product where no factor is one the program itself may make an infinity or a NaN of (a
+/// division, a square root, a logarithm...; see `Module::inf_prone`), and with one test of
+/// the zero where one is. Values from memory and from the pipeline are taken to be numbers,
+/// so this is not exact for the title's data that holds an infinity or a NaN next to a
+/// zero. `VICTORY_LEGACY_ASSUME=1` turns it on; off by default. Part of the translation: the
+/// shader cache keys on it.
+pub fn legacy_assume() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::TEST_LEGACY_ASSUME.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_ASSUME").is_some_and(|v| v == "1"))
+}
+
 /// Which of a translated program's group barriers wait for the whole
 /// group (`GroupMemoryBarrierWithGroupSync`); the others keep their memory
 /// fence and lose the wait. A wait that some thread of the group never

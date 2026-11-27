@@ -2060,6 +2060,64 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
     }
 }
 
+/// `VICTORY_LEGACY_ASSUME`: a legacy product is the host's where no factor is one the
+/// program makes an infinity or a NaN of, and the same as the spelled out one (a zero
+/// of the other sign apart) where a factor is: a reciprocal, here, of any number.
+#[test]
+fn a_legacy_product_without_a_fixup_gives_what_the_spelled_out_one_gives() {
+    let (a, b, c) = (vgpr(1), vgpr(2), vgpr(3));
+    // (name, body, whether a reciprocal stands between the data and the product)
+    let saturated = vop3_mod(0x110, 5, a, a, 0, 0, 0, 0, true);
+    let bodies: [(&str, Vec<u32>, bool); 6] = [
+        ("mul_legacy", vop3(0x107, 0, a, b, 0).to_vec(), false),
+        ("mul_legacy by itself", vop3(0x107, 0, a, a, 0).to_vec(), false),
+        ("mul_legacy by a constant", vop3(0x107, 0, a, 243, 0).to_vec(), false),
+        ("mul_legacy of a saturated", [saturated, vop3(0x107, 0, vgpr(5), b, 0)].concat(), false),
+        ("mad_legacy", vop3(0x140, 0, a, b, c).to_vec(), false),
+        ("mul_legacy of a reciprocal", [vec![vop1(0x02A, 5, a)], vop3(0x107, 0, vgpr(5), b, 0).to_vec()].concat(), true),
+    ];
+    let numbers = [0.0f32, -0.0, 1.0, -1.0, 0.3, -2.5e-7, 3e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    let mut cases = Vec::new();
+    for (i, x) in numbers.iter().enumerate() {
+        for (j, y) in numbers.iter().enumerate() {
+            let z = numbers[(3 * i + j) % numbers.len()];
+            cases.push([x.to_bits(), y.to_bits(), z.to_bits(), 0]);
+        }
+    }
+    for (name, body, reciprocal) in bodies {
+        let was = lower::TEST_LEGACY_ASSUME.replace(None);
+        let shaders = [false, true].map(|on| {
+            lower::TEST_LEGACY_ASSUME.set(Some(on));
+            let shader = build_valu_cs(&body);
+            lower::TEST_LEGACY_ASSUME.set(None);
+            shader
+        });
+        lower::TEST_LEGACY_ASSUME.set(was);
+        assert_ne!(shaders[0].dxil, shaders[1].dxil, "{name}: written alike");
+        for device in [("hardware", false), ("WARP", true)] {
+            let mut got: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
+            for (shader, all) in shaders.iter().zip(&mut got) {
+                run_cases_on(shader, &cases, &[device], |_, _, _, r| all.push(r));
+            }
+            if got[0].is_empty() {
+                continue;
+            }
+            for (case, (&was, &is)) in cases.iter().zip(got[0].iter().zip(&got[1])) {
+                let given = case.map(f32::from_bits);
+                // the data are numbers where the product has no fixup; with a reciprocal
+                // only the second factor is
+                let numbers_only = if reciprocal { given[1].is_finite() } else { given[..3].iter().all(|x| x.is_finite()) };
+                if !numbers_only {
+                    continue;
+                }
+                let (x, y) = (f32::from_bits(was), f32::from_bits(is));
+                let same = was == is || x.is_nan() && y.is_nan() || x == 0.0 && y == 0.0;
+                assert!(same, "{name} of {given:?} on {}: {x} ({was:#x}), now {y} ({is:#x})", device.0);
+            }
+        }
+    }
+}
+
 /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
 const fn mubuf_idxen(op: u8, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
     [

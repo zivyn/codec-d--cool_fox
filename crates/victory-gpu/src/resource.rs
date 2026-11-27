@@ -2812,7 +2812,10 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        // A default heap (or a custom one without CPU pages): no CPU of the
+        // title writes the buffer, only shaders and our own copies.
+        let gpu_only = heap.kind == 1 || (heap.kind == 4 && heap.cpu_pages == 1);
+        crate::shadow::register(at, resource.data() as u64, desc.width, gpu_only);
         // The big ones are named with how they were made: heap type, CPU page
         // property, pool, flags (what the title could write from the CPU).
         if desc.width >= 16 << 20 {

@@ -422,6 +422,93 @@ fn what_frees_the_upload_memory_the_driver_keeps() {
                 device.cast::<IDXGIDevice3>().is_ok()
             );
         }
+        "untouched" => {
+            // Upload buffers of 64 MiB mapped and not written: does the
+            // working set take their pages, or only the commit?
+            let held: Vec<_> = (0..16)
+                .map(|_| {
+                    let heap = D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_UPLOAD,
+                        ..Default::default()
+                    };
+                    let desc = D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 64 << 20,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    };
+                    let mut made: Option<ID3D12Resource> = None;
+                    let mut data = std::ptr::null_mut();
+                    // SAFETY: plain creation and mapping.
+                    unsafe {
+                        device
+                            .CreateCommittedResource(
+                                &heap,
+                                D3D12_HEAP_FLAG_NONE,
+                                &desc,
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                                None,
+                                &mut made,
+                            )
+                            .unwrap();
+                        let made = made.unwrap();
+                        made.Map(0, None, Some(&mut data)).unwrap();
+                        (made, data.cast::<u8>())
+                    }
+                })
+                .collect();
+            last = report("16 upload buffers of 64 MiB, mapped, not written", last, 16);
+            for (_, data) in &held {
+                for at in (0..(32usize << 20)).step_by(4096) {
+                    // SAFETY: inside the mapping.
+                    unsafe { data.add(at).write(1) };
+                }
+            }
+            last = report("... the first half of each written", last, 16);
+            drop(held);
+            let _ = report("... dropped", last, 16);
+        }
+        "heaps" => {
+            // Descriptor heaps: the title's tables span 1.5 million slots.
+            for (count, visible) in [
+                (1_000_000u32, true),
+                (1_000_000, false),
+                (4_000_000, true),
+                (65_536, true),
+            ] {
+                let desc = D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: count,
+                    Flags: if visible {
+                        D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE
+                    } else {
+                        D3D12_DESCRIPTOR_HEAP_FLAG_NONE
+                    },
+                    NodeMask: 0,
+                };
+                // SAFETY: plain creation.
+                let made: Result<ID3D12DescriptorHeap, _> =
+                    unsafe { device.CreateDescriptorHeap(&desc) };
+                last = report(
+                    &format!(
+                        "a descriptor heap of {count}, shader visible {visible}: {}",
+                        made.is_ok()
+                    ),
+                    last,
+                    1,
+                );
+                drop(made);
+                idle.wait();
+                last = report("... dropped", last, 1);
+            }
+        }
         "ring" => {
             // One buffer of 256 MiB, pieces of the sizes cut from it in a
             // ring, as the host would cut scratch and send memory.

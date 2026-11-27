@@ -44,6 +44,8 @@ pub(crate) struct Site {
 struct Book {
     index: HashMap<(&'static str, u32, u8), usize>,
     sites: Vec<Site>,
+    /// The buffers alive, by where their mapping starts: bytes.
+    live: std::collections::BTreeMap<usize, u64>,
 }
 
 static BOOK: OnceLock<Mutex<Book>> = OnceLock::new();
@@ -56,7 +58,13 @@ fn book() -> std::sync::MutexGuard<'static, Book> {
 
 /// The buffer `resource` of `size` bytes was made for `kind` at `at`.
 #[cfg(feature = "diagnostics")]
-pub(crate) fn made(resource: &ID3D12Resource, kind: u8, size: u64, at: &'static Location<'static>) {
+pub(crate) fn made(
+    resource: &ID3D12Resource,
+    kind: u8,
+    size: u64,
+    data: *mut u8,
+    at: &'static Location<'static>,
+) {
     let slot = {
         let mut book = book();
         let book = &mut *book;
@@ -80,9 +88,10 @@ pub(crate) fn made(resource: &ID3D12Resource, kind: u8, size: u64, at: &'static 
         site.alive_bytes += size;
         site.made += 1;
         site.made_bytes += size;
+        book.live.insert(data as usize, size);
         slot
     };
-    watch(resource, slot, size);
+    watch(resource, slot, size, data as usize);
 }
 
 /// Counted in when the build has no memory line: nothing.
@@ -91,8 +100,19 @@ pub(crate) fn made(
     _resource: &ID3D12Resource,
     _kind: u8,
     _size: u64,
+    _data: *mut u8,
     _at: &'static Location<'static>,
 ) {
+}
+
+/// The bytes of buffers alive whose mapping starts in `[start, start + len)`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn covered(start: usize, len: usize) -> u64 {
+    let book = book();
+    book.live
+        .range(start..start.saturating_add(len))
+        .map(|(_, &bytes)| bytes)
+        .sum()
 }
 
 /// Every site with something alive, the biggest first.
@@ -130,6 +150,7 @@ struct Notice {
     references: AtomicU32,
     slot: usize,
     size: u64,
+    data: usize,
 }
 
 struct Methods([*const (); 3]);
@@ -185,6 +206,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
                 site.alive = site.alive.saturating_sub(1);
                 site.alive_bytes = site.alive_bytes.saturating_sub(gone.size);
             }
+            book.live.remove(&gone.data);
         }
         left
     }
@@ -192,7 +214,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 
 /// Has the book told when `resource` goes.
 #[cfg(feature = "diagnostics")]
-fn watch(resource: &ID3D12Resource, slot: usize, size: u64) {
+fn watch(resource: &ID3D12Resource, slot: usize, size: u64, data: usize) {
     use windows::Win32::Graphics::Direct3D12::ID3D12Object;
     const KEY: GUID = GUID::from_u128(0x7a31c5e2_04d9_4b86_a1f3_52c8d90e6b47);
     let Ok(object) = resource.cast::<ID3D12Object>() else {
@@ -203,6 +225,7 @@ fn watch(resource: &ID3D12Resource, slot: usize, size: u64) {
         references: AtomicU32::new(1),
         slot,
         size,
+        data,
     }));
     // SAFETY: a COM object of ours with one reference, which this drops; the
     // buffer takes its own. (One that is refused is never counted out.)
@@ -240,6 +263,7 @@ mod tests {
             references: AtomicU32::new(1),
             slot,
             size: 4096,
+            data: 0,
         }));
         {
             let mut book = book();

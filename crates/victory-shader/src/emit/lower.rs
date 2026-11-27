@@ -13386,19 +13386,23 @@ impl<'a> Lower<'a> {
                 // go round it as many times as the console wave does, but each ends its own
                 // loop when its lanes are through: the half that is left reads the other's
                 // last words as if they were new (`half_leaves`).
-                let closing = if back(self, taken) {
-                    Some((taken, f, cond))
+                let header = if back(self, taken) {
+                    Some(taken)
                 } else if back(self, not_taken) {
-                    let goes_on = self.negated(cond);
-                    Some((not_taken, t, goes_on))
+                    Some(not_taken)
                 } else {
                     None
                 };
-                if let Some((header, leaving, goes_on)) = closing
-                    && half_exit()
+                if half_exit()
+                    && let Some(header) = header
                     && self.exchanged > self.loop_exchanged.get(&header).copied().unwrap_or(u32::MAX)
                 {
-                    self.half_leaves(leaving, goes_on);
+                    if header == taken {
+                        self.half_leaves(f, cond);
+                    } else {
+                        let goes_on = self.negated(cond);
+                        self.half_leaves(t, goes_on);
+                    }
                 }
                 Term::CondBr(cond, t, f)
             }

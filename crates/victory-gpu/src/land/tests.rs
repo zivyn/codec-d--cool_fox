@@ -43,6 +43,31 @@ impl Title {
     }
 }
 
+/// The wide pool takes the batches of the landing the title waits behind when
+/// it is asked for, adds threads, and the batch is big enough for them.
+#[test]
+fn only_big_batches_of_the_tail_go_wide() {
+    assert!(goes_wide(true, 6, 3, 40));
+    assert!(!goes_wide(false, 6, 3, 40), "any other landing");
+    assert!(!goes_wide(true, 0, 3, 40), "not asked for");
+    assert!(!goes_wide(true, 3, 3, 40), "no thread more");
+    assert!(!goes_wide(true, 6, 3, 11), "too small a batch");
+    assert!(goes_wide(true, 6, 3, 12));
+    // The guard is for the thread, and is put back.
+    assert!(!TAIL.get());
+    {
+        let _tail = tail(true);
+        assert!(TAIL.get());
+        std::thread::spawn(|| assert!(!TAIL.get())).join().unwrap();
+        {
+            let _inner = tail(false);
+            assert!(!TAIL.get());
+        }
+        assert!(TAIL.get());
+    }
+    assert!(!TAIL.get());
+}
+
 /// Every number once, whatever the count and the threads, batch after batch
 /// and from several callers.
 #[test]

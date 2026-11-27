@@ -47,6 +47,45 @@ pub(crate) fn on() -> bool {
     })
 }
 
+thread_local! {
+    /// Whether the landing this thread is at is one the title waits behind
+    /// ([`tail`]).
+    static TAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The thread is landing the last flights of a burst: nothing is behind them
+/// and the title is to be told something when they are in (what the relay
+/// finds when the card has run the frame's last flight and the title's next
+/// frame waits for it). Until the guard is dropped [`each`] puts its work on
+/// more threads, if `VICTORY_LAND_TAIL_THREADS` asks for them.
+pub(crate) struct TailGuard(bool);
+
+pub(crate) fn tail(on: bool) -> TailGuard {
+    TailGuard(TAIL.replace(on))
+}
+
+impl Drop for TailGuard {
+    fn drop(&mut self) {
+        TAIL.set(self.0);
+    }
+}
+
+/// How many threads land a landing the title waits behind, the relay's own
+/// counted (`VICTORY_LAND_TAIL_THREADS`; 0, the default: the same as any
+/// landing). Those beyond [`threads`] sleep until such a landing comes: at that
+/// moment the title's threads wait for the landing and the cores are idle.
+fn tail_threads() -> usize {
+    static THREADS: OnceLock<usize> = OnceLock::new();
+    *THREADS.get_or_init(|| std::env::var("VICTORY_LAND_TAIL_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0usize).min(16))
+}
+
+/// Whether a batch of `count` jobs goes to the wide pool: it is the title's
+/// tail, there are threads to add, and the batch is big enough for them (a
+/// small one is done before they are awake).
+fn goes_wide(tail: bool, tail_threads: usize, threads: usize, count: usize) -> bool {
+    tail && tail_threads > threads && count >= 2 * tail_threads
+}
+
 /// How many threads land, the relay's own counted (`VICTORY_LAND_THREADS`).
 fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
@@ -144,7 +183,16 @@ pub(crate) mod stat {
     pub(crate) const UNWATCHED: usize = 28;
     pub(crate) const UNWATCH_DIRTY: usize = 29;
     pub(crate) const UNWATCH_NOT_WATCHED: usize = 30;
-    pub(crate) const COUNT: usize = 31;
+    /// Landings with nothing behind them that hold a signal for the title
+    /// ([`tail`]): how many, their microseconds, those of their copies in the
+    /// card's memory and in the PC's, and the batches that went to the wide
+    /// pool.
+    pub(crate) const TAIL_N: usize = 31;
+    pub(crate) const TAIL_US: usize = 32;
+    pub(crate) const TAIL_CARD_US: usize = 33;
+    pub(crate) const TAIL_PC_US: usize = 34;
+    pub(crate) const TAIL_WIDE: usize = 35;
+    pub(crate) const COUNT: usize = 36;
 }
 
 pub(crate) mod quiet;
@@ -230,6 +278,17 @@ pub(crate) fn log(frames: f64) {
             s[stat::UNWATCHED],
             s[stat::UNWATCH_DIRTY],
             s[stat::UNWATCH_NOT_WATCHED],
+        );
+    }
+    if s[stat::TAIL_N] > 0.0 {
+        tracing::info!(
+            "landing tail per frame (VICTORY_LAND_TAIL_THREADS={}): {:.1} landings with nothing behind them and a signal for the title, {:.2} ms each: copies in the card's memory {:.2}, in the PC's {:.2}; {:.1} batches of jobs on the wide pool",
+            tail_threads(),
+            s[stat::TAIL_N],
+            ms(stat::TAIL_US) / s[stat::TAIL_N],
+            ms(stat::TAIL_CARD_US) / s[stat::TAIL_N],
+            ms(stat::TAIL_PC_US) / s[stat::TAIL_N],
+            s[stat::TAIL_WIDE],
         );
     }
     crate::readprobe::log();
@@ -372,11 +431,19 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
     Some((work, state.next - 1))
 }
 
-/// [`Pool::each`] on the threads kept for landing.
+/// [`Pool::each`] on the threads kept for landing, or for the landing the
+/// title waits behind ([`tail`]).
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    static WIDE: OnceLock<&'static Pool> = OnceLock::new();
+    if goes_wide(TAIL.get(), tail_threads(), threads(), count) {
+        count(stat::TAIL_WIDE, 1);
+        WIDE.get_or_init(|| Pool::new("victory-land-tail", tail_threads())).each(count, f);
+        return;
+    }
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
 }
+
 
 /// [`Pool::each`] on threads kept for the title's bytes under flights' writes
 /// (`VICTORY_UNDER_THREADS`, 6 with this one).

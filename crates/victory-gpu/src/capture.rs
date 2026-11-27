@@ -47,7 +47,33 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || n == TRIGGERED.load(std::sync::atomic::Ordering::Relaxed)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// The frame a trigger file asked for (`VICTORY_CAPTURE_TRIGGER`), or `u64::MAX`.
+static TRIGGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// `VICTORY_CAPTURE_TRIGGER=<file>` (with `VICTORY_CAPTURE`): when the file
+/// appears it is deleted, and the frame two presents on is captured as the
+/// frames of `VICTORY_CAPTURE_FRAMES` are (picture, `-ops.txt`, and with
+/// `VICTORY_DUMP_TARGETS` its targets and `-targets.tsv`). The file can be
+/// made again for another frame. Called at every present.
+fn triggered(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    let Some(file) = FILE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_TRIGGER").map(PathBuf::from)) else {
+        return;
+    };
+    let pending = TRIGGERED.load(Relaxed);
+    if pending != u64::MAX && pending >= frame || !file.exists() {
+        return;
+    }
+    if std::fs::remove_file(file).is_ok() {
+        TRIGGERED.store(frame + 2, Relaxed);
+        tracing::info!(frame = frame + 2, "capture trigger found: this frame is captured");
+    }
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
@@ -128,6 +154,7 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    triggered(frame);
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -383,7 +410,9 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1
+            || !matches!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -441,7 +470,10 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // A volume's slices follow each other (a slice is `Height` rows): the volume is read as
+        // `Depth * Height` rows, so its census (a color-grading table's, say) covers every slice.
+        let slices = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { usize::from(d.DepthOrArraySize) } else { 1 };
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize * slices);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -462,16 +494,207 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        let height = f.Height as usize * slices;
+        let rgba = to_rgba(f.Format.0 as u32, f.Width as usize, height, pitch, rows);
+        target_stats(frame, i, resource, d, f.Format.0 as u32, f.Width as usize, height, pitch, rows, rgba.as_deref());
+        if stats_only() {
+            buffer.Unmap(0, None);
+            return;
+        }
+        if let Some(rgba) = rgba {
             let name = format!(
                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, height as u32, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
         buffer.Unmap(0, None);
+    }
+}
+
+/// `VICTORY_DUMP_TARGETS=stats`: no pictures of the targets, only
+/// `frame-<n>-targets.tsv`.
+fn stats_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DUMP_TARGETS").is_ok_and(|v| v == "stats"))
+}
+
+/// Bytes a texel takes in a color or single-channel format the dump reads
+/// (`None`: not handled).
+fn texel_bytes(format: u32) -> Option<usize> {
+    Some(match format {
+        1..=4 => 16,
+        5..=8 => 12,
+        9..=22 => 8,
+        23..=47 | 87..=93 => 4,
+        48..=59 => 2,
+        60..=65 => 1,
+        _ => return None,
+    })
+}
+
+/// The most distinct values counted in a target.
+const DISTINCT_CAP: usize = 1 << 20;
+
+/// How many different texels (`bytes` each) the rows hold, counted up to
+/// [`DISTINCT_CAP`] (then `true`), and the most common one with its count.
+fn distinct_values(rows: &[u8], pitch: usize, w: usize, h: usize, bytes: usize) -> (usize, bool, u128, u32) {
+    let mut counts = std::collections::HashMap::<u128, u32>::new();
+    let mut capped = false;
+    for y in 0..h {
+        let row = &rows[y * pitch..y * pitch + w * bytes];
+        for t in row.chunks_exact(bytes) {
+            let mut v = [0u8; 16];
+            v[..bytes].copy_from_slice(t);
+            let key = u128::from_le_bytes(v);
+            if let Some(n) = counts.get_mut(&key) {
+                *n += 1;
+            } else if counts.len() < DISTINCT_CAP {
+                counts.insert(key, 1);
+            } else {
+                capped = true;
+            }
+        }
+    }
+    let (top, top_n) = counts.iter().max_by_key(|e| *e.1).map_or((0, 0), |(k, n)| (*k, *n));
+    (counts.len(), capped, top, top_n)
+}
+
+/// How a format's texels are told alike: exactly, or within a few steps
+/// of the float (`Half`/`Float`: that many channels of 16 or 32 bits).
+#[derive(Clone, Copy)]
+enum Alike {
+    Exact,
+    Half(usize),
+    Float(usize),
+}
+
+fn alike_of(format: u32) -> Alike {
+    match format {
+        1..=2 => Alike::Float(4),
+        39..=41 => Alike::Float(1),
+        9..=10 => Alike::Half(4),
+        33..=34 => Alike::Half(2),
+        53..=54 => Alike::Half(1),
+        _ => Alike::Exact,
+    }
+}
+
+/// A float's bits as an integer that grows with the value (sign aside).
+fn ordered(bits: i64, sign: i64) -> i64 {
+    if bits & sign != 0 { sign - (bits & (sign - 1)) } else { sign + bits }
+}
+
+fn texels_alike(a: &[u8], b: &[u8], how: Alike) -> bool {
+    match how {
+        Alike::Exact => a == b,
+        Alike::Half(n) => (0..n).all(|i| {
+            let (x, y) = (
+                i64::from(u16::from_le_bytes([a[2 * i], a[2 * i + 1]])),
+                i64::from(u16::from_le_bytes([b[2 * i], b[2 * i + 1]])),
+            );
+            (ordered(x, 0x8000) - ordered(y, 0x8000)).abs() <= 4
+        }),
+        Alike::Float(n) => (0..n).all(|i| {
+            let word = |t: &[u8]| i64::from(u32::from_le_bytes(t[4 * i..4 * i + 4].try_into().unwrap_or([0; 4])));
+            (ordered(word(a), 0x8000_0000) - ordered(word(b), 0x8000_0000)).abs() <= 4096
+        }),
+    }
+}
+
+/// How flat the picture of a target is, in percent: of horizontally
+/// adjacent texel pairs, of vertically adjacent pairs, and of the 8x8
+/// blocks that lie whole in it, the share whose texels are alike (equal; for
+/// floats within a few steps, 0.05%). Smooth light, with the noise of a
+/// render, scores low; flat patches of one value (a posterized picture) high.
+/// A volume is read as `Depth * Height` rows.
+fn flatness(rows: &[u8], pitch: usize, w: usize, h: usize, bytes: usize, format: u32) -> (f64, f64, f64) {
+    let how = alike_of(format);
+    let at = |x: usize, y: usize| &rows[y * pitch + x * bytes..][..bytes];
+    let share = |same: usize, all: usize| if all == 0 { 0.0 } else { same as f64 * 100.0 / all as f64 };
+    let (mut h_same, mut v_same) = (0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if x + 1 < w && texels_alike(at(x, y), at(x + 1, y), how) {
+                h_same += 1;
+            }
+            if y + 1 < h && texels_alike(at(x, y), at(x, y + 1), how) {
+                v_same += 1;
+            }
+        }
+    }
+    let (bw, bh) = (w / 8, h / 8);
+    let mut flat = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let first = at(bx * 8, by * 8);
+            if (0..8).all(|j| (0..8).all(|i| texels_alike(first, at(bx * 8 + i, by * 8 + j), how))) {
+                flat += 1;
+            }
+        }
+    }
+    (
+        share(h_same, h * w.saturating_sub(1)),
+        share(v_same, w * h.saturating_sub(1)),
+        share(flat, bw * bh),
+    )
+}
+
+/// One line per target in `frame-<frame>-targets.tsv` (in the order the
+/// frame first used them, which the `-ops.txt` lines name by resource):
+/// how many different texel values the target holds as the card wrote them
+/// (`raw`, counted up to a million) and as the 8-bit picture of it
+/// (`rgba8`), the most common value and its share. A pass whose output
+/// collapses to a few values where the run before had thousands is the one
+/// that lost the detail.
+#[allow(clippy::too_many_arguments)]
+fn target_stats(
+    frame: u64,
+    i: usize,
+    resource: crate::object::This,
+    d: &D3D12_RESOURCE_DESC,
+    format: u32,
+    w: usize,
+    h: usize,
+    pitch: usize,
+    rows: &[u8],
+    rgba: Option<&[u8]>,
+) {
+    use std::io::Write;
+    let Some(folder) = folder() else { return };
+    let Some(bytes) = texel_bytes(format) else { return };
+    if w == 0 || h == 0 || rows.len() < pitch * (h - 1) + w * bytes {
+        return;
+    }
+    let (distinct, capped, top, top_n) = distinct_values(rows, pitch, w, h, bytes);
+    let (eqh, eqv, flat8) = flatness(rows, pitch, w, h, bytes, format);
+    let rgba8 = rgba.map_or(0, |p| {
+        p.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], 0]))
+            .collect::<std::collections::HashSet<u32>>()
+            .len()
+    });
+    let line = format!(
+        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%",
+        d.Width,
+        d.Height,
+        if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { format!("x{}", d.DepthOrArraySize) } else { String::new() },
+        format,
+        d.MipLevels,
+        w * h,
+        distinct,
+        if capped { "+" } else { "" },
+        top_n as f64 * 100.0 / (w * h) as f64,
+    );
+    tracing::debug!(frame, "target {line}");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(folder.join(format!("frame-{frame}-targets.tsv")))
+    {
+        let _ = writeln!(file, "{line}");
     }
 }
 
@@ -860,5 +1083,59 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn distinct_texels_are_counted_without_the_row_padding() {
+        // 3x2 texels of 4 bytes, rows 16 bytes apart (4 bytes of padding that differ).
+        let mut rows = vec![0u8; 16 * 2];
+        for (y, row) in [[1u32, 1, 2], [1, 3, 1]].iter().enumerate() {
+            for (x, v) in row.iter().enumerate() {
+                rows[y * 16 + x * 4..][..4].copy_from_slice(&v.to_le_bytes());
+            }
+            rows[y * 16 + 12..][..4].copy_from_slice(&(99 + y as u32).to_le_bytes());
+        }
+        let (distinct, capped, top, top_n) = distinct_values(&rows, 16, 3, 2, 4);
+        assert_eq!((distinct, capped, top, top_n), (3, false, 1, 4));
+        assert_eq!(texel_bytes(28), Some(4));
+        assert_eq!(texel_bytes(10), Some(8));
+        assert_eq!(texel_bytes(61), Some(1));
+        assert_eq!(texel_bytes(71), None);
+    }
+
+    #[test]
+    fn flat_patches_score_high_and_noise_low() {
+        // 16x16 texels of 4 bytes (R8G8B8A8): the left half one value, the right half another.
+        let mut rows = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                rows[(y * 16 + x) * 4..][..4].copy_from_slice(&[if x < 8 { 1 } else { 2 }, 0, 0, 255]);
+            }
+        }
+        let (eqh, eqv, flat) = flatness(&rows, 64, 16, 16, 4, 28);
+        assert!((eqh - 224.0 * 100.0 / 240.0).abs() < 1e-9 && eqv == 100.0 && flat == 100.0);
+        // The same size with a different value in every texel.
+        for (i, t) in rows.chunks_exact_mut(4).enumerate() {
+            t.copy_from_slice(&(i as u32).to_le_bytes());
+        }
+        let (eqh, eqv, flat) = flatness(&rows, 64, 16, 16, 4, 28);
+        assert_eq!((eqh, eqv, flat), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn floats_a_few_steps_apart_are_alike() {
+        let f = |v: f32| v.to_le_bytes();
+        assert!(texels_alike(&f(1.0), &f(1.0 + 1.0 / 4096.0), Alike::Float(1)));
+        assert!(!texels_alike(&f(1.0), &f(1.01), Alike::Float(1)));
+        assert!(!texels_alike(&f(1.0), &f(-1.0), Alike::Float(1)));
+        // Half floats: 1.0 is 0x3c00, one step is 0x3c01, 1.01 is about 0x3c0a.
+        let h = |v: u16| v.to_le_bytes();
+        assert!(texels_alike(&h(0x3c00), &h(0x3c03), Alike::Half(1)));
+        assert!(!texels_alike(&h(0x3c00), &h(0x3c0a), Alike::Half(1)));
     }
 }

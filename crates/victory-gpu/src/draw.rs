@@ -4916,6 +4916,21 @@ fn describe(view: Option<&View>) -> String {
         Some(View::Constant(address, size))
             if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>
         {
+            // `VICTORY_CAPTURE_CBV_WORDS=<n>`: the first n words as hex too (IMG1: the
+            // jitter and previous-frame constants of the TAA passes differ per process).
+            static WORDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let words = *WORDS.get_or_init(|| {
+                std::env::var("VICTORY_CAPTURE_CBV_WORDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+            });
+            let n = words.min(*size as usize / 4);
+            if n > 4 && crate::texture::committed(*address as *const u8, n * 4) {
+                // SAFETY: n * 4 committed bytes of title memory.
+                let w: Vec<u32> = (0..n)
+                    .map(|i| unsafe { (*address as *const u32).add(i).read_unaligned() })
+                    .collect();
+                let hex: Vec<String> = w.iter().map(|x| format!("{x:08x}")).collect();
+                return format!("Constant({address:#x}, {size}) words {}", hex.join(" "));
+            }
             // SAFETY: 16 committed bytes of title memory.
             let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
             format!("Constant({address:#x}, {size}) {v:?}")

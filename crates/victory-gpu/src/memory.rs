@@ -219,6 +219,119 @@ pub(crate) struct Ready {
     pub(crate) base: u32,
 }
 
+/// What the notes of the diagnostics in the faults buffer say: the two host waves of a console
+/// wave that gave up waiting for each other (`PAIR_NOTE`, said once for each program), a loop
+/// that reached its iteration limit (`LOOP_NOTE`, `VICTORY_LOOP_NOTES=1`: counted by frames for
+/// each program and loop, said at the first, then at powers of two) and values a program was
+/// asked to show (`PEEK_NOTE`, `VICTORY_PEEK`: 16 bits of a value to a note, said for the first
+/// few frames that have them).
+fn say_notes(notes: &[u32], frame: u64) {
+    static SAID_PAIR: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static CUTS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+    static PEEKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let mut peeked: Vec<u32> = Vec::new();
+    for &page in notes {
+        if page >= victory_shader::emit::PAIR_NOTE {
+            let mut said = SAID_PAIR.lock().unwrap_or_else(|e| e.into_inner());
+            if !said.contains(&page) {
+                said.push(page);
+                tracing::warn!(
+                    program = format!("{:07x}", page & 0x0FFF_FFFF),
+                    "the two host waves of a console wave gave up waiting for each other in a shader (hash starts with `program`)"
+                );
+            }
+        } else if page >= victory_shader::emit::LOOP_NOTE {
+            let mut cuts = CUTS.lock().unwrap_or_else(|e| e.into_inner());
+            let frames = match cuts.iter_mut().find(|c| c.0 == page) {
+                Some(c) => {
+                    c.1 += 1;
+                    c.1
+                }
+                None => {
+                    cuts.push((page, 1));
+                    1
+                }
+            };
+            if frames.is_power_of_two() {
+                tracing::warn!(
+                    program = format!("{:05x}", page >> 8 & 0x000F_FFFF),
+                    loop_id = page & 0xFF,
+                    frames,
+                    "a shader loop was cut at its limit (hash starts with `program`; `loop_id` is the loop's number in the program, `VICTORY_LOOP_WHY=1` lists them)"
+                );
+            }
+        } else {
+            peeked.push(page);
+        }
+    }
+    if !peeked.is_empty() && PEEKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+        let mut values: std::collections::BTreeMap<(u32, u32), [u32; 2]> = Default::default();
+        for note in peeked {
+            let (k, r, half) = (note >> 24 & 0xF, note >> 20 & 0xF, note >> 16 & 1);
+            values.entry((k, r)).or_default()[half as usize] = note & 0xFFFF;
+        }
+        let shown: Vec<String> =
+            values.iter().map(|(&(k, r), h)| format!("offset#{k} reg#{r} = {:#010x}", h[1] << 16 | h[0])).collect();
+        tracing::warn!(frame, values = ?shown, "values a program was asked to show (VICTORY_PEEK)");
+    }
+}
+
+/// The faults buffer of shaders that leave notes of the diagnostics but read no title memory by
+/// address, so that no [`Memory`] is made for them. Shaders that do use [`Memory`]'s faults
+/// buffer: this is the same kind of buffer, read once a frame by the draw that binds it.
+struct Notes {
+    buffer: ID3D12Resource,
+    data: *mut u32,
+    gpu: u64,
+    frame: u64,
+}
+
+// SAFETY: the mapping is of memory the struct owns; all access is under the mutex.
+unsafe impl Send for Notes {}
+
+static NOTES: Mutex<Option<Notes>> = Mutex::new(None);
+
+/// The address of the buffer a shader that only leaves notes binds as its faults buffer, made
+/// at the first call (a root view nothing sets is address 0: the first note a shader stores
+/// there lost the card). The notes in it are said once a frame, by the first call of the frame;
+/// `list` keeps the buffer until it has run. None if the host cannot make it.
+pub(crate) fn notes(list: &HostList) -> Option<u64> {
+    let mut guard = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let (buffer, data) = host()?.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+        crate::host::name(&buffer, || "notes of diagnostics: faults".into());
+        // SAFETY: a fresh mapping of at least that many bytes; a live buffer.
+        let gpu = unsafe {
+            std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4);
+            buffer.GetGPUVirtualAddress()
+        };
+        *guard = Some(Notes { buffer, data: data.cast::<u32>(), gpu, frame: u64::MAX });
+    }
+    let n = guard.as_mut()?;
+    let frame = crate::frame::current();
+    if n.frame != frame {
+        n.frame = frame;
+        let mut found = Vec::new();
+        for i in 1..MEMORY_FAULTS as usize {
+            // SAFETY: inside the mapping; the GPU may be writing, a note missed now is written
+            // again next frame.
+            let at = unsafe { n.data.add(i) };
+            // SAFETY: as above.
+            let note = unsafe { at.read_volatile() };
+            if note != 0 {
+                if note >= victory_shader::emit::PEEK_NOTE {
+                    found.push(note);
+                }
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            }
+        }
+        say_notes(&found, frame);
+    }
+    list.keep(&n.buffer);
+    Some(n.gpu)
+}
+
 impl Memory {
     fn new() -> Option<Memory> {
         let host = host()?;
@@ -658,57 +771,16 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
-        let mut peeked: Vec<u32> = Vec::new();
+        let mut notes: Vec<u32> = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
-            if page >= victory_shader::emit::PAIR_NOTE {
-                // Not a page: the two host waves of a console wave in some program waited for
-                // each other until they gave up (`pair_wait`), and went on without what the
-                // other was to give. Said once for each program.
-                static SAID_PAIR: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-                let mut said = SAID_PAIR.lock().unwrap_or_else(|e| e.into_inner());
-                if !said.contains(&page) {
-                    said.push(page);
-                    tracing::warn!(
-                        program = format!("{:07x}", page & 0x0FFF_FFFF),
-                        "the two host waves of a console wave gave up waiting for each other in a shader (hash starts with `program`)"
-                    );
-                }
-                // SAFETY: as above.
-                unsafe { at.write_volatile(0) };
-            } else if page >= victory_shader::emit::LOOP_NOTE {
-                // Not a page: a loop of a translated shader reached its iteration limit
-                // (`VICTORY_LOOP_NOTES=1`). The frames it did so in are counted for each
-                // program and loop, and said at the first, then at powers of two.
-                static CUTS: std::sync::Mutex<Vec<(u32, u64)>> = std::sync::Mutex::new(Vec::new());
-                let mut cuts = CUTS.lock().unwrap_or_else(|e| e.into_inner());
-                let frames = match cuts.iter_mut().find(|c| c.0 == page) {
-                    Some(c) => {
-                        c.1 += 1;
-                        c.1
-                    }
-                    None => {
-                        cuts.push((page, 1));
-                        1
-                    }
-                };
-                if frames.is_power_of_two() {
-                    tracing::warn!(
-                        program = format!("{:05x}", page >> 8 & 0x000F_FFFF),
-                        loop_id = page & 0xFF,
-                        frames,
-                        "a shader loop was cut at its limit (hash starts with `program`; `loop_id` is the loop's number in the program, `VICTORY_LOOP_WHY=1` lists them)"
-                    );
-                }
-                // SAFETY: as above.
-                unsafe { at.write_volatile(0) };
-            } else if page >= victory_shader::emit::PEEK_NOTE {
-                // Not a page: a value a program was asked to show (`VICTORY_PEEK`), 16 bits of it.
-                peeked.push(page);
+            if page >= victory_shader::emit::PEEK_NOTE {
+                // Not a page: a note of a diagnostic ([`say_notes`]).
+                notes.push(page);
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             } else if page != 0 {
@@ -717,23 +789,7 @@ impl Memory {
                 unsafe { at.write_volatile(0) };
             }
         }
-        if !peeked.is_empty() {
-            // The values (offset number, register number: 32 bits from two notes), said for the
-            // first few frames that have them.
-            static PEEKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if PEEKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
-                let mut values: std::collections::BTreeMap<(u32, u32), [u32; 2]> = Default::default();
-                for note in peeked {
-                    let (k, r, half) = (note >> 24 & 0xF, note >> 20 & 0xF, note >> 16 & 1);
-                    values.entry((k, r)).or_default()[half as usize] = note & 0xFFFF;
-                }
-                let shown: Vec<String> = values
-                    .iter()
-                    .map(|(&(k, r), h)| format!("offset#{k} reg#{r} = {:#010x}", h[1] << 16 | h[0]))
-                    .collect();
-                tracing::warn!(frame = self.frame, values = ?shown, "values a program was asked to show (VICTORY_PEEK)");
-            }
-        }
+        say_notes(&notes, self.frame);
         if pages.is_empty() {
             return;
         }

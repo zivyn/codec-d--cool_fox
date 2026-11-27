@@ -94,3 +94,40 @@ fn an_instruction_asked_for_leaves_its_values_as_notes() {
     // (an offset with no instruction: nothing)
     assert_eq!(plain, dxil(&WAIT, false, &[1000]));
 }
+
+/// A program with its notes on has the faults buffer as a root view of its own, and a shader
+/// that reads no title memory by address has nothing else to bind it: the host gives it a
+/// buffer (`memory::notes`), for a root view nothing sets is address 0 and the first note
+/// stored there lost the card. Here the loop waits for a flag no one sets, is cut at its limit
+/// and notes it, in the buffer the dispatch binds.
+#[test]
+fn a_loop_cut_at_its_limit_notes_it_in_the_buffer_it_is_given_on_the_card() {
+    use std::collections::HashSet;
+
+    use super::host::{Dispatch, Host, Root, View};
+
+    let native = native_of(&WAIT, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::set_program_tag(b"a program");
+    let was = lower::TEST_LOOP_NOTES.replace(true);
+    let shader = super::wave64_tests::lowered(&native, &p, &HashSet::new());
+    lower::TEST_LOOP_NOTES.set(was);
+    let shader = shader.expect("lower");
+    assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+    let user = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    // (root parameter 0 is the user data, 1 the faults buffer: the only root view)
+    host.dispatch(
+        &root,
+        &pso,
+        &Dispatch {
+            roots: vec![(0, Root::Constants(user)), (1, Root::Uav(super::MEMORY_FAULTS))],
+            views: &[View::RawUav(64)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        },
+    )
+    .expect("a loop cut at its limit, with its notes on, runs to its end");
+}

@@ -1844,15 +1844,22 @@ impl State {
             }
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_FAULTS {
-                    // Ours: where shaders note the pages they found empty.
-                    if let Some(m) = &memory {
+                    // Ours: where shaders note the pages they found empty. A shader that leaves
+                    // only the notes of a diagnostic (a loop cut, a meeting given up, values it
+                    // was asked to show) has no title memory by address: a buffer of its own,
+                    // for a root view nothing sets is address 0.
+                    let faults = match &memory {
+                        Some(m) => Some(m.faults),
+                        None => crate::memory::notes(list),
+                    };
+                    if let Some(gpu) = faults {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process and the list holds it.
                         unsafe {
                             if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
                             } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
                             }
                         }
                     }

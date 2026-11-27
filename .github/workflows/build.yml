@@ -204,7 +204,7 @@ jobs:
           notes="Rolling build of \`${BRANCH}\` at ${GITHUB_SHA}, from ${run_url}. Files: $(ls dist | xargs). Replaced by the next published run."
           if gh api "repos/${GH_REPO}/git/ref/tags/${tag}" >/dev/null 2>&1; then
             gh api -X PATCH "repos/${GH_REPO}/git/refs/tags/${tag}" -f sha="${GITHUB_SHA}" -F force=true >/dev/null
-            gh release edit "$tag" --prerelease --title "Build ${BRANCH}" --notes "$notes"
+            gh release edit "$tag" --prerelease --target "${GITHUB_SHA}" --title "Build ${BRANCH}" --notes "$notes"
           else
             gh release create "$tag" --prerelease --target "${GITHUB_SHA}" --title "Build ${BRANCH}" --notes "$notes"
           fi

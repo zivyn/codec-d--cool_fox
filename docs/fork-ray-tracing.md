@@ -1,10 +1,42 @@
 # Ray tracing in this fork: what the title does and what has been built
 
-Status, 2026-11-25, midday: **with `VICTORY_BVH_BUILDER=1` rooms get their
-indirect light** (runs light-10, light-11, n19), for some 40 ms more of the
-card's time a frame (the dorm: 75 of 90 ms busy against 34 of 64). Off by
-default. **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place
-for next to nothing (below).
+Status, 2026-11-27 (main ea965a797 and the branch that adds the notes below):
+**with `VICTORY_BVH_BUILDER=1` rooms get their indirect light** (runs light-10,
+light-11, n19 on a 7900 XTX), for some 40 ms more of the card's time a frame
+there (the dorm: 75 of 90 ms busy against 34 of 64). Off by default. The first
+whole run on an RTX 4060 (8 GB) reached the world and the cell with the builder
+on: some 15 % more a frame then (the card was the limit), 4.5 GB more of the PC's
+memory, the card's memory over its budget, dark dots in the window and a face
+turned from the light still black. Since then the title's hang watchdog is
+paused for our stalls (the crashes before the world were that) and
+the fault limit below is 4 times higher; no run of the builder has been made
+since, so what follows says what the code does, not that the picture is right.
+**`VICTORY_AMBIENT=1`** puts an estimate of that light in its place for next to
+nothing, and rests by itself once the builder has run (below).
+
+## What the builder switch changes
+
+Without it the title still dispatches every trace, shading and probe program of
+its ray-traced light, and they run on structures that were never built (the
+static ones are shipped packed and only the builder unpacks them), so rays find
+nothing. With `VICTORY_BVH_BUILDER=1`:
+
+| | off (default) | on |
+|---|---|---|
+| the builder's 53 stages (unpack, build, refit, copy) | dropped | run, all or none per frame |
+| the programs that shade ray hits (~1,000 pipelines, 540 to 800 dispatches a frame) | left out, no host pipeline: `VICTORY_RT_RESOLVE=1` makes them (hits all miss) | run |
+| the probe ray activation (1 dispatch a frame) | left out: tiles of the screen probes are never marked and keep what they held, which shows as blocks of the picture's tiles; `VICTORY_ACTIVATE_RAYS=1` runs it | runs; `VICTORY_ACTIVATE_RAYS=0` leaves it out |
+| trace programs (probes, visibility buffer, irradiance cache, shadows, reflections) | run on empty structures | run on the built ones |
+| title memory by address (`memory.rs`) | only what a stray trace touches | the arenas: about 1 GB in 19 arenas in a run of the opening; by the code each page is twice in the PC's memory (reserved and staged) and once on the card, twice while shader writes are compared (`shadow::Card::before`) |
+| the indirect-light stand-in (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_AIR`) | applies | rests once the builder has run |
+
+The builder is the title's own, from its structure-builder library: bottom levels
+from vertex and index buffers (skinned and animated meshes from the output of the
+title's skinning programs, refitted every frame), top levels from instance
+descriptors, with the compacted size read back by the title. The fork does not
+make any DXR structure. So **anything that skips the skinning that only feeds the
+structures (upstream #3536, `VICTORY_SKIP_BVH_SKINNING`) must stay off with the
+builder on**: the structures of characters would be built from stale vertices.
 
 ## What the title does
 
@@ -91,7 +123,11 @@ after it was given them as an unordered access view.
 
 | variable | does |
 |---|---|
-| `VICTORY_BVH_BUILDER=1` | the builder's stages run |
+| `VICTORY_BVH_BUILDER=1` | the builder's stages run; the hit shading and the probe activation are not left out; the stand-in rests |
+| `VICTORY_RT_RESOLVE=1` | without the builder: the programs that shade hits are made and run (all miss; ~10 minutes of compiling on a cold cache) |
+| `VICTORY_ACTIVATE_RAYS=1` | without the builder: the probe activation runs; with it, `=0` leaves it out |
+| `VICTORY_MEMORY_FAULT_PAGES=<n>` | the most pages taken from faults in a run (8192; it was 2048 and was spent in seconds) |
+| `VICTORY_MEMORY_CARD_OVER=1` | a copy by address goes on the card even when the card is over its budget (else it is in the PC's memory, read over the bus: the log says so, `a copy is in the PC's memory`) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
 | `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
@@ -105,6 +141,34 @@ Every ten seconds the log has a line "title memory by address: ..." with pages,
 dispatches, faults and what came.
 
 ## Known gaps
+
+What stands between the builder and being on by default on an 8 GB card
+(2026-11-27; the numbers are of the first whole run, which was on a build from
+before the work on the card's time):
+
+- **The card's memory.** The title's own copies already take the card to its
+  budget in the world (7.4 to 7.6 GB in use against about 7 GB of budget), so a
+  copy by address finds no room, and is made in the PC's memory, read over the
+  bus with every step of every ray (`VICTORY_MEMORY_CARD_OVER=1` asks the card
+  for it anyway; the first of them are said in the log).
+- **The PC's memory:** 4.5 GB more in that run (the arenas above account for a
+  part; the rest was not split).
+- **The card's time:** 40 ms more a frame on a 7900 XTX; on the 4060 the first
+  run took the cell from some 410 to 474 ms with the card the limit. The frame
+  is limited by the submitting thread at about 90 ms with the GPU at about
+  55 ms, so there are some 30 ms to give before the card is the limit again.
+- **The fault limit.** A page that a shader finds empty is taken from the next
+  frame on, but only 2,048 of them in all in a run, and a run with the builder
+  had them spent in seconds, with 700 to 1,400 entries a frame in the fault
+  list after (some of pages that are not memory of the title, which are turned
+  down, and some of pages that are: how many of each was not counted). It is
+  8,192 now (`VICTORY_MEMORY_FAULT_PAGES`); the
+  periodic line of `memory.rs` counts the pages the limit turns away.
+- **The first dispatch** of the builder makes its 53 programs on the title's
+  thread (up to some minutes on a cold cache): the title's watchdog is held for
+  it. A cache that has the builder's programs and the hit shading is needed
+  first (a run with the builder and `VICTORY_PIPELINE_BOOK=1`, or `victory warm`
+  with `VICTORY_BVH_BUILDER=1`, which does not leave the passes out).
 
 - Dynamic structures overlap each other (8 of 65 good in run light-10, 48 of
   275 in light-15). Part of the cause, run light-11's trace (`VICTORY_BVH_TRACE=1`): the title asks for a new
@@ -125,10 +189,8 @@ dispatches, faults and what came.
   cache 3.5, primary probes 2.3, shadows 1.6).
 - Captures made on 2026-11-25 (builder on or off) hang the card in a replay
   (cause unknown; do not try).
-- Five shadow-mask trace programs do not translate (a structure's address out
-  of a descriptor picked from the heap by a computed index: the host would have
-  to give a table of addresses by slot). The title did not create them in any
-  run so far.
+- (Mended: the five shadow-mask trace programs now translate, with a host
+  table of addresses by slot.)
 - An access to a page that is not there is lost (a read gives zero, a store is
   dropped).
 - Not publicly documented, and assumed: the instruction's rounding, the order
@@ -161,7 +223,15 @@ fork's constant.
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `VICTORY_AMBIENT_AIR=<multiple>[,max:<level>]` | what the air scatters is bounded by a multiple of the light around (and by the constant `<level>`: the multiple alone grows with the room) (off: the brown veil in the day room stays with it, light-14) |
 
-It is off while the builder runs.
+It rests once the builder has run (`pipeline::builder_lights`), also for the
+frame or two the builder sits out after a stage it could not bind: the title's
+own light then has the structures of the frames before, and the stand-in added
+to it would flash. Before the builder's first run, or when it cannot run (a
+program of it has no host pipeline), the stand-in is what lights the rooms. In
+a run with the builder the light of the title feeds its fog and its diffusion
+as it was made to, so nothing of the stand-in's fog, floor or air limits is
+in the picture: the launcher's `VICTORY_AMBIENT` and `VICTORY_AMBIENT_AIR` can
+stay as they are.
 
 The title has several variants of the resolving program (seven in its
 shaders). They have the diffuse light and the depth at the same shader

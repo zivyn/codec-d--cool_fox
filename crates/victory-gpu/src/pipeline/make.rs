@@ -78,29 +78,45 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+/// Which of the title's ray-tracing passes are left out, as `(the shading of
+/// hits, the activation of probe rays)`, by what the switches say.
+///
+/// Without the structure builder every ray misses, and the ~1,000 programs
+/// that shade hits cost compile time for nothing, so they are left out unless
+/// `VICTORY_RT_RESOLVE` is set to something but 0; the activation of probe
+/// rays is one pipeline, left out unless `VICTORY_ACTIVATE_RAYS` is set to
+/// something but 0 (what it marks is then kept stale in blocks of the picture's
+/// tiles). With the builder (`VICTORY_BVH_BUILDER=1`) both run, and only
+/// `VICTORY_ACTIVATE_RAYS=0` takes the activation out.
+fn passes_left_out(
+    builder: bool,
+    rt_resolve: Option<&str>,
+    activate_rays: Option<&str>,
+) -> (bool, bool) {
+    let set = |v: Option<&str>| v.is_some_and(|v| v != "0");
+    let hits = !builder && !set(rt_resolve);
+    let activation = if builder {
+        activate_rays == Some("0")
+    } else {
+        !set(activate_rays)
+    };
+    (hits, activation)
+}
+
 pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
-    static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
-    let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return false;
-        }
-        // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
-        // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
+    static LEFT_OUT: OnceLock<(bool, bool)> = OnceLock::new();
+    let (hits, activation) = *LEFT_OUT.get_or_init(|| {
+        let var = |name| std::env::var(name).ok();
+        passes_left_out(
+            std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"),
+            var("VICTORY_RT_RESOLVE").as_deref(),
+            var("VICTORY_ACTIVATE_RAYS").as_deref(),
+        )
     });
-    if skip_rt && named(shaders, b"CS_RaytracingResolve") {
+    if hits && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
-    static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
-    let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
-        if builder {
-            return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
-        }
-        std::env::var_os("VICTORY_ACTIVATE_RAYS").is_none_or(|v| v == "0")
-    });
-    if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
+    if activation && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
     None
@@ -789,6 +805,23 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ray_tracing_passes_follow_the_builder_and_their_switches() {
+        // (hits left out, activation left out)
+        // Default, without the builder: both out.
+        assert_eq!(passes_left_out(false, None, None), (true, true));
+        assert_eq!(passes_left_out(false, Some("0"), Some("0")), (true, true));
+        // Each has its own switch.
+        assert_eq!(passes_left_out(false, None, Some("1")), (true, false));
+        assert_eq!(passes_left_out(false, Some("1"), None), (false, true));
+        assert_eq!(passes_left_out(false, Some("1"), Some("1")), (false, false));
+        // The builder brings both back.
+        assert_eq!(passes_left_out(true, None, None), (false, false));
+        assert_eq!(passes_left_out(true, Some("0"), Some("1")), (false, false));
+        // Only the activation has a switch that takes it out again.
+        assert_eq!(passes_left_out(true, None, Some("0")), (false, true));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

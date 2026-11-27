@@ -322,12 +322,47 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// `VICTORY_BVH_BUILDER=1`: the builder is asked for.
+#[cfg(windows)]
+fn builder_asked() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether the title's rays find structures the builder made, which is when
+/// the stand-in for the indirect light (`crate::ambient`) must rest: the
+/// builder is asked for and has run, or runs now. It stays so while the
+/// builder rests for a frame or two after a stage it could not bind
+/// ([`builder_rests`]): the structures of the frames before are still there,
+/// and the stand-in added to the title's own light for those frames would flash.
+/// Before the builder's first run, or when it cannot run, the rays find nothing
+/// and the stand-in is what lights the rooms.
+#[cfg(windows)]
+pub(crate) fn builder_lights() -> bool {
+    rays_find_structures(
+        builder_asked(),
+        || BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole,
+        builder_runs,
+    )
+}
+
+/// [`builder_lights`] from its parts: `has_run` and `runs_now` are only
+/// asked when the builder is asked for (and the second only when the first
+/// says no).
+#[cfg(any(windows, test))]
+fn rays_find_structures(
+    asked: bool,
+    has_run: impl FnOnce() -> bool,
+    runs_now: impl FnOnce() -> bool,
+) -> bool {
+    asked && (has_run() || runs_now())
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -802,6 +837,18 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn the_stand_in_rests_once_the_builder_has_run() {
+        let unasked = || -> bool { panic!("not to be asked") };
+        // The builder is not asked for: the rays find nothing, whatever else.
+        assert!(!rays_find_structures(false, unasked, unasked));
+        // It has run: it counts, without asking whether it runs this frame (it may be resting).
+        assert!(rays_find_structures(true, || true, unasked));
+        // It has not run yet: it counts when it runs now, else the stand-in lights the rooms.
+        assert!(rays_find_structures(true, || false, || true));
+        assert!(!rays_find_structures(true, || false, || false));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

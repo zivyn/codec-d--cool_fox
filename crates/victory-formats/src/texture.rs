@@ -292,7 +292,10 @@ impl Layout {
             && d.samples.is_power_of_two()
             && d.samples <= 8
             && (d.samples == 1
-                || (d.dimension == Dimension::Tex2d && d.mips == 1 && d.swizzle != Swizzle::LINEAR))
+                || (d.block == 1
+                    && d.dimension == Dimension::Tex2d
+                    && d.mips == 1
+                    && d.swizzle != Swizzle::LINEAR))
             && (d.dimension != Dimension::Tex1d || d.height == 1)
             && (d.dimension != Dimension::Tex3d
                 || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
@@ -946,6 +949,77 @@ mod tests {
             samples: 1,
             swizzle,
         }
+    }
+
+    const RGBA8_TEXTURE: TextureDesc = TextureDesc {
+        dimension: Dimension::Tex2d,
+        width: 4,
+        height: 4,
+        depth_or_array: 1,
+        mips: 1,
+        format: 28, // R8G8B8A8_UNORM
+        samples: 1,
+        swizzle: Swizzle::SW_4KB_S,
+    };
+
+    #[test]
+    fn bc_formats_accept_single_sample_layouts() {
+        for format in (70..=84).chain(94..=99) {
+            let desc = TextureDesc {
+                format,
+                ..RGBA8_TEXTURE
+            };
+            assert!(Texture::new(&desc).is_ok(), "DXGI format {format}");
+        }
+    }
+
+    #[test]
+    fn bc_formats_reject_multisampled_layouts() {
+        // DXGI BC1 through BC5, then BC6H and BC7.
+        for format in (70..=84).chain(94..=99) {
+            for samples in [2, 4, 8] {
+                let desc = TextureDesc {
+                    format,
+                    samples,
+                    swizzle: Swizzle::SW_64KB_R_X,
+                    ..RGBA8_TEXTURE
+                };
+                assert_eq!(
+                    Texture::new(&desc),
+                    Err(Error::Invalid),
+                    "DXGI format {format} with {samples} samples"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uncompressed_formats_keep_multisample_layout_rules() {
+        let color = TextureDesc {
+            samples: 4,
+            swizzle: Swizzle::SW_64KB_R_X,
+            ..RGBA8_TEXTURE
+        };
+        assert!(Texture::new(&color).is_ok());
+
+        let packed = TextureDesc {
+            format: 24, // R10G10B10A2_UNORM
+            ..color
+        };
+        assert!(Texture::new(&packed).is_ok());
+
+        let depth = TextureDesc {
+            format: 40, // D32_FLOAT
+            swizzle: Swizzle::SW_64KB_Z_X,
+            ..color
+        };
+        assert!(Texture::new(&depth).is_ok());
+
+        let linear = TextureDesc {
+            swizzle: Swizzle::LINEAR,
+            ..color
+        };
+        assert_eq!(Texture::new(&linear), Err(Error::Invalid));
     }
 
     #[test]

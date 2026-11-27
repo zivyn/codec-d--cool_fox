@@ -41,6 +41,9 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
+//! `VICTORY_AMBIENT_TRUST=<multiple>` (4) bounds what the program left by that multiple of
+//! the estimate; 0 drops it: the light is the estimate alone (no colour from stale memory).
+//!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around, and with `,max:<level>`
@@ -194,6 +197,20 @@ fn air_set() -> (f32, f32) {
 
 fn air() -> f32 {
     air_set().0
+}
+
+/// How far what the title's program left may be believed, as a multiple of the estimate
+/// (`VICTORY_AMBIENT_TRUST=<multiple>`; unset: 4). What it left is bounded in brightness by
+/// this much of the estimate, but keeps its own colour, and in the blocks of memory nothing
+/// wrote that colour is whatever the memory held (it changes from one run to the next).
+/// 0: none of it, the light is the estimate alone.
+fn trust() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_trust(&std::env::var("VICTORY_AMBIENT_TRUST").unwrap_or_default()))
+}
+
+fn parse_trust(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && (0.0..=64.0).contains(v)).unwrap_or(4.0)
 }
 
 /// Strength and radius of the creases' shade.
@@ -536,7 +553,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> Result<[u32; 
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = 4.0f32.to_bits();
+    words[9] = trust().to_bits();
     words[10] = air().to_bits();
     words[11] = base.to_bits();
     words[12] = air_set().1.to_bits();
@@ -740,6 +757,17 @@ mod tests {
         assert_eq!(parse("constant:nan"), Set::Off);
         assert_eq!(parse("constant:"), Set::Off);
         assert_eq!(parse("floor:0.1"), Set::Off);
+    }
+
+    #[test]
+    fn trust_in_what_the_program_left() {
+        assert_eq!(parse_trust(""), 4.0);
+        assert_eq!(parse_trust("0"), 0.0);
+        assert_eq!(parse_trust(" 1.5 "), 1.5);
+        assert_eq!(parse_trust("-1"), 4.0);
+        assert_eq!(parse_trust("nan"), 4.0);
+        assert_eq!(parse_trust("1000"), 4.0);
+        assert_eq!(parse_trust("x"), 4.0);
     }
 
     #[test]

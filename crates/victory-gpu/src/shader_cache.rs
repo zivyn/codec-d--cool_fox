@@ -48,10 +48,10 @@ fn build() -> [u8; 32] {
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        if victory_shader::emit::loop_limit_is_named() {
             tracing::warn!(
                 limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+                "VICTORY_SHADER_LOOP_LIMIT: every translated loop has this limit, whatever its stage"
             );
         }
         if let Some(table) = std::env::var("VICTORY_LOOP_LIMITS")

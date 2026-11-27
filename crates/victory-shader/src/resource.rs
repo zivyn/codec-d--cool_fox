@@ -366,10 +366,22 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
-            out.waterfall.compares.extend(proof.compares);
-            out.waterfall.reads.extend(proof.reads);
-            out.waterfall.loads.extend(loads);
+        match t.waterfall(block, &accesses, &reads) {
+            Ok(proof) => {
+                out.waterfall.compares.extend(proof.compares);
+                out.waterfall.reads.extend(proof.reads);
+                out.waterfall.loads.extend(loads);
+            }
+            Err(why) => {
+                // (`VICTORY_WAVE_WHY=1`: a loop that reads a descriptor offset at the first
+                // lane and was not proven a waterfall is a loop the translation runs as is)
+                if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                    eprintln!(
+                        "WATERFALL-UNPROVEN at {:#x}: {why}",
+                        t.inst((block, accesses[0])).machine.offset
+                    );
+                }
+            }
         }
     }
     out.lane_copied = t.lane_copied.take();

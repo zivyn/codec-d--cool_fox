@@ -1780,6 +1780,26 @@ pub(crate) fn may_make(memory: Option<[u64; 4]>) -> bool {
     if crate::tiles::wanted() { level_cap(memory) > 0 } else { room(memory) }
 }
 
+/// Whether a texture whose upload left held levels out under `cap` may be
+/// uploaded again now: the card takes larger levels than it did then
+/// (`now`). The card of a title this size sits past its line for the whole
+/// run, so the old rule (`now` is `u64::MAX`, 1.5 GB of room) never held
+/// after the load: a texture uploaded while the world loaded kept its
+/// small levels for good, a different set of them in every run (the
+/// banding of IMG1). `VICTORY_LEVELS_RETRY=0` brings the old rule back.
+#[cfg(any(windows, test))]
+pub(crate) fn retry_allowed(now: u64, cap: u64, steps: bool) -> bool {
+    if steps { now > cap } else { now == u64::MAX }
+}
+
+/// [`retry_allowed`] for the card as it is now (see [`level_cap_lately`]).
+#[cfg(windows)]
+pub(crate) fn may_retry(cap: u64) -> bool {
+    static STEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let steps = *STEPS.get_or_init(|| std::env::var_os("VICTORY_LEVELS_RETRY").is_none_or(|v| v != "0"));
+    retry_allowed(level_cap_lately(), cap, steps)
+}
+
 /// [`level_cap`] as it was at most a tenth of a second ago.
 #[cfg(windows)]
 pub(crate) fn level_cap_lately() -> u64 {
@@ -2692,20 +2712,20 @@ impl OnDemand {
     /// they may show changed).
     /// Held levels get tiles only up to the size the card's room allows
     /// ([`level_cap_for`]).
-    /// Returns whether a level is still without its tiles: the caller
-    /// records the upload again later.
-    pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
-        let Some(tiled) = &self.0.tiled else {
-            return false;
-        };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, level_cap(crate::host::host().and_then(|h| h.video_memory())));
+    /// Returns, if a level is still without its tiles, the cap it was
+    /// uploaded under: the caller records the upload again later, when
+    /// [`may_retry`] says the card takes more.
+    pub(crate) fn uploaded(&self, held: u32, memory: u64) -> Option<u64> {
+        let tiled = self.0.tiled.as_ref()?;
+        let cap = level_cap(crate::host::host().and_then(|h| h.video_memory()));
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, cap);
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
         if waiting {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        waiting
+        waiting.then_some(cap)
     }
 
     /// [`crate::tiles::Tiled::card_wrote`]; `memory` as above.
@@ -4675,6 +4695,26 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(caps.windows(2).all(|w| w[0] >= w[1]), "never more memory for a fuller card");
         // Past an explicit limit: none.
         assert_eq!(level_cap_for(i64::MIN), 0);
+    }
+
+    #[test]
+    fn a_texture_left_short_is_uploaded_again_when_the_cap_grows() {
+        const MB: i64 = 1 << 20;
+        // Uploaded while the card was past its line (cap 64 KiB), a card
+        // that stays past it gives no reason to try again; one that takes
+        // 1 MiB levels later does, once, and a second try at that cap
+        // does not repeat.
+        let at = level_cap_for(-100 * MB);
+        assert!(!retry_allowed(level_cap_for(-100 * MB), at, true));
+        assert!(!retry_allowed(level_cap_for(-200 * MB), at, true));
+        let later = level_cap_for(300 * MB);
+        assert!(retry_allowed(later, at, true));
+        assert!(!retry_allowed(later, later, true));
+        // A texture that got no level at all (cap 0) tries again as soon as any fits.
+        assert!(retry_allowed(level_cap_for(-100 * MB), level_cap_for(-200 * MB), true));
+        // The old rule (`VICTORY_LEVELS_RETRY=0`): only with room for any size.
+        assert!(!retry_allowed(later, at, false));
+        assert!(retry_allowed(u64::MAX, at, false));
     }
 
     /// A placed texture viewed from a later level has a host copy of that

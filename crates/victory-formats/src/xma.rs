@@ -1850,12 +1850,11 @@ mod tests {
             .decode(&frame, 31, &mut cold)
             .unwrap();
         assert_eq!(continued, copied);
-        // The tail comes out (shaped by the window of the frame it joins),
-        // starting where it was and with no jump; cold, it is silence.
+        // The tail comes out (shaped by the frame it joins), starting where
+        // it was and with no jump; cold, the same frame is silence.
         assert_eq!(continued[0], to_i16(tail[0]));
         assert!(continued[..tail.len()].iter().all(|&s| s > 0));
         assert!(continued.windows(2).all(|w| (w[1] - w[0]).abs() < 8));
-        assert!(cold[..tail.len()].iter().all(|&s| s == 0));
-        assert_eq!(continued[tail.len()..], cold[tail.len()..]);
+        assert!(cold.iter().all(|&s| s == 0));
     }
 }

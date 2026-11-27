@@ -105,7 +105,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             state.0.push(ms);
                             state.1 += usize::from(!there);
                             let count = state.0.len();
-                            if count % 1000 == 0 {
+                            if count.is_multiple_of(1000) {
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);

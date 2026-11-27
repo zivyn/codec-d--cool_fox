@@ -1377,7 +1377,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
-        let (start, end) = (0xd0419_6698, 0xd0419_6690);
+        let (start, end) = (0x000d_0419_6698, 0x000d_0419_6690);
         assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);

@@ -1802,7 +1802,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     if every > 0 {
         static PRESENTS: AtomicU32 = AtomicU32::new(0);
         let n = PRESENTS.fetch_add(1, Relaxed);
-        if n % every == 0 {
+        if n.is_multiple_of(every) {
             set_framegen([2, 4, 0, 6][(n / every % 4) as usize]);
         }
     }

@@ -61,7 +61,9 @@ fn book() -> Option<&'static Mutex<Book>> {
         let mut keys = HashSet::new();
         let mut shaders = HashSet::new();
         let ends = [
-            walk_shaders(&dir, |_, hash, _, _| drop(shaders.insert(hash))),
+            walk_shaders(&dir, |_, hash, _, _| {
+                shaders.insert(hash);
+            }),
             walk_pipelines(&dir, |_, bytes| {
                 keys.extend(bytes.first_chunk::<16>().copied());
             }),
@@ -234,7 +236,9 @@ pub fn keep_library() {
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
+    walk_shaders(dir, |stage, hash, at, len| {
+        places.insert(hash, (stage, at, len));
+    });
     let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();

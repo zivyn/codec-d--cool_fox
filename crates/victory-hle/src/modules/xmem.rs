@@ -3155,7 +3155,7 @@ mod tests {
         assert!(lazy(c));
         assert_eq!(map_pages(c, 3, std::ptr::null(), true), c);
         assert!(!lazy(c));
-        assert!(physical().views.get(&(c as usize)).is_none());
+        assert!(!physical().views.contains_key(&(c as usize)));
         assert_eq!(host(c), MEM_RESERVE);
         assert_eq!(map_pages(c, 3, pages.as_ptr(), false), c);
         // SAFETY: mapped.
@@ -3166,7 +3166,7 @@ mod tests {
         assert_eq!(map_pages(d, 3, pages.as_ptr(), true), d);
         assert_eq!(map_pages(at(d, 1), 1, std::ptr::null(), true), at(d, 1));
         assert!(lazy(d) && lazy(at(d, 2)));
-        assert!(physical().views.get(&(at(d, 1) as usize)).is_none());
+        assert!(!physical().views.contains_key(&(at(d, 1) as usize)));
         assert!(materialize(at(d, 2) as usize, 1));
         assert!(!lazy(at(d, 2)) && lazy(d));
         // SAFETY: mapped now.
@@ -3259,7 +3259,7 @@ mod tests {
         assert_eq!(read(heap, 1), ((true, 1), vec![2]));
         // Unmapped: gone, with no view of the host's ever there.
         assert!(alias_as((heap + PAGE) as u64, 0, PAGE as u64, false, true));
-        assert!(!lazy(heap + PAGE) && physical().views.get(&(heap + PAGE)).is_none());
+        assert!(!lazy(heap + PAGE) && !physical().views.contains_key(&(heap + PAGE)));
         assert_eq!(soft_runs(heap, 4 * PAGE), [(heap, PAGE), (heap + 2 * PAGE, PAGE)]);
         assert_eq!(read(heap + PAGE, 2 * PAGE).0, (false, PAGE));
         // The CPU touches one: the handler maps it with its page's bytes,

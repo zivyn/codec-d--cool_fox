@@ -1342,8 +1342,8 @@ impl Due {
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
         let Due { mut again, mut fresh } = self;
         // By the number of the write, counted over the run.
-        again.sort_unstable_by(|a, b| b.2.cmp(&a.2));
-        fresh.sort_unstable_by(|a, b| b.2.cmp(&a.2));
+        again.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
+        fresh.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
         let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
         let (mut new, mut old) = (0, fresh.len());

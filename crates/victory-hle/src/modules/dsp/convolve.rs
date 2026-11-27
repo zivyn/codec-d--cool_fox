@@ -91,7 +91,7 @@ pub(super) struct Convolver {
 impl Convolver {
     /// `None` when the response is not in the layout described above.
     pub(super) fn new(ir: &[f32]) -> Option<Self> {
-        if ir.is_empty() || ir.len() % N != 0 {
+        if ir.is_empty() || !ir.len().is_multiple_of(N) {
             return None;
         }
         let mut blocks = ir.len() / N;

@@ -293,7 +293,7 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
                     while !stop.load(Ordering::Relaxed) {
                         // Its own dwords, in every other block (in the rest
                         // only landings change anything).
-                        for i in (w..LEN / 4).step_by(4 * 97).filter(|i| i * 4 / BLOCK % 2 == 0) {
+                        for i in (w..LEN / 4).step_by(4 * 97).filter(|i| (i * 4 / BLOCK).is_multiple_of(2)) {
                             assert_eq!(dword(i).swap(value, Ordering::Relaxed), value - 1, "dword {i}: undone");
                         }
                         value += 1;
@@ -343,7 +343,7 @@ fn landings_beside_the_title_and_its_refreshes_lose_nothing() {
         stop.store(true, Ordering::Relaxed);
         for (w, writer) in writers.into_iter().enumerate() {
             let last = writer.join().expect("nothing undone");
-            for i in (w..LEN / 4).step_by(4 * 97).filter(|i| i * 4 / BLOCK % 2 == 0) {
+            for i in (w..LEN / 4).step_by(4 * 97).filter(|i| (i * 4 / BLOCK).is_multiple_of(2)) {
                 assert_eq!(dword(i).load(Ordering::Relaxed), last);
             }
         }

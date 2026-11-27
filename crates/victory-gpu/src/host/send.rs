@@ -32,7 +32,7 @@ const SHORT: usize = 256;
 
 /// Whether a run of `len` bytes at offset `at` of a copy goes as pairs.
 fn short(at: usize, len: usize) -> bool {
-    len <= SHORT && at % 4 == 0 && len % 4 == 0
+    len <= SHORT && at.is_multiple_of(4) && len.is_multiple_of(4)
 }
 
 /// Whether a run of `len` bytes at offset `at` of a copy in the card's memory

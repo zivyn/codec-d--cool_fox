@@ -604,7 +604,7 @@ mod tests {
         f.extend([0x9c, 0x41, 0x5a, 0x48, 0x8b, 0x4c, 0x24, 0x28]);
         f.extend([0x4c, 0x89, 0x11, 0x48, 0x89, 0x51, 0x08, 0x48, 0x89, 0x41, 0x10, 0xc3]);
         type F = unsafe extern "system" fn(*mut u64, u64, u64, u64, *mut [u64; 3]);
-        let (there, operand, compared) = (spread(1), spread(2), if seed % 3 == 0 { spread(1) } else { spread(3) });
+        let (there, operand, compared) = (spread(1), spread(2), if seed.is_multiple_of(3) { spread(1) } else { spread(3) });
         let flags = 0x202 | (spread(4) & 0x8d5) as u32;
         let (mut memory, mut out) = (there, [0; 3]);
         // SAFETY: the code above, which keeps to the calling convention.

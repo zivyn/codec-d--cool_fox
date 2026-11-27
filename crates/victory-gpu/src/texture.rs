@@ -2570,7 +2570,7 @@ mod allocation_costs {
                 seen.push(digest(&bytes));
             }
         }
-        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
+        let text: Vec<u8> = (0..400u32).map(|i| ((i * 37) >> 2) as u8).collect();
         for at in 0..399 {
             let mut bytes = text.clone();
             bytes.swap(at, at + 1);

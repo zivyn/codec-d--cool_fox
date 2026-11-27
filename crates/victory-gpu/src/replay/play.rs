@@ -3154,7 +3154,7 @@ impl Player {
                     continue;
                 }
                 for l in all {
-                    self.worker.queue.ExecuteCommandLists(&[l.clone()]);
+                    self.worker.queue.ExecuteCommandLists(std::slice::from_ref(l));
                     self.worker.idle()?;
                 }
             }

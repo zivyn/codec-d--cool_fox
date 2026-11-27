@@ -970,7 +970,7 @@ mod tests {
     fn a_target_is_the_one_at_the_call() {
         let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);
-        slot[1] = 99;
+        std::hint::black_box(&mut slot)[1] = 99;
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
     }

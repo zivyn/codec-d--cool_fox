@@ -64,6 +64,25 @@ driver reported about 4,844 MiB used out of a 4,923 MiB local budget. The run
 ended when the window was closed. This result verifies progress past the
 allocation failure. Rendering in the cutscene still needs testing.
 
+### Follow-up on the invisible scene
+
+The same checkpoint, with two pipeline workers and frame generation off,
+gave these results during the opening cutscene:
+
+| Configuration | Observed result |
+| --- | --- |
+| Original Series S path after warming 1,561 recorded pipelines | Black picture with subtitles |
+| DLSS Balanced, with its own cache | Black picture with subtitles despite successful DLSS dispatches |
+| Internal upscaler from #68, default 3,072 MiB target reserve | Black picture with subtitles |
+| Internal upscaler, 1,536 MiB target reserve | Black picture even after the unused target reserve went to zero |
+| Internal upscaler, 1,536 MiB target reserve, `VICTORY_THIN=0`, `VICTORY_JOIN_PARTS=1` | 3D street scene visible, with dark areas and the texture queue still waiting for room |
+
+The last two runs used the same build and save, with a cache that warmed
+between runs. Synchronous recording is a candidate for reproducing visible
+output; the test does not isolate it from that cache history. The Windows
+commit peak in the visible run was approximately 32 GiB. Later gameplay and
+DLSS with synchronous recording have yet to be verified.
+
 ## Related work
 
 - fxceless reports a similar allocation abort during a scene transition with
@@ -85,3 +104,6 @@ allocation failure. Rendering in the cutscene still needs testing.
   Windows paging.
   [Upscaler #68](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/68),
   [render target reserve #76](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/76)
+- Another tester saw missing character geometry that returned with `THIN`
+  and `JOIN_PARTS` disabled on a different GPU.
+  [Recording mode #66](https://github.com/trustno1-coder/VIctory-NVIDIA/pull/66)

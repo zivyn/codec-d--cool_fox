@@ -467,6 +467,8 @@ struct Lower<'a> {
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
+    /// The code offset of the instruction being lowered, for `VICTORY_MASK_WHY`.
+    at_offset: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -2030,6 +2032,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            at_offset: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -3896,6 +3899,18 @@ impl<'a> Lower<'a> {
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
+            }
+            if std::env::var_os("VICTORY_MASK_WHY").is_some() {
+                // (which mask, written where, read where: the lines to read the refusal by)
+                let writer = made.and_then(|b| {
+                    self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)).map(|i| (b, i.machine.offset, i.name()))
+                });
+                eprintln!(
+                    "MASK-WHY {lo:?} {} in block {made:?}, written by {writer:?}, read as data in IR block {} by the instruction at {:#x}",
+                    if high { "(high dword)" } else { "" },
+                    self.cur_ir,
+                    self.at_offset
+                );
             }
             return Err(MASK_ELSEWHERE);
         }
@@ -5839,6 +5854,7 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        self.at_offset = offset;
         let name = inst.name();
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")

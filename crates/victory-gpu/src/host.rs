@@ -5087,6 +5087,66 @@ impl Host {
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
         let mut written = 0;
+        // The tail's landing: what the title was seen to read is landed at
+        // once, what it was not is left owed ([`crate::land::owed`]). What
+        // cannot be armed is landed here, at once.
+        let mut had_keys: Option<Vec<(u64, usize, usize)>> = None;
+        let mut tail_bytes = (0u64, 0u64);
+        if land::in_tail() && land::on() {
+            for (shadow, lo, hi, _) in &pieces {
+                let n = (hi - lo) as u64;
+                if shadow.title_read() { tail_bytes.0 += n } else { tail_bytes.1 += n }
+            }
+            land::count(land::stat::TAIL_READ_BYTES, tail_bytes.0);
+            land::count(land::stat::TAIL_UNREAD_BYTES, tail_bytes.1);
+        }
+        if land::owed::on() && land::on() && land::in_tail() && check.is_none() {
+            had_keys = Some(pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)).collect());
+            let (eager, owed): (Vec<_>, Vec<_>) = std::mem::take(&mut pieces).into_iter().partition(|p| !p.0.lazy_landing());
+            pieces = eager;
+            let spans: Vec<(usize, usize)> = owed
+                .iter()
+                .map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, shadow.span().0 as usize + hi))
+                .collect();
+            let grouped = land::owed::groups(&spans);
+            let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); grouped.len()];
+            for (i, &(a, _)) in spans.iter().enumerate() {
+                buckets[grouped.partition_point(|g| g.1 <= a)].push(i);
+            }
+            let mut units: Vec<(usize, usize, land::owed::Land, Box<dyn Fn() + Send + Sync>)> = Vec::new();
+            for (&(from, to), bucket) in grouped.iter().zip(&buckets) {
+                let runs: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize, usize)> =
+                    bucket.iter().map(|&i| (owed[i].0.clone(), owed[i].1, owed[i].2, data + owed[i].3 as usize)).collect();
+                let mut copies: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
+                for run in &runs {
+                    if !copies.iter().any(|c| std::sync::Arc::ptr_eq(c, &run.0)) {
+                        copies.push(run.0.clone());
+                    }
+                }
+                let landing: land::owed::Land = Box::new(move || {
+                    let mut notes = land::Notes::default();
+                    for run in runs.chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
+                        let addressed: Vec<(usize, usize, usize)> = run.iter().map(|(_, lo, hi, now)| (*lo, *hi, *now)).collect();
+                        // SAFETY: the fetched bytes, which stay (the buffer is
+                        // not used again before `finish_all`); the copies are
+                        // held by the unit.
+                        unsafe { run[0].0.land_card_with(&addressed, after, &mut notes, true) };
+                    }
+                    notes.flush();
+                    if land::owed::check_on() {
+                        for (shadow, lo, hi, now) in &runs {
+                            land::owed::verify(shadow.span().0 as usize + lo, *now as *const u8, hi - lo);
+                        }
+                    }
+                });
+                let touched: Box<dyn Fn() + Send + Sync> = Box::new(move || copies.iter().for_each(|c| c.note_title_read()));
+                units.push((from, to, landing, touched));
+            }
+            // Armed; those that could not be are landed here and now.
+            for landing in land::owed::register(units) {
+                landing();
+            }
+        }
         if land::on() {
             let titles: Vec<(usize, usize)> =
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
@@ -5130,15 +5190,19 @@ impl Host {
             }
         }
         land::spent(land::stat::CARD, merging);
+        if tail_bytes.0 + tail_bytes.1 > 0 {
+            let us = merging.elapsed().as_micros() as u64;
+            land::count(land::stat::TAIL_UNREAD_US, us * tail_bytes.1 / (tail_bytes.0 + tail_bytes.1));
+        }
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
                 check.done(&mut f.suspects);
             }
-            f.had.fetched(
-                ahead,
-                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)),
-            );
+            // (What was fetched, whether it is landed yet or not.)
+            let keys: Vec<(u64, usize, usize)> = had_keys
+                .unwrap_or_else(|| pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)).collect());
+            f.had.fetched(ahead, keys.into_iter());
         }
         // Sends up to `after` are of no use to any later merge.
         crate::shadow::relay_fetched(after);
@@ -5153,6 +5217,9 @@ impl Host {
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
     fn relay_land(&self, items: Vec<Late>, tail: bool, fetch: &mut Option<RelayFetch>) {
+        // What an earlier landing still owes is in before this one begins, and
+        // so before any signal behind it is told.
+        crate::land::owed::finish_all();
         let landing = std::time::Instant::now();
         let _tail = crate::land::tail(tail);
         let (mut card_us, mut pc_us) = (0u64, 0u64);
@@ -5251,6 +5318,9 @@ impl Host {
                 }
             };
         }
+        // The title is told: what was left owed is landed now, here and by the
+        // landing's threads, unless a thread of the title has landed it.
+        crate::land::owed::run_pending();
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
@@ -8805,6 +8875,8 @@ pub(crate) fn read_there(src: *const u8, dst: &mut [u8]) -> usize {
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // What of it a landing owes is landed first (never zeros, never what was).
+    crate::land::owed::land_range(src as usize, len);
     if crate::safecopy::on() {
         // SAFETY: the destination is mapped writable memory of `len` bytes;
         // a source page that is not there fails the copy.

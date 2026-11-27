@@ -2153,6 +2153,8 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // (The kernel's write into a page owed would fail.)
+    crate::land::owed::land_range(at, len);
     quiet_touched(at, len);
     open_for_writing(at, len);
 }
@@ -2187,6 +2189,7 @@ pub struct KernelWrite(usize, usize);
 /// write fail (the kernel does not fault into our handler): a read cut
 /// short, which the title takes for what the file holds.
 pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
+    crate::land::owed::land_range(at, len);
     quiet_touched(at, len);
     let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     {
@@ -2696,7 +2699,9 @@ pub(crate) fn install() {
         // noted, and the access goes on. Another guard page is not ours.
         if r.ExceptionCode == 0x8000_0001u32 as NTSTATUS && r.NumberParameters >= 2 {
             let write = r.ExceptionInformation[0] == 1;
-            return if crate::readprobe::fault(r.ExceptionInformation[1], r.ExceptionAddress as usize, write) {
+            return if crate::land::owed::fault(r.ExceptionInformation[1])
+                || crate::readprobe::fault(r.ExceptionInformation[1], r.ExceptionAddress as usize, write)
+            {
                 EXCEPTION_CONTINUE_EXECUTION
             } else {
                 EXCEPTION_CONTINUE_SEARCH

@@ -60,6 +60,11 @@ thread_local! {
 /// more threads, if `VICTORY_LAND_TAIL_THREADS` asks for them.
 pub(crate) struct TailGuard(bool);
 
+/// Whether the thread is at a landing the title waits behind.
+pub(crate) fn in_tail() -> bool {
+    TAIL.get()
+}
+
 pub(crate) fn tail(on: bool) -> TailGuard {
     TailGuard(TAIL.replace(on))
 }
@@ -192,9 +197,17 @@ pub(crate) mod stat {
     pub(crate) const TAIL_CARD_US: usize = 33;
     pub(crate) const TAIL_PC_US: usize = 34;
     pub(crate) const TAIL_WIDE: usize = 35;
-    pub(crate) const COUNT: usize = 36;
+    /// Of the bytes the tail's landings fetch: those in copies the title was
+    /// seen to read (a read of an owed unit, or the probe's), those in copies
+    /// it was not, and the microseconds of the merge those took (the merge's
+    /// time shared by bytes).
+    pub(crate) const TAIL_READ_BYTES: usize = 36;
+    pub(crate) const TAIL_UNREAD_BYTES: usize = 37;
+    pub(crate) const TAIL_UNREAD_US: usize = 38;
+    pub(crate) const COUNT: usize = 39;
 }
 
+pub(crate) mod owed;
 pub(crate) mod quiet;
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -289,6 +302,32 @@ pub(crate) fn log(frames: f64) {
             ms(stat::TAIL_CARD_US) / s[stat::TAIL_N],
             ms(stat::TAIL_PC_US) / s[stat::TAIL_N],
             s[stat::TAIL_WIDE],
+        );
+        let (seen, unseen) = (s[stat::TAIL_READ_BYTES], s[stat::TAIL_UNREAD_BYTES]);
+        tracing::info!(
+            "bytes the tail's landings fetch, per frame: {:.1} MB in copies the title was seen to read, {:.1} MB in copies it was not (what lazy landing can leave owed): {:.2} ms of their merge (VICTORY_LAND_LAZY={})",
+            mb(seen),
+            mb(unseen),
+            ms(stat::TAIL_UNREAD_US),
+            u8::from(owed::on()),
+        );
+    }
+    if owed::on() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let o: Vec<f64> = owed::STATS.iter().map(|o| o.swap(0, Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "lazy landing per frame (VICTORY_LAND_LAZY=1): {:.1} units owed ({:.1} MB), {:.1} not armed and landed at once; the title or another thread touched {:.2} of them ({:.2} ms landing them in the handler), {:.2} waits for another thread's landing; {:.1} landed by the relay after the title was told ({:.2} ms); verifier (VICTORY_OWED_CHECK={}): {:.1} MB compared, {:.1} dwords differ",
+            o[owed::UNITS_N],
+            mb(o[owed::BYTES]),
+            o[owed::UNARMED],
+            o[owed::TOUCHES],
+            o[owed::TOUCH_US] / 1000.0,
+            o[owed::WAITS],
+            o[owed::BACKGROUND_N],
+            o[owed::BACKGROUND_US] / 1000.0,
+            u8::from(owed::check_on()),
+            mb(o[owed::CHECKED]),
+            o[owed::DIFFERING],
         );
     }
     crate::readprobe::log();

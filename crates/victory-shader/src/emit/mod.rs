@@ -102,6 +102,8 @@ mod shader;
 mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
+mod mesh_size_tests;
+#[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
 mod size_tests;
@@ -119,7 +121,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{PAIR_NOTE, host_settings, set_host_lds_bytes, set_host_max_wave, set_host_rdna};
+pub use lower::{
+    PAIR_NOTE, host_mesh_output_bytes, host_settings, set_host_lds_bytes, set_host_max_wave,
+    set_host_mesh_output_bytes, set_host_rdna,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,

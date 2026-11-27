@@ -286,6 +286,12 @@ pub(crate) fn amd(device: &ID3D12Device) -> bool {
     vendor(device) == 0x1002
 }
 
+/// The output of a mesh shader (vertex plus primitive) NVIDIA's drivers take, where the DXIL
+/// validator and D3D12's documents say 32 KiB (`set_host_mesh_output_bytes`). An RTX 4060 drew
+/// right up to 46 KiB and lost the device at 48 (`mesh_output_limit_probe`): 40 KiB leaves room
+/// for other cards of the vendor, which are not checked.
+pub(crate) const NVIDIA_MESH_OUTPUT_BYTES: u32 = 40 * 1024;
+
 /// Whether the device is NVIDIA's.
 pub(crate) fn nvidia(device: &ID3D12Device) -> bool {
     vendor(device) == 0x10DE

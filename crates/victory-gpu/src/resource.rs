@@ -1761,8 +1761,13 @@ pub(crate) fn level_cap_for(headroom: i64) -> u64 {
 /// any size while there is room, none without (as before).
 #[cfg(windows)]
 pub(crate) fn level_cap(memory: Option<[u64; 4]>) -> u64 {
+    cap_at(headroom(memory))
+}
+
+/// [`level_cap`] for a card with `headroom` bytes left to its line.
+#[cfg(windows)]
+fn cap_at(headroom: i64) -> u64 {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let headroom = headroom(memory);
     if *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SQUEEZE").is_none_or(|v| v != "0")) {
         level_cap_for(headroom)
     } else if headroom > 0 {
@@ -1772,12 +1777,63 @@ pub(crate) fn level_cap(memory: Option<[u64; 4]>) -> u64 {
     }
 }
 
+/// The cap of everyone ([`level_cap`]) and the cap a hot texture gets
+/// ([`crate::priority::hot_cap`]) for a card with `memory`.
+#[cfg(windows)]
+pub(crate) fn hot_level_cap(memory: Option<[u64; 4]>) -> (u64, u64) {
+    let headroom = headroom(memory);
+    let cap = cap_at(headroom);
+    (cap, crate::priority::hot_cap(cap, headroom, crate::priority::Heat::Hot))
+}
+
+/// Whether a hot texture left short of levels under `cap` may be uploaded
+/// again now: the card takes larger levels for it than it did
+/// ([`crate::priority::hot_cap`]).
+#[cfg(windows)]
+pub(crate) fn may_retry_hot(cap: u64) -> bool {
+    crate::priority::enabled() && {
+        let headroom = headroom_lately();
+        crate::priority::hot_cap(level_cap_lately(), headroom, crate::priority::Heat::Hot) > cap
+    }
+}
+
+/// The room left to the card's line as it was at most a tenth of a second ago
+/// ([`level_cap_lately`] makes it).
+#[cfg(windows)]
+pub(crate) fn headroom_lately() -> i64 {
+    level_cap_lately();
+    LATE_HEADROOM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(windows)]
+static LATE_HEADROOM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MAX);
+
 /// Whether more host copies of textures may be made now: with levels on
 /// demand while the card takes any level at all ([`level_cap_for`]: what
 /// does not fit is left without memory), else while it has [`room`].
 #[cfg(windows)]
 pub(crate) fn may_make(memory: Option<[u64; 4]>) -> bool {
     if crate::tiles::wanted() { level_cap(memory) > 0 } else { room(memory) }
+}
+
+/// Whether a texture whose upload left held levels out under `cap` may be
+/// uploaded again now: the card takes larger levels than it did then
+/// (`now`). The card of a title this size sits past its line for the whole
+/// run, so the old rule (`now` is `u64::MAX`, 1.5 GB of room) never held
+/// after the load: a texture uploaded while the world loaded kept its
+/// small levels for good, a different set of them in every run (the
+/// banding of IMG1). `VICTORY_LEVELS_RETRY=0` brings the old rule back.
+#[cfg(any(windows, test))]
+pub(crate) fn retry_allowed(now: u64, cap: u64, steps: bool) -> bool {
+    if steps { now > cap } else { now == u64::MAX }
+}
+
+/// [`retry_allowed`] for the card as it is now (see [`level_cap_lately`]).
+#[cfg(windows)]
+pub(crate) fn may_retry(cap: u64) -> bool {
+    static STEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let steps = *STEPS.get_or_init(|| std::env::var_os("VICTORY_LEVELS_RETRY").is_none_or(|v| v != "0"));
+    retry_allowed(level_cap_lately(), cap, steps)
 }
 
 /// [`level_cap`] as it was at most a tenth of a second ago.
@@ -1792,7 +1848,9 @@ pub(crate) fn level_cap_lately() -> u64 {
     if AT.load(Relaxed) == tenth {
         return CAP.load(Relaxed);
     }
-    let cap = level_cap(crate::host::host().and_then(|h| h.video_memory()));
+    let headroom = headroom(crate::host::host().and_then(|h| h.video_memory()));
+    let cap = cap_at(headroom);
+    LATE_HEADROOM.store(headroom, Relaxed);
     CAP.store(cap, Relaxed);
     AT.store(tenth, Relaxed);
     cap
@@ -2692,20 +2750,38 @@ impl OnDemand {
     /// they may show changed).
     /// Held levels get tiles only up to the size the card's room allows
     /// ([`level_cap_for`]).
-    /// Returns whether a level is still without its tiles: the caller
-    /// records the upload again later.
-    pub(crate) fn uploaded(&self, held: u32, memory: u64) -> bool {
-        let Some(tiled) = &self.0.tiled else {
-            return false;
-        };
-        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, level_cap(crate::host::host().and_then(|h| h.video_memory())));
+    /// Returns, if a level is still without its tiles, the cap it was
+    /// uploaded under: the caller records the upload again later, when
+    /// [`may_retry`] says the card takes more.
+    pub(crate) fn uploaded(&self, held: u32, memory: u64) -> Option<u64> {
+        let tiled = self.0.tiled.as_ref()?;
+        let (mut cap, hot) = hot_level_cap(crate::host::host().and_then(|h| h.video_memory()));
+        // A texture draws read through a table is given levels as if the
+        // card had more room (`crate::priority`).
+        if hot > cap && crate::priority::enabled() && tiled.heat() == crate::priority::Heat::Hot {
+            cap = hot;
+            crate::tiles::STATS[16].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let (changed, waiting) = tiled.uploaded(&self.0.texture, held, cap);
         if changed {
             crate::descriptor::host::levels_changed(memory);
         }
         if waiting {
             crate::tiles::STATS[9].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        waiting
+        waiting.then_some(cap)
+    }
+
+    /// The texture has had an upload: [`crate::tiles::pass`] looks at it
+    /// from now on; `memory` as above.
+    pub(crate) fn track(&self, memory: u64) {
+        crate::tiles::track(memory, &self.0);
+    }
+
+    /// Its handle for the list of textures waiting for levels
+    /// ([`crate::descriptor::host::levels_waiting`]).
+    pub(crate) fn weak(&self) -> std::sync::Weak<HostTexture> {
+        std::sync::Arc::downgrade(&self.0)
     }
 
     /// [`crate::tiles::Tiled::card_wrote`]; `memory` as above.
@@ -2793,6 +2869,22 @@ fn hand_out_resource(
             grown: std::sync::atomic::AtomicBool::new(false),
         },
     });
+    // Volumes the title makes (light, fog and grading tables): their size is a
+    // quality choice it makes per run (IMG1: 64x64x32 against 64x64x64), so
+    // when it chose is logged beside what the host showed it by then.
+    #[cfg(windows)]
+    if desc.dimension == 4 && desc.depth_or_array_size >= 16 {
+        tracing::info!(
+            width = desc.width,
+            height = desc.height,
+            depth = desc.depth_or_array_size,
+            format = desc.format,
+            flags = desc.flags,
+            frame = crate::frame::current(),
+            at_ms = crate::host::now_ms(),
+            "the title makes a volume texture"
+        );
+    }
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
     if desc.dimension != BUFFER {
@@ -4678,6 +4770,26 @@ float4 lit() : SV_Target { return 1.0; }
         assert!(caps.windows(2).all(|w| w[0] >= w[1]), "never more memory for a fuller card");
         // Past an explicit limit: none.
         assert_eq!(level_cap_for(i64::MIN), 0);
+    }
+
+    #[test]
+    fn a_texture_left_short_is_uploaded_again_when_the_cap_grows() {
+        const MB: i64 = 1 << 20;
+        // Uploaded while the card was past its line (cap 64 KiB), a card
+        // that stays past it gives no reason to try again; one that takes
+        // 1 MiB levels later does, once, and a second try at that cap
+        // does not repeat.
+        let at = level_cap_for(-100 * MB);
+        assert!(!retry_allowed(level_cap_for(-100 * MB), at, true));
+        assert!(!retry_allowed(level_cap_for(-200 * MB), at, true));
+        let later = level_cap_for(300 * MB);
+        assert!(retry_allowed(later, at, true));
+        assert!(!retry_allowed(later, later, true));
+        // A texture that got no level at all (cap 0) tries again as soon as any fits.
+        assert!(retry_allowed(level_cap_for(-100 * MB), level_cap_for(-200 * MB), true));
+        // The old rule (`VICTORY_LEVELS_RETRY=0`): only with room for any size.
+        assert!(!retry_allowed(later, at, false));
+        assert!(retry_allowed(u64::MAX, at, false));
     }
 
     /// A placed texture viewed from a later level has a host copy of that

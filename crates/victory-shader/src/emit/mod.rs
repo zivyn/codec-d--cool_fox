@@ -136,7 +136,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use lower::{PAIR_NOTE, host_settings, set_host_lds_bytes, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -411,6 +411,7 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    lower::set_program_tag(container);
     match translate_plain(container) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
             lower::with_first_half_pairs(|| translate_plain(container))
@@ -724,8 +725,9 @@ pub fn emit(
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
 /// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// wave, or a group of whole console waves whose halves meet by counters of their own: a
+/// group barrier inside such a branch would wait for threads that never come, the waves of a
+/// group deciding differently.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -741,6 +743,12 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // (several console waves: the two host waves of each meet by counters of their own,
+        // not at group barriers the other console waves would have to reach, `lower::pair_wait`)
+        crate::native::StageIo::Cs(cs)
+            if lower::pair_meet_on()
+                && cs.threads.iter().product::<u32>() % 64 == 0
+                && cs.threads.iter().product::<u32>() <= 1024 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

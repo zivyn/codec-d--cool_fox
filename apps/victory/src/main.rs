@@ -123,9 +123,33 @@ enum Command {
         /// Only the pipelines earlier runs drew with.
         #[arg(long)]
         used: bool,
+        /// Also every compute pipeline the archives hold (a compute
+        /// pipeline is its shader alone, so no run is needed to know it):
+        /// with `--used`, those and the drawn-with ones; without, all.
+        /// The archives are read once; `paths` names them (default: the
+        /// game folder's shaders.rpf and executable).
+        #[arg(long)]
+        compute: bool,
+        /// The user waits for it: the processes run at normal priority,
+        /// one per logical core.
+        #[arg(long)]
+        now: bool,
+        /// Say what there is to make and stop.
+        #[arg(long)]
+        status: bool,
+        /// Ask the pipeline library, as a run does, for every pipeline made
+        /// before (this build, this driver): how many it has and how many
+        /// would be compiled by the title.
+        #[arg(long)]
+        verify: bool,
+        /// Archives for `--compute`.
+        paths: Vec<PathBuf>,
         /// (What the processes it starts are given.)
         #[arg(long, hide = true)]
         these: Option<String>,
+        /// (Where they save what they made.)
+        #[arg(long, hide = true)]
+        shard: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -215,7 +239,9 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        Command::Warm { jobs, limit, again, used, compute, now, status, verify, paths, these, shard } => {
+            warm::run(warm::Ask { jobs, limit, again, used, compute, now, status, verify, paths, these, shard })
+        }
         Command::Run {
             exe,
             unimplemented,

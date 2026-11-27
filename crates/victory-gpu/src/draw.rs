@@ -751,6 +751,15 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// `VICTORY_HEAP_RECHECK_EVERY=<frames>`: the looks at an uploaded texture
+/// picked by index go on at that interval after [`RECHECK_FRAMES`] ran out.
+fn recheck_every() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| n > 0)
+    })
+}
+
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
@@ -2589,6 +2598,9 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::may_make(memory);
+        // Tiles taken back from levels the title let go and from cold
+        // textures, for the hot ones that wait (`crate::priority`).
+        crate::tiles::pass(crate::resource::headroom_lately());
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2618,12 +2630,14 @@ impl State {
         // has run are made from that.
         host.texture_views_remade();
         host.texture_slots_flip();
-        // And with room for any size, the textures whose upload left a held
-        // level without the card's memory are uploaded again (with room for
-        // less than that the same levels would be left out again).
-        if room && crate::resource::level_cap(memory) == u64::MAX {
-            host.texture_slots_waiting(frame);
-        }
+        // And when the card takes larger levels than at their upload, the
+        // textures whose upload left a held level without the card's memory
+        // are uploaded again (under the same cap the same levels would be
+        // left out again).
+        // (Also without room: a texture draws read through a table may be
+        // asked for again past the line, and what hot textures lack is
+        // counted, `crate::priority`.)
+        host.texture_slots_waiting(frame);
         let required = PASS_BUDGET.get().is_some_and(|(_, _, bake)| bake);
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
@@ -2743,7 +2757,15 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // `VICTORY_HEAP_RECHECK_EVERY=<frames>` (diagnostic, off): after the
+                        // last scheduled look the memory is still looked at that often, for
+                        // the whole run; the title may fill it later than the schedule.
+                        None => match recheck_every() {
+                            Some(wait) => {
+                                host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks, uploaded)
+                            }
+                            None => host.texture_slot_done(index, write, None),
+                        },
                     }
                     continue;
                 }

@@ -13,7 +13,7 @@ use windows::core::Interface;
 
 use super::Host;
 
-/// Submissions stamped before the first stamps are read and used again.
+/// Query/list pairs kept in the ring; reuse is guarded by their actual fence.
 const SPANS: usize = 512;
 
 /// The stamps of one queue's submissions.
@@ -26,6 +26,8 @@ pub(super) struct Spans {
     lists: Vec<ID3D12CommandList>,
     ticks_per_ms: f64,
     next: usize,
+    /// Last submission fence using each query/list/readback pair; 0 is unused.
+    last_fence: [u64; SPANS],
     sums: Sums,
 }
 
@@ -42,6 +44,27 @@ struct Sums {
     /// Ticks of the longest one, and the last one's end.
     longest: u64,
     last: u64,
+    /// Sampling attempts skipped instead of waiting for a slot or lost device.
+    skipped: u64,
+}
+
+/// Whether a slot has an earlier result that must be read before reuse.
+#[derive(Debug, PartialEq, Eq)]
+enum SlotRead {
+    Unused,
+    Completed,
+}
+
+/// Reserves a slot without waiting. The existing queue signal for `target`
+/// must follow the lists using it. A failed reservation leaves its old fence
+/// intact, so a later attempt cannot mistake pending results for an unused slot.
+fn reserve_slot(last_fence: &mut u64, completed: u64, target: u64) -> Option<SlotRead> {
+    if completed == u64::MAX || target == 0 || target == u64::MAX || (*last_fence != 0 && completed < *last_fence) {
+        return None;
+    }
+    let read = if *last_fence == 0 { SlotRead::Unused } else { SlotRead::Completed };
+    *last_fence = target;
+    Some(read)
 }
 
 impl Sums {
@@ -73,8 +96,10 @@ static SPANS_MADE: Mutex<Option<Option<Spans>>> = Mutex::new(None);
 
 impl Host {
     /// The lists that go in front of and behind a submission about to be
-    /// sent to the drawing queue, if stamps are asked for.
-    pub(super) fn span_lists(&self) -> Option<[ID3D12CommandList; 2]> {
+    /// sent to the drawing queue, if stamps are asked for. The caller holds
+    /// the submission lock and has reserved `target` on this host's fence;
+    /// its signal follows the returned lists in the existing submission.
+    pub(super) fn span_lists(&self, target: u64) -> Option<[ID3D12CommandList; 2]> {
         if !on() {
             return None;
         }
@@ -87,18 +112,25 @@ impl Host {
             })
             .as_mut()?;
         let i = spans.next;
-        spans.next = (i + 1) % SPANS;
-        // The stamps of the submission that had these lists, that many
-        // submissions ago: long done.
-        // SAFETY: inside the mapping; written by the card at whole words.
-        let (start, end) = unsafe {
-            let at = (spans.data as *mut u64).add(2 * i);
-            let read = (at.read_volatile(), at.add(1).read_volatile());
-            at.write_volatile(0);
-            at.add(1).write_volatile(0);
-            read
+        // SAFETY: a plain query of the fence that follows this ring's lists.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let Some(read) = reserve_slot(&mut spans.last_fence[i], completed, target) else {
+            spans.sums.skipped += 1;
+            return None;
         };
-        spans.sums.add(start, end);
+        if read == SlotRead::Completed {
+            // SAFETY: both results are inside the mapping, and the recorded
+            // submission fence proves their resolves and earlier list use
+            // completed. No new use can be enqueued until this call returns
+            // under the submission lock. An unused slot is never read, and
+            // the CPU never writes the readback buffer.
+            let (start, end) = unsafe {
+                let at = (spans.data as *const u64).add(2 * i);
+                (at.read_volatile(), at.add(1).read_volatile())
+            };
+            spans.sums.add(start, end);
+        }
+        spans.next = (i + 1) % SPANS;
         Some([spans.lists[2 * i].clone(), spans.lists[2 * i + 1].clone()])
     }
 
@@ -120,7 +152,6 @@ impl Host {
             let back = self.read_back_buffer(16 * SPANS as u64).ok_or_else(windows::core::Error::empty)?;
             let mut data = std::ptr::null_mut();
             back.Map(0, None, Some(&mut data))?;
-            std::ptr::write_bytes(data.cast::<u8>(), 0, 16 * SPANS);
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
             let mut lists = Vec::with_capacity(2 * SPANS);
             for i in 0..2 * SPANS as u32 {
@@ -139,6 +170,7 @@ impl Host {
                 lists,
                 ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
                 next: 0,
+                last_fence: [0; SPANS],
                 sums: Sums::default(),
             })
         }
@@ -181,7 +213,11 @@ pub(crate) fn viewport(width: u32, height: u32) {
 }
 
 /// For the frame-rate line: what the stamps read since the last one say, per
-/// frame (they are of some [`SPANS`] submissions ago).
+/// frame (they are of some [`SPANS`] submissions ago). This divides completed
+/// older samples by the current meter's frame count: a steady-scene average,
+/// not completed per-frame durations. Brackets include title lists, preludes,
+/// comparisons and present copies. Upload/rehash and fetch lists outside the
+/// brackets can run between samples, so that interval is not all GPU idle time.
 pub(super) fn line(frames: f64) {
     {
         let mut s = STAMPED.lock().unwrap_or_else(|e| e.into_inner());
@@ -202,17 +238,62 @@ pub(super) fn line(frames: f64) {
     let s = std::mem::replace(&mut spans.sums, Sums { last, ..Sums::default() });
     let ms = |ticks: u64| ticks as f64 / spans.ticks_per_ms / frames;
     tracing::info!(
-        "the card's own stamps per frame: {:.1} submissions, working {:.1} ms, idle between them {:.1} ms, the longest {:.1} ms",
+        "the card's own stamps per frame: {:.1} submissions, working inside their brackets {:.1} ms, \
+         between brackets {:.1} ms (includes unmeasured helpers and idle), the longest {:.1} ms, {:.1} samples skipped",
         s.count as f64 / frames,
         ms(s.busy),
         ms(s.between),
-        s.longest as f64 / spans.ticks_per_ms
+        s.longest as f64 / spans.ticks_per_ms,
+        s.skipped as f64 / frames
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Sums;
+    use super::{SlotRead, Sums, reserve_slot};
+
+    #[test]
+    fn unused_timestamp_slot_is_reserved_without_reading_a_result() {
+        let mut last = 0;
+        assert_eq!(reserve_slot(&mut last, 0, 10), Some(SlotRead::Unused));
+        assert_eq!(last, 10);
+    }
+
+    #[test]
+    fn pending_timestamp_slot_keeps_its_fence_until_completion() {
+        let mut last = 10;
+        for completed in [0, 8, 9] {
+            assert_eq!(reserve_slot(&mut last, completed, 11), None);
+            assert_eq!(last, 10);
+        }
+        // Exactly the old fence suffices; the new execution is pending again.
+        assert_eq!(reserve_slot(&mut last, 10, 11), Some(SlotRead::Completed));
+        assert_eq!(last, 11);
+        assert_eq!(reserve_slot(&mut last, 10, 12), None);
+        assert_eq!(last, 11);
+        assert_eq!(reserve_slot(&mut last, 15, 16), Some(SlotRead::Completed));
+        assert_eq!(last, 16);
+    }
+
+    #[test]
+    fn device_loss_never_authorizes_timestamp_slot_access() {
+        for mut last in [0, 10, u64::MAX] {
+            let before = last;
+            assert_eq!(reserve_slot(&mut last, u64::MAX, 11), None);
+            assert_eq!(last, before);
+        }
+    }
+
+    #[test]
+    fn timestamp_slot_requires_a_real_reserved_target() {
+        for mut last in [0, 10] {
+            for target in [0, u64::MAX] {
+                let before = last;
+                assert_eq!(reserve_slot(&mut last, 10, target), None);
+                assert_eq!(last, before);
+            }
+        }
+    }
 
     #[test]
     fn submissions_add_up_without_counting_anything_twice() {

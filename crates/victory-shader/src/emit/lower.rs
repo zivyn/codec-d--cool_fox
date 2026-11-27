@@ -3942,7 +3942,24 @@ impl<'a> Lower<'a> {
                         }
                         continue;
                     };
-                    let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)) else { continue };
+                    let Some(w) = self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)) else {
+                        if let Some(phi) = self.x.p.blocks[b].phis.iter().find(|p| p.value == v) {
+                            eprintln!("MASK-WHY {:indent$}{v:?} is a join in block {b} of {:?}", "", phi.reg, indent = depth * 2);
+                            for &a in &phi.args {
+                                let state = match self.vals.get(&a) {
+                                    Some(Val::Missing(why)) => format!("missing ({why})"),
+                                    Some(_) => "a value".to_string(),
+                                    None => "not made".to_string(),
+                                };
+                                let kind = if self.x.st.masks.contains_key(&a) { "a mask" } else { "not a mask" };
+                                let writer = self.def_block.get(&a).and_then(|&ab| {
+                                    self.x.p.blocks[ab].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == a)).map(|i| (i.name(), i.machine.offset))
+                                });
+                                eprintln!("MASK-WHY {:indent$}  joins {a:?}: {kind}, {state}, written by {writer:?}", "", indent = depth * 2);
+                            }
+                        }
+                        continue;
+                    };
                     eprintln!("MASK-WHY {:indent$}{v:?} is written by {} at {:#x}", "", w.name(), w.machine.offset, indent = depth * 2);
                     for &(reg, r) in &w.reads {
                         let missing = match self.vals.get(&r) {

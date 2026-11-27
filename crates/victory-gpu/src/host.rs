@@ -3131,8 +3131,8 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
 }
 
 /// How many parts of submissions, and lists, the line's thread gives to the
-/// host as one (`VICTORY_JOIN_PARTS=<n>`; off by default, 1; `VICTORY_JOIN_LISTS`,
-/// 48).
+/// host as one (`VICTORY_JOIN_PARTS=<n>`; 16 by default, 1 turns it off; `VICTORY_JOIN_LISTS`,
+/// 96).
 ///
 /// The idea is fxceless/victory-fork's, commit 39731795 (GPL-3.0-or-later, as
 /// this): the title's lists wait for memory values, which cuts a frame into
@@ -3152,7 +3152,7 @@ pub(crate) fn joins() -> (usize, usize) {
 fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
     let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
-    let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(1).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(48).max(1)));
+    let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(16).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(96).max(1)));
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
         return (if on { 8 } else { 1 }, lists);

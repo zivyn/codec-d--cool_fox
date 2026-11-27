@@ -477,6 +477,8 @@ struct Lower<'a> {
     def_block: HashMap<Value, usize>,
     /// IR block being lowered.
     cur_ir: usize,
+    /// The code offset of the instruction being lowered, for `VICTORY_WAVE_WHY`.
+    at_offset: usize,
     /// Whole-wave sections by block and start index.
     sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
@@ -2216,6 +2218,7 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            at_offset: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -4866,6 +4869,9 @@ impl<'a> Lower<'a> {
             let hi = self.s.m.select(at, upper, mine, z);
             return (lo, hi);
         }
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            eprintln!("WAVE64-EXCHANGE at {:#x} (IR block {})", self.at_offset, self.cur_ir);
+        }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
         // (with `lean`, one of two pairs by the parity of the meetings made so far, which both
@@ -6060,6 +6066,7 @@ impl<'a> Lower<'a> {
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
+        self.at_offset = offset;
         let name = inst.name();
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")

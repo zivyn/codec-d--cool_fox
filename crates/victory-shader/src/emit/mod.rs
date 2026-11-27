@@ -551,7 +551,7 @@ pub fn emit(
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1")
-            || wide_first(c, &std::env::var("VICTORY_WAVE_WIDE_FIRST").unwrap_or_default());
+            || wide_first(c, wide_first_names(std::env::var("VICTORY_WAVE_WIDE_FIRST").ok().as_deref()));
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -699,12 +699,30 @@ pub fn emit(
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
-/// Whether `VICTORY_WAVE_WIDE_FIRST` (comma-separated names, as the containers carry them)
-/// names this program: its per-lane branches are then taken wave-wide ([`widen`], exact, at
+/// The programs that take the wave-wide form first unless `VICTORY_WAVE_WIDE_FIRST` says
+/// otherwise: the title's lens flare scans, which build a work queue from a ballot and a lane
+/// count (the approximate form of each half writes the queue's same slots, and a bright
+/// source then fills the picture with garbage flares until the camera cuts). They ran
+/// through the wave-wide form in the pilot's runs without a lost card.
+const WIDE_FIRST: &str = "CS_ScanMip";
+
+/// The names `VICTORY_WAVE_WIDE_FIRST` asks for: the variable's value (empty or `none`: no
+/// program), or [`WIDE_FIRST`] where it is not set.
+fn wide_first_names(set: Option<&str>) -> &str {
+    match set.map(str::trim) {
+        None => WIDE_FIRST,
+        Some("none") => "",
+        Some(names) => names,
+    }
+}
+
+/// Whether the comma-separated `names` (as the containers carry them)
+/// name this program: its per-lane branches are then taken wave-wide ([`widen`], exact, at
 /// group barriers) before any approximate local-wave form, which gives each host wave its own
 /// counts and sums (a queue built from a ballot and a lane count then has half the slots, and
-/// both halves write the same ones). Off for every program unless asked for: the barriers this
-/// form puts inside branches lost the card for two programs the approximate forms ran.
+/// both halves write the same ones). Only for the programs named ([`WIDE_FIRST`] unless the
+/// variable says otherwise): the barriers this form puts inside branches lost the card for two
+/// programs the approximate forms ran.
 fn wide_first(c: &Container, names: &str) -> bool {
     names
         .split(',')
@@ -1101,6 +1119,12 @@ mod tests {
         assert!(!super::wide_first(&c, "CS_Scan_Five"));
         assert!(!super::wide_first(&c, ""));
         assert!(!super::wide_first(&c, " , ,"));
+        // The default list, `none`, and an empty value.
+        let scan = Container::parse(&crate::dxbc::build(&[(FourCC(*b"ILDN"), b"\x10\0\0\0queue:CS_ScanMip3_ab\0".as_slice())])).unwrap();
+        assert!(super::wide_first(&scan, super::wide_first_names(None)));
+        assert!(!super::wide_first(&scan, super::wide_first_names(Some("none"))));
+        assert!(!super::wide_first(&scan, super::wide_first_names(Some(""))));
+        assert!(super::wide_first(&scan, super::wide_first_names(Some("CS_Scan"))));
     }
 
     /// The LLVM text `dxc -dumpbin` prints for a DXIL container, when dxc

@@ -279,16 +279,16 @@ pub(crate) unsafe fn differ(a: *const u8, b: *const u8, len: usize) -> bool {
     (len / 32 * 32..len).any(|i| unsafe { a.add(i).read_volatile() != b.add(i).read_volatile() })
 }
 
-/// Whether the two slices (of one length) hold the same bytes. With
-/// `VICTORY_COMPARE_AVX=1` (off by default) the processor's 256-bit loads
-/// take 256 bytes between tests, from both slices at once; else `==`, which
-/// is the C library's `memcmp`. The compare of what shaders wrote to copies
+/// Whether the two slices (of one length) hold the same bytes. With the
+/// processor's 256-bit loads (on by default where there are; `VICTORY_COMPARE_AVX=0`
+/// turns them off) 256 bytes are taken between tests, from both slices at
+/// once; else `==`, which is the C library's `memcmp`. The compare of what shaders wrote to copies
 /// in the PC's memory against their snapshots (172 MB a frame in the cell)
 /// is this, on several threads.
 pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
     static AVX: OnceLock<bool> = OnceLock::new();
     let avx = *AVX.get_or_init(|| {
-        std::env::var_os("VICTORY_COMPARE_AVX").is_some_and(|v| v == "1") && std::arch::is_x86_feature_detected!("avx2")
+        std::env::var_os("VICTORY_COMPARE_AVX").is_none_or(|v| v != "0") && std::arch::is_x86_feature_detected!("avx2")
     });
     same_with(a, b, avx)
 }

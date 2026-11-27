@@ -2096,7 +2096,7 @@ pub(crate) fn back_line(frames: f64) {
     if keep_remark() {
         let r: Vec<f64> = REMARKED.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
-            "kept snapshots per frame (VICTORY_KEEP_REMARK=1): {:.1} MB of units made current again after {:.0} pieces landed, which the next submission does not take again",
+            "kept snapshots per frame (VICTORY_KEEP_REMARK, on): {:.1} MB of units made current again after {:.0} pieces landed, which the next submission does not take again",
             r[0] / (1 << 20) as f64,
             r[1],
         );
@@ -2900,8 +2900,9 @@ fn keeps() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_KEEP_SNAPSHOTS").map_or(!cfg!(test), |v| v == "1"))
 }
 
-/// `VICTORY_KEEP_REMARK=1` (off by default): with [`keeps`], the units of a
-/// kept snapshot that a landing made equal to the copy are current again.
+/// With [`keeps`], the units of a kept snapshot that a landing made equal to
+/// the copy are current again (on by default; `VICTORY_KEEP_REMARK=0` turns it
+/// off; no stale unit in the pilot's `VICTORY_KEEP_CHECK=1` run).
 ///
 /// The compare after a submission marks every 4 KiB unit it finds different
 /// from the copy as not current ([`Shadow::changed`]), so that the next
@@ -2918,7 +2919,7 @@ fn keeps() -> bool {
 /// `VICTORY_KEEP_CHECK=1` counts what this takes wrong.
 fn keep_remark() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| keeps() && std::env::var_os("VICTORY_KEEP_REMARK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| keeps() && std::env::var_os("VICTORY_KEEP_REMARK").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame line, the 4 KiB pages the refreshes took into copies

@@ -62,6 +62,8 @@ pub(crate) struct Shadow {
     quiet: Mutex<Option<(usize, usize, u64)>>,
     /// Whether the buffer is such ([`Shadow::mark_gpu_only`]).
     gpu_only: std::sync::atomic::AtomicBool,
+    /// When [`Shadow::probe`] last said (ms).
+    probed: AtomicU64,
     /// The next window of the range [`Shadow::quiet_skip`] compares.
     quiet_window: AtomicU64,
     /// Whether its landings are left out ([`crate::land::quiet`]).
@@ -3513,6 +3515,7 @@ impl Shadow {
             settled: Settled::default(),
             quiet: Mutex::default(),
             gpu_only: Default::default(),
+            probed: AtomicU64::new(0),
             quiet_window: AtomicU64::new(0),
             quiet_landing: Default::default(),
             found_seq: AtomicU64::new(0),
@@ -4254,6 +4257,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        self.probe();
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4387,6 +4391,11 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // (`VICTORY_BUFFER_WHOLE`: a buffer the list names is taken whole from title memory
+        // at every refresh, whatever the watch and the notes say of it)
+        if buffer_listed(&BUFFER_WHOLE, self.start, self.len) {
+            return self.copy(from, to);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 // (A range whose blocks rest after a write has no guard now.)
@@ -4468,6 +4477,49 @@ impl Shadow {
     /// them): what a landing brings of a copy that was left out.
     pub(crate) fn whole_pieces(&self) -> Vec<(usize, usize)> {
         whole_pieces_of(self.start as usize, self.len as usize)
+    }
+
+    /// `VICTORY_BUFFER_PROBE=<hex address>,...`: for a buffer the list names, once in a while, what
+    /// title memory holds, what this copy's CPU side holds, and how the copy is kept, in a line:
+    /// the dwords that are not zero (the whole buffer and its first sixteen) on each side. The
+    /// copy is what the card's is made from; a title memory that holds a header the copy does
+    /// not is a copy that was not brought up to date.
+    fn probe(&self) {
+        if !buffer_listed(&BUFFER_PROBE, self.start, self.len) {
+            return;
+        }
+        let now = crate::host::now_ms();
+        let last = self.probed.load(Ordering::Relaxed);
+        if now < last.saturating_add(2000) || self.probed.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let n = (self.len as usize).min(8 << 20) & !3;
+        let mut title = vec![0u8; n];
+        let readable = crate::host::read_into(self.start as *const u8, &mut title);
+        // SAFETY: the copy's mapping is `len` bytes (rounded up).
+        let held = unsafe { std::slice::from_raw_parts(self.data.cast_const(), n) };
+        let dwords = |b: &[u8]| -> (usize, Vec<u32>) {
+            let all = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            (all.clone().filter(|&d| d != 0).count(), all.take(16).collect())
+        };
+        let ((tn, tf), (cn, cf)) = (dwords(&title), dwords(held));
+        let differ = title.chunks(4096).zip(held.chunks(4096)).filter(|(a, b)| a != b).count();
+        tracing::info!(
+            start = format_args!("{:#x}", self.start),
+            len = self.len,
+            readable,
+            title_nonzero = tn,
+            copy_nonzero = cn,
+            pages_differ = differ,
+            gpu_only = self.gpu_only.load(Ordering::Relaxed),
+            watched = self.watched.load(Ordering::Relaxed),
+            on_card = self.card.is_some(),
+            in_place = self.place.is_some(),
+            pending = self.pending.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            title_first = ?tf,
+            copy_first = ?cf,
+            "buffer probe (VICTORY_BUFFER_PROBE)"
+        );
     }
 
     /// Whether a refresh of `[from, to)` of memory that is not watched may
@@ -5873,6 +5925,29 @@ fn made_aside() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MAKE_ASIDE").is_none_or(|v| v != "0"))
 }
 
+/// A list of title addresses in an environment variable (hex, comma apart): the buffers that hold
+/// one are the ones it names.
+struct BufferList {
+    name: &'static str,
+    at: std::sync::OnceLock<Vec<u64>>,
+}
+
+/// `VICTORY_BUFFER_PROBE` ([`Shadow::probe`]).
+static BUFFER_PROBE: BufferList = BufferList { name: "VICTORY_BUFFER_PROBE", at: std::sync::OnceLock::new() };
+/// `VICTORY_BUFFER_WHOLE`: the buffers that are taken whole from title memory at every refresh
+/// (an experiment: what a copy that the watch and the notes keep from being brought up to date
+/// would hold otherwise).
+static BUFFER_WHOLE: BufferList = BufferList { name: "VICTORY_BUFFER_WHOLE", at: std::sync::OnceLock::new() };
+
+fn buffer_listed(list: &BufferList, start: u64, len: u64) -> bool {
+    let at = list.at.get_or_init(|| {
+        std::env::var(list.name)
+            .map(|v| v.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect())
+            .unwrap_or_default()
+    });
+    at.iter().any(|&a| a >= start && a < start + len)
+}
+
 /// The buffers whose copies are being made ([`made_aside`]).
 static MAKING: Making = Making::new();
 
@@ -6757,6 +6832,17 @@ mod quiet_tests {
         title[3 << 20] ^= 0xff;
         assert_eq!(shadow.update(start, LEN), LEN);
         assert_eq!(held, title);
+    }
+
+    #[test]
+    fn a_buffer_list_names_the_buffers_that_hold_one_of_its_addresses() {
+        let list = BufferList { name: "VICTORY_NO_SUCH_LIST", at: std::sync::OnceLock::from(vec![0x1_0000, 0x9957a2f00]) };
+        assert!(buffer_listed(&list, 0x9957a2f00, 1_434_624));
+        assert!(buffer_listed(&list, 0x9957a0000, 0x10000 * 40));
+        assert!(!buffer_listed(&list, 0x9957a2f01, 1_434_624));
+        assert!(!buffer_listed(&list, 0x2_0000, 0x1000));
+        let none = BufferList { name: "VICTORY_NO_SUCH_LIST", at: std::sync::OnceLock::new() };
+        assert!(!buffer_listed(&none, 0x1_0000, 0x1000));
     }
 
     /// What `make_copy` does with a buffer `register` said is in a heap the

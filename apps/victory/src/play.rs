@@ -195,8 +195,11 @@ pub(crate) fn preload(exe: &Path) {
     }
 }
 
-/// `%LOCALAPPDATA%\victory`.
+/// `%LOCALAPPDATA%\victory`, or the folder `VICTORY_HOME` names.
 fn home() -> Result<PathBuf> {
+    if let Some(home) = victory_core::config::home_override() {
+        return Ok(home);
+    }
     let base = std::env::var_os("LOCALAPPDATA").context("no %LOCALAPPDATA% to keep settings and logs in")?;
     Ok(PathBuf::from(base).join("victory"))
 }

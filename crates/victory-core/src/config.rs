@@ -134,8 +134,19 @@ fn subdir(root: &Path, sub: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache).
+/// The folder for everything of ours (settings, logs, caches, saves,
+/// downloads) when `VICTORY_HOME` names one: for a full C: drive, e.g.
+/// `setx VICTORY_HOME D:\victory`. Else `%LOCALAPPDATA%\victory`.
+pub fn home_override() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_HOME").filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// `%LOCALAPPDATA%/victory/<name>` (elsewhere the XDG or home cache), or
+/// `VICTORY_HOME/<name>`.
 fn default_dir(name: &str) -> Result<PathBuf> {
+    if let Some(home) = home_override() {
+        return Ok(home.join(name));
+    }
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_CACHE_HOME"))
         .map(PathBuf::from)

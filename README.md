@@ -1,5 +1,19 @@
 # VIctory on NVIDIA
 
+> **Reporting a problem?** Please attach **both** logs from the run that went
+> wrong. Without them we can only guess. Paste `%LOCALAPPDATA%` into the address
+> bar of File Explorer to get there.
+>
+> 1. **The play log**, in `%LOCALAPPDATA%\victory\logs\`: the newest
+>    `victory-nvidia-play-<date>-<time>-<number>.log` (from `victory.exe`) or
+>    `victory-nvidia-<date>-<time>.log` (from the script launcher). The window
+>    shows its path at the start, on the line `Log: ...`.
+> 2. **The crash log**: `%LOCALAPPDATA%\VIctory\data\7952987A\crashes.log`, and,
+>    if there is one from that run, the newest `victory-<date>-<time>-<number>.crash.log`
+>    in `%LOCALAPPDATA%\VIctory\data\7952987A\temp\`.
+>
+> Also say which GPU, Windows version (10 or 11) and release you used.
+
 ## Frame generation: what your card supports
 
 | Your card | Frame generation | Limits |

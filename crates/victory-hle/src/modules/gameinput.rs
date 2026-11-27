@@ -80,8 +80,10 @@ const DEVICES: usize = PADS + 3;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// The keyboard's stand-in gamepad (key, button); README lists it.
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. The letters are
+/// where a US keyboard has them ([`pad_key`]): the same keys under the
+/// fingers on every layout (Z/Q/S/D on AZERTY).
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -98,6 +100,45 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'F', LEFT_STICK),
     (b'H', RIGHT_STICK),
 ];
+
+/// Where the stand-in pad's letters are on the keyboard: scan code (set 1)
+/// and the letter a US layout prints there.
+const LETTER_POSITIONS: [(u32, u8); 16] = [
+    (0x10, b'Q'),
+    (0x11, b'W'),
+    (0x12, b'E'),
+    (0x15, b'Y'),
+    (0x17, b'I'),
+    (0x1E, b'A'),
+    (0x1F, b'S'),
+    (0x20, b'D'),
+    (0x21, b'F'),
+    (0x23, b'H'),
+    (0x24, b'J'),
+    (0x25, b'K'),
+    (0x26, b'L'),
+    (0x2C, b'Z'),
+    (0x2D, b'X'),
+    (0x2E, b'C'),
+];
+
+/// The scan code of the stand-in pad's letter `vk` on a US layout.
+fn letter_position(vk: u8) -> Option<u32> {
+    LETTER_POSITIONS.iter().find(|(_, letter)| *letter == vk).map(|&(scan, _)| scan)
+}
+
+/// Which of the stand-in pad's keys `key` is. A letter key counts by where
+/// it is, not by what the layout prints on it: with the virtual key, an
+/// AZERTY keyboard had forward on the key marked W, in the bottom row. Other
+/// keys (Esc, Enter, the arrows) are the same key on every layout. 0: a
+/// letter key in none of the pad's places.
+fn pad_key(key: &KeyState) -> u8 {
+    match LETTER_POSITIONS.iter().find(|(scan, _)| *scan == key.scan_code) {
+        Some(&(_, letter)) => letter,
+        None if key.virtual_key.is_ascii_uppercase() => 0,
+        None => key.virtual_key,
+    }
+}
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -169,7 +210,7 @@ trait Source: Send {
 
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
+        if keys.iter().any(|k| pad_key(k) == vk) {
             1.0
         } else {
             0.0
@@ -1312,6 +1353,7 @@ mod host {
                 return Vec::new();
             }
             let mut down = scripted();
+            let scripted_keys = down.len();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1323,9 +1365,14 @@ mod host {
                 down.extend(held);
             }
             down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                .enumerate()
+                .map(|(i, vk)| KeyState {
+                    // A scripted letter is the stand-in pad's key of that
+                    // name, where a US layout has it (`pad_key`).
+                    scan_code: Some(vk).filter(|_| i < scripted_keys).and_then(super::letter_position).unwrap_or_else(|| {
+                        // SAFETY: plain query.
+                        unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) }
+                    }),
                     virtual_key: vk,
                     // shortcut: no characters (code point 0);
                     // the title reads scan codes and virtual keys only.
@@ -1570,7 +1617,7 @@ mod tests {
 
     fn key(virtual_key: u8) -> KeyState {
         KeyState {
-            scan_code: u32::from(virtual_key) + 0x100,
+            scan_code: letter_position(virtual_key).unwrap_or(u32::from(virtual_key) + 0x100),
             virtual_key,
             ..Default::default()
         }
@@ -1820,6 +1867,23 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn the_stand_in_pad_reads_letters_by_their_place() {
+        // An AZERTY keyboard: the key above S is marked Z, the one left of S is Q.
+        let at = |scan_code, virtual_key| KeyState { scan_code, virtual_key, ..Default::default() };
+        let pad = fallback(&[at(0x11, b'Z'), at(0x1E, b'Q')]);
+        assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (-1.0, 1.0, 0.0));
+        // Its key marked W is in the bottom row, where the left trigger is; the one marked A is
+        // the left shoulder's.
+        let pad = fallback(&[at(0x2C, b'W'), at(0x10, b'A')]);
+        assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (0.0, 0.0, 1.0));
+        assert_eq!(pad.buttons, LEFT_SHOULDER);
+        // A letter in none of the pad's places presses nothing (Dvorak's S, right of L).
+        assert_eq!(fallback(&[at(0x27, b'S')]), PadState::default());
+        // Keys that are no letters are the same on every layout.
+        assert_eq!(fallback(&[at(0x1C, 0x0D)]).buttons, A);
     }
 
     #[test]

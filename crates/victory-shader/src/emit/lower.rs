@@ -1161,7 +1161,7 @@ pub const PAIR_NOTE: u32 = 0xF000_0000;
 pub const LOOP_NOTE: u32 = 0xE000_0000;
 
 /// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
-pub(super) fn set_program_tag(container: &[u8]) {
+pub fn set_program_tag(container: &[u8]) {
     let hash = blake3::hash(container);
     let first = u32::from_be_bytes(hash.as_bytes()[..4].try_into().expect("4 bytes"));
     PROGRAM_TAG.set(PAIR_NOTE | first >> 4);

@@ -3999,11 +3999,11 @@ fn late_line(frames: f64) {
     card_steps::log(frames);
     {
         let r: Vec<f64> = REFRESH_SIZE.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
-        let [ranges, bytes, pages, with] = crate::shadow::under_stats().map(|n| n as f64 / frames);
+        let [ranges, bytes, pages, with, detect, lock, merge, put] = crate::shadow::under_stats().map(|n| n as f64 / frames);
         let mb = |v: f64| v / (1 << 20) as f64;
         if r[0] + r[3] + ranges > 0.0 {
             tracing::info!(
-                "the refreshes' work per frame: {:.0} spans in front of the lists' steps ({:.0} MB of range; {:.0} left after those known to copy nothing), {:.0} before shader writes ({:.0} MB of range); what the steps refer to, each byte once (VICTORY_REFRESH_SIZING=1): {:.0} MB in {:.0} refreshes; narrowed (VICTORY_REFRESH_NARROW={}), checked (VICTORY_REFRESH_CHECK=1): {:.1} MB looked at, {:.3} MB stale, {:.1} MB not to be looked at without asking; under flights' writes: {ranges:.0} declared ranges ({:.0} MB), {pages:.0} stale pages of 64 KiB in {with:.0} of them",
+                "the refreshes' work per frame: {:.0} spans in front of the lists' steps ({:.0} MB of range; {:.0} left after those known to copy nothing), {:.0} before shader writes ({:.0} MB of range); what the steps refer to, each byte once (VICTORY_REFRESH_SIZING=1): {:.0} MB in {:.0} refreshes; narrowed (VICTORY_REFRESH_NARROW={}), checked (VICTORY_REFRESH_CHECK=1): {:.1} MB looked at, {:.3} MB stale, {:.1} MB not to be looked at without asking; under flights' writes: {ranges:.0} declared ranges ({:.0} MB), {pages:.0} stale pages of 64 KiB in {with:.0} of them; the submitting thread's time there: {:.2} ms finding what is stale, {:.2} getting the copy's locks, {:.2} comparing and putting the pages in, {:.2} noting what goes up",
                 r[0],
                 mb(r[1]),
                 r[2],
@@ -4016,6 +4016,10 @@ fn late_line(frames: f64) {
                 mb(r[8]),
                 mb(r[9]),
                 mb(bytes),
+                detect / 1e6,
+                lock / 1e6,
+                merge / 1e6,
+                put / 1e6,
             );
         }
     }

@@ -300,6 +300,11 @@ enum Command {
     Preload {
         /// The title's folder (default: the configured game folder).
         paths: Vec<PathBuf>,
+        /// Threads and processes for each of its steps, to leave the rest of
+        /// the PC free (default: `VICTORY_PRELOAD_JOBS`, else each step's
+        /// own: every core to translate, two thirds of them to make).
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
@@ -475,11 +480,18 @@ fn main() -> Result<()> {
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         #[cfg(windows)]
-        Command::Preload { paths } => {
+        Command::Preload { paths, jobs } => {
+            // The launcher and the F1 menu's restart pass it as a switch.
+            let jobs = jobs
+                .or_else(|| std::env::var("VICTORY_PRELOAD_JOBS").ok()?.trim().parse().ok())
+                .filter(|&n| n > 0);
+            if let Some(n) = jobs {
+                println!("Preloading on {n} threads at a time (VICTORY_PRELOAD_JOBS / --jobs).");
+            }
             play::explain_preload();
-            translate::precompile(paths, None)?;
-            warm::run(None, None, false, false, None)?;
-            warm::into_library(None)
+            translate::precompile(paths, jobs)?;
+            warm::run(jobs, None, false, false, None)?;
+            warm::into_library(jobs)
         }
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),

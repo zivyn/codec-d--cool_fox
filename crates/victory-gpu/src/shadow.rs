@@ -64,6 +64,8 @@ pub(crate) struct Shadow {
     gpu_only: std::sync::atomic::AtomicBool,
     /// The next window of the range [`Shadow::quiet_skip`] compares.
     quiet_window: AtomicU64,
+    /// Whether its landings are left out ([`crate::land::quiet`]).
+    quiet_landing: crate::land::quiet::Quiet,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -924,6 +926,16 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
 
+/// The offsets of every piece of a copy of `len` bytes of title memory from
+/// `start` on, in order: [`Shadow::whole_pieces`].
+fn whole_pieces_of(start: usize, len: usize) -> Vec<(usize, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let span = card_span_of(start, 0, len);
+    (0..span.pieces).map(|i| card_piece_of(start, len, &span, i)).filter(|p| p.0 < p.1).collect()
+}
+
 /// The offsets [`Shadow::card_hashed`] gives, for a card's buffer of `size`
 /// bytes for title memory from `start` on.
 fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
@@ -933,7 +945,27 @@ fn card_hashed_of(start: usize, size: usize, piece: usize) -> (usize, usize) {
 
 #[cfg(test)]
 mod card_tests {
-    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs};
+    use super::{CardSpan, PIECE, card_hashed_of, card_piece_of, card_span_of, joined, joined_piece_runs, whole_pieces_of};
+
+    /// The pieces a copy that was left out of landing brings hold every
+    /// byte of it once, each within one 64 KiB block of title memory.
+    #[test]
+    fn the_whole_copy_is_pieces_that_cover_it_once() {
+        for start in [0usize, 4096, PIECE - 16, PIECE, 3 * PIECE + 0x1f00, 0xd_b790_df00] {
+            for len in [1usize, 16, PIECE - 1, PIECE, 5 * PIECE + 4096, 21_045_760] {
+                let pieces = whole_pieces_of(start, len);
+                let mut at = 0;
+                for &(lo, hi) in &pieces {
+                    assert_eq!(lo, at, "start {start:#x} len {len}: no gap, no overlap");
+                    assert!(hi > lo);
+                    assert_eq!((start + lo) / PIECE, (start + hi - 1) / PIECE, "within one block");
+                    at = hi;
+                }
+                assert_eq!(at, len, "start {start:#x} len {len}");
+            }
+        }
+        assert!(whole_pieces_of(PIECE, 0).is_empty());
+    }
 
     /// Joined runs hold every piece of the runs given, once, and no other.
     #[test]
@@ -3253,6 +3285,7 @@ impl Shadow {
             quiet: Mutex::default(),
             gpu_only: Default::default(),
             quiet_window: AtomicU64::new(0),
+            quiet_landing: Default::default(),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -4141,6 +4174,26 @@ impl Shadow {
     pub(crate) fn mark_gpu_only(&self) {
         crate::watch::quiet_mark(self.start as usize, (self.start + self.len) as usize);
         self.gpu_only.store(true, Ordering::Release);
+    }
+
+    /// What to do with the landing of what shaders wrote to this copy, now
+    /// ([`crate::land::quiet`]; called once per copy and landing, by the
+    /// thread that lands).
+    pub(crate) fn landing_verdict(&self) -> crate::land::quiet::Verdict {
+        use crate::land::quiet;
+        let eligible = quiet::on()
+            && self.card.is_some()
+            && self.gpu_only.load(Ordering::Acquire)
+            && self.len >= quiet::min_bytes()
+            && quiet_on();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        self.quiet_landing.landing(eligible, crate::watch::tick, |since| crate::watch::quiet_since(start, end, since))
+    }
+
+    /// The offsets of every piece of the copy (cut as the compare cuts
+    /// them): what a landing brings of a copy that was left out.
+    pub(crate) fn whole_pieces(&self) -> Vec<(usize, usize)> {
+        whole_pieces_of(self.start as usize, self.len as usize)
     }
 
     /// Whether a refresh of `[from, to)` of memory that is not watched may

@@ -227,7 +227,7 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Psv<'a> {
-    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute.
+    /// PSV shader kind: 0 pixel, 1 vertex, 2 geometry, 5 compute, 13 mesh.
     pub stage: u8,
     /// Vertex: writes `SV_Position`. Pixel: writes depth.
     pub flag: bool,
@@ -237,9 +237,9 @@ pub(crate) struct Psv<'a> {
     pub prims: &'a [SigElement],
     /// Mesh: its state and the group-shared bytes it declares.
     pub mesh: Option<(super::shader::Mesh, u32)>,
-    /// Geometry (triangles in, triangle strips out on stream 0): its
-    /// maximum vertex count. `flag`: writes `SV_Position`.
-    pub geometry: Option<u32>,
+    /// Geometry: its primitives and maximum output vertices. `flag`: writes
+    /// `SV_Position`.
+    pub geometry: Option<super::shader::Geometry>,
     pub bindings: &'a [Binding],
     /// Compute: thread-group size and required wave size.
     pub threads: [u32; 3],
@@ -293,14 +293,14 @@ pub(crate) fn psv(p: &Psv) -> Vec<u8> {
         info[27] = mesh.topology;
         info[30] = p.prims.len() as u8;
     }
-    if let Some(max_vertices) = p.geometry {
-        // Input primitive (3: triangles), output topology (5: triangle
-        // strips), stream mask, position written; the vertex maximum.
-        info[0..4].copy_from_slice(&3u32.to_le_bytes());
-        info[4..8].copy_from_slice(&5u32.to_le_bytes());
-        info[8..12].copy_from_slice(&1u32.to_le_bytes());
+    if let Some(gs) = p.geometry {
+        // Input primitive, output topology, stream mask (stream 0), then
+        // whether it writes a position.
+        for (k, v) in [gs.input, gs.topology, 1].into_iter().enumerate() {
+            info[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+        }
         info[12] = u8::from(p.flag);
-        info[26..28].copy_from_slice(&(max_vertices as u16).to_le_bytes());
+        info[26..28].copy_from_slice(&(gs.max_vertices as u16).to_le_bytes());
     }
     out.extend(info);
     u32s(&mut out, &[p.bindings.len() as u32]);

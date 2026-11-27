@@ -30,6 +30,20 @@
 //! each with an edge flag above it, bit 31 culls); `param` entries with
 //! bit 7 are per-primitive outputs. One lane sends the output counts
 //! (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices | primitives << 12).
+//!
+//! Merged geometry stages run a vertex shader (the export program, stage
+//! ES) and the geometry shader it feeds (stage GS) as the two halves of one
+//! wave, the vertices between them in LDS. The export program gets the
+//! vertex id in v5, the primitive id in v7 and the instance id in v8, and
+//! writes its outputs to its vertex's slot of the vertex ring (`ds_write*`
+//! at the lane's slot: dword 4 * row + channel). The geometry program gets
+//! its primitive's vertices as ring offsets in dwords, two 16-bit ones per
+//! register (v0: vertices 0 and 1, v1: 2 and 3, v4: 4 and 5), the primitive
+//! id in v2 and its instance in v3; it reads the vertices' outputs there
+//! (`ds_read*`), writes each vertex it makes to the output ring
+//! (`ds_write*`) and emits it or cuts the strip with `s_sendmsg` (GS, then
+//! GS_DONE). The ring accesses are raised to inputs and outputs by row and
+//! channel.
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
@@ -70,6 +84,8 @@ pub enum Input {
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
     MergedWaveInfo,
+    /// Geometry: v3, the GS invocation / instance id (`SV_GSInstanceID`).
+    GsInstanceId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +196,32 @@ pub struct Export {
     pub done: bool,
 }
 
+/// One per-vertex input channel a geometry shader reads from ES->GS LDS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GsInput {
+    pub vertex: u8,
+    pub row: u8,
+    pub channel: u8,
+}
+
+/// One output channel an ES or GS writes to ES->GS or GSVS LDS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LdsOutput {
+    pub vertex: u32,
+    pub row: u8,
+    pub channel: u8,
+    pub value: Value,
+}
+
+/// A geometry shader stream message (`s_sendmsg(MSG_GS / MSG_GS_DONE)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GsOp {
+    Emit(u8),
+    Cut(u8),
+    EmitCut(u8),
+    Done,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Io {
     /// Input values the hardware loads, with their meaning; other VGPRs
@@ -190,6 +232,13 @@ pub struct Io {
     /// Compute: how many SGPRs the hardware initializes
     /// ([`ComputeIo::initialized_sgprs`](crate::native::ComputeIo::initialized_sgprs)).
     pub initialized_sgprs: Option<u8>,
+    /// Geometry shader per-vertex input reads from ES->GS LDS (`ds_read*`),
+    /// each entry `(dst_vgpr_offset, GsInput)`.
+    pub gs_reads: Vec<(Site, Vec<(u8, GsInput)>)>,
+    /// ES or GS vertex outputs written to ES->GS or GSVS LDS (`ds_write*`).
+    pub lds_outputs: Vec<(Site, Vec<LdsOutput>)>,
+    /// Geometry shader stream operations (`s_sendmsg`).
+    pub gs_ops: Vec<(Site, GsOp)>,
 }
 
 /// Raises the I/O of `p`, built from `native`'s patched code. Fails for
@@ -301,6 +350,37 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                 (Reg::S(3), Input::MergedWaveInfo),
             ];
             (loaded, &[][..], &ms.outputs[..])
+        }
+        (
+            StageIo::Es {
+                inputs, outputs, ..
+            },
+            HwStage::Es,
+        ) => {
+            // Merged ES+GS ABI: v0..v4 carry GS inputs; ES system VGPRs start
+            // at v5 (vertex id), v7 (primitive id), v8 (instance id).
+            let mut loaded = vec![
+                (Reg::V(5), Input::VertexId),
+                (Reg::V(7), Input::PrimitiveId),
+                (Reg::V(8), Input::InstanceId),
+            ];
+            for i in inputs {
+                for channel in (0..4).filter(|c| i.mask >> c & 1 != 0) {
+                    let input = Input::Attribute {
+                        row: i.row,
+                        channel,
+                    };
+                    loaded.push((Reg::V(i.vgpr + channel), input));
+                }
+            }
+            (loaded, &[][..], &outputs[..])
+        }
+        (StageIo::Gs(gs), HwStage::Gs) => {
+            let loaded = vec![
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::GsInstanceId),
+            ];
+            (loaded, &[][..], &gs.outputs[..])
         }
         _ => return Err(unsupported(0, "I/O of this stage")),
     };
@@ -463,6 +543,15 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             }
         }
     }
+    match (&native.io, native.stage) {
+        (StageIo::Es { vertex_dwords, .. }, HwStage::Es) => {
+            raise_es_gs_lds(p, *vertex_dwords, *vertex_dwords, false, &mut io)?;
+        }
+        (StageIo::Gs(gs), HwStage::Gs) => {
+            raise_es_gs_lds(p, gs.ring_dwords, gs.vertex_dwords, true, &mut io)?;
+        }
+        _ => {}
+    }
     if first_halves.is_empty() {
         return Ok(io);
     }
@@ -510,6 +599,364 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         }
     }
     Ok(io)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LdsAddr {
+    /// Packed 16-bit ES->GS vertex LDS dword offsets (base_v in low half, base_v+1 in high half).
+    Packed(u8),
+    /// `packed << 2` (low vertex offset in bits 2..17 before masking with `0x3fffc`).
+    ShiftedLow(u8),
+    /// Extracted 16-bit vertex dword offset.
+    VertexDword(u8),
+    /// Resolved byte address inside input vertex `vertex`'s ES->GS LDS slot.
+    Vertex(u8, u32),
+    /// Resolved byte address inside this thread's ES->GS or GSVS output LDS slot.
+    Output(u32),
+}
+
+fn ds_elements(name: &str, offset0: u8, offset1: u8) -> Option<Vec<(u32, u32)>> {
+    let w = match name.rsplit('_').next() {
+        Some("b64") => 2,
+        Some("b96") => 3,
+        Some("b128") => 4,
+        Some("b32") => 1,
+        _ => return None,
+    };
+    let rest = name
+        .strip_prefix("ds_read")
+        .or_else(|| name.strip_prefix("ds_write"))?;
+    if rest.starts_with('2') {
+        let scale = 4 * w * if name.contains("st64") { 64 } else { 1 };
+        Some(vec![
+            (u32::from(offset0) * scale, w),
+            (u32::from(offset1) * scale, w),
+        ])
+    } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
+        let off = u32::from(offset0) | u32::from(offset1) << 8;
+        Some(vec![(off, w)])
+    } else {
+        None
+    }
+}
+
+/// Traces ES->GS input reads (`ds_read*`), ES->GS / GSVS output writes
+/// (`ds_write*`), and GS stream messages (`s_sendmsg`).
+fn raise_es_gs_lds(
+    p: &Program,
+    stride_dwords: u32,
+    vertex_dwords: u32,
+    is_gs: bool,
+    io: &mut Io,
+) -> Result<(), ShaderError> {
+    let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+    let stride_bytes = stride_dwords.saturating_mul(4);
+    let mut consts: std::collections::HashMap<Value, u32> = std::collections::HashMap::new();
+    let mut addrs: std::collections::HashMap<Value, LdsAddr> = std::collections::HashMap::new();
+    if is_gs {
+        for &(reg, v) in &p.inputs {
+            match reg {
+                Reg::V(0) => {
+                    addrs.insert(v, LdsAddr::Packed(0));
+                }
+                Reg::V(1) => {
+                    addrs.insert(v, LdsAddr::Packed(2));
+                }
+                Reg::V(4) => {
+                    addrs.insert(v, LdsAddr::Packed(4));
+                }
+                _ => {}
+            }
+        }
+    }
+    let val_of = |inst: &Inst, op: &Operand| -> Option<Value> {
+        match *op {
+            Operand::Vector { reg, .. } => inst.read(Reg::V(reg)),
+            Operand::Scalar { code, .. } if code != crate::gfx10::NULL => inst.read(Reg::S(code)),
+            _ => None,
+        }
+    };
+    let const_of = |consts: &std::collections::HashMap<Value, u32>,
+                    inst: &Inst,
+                    op: &Operand|
+     -> Option<u32> {
+        match *op {
+            Operand::Const(k) => crate::resource::inline(k),
+            Operand::Literal(x) => Some(x),
+            Operand::Scalar { code, .. } if code == crate::gfx10::NULL => Some(0),
+            _ => val_of(inst, op).and_then(|v| consts.get(&v).copied()),
+        }
+    };
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    for &b in &order {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let site = (b, i);
+            let at = inst.machine.offset;
+            let name = inst.name();
+            match &inst.fields {
+                Fields::Sop {
+                    dst: Some(Operand::Scalar { code, .. }),
+                    src,
+                    ..
+                } if name == "s_mov_b32" => {
+                    if let Some(w) = inst.write(Reg::S(*code))
+                        && let Some(c) = src.first().and_then(|o| const_of(&consts, inst, o))
+                    {
+                        consts.insert(w, c);
+                    }
+                }
+                Fields::Valu(v) => {
+                    let Some(Operand::Vector { reg: dreg, .. }) = v.dst else {
+                        continue;
+                    };
+                    let Some(w) = inst.write(Reg::V(dreg)) else {
+                        continue;
+                    };
+                    if name == "v_mov_b32" && v.sdwa.is_none() {
+                        if let Some(c) = v.src.first().and_then(|o| const_of(&consts, inst, o)) {
+                            consts.insert(w, c);
+                        } else if let Some(a) = v
+                            .src
+                            .first()
+                            .and_then(|o| val_of(inst, o))
+                            .and_then(|x| addrs.get(&x).copied())
+                        {
+                            addrs.insert(w, a);
+                        }
+                        continue;
+                    }
+                    // Output ring base: `v_mad_u32_u24 dst, stride_bytes, lane, base`
+                    // (or `lane, stride_bytes, base`).
+                    if name == "v_mad_u32_u24" && stride_bytes > 0 && v.src.len() >= 2 {
+                        let c0 = const_of(&consts, inst, &v.src[0]);
+                        let c1 = const_of(&consts, inst, &v.src[1]);
+                        if c0 == Some(stride_bytes) || c1 == Some(stride_bytes) {
+                            addrs.insert(w, LdsAddr::Output(0));
+                            continue;
+                        }
+                    }
+                    if !is_gs {
+                        if matches!(name, "v_add_nc_u32" | "v_add_co_u32") && v.src.len() >= 2 {
+                            for (a_i, c_i) in [(0, 1), (1, 0)] {
+                                if let Some(LdsAddr::Output(off)) =
+                                    val_of(inst, &v.src[a_i]).and_then(|x| addrs.get(&x).copied())
+                                    && let Some(c) = const_of(&consts, inst, &v.src[c_i])
+                                {
+                                    addrs.insert(w, LdsAddr::Output(off.wrapping_add(c)));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    // GS ES->GS input vertex offset arithmetic.
+                    match name {
+                        "v_lshlrev_b32" if v.src.len() >= 2 => {
+                            if const_of(&consts, inst, &v.src[0]) == Some(2)
+                                && let Some(src_a) =
+                                    val_of(inst, &v.src[1]).and_then(|x| addrs.get(&x).copied())
+                            {
+                                let sel = v.sdwa.and_then(|s| s.src_sel.get(1).copied());
+                                let out_a = match (src_a, sel) {
+                                    (LdsAddr::Packed(base_v), Some(4)) => {
+                                        Some(LdsAddr::Vertex(base_v, 0))
+                                    }
+                                    (LdsAddr::Packed(base_v), Some(5)) => {
+                                        Some(LdsAddr::Vertex(base_v + 1, 0))
+                                    }
+                                    (LdsAddr::Packed(base_v), None | Some(6)) => {
+                                        Some(LdsAddr::ShiftedLow(base_v))
+                                    }
+                                    (LdsAddr::VertexDword(vtx), None | Some(6)) => {
+                                        Some(LdsAddr::Vertex(vtx, 0))
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(a) = out_a {
+                                    addrs.insert(w, a);
+                                }
+                            }
+                        }
+                        "v_and_b32" if v.src.len() >= 2 => {
+                            for (a_i, c_i) in [(0, 1), (1, 0)] {
+                                let src_a =
+                                    val_of(inst, &v.src[a_i]).and_then(|x| addrs.get(&x).copied());
+                                let mask = const_of(&consts, inst, &v.src[c_i]);
+                                match (src_a, mask) {
+                                    (Some(LdsAddr::ShiftedLow(base_v)), Some(0x3_fffc)) => {
+                                        addrs.insert(w, LdsAddr::Vertex(base_v, 0));
+                                    }
+                                    (Some(LdsAddr::Packed(base_v)), Some(0xffff)) => {
+                                        addrs.insert(w, LdsAddr::VertexDword(base_v));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        "v_lshrrev_b32" if v.src.len() >= 2 => {
+                            if const_of(&consts, inst, &v.src[0]) == Some(16)
+                                && let Some(LdsAddr::Packed(base_v)) =
+                                    val_of(inst, &v.src[1]).and_then(|x| addrs.get(&x).copied())
+                            {
+                                addrs.insert(w, LdsAddr::VertexDword(base_v + 1));
+                            }
+                        }
+                        "v_bfe_u32" if v.src.len() >= 3 => {
+                            if let Some(LdsAddr::Packed(base_v)) =
+                                val_of(inst, &v.src[0]).and_then(|x| addrs.get(&x).copied())
+                                && const_of(&consts, inst, &v.src[2]) == Some(16)
+                            {
+                                match const_of(&consts, inst, &v.src[1]) {
+                                    Some(0) => {
+                                        addrs.insert(w, LdsAddr::VertexDword(base_v));
+                                    }
+                                    Some(16) => {
+                                        addrs.insert(w, LdsAddr::VertexDword(base_v + 1));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        "v_lshl_add_u32" if v.src.len() >= 3 => {
+                            if const_of(&consts, inst, &v.src[1]) == Some(2)
+                                && let Some(LdsAddr::VertexDword(vtx)) =
+                                    val_of(inst, &v.src[0]).and_then(|x| addrs.get(&x).copied())
+                                && let Some(c) = const_of(&consts, inst, &v.src[2])
+                            {
+                                addrs.insert(w, LdsAddr::Vertex(vtx, c));
+                            }
+                        }
+                        "v_add_nc_u32" | "v_add_co_u32" if v.src.len() >= 2 => {
+                            for (a_i, c_i) in [(0, 1), (1, 0)] {
+                                let src_a =
+                                    val_of(inst, &v.src[a_i]).and_then(|x| addrs.get(&x).copied());
+                                let Some(c) = const_of(&consts, inst, &v.src[c_i]) else {
+                                    continue;
+                                };
+                                match src_a {
+                                    Some(LdsAddr::Vertex(vtx, off)) => {
+                                        addrs.insert(w, LdsAddr::Vertex(vtx, off.wrapping_add(c)));
+                                    }
+                                    Some(LdsAddr::Output(off)) => {
+                                        addrs.insert(w, LdsAddr::Output(off.wrapping_add(c)));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Fields::Ds {
+                    addr,
+                    data,
+                    offset0,
+                    offset1,
+                    gds,
+                    ..
+                } => {
+                    if *gds {
+                        return Err(unsupported(at, "GDS in a merged geometry stage"));
+                    }
+                    let Some(a_val) = addr.as_ref().and_then(|o| val_of(inst, o)) else {
+                        continue;
+                    };
+                    if name.starts_with("ds_read") && is_gs {
+                        let Some(LdsAddr::Vertex(vertex, base_off)) = addrs.get(&a_val).copied()
+                        else {
+                            return Err(unsupported(
+                                at,
+                                "a geometry LDS read not of an input vertex",
+                            ));
+                        };
+                        let elems = ds_elements(name, *offset0, *offset1).ok_or_else(|| {
+                            unsupported(at, "a geometry LDS read of bytes or halves")
+                        })?;
+                        let mut reads = Vec::new();
+                        let mut dst_off = 0u8;
+                        for (off, w) in elems {
+                            for k in 0..w {
+                                let byte = base_off.wrapping_add(off).wrapping_add(4 * k);
+                                if byte % 4 != 0 {
+                                    return Err(unsupported(
+                                        at,
+                                        "an unaligned geometry input read",
+                                    ));
+                                }
+                                let dword = byte / 4;
+                                reads.push((
+                                    dst_off,
+                                    GsInput {
+                                        vertex,
+                                        row: (dword / 4) as u8,
+                                        channel: (dword % 4) as u8,
+                                    },
+                                ));
+                                dst_off += 1;
+                            }
+                        }
+                        io.gs_reads.push((site, reads));
+                    } else if name.starts_with("ds_write") {
+                        let Some(LdsAddr::Output(base_off)) = addrs.get(&a_val).copied() else {
+                            return Err(unsupported(
+                                at,
+                                "an LDS write of a merged geometry stage not to its outputs",
+                            ));
+                        };
+                        if vertex_dwords == 0 {
+                            return Err(unsupported(
+                                at,
+                                "a merged geometry stage without a vertex size",
+                            ));
+                        }
+                        let elems = ds_elements(name, *offset0, *offset1)
+                            .ok_or_else(|| unsupported(at, "an output write of bytes or halves"))?;
+                        let mut writes = Vec::new();
+                        for (e_i, (off, w)) in elems.into_iter().enumerate() {
+                            let Some(&Operand::Vector { reg, .. }) = data.get(e_i) else {
+                                return Err(unsupported(at, "an output write without its data"));
+                            };
+                            for k in 0..w {
+                                let value = inst.read(Reg::V(reg + k as u8)).ok_or_else(|| {
+                                    unsupported(at, "an output write without its data")
+                                })?;
+                                let byte = base_off.wrapping_add(off).wrapping_add(4 * k);
+                                if byte % 4 != 0 {
+                                    return Err(unsupported(at, "an unaligned output write"));
+                                }
+                                let dword = byte / 4;
+                                let (vertex, within) = if is_gs {
+                                    (dword / vertex_dwords, dword % vertex_dwords)
+                                } else {
+                                    (0, dword)
+                                };
+                                writes.push(LdsOutput {
+                                    vertex,
+                                    row: (within / 4) as u8,
+                                    channel: (within % 4) as u8,
+                                    value,
+                                });
+                            }
+                        }
+                        io.lds_outputs.push((site, writes));
+                    }
+                }
+                Fields::Sopp { imm } if name == "s_sendmsg" && is_gs => {
+                    let msg_id = imm & 0xF;
+                    let op = (imm >> 4) & 3;
+                    let stream = ((imm >> 8) & 3) as u8;
+                    match (msg_id, op) {
+                        (2, 1) => io.gs_ops.push((site, GsOp::Cut(stream))),
+                        (2, 2) => io.gs_ops.push((site, GsOp::Emit(stream))),
+                        (2, 3) => io.gs_ops.push((site, GsOp::EmitCut(stream))),
+                        (3, _) => io.gs_ops.push((site, GsOp::Done)),
+                        _ => return Err(unsupported(at, "a geometry stream message")),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
@@ -888,6 +1335,101 @@ mod tests {
             S_ENDPGM,
         ];
         assert_eq!(mesh(&reuse).map(|_| ()), Ok(()));
+    }
+
+    #[test]
+    fn gs_lds_inputs_outputs_and_stream_ops() {
+        // Synthetic merged GS: unpack vertex 0/1/2 ES->GS LDS offsets from v0/v1,
+        // read SV_Position.xy for vertices 0..2, write vertex 0's SV_Position.xy
+        // into GSVS LDS (stride 48 bytes = 12 dwords = 3 verts * 4 dwords), emit, cut, done.
+        let words: &[u32] = &[
+            0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+            0x3402_0282, // v_lshlrev_b32 v1, 2, v1
+            0xBE81_0382, // s_mov_b32 s1, 2
+            0x3410_00F9,
+            0x0586_0601, // v_lshlrev_b32 v8, s1, v0 src1_sel:WORD_1
+            0x3614_06FF,
+            0x0003_FFFC, // v_and_b32 v10, 0x3fffc, v3   (vertex 0)
+            0x360C_02FF,
+            0x0003_FFFC, // v_and_b32 v6, 0x3fffc, v1    (vertex 2)
+            0xD8DC_0100,
+            0x0000_000A, // ds_read2_b32 v[0:1], v10 offset1:1  (vtx 0 pos.xy)
+            0xD8DC_0100,
+            0x0200_0008, // ds_read2_b32 v[2:3], v8 offset1:1   (vtx 1 pos.xy)
+            0xD8DC_0100,
+            0x0400_0006, // ds_read2_b32 v[4:5], v6 offset1:1   (vtx 2 pos.xy)
+            0xD543_000C,
+            0x0002_04FF,
+            0x0000_0030, // v_mad_u32_u24 v12, 48, v2, s0
+            0xD838_0100,
+            0x0001_000C, // ds_write2_b32 v12, v0, v1 offset1:1
+            0xBF90_0022, // s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 0)
+            0xBF90_0012, // s_sendmsg sendmsg(MSG_GS, GS_OP_CUT, 0)
+            0xBF90_0003, // s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 16).unwrap();
+        let native = NativeProgram {
+            stage: HwStage::Gs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Gs(crate::native::GsIo {
+                outputs: vec![],
+                ring_dwords: 12,
+                invocations: 1,
+                max_vertices: 3,
+                vertex_dwords: 4,
+            }),
+            code,
+        };
+        let io = raise(&p, &native).unwrap();
+        assert_eq!(io.gs_reads.len(), 3);
+        assert_eq!(
+            io.gs_reads[0].1,
+            vec![
+                (
+                    0,
+                    GsInput {
+                        vertex: 0,
+                        row: 0,
+                        channel: 0
+                    }
+                ),
+                (
+                    1,
+                    GsInput {
+                        vertex: 0,
+                        row: 0,
+                        channel: 1
+                    }
+                ),
+            ]
+        );
+        assert_eq!(io.gs_reads[1].1[0].1.vertex, 1);
+        assert_eq!(io.gs_reads[2].1[0].1.vertex, 2);
+        assert_eq!(io.lds_outputs.len(), 1);
+        assert_eq!(io.lds_outputs[0].1.len(), 2);
+        assert_eq!(
+            (
+                io.lds_outputs[0].1[0].vertex,
+                io.lds_outputs[0].1[0].row,
+                io.lds_outputs[0].1[0].channel
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            (
+                io.lds_outputs[0].1[1].vertex,
+                io.lds_outputs[0].1[1].row,
+                io.lds_outputs[0].1[1].channel
+            ),
+            (0, 0, 1)
+        );
+        let ops: Vec<GsOp> = io.gs_ops.iter().map(|(_, op)| *op).collect();
+        assert_eq!(ops, vec![GsOp::Emit(0), GsOp::Cut(0), GsOp::Done]);
     }
 
     #[test]

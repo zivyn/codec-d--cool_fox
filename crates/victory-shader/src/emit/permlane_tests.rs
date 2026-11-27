@@ -93,6 +93,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderE
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        geometry: None,
     });
     lower::TEST_HOST_WAVE.set(was);
     let result = result?;

@@ -73,6 +73,15 @@ struct Tally {
     /// Mesh programs the validator refuses for their output size alone, which the host's
     /// driver takes (`VICTORY_HOST_MESH_OUTPUT_KIB`).
     ms_over_limit: usize,
+    /// The same for geometry (and export) programs.
+    gs_programs: usize,
+    gs_emitted: usize,
+    gs_validated: usize,
+    gs_pipelines: usize,
+    es_programs: usize,
+    es_emitted: usize,
+    es_validated: usize,
+    es_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -135,6 +144,14 @@ impl Tally {
         self.ms_validated += other.ms_validated;
         self.ms_pipelines += other.ms_pipelines;
         self.ms_over_limit += other.ms_over_limit;
+        self.gs_programs += other.gs_programs;
+        self.gs_emitted += other.gs_emitted;
+        self.gs_validated += other.gs_validated;
+        self.gs_pipelines += other.gs_pipelines;
+        self.es_programs += other.es_programs;
+        self.es_emitted += other.es_emitted;
+        self.es_validated += other.es_validated;
+        self.es_pipelines += other.es_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
         }
@@ -150,7 +167,7 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
-    /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
+    /// Shaders named in `VICTORY_PAIRS` (`vs+ps,vs+gs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
     validator: Option<Validator>,
@@ -294,11 +311,12 @@ pub fn run(
     if pipelines {
         Host::new(false).map_err(anyhow::Error::msg)?;
     }
-    let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
+    // `vs+ps`, or `vs+gs+ps` for a geometry shader between them.
+    let pairs: Vec<Vec<String>> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
-        .filter_map(|p| p.split_once('+'))
-        .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
+        .map(|p| p.split('+').map(|n| n.trim().to_owned()).collect::<Vec<_>>())
+        .filter(|p| matches!(p.len(), 2 | 3))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
@@ -400,25 +418,51 @@ pub fn run(
             emit::host_mesh_output_bytes() / 1024
         );
     }
+    if t.gs_programs > 0 {
+        println!(
+            "             {} emitted of {} geometry programs; {} validated, {} pipelines",
+            t.gs_emitted, t.gs_programs, t.gs_validated, t.gs_pipelines
+        );
+    }
+    if t.es_programs > 0 {
+        println!(
+            "             {} emitted of {} export (Es) programs; {} validated, {} pipelines",
+            t.es_emitted, t.es_programs, t.es_validated, t.es_pipelines
+        );
+    }
     #[cfg(not(windows))]
     anyhow::ensure!(pairs.is_empty(), "VICTORY_PAIRS needs the D3D12 host (Windows)");
     #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
-        let find = |name: &str| kept.iter().find(|(l, _)| l.contains(name));
-        for (v, p) in &pairs {
-            let made = match (find(v), find(p)) {
-                (Some((_, vs)), Some((_, ps))) => if vs.stage == HwStage::Ms {
+        // The first emitted program with the name; a vertex shader is the
+        // plain one of its container before its export program.
+        let find = |name: &str| {
+            let found: Vec<_> = kept.iter().filter(|(l, _)| l.contains(name)).collect();
+            found
+                .iter()
+                .find(|(_, s)| s.stage == HwStage::Vs)
+                .or(found.first())
+                .copied()
+        };
+        for names in &pairs {
+            let shaders: Vec<_> = names.iter().map(|n| find(n)).collect();
+            let made = match shaders[..] {
+                [Some((_, vs)), Some((_, ps))] => if vs.stage == HwStage::Ms {
                     host.mesh_pipeline(vs, ps)
                 } else {
                     host.pipeline(vs, ps)
                 }
                 .map(|_| "pipeline created".to_owned())
                 .unwrap_or_else(|e| e),
+                [Some((_, vs)), Some((_, gs)), Some((_, ps))] => host
+                    .geometry_pipeline(vs, gs, ps)
+                    .map(|_| "pipeline created".to_owned())
+                    .unwrap_or_else(|e| e),
                 _ => "not emitted".to_owned(),
             };
-            println!("pair {v} + {p}: {made}");
+            println!("pair {}: {made}", names.join(" + "));
         }
     }
     let mut lines = t.lines;
@@ -617,7 +661,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 let graphics = matches!(p.stage, HwStage::Vs | HwStage::Ps);
                 let compute = p.stage == HwStage::Cs;
                 let mut raised = None;
-                if graphics || compute || p.stage == HwStage::Ms {
+                if graphics || compute || matches!(p.stage, HwStage::Ms | HwStage::Gs | HwStage::Es)
+                {
                     t.io_programs += usize::from(graphics);
                     match io::raise(&program, &p) {
                         Ok(r) => {
@@ -753,9 +798,11 @@ fn check(
     #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
-            HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
+            HwStage::Vs | HwStage::Es => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),
             HwStage::Ms => h.mesh_pipeline(&shader, stub_ps).map(drop),
+            HwStage::Gs => host::stub_vs(&shader)
+                .and_then(|vs| h.geometry_pipeline(&vs, &shader, stub_ps).map(drop)),
             _ => host::stub_vs(&shader).and_then(|vs| h.pipeline(&vs, &shader).map(drop)),
         };
         match made {
@@ -841,6 +888,18 @@ fn counter(t: &mut Tally, stage: HwStage, k: usize) -> &mut usize {
             &mut t.ms_emitted,
             &mut t.ms_validated,
             &mut t.ms_pipelines,
+        ],
+        HwStage::Gs => [
+            &mut t.gs_programs,
+            &mut t.gs_emitted,
+            &mut t.gs_validated,
+            &mut t.gs_pipelines,
+        ],
+        HwStage::Es => [
+            &mut t.es_programs,
+            &mut t.es_emitted,
+            &mut t.es_validated,
+            &mut t.es_pipelines,
         ],
         _ => [
             &mut t.emit_programs,

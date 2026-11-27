@@ -642,6 +642,81 @@ fn flatness(rows: &[u8], pitch: usize, w: usize, h: usize, bytes: usize, format:
     )
 }
 
+/// What the float texels of a target hold, over the color channels (the first three; the
+/// alpha of four is left out), and in every channel how many are no number or infinite.
+#[derive(Debug, Default, PartialEq)]
+struct Range {
+    /// The largest and the smallest finite value.
+    max: f32,
+    min: f32,
+    /// The mean of the finite values.
+    mean: f64,
+    nan: u64,
+    inf: u64,
+}
+
+/// [`Range`] of the rows of a float format (`None` for any other).
+fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Range> {
+    // Channels, and how a channel is read: 32-bit, 16-bit, or R11G11B10.
+    let (channels, kind) = match format {
+        2 => (4, 32),
+        6 => (3, 32),
+        16 => (2, 32),
+        41 => (1, 32),
+        10 => (4, 16),
+        34 => (2, 16),
+        54 => (1, 16),
+        26 => (3, 11),
+        _ => return None,
+    };
+    let bytes = match kind {
+        32 => 4 * channels,
+        16 => 2 * channels,
+        _ => 4,
+    };
+    let mut r = Range { max: f32::MIN, min: f32::MAX, ..Range::default() };
+    let (mut sum, mut n) = (0f64, 0u64);
+    for y in 0..h {
+        let row = rows.get(y * pitch..y * pitch + w * bytes)?;
+        for t in row.chunks_exact(bytes) {
+            for c in 0..channels {
+                // (a value; whether it is no number; whether it is an infinity)
+                let (v, nan, inf) = match kind {
+                    32 => {
+                        let f = f32::from_le_bytes(t[4 * c..4 * c + 4].try_into().unwrap_or([0; 4]));
+                        (f, f.is_nan(), f.is_infinite())
+                    }
+                    16 => {
+                        let b = u16::from_le_bytes([t[2 * c], t[2 * c + 1]]);
+                        let special = (b >> 10) & 0x1f == 0x1f;
+                        (half(b), special && b & 0x3ff != 0, special && b & 0x3ff == 0)
+                    }
+                    _ => {
+                        let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
+                        let (bits, man) = [(w & 0x7ff, 6), ((w >> 11) & 0x7ff, 6), (w >> 22, 5)][c];
+                        let special = (bits >> man) & 0x1f == 0x1f;
+                        (small_float(bits, man), special && bits & ((1 << man) - 1) != 0, special && bits & ((1 << man) - 1) == 0)
+                    }
+                };
+                r.nan += u64::from(nan);
+                r.inf += u64::from(inf);
+                if c < 3 && v.is_finite() {
+                    r.max = r.max.max(v);
+                    r.min = r.min.min(v);
+                    sum += f64::from(v);
+                    n += 1;
+                }
+            }
+        }
+    }
+    if n == 0 {
+        r.max = 0.0;
+        r.min = 0.0;
+    }
+    r.mean = if n == 0 { 0.0 } else { sum / n as f64 };
+    Some(r)
+}
+
 /// One line per target in `frame-<frame>-targets.tsv` (in the order the
 /// frame first used them, which the `-ops.txt` lines name by resource):
 /// how many different texel values the target holds as the card wrote them
@@ -676,8 +751,13 @@ fn target_stats(
             .collect::<std::collections::HashSet<u32>>()
             .len()
     });
+    // Float targets: the range of their values, the columns after the flatness ones
+    // (`max`, `min` and `mean` over the color channels; `nan` and `inf` count channels).
+    let range = float_range(format, w, h, pitch, rows).map_or(String::new(), |r| {
+        format!("	max{:.4e}	min{:.4e}	mean{:.4e}	nan{}	inf{}", r.max, r.min, r.mean, r.nan, r.inf)
+    });
     let line = format!(
-        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%",
+        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%{range}",
         d.Width,
         d.Height,
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { format!("x{}", d.DepthOrArraySize) } else { String::new() },
@@ -1125,6 +1205,39 @@ mod stats_tests {
         }
         let (eqh, eqv, flat) = flatness(&rows, 64, 16, 16, 4, 28);
         assert_eq!((eqh, eqv, flat), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn float_ranges_count_what_is_no_number_or_infinite() {
+        // Two texels of R16G16B16A16_FLOAT, rows padded to 16 bytes: (1, 2, 3, NaN-alpha)
+        // and (65504, +Inf, 0.5, 1).
+        let half = |v: f32| -> u16 {
+            match v {
+                1.0 => 0x3c00,
+                2.0 => 0x4000,
+                3.0 => 0x4200,
+                0.5 => 0x3800,
+                65504.0 => 0x7bff,
+                _ => unreachable!(),
+            }
+        };
+        let words = [half(1.0), half(2.0), half(3.0), 0x7e00, half(65504.0), 0x7c00, half(0.5), half(1.0)];
+        let mut rows = vec![0u8; 16];
+        for (i, w) in words.iter().enumerate() {
+            rows[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+        }
+        let r = float_range(10, 2, 1, 16, &rows).unwrap();
+        assert_eq!((r.nan, r.inf), (1, 1));
+        assert_eq!((r.max, r.min), (65504.0, 0.5));
+        // R11G11B10_FLOAT: red 1.0 (exponent 15), green infinity, blue NaN (exponent 31, mantissa 1).
+        let packed = 15u32 << 6 | (0x1f << 6) << 11 | (0x1f << 5 | 1) << 22;
+        let r = float_range(26, 1, 1, 4, &packed.to_le_bytes()).unwrap();
+        assert_eq!((r.nan, r.inf, r.max, r.min), (1, 1, 1.0, 1.0));
+        // Single 32-bit channels, and a format that is not a float.
+        let rows: Vec<u8> = [4.0f32, f32::NAN, f32::NEG_INFINITY, -2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let r = float_range(41, 4, 1, 16, &rows).unwrap();
+        assert_eq!((r.nan, r.inf, r.max, r.min, r.mean), (1, 1, 4.0, -2.0, 1.0));
+        assert!(float_range(28, 1, 1, 4, &[0; 4]).is_none());
     }
 
     #[test]

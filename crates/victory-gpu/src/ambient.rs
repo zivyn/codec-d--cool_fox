@@ -43,7 +43,8 @@
 //!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
-//! bounds what the air scatters by a multiple of the light around.
+//! bounds what the air scatters by a multiple of the light around, and with `,max:<level>`
+//! by a constant too (the multiple alone grows with the room).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -174,14 +175,25 @@ pub(crate) fn wanted() -> bool {
 /// Why the stand-in does nothing while the structure builder runs.
 pub(crate) const BUILDER_RUNS: &str = "the structure builder runs (the title's rays find something)";
 
-/// The most the air scatters, as a multiple of the light around
-/// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
+/// What `VICTORY_AMBIENT_AIR=<multiple>[,max:<level>]` asks for: the most the air scatters,
+/// as a multiple of the light around, and nowhere more than the constant `<level>` (the
+/// multiple alone grows with the room: a bright room's air may then scatter a lot; the level
+/// is in the light image's unit, as `floor:` is). Unset or 0: what the title has.
+fn air_setting(set: &str) -> (f32, f32) {
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    let mut parts = set.split(',');
+    let multiple = parts.next().and_then(number).unwrap_or(0.0);
+    let most = parts.find_map(|p| p.trim().strip_prefix("max:").and_then(number)).unwrap_or(f32::MAX);
+    (multiple, most)
+}
+
+fn air_set() -> (f32, f32) {
+    static SET: OnceLock<(f32, f32)> = OnceLock::new();
+    *SET.get_or_init(|| air_setting(&std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default()))
+}
+
 fn air() -> f32 {
-    static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
-    })
+    air_set().0
 }
 
 /// Strength and radius of the creases' shade.
@@ -200,7 +212,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -209,7 +221,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float base;
+    float follow; float most; float air; float base; float air_max;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -313,7 +325,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
-    float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    float cap = min(air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far), air_max);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
@@ -517,7 +529,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> Result<[u32; 
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 13];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -527,6 +539,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> Result<[u32; 
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     words[11] = base.to_bits();
+    words[12] = air_set().1.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -534,7 +547,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> Result<[u32; 
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -704,6 +717,16 @@ mod tests {
     use victory_shader::{ResourceType, RootType, UsedResource};
 
     use super::*;
+
+    #[test]
+    fn the_air_setting_has_a_multiple_and_a_most() {
+        assert_eq!(air_setting(""), (0.0, f32::MAX));
+        assert_eq!(air_setting("1.5"), (1.5, f32::MAX));
+        assert_eq!(air_setting("1.5,max:4"), (1.5, 4.0));
+        assert_eq!(air_setting(" 0.5 , max: 0.25 "), (0.5, 0.25));
+        assert_eq!(air_setting("off,max:3"), (0.0, 3.0));
+        assert_eq!(air_setting("1,max:-2"), (1.0, f32::MAX));
+    }
 
     #[test]
     fn settings() {

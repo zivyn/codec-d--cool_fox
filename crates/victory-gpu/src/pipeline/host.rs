@@ -383,7 +383,8 @@ pub(crate) struct HostPipeline {
     pub(crate) mesh: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
-    /// Vertex, then pixel stage, or the compute stage.
+    /// Vertex (or mesh), then pixel, then geometry stage, or the compute
+    /// stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
@@ -412,8 +413,8 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
 }
 
 impl HostPipeline {
-    /// A host pipeline for vertex and pixel shaders with the graphics
-    /// state `g`, or for one compute shader.
+    /// A host pipeline for vertex (or mesh), geometry and pixel shaders
+    /// with the graphics state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
@@ -426,14 +427,27 @@ impl HostPipeline {
         if compute.is_none()
             && shaders
                 .iter()
-                .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
+                .any(|s| !matches!(s.stage, "vertex" | "geometry" | "pixel" | "mesh"))
         {
             return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
+                "only vertex, geometry, mesh, pixel and compute stages are translated",
                 shaders,
             );
         }
         let mesh = find("mesh");
+        let geometry = find("geometry").filter(|_| compute.is_none());
+        if geometry.is_some() && mesh.is_some() {
+            return refuse("a geometry shader in a mesh pipeline", shaders);
+        }
+        // Rectangle lists are completed by a geometry shader of the host's
+        // own (below): the host has one geometry stage, and the two are not
+        // chained.
+        if geometry.is_some() && g.is_some_and(|g| g.topology.0 == RECTANGLES) {
+            return refuse(
+                "a geometry shader drawing rectangle lists (both need the host's geometry stage)",
+                shaders,
+            );
+        }
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -444,6 +458,7 @@ impl HostPipeline {
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(geometry.map(|gs| (gs, D3D12_SHADER_VISIBILITY_GEOMETRY)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
@@ -600,14 +615,21 @@ impl HostPipeline {
                 return None;
             }
         };
+        // Stage 0 is the first; the pixel and geometry stages by name (either
+        // may be missing).
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
-                D3D12_SHADER_BYTECODE::default(),
-                |t| D3D12_SHADER_BYTECODE {
+            let stage = match i {
+                0 => stages.first(),
+                1 => stages.iter().find(|(s, _)| s.stage == "pixel"),
+                _ => stages.iter().find(|(s, _)| s.stage == "geometry"),
+            };
+            let translated = stage.and_then(|(s, _)| s.translated());
+            translated.map_or(D3D12_SHADER_BYTECODE::default(), |t| {
+                D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
                     BytecodeLength: t.host.dxil.len(),
-                },
-            )
+                }
+            })
         };
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
@@ -704,9 +726,10 @@ impl HostPipeline {
         // A pipeline the title makes for rectangles gets a geometry stage
         // that completes each one from the three vertices the vertex
         // shader made. Without it (refused here or by the host) the draws
-        // fall back on what `draw` does for rectangles.
+        // fall back on what `draw` does for rectangles. A title's own geometry
+        // shader takes the stage instead (never both, see above).
         let mut rect_gs = None;
-        if g.topology.0 == RECTANGLES {
+        if g.topology.0 == RECTANGLES && geometry.is_none() {
             let ps = stages.get(1).and_then(|(s, _)| s.translated());
             let vs = &stages[0].0.translated()?.host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
@@ -719,12 +742,16 @@ impl HostPipeline {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
             PS: code(1),
-            GS: rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
-                D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: gs.as_ptr().cast(),
-                    BytecodeLength: gs.len(),
-                }
-            }),
+            GS: if geometry.is_some() {
+                code(2)
+            } else {
+                rect_gs.as_ref().map_or(D3D12_SHADER_BYTECODE::default(), |gs| {
+                    D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: gs.as_ptr().cast(),
+                        BytecodeLength: gs.len(),
+                    }
+                })
+            },
             BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
@@ -749,6 +776,12 @@ impl HostPipeline {
         // A pipeline with the geometry stage has a name of its own in the
         // library; the others keep theirs.
         let name = |gs: Option<&Vec<u8>>| match gs {
+            _ if geometry.is_some() => super::library::name(
+                "graphics geometry",
+                &root_blob,
+                &[&code_bytes(&code(0)), &code_bytes(&code(1)), &code_bytes(&code(2))],
+                &state,
+            ),
             Some(gs) => super::library::name(
                 "graphics rectangles",
                 &root_blob,

@@ -37,6 +37,9 @@ pub struct Address {
 /// compiler appends after the code and reads through `s_getpc_b64`; the
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
+/// [`Address::param`] of the console GS internal state table (`s[8:9]`), from
+/// which merged GS prologues load the GSVS LDS ring base offset.
+pub const GS_TABLE: usize = usize::MAX - 3;
 
 /// [`Address::param`] of title memory at an address no root parameter
 /// gives: one the code computes from root constants, reads out of a
@@ -491,6 +494,14 @@ impl<'a> Tracer<'a> {
         Ok(t)
     }
 
+    /// Whether `v` is s8 as a geometry program gets it: the low half of the
+    /// address of the stage's own table ([`GS_TABLE`]), no root parameter.
+    fn gs_table(&self, v: Value) -> bool {
+        self.stage == HwStage::Gs
+            && self.inputs[v.0 as usize] == Some(Reg::S(8))
+            && self.param_of(Reg::S(8)).is_none()
+    }
+
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
     fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
@@ -661,6 +672,11 @@ impl<'a> Tracer<'a> {
         if let Some(reg) = self.inputs[v.0 as usize] {
             return match self.param_of(reg) {
                 Some((_, 0)) => Sum {
+                    base: Some(v),
+                    offset: 0,
+                    dynamic: None,
+                },
+                None if self.gs_table(v) => Sum {
                     base: Some(v),
                     offset: 0,
                     dynamic: None,
@@ -968,6 +984,21 @@ impl<'a> Tracer<'a> {
             return Ok(Address {
                 param: CODE,
                 offset: first.wrapping_add(s.offset).wrapping_add(extra.offset),
+                dynamic: s.dynamic.or(extra.dynamic),
+            });
+        }
+        if self.gs_table(base) {
+            // The high half is s9, masked to the address bits.
+            let s9 = self.p.inputs.iter().find(|i| i.0 == Reg::S(9)).map(|i| i.1);
+            let masked = matches!(hi, Term::Value(v) if self.sop2(v, &["s_and_b32"]).is_some_and(
+                |(_, [a, b])| s9.is_some_and(|h| a == Term::Value(h) || b == Term::Value(h))
+            ));
+            if !self.high_half(hi, s9) && !masked {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param: GS_TABLE,
+                offset: s.offset.wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }

@@ -3357,6 +3357,15 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
+        if !idle.is_empty() {
+            // Before it looks at who holds them again: a thread that hands out what it remembers ([`LOOSE_FOUND`]) makes it
+            // held first, or finds this number moved.
+            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
+        let idle: Vec<(u64, u64)> = idle
+            .into_iter()
+            .filter(|key| map.get(key).is_some_and(|s| Arc::strong_count(s) == 1))
+            .collect();
         let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
         if !gone.is_empty() {
             WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
@@ -5625,6 +5634,31 @@ pub(crate) fn pin_world_for_test(world: Option<u64>) {
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
 
+/// Whether a thread remembers more answers, and those of windows outside buffers too (`VICTORY_ASK_CACHE=1`; off by
+/// default): the list threads ask 40,000 times a frame for the copies of a few thousand ranges, and the answer to most is
+/// one lock and a search of a map away (6 to 10 % of their time).
+fn ask_cache() -> bool {
+    #[cfg(test)]
+    if TEST_ASK_CACHE.load(Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_CACHE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+static TEST_ASK_CACHE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many answers of [`BUFFERS`] a thread remembers.
+fn found_most() -> usize {
+    if ask_cache() { 8 * FOUND_MOST } else { FOUND_MOST }
+}
+
+thread_local! {
+    /// The answers of [`loose`] for the windows it names by the ask alone.
+    static LOOSE_FOUND: std::cell::RefCell<Option<crate::asked::Asked<Shadow>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
 type Found = (u64, u64, u64, std::sync::Weak<Shadow>);
@@ -5644,7 +5678,7 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    (h >> 40) as usize % found_most()
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
@@ -5665,8 +5699,9 @@ fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
-        if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+        if f.len() != found_most() {
+            f.clear();
+            f.resize_with(found_most(), || (0, 0, 0, std::sync::Weak::new()));
         }
         f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
     });
@@ -6206,9 +6241,25 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+        // (The number is read before the lock: see `crate::asked`.)
+        let stamp = world();
+        let asked = ask_cache();
+        if asked
+            && let Some(shadow) = LOOSE_FOUND.with(|f| f.borrow().as_ref().and_then(|f| f.get(named.0, named.1, world)))
+        {
+            note(&shadow);
+            return Some(shadow);
+        }
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if let Some(shadow) = map.get(&named) {
             note(shadow);
+            if asked {
+                LOOSE_FOUND.with(|f| {
+                    f.borrow_mut()
+                        .get_or_insert_with(|| crate::asked::Asked::new(4096))
+                        .put(named.0, named.1, stamp, shadow)
+                });
+            }
             return Some(shadow.clone());
         }
     }
@@ -6873,5 +6924,37 @@ mod making_tests {
             t.join().unwrap();
         }
         assert_eq!(made.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod ask_cache_tests {
+    use super::*;
+
+    /// Threads that ask for the copy of the same memory outside buffers with `VICTORY_ASK_CACHE` on get one copy, each
+    /// time, whatever is remembered.
+    #[test]
+    fn threads_asking_again_and_again_get_the_one_window() {
+        TEST_ASK_CACHE.store(true, Ordering::Relaxed);
+        let memory = vec![0u8; 64 << 10];
+        let at = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let Some(first) = find(at, 256) else {
+            return; // no host GPU
+        };
+        // What each ask gets with nothing remembered: held, so that no window goes.
+        let expected: Vec<Arc<Shadow>> = (0..8u64).map(|k| find(at + k * 256, 256).expect("a window")).collect();
+        assert!(Arc::ptr_eq(&first, &expected[0]));
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let expected = &expected;
+                s.spawn(move || {
+                    for i in 0..2000u64 {
+                        let k = ((i + t) % 8) as usize;
+                        let again = find(at + k as u64 * 256, 256).expect("the window is there");
+                        assert!(Arc::ptr_eq(&expected[k], &again));
+                    }
+                });
+            }
+        });
     }
 }

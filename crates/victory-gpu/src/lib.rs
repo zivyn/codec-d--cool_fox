@@ -17,6 +17,7 @@
 
 #[cfg(windows)]
 mod ambient;
+mod asked;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]

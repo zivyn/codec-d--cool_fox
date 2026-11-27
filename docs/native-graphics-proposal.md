@@ -28,40 +28,62 @@ renderer, so its native control still needs integration and a title run.
 The first integration exercises one VIctory-owned setting. Restored stock
 rows are outside that test.
 
-## Rust sketch
+## Rust example
 
-The launcher already resolves the SDK directory and sets
-`VICTORY_STREAMLINE_DIR`. Keep using that path for the signed
-`sl.interposer.dll`, `sl.dlss_g.dll`, `nvngx_dlssg.dll` and the rest of their
-dependencies. [Existing DLL setup](dlss.md#setup)
+The native settings module uses a fieldless enum and one `Choice` implementation per row. The row's labels, option order, default, and config value all come from that type. This example adds the proposed `dlss_frame_generation` field to `Config` and uses the same pattern as the existing `GraphicsUpscaler` and `FrameGeneration` enums.
 
-Use the same option values for the native row and F1. Place the commit
-handler in `victory-gpu` so it can call the existing Streamline helpers. The
-save callback below represents the shared settings helper to extract from
-F1's save path.
+```rust
+use crate::settings::{Choice, ConfigKey, Opt, Text};
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u32)]
+pub enum DlssFrameGeneration {
+    #[default]
+    Off = 0,
+    X2 = 2,
+    X3 = 3,
+    X4 = 4,
+    X5 = 5,
+    X6 = 6,
+}
+
+impl Choice for DlssFrameGeneration {
+    const CONFIG: ConfigKey = ConfigKey {
+        section: "graphics",
+        key: "dlss_frame_generation",
+    };
+    const NAME: Text = Text::own("victory_dlss_fg", "DLSS Frame Generation");
+    const HELP: Text = Text::own("victory_dlss_fg_help", "Choose a frame multiplier.");
+    const OPTIONS: &'static [Opt<Self>] = &[
+        Opt { value: Self::Off, label: Text::own("victory_dlss_fg_off", "Off"), toml: "off" },
+        Opt { value: Self::X2, label: Text::own("victory_dlss_fg_x2", "2×"), toml: "x2" },
+        Opt { value: Self::X3, label: Text::own("victory_dlss_fg_x3", "3×"), toml: "x3" },
+        Opt { value: Self::X4, label: Text::own("victory_dlss_fg_x4", "4×"), toml: "x4" },
+        Opt { value: Self::X5, label: Text::own("victory_dlss_fg_x5", "5×"), toml: "x5" },
+        Opt { value: Self::X6, label: Text::own("victory_dlss_fg_x6", "6×"), toml: "x6" },
+    ];
+
+    fn from_config(config: &crate::Config) -> Self {
+        config.dlss_frame_generation
+    }
+}
+```
+
+Register `ListSetting::of::<DlssFrameGeneration>()` in the native Graphics section. For this fork, load the typed field from F1's saved value and route the row's commit through a shared F1 setter in `victory-gpu`. The setter needs to save the numeric value to `victory-settings.txt` and update the value F1 displays. Both menus can then read the same choice.
 
 ```rust
 use std::io;
+use victory_core::{config::DlssFrameGeneration, settings::Choice};
 
-const FRAMEGEN_KEY: &str = "VICTORY_MENU_FRAMEGEN";
-const FRAMEGEN_OPTIONS: &[(&str, u32)] = &[
-    ("Off", 0),
-    ("2×", 2),
-    ("3×", 3),
-    ("4×", 4),
-    ("5×", 5),
-    ("6×", 6),
-];
-
-// The proposed shared setter updates F1's state and the same settings file.
-fn commit_framegen(
-    picked: usize,
-    save_shared_choice: impl FnOnce(&str, &str) -> io::Result<()>,
+fn commit_dlss_frame_generation(
+    row_index: usize,
+    save_f1_choice: impl FnOnce(&str, u32) -> io::Result<()>,
 ) -> io::Result<()> {
-    let &(_, multiplier) = FRAMEGEN_OPTIONS
-        .get(picked)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid frame generation choice"))?;
-    save_shared_choice(FRAMEGEN_KEY, &multiplier.to_string())?;
+    let choice = DlssFrameGeneration::from_index(row_index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid multiplier"))?;
+    let multiplier = choice as u32;
+    save_f1_choice("VICTORY_MENU_FRAMEGEN", multiplier)?;
 
     if crate::streamline::framegen_live() {
         crate::streamline::set_framegen(multiplier);
@@ -70,11 +92,7 @@ fn commit_framegen(
 }
 ```
 
-If the Streamline swap-chain proxy is ready, the new multiplier takes
-effect from the next present. Otherwise, the launcher uses the saved
-choice next time. The existing Streamline code checks the GPU's maximum
-and caps the request. For example, 6× requests five generated frames for
-each rendered frame.
+The launcher already uses `VICTORY_STREAMLINE_DIR` to find the NVIDIA SDK DLLs, including `sl.interposer.dll`, `sl.dlss_g.dll`, and `nvngx_dlssg.dll`. This proposal uses that setup and the existing Streamline multiplier limits. With a live proxy the choice takes effect on the next present. Otherwise the launcher reads it on the next start. [NVIDIA fork DLL setup](https://github.com/trustno1-coder/VIctory-NVIDIA/blob/main/docs/dlss.md#setup)
 
 [F1 menu implementation](../crates/victory-gpu/src/host/menu.rs) ·
 [Upstream prototype](https://github.com/Marvisak/VIctory/pull/2863) ·

@@ -61,6 +61,12 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         };
         pool.reclaim(tick, staging_limit, true);
     }
+    if stats_on() {
+        static ASKED: AtomicU64 = AtomicU64::new(0);
+        if ASKED.fetch_add(1, Ordering::Relaxed).is_multiple_of(5) {
+            stats();
+        }
+    }
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
@@ -338,6 +344,45 @@ impl<B: Clone> Pool<B> {
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
     }
+
+    /// What the blocks hold now, for [`stats`].
+    fn census(&self) -> Census {
+        let mut c = Census::default();
+        for block in self.blocks.iter().flatten() {
+            c.blocks += 1;
+            c.empty += u64::from(block.free.whole(BLOCK));
+            let mut free = 0;
+            for &len in block.free.0.values() {
+                free += len;
+                c.ranges += 1;
+                c.largest = c.largest.max(len);
+                if len >= 1 << 20 {
+                    c.wide += len;
+                }
+            }
+            c.free += free;
+            // (Pieces that rest count as taken: they are not free yet.)
+            c.full[((BLOCK - free) * 4 / BLOCK).min(3) as usize] += 1;
+        }
+        c.resting = self.resting.iter().map(|(_, piece)| piece.len).sum();
+        c
+    }
+}
+
+/// A pool's blocks at one moment: how many there are and how many of them
+/// are empty; the bytes free in them now, in how many ranges, the largest of
+/// those, and the bytes in ranges of 1 MiB and more; the bytes of pieces
+/// given back that rest; and the blocks by how full they are, in quarters.
+#[derive(Default)]
+struct Census {
+    blocks: u64,
+    empty: u64,
+    free: u64,
+    ranges: u64,
+    largest: u64,
+    wide: u64,
+    resting: u64,
+    full: [u64; 4],
 }
 
 /// A mapped upload buffer's memory.
@@ -366,6 +411,103 @@ pub(crate) fn texture_room() -> u64 {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
+}
+
+/// Whether the texture blocks are counted in the log every five seconds
+/// (`VICTORY_POOL_STATS=1`; off by default): how full the blocks are, how
+/// their free bytes lie, the textures by the size of their pieces, and what
+/// the small ones would hold at multiples of 4 KiB ([`small_placement`]),
+/// which costs one more question of the host for each texture made.
+///
+/// What it showed on an RTX 4070 Laptop (8 GiB), Series S profile,
+/// 2026-11-27, five minutes into a run with `VICTORY_POOL_SMALL=0`: 57
+/// blocks (3,648 MB) for 2,387 MB of textures, 1,260 MB of them free in 1,655
+/// ranges, 25 blocks less than half full and none empty; 13,363 of 15,836
+/// textures in pieces of 64 KiB, and 13,748 that would hold 222 MB at
+/// multiples of 4 KiB where they held 907 MB.
+fn stats_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_STATS").is_some_and(|v| v == "1"))
+}
+
+/// The live textures by their piece's bytes (64 KiB and less, to 256 KiB, to
+/// 1 MiB, to 4 MiB, more): how many, and the bytes.
+static LIVE: [[AtomicU64; 2]; 5] = [const { [const { AtomicU64::new(0) }; 2] }; 5];
+/// The live textures that could lie at multiples of 4 KiB and do not: how
+/// many, the bytes their pieces hold, and the bytes they would hold there.
+static SMALLER: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn class(len: u64) -> usize {
+    match len {
+        0..=0x1_0000 => 0,
+        0x1_0001..=0x4_0000 => 1,
+        0x4_0001..=0x10_0000 => 2,
+        0x10_0001..=0x40_0000 => 3,
+        _ => 4,
+    }
+}
+
+/// A texture took `piece` (`made`) or gave it back; `small`: the bytes it
+/// would hold at multiples of 4 KiB, 0 if it could not lie there or was not
+/// asked ([`stats_on`]).
+fn counted(piece: Piece, small: u64, made: bool) {
+    let step = |counter: &AtomicU64, by: u64| {
+        if made {
+            counter.fetch_add(by, Ordering::Relaxed);
+        } else {
+            counter.fetch_sub(by, Ordering::Relaxed);
+        }
+    };
+    let live = &LIVE[class(piece.len)];
+    step(&live[0], 1);
+    step(&live[1], piece.len);
+    if small != 0 {
+        step(&SMALLER[0], 1);
+        step(&SMALLER[1], piece.len);
+        step(&SMALLER[2], small);
+    }
+}
+
+/// The log's line of [`stats_on`].
+fn stats() {
+    let c = lock(&TEXTURES).census();
+    let live: [[u64; 2]; 5] = std::array::from_fn(|i| std::array::from_fn(|j| LIVE[i][j].load(Ordering::Relaxed)));
+    let smaller: [u64; 3] = std::array::from_fn(|i| SMALLER[i].load(Ordering::Relaxed));
+    let mb = |bytes: u64| bytes >> 20;
+    tracing::info!(
+        "texture blocks (VICTORY_POOL_STATS=1): {} of them ({} MB), {} MB held by {} textures, {} MB free now in {} ranges (the largest \
+         {} KB; {} MB of it in ranges of 1 MiB and more), {} MB resting, {} blocks empty; blocks by how full: {} under a quarter, {} \
+         under a half, {} under three quarters, {} above; textures by their piece: {} of 64 KiB ({} MB), {} to 256 KiB ({} MB), {} to \
+         1 MiB ({} MB), {} to 4 MiB ({} MB), {} larger ({} MB); {} of them could lie at multiples of 4 KiB and would hold {} MB where \
+         they hold {} MB",
+        c.blocks,
+        mb(c.blocks * BLOCK),
+        mb(HELD.load(Ordering::Relaxed)),
+        live.iter().map(|l| l[0]).sum::<u64>(),
+        mb(c.free),
+        c.ranges,
+        c.largest >> 10,
+        mb(c.wide),
+        mb(c.resting),
+        c.empty,
+        c.full[0],
+        c.full[1],
+        c.full[2],
+        c.full[3],
+        live[0][0],
+        mb(live[0][1]),
+        live[1][0],
+        mb(live[1][1]),
+        live[2][0],
+        mb(live[2][1]),
+        live[3][0],
+        mb(live[3][1]),
+        live[4][0],
+        mb(live[4][1]),
+        smaller[0],
+        mb(smaller[2]),
+        mb(smaller[1]),
+    );
 }
 
 /// Part of a block of mapped upload memory, back in the pool when dropped.
@@ -416,6 +558,8 @@ struct Reclaim {
     methods: &'static [*const (); 3],
     references: AtomicU32,
     piece: Piece,
+    /// What [`counted`] was told of it.
+    small: u64,
 }
 
 struct Methods([*const (); 3]);
@@ -453,6 +597,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
+            counted(gone.piece, gone.small, false);
             lock(&TEXTURES).give(gone.piece, now());
         }
         left
@@ -622,9 +767,9 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
 }
 
 /// Makes `texture` give `piece` back when the last reference to it goes.
-fn give_back_with(texture: &ID3D12Resource, piece: Piece) {
+fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
     const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
-    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece }));
+    let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, small }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
@@ -665,6 +810,18 @@ pub(crate) unsafe fn texture(
     if info.SizeInBytes == u64::MAX {
         return None;
     }
+    // For the census ([`stats_on`]): what its piece would be at multiples of
+    // 4 KiB, if it does not lie at those and the host would have it there.
+    let small = if stats_on() && info.Alignment > u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT) {
+        // SAFETY: the caller's description.
+        let mut at = unsafe { *desc };
+        at.Alignment = u64::from(D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT);
+        // SAFETY: a plain query.
+        let there = unsafe { device.GetResourceAllocationInfo(0, &[at]) };
+        if there.SizeInBytes != u64::MAX && there.Alignment == at.Alignment { there.SizeInBytes } else { 0 }
+    } else {
+        0
+    };
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
     let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
         let desc = D3D12_HEAP_DESC {
@@ -694,7 +851,8 @@ pub(crate) unsafe fn texture(
     match (result, made) {
         (Ok(()), Some(made)) => {
             HELD.fetch_add(piece.len, Ordering::Relaxed);
-            give_back_with(&made, piece);
+            counted(piece, small, true);
+            give_back_with(&made, piece, small);
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
@@ -740,6 +898,31 @@ mod tests {
         assert!(!r.whole(1024));
         r.give(100, 28);
         assert!(r.whole(1024));
+    }
+
+    #[test]
+    fn the_census_counts_what_is_free_resting_and_how_full_blocks_are() {
+        let mut pool: Pool<u32> = Pool::new(2);
+        let (kept, ..) = pool.take(BLOCK / 2, 64 << 10, 0, || Some(1)).unwrap();
+        let (given, ..) = pool.take(1 << 20, 64 << 10, 0, || Some(1)).unwrap();
+        assert_eq!((kept.start, given.start), (0, BLOCK / 2));
+        let c = pool.census();
+        assert_eq!((c.blocks, c.empty, c.ranges, c.resting), (1, 0, 1, 0));
+        assert_eq!(c.free, BLOCK / 2 - (1 << 20));
+        assert_eq!(c.full, [0, 0, 1, 0]);
+        // A piece given back rests: neither held nor free.
+        pool.give(given, 0);
+        let c = pool.census();
+        assert_eq!((c.resting, c.free, c.full), (1 << 20, BLOCK / 2 - (1 << 20), [0, 0, 1, 0]));
+        pool.reclaim(REST, 2, false);
+        let c = pool.census();
+        assert_eq!((c.resting, c.free, c.ranges, c.largest, c.wide), (0, BLOCK / 2, 1, BLOCK / 2, BLOCK / 2));
+        assert_eq!(c.full, [0, 0, 1, 0]);
+    }
+
+    #[test]
+    fn textures_are_counted_by_their_piece() {
+        assert_eq!([0x1_0000, 0x1_0001, 0x4_0000, 0x10_0000, 0x40_0000, 0x40_0001].map(class), [0, 1, 1, 2, 3, 4]);
     }
 
     #[test]

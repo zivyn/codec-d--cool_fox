@@ -1816,7 +1816,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     };
     // SAFETY: our own process and a sized structure.
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
-    let (gpu_optimal, standard) = victory_gpu::console::current().title_memory();
+    let (gpu_optimal, standard) = victory_gpu::console::pools().title_memory();
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
         title_used: counters.PagefileUsage,

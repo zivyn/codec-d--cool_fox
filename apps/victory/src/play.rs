@@ -684,7 +684,11 @@ fn check_shader_model() -> Result<()> {
         };
         if yes {
             match fetch_d3d12(&to) {
-                Ok(()) => match shader_model() {
+                Ok(()) => match {
+                    // This process is yet to load Direct3D 12: it asks for the file now there.
+                    crate::match_d3d12_core();
+                    shader_model()
+                } {
                     Some(now) if now >= needed => {
                         println!("Shader model {}.{} with Microsoft's runtime. Starting the game.", now.0, now.1);
                         return Ok(());

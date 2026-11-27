@@ -32,6 +32,12 @@ use clap::{Parser, Subcommand, ValueEnum};
 /// version configuration of the host exe is invalid" (0x887E0003; 2026-11-27,
 /// an RTX 5080 and an RTX 3080 Ti on Windows 11): [`match_d3d12_core`] asks
 /// for the version of the file that is there, before Direct3D 12 is loaded.
+///
+/// Without the folder, it asks for [`OS_RUNTIME`]: Windows' own runtime,
+/// whatever its version. Asking for 614 there made a Windows 11 whose own
+/// runtime is older (22H2, build 22623, 11-27) look for 1.614 in the missing
+/// folder and refuse Direct3D 12 the same way (0x887E0003; releases before
+/// v2026.11.27.2, which asked for nothing, ran there).
 /// (An atomic: the same bytes as a `u32`, in memory that can be written.)
 #[cfg(windows)]
 #[unsafe(no_mangle)]
@@ -49,23 +55,38 @@ fn agility_version(dll: &[u8]) -> Option<u32> {
     (major == 1 && minor >= 600).then_some(minor)
 }
 
-/// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
-/// beside this program, where there is one and it is not 614. First thing in
-/// `main`: Windows reads `D3D12SDKVersion` when Direct3D 12 is first used.
+/// The version asked for where no `D3D12\D3D12Core.dll` is beside this
+/// program: the first Agility SDK's (1.4), at or below every Windows that
+/// reads `D3D12SDKVersion`, so Windows keeps its own runtime.
 #[cfg(windows)]
-fn match_d3d12_core() {
+const OS_RUNTIME: u32 = 4;
+
+/// Asks Windows for the Agility SDK version of the `D3D12\D3D12Core.dll`
+/// beside this program, or for its own runtime where there is none. First
+/// thing in `main`, and again after `victory play` fetched the file: Windows
+/// reads `D3D12SDKVersion` when Direct3D 12 is first used.
+#[cfg(windows)]
+pub(crate) fn match_d3d12_core() {
+    use std::sync::atomic::Ordering::Relaxed;
     let Some(core) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("D3D12").join("D3D12Core.dll")))
     else {
         return;
     };
-    let Ok(bytes) = std::fs::read(&core) else { return };
+    let Ok(bytes) = std::fs::read(&core) else {
+        D3D12SDKVersion.store(OS_RUNTIME, Relaxed);
+        return;
+    };
     match agility_version(&bytes) {
-        Some(v) if v != D3D12SDKVersion.load(std::sync::atomic::Ordering::Relaxed) => {
-            D3D12SDKVersion.store(v, std::sync::atomic::Ordering::Relaxed);
-            println!("{} is the D3D12 Agility SDK 1.{v}: asking Windows for that version.", core.display());
+        Some(v) => {
+            if v != 614 {
+                println!("{} is the D3D12 Agility SDK 1.{v}: asking Windows for that version.", core.display());
+            }
+            D3D12SDKVersion.store(v, Relaxed);
         }
-        Some(_) => {}
-        None => println!("{} is not a D3D12 Agility SDK runtime Windows can use; move it away if Direct3D 12 fails.", core.display()),
+        None => {
+            D3D12SDKVersion.store(OS_RUNTIME, Relaxed);
+            println!("{} is not a D3D12 Agility SDK runtime Windows can use: Windows' own is used.", core.display());
+        }
     }
 }
 

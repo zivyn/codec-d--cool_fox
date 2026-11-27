@@ -29,6 +29,7 @@ fn dxil(body: &[u32], notes: bool) -> Vec<u8> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        geometry: None,
     });
     lower::TEST_HOST_WAVE.set(was);
     lower::TEST_LOOP_NOTES.set(was_notes);

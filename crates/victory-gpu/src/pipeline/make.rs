@@ -78,7 +78,7 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -128,14 +128,20 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
+/// What identifies a title pipeline across runs: its shaders and state.
+pub(super) fn key_of(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.finalize().to_hex()[..32].to_owned()
+}
+
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key_of(&shaders, graphics.as_deref());
         let scene_input = scene_input(&shaders);
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
@@ -151,7 +157,7 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
             touched: AtomicU64::new(0),
             seq: AtomicU64::new(0),

@@ -512,11 +512,69 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// A library a `victory warm` process saved: what it made, to be taken into
+/// the library of the cache by the process that merges them ([`use_shards`]).
+struct Shard {
+    library: ID3D12PipelineLibrary1,
+    /// The file the library was made from: it must outlive the library.
+    _blob: Blob,
+}
+
+// SAFETY: as `Library`: used only to load pipelines, which the host allows
+// from several threads (two loads of one name are serialised by `same_name`).
+unsafe impl Send for Shard {}
+// SAFETY: as above.
+unsafe impl Sync for Shard {}
+
+static SHARDS: RwLock<Vec<std::sync::Arc<Shard>>> = RwLock::new(Vec::new());
+
+/// From now on a pipeline the library does not have is looked for in these
+/// files (libraries `victory warm`'s processes saved) before it is made, and
+/// stored into the library when found (these replace the earlier ones).
+pub(crate) fn use_shards(files: &[PathBuf]) {
+    let Some(device) = crate::host::host().and_then(|h| h.device.cast::<ID3D12Device1>().ok()) else { return };
+    let shards = files
+        .iter()
+        .filter_map(|file| {
+            let blob = Mapped::open(file).map(Blob::Mapped)?;
+            // SAFETY: the bytes outlive the library (kept beside it).
+            let library = unsafe { device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(blob.bytes()) }.ok()?;
+            Some(std::sync::Arc::new(Shard { library: library.cast().ok()?, _blob: blob }))
+        })
+        .collect();
+    *SHARDS.write().unwrap_or_else(|e| e.into_inner()) = shards;
+}
+
+/// Writes the pipelines this process made, as a library, to `path` (a
+/// `victory warm` process, whose pipelines the merging process takes into the
+/// cache's library): nothing if there is nothing new since the last call.
+pub(crate) fn save_shard(path: &std::path::Path) -> bool {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let Some(library) = library() else { return false };
+    let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+    let added = library.added.load(Ordering::Relaxed);
+    if added == 0 || added == LAST.load(Ordering::Relaxed) {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = path.with_extension("tmp");
+    // SAFETY: a plain query.
+    let size = unsafe { library.library.GetSerializedSize() };
+    if serialise(&library.library, &tmp, size).is_err() || std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    LAST.store(added, Ordering::Relaxed);
+    true
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
     name: &str,
-    load: impl FnOnce(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
+    load: impl Fn(&ID3D12PipelineLibrary1, PCWSTR) -> windows::core::Result<ID3D12PipelineState>,
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
@@ -545,6 +603,25 @@ pub(crate) fn pipeline(
         }
         Err(e) => e,
     };
+    // One a `victory warm` process made: found in its library and kept in ours.
+    let shards = SHARDS.read().unwrap_or_else(|e| e.into_inner()).clone();
+    for shard in &shards {
+        let found = {
+            let _all = one_call();
+            let _one = same_name(name);
+            load(&shard.library, PCWSTR(wide.as_ptr()))
+        };
+        if let Ok(pso) = found {
+            LOADED.fetch_add(1, Ordering::Relaxed);
+            let _all = one_call();
+            let _stores = library.saving.read().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: a live pipeline; a name already stored is refused.
+            if unsafe { library.library.StorePipeline(PCWSTR(wide.as_ptr()), &pso) }.is_ok() {
+                library.added.fetch_add(1, Ordering::Relaxed);
+            }
+            return Ok(pso);
+        }
+    }
     // Compiled outside any lock: compiles take up to seconds.
     let pso = {
         let _call = call("make", name);

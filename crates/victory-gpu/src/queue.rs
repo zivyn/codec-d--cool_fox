@@ -460,6 +460,13 @@ pub(crate) fn no_drain_here() {
     behind::no_drain_here();
 }
 
+/// The round of the heaps' records that was asked for ahead for what our
+/// thread of [`behind`] prepares now, 0 if none (`VICTORY_HEAPS_EARLY`).
+#[cfg(windows)]
+pub(crate) fn heaps_round() -> u64 {
+    behind::round()
+}
+
 /// Submissions the title made that the host has not begun ([`behind`]).
 #[cfg(windows)]
 pub(crate) fn queued() -> u64 {

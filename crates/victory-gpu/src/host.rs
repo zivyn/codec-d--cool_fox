@@ -8803,6 +8803,31 @@ impl Meter {
                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
                 );
             }
+            // New memory waited for ([`resident`], [`mapped`]): their totals since the start are said every
+            // 1,000 and 200 calls, which tells nothing of one stretch of the run; the stall of a scene's first
+            // seconds is where they cost 3 to 5 ms a call against 0.3 before it (V3d, card at its budget).
+            {
+                static SAID: [std::sync::atomic::AtomicU64; 4] =
+                    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+                let now = [
+                    RESIDENT[0].load(Ordering::Relaxed),
+                    RESIDENT[1].load(Ordering::Relaxed),
+                    MAPPED[0].load(Ordering::Relaxed),
+                    MAPPED[1].load(Ordering::Relaxed),
+                ];
+                let [made, made_us, mapped_n, mapped_us] = std::array::from_fn(|i| {
+                    now[i].saturating_sub(SAID[i].swap(now[i], Ordering::Relaxed))
+                });
+                if made + mapped_n > 0 {
+                    tracing::info!(
+                        "new card memory waited for per frame, all threads (VICTORY_WAIT_RESIDENT=0: not): {:.1} MakeResident calls {:.1} ms, {:.1} waits for the mapping {:.1} ms",
+                        made as f64 / frames,
+                        made_us as f64 / 1000.0 / frames,
+                        mapped_n as f64 / frames,
+                        mapped_us as f64 / 1000.0 / frames
+                    );
+                }
+            }
             let [through, left, filled, short] =
                 [0, 1, 2, 3].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if through + left + filled > 0.0 {

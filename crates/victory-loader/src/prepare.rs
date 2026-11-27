@@ -98,10 +98,15 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
-        for (entry, target) in dir64_relocations(&bytes, &info) {
-            if target == field_rva {
-                write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+        // A field past the top of the RVA space has no relocation to clear.
+        if let Some(field_rva) = tls
+            .directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+        {
+            for (entry, target) in dir64_relocations(&bytes, &info) {
+                if target == field_rva {
+                    write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
+                }
             }
         }
     }
@@ -147,8 +152,12 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
                 break;
             };
             let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+            // A target past the top of the 32-bit RVA space can only come from
+            // a malformed page RVA: skip it rather than wrap around.
+            if e >> 12 == DIR64
+                && let Some(target) = page.checked_add(u32::from(e & 0xFFF))
+            {
+                out.push((entry, target));
             }
         }
         at += block;
@@ -270,6 +279,92 @@ mod tests {
         assert_ne!(
             assigned, 0,
             "the process executable already owns TLS slot zero"
+        );
+    }
+
+    /// A relocation block whose page RVA is not page-aligned and lies near the
+    /// top of the 32-bit RVA space: the target of its first entry is past
+    /// 4 GiB and must be skipped, not overflow.
+    #[test]
+    fn relocation_targets_past_the_top_of_the_rva_space_are_skipped() {
+        use victory_pe::SectionInfo;
+        const BLOCK_AT: usize = 0x200;
+        let mut bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut info = ImageInfo::parse(&bytes).unwrap();
+        // RVA 0x1000 is 12 bytes of file data at BLOCK_AT; nothing runs them.
+        info.sections = vec![SectionInfo {
+            name: ".reloc".into(),
+            rva: 0x1000,
+            virtual_size: 12,
+            file_offset: BLOCK_AT as u32,
+            file_size: 12,
+            characteristics: 0,
+        }];
+        let dir = layout::data_directory_offset(&bytes, dir::BASERELOC).unwrap();
+        write_u32(&mut bytes, dir, 0x1000).unwrap();
+        write_u32(&mut bytes, dir + 4, 12).unwrap();
+        // One block: a page RVA of 0xFFFFF001 with two DIR64 entries, at
+        // offsets 0xFFF (target 0x1_0000_0000, past the top) and 0x010.
+        write_u32(&mut bytes, BLOCK_AT, 0xFFFF_F001).unwrap();
+        write_u32(&mut bytes, BLOCK_AT + 4, 12).unwrap();
+        write_u16(&mut bytes, BLOCK_AT + 8, 0xAFFF).unwrap();
+        write_u16(&mut bytes, BLOCK_AT + 10, 0xA010).unwrap();
+        assert_eq!(
+            dir64_relocations(&bytes, &info),
+            [(BLOCK_AT + 10, 0xFFFF_F011)]
+        );
+    }
+
+    /// A TLS directory at the top of the 32-bit RVA space (in a section that
+    /// ends there) with one callback pointer: the RVA of the callback field
+    /// lies past 4 GiB. The image must still be prepared.
+    #[test]
+    fn tls_directory_at_the_top_of_the_rva_space_is_prepared() {
+        const IMAGE_BASE: u64 = 0x1_4000_0000;
+        const TLS_RVA: u32 = 0xFFFF_FFE8;
+        const CALLBACKS_RVA: u32 = 0xFFFF_FF80;
+        // The TLS directory is at file offset 0x2E8, its callback pointer 24
+        // bytes in.
+        const TLS_AT: usize = 0x2E8;
+        let mut image = vec![0u8; 0x400];
+        image[..2].copy_from_slice(b"MZ");
+        write_u32(&mut image, layout::DOS_E_LFANEW, 0x40).unwrap();
+        image[0x40..0x44].copy_from_slice(b"PE\0\0");
+        write_u16(&mut image, 0x44, victory_pe::MACHINE_AMD64).unwrap();
+        write_u16(&mut image, 0x46, 1).unwrap(); // one section
+        write_u16(&mut image, 0x54, 240).unwrap(); // optional header size
+        write_u16(&mut image, 0x56, 0x0022).unwrap(); // executable, large address aware
+        let opt = 0x58;
+        write_u16(&mut image, opt, 0x20B).unwrap(); // PE32+
+        write_u64(&mut image, opt + 24, IMAGE_BASE).unwrap();
+        write_u32(&mut image, opt + 32, 0x1000).unwrap(); // section alignment
+        write_u32(&mut image, opt + 36, 0x200).unwrap(); // file alignment
+        write_u32(&mut image, opt + 56, 0x1000).unwrap(); // size of image
+        write_u32(&mut image, opt + 60, 0x200).unwrap(); // size of headers
+        write_u32(&mut image, opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES, 16).unwrap();
+        let tls_dir = opt + layout::OPT_DATA_DIRECTORY + 9 * layout::DATA_DIRECTORY_SIZE;
+        write_u32(&mut image, tls_dir, TLS_RVA).unwrap();
+        write_u32(&mut image, tls_dir + 4, 0x28).unwrap();
+        // The one section: raw data at 0x200, mapped at the top of the RVA space.
+        let sec = opt + 240;
+        image[sec..sec + 4].copy_from_slice(b".tls");
+        write_u32(&mut image, sec + 8, 0x200).unwrap(); // virtual size
+        write_u32(&mut image, sec + 12, 0xFFFF_FF00).unwrap(); // virtual address
+        write_u32(&mut image, sec + 16, 0x200).unwrap(); // raw size
+        write_u32(&mut image, sec + 20, 0x200).unwrap(); // raw pointer
+        write_u64(
+            &mut image,
+            TLS_AT + 24,
+            IMAGE_BASE + u64::from(CALLBACKS_RVA),
+        )
+        .unwrap();
+        // The callback array (at CALLBACKS_RVA) is empty: a zero slot.
+
+        let prepared = prepare(&image).unwrap();
+        assert_eq!(
+            layout::read_u64(&prepared.bytes, TLS_AT + 24),
+            Some(0),
+            "the callback pointer is cleared"
         );
     }
 

@@ -798,6 +798,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
+            crate::barrier::EMITTED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -812,6 +813,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
+            crate::barrier::EMITTED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::barrier::EMITTED[1].fetch_add(host.len() as u64, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -826,6 +829,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        crate::barrier::EMITTED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1582,6 +1586,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
+            crate::barrier::EMITTED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
@@ -1867,6 +1872,16 @@ fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `n` draws, for executions made one ([`thin`]).
+fn count_draws(n: u64) {
+    DRAWS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The line of the executions with one record ([`thin::runs_line`]).
+pub(crate) fn runs_line(frames: f64) {
+    thin::runs_line(frames);
+}
+
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
@@ -2140,7 +2155,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2155,13 +2170,28 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // The groups are read (`VICTORY_BARRIER_LOOK`, `VICTORY_GROUP_SKIP`):
+        // a wait for every earlier shader write is left out only for groups
+        // read fully that say no shader wrote before them.
+        let wait = if crate::barrier::looking() {
+            let looks = crate::barrier::decode(groups as usize, count, &|at, out| {
+                crate::host::read_into(at as *const u8, out)
+            });
+            let wait = !crate::barrier::skipping() || looks.as_deref().is_none_or(crate::barrier::needs_wait);
+            crate::barrier::note(looks.as_deref(), wait);
+            wait
+        } else {
+            true
+        };
+        if wait {
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

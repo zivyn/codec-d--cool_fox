@@ -207,6 +207,12 @@ static LAST: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// The line: the card's memory by category, with the numbers [`assess`]
 /// derives, once for each memory line (every five seconds).
 pub(crate) fn log() {
+    // The barriers the title sent, over the frames since the line before.
+    static FRAME: AtomicU64 = AtomicU64::new(0);
+    let frame = crate::frame::current();
+    let frames = frame.saturating_sub(FRAME.swap(frame, Ordering::Relaxed));
+    crate::barrier::line(frames as f64);
+    crate::list::runs_line(frames as f64);
     let Some(host) = crate::host::host() else {
         return;
     };

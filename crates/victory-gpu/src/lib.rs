@@ -59,6 +59,8 @@ mod popwatch;
 #[cfg(windows)]
 mod primitive;
 #[cfg(windows)]
+mod barrier;
+#[cfg(windows)]
 mod priority;
 #[cfg(windows)]
 mod vram;

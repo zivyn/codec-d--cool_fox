@@ -6803,7 +6803,7 @@ mod settled_tests {
 
 #[cfg(test)]
 mod quiet_tests {
-    use super::Shadow;
+    use super::{BufferList, Shadow, buffer_listed};
 
     const LEN: usize = 5 << 20;
     const WINDOW: usize = 256 << 10;

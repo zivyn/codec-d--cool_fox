@@ -3334,6 +3334,12 @@ impl State {
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
+        // The title's skinning for the structure builder, if listed
+        // (`VICTORY_SKIP_BVH_SKINNING`): nothing reads what it writes while
+        // the builder is off.
+        if crate::pipeline::is_bvh_skinning_skipped(self.pipeline as This) {
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4436,6 +4442,11 @@ impl State {
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             return false;
+        }
+        // (As in `dispatch`: counted and left out; true, so that it is not
+        // counted as an execution the host dropped.)
+        if crate::pipeline::is_bvh_skinning_skipped(self.pipeline as This) {
+            return true;
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;

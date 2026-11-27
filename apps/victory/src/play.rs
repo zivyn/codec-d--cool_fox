@@ -113,7 +113,16 @@ const SETTINGS: &[(&str, &str)] = &[
 /// Path settings a start keeps from its surroundings; every other
 /// `VICTORY_...` variable is cleared before the settings are put in (a
 /// restart from the menu inherits the last run's).
+///
+/// `VICTORY_HOME` and `VICTORY_ADAPTER` are read again after the clearing:
+/// the cache and save folders (`Config::load` in `run`), the restart the F1
+/// menu or the warm-up starts (which inherits this environment), and the
+/// card the host device is made on. Cleared, the caches and saves went to
+/// `%LOCALAPPDATA%` with `VICTORY_HOME` set (#472), and a named card was
+/// passed over for the one with the most memory.
 const KEPT: &[&str] = &[
+    "VICTORY_HOME",
+    "VICTORY_ADAPTER",
     "VICTORY_CONFIG",
     "VICTORY_GAME_DIR",
     "VICTORY_CACHE_DIR",
@@ -1100,6 +1109,14 @@ mod tests {
         assert!(older_rtx("NVIDIA GeForce RTX 3080 Ti") && older_rtx("NVIDIA GeForce RTX 2060 SUPER") && older_rtx("NVIDIA GeForce RTX 3050 Laptop GPU"));
         assert!(!older_rtx("NVIDIA GeForce RTX 5070") && !older_rtx("NVIDIA GeForce RTX 4090") && !older_rtx("NVIDIA GeForce GTX 1080"));
         assert!(!older_rtx("NVIDIA RTX A2000") && !older_rtx("AMD Radeon RX 7900 XTX") && !older_rtx(""));
+    }
+
+    /// Settings read again after `prepare` clears the others survive it.
+    #[test]
+    fn paths_and_the_named_card_are_kept() {
+        for k in ["VICTORY_HOME", "VICTORY_ADAPTER", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"] {
+            assert!(KEPT.contains(&k), "{k}");
+        }
     }
 
     #[test]

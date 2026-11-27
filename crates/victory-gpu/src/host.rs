@@ -9640,6 +9640,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -9648,7 +9649,8 @@ impl Meter {
                  {indirect:.0} indirect ({left_out:.0} of all these left out on purpose: \
                  ray-tracing passes without the structure builder); heap buffers {picked:.1} passes {picked_ms:.1} ms;                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),

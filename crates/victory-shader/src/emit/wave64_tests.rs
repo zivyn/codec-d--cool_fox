@@ -846,7 +846,7 @@ fn a_lane_branch_that_writes_and_reads_lds_translates_wave_wide_as_a_last_resort
 /// `lds_read_after_write_in_a_lane_branch` for `threads` threads, `threads / 64` console waves:
 /// each wave reads inside the branch what its own lanes wrote (the lane 16 above, in the wave),
 /// and `out[threads + t]` is what the wave's count `n` came to (1 if the wave entered the branch).
-fn lds_in_a_lane_branch_per_console_wave(threads: u32) -> NativeProgram {
+fn lds_in_a_lane_branch_per_console_wave(threads: u32, lds_units: u32) -> NativeProgram {
     let words = [
         0xBE94_0380, // s_mov_b32 s20, 0
         0xD760_0016, // v_readlane_b32 s22, v0, 3 (a lane read: the console wave's lanes are in step)
@@ -882,7 +882,8 @@ fn lds_in_a_lane_branch_per_console_wave(threads: u32) -> NativeProgram {
     ];
     let mut native = native_of(&words, true, threads);
     if let StageIo::Cs(cs) = &mut native.io {
-        cs.rsrc2 |= (threads * 4).div_ceil(512) << 15; // 4 bytes of LDS per thread, in units of 512
+        // 4 bytes of LDS per thread, in units of 512 (or `lds_units` of them, if more)
+        cs.rsrc2 |= (threads * 4).div_ceil(512).max(lds_units) << 15;
     }
     native
 }
@@ -894,8 +895,19 @@ fn lds_in_a_lane_branch_per_console_wave(threads: u32) -> NativeProgram {
 /// their own ([`lower`]'s `pair_wait`) instead.
 #[test]
 fn console_waves_of_a_group_take_a_lane_branch_with_lds_on_their_own() {
-    for threads in [128u32, 192, 256] {
-        let native = lds_in_a_lane_branch_per_console_wave(threads);
+    console_waves_branching(&[128, 192, 256], 0, 32768);
+}
+
+/// The same for programs that use all the 32 KiB: the exchange of the halves lies above them,
+/// where an NVIDIA card runs shared memory that D3D12 does not promise (48 KiB per group).
+#[test]
+fn console_waves_of_a_group_that_fills_the_shared_memory_still_meet() {
+    console_waves_branching(&[256, 512], 64, 49152);
+}
+
+fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
+    for &threads in sizes {
+        let native = lds_in_a_lane_branch_per_console_wave(threads, lds_units);
         let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
         let st = structure::structure(&p).expect("structure");
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
@@ -903,10 +915,14 @@ fn console_waves_of_a_group_take_a_lane_branch_with_lds_on_their_own() {
         let container = crate::dxbc::build(&[]);
         let c = crate::dxbc::Container::parse(&container).unwrap();
         let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let lds = lower::TEST_HOST_LDS.replace(Some(host_lds));
         let shader = super::emit(&c, &native, &p, &st, &io, &res);
         lower::TEST_HOST_WAVE.set(was);
+        lower::TEST_HOST_LDS.set(lds);
         let shader = shader.unwrap_or_else(|e| panic!("{threads} threads: {e}"));
-        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        if host_lds <= 32768
+            && let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
             let mut copy = shader.dxil.clone();
             v.validate(&mut copy).expect("DXIL validation failed");
         }

@@ -939,6 +939,12 @@ fn create() -> windows::core::Result<Host> {
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
+            // (NVIDIA's cards run 48 KiB of shared memory per thread group, where D3D12 promises
+            // 32: what a console wave split in two host waves gives its halves to exchange
+            // goes above the 32 KiB some programs use whole.)
+            if crate::indirect::nvidia(&device) {
+                victory_shader::emit::set_host_lds_bytes(48 * 1024);
+            }
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())

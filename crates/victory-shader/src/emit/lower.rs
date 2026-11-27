@@ -1137,8 +1137,31 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+pub fn host_settings() -> [u32; 5] {
+    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna(), host_lds_bytes()]
+}
+
+static HOST_LDS_BYTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(32768);
+
+/// Tells the translator how much shared memory a thread group may have on the host: D3D12's
+/// 32 KiB unless the host's GPU runs more (NVIDIA's take 48 KiB).
+pub fn set_host_lds_bytes(bytes: u32) {
+    HOST_LDS_BYTES.store(bytes.max(32768), std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_lds_bytes`], for its thread only.
+    pub(super) static TEST_HOST_LDS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The shared memory of a thread group the host allows ([`set_host_lds_bytes`]).
+pub(super) fn host_lds_bytes() -> u32 {
+    #[cfg(test)]
+    if let Some(bytes) = TEST_HOST_LDS.get() {
+        return bytes;
+    }
+    HOST_LDS_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1518,7 +1541,7 @@ impl<'a> Lower<'a> {
                                 if group > 64
                                     && group % 64 == 0
                                     && !x.st.wide.is_empty()
-                                    && s.lds_dwords + 2 * (group / 64) + 2 <= 8192
+                                    && s.lds_dwords + 2 * (group / 64) + 2 <= host_lds_bytes() / 4
                                     && pair_meet_on()
                                 {
                                     pair_meet = true;
@@ -2365,7 +2388,7 @@ impl<'a> Lower<'a> {
         let p = self.x.p;
         // (D3D12 gives a group 32 KiB: a program that uses it all has no room for what two
         // host waves of a console wave give each other)
-        if self.s.lds_dwords > 8192 {
+        if self.s.lds_dwords > host_lds_bytes() / 4 {
             return Err(unsupported(0, "shared memory over 32 KiB with the exchange of the host waves"));
         }
         if counted {

@@ -212,6 +212,7 @@ pub(crate) fn log() {
     let frame = crate::frame::current();
     let frames = frame.saturating_sub(FRAME.swap(frame, Ordering::Relaxed));
     crate::barrier::line(frames as f64);
+    crate::list::runs_line(frames as f64);
     let Some(host) = crate::host::host() else {
         return;
     };

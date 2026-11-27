@@ -710,11 +710,135 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Whether runs of executions the title makes one after the other, with
+/// nothing between them, one record each, the next record after the last, are
+/// one execution of all of them (`VICTORY_INDIRECT_RUNS=1`; off by default).
+/// Nothing is between them, so the state they run with is the same, and so
+/// are the draws and their order.
+fn runs_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RUNS").is_some_and(|v| v == "1"))
+}
+
+/// Whether what the title does between two executions that would be one is
+/// noted (`VICTORY_INDIRECT_LOOK=1`).
+fn look_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| runs_on() || std::env::var_os("VICTORY_INDIRECT_LOOK").is_some_and(|v| v == "1"))
+}
+
+/// Since the last line: executions with one record and no count; each that
+/// is the next record of the one before (same signature and arguments); of
+/// those, with nothing between; runs made one and the executions that saved.
+static RUNS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// What lay between executions that were the next record of the one before
+/// (the first op codes), and how often.
+static BETWEEN: Mutex<Option<std::collections::HashMap<Vec<u8>, u64>>> = Mutex::new(None);
+
+/// The names of the plain ops and the others, by code.
+const NAMES: [&str; 45] = [
+    "topology", "stencil_ref", "depth_bounds", "compute_table", "graphics_table", "compute_constant",
+    "graphics_constant", "compute_view", "graphics_view", "set_pipeline", "draw", "draw_indexed", "dispatch",
+    "dispatch_x", "dispatch_mesh", "dispatch_mesh_x", "copy_buffer", "copy_resource", "copy_resource_x",
+    "copy_memory", "resolve", "resolve_queries", "execute_indirect", "write32", "write64", "wait_value",
+    "wait_value64", "sync", "reset", "close", "upload", "barrier", "barrier_groups", "viewports", "scissors",
+    "blend_factor", "heaps", "compute_constants", "graphics_constants", "index_buffer", "vertex_buffers",
+    "targets", "clear_rtv", "clear_dsv", "copy_texture",
+];
+
+/// The line of what the executions come to, per frame.
+pub(crate) fn runs_line(frames: f64) {
+    let r: Vec<u64> = RUNS.iter().map(|r| r.swap(0, Relaxed)).collect();
+    let between = held(&BETWEEN).take();
+    if r[0] == 0 || frames <= 0.0 {
+        return;
+    }
+    let per = |v: u64| v as f64 / frames;
+    let mut top = String::new();
+    if let Some(between) = between {
+        let mut all: Vec<_> = between.into_iter().collect();
+        all.sort_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
+        for (ops, n) in all.into_iter().take(8) {
+            let names: Vec<&str> = ops.iter().map(|&o| NAMES.get(o as usize).copied().unwrap_or("?")).collect();
+            top.push_str(&format!("; {:.1}/frame after [{}]", per(n), names.join(" ")));
+        }
+    }
+    tracing::info!(
+        "executions with one record per frame (VICTORY_INDIRECT_RUNS={}): {:.0}, of them {:.0} the next record of the one before, {:.0} of those with nothing between; {:.0} runs made one, saving {:.0} executions{top}",
+        u8::from(runs_on()),
+        per(r[0]),
+        per(r[1]),
+        per(r[2]),
+        per(r[3]),
+        per(r[4]),
+    );
+}
+
+/// The call `execute_indirect(signature, max, arguments, offset, count,
+/// count offset)` as the words of a stream hold it, if it is one execution
+/// of one record without a count: the signature, the arguments, the offset.
+fn single(w: &[u64]) -> Option<(u64, u64, u64)> {
+    (w.len() >= 6 && w[0] != 0 && w[1] as u32 == 1 && w[2] != 0 && w[4] == 0).then(|| (w[0], w[2], w[3]))
+}
+
+/// How far the run of executions that the one with `first` begins goes in
+/// `stream` from `at` (the next op): how many records it is, and where the
+/// stream goes on. Only uploads (which take no part in what the card does)
+/// may lie between; the ones in the run are `done` as they pass.
+fn run_of(
+    stream: &[u64],
+    mut at: usize,
+    first: (u64, u64, u64),
+    stride: u64,
+    mut done: impl FnMut(&[u64]),
+) -> (u64, usize) {
+    let (signature, arguments, offset) = first;
+    let mut records = 1u64;
+    let mut uploads: Vec<usize> = Vec::new();
+    let mut end = at;
+    while at < stream.len() {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        let Some(w) = stream.get(at + 1..at + 1 + len) else {
+            break;
+        };
+        if op == UPLOAD {
+            uploads.push(at);
+            at += 1 + len;
+            continue;
+        }
+        let next = single(w)
+            .filter(|&(s, a, o)| op == Plain::EXECUTE_INDIRECT as u64 && s == signature && a == arguments && o == offset + records * stride);
+        if next.is_none() {
+            break;
+        }
+        records += 1;
+        at += 1 + len;
+        end = at;
+    }
+    for u in uploads.into_iter().filter(|&u| u < end) {
+        done(&stream[u + 1..u + 1 + (stream[u] >> 16) as usize]);
+    }
+    (records, end)
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    // The execution before: its signature, arguments and where its next
+    // record would be; what came since (op codes, the first few, and how many).
+    let mut last: Option<(u64, u64, u64)> = None;
+    let mut between: Vec<u8> = Vec::new();
+    let mut since = 0u32;
+    let name_upload = |w: &[u64]| {
+        // SAFETY: made by `allocate_upload`, named once.
+        let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
+        // SAFETY: a list of ours.
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        held(uploads).push(block);
+    };
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -724,15 +848,65 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             skip = left();
         }
         if op == UPLOAD {
-            // SAFETY: made by `allocate_upload`, named once.
-            let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
-            // SAFETY: a list of ours.
-            let uploads = unsafe { &(*list.cast::<List>()).uploads };
-            held(uploads).push(block);
+            name_upload(w);
             continue;
         }
         if skip && op != CLOSE && op != RESET {
             continue;
+        }
+        if op == Plain::EXECUTE_INDIRECT as u64 {
+            RUNS[0].fetch_add(1, Relaxed);
+            let first = single(w);
+            if let Some((signature, arguments, offset)) = first {
+                if last == Some((signature, arguments, offset)) {
+                    RUNS[1].fetch_add(1, Relaxed);
+                    if since == 0 {
+                        RUNS[2].fetch_add(1, Relaxed);
+                    } else if look_on() {
+                        let mut seen = held(&BETWEEN);
+                        let seen = seen.get_or_insert_with(Default::default);
+                        if seen.len() < 256 {
+                            *seen.entry(between.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let stride = crate::signature::layout(signature as This).map_or(0, |(stride, _)| u64::from(stride));
+                last = (stride > 0).then_some((signature, arguments, offset + stride));
+                if runs_on() && stride > 0 {
+                    let (records, end) = run_of(stream, i, (signature, arguments, offset), stride, &name_upload);
+                    if records > 1 {
+                        // One execution of all the records; the calls it
+                        // stands for are counted as draws.
+                        calls += records - 1;
+                        RUNS[3].fetch_add(1, Relaxed);
+                        RUNS[4].fetch_add(records - 1, Relaxed);
+                        super::count_draws(records - 1);
+                        super::execute_indirect(
+                            list,
+                            signature as This,
+                            records as u32,
+                            arguments as This,
+                            offset,
+                            std::ptr::null(),
+                            0,
+                        );
+                        i = end;
+                        last = Some((signature, arguments, offset + records * stride));
+                        between.clear();
+                        since = 0;
+                        continue;
+                    }
+                }
+            } else {
+                last = None;
+            }
+            between.clear();
+            since = 0;
+        } else {
+            since += 1;
+            if look_on() && between.len() < 8 {
+                between.push(op.min(255) as u8);
+            }
         }
         if run_plain(op, list, w) {
             continue;
@@ -906,6 +1080,87 @@ mod tests {
                 "slot {slot} is written down and not there"
             );
         }
+    }
+
+    fn put(stream: &mut Vec<u64>, op: u64, args: &[u64]) {
+        stream.push(op | (args.len() as u64) << 16);
+        stream.extend_from_slice(args);
+    }
+
+    const EXECUTE: u64 = Plain::EXECUTE_INDIRECT as u64;
+
+    /// The names go by the codes.
+    #[test]
+    fn the_names_of_the_ops_are_by_their_codes() {
+        assert_eq!(NAMES.len(), COPY_TEXTURE as usize + 1);
+        for (op, name) in [
+            (Plain::EXECUTE_INDIRECT as u64, "execute_indirect"),
+            (Plain::DRAW as u64, "draw"),
+            (Plain::SYNC as u64, "sync"),
+            (RESET, "reset"),
+            (UPLOAD, "upload"),
+            (BARRIER_GROUPS, "barrier_groups"),
+            (COPY_TEXTURE, "copy_texture"),
+        ] {
+            assert_eq!(NAMES[op as usize], name);
+        }
+    }
+
+    /// A run is the executions of one record, one after the other, each the
+    /// next record of the one before; uploads may lie between; anything else
+    /// ends it, as do another signature, other arguments, a gap, a count or
+    /// more records.
+    #[test]
+    fn a_run_is_the_executions_that_follow_one_another_record_by_record() {
+        let call = |signature: u64, max: u64, arguments: u64, offset: u64, count: u64| [signature, max, arguments, offset, count, 0];
+        let mut stream = Vec::new();
+        // The first of the run was taken by the caller; its offset is 0x100, stride 16.
+        put(&mut stream, EXECUTE, &call(7, 1, 9, 0x110, 0));
+        put(&mut stream, UPLOAD, &[0xdead]);
+        put(&mut stream, EXECUTE, &call(7, 1, 9, 0x120, 0));
+        let upto_third = stream.len();
+        put(&mut stream, UPLOAD, &[0xbeef]);
+        put(&mut stream, Plain::DRAW as u64, &[3, 1, 0, 0]);
+        put(&mut stream, EXECUTE, &call(7, 1, 9, 0x130, 0));
+        let mut named = Vec::new();
+        let (records, end) = run_of(&stream, 0, (7, 9, 0x100), 16, |w| named.push(w[0]));
+        assert_eq!((records, end), (3, upto_third));
+        // The upload between the executions was named; the one behind the run was not.
+        assert_eq!(named, [0xdead]);
+        // The same without the draw: the second upload is also between.
+        let mut again = Vec::new();
+        again.extend_from_slice(&stream[..upto_third]);
+        put(&mut again, UPLOAD, &[0xbeef]);
+        put(&mut again, EXECUTE, &call(7, 1, 9, 0x130, 0));
+        let mut named = Vec::new();
+        assert_eq!(run_of(&again, 0, (7, 9, 0x100), 16, |w| named.push(w[0])), (4, again.len()));
+        assert_eq!(named, [0xdead, 0xbeef]);
+        // Each thing that ends a run.
+        for (what, next) in [
+            ("another signature", call(8, 1, 9, 0x110, 0)),
+            ("other arguments", call(7, 1, 10, 0x110, 0)),
+            ("a gap", call(7, 1, 9, 0x120, 0)),
+            ("the same record again", call(7, 1, 9, 0x100, 0)),
+            ("a count", call(7, 1, 9, 0x110, 5)),
+            ("more records", call(7, 2, 9, 0x110, 0)),
+        ] {
+            let mut stream = Vec::new();
+            put(&mut stream, EXECUTE, &next);
+            assert_eq!(run_of(&stream, 0, (7, 9, 0x100), 16, |_| ()), (1, 0), "{what}");
+        }
+        // Nothing after it, and an op cut short.
+        assert_eq!(run_of(&[], 0, (7, 9, 0x100), 16, |_| ()), (1, 0));
+        assert_eq!(run_of(&[EXECUTE | 6 << 16, 7], 0, (7, 9, 0x100), 16, |_| ()), (1, 0));
+    }
+
+    /// Which calls are executions of one record without a count.
+    #[test]
+    fn one_record_without_a_count_is_a_single() {
+        assert_eq!(single(&[7, 1, 9, 0x40, 0, 0]), Some((7, 9, 0x40)));
+        for w in [[0u64, 1, 9, 0, 0, 0], [7, 2, 9, 0, 0, 0], [7, 1, 0, 0, 0, 0], [7, 1, 9, 0, 3, 0]] {
+            assert_eq!(single(&w), None);
+        }
+        assert_eq!(single(&[7, 1, 9]), None);
     }
 
     /// Arguments come out of a stream as they went in.

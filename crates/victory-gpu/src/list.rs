@@ -1872,6 +1872,16 @@ fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `n` draws, for executions made one ([`thin`]).
+fn count_draws(n: u64) {
+    DRAWS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The line of the executions with one record ([`thin::runs_line`]).
+pub(crate) fn runs_line(frames: f64) {
+    thin::runs_line(frames);
+}
+
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).

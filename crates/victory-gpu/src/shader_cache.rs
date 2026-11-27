@@ -68,6 +68,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_PAIR_SYNC",
             "VICTORY_PAIR_CLAMP",
+            "VICTORY_PAIR_LEAN",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
@@ -77,6 +78,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_LOOP_NOTES",
             "VICTORY_LOOP_WHY",
+            "VICTORY_PEEK",
             "VICTORY_BVH_BOUNDS",
         ] {
             bytes.extend_from_slice(name.as_bytes());

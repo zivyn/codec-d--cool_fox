@@ -132,8 +132,25 @@ pub(crate) enum C {
     /// Waits for a pipeline not made because it would not be within the
     /// frame's budget (`pipeline::make`).
     PipelineSkips,
+    /// Looks at whether a copy has nothing new in a range
+    /// (`Shadow::nothing_new`): answered by a note of the copy's, no note
+    /// held the range, the note's range was touched since, and notes made;
+    /// and one that was true but of memory no stamp covers (not view
+    /// memory); the calls and their nanoseconds (all threads).
+    NoteHits,
+    NoteNone,
+    NoteTouched,
+    NoteMade,
+    NoteUnknown,
+    LooksNs,
+    /// The wall time of a flush of refreshes (`Batch::refresh_front`,
+    /// `Batch::flush_all`) in leaving out what is known to copy nothing,
+    /// in asking the write watch ahead, and in the copies on the threads.
+    FlushPruneNs,
+    FlushAskNs,
+    FlushEachNs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -1355,6 +1372,18 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  looks for nothing new in a range, per frame (VICTORY_REFRESH_NOTES): {:.0} answered by a note,          {:.0} with no note that held the range, {:.0} whose note was touched since, {:.0} notes made,          {:.0} found nothing new in memory no stamp covers; {:.1} ms of the looks (all threads); the          flushes' wall time: {:.1} ms leaving out what copies nothing, {:.1} asking ahead, {:.1} copying",
+        c[C::NoteHits as usize],
+        c[C::NoteNone as usize],
+        c[C::NoteTouched as usize],
+        c[C::NoteMade as usize],
+        c[C::NoteUnknown as usize],
+        c[C::LooksNs as usize] / 1e6,
+        c[C::FlushPruneNs as usize] / 1e6,
+        c[C::FlushAskNs as usize] / 1e6,
+        c[C::FlushEachNs as usize] / 1e6,
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

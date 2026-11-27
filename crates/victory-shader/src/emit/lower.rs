@@ -3082,6 +3082,46 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// The title address of the view a descriptor load picks from the view
+    /// heap at an index the program computes (a constant buffer's): the
+    /// host's table of addresses by heap slot
+    /// ([`super::shader::SLOT_VIEW_ADDRESSES`]), read in the current block.
+    /// None for a load of anything but a whole descriptor of the heap.
+    fn heap_view_address(&mut self, site: Site) -> Option<(V, V)> {
+        use super::shader::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES};
+        let a = self.scalar.get(&site).copied()?;
+        let rp = *self.x.native.layout.get(a.param)?;
+        if rp.root != RootType::ResourceHeap || a.offset % 32 != 0 {
+            return None;
+        }
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        // Inside the table whatever the index: a root view has no bounds.
+        let last = self.s.m.i32(SLOT_STRIDES_COUNT - 1);
+        let slot = self
+            .s
+            .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[slot, last]);
+        self.s.m.tag(slot, Tag::Clamp);
+        let three = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, slot, three);
+        let h = self.s.root_srv_handle(SLOT_VIEW_ADDRESSES);
+        let (iu, mask, align) = (self.s.m.undef(i32t), self.s.m.i8(3), self.s.m.i32(4));
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        let [lo, hi] = [0, 1].map(|k| {
+            let f = self.s.m.extract(c, r, k);
+            self.as_int(f)
+        });
+        Some((lo, hi))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -6449,7 +6489,7 @@ impl<'a> Lower<'a> {
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
             if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+                && let Some((lo, hi)) = self.view_address(site).or_else(|| self.heap_view_address(site))
             {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
@@ -11137,6 +11177,14 @@ impl<'a> Lower<'a> {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                // The array slice is no coordinate of the level of detail:
+                // the validator wants every coordinate past the texture's
+                // dimensions undefined.
+                let cs: Vec<V> = cs
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &x)| if k < spatial { x } else { fu })
+                    .collect();
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(

@@ -60,7 +60,7 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    pub(crate) container: Vec<u8>,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,

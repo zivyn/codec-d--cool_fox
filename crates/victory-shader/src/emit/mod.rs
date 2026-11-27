@@ -124,7 +124,7 @@ pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -1738,6 +1738,64 @@ mod tests {
         let ours = c[4..20].to_vec();
         v.validate(&mut c).unwrap();
         assert_eq!(c[4..20], ours[..], "our hash differs from the validator's");
+    }
+
+    /// Inputs of different interpolation modes packed into one register
+    /// (an integer beside a float, a front face beside one that is read)
+    /// validate: the elements that cannot follow move to registers of their
+    /// own.
+    #[test]
+    #[cfg(windows)]
+    fn pixel_inputs_of_two_modes_in_one_row_validate() {
+        let input = |name: &str, index, kind, comp, interp, row, col, usage| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        };
+        let mut s = Shader::new(true);
+        s.inputs.extend([
+            input("TEXCOORD", 0, 0, 5, 1, 0, 0, 0),
+            input("TEXCOORD", 1, 0, 9, 2, 0, 1, 0),
+            input("TEXCOORD", 2, 0, 9, 2, 1, 0, 0),
+            input("SV_IsFrontFace", 0, 13, 5, 1, 1, 1, 0),
+            input("TEXCOORD", 3, 0, 5, 1, 2, 0, 0),
+            input("TEXCOORD", 4, 0, 9, 2, 2, 1, 1),
+        ]);
+        s.outputs.push(SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        });
+        let b = s.entry;
+        let args = [s.m.i32(5), s.m.i32(0), s.m.i8(0), s.m.undef(s.t.i32)];
+        let x = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+        for c in 0..4u8 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(c), x];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let mut c = s.finish();
+        let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) else {
+            eprintln!("no dxil.dll; skipped");
+            return;
+        };
+        v.validate(&mut c).unwrap();
     }
 
     /// A pixel program of `words` with no user data.

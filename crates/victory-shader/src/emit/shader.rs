@@ -29,6 +29,15 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Kept distinct from [`SLOT_STRIDES`] so the host binds the table without
 /// running the full bindless heap buffer sweep.
 pub const SLOT_TABLE_STRIDES: u8 = 252;
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that takes the address of a buffer view or ray-tracing structure out of a
+/// descriptor it picks from the view heap at an index it computes (inline
+/// ray tracing: the structure's address is the descriptor's, and the
+/// program walks title memory from there, [`SLOT_MEMORY`]): a raw buffer of
+/// [`SLOT_STRIDES_COUNT`] entries of two dwords the host keeps, entry `i`
+/// the title address (low dword, then bits 32 up) the view at heap slot `i`
+/// starts at (0: none).
+pub const SLOT_VIEW_ADDRESSES: u8 = 251;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
@@ -528,27 +537,10 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
-        if self.pixel {
-            // Reading a per-vertex value with attributeAtVertex needs a
-            // constant input, even when the source declaration was smooth.
-            // D3D requires all components packed into the same register to
-            // share a mode, including the ones the shader never reads.
-            for index in 0..self.inputs.len() {
-                let unused = &self.inputs[index];
-                if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
-                    continue;
-                }
-                let mut modes = self.inputs.iter()
-                    .filter(|e| e.row == unused.row && e.usage != 0)
-                    .map(|e| e.interp);
-                if let Some(mode) = modes.next()
-                    && (mode == 1 || unused.comp == 9)
-                    && modes.all(|other| other == mode)
-                {
-                    self.inputs[index].interp = mode;
-                }
-            }
-        }
+        // D3D requires all components packed into the same register to share
+        // a mode, including the ones the shader never reads.
+        container::unify_row_interp(&mut self.inputs, self.pixel);
+        container::unify_row_interp(&mut self.outputs, false);
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a

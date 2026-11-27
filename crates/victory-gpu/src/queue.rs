@@ -926,6 +926,11 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // What the stand-in for the indirect light did, per program.
+    #[cfg(windows)]
+    if frame.is_multiple_of(256) {
+        crate::ambient::report(frame);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

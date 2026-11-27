@@ -7935,6 +7935,14 @@ impl Batch {
         }
     }
 
+    /// Adds the time since `lap` to counter `c`, and starts the next lap.
+    #[cfg(feature = "diagnostics")]
+    fn lap(lap: &mut std::time::Instant, c: crate::copystat::C) {
+        let now = std::time::Instant::now();
+        crate::copystat::add(c, (now - *lap).as_nanos() as u64);
+        *lap = now;
+    }
+
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
         let started = std::time::Instant::now();
@@ -8012,6 +8020,8 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
+        #[cfg(feature = "diagnostics")]
+        let mut lap = std::time::Instant::now();
         if spans.len() > FEW {
             // Those a copy noted as holding nothing new, and nothing has
             // touched since, need no thread (nor asking ahead).
@@ -8029,13 +8039,18 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        Self::lap(&mut lap, crate::copystat::C::FlushPruneNs);
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
         #[cfg(feature = "diagnostics")]
-        FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+        {
+            FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+            Self::lap(&mut lap, crate::copystat::C::FlushAskNs);
+        }
         crate::shadow::wide_each(spans.len() + due.len(), move |i| {
             // The textures first: they are the longer pieces.
             let Some(i) = i.checked_sub(due.len()) else {
@@ -8050,6 +8065,8 @@ impl Batch {
             }
             Self::update(shadow, *from, *to);
         });
+        #[cfg(feature = "diagnostics")]
+        Self::lap(&mut lap, crate::copystat::C::FlushEachNs);
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8179,6 +8196,8 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
+        #[cfg(feature = "diagnostics")]
+        let mut lap = std::time::Instant::now();
         if light && self.refreshes.len() > FEW {
             // (As in `refresh_front`.)
             #[cfg(feature = "diagnostics")]
@@ -8196,6 +8215,8 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        Self::lap(&mut lap, crate::copystat::C::FlushPruneNs);
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
         let ahead = self.refreshes.len() > 1;
@@ -8210,6 +8231,8 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        Self::lap(&mut lap, crate::copystat::C::FlushAskNs);
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
@@ -8245,6 +8268,8 @@ impl Batch {
                 Self::update(&shadow, from, to);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        Self::lap(&mut lap, crate::copystat::C::FlushEachNs);
         if ahead {
             crate::watch::ask_ahead_done();
         }

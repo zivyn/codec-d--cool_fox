@@ -703,8 +703,9 @@ pub fn emit(
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
 /// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// wave, or a group of whole console waves whose halves meet by counters of their own: a
+/// group barrier inside such a branch would wait for threads that never come, the waves of a
+/// group deciding differently.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -720,6 +721,12 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        // (several console waves: the two host waves of each meet by counters of their own,
+        // not at group barriers the other console waves would have to reach, `lower::pair_wait`)
+        crate::native::StageIo::Cs(cs)
+            if lower::pair_meet_on()
+                && cs.threads.iter().product::<u32>() % 64 == 0
+                && cs.threads.iter().product::<u32>() <= 1024 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);

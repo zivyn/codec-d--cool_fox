@@ -2931,8 +2931,17 @@ fn lists_before_wait(len: usize, waits: impl Fn(usize) -> bool) -> Option<usize>
     if len < 2 || !waits(len) {
         return None;
     }
-    let free = (1..len).partition_point(|&n| !waits(n));
-    (free > 0).then_some(free)
+    // The least number of places that waits (`len` does): one less goes first.
+    let (mut low, mut high) = (1, len);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if waits(mid) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    (low > 1).then_some(low - 1)
 }
 
 /// Where a submission of `lists` run in `order`, joined from the parts that

@@ -2841,13 +2841,12 @@ impl<'a> Lower<'a> {
 
     /// An input element's channel as declared (16-bit ones as 32-bit floats).
     fn load_any_input(&mut self, id: usize, col: u8) -> Val {
-        let vertex = self.s.m.undef(self.s.t.i32);
-        self.load_element(self.s.entry, id, col, vertex)
+        self.load_element(self.s.entry, id, col, None)
     }
 
     /// [`Lower::load_any_input`] in block `entry`, at `vertex` of the input
     /// primitive (undefined outside geometry shaders).
-    fn load_element(&mut self, entry: usize, id: usize, col: u8, vertex: V) -> Val {
+    fn load_element(&mut self, entry: usize, id: usize, col: u8, vertex: Option<u32>) -> Val {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let (int, bit) = (e.comp != 9, e.comp == 1);
@@ -2869,7 +2868,10 @@ impl<'a> Lower<'a> {
             self.s.m.i32(id as u32),
             self.s.m.i32(0),
             self.s.m.i8(col),
-            vertex,
+            match vertex {
+                Some(n) => self.s.m.i32(n),
+                None => self.s.m.undef(self.s.t.i32),
+            },
         ];
         let v = self.s.op(
             entry,
@@ -2900,8 +2902,7 @@ impl<'a> Lower<'a> {
         if u32::from(vertex) >= vertices {
             return Err("a geometry input vertex its primitive lacks");
         }
-        let vertex = self.s.m.i32(u32::from(vertex));
-        match self.load_element(self.cur, id, col, vertex) {
+        match self.load_element(self.cur, id, col, Some(u32::from(vertex))) {
             Val::I32(x) => Ok(x),
             _ => unreachable!("an input element loads as a dword"),
         }

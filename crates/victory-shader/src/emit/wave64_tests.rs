@@ -94,7 +94,7 @@ pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgr
 }
 
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
-fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
+pub(super) fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
     lowered_on(native, p, wide, 32)
 }
 

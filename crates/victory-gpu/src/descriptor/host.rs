@@ -88,9 +88,8 @@ struct Made {
 impl Made {
     const LOCKS: usize = 512;
 
-    fn new(count: usize) -> Self {
-        let mut keys = Vec::new();
-        keys.resize_with(count, Default::default);
+    fn new(count: usize, sparse: bool) -> Self {
+        let keys = super::sparse::words64(count, sparse);
         Made { keys, locks: [const { Mutex::new(()) }; Self::LOCKS] }
     }
 
@@ -182,7 +181,7 @@ pub(crate) struct HostHeap {
     /// A lock for each slot: one for the heap was what the recording threads
     /// waited for most (5.6 % of their time, profile waits-1: each descriptor
     /// made for a draw takes it, and lets go of what the slot held under it).
-    kept: Box<[Mutex<Option<ID3D12Resource>>]>,
+    kept: super::sparse::Pages<ID3D12Resource>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1652,6 +1651,7 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let sparse = crate::lean::heap_sparse();
         let h = HostHeap {
             // The per-slot arrays: a lock and an option of a pointer (24 bytes) per slot kept, 8 per
             // quick slot, one more word each for what is made.
@@ -1673,12 +1673,12 @@ impl HostHeap {
             written: (0..if sampler || !crate::book::on() { 0 } else { size })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
-            made: Made::new(count as usize),
-            quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+            made: Made::new(count as usize, sparse),
+            quick: super::sparse::words64(count as usize, sparse),
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
-            kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
+            kept: super::sparse::Pages::new((count + extra) as usize, sparse),
             next: Mutex::new((0, vec![false; extra as usize])),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1688,9 +1688,7 @@ impl HostHeap {
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
             textures: Mutex::default(),
-            tabled: (0..if sampler { 0 } else { count })
-                .map(|_| std::sync::atomic::AtomicU32::new(0))
-                .collect(),
+            tabled: super::sparse::words32((if sampler { 0 } else { count }) as usize, sparse),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
                 if !sampler {
@@ -3075,7 +3073,9 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let Some(slot) = self.kept.get(index as usize) else {
+        // Nothing to put where no page was made: the slot shows nothing.
+        let slot = if resource.is_some() { self.kept.get(index as usize) } else { self.kept.peek(index as usize) };
+        let Some(slot) = slot else {
             return;
         };
         let old = {
@@ -3099,7 +3099,8 @@ impl HostHeap {
     /// of memory they fight over) only if the slot shows another.
     fn keep_ref(&self, index: u32, resource: &Kept) {
         use windows::core::Interface;
-        let Some(slot) = self.kept.get(index as usize) else {
+        let slot = if resource.is_some() { self.kept.get(index as usize) } else { self.kept.peek(index as usize) };
+        let Some(slot) = slot else {
             return;
         };
         let old = {
@@ -3116,7 +3117,7 @@ impl HostHeap {
 
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.kept.peek(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes

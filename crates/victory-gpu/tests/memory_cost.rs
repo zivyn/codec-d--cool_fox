@@ -475,6 +475,30 @@ fn what_frees_the_upload_memory_the_driver_keeps() {
             drop(held);
             let _ = report("... dropped", last, 16);
         }
+        "zeroed" => {
+            // The per-slot arrays of a host heap: written whole, or zeroed
+            // memory of which only the slots used are touched.
+            use std::sync::atomic::AtomicU64;
+            let n = 8usize << 20;
+            let dense: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+            last = report("8M words written one by one (64 MB)", last, 1);
+            let sparse: Vec<u64> = vec![0u64; n];
+            last = report("8M words from vec![0; n] (64 MB), not touched", last, 1);
+            let mut sparse = sparse;
+            for i in (0..n).step_by(512 * 1024) {
+                sparse[i] = 1;
+            }
+            last = report("... 16 words of them written", last, 1);
+            let mutexes: Vec<std::sync::Mutex<Option<usize>>> =
+                (0..n / 4).map(|_| std::sync::Mutex::new(None)).collect();
+            last = report(
+                "2M locks with an option (32 MB), written one by one",
+                last,
+                1,
+            );
+            drop((dense, sparse, mutexes));
+            let _ = report("... all dropped", last, 1);
+        }
         "heaps" => {
             // Descriptor heaps: the title's tables span 1.5 million slots.
             for (count, visible) in [

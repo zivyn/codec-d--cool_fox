@@ -242,9 +242,20 @@ pub(crate) fn left_in_pc() -> [u64; 4] {
 /// ([`within_cap`]): 16 MiB.
 const BIG_COPY: u64 = 16 << 20;
 
-/// [`BIG_COPY`] or what `VICTORY_CARD_MEDIUM_KB` says (GPU1), from 64 KiB:
-/// copies from that size on get the big copies' margin ([`within_cap`]),
+/// The size from which copies get the big copies' margin by default.
+const MEDIUM_COPY: u64 = 1 << 20;
+
+/// 1 MiB, or what `VICTORY_CARD_MEDIUM_KB` says (GPU1), from 64 KiB to 16 MiB;
+/// `0` is [`BIG_COPY`], as before the switch. Copies from that size on get the big copies' margin ([`within_cap`]),
 /// their line ([`copy_line`]) and their reserve ([`big_reserve`]).
+///
+/// On by default since the window-spot run V8 of 2026-11-27 on an 8 GB card:
+/// 125.6 to 96.8 ms a frame, the card's working time 95.0 to 64.6 ms, the
+/// title buffers' ranges the CPU looks at 147.6 to 14.4 MB, the card's use
+/// past its budget 444 to 260 MB. It needs no rule by the card's size: on a
+/// card where the cap of copies is never reached (budget over 20 GiB, a cap of
+/// a quarter of it) every buffer of 1 MiB or more has its copy anyway, and
+/// the reserve it keeps for the first ones is 192 MB.
 ///
 /// At the window spot of run I8 the first 1,239 copies of under 64 KiB took
 /// the 512 MB of an 8 GB card before the title buffers of 1 to 16 MiB came
@@ -258,7 +269,11 @@ fn big_copy() -> u64 {
 }
 
 fn big_copy_from(kib: Option<&str>) -> u64 {
-    kib.and_then(|v| v.trim().parse::<u64>().ok()).map_or(BIG_COPY, |kib| (kib.max(64) << 10).min(BIG_COPY))
+    match kib.and_then(|v| v.trim().parse::<u64>().ok()) {
+        None => MEDIUM_COPY,
+        Some(0) => BIG_COPY,
+        Some(kib) => (kib.max(64) << 10).min(BIG_COPY),
+    }
 }
 
 /// Whether a copy of `size` bytes may be made when copies hold `held` bytes
@@ -276,7 +291,12 @@ fn big_copy_from(kib: Option<&str>) -> u64 {
 /// each is read by whole passes, so they get a margin the many small ones
 /// do not.
 fn within_cap(held: u64, size: u64, most: u64) -> bool {
-    let allowed = if size >= big_copy() {
+    within_cap_at(held, size, most, big_copy())
+}
+
+/// [`within_cap`] with the size `big` from which a copy is a big one.
+fn within_cap_at(held: u64, size: u64, most: u64, big: u64) -> bool {
+    let allowed = if size >= big {
         most.saturating_add(most / 2)
     } else {
         most
@@ -311,21 +331,29 @@ static CARD_BIG: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// [`BIG_RESERVE`], three times that when the big copies start lower
 /// ([`big_copy`]): there are some 100 of 1 to 16 MiB.
-fn reserve() -> u64 {
-    if big_copy() < BIG_COPY { 3 * BIG_RESERVE } else { BIG_RESERVE }
+fn reserve_at(big: u64) -> u64 {
+    if big < BIG_COPY { 3 * BIG_RESERVE } else { BIG_RESERVE }
 }
 
 /// What is left of [`BIG_RESERVE`] when `made` bytes of big copies were made
 /// and `refused` turned down.
 fn big_reserve(made: u64, refused: u64) -> u64 {
-    reserve().saturating_sub(made.saturating_add(refused))
+    big_reserve_at(made, refused, big_copy())
+}
+
+fn big_reserve_at(made: u64, refused: u64, big: u64) -> u64 {
+    reserve_at(big).saturating_sub(made.saturating_add(refused))
 }
 
 /// The part of the card's budget, in hundredths, a copy of `size` bytes may
 /// be made up to: 97 with the room kept for copies (a big one, 100, when
 /// they come first), else 80.
 fn copy_line(size: u64, room_kept: bool, big_first: bool) -> u64 {
-    match (room_kept, big_first && size >= big_copy()) {
+    copy_line_at(size, room_kept, big_first, big_copy())
+}
+
+fn copy_line_at(size: u64, room_kept: bool, big_first: bool, big: u64) -> u64 {
+    match (room_kept, big_first && size >= big) {
         (true, true) => 100,
         (true, false) => 97,
         (false, _) => 80,
@@ -6048,8 +6076,8 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of, within_cap,
+        BIG_COPY, WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
+        tail_of, window_of, within_cap_at,
     };
 
     /// Copies fill the limit first come, first served, but a big one still fits in the margin
@@ -6058,48 +6086,70 @@ mod window_tests {
     fn big_copies_fit_past_the_limit_small_ones_do_not() {
         const MIB: u64 = 1 << 20;
         let most = 512 * MIB;
-        assert!(within_cap(500 * MIB, 12 * MIB, most));
-        assert!(!within_cap(500 * MIB, 13 * MIB, most));
-        assert!(!within_cap(512 * MIB, 64 << 10, most));
+        assert!(within_cap_at(500 * MIB, 12 * MIB, most, BIG_COPY));
+        assert!(!within_cap_at(500 * MIB, 13 * MIB, most, BIG_COPY));
+        assert!(!within_cap_at(512 * MIB, 64 << 10, most, BIG_COPY));
         // A big copy: up to 768 MiB in all.
-        assert!(within_cap(515 * MIB, 21 * MIB, most));
-        assert!(within_cap(747 * MIB, 21 * MIB, most));
-        assert!(!within_cap(748 * MIB, 21 * MIB, most));
+        assert!(within_cap_at(515 * MIB, 21 * MIB, most, BIG_COPY));
+        assert!(within_cap_at(747 * MIB, 21 * MIB, most, BIG_COPY));
+        assert!(!within_cap_at(748 * MIB, 21 * MIB, most, BIG_COPY));
         // Just under big: no margin.
-        assert!(!within_cap(515 * MIB, 16 * MIB - 1, most));
-        assert!(within_cap(0, u64::MAX, u64::MAX));
+        assert!(!within_cap_at(515 * MIB, 16 * MIB - 1, most, BIG_COPY));
+        assert!(within_cap_at(0, u64::MAX, u64::MAX, BIG_COPY));
     }
 
     #[test]
     fn a_big_copy_goes_up_to_the_whole_budget_and_has_room_kept() {
-        use super::{BIG_COPY, BIG_RESERVE, big_reserve, copy_line};
+        use super::{BIG_RESERVE, big_reserve_at, copy_line_at};
         const MIB: u64 = 1 << 20;
         // Run V4d: 6,157 MB in use of 6,346, a copy of 20,608 KiB.
         let (budget, used, size) = (6346 * MIB, 6157 * MIB, 20608 << 10);
         let fits = |line: u64| used + size <= budget / 100 * line;
-        assert!(!fits(copy_line(size, true, false)));
-        assert!(fits(copy_line(size, true, true)));
+        assert!(!fits(copy_line_at(size, true, false, BIG_COPY)));
+        assert!(fits(copy_line_at(size, true, true, BIG_COPY)));
         // The small ones keep their line, and without room kept all do.
-        assert_eq!(copy_line(64 << 10, true, true), 97);
-        assert_eq!(copy_line(BIG_COPY - 1, true, true), 97);
-        assert_eq!(copy_line(BIG_COPY, true, true), 100);
-        assert_eq!(copy_line(BIG_COPY, false, true), 80);
+        assert_eq!(copy_line_at(64 << 10, true, true, BIG_COPY), 97);
+        assert_eq!(copy_line_at(BIG_COPY - 1, true, true, BIG_COPY), 97);
+        assert_eq!(copy_line_at(BIG_COPY, true, true, BIG_COPY), 100);
+        assert_eq!(copy_line_at(BIG_COPY, false, true, BIG_COPY), 80);
         // Room kept until a big copy is made or turned down.
         // GPU1: the threshold moves down to 1 MiB, never above 16 MiB, never under 64 KiB.
         use super::big_copy_from;
-        assert_eq!(big_copy_from(None), BIG_COPY);
+        // On by default at 1 MiB; 0 is the old threshold.
+        assert_eq!(big_copy_from(None), MIB);
+        assert_eq!(big_copy_from(Some("0")), BIG_COPY);
         assert_eq!(big_copy_from(Some("1024")), MIB);
         assert_eq!(big_copy_from(Some("1")), 64 << 10);
         assert_eq!(big_copy_from(Some("999999")), BIG_COPY);
-        assert_eq!(big_copy_from(Some("x")), BIG_COPY);
+        assert_eq!(big_copy_from(Some("x")), MIB);
         use super::window_line_from;
         assert_eq!(window_line_from(None), 80);
         assert_eq!(window_line_from(Some("100")), 100);
         assert_eq!(window_line_from(Some("250")), 100);
         assert_eq!(window_line_from(Some("10")), 50);
-        assert_eq!(big_reserve(0, 0), BIG_RESERVE);
-        assert_eq!(big_reserve(21 * MIB, 0), BIG_RESERVE - 21 * MIB);
-        assert_eq!(big_reserve(40 * MIB, 40 * MIB), 0);
+        assert_eq!(big_reserve_at(0, 0, BIG_COPY), BIG_RESERVE);
+        assert_eq!(big_reserve_at(21 * MIB, 0, BIG_COPY), BIG_RESERVE - 21 * MIB);
+        assert_eq!(big_reserve_at(40 * MIB, 40 * MIB, BIG_COPY), 0);
+    }
+
+    /// The default (V8, 8 GB card: 125.6 to 96.8 ms a frame): from 1 MiB on a
+    /// copy has the big copies' margin, line and a reserve of three times 64 MB.
+    #[test]
+    fn copies_of_one_mib_and_more_are_big_by_default() {
+        use super::{BIG_RESERVE, MEDIUM_COPY, big_reserve_at, copy_line_at};
+        const MIB: u64 = 1 << 20;
+        let most = 512 * MIB;
+        // A buffer of 2,752 KiB after the small ones filled the cap: in the margin.
+        assert!(within_cap_at(556 * MIB, 2752 << 10, most, MEDIUM_COPY));
+        assert!(!within_cap_at(556 * MIB, 2752 << 10, most, BIG_COPY));
+        // Not one of 960 KiB, nor a small one.
+        assert!(!within_cap_at(556 * MIB, 960 << 10, most, MEDIUM_COPY));
+        // Up to 768 MiB in all.
+        assert!(!within_cap_at(767 * MIB, 2 * MIB, most, MEDIUM_COPY));
+        assert_eq!(copy_line_at(MIB, true, true, MEDIUM_COPY), 100);
+        assert_eq!(copy_line_at(MIB - 1, true, true, MEDIUM_COPY), 97);
+        assert_eq!(big_reserve_at(0, 0, MEDIUM_COPY), 3 * BIG_RESERVE);
+        assert_eq!(big_reserve_at(100 * MIB, 0, MEDIUM_COPY), 92 * MIB);
     }
 
     #[test]

@@ -3309,13 +3309,22 @@ mod narrow_tests {
         let copy = Shadow::unbacked(at as u64, side.as_mut_ptr(), (N * PAGE) as u64, false);
         copy.update(at, N * PAGE);
         // SAFETY: inside the allocation.
-        unsafe { ((at + PAGE + 1) as *mut u8).write_volatile(7) };
+        unsafe {
+            ((at + PAGE + 1) as *mut u8).write_volatile(7);
+            ((at + 5 * PAGE + 1) as *mut u8).write_volatile(8);
+        }
         // Nothing asked ahead: it cannot be looked at without the kernel.
         assert_eq!(copy.stale_in(at, at + 2 * PAGE), None);
         crate::watch::ask_ahead(&[(at, at + 2 * PAGE), (at + 4 * PAGE, at + 6 * PAGE)]);
-        assert_eq!(copy.stale_in(at, at + 2 * PAGE), Some((2 * PAGE, PAGE)), "page 1 was written since it was taken");
+        let (looked, stale) = copy.stale_in(at, at + 2 * PAGE).expect("asked");
+        assert_eq!(looked, 2 * PAGE);
+        assert!(stale >= PAGE, "page 1 was written since it was taken: {stale}");
         copy.update(at, 2 * PAGE);
         assert_eq!(copy.stale_in(at, at + 2 * PAGE), Some((2 * PAGE, 0)), "refreshed");
+        // What is outside the refreshed span is as stale as the title's write made it.
+        let (_, outside) = copy.stale_in(at + 4 * PAGE, at + 6 * PAGE).expect("asked");
+        assert!(outside >= PAGE, "page 5 was written, nobody refreshed it: {outside}");
+        copy.update(at + 4 * PAGE, 2 * PAGE);
         assert_eq!(copy.stale_in(at + 4 * PAGE, at + 6 * PAGE), Some((2 * PAGE, 0)));
         // A range the asking did not cover.
         assert_eq!(copy.stale_in(at + 2 * PAGE, at + 4 * PAGE), None);

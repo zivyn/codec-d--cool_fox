@@ -562,6 +562,86 @@ fn distinct_values(rows: &[u8], pitch: usize, w: usize, h: usize, bytes: usize) 
     (counts.len(), capped, top, top_n)
 }
 
+/// How a format's texels are told alike: exactly, or within a few steps
+/// of the float (`Half`/`Float`: that many channels of 16 or 32 bits).
+#[derive(Clone, Copy)]
+enum Alike {
+    Exact,
+    Half(usize),
+    Float(usize),
+}
+
+fn alike_of(format: u32) -> Alike {
+    match format {
+        1..=2 => Alike::Float(4),
+        39..=41 => Alike::Float(1),
+        9..=10 => Alike::Half(4),
+        33..=34 => Alike::Half(2),
+        53..=54 => Alike::Half(1),
+        _ => Alike::Exact,
+    }
+}
+
+/// A float's bits as an integer that grows with the value (sign aside).
+fn ordered(bits: i64, sign: i64) -> i64 {
+    if bits & sign != 0 { sign - (bits & (sign - 1)) } else { sign + bits }
+}
+
+fn texels_alike(a: &[u8], b: &[u8], how: Alike) -> bool {
+    match how {
+        Alike::Exact => a == b,
+        Alike::Half(n) => (0..n).all(|i| {
+            let (x, y) = (
+                i64::from(u16::from_le_bytes([a[2 * i], a[2 * i + 1]])),
+                i64::from(u16::from_le_bytes([b[2 * i], b[2 * i + 1]])),
+            );
+            (ordered(x, 0x8000) - ordered(y, 0x8000)).abs() <= 4
+        }),
+        Alike::Float(n) => (0..n).all(|i| {
+            let word = |t: &[u8]| i64::from(u32::from_le_bytes(t[4 * i..4 * i + 4].try_into().unwrap_or([0; 4])));
+            (ordered(word(a), 0x8000_0000) - ordered(word(b), 0x8000_0000)).abs() <= 4096
+        }),
+    }
+}
+
+/// How flat the picture of a target is, in percent: of horizontally
+/// adjacent texel pairs, of vertically adjacent pairs, and of the 8x8
+/// blocks that lie whole in it, the share whose texels are alike (equal; for
+/// floats within a few steps, 0.05%). Smooth light, with the noise of a
+/// render, scores low; flat patches of one value (a posterized picture) high.
+/// A volume is read as `Depth * Height` rows.
+fn flatness(rows: &[u8], pitch: usize, w: usize, h: usize, bytes: usize, format: u32) -> (f64, f64, f64) {
+    let how = alike_of(format);
+    let at = |x: usize, y: usize| &rows[y * pitch + x * bytes..][..bytes];
+    let share = |same: usize, all: usize| if all == 0 { 0.0 } else { same as f64 * 100.0 / all as f64 };
+    let (mut h_same, mut v_same) = (0usize, 0usize);
+    for y in 0..h {
+        for x in 0..w {
+            if x + 1 < w && texels_alike(at(x, y), at(x + 1, y), how) {
+                h_same += 1;
+            }
+            if y + 1 < h && texels_alike(at(x, y), at(x, y + 1), how) {
+                v_same += 1;
+            }
+        }
+    }
+    let (bw, bh) = (w / 8, h / 8);
+    let mut flat = 0usize;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let first = at(bx * 8, by * 8);
+            if (0..8).all(|j| (0..8).all(|i| texels_alike(first, at(bx * 8 + i, by * 8 + j), how))) {
+                flat += 1;
+            }
+        }
+    }
+    (
+        share(h_same, h * w.saturating_sub(1)),
+        share(v_same, w * h.saturating_sub(1)),
+        share(flat, bw * bh),
+    )
+}
+
 /// One line per target in `frame-<frame>-targets.tsv` (in the order the
 /// frame first used them, which the `-ops.txt` lines name by resource):
 /// how many different texel values the target holds as the card wrote them
@@ -589,6 +669,7 @@ fn target_stats(
         return;
     }
     let (distinct, capped, top, top_n) = distinct_values(rows, pitch, w, h, bytes);
+    let (eqh, eqv, flat8) = flatness(rows, pitch, w, h, bytes, format);
     let rgba8 = rgba.map_or(0, |p| {
         p.chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], 0]))
@@ -596,7 +677,7 @@ fn target_stats(
             .len()
     });
     let line = format!(
-        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}",
+        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%",
         d.Width,
         d.Height,
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { format!("x{}", d.DepthOrArraySize) } else { String::new() },
@@ -1025,5 +1106,36 @@ mod stats_tests {
         assert_eq!(texel_bytes(10), Some(8));
         assert_eq!(texel_bytes(61), Some(1));
         assert_eq!(texel_bytes(71), None);
+    }
+
+    #[test]
+    fn flat_patches_score_high_and_noise_low() {
+        // 16x16 texels of 4 bytes (R8G8B8A8): the left half one value, the right half another.
+        let mut rows = vec![0u8; 16 * 16 * 4];
+        for y in 0..16 {
+            for x in 0..16 {
+                rows[(y * 16 + x) * 4..][..4].copy_from_slice(&[if x < 8 { 1 } else { 2 }, 0, 0, 255]);
+            }
+        }
+        let (eqh, eqv, flat) = flatness(&rows, 64, 16, 16, 4, 28);
+        assert!((eqh - 224.0 * 100.0 / 240.0).abs() < 1e-9 && eqv == 100.0 && flat == 100.0);
+        // The same size with a different value in every texel.
+        for (i, t) in rows.chunks_exact_mut(4).enumerate() {
+            t.copy_from_slice(&(i as u32).to_le_bytes());
+        }
+        let (eqh, eqv, flat) = flatness(&rows, 64, 16, 16, 4, 28);
+        assert_eq!((eqh, eqv, flat), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn floats_a_few_steps_apart_are_alike() {
+        let f = |v: f32| v.to_le_bytes();
+        assert!(texels_alike(&f(1.0), &f(1.0 + 1.0 / 4096.0), Alike::Float(1)));
+        assert!(!texels_alike(&f(1.0), &f(1.01), Alike::Float(1)));
+        assert!(!texels_alike(&f(1.0), &f(-1.0), Alike::Float(1)));
+        // Half floats: 1.0 is 0x3c00, one step is 0x3c01, 1.01 is about 0x3c0a.
+        let h = |v: u16| v.to_le_bytes();
+        assert!(texels_alike(&h(0x3c00), &h(0x3c03), Alike::Half(1)));
+        assert!(!texels_alike(&h(0x3c00), &h(0x3c0a), Alike::Half(1)));
     }
 }

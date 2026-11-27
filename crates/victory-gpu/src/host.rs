@@ -5806,6 +5806,9 @@ impl Host {
         // what they write.
         // Or the reads are done on the card, behind the flights.
         let own = if late { self.card_steps(runs) } else { None };
+        // A round of the heaps' records asked for as the submission came into
+        // the line (`VICTORY_HEAPS_EARLY`), unless it has to wait for flights.
+        let mut early = if late { crate::queue::heaps_round() } else { 0 };
         #[cfg(feature = "diagnostics")]
         ahead.part(12);
         stage.next("submit: waiting for flights it reads from");
@@ -5814,6 +5817,8 @@ impl Host {
         } else if own.is_none()
             && let Some(why) = late_blocked(runs)
         {
+            // What the flights land may be descriptors: a round after it.
+            early = 0;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -5828,7 +5833,11 @@ impl Host {
         ahead.part(13);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted.
-        let heaps_synced = crate::descriptor::begin_sync_heaps();
+        let heaps_synced = if early > 0 {
+            crate::descriptor::SyncedHeaps::asked(early)
+        } else {
+            crate::descriptor::begin_sync_heaps()
+        };
         // That list runs first, and is one of the submission's from here on.
         let with: Vec<&HostList>;
         let runs = match &own {

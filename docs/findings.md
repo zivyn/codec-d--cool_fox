@@ -109,3 +109,69 @@ each commit naming its source. In short:
 - Belobug: pipeline workers for screen passes, the ambient stand-in's idea, pipeline and
   constant buffer bookkeeping (romainhedouin).
 - ZJOU: render targets not set again; some shader corrections are being looked at.
+
+# What was learned on an RTX 5070 Ti Laptop (2026-11-27 to 2026-11-28)
+
+One PC: i9-14900HX, 32 GB, RTX 5070 Ti Laptop 12 GB, Windows 11 26100, Series X profile
+(and Series S for the DLSS runs), release and diagnostics builds. Windows are aligned by
+index and kept only where `draws/frame` agrees within 5 %, and medians are used, never
+means — the same run's own fps average has read 7.76 where its median read 2.44.
+
+## Where a frame goes here
+
+Series X, in the world: **383-410 ms median**. Of it, `preparing` on the submitting thread
+161-375 ms, the card 177-290 ms, copying back 57-85 ms, and the three overlap.
+
+Inside `preparing`, the largest single item is a settle waiting for the card — **226-326 ms**
+— and a microsecond breakdown by what was read (added while measuring this) shows it is
+**all one thing: a fill of upload memory**. The blame line then names the blocker: a fill of
+`0x20` bytes waits for shader writes declared over `0x11600000+0xae00000` — 174 MB. That
+range is the view's own extent (`descriptor/host.rs` `buffer_copy`), not an over-wide guess,
+so tightening it is not available; `VICTORY_ROOT_UAV_MB` only bounds the root path and
+changes nothing here (310.5 / 334.5 / 341.8 ms at default / 4 MB / 1 MB).
+
+`card_steps.rs` describes the same phenomenon from the AMD side (a 480-byte constant buffer
+waiting on eleven skinning dispatches that write through one 174 MB heap view).
+`VICTORY_FILL_TITLE=1` moves the wait — read-wait 310 -> 226 ms and preparing 236 -> 117 ms
+— but the frame median stays at 404 ms: the buckets trade places.
+
+## Five things that did not move this frame, and the numbers
+
+Each of these shortens work the frame does not wait on here. Reporting them so the next
+person does not spend the days again:
+
+| What was tried | What it changed | Frame |
+|---|---|---|
+| Leaving both shadow masks out | GPU -44 ms, fps 5.02 -> 6.46 | interiors and hair go dark, so not a fix |
+| Halving the non-hair mask's dispatch | nothing measurable | the switch was not reaching that pass (indirect), retracted |
+| Another branch's pipeline group (`-Fast`) | GPU -21 % (389 -> 308 ms) | 2.40 -> 2.40 fps |
+| Striping the mapping lock, 4 stripes | GPU -24 %, and submit lock wait 202 -> 23 ms | 2.44 -> 2.36 fps; the win is only in **loading** frames: 499 -> 258 ms |
+| DLSS Super Resolution, once the files were complete | 1.00 upscalings a frame, 375 done, none failed | 400 ms against 399 without it |
+| The title's own upscaler set lower (`fsrQuality` 2 -> 4) | internal resolution clearly lower | 406 ms against 400 |
+
+The last two make the point best: **lowering what the card renders changes nothing**, so
+this frame is not limited by pixel work, and the `on the GPU` figure is not pure execution
+time either — it moves with the queue.
+
+## Faults found
+
+- **No DLSS at all, for days, without a word.** `victory.exe upscaler-check` said
+  "DLSS NOT supported ... feature missing" against a Streamline folder that had
+  `sl.dlss_g.dll` but no `sl.dlss.dll` or `nvngx_dlss.dll`. `victory.exe get-dlss` fixed it
+  and the same check then said "DLSS supported, frame generation supported". Worth having
+  the check say which file is missing, not just which feature.
+- **A MiB count that wrapped.** `VICTORY_UPLOAD_QUEUE` parsed a MiB count with
+  `mebibytes << 20`, so a large enough setting became a small gate. `checked_mul` now, with a
+  test, found by ANDREANIADS reading the pull request.
+- **A pad that was never there.** The title's XInput slot asked the system `XInputGetState`,
+  which answers 1167 on all four slots for a GameInput synthetic pad; loading
+  `Microsoft GameInput\x64\XInput1_3.dll` first makes the pad appear.
+
+## The one lever left
+
+Since neither GPU work nor internal resolution moves the frame, what is left is the
+submission pipeline itself: every submission is prepared, sent, waited for and copied back
+before the next is looked at (`VICTORY_LATE_WAIT` off by default, and its two stages moved
+preparing 105 -> 69 ms while the frame stayed put). Two frames in flight end to end —
+`settle`, the relay that lands flights, `copied_read`, the queue behind — is the next thing
+worth measuring, and the only one of these that can plausibly reach 15 fps at Series X.

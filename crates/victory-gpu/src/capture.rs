@@ -411,7 +411,10 @@ pub(crate) fn dump_targets(frame: u64) {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         if d.SampleDesc.Count > 1
-            || !matches!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            || !matches!(
+                d.Dimension,
+                D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            )
         {
             continue;
         }
@@ -768,6 +771,27 @@ fn target_stats(
         if capped { "+" } else { "" },
         top_n as f64 * 100.0 / (w * h) as f64,
     );
+    // Small targets (exposure and tone tables, a 4096-entry curve, light parameters): every
+    // texel as the card holds it, in hex, in `frame-<n>-values.tsv`, to compare processes.
+    if w * h <= 8192 {
+        let mut values = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let t = &rows[y * pitch + x * bytes..][..bytes];
+                for b in t.iter().rev() {
+                    values.push_str(&format!("{b:02x}"));
+                }
+                values.push(' ');
+            }
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(folder.join(format!("frame-{frame}-values.tsv")))
+        {
+            let _ = writeln!(file, "{i}	{resource:?}	{}x{}	f{format}	{}", d.Width, d.Height, values.trim_end());
+        }
+    }
     tracing::debug!(frame, "target {line}");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)

@@ -51,6 +51,9 @@ pub(crate) struct Audit {
     /// limit costs the limit's number of barriers; in a loop in a loop, its square).
     pub loops: usize,
     pub nest: usize,
+    /// How deep the loops with a barrier that waits for the group nest (without the loops that
+    /// only hold the waits of the host waves of a console wave, which cost little a round).
+    pub barrier_nest: usize,
     /// The branches to a loop's limit exit (a thread that reaches the limit leaves the program):
     /// left out of the control flow the audit follows, since a loop that reaches its limit has
     /// stopped doing what the program does. Without the limit's exits every barrier below is
@@ -173,6 +176,7 @@ impl Module {
     /// keep threads of the group from them.
     pub(crate) fn audit_barriers(&self) -> Audit {
         let mut audit = self.audit_with(false);
+        audit.barrier_nest = audit.nest;
         if !self.waits.is_empty() {
             let pair = self.audit_with(true);
             audit.waits = pair.barriers;

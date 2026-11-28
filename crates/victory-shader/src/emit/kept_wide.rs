@@ -69,9 +69,10 @@ pub(super) fn attempt(
             Mode::Safe => audit.as_ref().is_none_or(|a| a.safe(true)),
             Mode::Strict => audit.as_ref().is_none_or(|a| a.safe(false) && a.nest <= 1),
             // (no barrier behind a branch that differs, or that reads memory: every thread of the
-            // group passes each barrier the same number of times; loops with a barrier nest two
-            // deep at most, the inner one bounded)
-            Mode::Audited => audit.as_ref().is_none_or(|a| a.safe(false) && a.nest <= 2),
+            // group passes each barrier the same number of times; loops with a barrier that waits
+            // for the group nest two deep at most, the inner one bounded; the waits of the two
+            // host waves of a console wave, cheap a round, nest as they do)
+            Mode::Audited => audit.as_ref().is_none_or(|a| a.safe(false) && a.barrier_nest <= 2),
             _ => true,
         };
         let safe = mode == Mode::All || wide_class::safe(&classes) && audited;

@@ -101,6 +101,12 @@ pub fn say(note: u32) -> (u32, u32, u32) {
 /// loop of 4096 in a loop of 4096 is 16.7 million of them: seconds, a reset of the device).
 pub const NESTED_LOOP_LIMIT: u32 = 64;
 
+/// [`NESTED_LOOP_LIMIT`] for a group of `threads`: a retry loop needs a round for each thread of
+/// the group at the very most, so a bigger group gets a bigger bound.
+pub fn nested_loop_limit(threads: u32) -> u32 {
+    threads.max(NESTED_LOOP_LIMIT)
+}
+
 thread_local! {
     /// Whether the modules this thread lowers bound their nested loops that hold a group barrier
     /// ([`NESTED_LOOP_LIMIT`]): set while the audited kept skips' form is made.

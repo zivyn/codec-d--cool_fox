@@ -85,6 +85,8 @@ enum Body {
     /// The walk with a retry loop in each round: `s1` rounds, each a loop of `s2` rounds (at least
     /// one) with an exchange in each (a compare-and-swap that the lanes repeat until it takes).
     SerialNested,
+    /// Three loops deep, `s1` rounds of `s2` of `s3`, an exchange in the innermost.
+    SerialDeep,
 }
 
 /// A loop of the counter `s<counter>` against the root constant `s<limit>`, round `body`.
@@ -176,6 +178,11 @@ fn region(body: Body) -> Vec<u32> {
         Body::SerialNested => {
             let inner = counted(21, 2, &exchange_words());
             w.extend(counted_or_none(22, 1, &inner));
+        }
+        Body::SerialDeep => {
+            let inner = counted(21, 3, &exchange_words());
+            let mid = counted(22, 2, &inner);
+            w.extend(counted_or_none(23, 1, &mid));
         }
         Body::Counted => {
             w.push(0xBE95_0380); // s_mov_b32 s21, 0
@@ -493,6 +500,26 @@ fn the_serial_walk_ends_with_the_lanes_and_by_its_count() {
                 );
             }
         }
+    }
+}
+
+/// Loops three deep in a group of two console waves (128 threads), where the exchange of each round
+/// is the two host waves' wait for each other and no barrier waits for the group inside a loop: the
+/// audit takes it (the waits are reached alike, the group's barriers are not in loops), which
+/// `strict` does not (it counts the waits' loops too), and nothing is bounded: the loops with only
+/// waits keep their limits.
+#[test]
+fn the_audited_form_takes_loops_three_deep_that_hold_only_the_waits_of_host_waves() {
+    for over in [Over::Skip, Over::EarlyOut] {
+        let native = lane_branch(over, Body::SerialDeep, 128, false);
+        let (result, form, module) = lowered(&native, Mode::Audited, None);
+        assert!(result.is_ok(), "{over:?}: {:?}", result.err());
+        let module = module.expect("a module");
+        let audit = module.audit_barriers();
+        assert_eq!(form, Form::KeptSkipsWide, "{over:?}: {}", audit.describe());
+        assert!(audit.safe(false) && audit.barrier_nest == 0 && audit.nest == 3, "{over:?}: {}", audit.describe());
+        let (_, strict, _) = lowered(&native, Mode::Strict, None);
+        assert_ne!(strict, Form::KeptSkipsWide, "{over:?}: strict takes loops three deep");
     }
 }
 

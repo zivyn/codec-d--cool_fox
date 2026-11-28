@@ -279,6 +279,7 @@ translation of shaders.
 |---|---|---|---|---|---|---|
 | `VICTORY_AB` | off | list |  |  | diag | Names switches to flip between phases inside one run for in-process A/B timing. |
 | `VICTORY_AB_BUNDLE` | off | flag |  |  | diag | Alternates between all named A/B switches off and all on, instead of every combination. |
+| `VICTORY_AB_SCREEN` | off | flag |  |  | diag | Up to 31 named A/B switches follow Hadamard rows and their complements; the log gives each switch's effect on the frame time from one run. |
 | `VICTORY_AB_SHOTS` | 0 (no pictures) | number |  |  | diag | Saves a picture of every phase of every Nth A/B cycle (needs VICTORY_CAPTURE). |
 | `VICTORY_AB_SKIP` | 1 (second) | number |  |  | diag | Seconds at the start of each A/B phase whose frame times are left out. |
 | `VICTORY_AB_START` | unset: first phase at the first present | number |  |  | diag | Seconds after the world is found before the first A/B phase begins. |

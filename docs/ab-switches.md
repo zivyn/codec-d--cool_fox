@@ -16,6 +16,7 @@ VICTORY_AB=<seconds>,<switch>[=<value>][,<switch>..]
 VICTORY_AB_START=<seconds>     # first phase begins this long after the world is found (default: at the first present)
 VICTORY_AB_SKIP=<seconds>      # left out at the start of each phase (default 1)
 VICTORY_AB_BUNDLE=1            # the phases alternate between all the named switches off and all on (a bundle against none)
+VICTORY_AB_SCREEN=1            # up to 31 switches, one effect each from one run (Hadamard rows and their complements, see below)
 VICTORY_AB_SHOTS=N              # a picture of every phase of every Nth cycle (1: every phase), ab-<phase>-<A|B>.png in VICTORY_CAPTURE's folder
 ```
 
@@ -51,6 +52,22 @@ VICTORY_AB_SHOTS=N              # a picture of every phase of every Nth cycle (1
   per-second lines of the log (what the submit thread worked, the card, the CPU) are given to their arm by time with
   `bin\bench1-ab.py <tag>` (outside the repo, in `G:\victory-work\bin`). The pilot kills the process, so there is no summary
   at exit: the last `so far` line is the summary.
+
+### A screen: the effect of each of up to 31 switches from one run
+
+`VICTORY_AB_SCREEN=1` (with `VICTORY_AB=<seconds>,<switch>,<switch>,..`, up to 31 switches, none of them a pair known to abort the
+process together, e.g. `VICTORY_PLACED_ORDER` with `VICTORY_STAGE_A_STEPS`): phase `p` follows row `p/2` of a Hadamard matrix of order
+`2^ceil(log2(n+1))` (odd phases its complement; phase 0 has every switch off, phase 1 every switch on), so each switch is on in half of the
+phases and off in the other half and every pair of switches meets in the four combinations equally often. A cycle is `2*order` phases:
+11 switches take 32 phases (5 min of 10 s phases), 31 switches 64. After every pair of phases, once there are more phases than terms (n + 2),
+the log says `A/B screen so far (P phases, D degrees of freedom, sd S ms, drift d ms a phase; on minus off, ms/frame, 95%, * = not zero):
+*VICTORY_X +2.10+-0.80, ...`, the switches by the size of their effect: a least squares fit of the phases' mean frame times on a constant, a
+straight drift over the phases and one column of plus and minus one for each switch, with Student's t on the degrees left. It is the main
+effect of each switch **averaged over the mixtures of the others**: a switch whose interval holds no zero is the one to take to a plain pair
+(or `VICTORY_AB_BUNDLE` with only the winners) before it is made a default. The other per-second lines (what the submit thread worked,
+the card, the CPU) are given to their phase by time as with the other plans (`bin\screen-read.py <tag>` reads them: the same fit on the lane's
+worked, the flight wait, the card working, the process's CPU and the frame). `VICTORY_AB_BUNDLE` is ignored with it (its first two phases are
+a bundle against none).
 
 ### Pictures of both arms (image-affecting switches)
 

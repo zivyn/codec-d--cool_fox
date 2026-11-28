@@ -134,6 +134,11 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+/// Whether `shaders` hold one of the title's programs that shade ray-tracing hits.
+pub(super) fn is_resolve(shaders: &[Arc<Shader>]) -> bool {
+    named(shaders, b"CS_RaytracingResolve")
+}
+
 /// Which of the title's ray-tracing passes are left out, as `(the shading of
 /// hits, the activation of probe rays)`, by what the switches say.
 ///

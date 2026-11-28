@@ -3614,6 +3614,10 @@ impl State {
         if crate::pipeline::is_bvh_skinning_skipped(self.pipeline as This) {
             return;
         }
+        // The hit shading while no structures are built (`VICTORY_RT_RESOLVE=0`): no hit to shade.
+        if crate::pipeline::is_resolve_idle(self.pipeline as This) {
+            return;
+        }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -4805,6 +4809,10 @@ impl State {
         // (As in `dispatch`: counted and left out; true, so that it is not
         // counted as an execution the host dropped.)
         if crate::pipeline::is_bvh_skinning_skipped(self.pipeline as This) {
+            return true;
+        }
+        // The hit shading while no structures are built (`VICTORY_RT_RESOLVE=0`): counted as run.
+        if crate::pipeline::is_resolve_idle(self.pipeline as This) {
             return true;
         }
         const DRAW: u32 = 0;

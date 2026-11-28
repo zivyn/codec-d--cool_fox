@@ -147,6 +147,7 @@ after it was given them as an unordered access view.
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run; the hit shading and the probe activation are not left out; the stand-in rests |
 | `VICTORY_RT_RESOLVE=0` | without the builder: the programs that shade hits are left out again (on by default: all miss; about 1,000 pipelines, ~10 minutes of compiling on a cache that has never made them) |
+| `VICTORY_BVH_MISS=1` | without the builder: every node test misses without reading the node (a box has no child, anything else is the triangle miss), so a walk ends where it began and the programs that walk structures read no title memory and note no page found empty. The answer for nodes of zeros (what unbuilt structures hold) is the same, tested on the card and WARP; off by default; part of the shader cache's key |
 | `VICTORY_ACTIVATE_RAYS=0` | the probe activation is left out (on by default, with or without the builder) |
 | `VICTORY_MEMORY_FAULT_PAGES=<n>` | the most pages taken from faults in a run (8192; it was 2048 and was spent in seconds) |
 | `VICTORY_MEMORY_CARD_OVER=1` | a copy by address goes on the card even when the card is over its budget (else it is in the PC's memory, read over the bus: the log says so, `a copy is in the PC's memory`) |

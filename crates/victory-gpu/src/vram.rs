@@ -305,6 +305,7 @@ pub(crate) fn log() {
     crate::barrier::line(frames as f64);
     crate::list::runs_line(frames as f64);
     crate::pipeline::skipped_line(frames as f64);
+    crate::pipeline::idle_line(frames as f64);
     let Some(host) = crate::host::host() else {
         return;
     };

@@ -5234,7 +5234,9 @@ impl<'a> Lower<'a> {
         if self.local && (self.local_any || local_exit_all()) {
             // Each host wave is a wave of its own (`with_local_waves_any`, `VICTORY_LOCAL_EXIT`):
             // its answer is the wave's, and its lanes must all be here to give it.
-            if !self.all_lanes(b) {
+            // (a constant means a lane's answer taken from where it is, not from where the
+            // wave is: the branches in the way are not the wave's)
+            if !self.all_lanes(b) || when == Bool::TRUE || when == Bool::FALSE {
                 need(b);
                 return Err(WHY);
             }

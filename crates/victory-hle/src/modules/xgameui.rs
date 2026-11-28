@@ -2,7 +2,9 @@
 //! show and closes at once. Text entry opens a small host dialog (title,
 //! description, default text, the console's length limit) on a thread of its own and
 //! completes the call with what the user typed, or as cancelled (`E_ABORT`)
-//! when the dialog is dismissed or cannot open.
+//! when the dialog is dismissed or cannot open. `VICTORY_TEXT_ENTRY=default`
+//! answers with the title's default text at once (a run nobody sits at, a
+//! dialog on a parked window waits for no one) and `=cancel` as cancelled.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::{c_char, c_void};
@@ -60,7 +62,8 @@ extern "system" fn text_entry_async(
     scope: u32,
     max_length: u32,
 ) -> HRESULT {
-    let [title, description, default] = [title, description, default].map(|t| text(t).unwrap_or_default());
+    let [title, description, default] =
+        [title, description, default].map(|t| text(t).unwrap_or_default());
     let max_length = max_length_for(scope, max_length);
     let password = scope == PASSWORD;
     tracing::info!(title, description, max_length, password, "text entry");
@@ -124,10 +127,52 @@ fn limit(typed: &str, max: u32) -> String {
     typed.chars().take(max as usize).collect()
 }
 
+/// Who answers a text entry.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Answer {
+    /// The user, in a host dialog.
+    User,
+    /// The title's default text, at once.
+    Default,
+    /// Nobody: cancelled.
+    Cancelled,
+}
+
+impl Answer {
+    /// `VICTORY_TEXT_ENTRY`'s value; anything else asks the user.
+    fn parse(value: Option<&str>) -> Answer {
+        match value.map(str::trim) {
+            Some("default") => Answer::Default,
+            Some("cancel") => Answer::Cancelled,
+            _ => Answer::User,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn configured() -> Answer {
+        static ANSWER: std::sync::LazyLock<Answer> = std::sync::LazyLock::new(|| {
+            Answer::parse(std::env::var("VICTORY_TEXT_ENTRY").ok().as_deref())
+        });
+        *ANSWER
+    }
+
+    /// The text for an entry whose default is `default`; `user` runs the
+    /// dialog only when the user is the one to answer.
+    fn text(self, default: &str, user: impl FnOnce() -> Option<String>) -> Option<String> {
+        match self {
+            Answer::User => user(),
+            Answer::Default => Some(default.to_owned()),
+            Answer::Cancelled => None,
+        }
+    }
+}
+
 /// Asks the user in a modal host dialog; `None` if dismissed.
 #[cfg(not(test))]
 fn ask(title: &str, description: &str, default: &str, max: u32, password: bool) -> Option<String> {
-    dialog::ask(title, description, default, max, password)
+    Answer::configured().text(default, || {
+        dialog::ask(title, description, default, max, password)
+    })
 }
 
 /// Tests answer for the user: "typed" for a title starting with "Type",
@@ -213,7 +258,13 @@ mod dialog {
         let ok = wm::BS_DEFPUSHBUTTON as u32 | tab;
         item(ok, [129, 40, 50, 14], wm::IDOK as u16, button, "OK");
         let cancel = wm::BS_PUSHBUTTON as u32 | tab;
-        item(cancel, [183, 40, 50, 14], wm::IDCANCEL as u16, button, "Cancel");
+        item(
+            cancel,
+            [183, 40, 50, 14],
+            wm::IDCANCEL as u16,
+            button,
+            "Cancel",
+        );
         // The template must start on a DWORD.
         let template: Vec<u32> = t
             .chunks(2)
@@ -234,7 +285,12 @@ mod dialog {
         entry.typed
     }
 
-    extern "system" fn procedure(dialog: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    extern "system" fn procedure(
+        dialog: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
         // SAFETY: our dialog; its user data is the `Entry` from `ask`,
         // stored at WM_INITDIALOG.
         unsafe {
@@ -256,9 +312,12 @@ mod dialog {
                     let entry = &mut *(user_data as *mut Entry);
                     match (wparam & 0xffff) as i32 {
                         wm::IDOK => {
-                            let mut buffer = vec![0u16; wm::GetWindowTextLengthW(edit) as usize + 1];
-                            let n = wm::GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
-                            entry.typed = Some(String::from_utf16_lossy(&buffer[..n.max(0) as usize]));
+                            let mut buffer =
+                                vec![0u16; wm::GetWindowTextLengthW(edit) as usize + 1];
+                            let n =
+                                wm::GetWindowTextW(edit, buffer.as_mut_ptr(), buffer.len() as i32);
+                            entry.typed =
+                                Some(String::from_utf16_lossy(&buffer[..n.max(0) as usize]));
                             wm::EndDialog(dialog, 1);
                         }
                         wm::IDCANCEL => {
@@ -324,6 +383,24 @@ mod tests {
         }
     }
 
+    /// Who answers follows `VICTORY_TEXT_ENTRY`: the user unless told
+    /// otherwise, and then the dialog is not opened at all.
+    #[test]
+    fn text_entry_can_answer_with_the_default_or_cancel() {
+        assert_eq!(Answer::parse(None), Answer::User);
+        assert_eq!(Answer::parse(Some("")), Answer::User);
+        assert_eq!(Answer::parse(Some("ask")), Answer::User);
+        assert_eq!(Answer::parse(Some(" default ")), Answer::Default);
+        assert_eq!(Answer::parse(Some("cancel")), Answer::Cancelled);
+        let dialog = || Some("typed".to_owned());
+        let never = || -> Option<String> { panic!("a dialog opened with nobody to answer it") };
+        assert_eq!(Answer::User.text("abc", dialog).as_deref(), Some("typed"));
+        assert_eq!(Answer::User.text("abc", || None), None);
+        assert_eq!(Answer::Default.text("abc", never).as_deref(), Some("abc"));
+        assert_eq!(Answer::Default.text("", never).as_deref(), Some(""));
+        assert_eq!(Answer::Cancelled.text("abc", never), None);
+    }
+
     #[test]
     fn dialogs_end_with_what_was_typed() {
         let this: This = &OBJECT;
@@ -347,19 +424,29 @@ mod tests {
             u32,
         ) -> HRESULT;
         type Size = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
-        type Result_ = extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
+        type Result_ =
+            extern "system" fn(This, *mut AsyncBlock, u32, *mut c_char, *mut u32) -> HRESULT;
         let null = std::ptr::null();
         let entry = method::<Entry>(&OBJECT, 0x88);
         // Dismissed: cancelled.
         let mut b = block();
-        assert_eq!(entry(this, &mut b, c"Name".as_ptr(), null, null, 0, 16), S_OK);
+        assert_eq!(
+            entry(this, &mut b, c"Name".as_ptr(), null, null, 0, 16),
+            S_OK
+        );
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), E_ABORT);
         let mut size = 0;
-        assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), E_ABORT);
+        assert_eq!(
+            method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size),
+            E_ABORT
+        );
         // Typed: the text, cut to the limit, with its NUL.
         let mut b = block();
         let default = c"abc".as_ptr();
-        assert_eq!(entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 6), S_OK);
+        assert_eq!(
+            entry(this, &mut b, c"Type".as_ptr(), null, default, 0, 6),
+            S_OK
+        );
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), S_OK);
         assert_eq!(method::<Size>(&OBJECT, 0x90)(this, &mut b, &mut size), S_OK);
         assert_eq!(size, 7);

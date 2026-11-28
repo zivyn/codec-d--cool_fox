@@ -6143,6 +6143,24 @@ impl Host {
         }
     }
 
+    /// The host queue waits for `fence` to reach `value` (the lanes' fences of
+    /// `VICTORY_ASYNC_COMPUTE`): a wait for a signal already queued ahead of
+    /// it on this queue is met at once.
+    pub(crate) fn queue_wait(&self, fence: &ID3D12Fence, value: u64) {
+        // SAFETY: our queue and a fence of ours.
+        if let Err(e) = unsafe { self.queue.Wait(fence, value) } {
+            tracing::warn!(error = %e, "the host queue was not told to wait for a lane");
+        }
+    }
+
+    /// The host queue signals `fence` with `value` behind what it was given.
+    pub(crate) fn queue_signal(&self, fence: &ID3D12Fence, value: u64) {
+        // SAFETY: our queue and a fence of ours.
+        if let Err(e) = unsafe { self.queue.Signal(fence, value) } {
+            tracing::warn!(error = %e, "the host queue did not signal a lane");
+        }
+    }
+
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {

@@ -969,6 +969,8 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // `VICTORY_AB` is read and checked now, so that what is wrong with it is in the log from the start.
+    crate::ab::announce();
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.

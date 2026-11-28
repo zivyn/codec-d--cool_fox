@@ -23,6 +23,22 @@ VICTORY_AB_SHOTS=N              # a picture of every phase of every Nth cycle (1
   with n switches all `2^n` combinations come one after another. A named switch does not go by its own variable
   any more. `<switch>=<value>`: what it is when on (a number for `VICTORY_REFRESH_NARROW`, `VICTORY_JOIN_RAMP=1`
   and so on; no value: `1`). What is off is what the switch is when its variable is not set.
+- **What is wrong with the list is said, at WARN, twice**: at the start of the process (`A/B (at startup): ...`, from the host's
+  creation) and where the world is found (`A/B (the world is found): ...`), each entry by name with what the A/B does about it.
+  An entry that cannot flip anything is **dropped and the rest runs**: a name that is not a live switch (mistyped, or not read
+  through the A/B at all, like `VICTORY_WAIT_NICE`; with a "did you mean"), a value its switch would not read (`VICTORY_PAGE_REFRESH=3`,
+  `VICTORY_REFRESH_NARROW=wide`, an empty value), a switch that is on by default and named without `=0` (both arms would be on) and a
+  name given twice. A plain on/off switch given a value keeps its entry (the value is ignored) and says so. A list that does not run
+  at all says `VICTORY_AB=".." is NOT RUNNING: <reason>` (no phase length of more than 1 s, nothing left after the drops, more than 8
+  switches as combinations, more than 31 as a bundle); a build without diagnostics says it has no A/B. `VICTORY_AB_START`, `_SKIP`,
+  `_SHOTS` that are not numbers and a `VICTORY_AB_BUNDLE` that is not `1` are said too. The switches that may be named are the list
+  `LIVE` in `crates/victory-gpu/src/ab/registry.rs`, each with how it reads a value; a test reads every source for the ways of
+  reading a switch through the A/B and fails when that list and the sources differ, so a switch made live has to be added there.
+  `grep "victory_gpu::ab"` shows all of it; `A/B (...): ... will flip N switch(es): [bit0 ..]` is the final list, and `A/B begins:`
+  repeats it with the phase length, the plan (every combination, or a bundle), the start and the pictures.
+  Eight switches at most when every combination is a phase (`2^8`); **a bundle (`VICTORY_AB_BUNDLE=1`) may name up to 31**.
+  (`VICTORY_PAGE_REFRESH=2` was never the problem of the nine-switch list that silently did not start: it is live and listed, as `=1` or `=2`. The list had
+  nine entries, one over the eight that every combination of switches can hold, and the old parser returned nothing for it without a word.)
 - The world is found as the pilot's driver finds it: three seconds in a row of 3000-5500 draws per frame and under
   260 ms per frame. `VICTORY_AB_START=70` begins the alternation at world+70 s, the window spot.
 - The switches change at the title's present call (`queue::frame_ends`), at any instant for the threads that read

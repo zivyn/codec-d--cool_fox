@@ -39,6 +39,34 @@ static SERIES_S: AtomicBool = AtomicBool::new(false);
 /// Set before the title starts.
 pub fn set(console: Console) {
     SERIES_S.store(console == Console::SeriesS, Ordering::Relaxed);
+    victory_formats::texture::set_gpu(tile_gpu(console));
+}
+
+/// The tile configuration the XOR swizzle modes are laid out by:
+/// the console's, or `VICTORY_TILE_GPU=<pipes>,<packers>` (counts, like
+/// `8,4`) to try another.
+fn tile_gpu(console: Console) -> victory_formats::texture::Gpu {
+    use victory_formats::texture::Gpu;
+    let own = match console {
+        Console::SeriesX => Gpu::SERIES_X,
+        Console::SeriesS => Gpu::SERIES_S,
+    };
+    let Ok(spec) = std::env::var("VICTORY_TILE_GPU") else {
+        return own;
+    };
+    let chosen = spec.split_once(',').and_then(|(pipes, packers)| {
+        Gpu::from_counts(pipes.trim().parse().ok()?, packers.trim().parse().ok()?)
+    });
+    match chosen {
+        Some(gpu) => {
+            tracing::info!(%spec, "XOR swizzle modes laid out for this many pipes and packers (VICTORY_TILE_GPU)");
+            gpu
+        }
+        None => {
+            tracing::warn!(%spec, "VICTORY_TILE_GPU is not a pair of pipe and packer counts addrlib has patterns for; the console's is used");
+            own
+        }
+    }
 }
 
 pub fn current() -> Console {

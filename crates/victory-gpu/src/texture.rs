@@ -2002,7 +2002,7 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         return None;
     };
     if layout.desc.swizzle.xor() {
-        once!(?desc, "texture contents in an XOR mode not uploaded");
+        once!(?desc, swizzle = layout.desc.swizzle.name(), "texture contents in an XOR mode not uploaded");
         return None;
     }
     let host = host()?;

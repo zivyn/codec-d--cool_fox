@@ -416,7 +416,7 @@ fn a_random_title_through_the_book_gives_what_the_order_gives() {
         let title = dice.next(2) as usize;
         let cell = dice.next(6) as usize;
         let write = dice.next(3) != 0;
-        let target = usize::from(title == 1 && dice.next(4) != 0);
+        let target = title;
         let mut fp = Footprint::default();
         if write {
             fp.write(cell * 64, cell * 64 + 4);
@@ -426,19 +426,12 @@ fn a_random_title_through_the_book_gives_what_the_order_gives() {
         let fp = fp.sealed();
         // SAFETY: plain queries.
         let completed = [0, 1].map(|q| unsafe { h.fences[q].GetCompletedValue() });
-        let want = book.waits_for(target, title, &[], &fp, completed);
+        let want = book.waits_for(target, title, &[], &fp, completed, false);
         assert!(want <= book.signalled[1 - target]);
         let (queue, kind) = if target == 1 {
             (h.compute.clone(), D3D12_COMMAND_LIST_TYPE_COMPUTE)
         } else {
-            (
-                h.direct.clone(),
-                if title == 1 {
-                    D3D12_COMMAND_LIST_TYPE_COMPUTE
-                } else {
-                    D3D12_COMMAND_LIST_TYPE_DIRECT
-                },
-            )
+            (h.direct.clone(), D3D12_COMMAND_LIST_TYPE_DIRECT)
         };
         let list = if write {
             let v = i as u32 + 1;
@@ -488,25 +481,27 @@ fn a_random_title_through_the_book_gives_what_the_order_gives() {
     assert_eq!(h.words(&finals, 6), value.to_vec());
 }
 
-/// A list of the compute type runs on the drawing queue (what the host's compute lists do when they do not go to
-/// the compute queue), and a list of the compute type runs on the compute queue; the device stays.
+/// A list runs on the queue of its own type, one of each, one after the other, and the device stays (a compute
+/// list on the drawing queue removes it: the host's compute lists never go there).
 #[test]
-fn a_compute_list_runs_on_either_queue() {
+fn a_list_runs_on_the_queue_of_its_type() {
     let Some(mut h) = Harness::new() else { return };
     let data = h.data();
     let back = h.readback(16);
-    for (n, queue) in [h.direct.clone(), h.compute.clone(), h.direct.clone()]
-        .iter()
-        .enumerate()
-    {
-        let write = h.step(D3D12_COMMAND_LIST_TYPE_COMPUTE, false, &data, n as u32 + 1);
+    let queues = [
+        (h.direct.clone(), D3D12_COMMAND_LIST_TYPE_DIRECT),
+        (h.compute.clone(), D3D12_COMMAND_LIST_TYPE_COMPUTE),
+        (h.direct.clone(), D3D12_COMMAND_LIST_TYPE_DIRECT),
+    ];
+    for (n, (queue, kind)) in queues.iter().enumerate() {
+        let write = h.step(*kind, false, &data, n as u32 + 1);
         Harness::run(queue, &write);
         // SAFETY: our queue and fence.
         unsafe { queue.Signal(&h.fences[0], n as u64 + 1).expect("a signal") };
         assert!(h.reached(&h.fences[0], n as u64 + 1, 60_000), "round {n}");
         // SAFETY: a plain query.
         let reason = unsafe { h.device.GetDeviceRemovedReason() };
-        assert!(reason.is_ok(), "round {n} on queue {n}: {reason:?}");
+        assert!(reason.is_ok(), "round {n}: {reason:?}");
     }
     let read = h.copy(D3D12_COMMAND_LIST_TYPE_DIRECT, &back, 0, &data);
     Harness::run(&h.direct, &read);
@@ -515,4 +510,173 @@ fn a_compute_list_runs_on_either_queue() {
     assert!(h.reached(&h.fences[0], 10, 60_000));
     // ((0 * 3 + 1) * 3 + 2) * 3 + 3
     assert_eq!(h.words(&back, 1), [18]);
+}
+
+/// A texture a drawing list left as a render target is moved out of that state on the drawing queue, in a list of
+/// its own; the compute queue waits for it, writes the texture through an unordered access view in a compute list
+/// (no state of drawing in it), and the drawing queue waits for that and reads the texture back: the hand-off.
+#[test]
+fn a_texture_goes_from_a_render_target_to_the_compute_queue_and_back() {
+    let Some(mut h) = Harness::new() else { return };
+    const TEXTURE_CS: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors = 1))"
+RWTexture2D<uint> image : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    image[uint2(0, 0)] = 42u;
+    image[uint2(3, 3)] = 7u;
+}
+"#;
+    let Some((root, pso)) = pipeline(&h.device, TEXTURE_CS) else {
+        return;
+    };
+    let (render_target, unordered, copy_source) = (0x4, 0x8, 0x800);
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+        Width: 4,
+        Height: 4,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        Format: DXGI_FORMAT_R32_UINT,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Flags: D3D12_RESOURCE_FLAGS(
+            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0
+                | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0,
+        ),
+        ..Default::default()
+    };
+    let mut texture: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation; the texture starts as a drawing list leaves one.
+    unsafe {
+        h.device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATES(render_target),
+                None,
+                &mut texture,
+            )
+            .expect("a texture");
+    }
+    let texture = texture.expect("a texture");
+    // SAFETY: plain creation of a heap with one view of the texture.
+    let heap: ID3D12DescriptorHeap = unsafe {
+        let heap = h
+            .device
+            .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+            .expect("a heap");
+        let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV {
+                    MipSlice: 0,
+                    PlaneSlice: 0,
+                },
+            },
+        };
+        h.device.CreateUnorderedAccessView(
+            &texture,
+            None::<&ID3D12Resource>,
+            Some(&view),
+            heap.GetCPUDescriptorHandleForHeapStart(),
+        );
+        heap
+    };
+    let back = h.readback(256 * 4);
+    // The hand-off, as the host makes it: the texture out of the render target state, on the drawing queue.
+    let hand = h.list(D3D12_COMMAND_LIST_TYPE_DIRECT, |l| {
+        // SAFETY: an open list and a live texture.
+        unsafe {
+            l.ResourceBarrier(&[transition(
+                &texture,
+                D3D12_RESOURCE_STATES(render_target),
+                D3D12_RESOURCE_STATES(unordered),
+            )])
+        }
+    });
+    // The compute list: the states it knows are the compute ones.
+    let write = h.list(D3D12_COMMAND_LIST_TYPE_COMPUTE, |l| {
+        // SAFETY: an open list and live objects.
+        unsafe {
+            l.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            l.Dispatch(1, 1, 1);
+        }
+    });
+    // Back on the drawing queue: out of the compute state, to be read.
+    let read = h.list(D3D12_COMMAND_LIST_TYPE_DIRECT, |l| {
+        // SAFETY: an open list and live objects.
+        unsafe {
+            l.ResourceBarrier(&[transition(
+                &texture,
+                D3D12_RESOURCE_STATES(unordered),
+                D3D12_RESOURCE_STATES(copy_source),
+            )]);
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&back),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R32_UINT,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            l.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+    });
+    Harness::run(&h.direct, &hand);
+    // SAFETY: our queues and fences.
+    unsafe {
+        h.direct.Signal(&h.fences[2], 1).expect("a signal");
+        h.compute.Wait(&h.fences[2], 1).expect("a wait");
+    }
+    Harness::run(&h.compute, &write);
+    // SAFETY: as above.
+    unsafe {
+        h.compute.Signal(&h.fences[1], 1).expect("a signal");
+        h.direct.Wait(&h.fences[1], 1).expect("a wait");
+    }
+    Harness::run(&h.direct, &read);
+    // SAFETY: as above.
+    unsafe { h.direct.Signal(&h.fences[0], 1).expect("a signal") };
+    assert!(
+        h.reached(&h.fences[0], 1, 60_000),
+        "the queues stand for each other"
+    );
+    // SAFETY: a plain query.
+    let reason = unsafe { h.device.GetDeviceRemovedReason() };
+    assert!(reason.is_ok(), "{reason:?}");
+    let words = h.words(&back, 256);
+    // (Row 0 starts at word 0, row 3 at word 3 * 64.)
+    assert_eq!((words[0], words[3 * 64 + 3]), (42, 7));
 }

@@ -5376,7 +5376,7 @@ impl Host {
         // On the compute queue the lists we add are of the compute type, and what the plan touches is told to the route.
         let compute = route.as_ref().is_some_and(|r| r.compute());
         if let Some(route) = route.as_mut() {
-            route.card(&dirty, &whole, &declared, &looked);
+            route.card(&dirty, &declared, &looked);
         }
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
@@ -6883,11 +6883,14 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late && staged_number.is_none() { self.card_steps(runs) } else { None };
-        // Which queue the submission goes to (`VICTORY_ASYNC_COMPUTE=2`): its compute lane's go to the compute queue if
-        // they can; with it on everything is joined to the host's fence by the sequencer ([`lanes`]).
-        let mut route = lanes::Route::begin(self, runs, late, staged_number.is_some() || own.is_some(), *submitted);
+        // Which queue the submission goes to (`VICTORY_ASYNC_COMPUTE=2`): lists of the compute type to the compute queue,
+        // the others to the host's; with it on everything is joined to the host's fence by the sequencer ([`lanes`]).
+        let mut route = lanes::Route::begin(self, runs);
         let on_compute = route.as_ref().is_some_and(|r| r.compute());
+        let own = if late && staged_number.is_none() { self.card_steps(runs, on_compute) } else { None };
+        if let (Some(route), Some(own)) = (route.as_mut(), own.as_ref()) {
+            route.add_list(own.list());
+        }
         // The next submission's refreshes of the copies this one does nothing to begin on the thread of
         // `prefetch` now, beside what this one does up to its snapshots (`VICTORY_STAGE_A=1`); they are over
         // at `join_early`, before anything of this submission's that the card sees.
@@ -7101,6 +7104,8 @@ impl Host {
         // With the summaries of the lists' steps [`onepass`]: the steps the card's plan takes, for each list in order (a
         // cursor over them, not a look in a table for each fill and copy).
         let takes: Option<Vec<Vec<usize>>> = (front_pass && own.is_some()).then(|| own.as_ref().map(|own| own.by_list(runs)).unwrap_or_default());
+        // What the lists' preludes ask of the drawing queue when the lists are of the compute type.
+        let mut hand: Vec<D3D12_RESOURCE_BARRIER> = Vec::new();
         for (n, list) in runs.iter().enumerate() {
             if staged_number.is_none() {
                 let cursor = if front_pass { pass.as_ref().and_then(|pass| pass.cursor(n)) } else { None };
@@ -7112,10 +7117,13 @@ impl Host {
                 }
             }
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            if let Some(prelude) = list.prelude(&mut hand) {
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
+        }
+        if let Some(route) = route.as_mut() {
+            route.hand(hand);
         }
         batch.fill();
         // (The holds the pass took on the copies are let go; what is ahead stays with the batch to its end.)
@@ -7333,12 +7341,19 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
-                self.card_sent();
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                if let Some(route) = route.as_mut() {
+                    route.waits(self);
+                }
+                let queue = route.as_ref().map_or(&self.queue, |r| r.queue(self));
+                queue.ExecuteCommandLists(group);
+                if !on_compute {
+                    self.card_sent();
+                }
+                let signalled = match route.as_mut() {
+                    Some(route) => route.signal(self, *submitted),
+                    None => self.queue.Signal(&self.fence, *submitted),
+                };
+                let waited = signalled.and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 #[cfg(feature = "diagnostics")]
                 crate::timeline::sent(sending, *submitted, stamp);
                 match waited {
@@ -8222,7 +8237,7 @@ impl HostList {
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
     /// from the other, if a list submitted earlier left it behind.
-    fn prelude(&self) -> Option<ID3D12CommandList> {
+    fn prelude(&self, hand: &mut Vec<D3D12_RESOURCE_BARRIER>) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
@@ -8251,6 +8266,11 @@ impl HostList {
         let mut to_copy = Vec::new();
         let mut barriers = Vec::new();
         let mut copying = std::collections::HashMap::new();
+        // (A list of the compute type: what moves a texture out of or into a state of drawing is not for the compute
+        // queue, and goes to `hand`, to be made on the drawing queue ahead of everything the submission does: a
+        // texture's way out of a drawing state is the first move of a submission of compute lists, `lanes`.)
+        let compute = self.compute;
+        let drawing = |before: u32, after: u32| compute && (before | after) & DRAWING_STATES != 0;
         for (depth, twin, colour) in &syncs {
             let (from, to) = if *colour {
                 (depth, &twin.colour)
@@ -8262,33 +8282,41 @@ impl HostList {
                 let real = texture.state.load(Ordering::Relaxed);
                 copying.insert(key, state);
                 if real != state {
-                    to_copy.push(transition(
-                        &texture.texture,
-                        host_state(real),
-                        host_state(state),
-                    ));
+                    let to = transition(&texture.texture, host_state(real), host_state(state));
+                    if drawing(real, state) {
+                        hand.push(to);
+                    } else {
+                        to_copy.push(to);
+                    }
                     if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
+                        if drawing(state, real) {
+                            // (Not back to a state of drawing from a compute queue: it stays as the copy left it.)
+                            texture.state.store(state, Ordering::Relaxed);
+                        } else {
+                            barriers.push(transition(&texture.texture, host_state(state), host_state(real)));
+                        }
                     }
                 }
             }
         }
-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
+        for (key, (first, last, copy)) in states.iter() {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
-            (real != *first)
-                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
-        }));
+            if real != *first {
+                let barrier = transition(&copy.texture, host_state(real), host_state(*first));
+                if drawing(real, *first) {
+                    hand.push(barrier);
+                } else {
+                    barriers.push(barrier);
+                }
+            }
+        }
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| h.make_prelude_of(compute)))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -11977,12 +12005,15 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+/// The states only a drawing queue may use: render target, depth write and read, pixel shader resource, stream out,
+/// resolve destination and source, shading rate source.
+pub(crate) const DRAWING_STATES: u32 = 0x4 | 0x10 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000 | 0x100_0000;
+
 /// `state` for a list of the compute type (`VICTORY_ASYNC_COMPUTE=2`): the states of drawing (render target, depth,
 /// pixel shader resource, stream out, resolve, shading rate) are not for a compute queue, and what a compute list
 /// reads a texture in is the non-pixel shader resource state.
 pub(crate) fn compute_legal(state: u32) -> u32 {
-    const DRAWING: u32 = 0x4 | 0x10 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000 | 0x100_0000;
-    match state & !DRAWING {
+    match state & !DRAWING_STATES {
         0 if state != 0 => 0x40,
         rest => rest,
     }

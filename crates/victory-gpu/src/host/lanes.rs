@@ -6,74 +6,106 @@
 //! one queue. The title overlaps its compute queue with its graphics queue on
 //! the console, so the card works the two one after the other where it could
 //! work them side by side. With the switch the submissions of the title's
-//! compute queue go to a host queue of type compute, when they can, and the
-//! rest of the host goes on as it was.
+//! compute queue go to a host queue of type compute and the rest of the host
+//! goes on as it was, on its own.
 //!
 //! The pieces, and why each is there:
 //!
-//! - Two host queues, Q1 (the one there always was) and Q2 (compute), each
-//!   with a fence of its own ([`Lanes::fences`]) that it signals behind each
-//!   submission, with the value the host numbers the submission by.
-//! - A sequencer ([`Lanes::order`], a copy queue that does no work): for each
-//!   submission it waits for the fence of the queue the submission went to and
-//!   then signals the host's one fence (`Host::fence`) with the same value, in
-//!   the order the submissions were given. The host's fence then still says
-//!   "everything up to this value has run", whichever queue ran it, so the
-//!   flights, their landing, the retirement of what they used (`bury`), and
-//!   every wait of the CPU for the card go on exactly as with one queue. (Two
-//!   queues signalling the one fence would go back and forth over it.)
 //! - Lists of the compute type for the title's compute lists
-//!   ([`want_compute`]): a compute queue runs nothing else, and the host list of
-//!   a title list is made before anyone knows where it goes. A compute list runs
-//!   on either queue.
-//! - Which submissions go to Q2 ([`unfit`]): all their lists are compute lists
-//!   and none of them names a texture (a texture's state is the host's to
-//!   track in submission order, and the transitions to the states a compute
-//!   queue may not use are made on Q1), a copy back, a step of ours that may
-//!   write anywhere, or the card's own steps for reads of what flights write
-//!   (those go behind the flights on the queue they are on, so the submission
-//!   keeps to it). Anything else goes to Q1 as it always did.
-//! - What a submission waits for on the other queue ([`Book::waits_for`]): the
-//!   submissions of the other lane the title's own waits resolved to (stage 1),
-//!   the title queue's previous submission if that ran on the other host queue
-//!   (a title queue is in order), and the submissions in the air on the other
-//!   queue that it shares memory with ([`Footprint`]): what one reads or
-//!   writes of title memory and of the pieces of host copies in the card's
-//!   memory the sends, hashes and compares of the two touch. With nothing in
-//!   common nothing waits, and that is where the overlap is. A wait is only
+//!   ([`want_compute`]). A queue runs the lists of its own type only (a
+//!   compute list on the drawing queue removes the device), and the host list
+//!   of a title list is made before anyone knows where it goes, so the type
+//!   *is* the queue: with the switch (`=2` in the variable, or in
+//!   `VICTORY_AB`, for the whole process) every submission of compute lists goes
+//!   to Q2 and every other one to Q1, the host's queue that there always was.
+//!   What the host adds to a submission of Q2 (the lists that send up to the
+//!   card's copies, the compare, the card's own steps, the preludes) is of the
+//!   compute type too. What a compute queue may not do goes to Q1 around the
+//!   hand-off: the transitions that name a state of drawing (the first move of a
+//!   texture out of the state a drawing list left it in) are made on Q1 in a
+//!   list of their own, ahead of the submission, and the compute queue waits for
+//!   it ([`Route::waits`]); the states a list of the compute type moves its
+//!   textures between are the non-drawing ones (`compute_legal`).
+//! - Two queues, each with a fence of its own ([`Lanes::fences`]) that it
+//!   signals behind each submission with the value the host numbers the
+//!   submission by, and a sequencer ([`Lanes::order`], a copy queue that does no
+//!   work): for each submission it waits for the fence of the queue the
+//!   submission went to and then signals the host's one fence (`Host::fence`)
+//!   with the same value, in the order the submissions were given. The host's
+//!   fence then still says "everything up to this value has run", whichever
+//!   queue ran it, so the flights, their landing, the retirement of what they
+//!   used (`bury`), and every wait of the CPU for the card go on exactly as with
+//!   one queue. (Two queues signalling the one fence would go back and forth
+//!   over it.) A flight lands only when both queues have got to it, so what a
+//!   compute flight wrote is in title memory before any later flight's landing
+//!   and before the title is told (fences, values) that it is done.
+//! - What a submission waits for on the other queue ([`Book::waits_for`]), with
+//!   the switch's overlap (`=2` in the phases that have it): the submissions of
+//!   the other lane the title's own waits resolved to (stage 1), the title
+//!   queue's previous submission if that ran on the other host queue, and the
+//!   submissions in the air on the other queue that it shares anything with
+//!   ([`Footprint`]): what one reads or writes of title memory, whole host copies
+//!   in the card's memory (the lists that send up to a copy and compare it move
+//!   it between states, and share its hashes) and whole textures (their states
+//!   are the host's to track). With nothing in common nothing waits, and that is
+//!   where the overlap is. In the phases without it (an A/B in the process, or
+//!   `=1`) the queues keep to one order: each submission waits for everything
+//!   in the air on the other queue, which is what one queue gave. A wait is only
 //!   ever queued for a value whose signal is already queued, so two queues
-//!   cannot wait for each other.
-//! - A flip of the switch (`VICTORY_AB`) drains both queues first
-//!   ([`flip`]), at the next submission: the host's fence is signalled by Q1
-//!   alone with the switch off and by the sequencer alone with it on, and two
-//!   signallers must never have values in the air at once.
+//!   cannot wait for each other. The switch may flip at any submission: the
+//!   queues and the sequencer stay, and the first submission after a flip to
+//!   serial waits for what the overlap left in the air.
+//! - Not with stage A's thread (`front`): it prepares a submission's card steps
+//!   before the queue is known.
 
 use std::collections::VecDeque;
 
 use super::*;
 use crate::queue::timelines::{self, Lane as Title};
 
-/// Where a list of the title's kind `kind` is made: the compute type for the
-/// title's compute lists when stage 2 is asked for (at all: with `VICTORY_AB`
-/// naming `VICTORY_ASYNC_COMPUTE=2` the lists are made so in both phases, and
-/// the phase without it runs them on Q1, where they are as good).
-pub(crate) fn want_compute(kind: u32) -> bool {
+/// Whether the variable (or `VICTORY_AB`'s switch with the value) says `=2`.
+fn asked() -> bool {
     static ASKED: OnceLock<bool> = OnceLock::new();
-    kind == 2
-        && *ASKED.get_or_init(|| {
-            let env = std::env::var("VICTORY_ASYNC_COMPUTE").ok();
-            timelines::mode_of(env.as_deref()) == 2
-                || crate::ab::value_b("VICTORY_ASYNC_COMPUTE")
-                    .is_some_and(|v| timelines::mode_of(Some(v)) == 2)
-        })
+    *ASKED.get_or_init(|| {
+        let env = std::env::var("VICTORY_ASYNC_COMPUTE").ok();
+        timelines::mode_of(env.as_deref()) == 2
+            || crate::ab::value_b("VICTORY_ASYNC_COMPUTE")
+                .is_some_and(|v| timelines::mode_of(Some(v)) == 2)
+    })
+}
+
+/// Whether the host's queues are Q1 and Q2 for the whole process: `=2` was asked, and what it needs is there (the
+/// submit line, the relay, a device that makes a compute queue). Then the title's compute lists are of the compute
+/// type, and every submission is joined to the host's fence by the sequencer.
+pub(crate) fn lists_compute() -> bool {
+    if !asked() {
+        return false;
+    }
+    let ready = timelines::line_on() && relay() && host().and_then(lanes).is_some();
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if !ready && host().is_some() {
+        WARNED.call_once(|| {
+            tracing::warn!("VICTORY_ASYNC_COMPUTE=2 needs the submit line (VICTORY_THIN), the relay and a compute queue: one queue as before")
+        });
+    }
+    ready
+}
+
+/// Where a list of the title's kind `kind` is made: the compute type for the title's compute lists ([`lists_compute`]).
+pub(crate) fn want_compute(kind: u32) -> bool {
+    kind == 2 && lists_compute()
 }
 
 // ---------------------------------------------------------------------
 // What a submission touches, and what has to wait for what (no D3D12).
 
-/// A key, and a range in the key's units: key 0 is title memory (bytes), any
-/// other is a host copy in the card's memory by its number plus one (pieces).
+/// A key, and a range in the key's units: key 0 is title memory (bytes), one
+/// with [`TEXTURE`] set is a texture, any other is a host copy in the card's
+/// memory by its number plus one (pieces).
 type Run = (u64, u64, u64);
+
+/// The key of a texture (its address, below this bit).
+const TEXTURE: u64 = 1 << 63;
 
 /// Sorts runs and joins those that touch or overlap, within a key.
 fn normalize(runs: &mut Vec<Run>) {
@@ -149,6 +181,19 @@ impl Footprint {
         self.writes.push((id + 1, u64::from(first), u64::from(end)));
     }
 
+    /// A texture (by its host copy's address) is used: whole, and exclusively (its states are changed by
+    /// the lists that name it).
+    pub(super) fn texture(&mut self, at: usize) {
+        self.writes.push((TEXTURE | (at as u64 & !TEXTURE), 0, 1));
+    }
+
+    /// What `more` reads and writes, too.
+    pub(super) fn merge(&mut self, more: Footprint) {
+        self.reads.extend(more.reads);
+        self.writes.extend(more.writes);
+        self.any |= more.any;
+    }
+
     /// Ready to be compared: runs sorted and joined.
     pub(super) fn sealed(mut self) -> Self {
         normalize(&mut self.reads);
@@ -166,29 +211,21 @@ impl Footprint {
     }
 }
 
-/// Why a submission of the compute lane did not go to Q2, and why a wait was
-/// made.
+/// What the host counted since the last line.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(super) struct Stats {
     /// Submissions sent, by queue.
     sent: [u64; 2],
-    /// Submissions of the compute lane kept on Q1: a list that is not of the
-    /// compute type, a texture or a copy back, a step of ours that may write
-    /// anywhere, the card's own steps behind flights.
-    kept: [u64; 4],
     /// Waits made on the other queue: for what the title waited for, for the
-    /// title queue's previous submission, for memory shared, and the
-    /// submissions that waited for none (the overlap).
-    waits: [u64; 3],
+    /// title queue's previous submission, for what both touch, and for
+    /// everything in the air (the phases without the overlap).
+    waits: [u64; 4],
+    /// Submissions that waited for nothing on the other queue.
     free: u64,
-    /// Flips of the switch (each drains both queues).
-    flips: u64,
+    /// Hand-offs: lists on Q1 that move textures out of the states of drawing
+    /// for a submission of Q2, and the barriers in them.
+    hands: [u64; 2],
 }
-
-const KEPT_TYPE: usize = 0;
-const KEPT_TEXTURE: usize = 1;
-const KEPT_RUN: usize = 2;
-const KEPT_STEPS: usize = 3;
 
 /// The two queues as the host numbers them: what was signalled on each, what
 /// is in the air, and where the title's submissions went.
@@ -214,7 +251,7 @@ impl Book {
     /// `title`, waits for on the other queue: the value on the other queue's
     /// fence, 0 for none. `deps`: the title's own waits as (title lane,
     /// number); `completed`: what each queue's fence reports now (what is done
-    /// is not waited for). `fp` sealed.
+    /// is not waited for). `fp` sealed. `serial`: the queues keep to one order.
     pub(super) fn waits_for(
         &mut self,
         target: usize,
@@ -222,10 +259,21 @@ impl Book {
         deps: &[(usize, u64)],
         fp: &Footprint,
         completed: [u64; 2],
+        serial: bool,
     ) -> u64 {
         let other = 1 - target;
         for q in 0..2 {
             self.flying[q].retain(|(v, _)| *v > completed[q]);
+        }
+        if serial {
+            // One order, as one queue gave it: everything queued on the other one is done first.
+            let want = self.signalled[other].max(completed[other]);
+            if want > completed[other] {
+                self.stats.waits[3] += 1;
+                return want;
+            }
+            self.stats.free += 1;
+            return 0;
         }
         let mut want = 0u64;
         for &(lane, number) in deps {
@@ -306,27 +354,29 @@ pub(crate) fn planned(lane: Title, number: u64) {
 
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
-    if timelines::mode() != 2 {
+    if !lists_compute() {
         return;
     }
     let s = book(|b| std::mem::take(&mut b.stats));
     let f = |n: u64| n as f64 / frames;
     tracing::info!(
-        "the compute lane on a queue of its own per frame (VICTORY_ASYNC_COMPUTE=2): {:.1} submissions sent to the compute queue, {:.1} to the drawing queue; \
-         {:.1} compute-lane submissions kept on the drawing queue (a list that is not of the compute type {:.1}, a texture {:.1}, a step of ours {:.1}, the card's own steps behind flights {:.1}); \
-         waits on the other queue: for what the title waited for {:.1}, for the title queue's last submission {:.1}, for memory both touch {:.1}, none {:.1}; flips {}",
+        "the compute lane on a queue of its own per frame (VICTORY_ASYNC_COMPUTE=2, {}): {:.1} submissions sent to the compute queue, {:.1} to the drawing queue; \
+         waits on the other queue: for what the title waited for {:.1}, for the title queue's last submission {:.1}, for what both touch {:.1}, for everything in the air {:.1}, none {:.1}; \
+         hand-offs of textures out of the states of drawing: {:.2} lists with {:.2} barriers",
+        if timelines::mode() == 2 {
+            "overlapping"
+        } else {
+            "one order"
+        },
         f(s.sent[1]),
         f(s.sent[0]),
-        f(s.kept.iter().sum()),
-        f(s.kept[KEPT_TYPE]),
-        f(s.kept[KEPT_TEXTURE]),
-        f(s.kept[KEPT_RUN]),
-        f(s.kept[KEPT_STEPS]),
         f(s.waits[0]),
         f(s.waits[1]),
         f(s.waits[2]),
+        f(s.waits[3]),
         f(s.free),
-        s.flips
+        f(s.hands[0]),
+        f(s.hands[1])
     );
 }
 
@@ -337,8 +387,9 @@ pub(crate) fn line(frames: f64) {
 pub(super) struct Lanes {
     compute: ID3D12CommandQueue,
     order: ID3D12CommandQueue,
-    /// Signalled by Q1 and Q2 behind their submissions.
-    fences: [ID3D12Fence; 2],
+    /// Signalled by Q1 and Q2 behind their submissions (with the host's number of
+    /// the submission), and by Q1 behind a hand-off (with its own count).
+    fences: [ID3D12Fence; 3],
 }
 
 // SAFETY: D3D12 queues and fences are free-threaded.
@@ -352,7 +403,7 @@ fn lanes(host: &Host) -> Option<&'static Lanes> {
         .get_or_init(|| match make(&host.device) {
             Ok(lanes) => {
                 tracing::info!(
-                    "VICTORY_ASYNC_COMPUTE=2: the title's compute lane runs on a compute queue of the host, joined to the host's fence by a sequencer queue"
+                    "VICTORY_ASYNC_COMPUTE=2: the title's compute lists are of the compute type and run on a compute queue of the host, joined to the host's fence by a sequencer queue"
                 );
                 Some(lanes)
             }
@@ -379,75 +430,34 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Lanes> {
             fences: [
                 device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+                device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
             ],
         })
     }
 }
 
-/// Whether the host's fence has been signalled by the sequencer since the last
-/// flip.
-static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The switch changed (or this is the first submission): both queues are
-/// drained, so that the host's fence is signalled by one thing at a time.
-/// `submitted` is the last value signalled on it, under the submission lock.
-fn flip(host: &Host, run: bool, submitted: u64) {
-    if RUNNING.load(Ordering::Acquire) == run {
-        return;
-    }
-    // SAFETY: the host's fence and event, under the submission lock.
-    unsafe {
-        if submitted > 0
-            && host.fence.GetCompletedValue() < submitted
-            && host
-                .fence
-                .SetEventOnCompletion(submitted, host.event)
-                .is_ok()
-        {
-            let was = working(false);
-            WaitForSingleObject(host.event, INFINITE);
-            working(was);
-        }
-    }
-    *BOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Book::default());
-    book(|b| b.stats.flips += 1);
-    RUNNING.store(run, Ordering::Release);
+/// The lists that make hand-offs, and when each is free again.
+struct Hands {
+    free: Vec<Prelude>,
+    /// By the count the list signalled.
+    busy: VecDeque<(u64, Prelude)>,
+    count: u64,
 }
+
+// SAFETY: D3D12 objects are free-threaded; a list is recorded by the thread that holds the submission lock
+// and not touched again until its count has been reached.
+unsafe impl Send for Hands {}
+
+static HANDS: Mutex<Hands> = Mutex::new(Hands {
+    free: Vec::new(),
+    busy: VecDeque::new(),
+    count: 0,
+});
 
 // ---------------------------------------------------------------------
 // What goes where.
 
-/// Why a list cannot go to Q2, if it cannot.
-fn unfit(list: &HostList) -> Option<usize> {
-    if !list.compute {
-        return Some(KEPT_TYPE);
-    }
-    let named = !list
-        .states
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_empty()
-        || !list
-            .twins
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty();
-    let d = list.deferred();
-    if named
-        || !d.backs.is_empty()
-        || !d.texture_backs.is_empty()
-        || !d.textures.is_empty()
-        || !d.plane_uploads.is_empty()
-    {
-        return Some(KEPT_TEXTURE);
-    }
-    d.copies
-        .iter()
-        .any(|step| matches!(step, Step::Run(_) | Step::Texture(_) | Step::Plane(..)))
-        .then_some(KEPT_RUN)
-}
-
-/// What the steps of `runs` read and write of title memory.
+/// What the steps of `runs`, and the textures they name, read and write.
 fn steps_footprint(runs: &[&HostList]) -> Footprint {
     let mut fp = Footprint::default();
     for list in runs {
@@ -477,6 +487,18 @@ fn steps_footprint(runs: &[&HostList]) -> Footprint {
                 Step::Placed(_) => fp.any = true,
             }
         }
+        for key in list.states.lock().unwrap_or_else(|e| e.into_inner()).keys() {
+            fp.texture(*key);
+        }
+        for twin in list
+            .twins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+        {
+            fp.texture(std::sync::Arc::as_ptr(&twin.depth) as usize);
+            fp.texture(std::sync::Arc::as_ptr(&twin.twin.colour) as usize);
+        }
     }
     fp
 }
@@ -487,60 +509,62 @@ pub(super) struct Route {
     target: usize,
     /// The title lane (0 graphics, 1 compute).
     title: usize,
+    /// The queues keep to one order (the phases without the overlap).
+    serial: bool,
     deps: Vec<(usize, u64)>,
     fp: Footprint,
+    /// What the lists' preludes ask of Q1 ahead of the submission.
+    hand: Vec<D3D12_RESOURCE_BARRIER>,
     waited: bool,
 }
 
 impl Route {
-    /// For a submission sent ahead (`late`) whose runs are `runs`; `submitted`
-    /// is the last value signalled on the host's fence. `None` with the
-    /// switch off (or without what stage 2 needs): the submission goes as it
-    /// always did. `keep`: it must stay on Q1 (its steps were prepared by
-    /// another thread, or done on the card).
-    pub(super) fn begin(
-        host: &Host,
-        runs: &[&HostList],
-        late: bool,
-        keep: bool,
-        submitted: u64,
-    ) -> Option<Route> {
-        if !late {
-            // (A submission that is waited for settles every flight first: nothing of the sequencer's is in the air.)
+    /// For a submission of `runs`: `None` without the switch (or without what it needs): the submission
+    /// goes as it always did. With it every submission has a route: its lists' type says its queue.
+    pub(super) fn begin(host: &Host, runs: &[&HostList]) -> Option<Route> {
+        if !lists_compute() {
             return None;
         }
-        let run = timelines::mode() == 2 && relay();
-        let lanes = if run { lanes(host) } else { None };
-        flip(host, lanes.is_some(), submitted);
-        lanes?;
-        let current = timelines::current();
-        let title = current.as_ref().map_or(0, |c| c.lane.index());
+        lanes(host)?;
+        let compute = runs.iter().filter(|list| list.compute).count();
+        if compute != 0 && compute != runs.len() {
+            fail(format_args!(
+                "a submission holds {compute} lists of the compute type and {} of the drawing type",
+                runs.len() - compute
+            ));
+        }
+        let target = usize::from(compute != 0);
+        let overlap = timelines::mode() == 2;
+        let current = if overlap { timelines::current() } else { None };
+        let title = current.as_ref().map_or(target, |c| c.lane.index());
         let deps = current.map_or_else(Vec::new, |c| {
             c.waits.iter().map(|d| (d.lane.index(), d.number)).collect()
         });
-        let mut why = keep.then_some(KEPT_STEPS);
-        if title == 1 && why.is_none() {
-            why = runs.iter().find_map(|list| unfit(list));
-        }
-        if title == 1
-            && let Some(why) = why
-        {
-            book(|b| b.stats.kept[why] += 1);
-        }
-        let target = usize::from(title == 1 && why.is_none());
         Some(Route {
             target,
             title,
+            serial: !overlap,
             deps,
             fp: steps_footprint(runs),
+            hand: Vec::new(),
             waited: false,
         })
     }
 
-    /// Whether the submission goes to Q2 (its lists, and everything the host
-    /// adds for it, are of the compute type).
+    /// Whether the submission goes to Q2: its lists, and everything the host
+    /// adds for it, are of the compute type.
     pub(super) fn compute(&self) -> bool {
         self.target == 1
+    }
+
+    /// A list the host added to the submission (the card's own steps).
+    pub(super) fn add_list(&mut self, list: &HostList) {
+        self.fp.merge(steps_footprint(&[list]));
+    }
+
+    /// What the lists' preludes ask to be made on Q1 first.
+    pub(super) fn hand(&mut self, barriers: Vec<D3D12_RESOURCE_BARRIER>) {
+        self.hand = barriers;
     }
 
     /// The queue the submission goes to.
@@ -553,19 +577,17 @@ impl Route {
 
     /// What the card's plan for the submission touches of the host copies in
     /// its memory, and what it declares written of title memory: the copies
-    /// sent up to (`dirty`, with `whole` sent whole), hashed and compared
-    /// (`declared`), and only compared (`looked`). A copy is one resource with
-    /// one state at a time (the lists that send up to it move it between
-    /// states), so it is taken whole: nothing that uses it runs on the other
-    /// queue at the same time as what changes it.
+    /// sent up to (`dirty`), hashed and compared (`declared`), and only
+    /// compared (`looked`). A copy is one resource with one state at a time
+    /// (the lists that send up to it move it between states), so it is taken
+    /// whole: nothing that uses it runs on the other queue at the same time
+    /// as what changes it.
     pub(super) fn card(
         &mut self,
         dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
-        whole: &[std::sync::Arc<crate::shadow::Shadow>],
         declared: &[Declared],
         looked: &[&crate::picked::Range],
     ) {
-        let _ = whole;
         for (shadow, _) in dirty {
             self.fp.card_write(shadow.id(), 0, u32::MAX);
         }
@@ -581,7 +603,8 @@ impl Route {
     }
 
     /// Before anything of the submission is given to its queue: the queue
-    /// waits for what the other queue must have done first. Once.
+    /// waits for what the other queue must have done first, and for the
+    /// hand-off. Once.
     pub(super) fn waits(&mut self, host: &Host) {
         if self.waited {
             return;
@@ -592,18 +615,35 @@ impl Route {
         };
         let fp = std::mem::take(&mut self.fp).sealed();
         // SAFETY: plain queries of fences of ours.
-        let completed = lanes
-            .fences
-            .each_ref()
-            .map(|f| unsafe { f.GetCompletedValue() });
+        let completed = [0, 1].map(|q| unsafe { lanes.fences[q].GetCompletedValue() });
         let other = 1 - self.target;
-        let want = book(|b| b.waits_for(self.target, self.title, &self.deps, &fp, completed));
+        let want = book(|b| {
+            b.waits_for(
+                self.target,
+                self.title,
+                &self.deps,
+                &fp,
+                completed,
+                self.serial,
+            )
+        });
         self.fp = fp;
+        let queue = self.queue(host);
         if want > 0 {
             // SAFETY: our queue and fence; the value was queued as a signal.
-            if let Err(e) = unsafe { self.queue(host).Wait(&lanes.fences[other], want) } {
+            if let Err(e) = unsafe { queue.Wait(&lanes.fences[other], want) } {
                 fail(format_args!(
                     "a queue could not be told to wait for the other ({e})"
+                ));
+            }
+        }
+        if !self.hand.is_empty() {
+            let barriers = std::mem::take(&mut self.hand);
+            if self.target == 1
+                && let Err(e) = hand_off(host, lanes, &barriers)
+            {
+                fail(format_args!(
+                    "the textures could not be handed to the compute queue ({e})"
                 ));
             }
         }
@@ -630,6 +670,55 @@ impl Route {
         book(|b| b.sent(self.target, self.title, value, fp));
         Ok(())
     }
+}
+
+/// Moves textures out of the states of drawing on Q1, in a list of its own,
+/// ahead of what the compute queue is about to do: the compute queue waits
+/// for it.
+fn hand_off(
+    host: &Host,
+    lanes: &Lanes,
+    barriers: &[D3D12_RESOURCE_BARRIER],
+) -> windows::core::Result<()> {
+    let (list, count) = {
+        let mut hands = HANDS.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain query.
+        let done = unsafe { lanes.fences[2].GetCompletedValue() };
+        while hands.busy.front().is_some_and(|(count, _)| *count <= done) {
+            if let Some((_, list)) = hands.busy.pop_front() {
+                hands.free.push(list);
+            }
+        }
+        let list = match hands.free.pop() {
+            Some(list) => list,
+            None => host
+                .make_prelude()
+                .ok_or_else(windows::core::Error::empty)?,
+        };
+        hands.count += 1;
+        (list, hands.count)
+    };
+    let (allocator, commands) = &list;
+    // SAFETY: the list is not executing (its count was reached); the textures are held by the lists that name them.
+    unsafe {
+        allocator.Reset()?;
+        commands.Reset(allocator, None)?;
+        commands.ResourceBarrier(barriers);
+        commands.Close()?;
+        host.queue.ExecuteCommandLists(&[Some(commands.cast()?)]);
+        host.queue.Signal(&lanes.fences[2], count)?;
+        lanes.compute.Wait(&lanes.fences[2], count)?;
+    }
+    book(|b| {
+        b.stats.hands[0] += 1;
+        b.stats.hands[1] += barriers.len() as u64;
+    });
+    HANDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .busy
+        .push_back((count, list));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -764,20 +853,26 @@ mod model_tests {
         b.planned(0, 2);
         let mine = fp(&[], &[(500, 510)]);
         // Nothing in common and nothing waited for: free.
-        assert_eq!(b.waits_for(1, 1, &[], &mine, [0, 0]), 0);
+        assert_eq!(b.waits_for(1, 1, &[], &mine, [0, 0], false), 0);
         assert_eq!(b.stats.free, 1);
         // The title waited for graphics number 1: value 5.
-        assert_eq!(b.waits_for(1, 1, &[(0, 1)], &mine, [0, 0]), 5);
+        assert_eq!(b.waits_for(1, 1, &[(0, 1)], &mine, [0, 0], false), 5);
         // Shared memory with the newest in the air: value 6.
-        assert_eq!(b.waits_for(1, 1, &[], &fp(&[(105, 106)], &[]), [0, 0]), 6);
+        assert_eq!(
+            b.waits_for(1, 1, &[], &fp(&[(105, 106)], &[]), [0, 0], false),
+            6
+        );
         // The older one only.
-        assert_eq!(b.waits_for(1, 1, &[], &fp(&[(5, 6)], &[]), [0, 0]), 5);
+        assert_eq!(
+            b.waits_for(1, 1, &[], &fp(&[(5, 6)], &[]), [0, 0], false),
+            5
+        );
         // What the other queue has done is not waited for.
         assert_eq!(
-            b.waits_for(1, 1, &[(0, 2)], &fp(&[(105, 106)], &[]), [6, 0]),
+            b.waits_for(1, 1, &[(0, 2)], &fp(&[(105, 106)], &[]), [6, 0], false),
             0
         );
-        assert_eq!(b.stats.waits, [1, 0, 2]);
+        assert_eq!(b.stats.waits, [1, 0, 2, 0]);
     }
 
     #[test]
@@ -786,7 +881,7 @@ mod model_tests {
         b.sent(1, 1, 3, Footprint::default().sealed());
         // The next of the title's compute queue goes to Q1: after value 3 on Q2.
         assert_eq!(
-            b.waits_for(0, 1, &[], &Footprint::default().sealed(), [0, 0]),
+            b.waits_for(0, 1, &[], &Footprint::default().sealed(), [0, 0], false),
             3
         );
         assert_eq!(b.stats.waits[1], 1);
@@ -794,7 +889,7 @@ mod model_tests {
         let mut b = Book::default();
         b.sent(1, 1, 3, Footprint::default().sealed());
         assert_eq!(
-            b.waits_for(1, 1, &[], &Footprint::default().sealed(), [0, 0]),
+            b.waits_for(1, 1, &[], &Footprint::default().sealed(), [0, 0], false),
             0
         );
     }
@@ -806,7 +901,14 @@ mod model_tests {
             b.sent(0, 0, v, Footprint::default().sealed());
         }
         assert_eq!(
-            b.waits_for(1, 1, &[(0, 99)], &Footprint::default().sealed(), [0, 0]),
+            b.waits_for(
+                1,
+                1,
+                &[(0, 99)],
+                &Footprint::default().sealed(),
+                [0, 0],
+                false
+            ),
             3
         );
     }
@@ -917,7 +1019,7 @@ mod model_tests {
                     must.push(at);
                 }
             }
-            let want = book.waits_for(target, title, &deps, &f, [0, 0]);
+            let want = book.waits_for(target, title, &deps, &f, [0, 0], false);
             assert!(
                 want <= book.signalled[1 - target],
                 "a wait for what was never queued"
@@ -1023,13 +1125,193 @@ mod model_tests {
         }
     }
 
+    /// The title's fences and memory values through the stage-1 model into the book and the queues: random signals
+    /// and waits on both lanes, each submission numbered among its lane's and waiting, on the other host queue, for
+    /// what the model resolved. Nothing stands for another, and what a submission was resolved to wait for runs first.
+    #[test]
+    fn the_titles_random_fences_and_values_become_waits_that_are_met_and_ordered() {
+        use crate::queue::timelines::{Lane, Model};
+        let mut dice = Dice(0x5851_f42d_4c95_7f2d);
+        let mut resolved = 0;
+        for round in 0..300 {
+            let mut model = Model::default();
+            let mut book = Book::default();
+            let mut queues: [Vec<Cmd>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            // By work number: the queue it went to; and (named, waiting) pairs of work.
+            let mut went: Vec<usize> = Vec::new();
+            let mut by_lane: std::collections::HashMap<(usize, u64), usize> =
+                std::collections::HashMap::new();
+            let mut named: Vec<(usize, usize)> = Vec::new();
+            let mut value = 0u64;
+            for _ in 0..(10 + round % 50) {
+                let title = dice.next(2) as usize;
+                let lane = if title == 0 {
+                    Lane::Graphics
+                } else {
+                    Lane::Compute
+                };
+                let (fence, at, seen) =
+                    (dice.next(3) as usize, dice.next(6), dice.next(3) as usize);
+                match dice.next(5) {
+                    0 => model.signal(lane, fence, at),
+                    1 => model.wait_fence(lane, fence, at),
+                    2 => model.wait_value(lane, seen, Box::new(|v| v >= 2)),
+                    _ => {
+                        let plan = model.run(lane, &[(seen, at)]);
+                        let deps: Vec<(usize, u64)> = plan
+                            .waits
+                            .iter()
+                            .map(|d| (d.lane.index(), d.number))
+                            .collect();
+                        let target = usize::from(title == 1 && dice.next(4) != 0);
+                        let mut f = Footprint::default();
+                        if dice.next(2) == 0 {
+                            let a = dice.next(6) * 100;
+                            f.write(a as usize, a as usize + 50);
+                        }
+                        let f = f.sealed();
+                        let want = book.waits_for(target, title, &deps, &f, [0, 0], false);
+                        assert!(
+                            want <= book.signalled[1 - target],
+                            "a wait for what was never queued"
+                        );
+                        let id = went.len();
+                        value += 1;
+                        if want > 0 {
+                            queues[target].push(Cmd::Wait(1 - target, want));
+                        }
+                        queues[target].push(Cmd::Work(id));
+                        queues[target].push(Cmd::Signal(target, value));
+                        queues[2].push(Cmd::Wait(target, value));
+                        queues[2].push(Cmd::Signal(2, value));
+                        for &(lane, number) in &deps {
+                            resolved += 1;
+                            let first = by_lane[&(lane, number)];
+                            named.push((first, id));
+                        }
+                        book.sent(target, title, value, f);
+                        book.planned(title, plan.number);
+                        by_lane.insert((title, plan.number), id);
+                        went.push(target);
+                    }
+                }
+            }
+            for _ in 0..3 {
+                let Ended::Done(log) = run(&queues, &mut dice) else {
+                    panic!("round {round} stalled: {queues:?}");
+                };
+                let place = |id: usize| log.iter().position(|c| *c == Cmd2::Work(id)).unwrap();
+                for &(first, waiting) in &named {
+                    // (On one queue it is the queue's own order.)
+                    assert!(
+                        place(first) < place(waiting),
+                        "round {round}: {first} named by {waiting}"
+                    );
+                }
+            }
+        }
+        assert!(
+            resolved > 100,
+            "the random titles resolved only {resolved} waits"
+        );
+    }
+
+    #[test]
+    fn in_one_order_everything_in_the_air_on_the_other_queue_is_waited_for() {
+        let mut b = Book::default();
+        b.sent(0, 0, 3, fp(&[], &[(0, 10)]));
+        b.sent(0, 0, 5, fp(&[], &[(100, 110)]));
+        let apart = fp(&[(500, 510)], &[]);
+        // Nothing in common, and still: the newest, as one queue would have it.
+        assert_eq!(b.waits_for(1, 1, &[], &apart, [0, 0], true), 5);
+        // Only what is not done.
+        assert_eq!(b.waits_for(1, 1, &[], &apart, [4, 0], true), 5);
+        assert_eq!(b.waits_for(1, 1, &[], &apart, [5, 0], true), 0);
+        assert_eq!(b.stats.waits, [0, 0, 0, 2]);
+        // The same from the other side.
+        b.sent(1, 1, 6, Footprint::default().sealed());
+        assert_eq!(b.waits_for(0, 0, &[], &apart, [5, 0], true), 6);
+    }
+
+    #[test]
+    fn a_texture_is_used_by_one_queue_at_a_time() {
+        let mut a = Footprint::default();
+        a.texture(0x1000);
+        let mut b = Footprint::default();
+        b.texture(0x1000);
+        let mut c = Footprint::default();
+        c.texture(0x2000);
+        let (a, b, c) = (a.sealed(), b.sealed(), c.sealed());
+        assert!(
+            a.conflicts(&b),
+            "two uses of the same texture, even two reads"
+        );
+        assert!(!a.conflicts(&c));
+        // Not a copy in the card's memory, not title memory.
+        let mut copy = Footprint::default();
+        copy.card_write(0x1000 - 1, 0, u32::MAX);
+        assert!(!a.conflicts(&copy.sealed()));
+        assert!(!a.conflicts(&fp(&[], &[(0x1000, 0x1001)])));
+    }
+
+    #[test]
+    fn a_compute_list_keeps_to_the_states_a_compute_queue_may_use() {
+        const RENDER_TARGET: u32 = 0x4;
+        const UNORDERED: u32 = 0x8;
+        const DEPTH_WRITE: u32 = 0x10;
+        const DEPTH_READ: u32 = 0x20;
+        const NON_PIXEL: u32 = 0x40;
+        const PIXEL: u32 = 0x80;
+        const COPY_DEST: u32 = 0x400;
+        const COPY_SOURCE: u32 = 0x800;
+        // What a title reads a texture as: in a compute list, the non-pixel state.
+        assert_eq!(compute_legal(NON_PIXEL | PIXEL), NON_PIXEL);
+        assert_eq!(compute_legal(PIXEL), NON_PIXEL);
+        assert_eq!(compute_legal(DEPTH_READ | NON_PIXEL | PIXEL), NON_PIXEL);
+        assert_eq!(compute_legal(DEPTH_READ), NON_PIXEL);
+        // What it may keep.
+        for state in [
+            0,
+            UNORDERED,
+            NON_PIXEL,
+            COPY_DEST,
+            COPY_SOURCE,
+            UNORDERED | NON_PIXEL,
+            COPY_SOURCE | NON_PIXEL,
+        ] {
+            assert_eq!(compute_legal(state), state);
+        }
+        // Whatever the state is, what comes out is legal and not nothing unless it was nothing.
+        for state in 0..0x4000u32 {
+            let legal = compute_legal(state);
+            assert_eq!(legal & DRAWING_STATES, 0, "{state:#x}");
+            assert_eq!(legal == 0, state == 0, "{state:#x}");
+        }
+        for drawing in [
+            RENDER_TARGET,
+            DEPTH_WRITE,
+            DEPTH_READ,
+            PIXEL,
+            0x100,
+            0x1000,
+            0x2000,
+            0x100_0000,
+        ] {
+            assert_ne!(DRAWING_STATES & drawing, 0, "{drawing:#x}");
+        }
+    }
+
     #[test]
     fn what_is_done_is_not_waited_for() {
         let mut b = Book::default();
         b.sent(0, 0, 4, fp(&[], &[(0, 10)]));
         let mine = fp(&[(5, 6)], &[]);
-        assert_eq!(b.waits_for(1, 1, &[], &mine, [3, 0]), 4);
-        assert_eq!(b.waits_for(1, 1, &[], &mine, [4, 0]), 0, "the card has it");
+        assert_eq!(b.waits_for(1, 1, &[], &mine, [3, 0], false), 4);
+        assert_eq!(
+            b.waits_for(1, 1, &[], &mine, [4, 0], false),
+            0,
+            "the card has it"
+        );
         assert!(b.flying[0].is_empty(), "and it is no longer in the air");
     }
 }

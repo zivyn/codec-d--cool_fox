@@ -76,11 +76,11 @@ pub(crate) struct Dep {
 
 /// A submission as the model numbered it.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Plan {
-    pub(super) lane: Lane,
-    pub(super) number: u64,
+pub(crate) struct Plan {
+    pub(crate) lane: Lane,
+    pub(crate) number: u64,
     /// The submissions of the other lane it waits for (the latest of them).
-    pub(super) waits: Vec<Dep>,
+    pub(crate) waits: Vec<Dep>,
 }
 
 /// What a lane's next submission stands behind.
@@ -111,7 +111,7 @@ pub(super) struct Stats {
 
 /// The two lanes' bookkeeping.
 #[derive(Default)]
-pub(super) struct Model {
+pub(crate) struct Model {
     /// Submissions numbered, by lane.
     ran: [u64; 2],
     /// Numbers whose signal on the lane's host fence is queued.
@@ -131,7 +131,7 @@ pub(super) struct Model {
 impl Model {
     /// The queue of `lane` signals `fence` to `value`: after what the lane
     /// has run so far.
-    pub(super) fn signal(&mut self, lane: Lane, fence: usize, value: u64) {
+    pub(crate) fn signal(&mut self, lane: Lane, fence: usize, value: u64) {
         let dep = Dep {
             lane,
             number: self.ran[lane.index()],
@@ -145,13 +145,13 @@ impl Model {
 
     /// The queue of `lane` waits for `fence` to reach `value`: what it is
     /// given next stands behind it.
-    pub(super) fn wait_fence(&mut self, lane: Lane, fence: usize, value: u64) {
+    pub(crate) fn wait_fence(&mut self, lane: Lane, fence: usize, value: u64) {
         self.ask(lane, Ask::Fence(fence, value));
     }
 
     /// The queue of `lane` waits for the memory at `address` to hold what
     /// `holds` accepts.
-    pub(super) fn wait_value(
+    pub(crate) fn wait_value(
         &mut self,
         lane: Lane,
         address: usize,
@@ -170,7 +170,7 @@ impl Model {
 
     /// A submission of `lane` goes, with the values its lists write at the end
     /// (`writes`: address and value).
-    pub(super) fn run(&mut self, lane: Lane, writes: &[(usize, u64)]) -> Plan {
+    pub(crate) fn run(&mut self, lane: Lane, writes: &[(usize, u64)]) -> Plan {
         let i = lane.index();
         self.ran[i] += 1;
         self.stats.runs[i] += 1;
@@ -297,6 +297,11 @@ pub(crate) fn mode() -> u8 {
         );
     }
     mode
+}
+
+/// Whether the submit line is on (stage 2 needs it: the lists of the compute type only ever go through it).
+pub(crate) fn line_on() -> bool {
+    super::behind::on()
 }
 
 /// Whether the lanes are numbered at all (stages 1 and 2).

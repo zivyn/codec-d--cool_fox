@@ -70,7 +70,9 @@ use super::*;
 /// (May change while the title runs, `VICTORY_AB`: [`offer`] reads it once; [`join`] and [`take`] look at what
 /// there is whatever it says.)
 pub(super) fn on() -> bool {
-    prefetch::on() && crate::queue::stage_front() && pending_flights() && crate::watch::once()
+    // (Not with the compute lane on a queue of its own, `lanes`: the thread would prepare the card's steps before it is
+    // known which queue they are for.)
+    !lanes::lists_compute() && prefetch::on() && crate::queue::stage_front() && pending_flights() && crate::watch::once()
 }
 
 /// What was done: the lists it was done for (addresses, in order), where their parts begin, the number the

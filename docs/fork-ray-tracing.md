@@ -14,6 +14,18 @@ since, so what follows says what the code does, not that the picture is right.
 **`VICTORY_AMBIENT=1`** puts an estimate of that light in its place for next to
 nothing, and rests by itself once the builder has run (below).
 
+Update, 2026-11-28 (`integ/validation-23`): the builder is still off by default, and the picture is still wrong with it
+on. The title's builder (53 compute pipelines) runs with `VICTORY_BVH_BUILDER=1`, and the traversal is an emulation of
+`image_bvh_intersect_ray` in DXIL (bit-exact in 311 cases checked, no `RayQuery`); DXR was ruled out (the layer does not
+see the geometry, and 64 loops read node bytes). With it the card works about 16 ms and the lane about 18 ms more and
+the PC uses about 3 GB more. The main suspect for the wrong picture is overlapping dynamic structures: the title reads
+the compacted size of a structure one or two frames before the card writes it (8 of 65 were whole in a run of 2026-11-25).
+`VICTORY_BVH_SIZES=off|wait|predict|both` (below) is the experiment: `predict` writes the size learned for a structure into
+its slot before the title reads it, and a frame-by-frame model says it misses only the first two questions of each
+structure; it has not been run in the game. The test of a box emulated in DXIL misses a ray parallel to an axis on the
+maximum face. The ray-tracing pair below is on by default since 2026-11-28 (the poster is the console's pale score with it,
+purple without; about 10 ms a frame).
+
 ## What the builder switch changes
 
 Without it the title still dispatches every trace, shading and probe program of
@@ -139,7 +151,8 @@ after it was given them as an unordered access view.
 | `VICTORY_MEMORY_FAULT_PAGES=<n>` | the most pages taken from faults in a run (8192; it was 2048 and was spent in seconds) |
 | `VICTORY_MEMORY_CARD_OVER=1` | a copy by address goes on the card even when the card is over its budget (else it is in the PC's memory, read over the bus: the log says so, `a copy is in the PC's memory`) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |
-| `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow) |
+| `VICTORY_BVH_SIZES_WAIT=1` | submissions that ask for structures' sizes are waited for (off: no help, slow); the same as `VICTORY_BVH_SIZES=wait` |
+| `VICTORY_BVH_SIZES=off\|wait\|predict\|both` | with the builder: what is done about the compacted sizes the title reads (`sizes.rs`): nothing, wait for the card, write the learned size into the slot before the title reads it, or both (off) |
 | `VICTORY_BVH_BOUNDS=0` | the builder's accesses are not bounded |
 | `VICTORY_BVH_TRACE=1` | logs what sizes are asked, when they came, and the copies (diagnostics) |
 | `VICTORY_BVH_QUARANTINE=1` | nothing it stores comes back to title memory |
@@ -227,7 +240,7 @@ fork's constant.
 
 | variable | does |
 |---|---|
-| `VICTORY_AMBIENT=<share>` | the estimate, 1 all of it (unset: the title's own) |
+| `VICTORY_AMBIENT=<share>` | the estimate, 1 all of it (unset: 0.8, from `defaults.rs`; `=0` leaves the title's own) |
 | `VICTORY_AMBIENT=<share>,floor:<level>` | the estimate, and nowhere less than the constant (the estimate is the mean of what visible surfaces send out, so a room only a sun patch lights stays near black) |
 | `VICTORY_AMBIENT=constant:<level>` | the same light everywhere |
 | `VICTORY_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |

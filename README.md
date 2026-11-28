@@ -37,8 +37,15 @@ $env:VICTORY_CACHE_DIR = 'D:\VIctory\cache'   # recommended: keeps the shader ca
 .\Play-VIctory.cmd pareto-residency
 ```
 
-The launcher selects the Series S profile and the residency settings tested on
-the RTX 4060. Without `VICTORY_CACHE_DIR` the cache goes to
+The launcher selects the Series S profile. The settings the title is played with
+(the ones checked in the game on the RTX 4060: relay, card steps, thin lists,
+joined parts, upload ahead, ambient light and the rest) are built into the
+executable, so `victory.exe run <game> --console series-s --execute` with no
+`VICTORY_*` variable in the environment behaves as the launcher does; they are in
+`crates/victory-gpu/src/defaults.rs`. A variable you set wins over them and `=0` turns
+one off (`VICTORY_THIN=0`; `VICTORY_JOIN_PARTS=1` and `VICTORY_MAP_THREADS=1` take a
+number; `VICTORY_AMBIENT=0` and `VICTORY_AMBIENT_AIR=0` leave the title's own light).
+Other `VICTORY_*` variables are for comparing and for diagnostics. Without `VICTORY_CACHE_DIR` the cache goes to
 `%LOCALAPPDATA%\VIctory\cache-pareto`, and it grows large. Requirements:
 Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and
 mesh shader support. The first run builds shader pipelines and stutters;

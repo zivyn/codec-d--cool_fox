@@ -1393,7 +1393,7 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
 const GROUP: usize = 64;
 
 /// How many threads map a group of pages side by side (`VICTORY_MAP_THREADS`;
-/// 8 unless set; 1: the caller alone, a page after the other; `auto`: 1 while
+/// 1 unless set (`victory_gpu::defaults`; 8 when it is set to something else); 1: the caller alone, a page after the other; `auto`: 1 while
 /// mapping takes little of the time, [`WIDE`] while the title streams as fast
 /// as its pages are mapped, [`Busy`]).
 ///
@@ -1428,7 +1428,7 @@ const WIDE: usize = 16;
 /// `VICTORY_MAP_THREADS` as a number; `None`: by how much there is to map.
 fn asked_threads() -> Option<usize> {
     static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
-        match std::env::var("VICTORY_MAP_THREADS") {
+        match victory_gpu::defaults::var("VICTORY_MAP_THREADS") {
             Ok(v) if v.trim() == "auto" => None,
             v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 32)),
         }

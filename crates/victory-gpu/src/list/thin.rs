@@ -56,7 +56,7 @@ pub(crate) fn on() -> bool {
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
 }
 
 /// What a title list keeps: the recording being written and the words of it

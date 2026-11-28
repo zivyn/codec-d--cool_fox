@@ -5263,6 +5263,23 @@ fn constants_text(address: u64, size: u32) -> String {
     text
 }
 
+/// `VICTORY_CAPTURE_BUFFER_WORDS=<bytes>` (BAND2): a raw buffer the title placed in its memory
+/// (dimension 1, no format) of at most that many bytes is listed with its non-zero dwords, as a
+/// constant buffer is by `VICTORY_CAPTURE_CBV`. The probe passes of the indirect light read a
+/// 2,044-byte block of per-view parameters (the volume's size, its slice distribution) that no
+/// census listed; whether it differs between a banded process and a smooth one is the question.
+#[cfg(feature = "diagnostics")]
+fn placed_words(dimension: u32, format: u32, width: u64, address: u64) -> String {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_BUFFER_WORDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    });
+    if limit == 0 || dimension != 1 || format != 0 || width == 0 || width > limit || address == 0 {
+        return String::new();
+    }
+    constants_text(address, width as u32)
+}
+
 /// A view in a few words (diagnostics builds).
 #[cfg(feature = "diagnostics")]
 fn describe(view: Option<&View>) -> String {
@@ -5285,15 +5302,15 @@ fn describe(view: Option<&View>) -> String {
                 format!("uav resource {r:#x} buffer {range:?}")
             }
         },
-        Some(View::Placed(u, r, d)) => format!(
-            "placed uav={u} dim {} {}x{} f{} layout {:#x} at {:#x}",
-            r[0],
-            u64::from(r[4]) | u64::from(r[5]) << 32,
-            r[6],
-            r[8],
-            r[11],
-            u64::from(d[10]) | u64::from(d[11]) << 32
-        ),
+        Some(View::Placed(u, r, d)) => {
+            let width = u64::from(r[4]) | u64::from(r[5]) << 32;
+            let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+            let base = format!(
+                "placed uav={u} dim {} {width}x{} f{} layout {:#x} at {address:#x}",
+                r[0], r[6], r[8], r[11]
+            );
+            format!("{base}{}", placed_words(r[0], r[8], width, address))
+        }
         // The first four values, as a colour rectangle's constants are.
         Some(View::Constant(address, size))
             if *size >= 16 && crate::texture::committed(*address as *const u8, 16) =>

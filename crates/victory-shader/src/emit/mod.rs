@@ -219,6 +219,12 @@ pub fn default_on_switches() -> [bool; 2] {
     [lower::half_exit(), crate::ir::keep_loop_skips()]
 }
 
+/// `VICTORY_KEPT_SKIPS_WIDE` as the value in force (0 off, the default; 1 the safe classes; 2 all),
+/// for the shader cache key.
+pub fn kept_skips_wide_code() -> u8 {
+    form::kept_skips_code()
+}
+
 /// The stage of a translated program, for its loops' limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LoopStage {

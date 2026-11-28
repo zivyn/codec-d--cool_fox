@@ -44,9 +44,9 @@ pub enum Form {
 /// How much of the kept skips' wave-wide form `VICTORY_KEPT_SKIPS_WIDE` allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Mode {
-    /// `=0`: none.
+    /// The default (unset, or `=0`): none.
     Off,
-    /// The default: where no branch of the form can hang the thread group (class A or B,
+    /// `=1`: where no branch of the form can hang the thread group (class A or B,
     /// [`super::wide_class`]).
     Safe,
     /// `=all`: whatever the classes say (to see the form the title lost the card in).
@@ -55,17 +55,29 @@ pub(super) enum Mode {
 
 /// `VICTORY_KEPT_SKIPS_WIDE`: with `VICTORY_KEEP_LOOP_SKIPS`, the skips and early-outs over loops of
 /// a program that has to be retried are kept and taken wave-wide ([`Form::KeptSkipsWide`],
-/// [`super::kept_wide`]), where that is safe. Part of the translation: the shader cache keys on
-/// the variable.
+/// [`super::kept_wide`]), where that is safe. OFF unless `=1` (the safe subset) or `=all`: with it
+/// on by default (integ/validation-21, 116 programs in the form) the title lost the card while
+/// loading in 2 of about 4 starts, against none in about 7 starts without it; DefragHeap's cut
+/// (7.8 ms) waits for a subset that is proven safe. Part of the translation: the shader cache keys
+/// on the value in force ([`kept_skips_code`]).
 pub(super) fn kept_skips_mode() -> Mode {
     #[cfg(test)]
     if let Some(mode) = TEST_KEPT_SKIPS_WIDE.get() {
         return mode;
     }
     match std::env::var("VICTORY_KEPT_SKIPS_WIDE").ok().as_deref().map(str::trim) {
-        Some("0") => Mode::Off,
         Some("all") => Mode::All,
-        _ => Mode::Safe,
+        Some("1") => Mode::Safe,
+        _ => Mode::Off,
+    }
+}
+
+/// [`kept_skips_mode`] as a number for the shader cache key (0 off, 1 safe, 2 all).
+pub(super) fn kept_skips_code() -> u8 {
+    match kept_skips_mode() {
+        Mode::Off => 0,
+        Mode::Safe => 1,
+        Mode::All => 2,
     }
 }
 

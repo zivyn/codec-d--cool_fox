@@ -101,7 +101,6 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_WIDE_FIRST",
             "VICTORY_VIEW_INDEX",
             "VICTORY_FOLD_VIEWS",
-            "VICTORY_KEPT_SKIPS_WIDE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -121,6 +120,10 @@ fn build() -> [u8; 32] {
             bytes.push(u8::from(on));
             bytes.push(0);
         }
+        // The wave-wide form of the kept skips (off unless asked for): by the value in force.
+        bytes.extend_from_slice(b"VICTORY_KEPT_SKIPS_WIDE=");
+        bytes.push(victory_shader::emit::kept_skips_wide_code());
+        bytes.push(0);
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes

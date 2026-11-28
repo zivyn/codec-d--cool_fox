@@ -164,9 +164,10 @@ The cache key holds the value in force (`victory_shader::emit::default_on_switch
 
 | switch | default | since | evidence |
 |---|---|---|---|
-| `VICTORY_KEEP_LOOP_SKIPS` | **on** (`=0` is off) | 2026-11-28 (integ/validation-18) | RTX 4060, LX-A (off) vs LX-B (on): alias copy 19.1 -> 1.9 ms under instrumentation, GPU commands 166.7 -> 140.2 ms in total, no errors, no device removal, identical picture |
+| `VICTORY_KEEP_LOOP_SKIPS` | **on** (`=0` is off); it changes no form unless `VICTORY_KEPT_SKIPS_WIDE` is on (below) | 2026-11-28 (integ/validation-18) | RTX 4060, LX-A (off) vs LX-B (on): alias copy 19.1 -> 1.9 ms under instrumentation, GPU commands 166.7 -> 140.2 ms in total, no errors, no device removal, identical picture |
 | `VICTORY_HALF_EXIT` | **on** (`=0` is off) | 2026-11-28 (integ/validation-18) | same pilot: DefragHeap's loop cut 7.78 ms -> under 0.5 ms |
 | `VICTORY_LOCAL_EXIT` | off (`=1`, `=2`) | not flipped | fails its RTX unit test; being fixed |
+| `VICTORY_KEPT_SKIPS_WIDE` | **off** (`=1`: the safe classes, `=all`: whatever the classes say); the shader cache key holds the value in force | 2026-11-28 (integ/validation-23: default back to off) | with the wave-wide form of the kept skips on by default (integ/validation-21, 116 programs in the form, 3 of them DefragHeap's) the title lost the card (GPU hang) while loading in 2 of about 4 starts, against none in about 7 starts of the family with it off (FORM1 v1). Without it `VICTORY_KEEP_LOOP_SKIPS` moves no program out of the exact form it had without the switch, and DefragHeap's cut (7.8 ms to under 0.5) is lost again until HANG1 shows a subset of the form that is safe |
 
 ## Not converted, and why
 

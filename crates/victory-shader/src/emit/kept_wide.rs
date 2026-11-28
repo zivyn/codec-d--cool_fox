@@ -4,7 +4,7 @@
 //! is code every lane runs, so the two host waves exchange in it. Taken only where no branch of
 //! the form can hang the thread group ([`super::wide_class`]): a group barrier under a branch that
 //! the waves of a group may decide differently is how the device was lost.
-//! `VICTORY_KEPT_SKIPS_WIDE=0` leaves the form out, `=all` takes it whatever the classes say.
+//! The form is out unless `VICTORY_KEPT_SKIPS_WIDE=1` (the safe classes) or `=all` (whatever the classes say).
 
 use super::form::{self, Mode};
 use super::wide_class;

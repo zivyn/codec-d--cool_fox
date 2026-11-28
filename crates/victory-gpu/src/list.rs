@@ -803,12 +803,15 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             // (`HostList::transition`); subresources are not told apart.
             let wanted = crate::host::texture_state(b.last as u32);
             let (texture, before) = list.transition(b.first, wanted)?;
+            let after = crate::host::legal_state(texture, wanted);
+            // (A compute list: the states of drawing are left out, as `HostList::transition` did.)
+            let after = if list.is_compute() { crate::host::compute_legal(after) } else { after };
             Some(Barrier {
                 kind: 0,
                 flags: 0,
                 first: texture.as_raw().cast_const().cast(),
                 second: 0xffff_ffff | (u64::from(before) << 32),
-                last: u64::from(crate::host::legal_state(texture, wanted)),
+                last: u64::from(after),
             })
         }
         1 => Some(Barrier {
@@ -915,6 +918,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
+        let state = if list.is_compute() { crate::host::compute_legal(state) } else { state };
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         crate::barrier::EMITTED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: an open list and a live texture.

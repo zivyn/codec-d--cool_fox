@@ -309,6 +309,13 @@ fn what_the_compute_queue_writes_the_drawing_queue_reads_after_the_wait() {
         expected.push(now);
         let write = h.step(D3D12_COMMAND_LIST_TYPE_COMPUTE, slow, &data, value);
         let read = h.copy(D3D12_COMMAND_LIST_TYPE_DIRECT, &back, round - 1, &data);
+        // SAFETY: our queue and fence; the signal it waits for was queued in the round before.
+        unsafe {
+            if round > 1 {
+                // (What the drawing queue reads is not written over before it has read it.)
+                h.compute.Wait(&h.fences[0], round - 1).expect("a wait");
+            }
+        }
         Harness::run(&h.compute, &write);
         // SAFETY: our queues and fences.
         unsafe {
@@ -452,6 +459,11 @@ fn a_random_title_through_the_book_gives_what_the_order_gives() {
             queue.Signal(&h.fences[target], sent).expect("a signal");
             h.order.Wait(&h.fences[target], sent).expect("a wait");
             h.order.Signal(&h.fences[2], sent).expect("a signal");
+            let reason = h.device.GetDeviceRemovedReason();
+            assert!(
+                reason.is_ok(),
+                "submission {i}: title {title}, cell {cell}, write {write}, target {target}, wait {want}: {reason:?}"
+            );
         }
         book.sent(target, title, sent, fp);
         book.planned(title, i + 1);
@@ -474,4 +486,33 @@ fn a_random_title_through_the_book_gives_what_the_order_gives() {
     unsafe { h.direct.Signal(&h.fences[0], sent + 1).expect("a signal") };
     assert!(h.reached(&h.fences[0], sent + 1, 60_000));
     assert_eq!(h.words(&finals, 6), value.to_vec());
+}
+
+/// A list of the compute type runs on the drawing queue (what the host's compute lists do when they do not go to
+/// the compute queue), and a list of the compute type runs on the compute queue; the device stays.
+#[test]
+fn a_compute_list_runs_on_either_queue() {
+    let Some(mut h) = Harness::new() else { return };
+    let data = h.data();
+    let back = h.readback(16);
+    for (n, queue) in [h.direct.clone(), h.compute.clone(), h.direct.clone()]
+        .iter()
+        .enumerate()
+    {
+        let write = h.step(D3D12_COMMAND_LIST_TYPE_COMPUTE, false, &data, n as u32 + 1);
+        Harness::run(queue, &write);
+        // SAFETY: our queue and fence.
+        unsafe { queue.Signal(&h.fences[0], n as u64 + 1).expect("a signal") };
+        assert!(h.reached(&h.fences[0], n as u64 + 1, 60_000), "round {n}");
+        // SAFETY: a plain query.
+        let reason = unsafe { h.device.GetDeviceRemovedReason() };
+        assert!(reason.is_ok(), "round {n} on queue {n}: {reason:?}");
+    }
+    let read = h.copy(D3D12_COMMAND_LIST_TYPE_DIRECT, &back, 0, &data);
+    Harness::run(&h.direct, &read);
+    // SAFETY: our queue and fence.
+    unsafe { h.direct.Signal(&h.fences[0], 10).expect("a signal") };
+    assert!(h.reached(&h.fences[0], 10, 60_000));
+    // ((0 * 3 + 1) * 3 + 2) * 3 + 3
+    assert_eq!(h.words(&back, 1), [18]);
 }

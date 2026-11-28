@@ -7971,6 +7971,7 @@ impl HostList {
         // hold the copy from here on.
         let texture: &'static ID3D12Resource = unsafe { &*std::ptr::from_ref(&copy.texture) };
         let wanted = legal_for(copy.flags(), wanted);
+        let wanted = if self.compute { compute_legal(wanted) } else { wanted };
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -7994,6 +7995,7 @@ impl HostList {
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
         let wanted = legal_for(copy.flags(), wanted);
+        let wanted = if self.compute { compute_legal(wanted) } else { wanted };
         self.changed_something();
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
@@ -11973,6 +11975,17 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
         .fold(state, |s, &(_, _, bits)| s & !bits)
+}
+
+/// `state` for a list of the compute type (`VICTORY_ASYNC_COMPUTE=2`): the states of drawing (render target, depth,
+/// pixel shader resource, stream out, resolve, shading rate) are not for a compute queue, and what a compute list
+/// reads a texture in is the non-pixel shader resource state.
+pub(crate) fn compute_legal(state: u32) -> u32 {
+    const DRAWING: u32 = 0x4 | 0x10 | 0x20 | 0x80 | 0x100 | 0x1000 | 0x2000 | 0x100_0000;
+    match state & !DRAWING {
+        0 if state != 0 => 0x40,
+        rest => rest,
+    }
 }
 
 impl Host {

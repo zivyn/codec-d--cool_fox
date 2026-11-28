@@ -36,14 +36,14 @@ const MOST: u64 = 96 << 20;
 /// Bytes and textures of one submission at most.
 const BATCH: (u64, usize) = (16 << 20, 64);
 
-/// Whether it is on (`VICTORY_UPLOAD_AHEAD`; off).
+/// Whether it is on (`VICTORY_UPLOAD_AHEAD`; on by default, `=0` turns it off).
 pub(crate) fn on() -> bool {
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_UPLOAD_AHEAD") {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_UPLOAD_AHEAD").is_some_and(|v| v != "0"))
 }
 
 /// An upload on its way.

@@ -319,14 +319,14 @@ struct Flip {
 }
 
 /// Whether a title slot shows a texture that is new to it only once the
-/// submission with its upload has finished (`VICTORY_SHOW_AFTER=1`; off).
+/// submission with its upload has finished (`VICTORY_SHOW_AFTER`; on by default, `=0` turns it off).
 /// Shown at once, the lists already on the card read it by index while it is
 /// made: all three losses whose report had the address book (n08, n11, n15)
 /// were page faults in a texture made and shown in the last tenth of a
 /// second.
 pub(crate) fn show_after() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v != "0"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v != "0"))
 }
 
 /// Slots shown late ([`show_after`]), the frames they waited, the longest;

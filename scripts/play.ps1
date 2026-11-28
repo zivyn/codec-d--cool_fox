@@ -12,16 +12,18 @@ param(
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
+# The settings the title is played with are built into the executable (README, "Run"); what is set here is
+# what the executable does not do by itself.
 $settings = @{
-    VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
-    VICTORY_JOIN_COPIES = '1'; VICTORY_INDIRECT_WINDOW = '1'; VICTORY_RELAY_COPY = '1'; VICTORY_CARD_STEPS = '2'
-    VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_TITLE_PRIORITIES = '0'; VICTORY_CARD_AWAKE = '1'
-    VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
+    VICTORY_TITLE_PRIORITIES = '0'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
 }
 if ($Safe) {
+    # Off what the executable has on: the newer, faster ways ("=0" turns a built-in setting off). JOIN_PARTS was not
+    # set in -Safe before the settings were built in, which left the code's own 16.
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
-} else {
-    $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    $settings.VICTORY_THIN = '0'; $settings.VICTORY_JOIN_PARTS = '16'; $settings.VICTORY_UPLOAD_AHEAD = '0'
+    # The launcher's other three, which this script did not set either (0: as the code is without them).
+    $settings.VICTORY_AMBIENT_AIR = '0'; $settings.VICTORY_LEVELS_ON_DEMAND = '0'; $settings.VICTORY_CARD_BUFFERS_MIN_KB = '0'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }

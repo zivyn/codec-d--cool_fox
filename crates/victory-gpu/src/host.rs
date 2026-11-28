@@ -2222,7 +2222,7 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
-/// once (`VICTORY_CARD_REHASH_RUNS=1`; off by default), and not in a pass
+/// once (`VICTORY_CARD_REHASH_RUNS`; on by default, `=0` turns it off), and not in a pass
 /// per range sent up.
 ///
 /// These passes are ours, they run on the card before every submission's
@@ -2232,7 +2232,7 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -2577,7 +2577,7 @@ fn relay_exact() -> bool {
     // Stage 2 unless `VICTORY_RELAY=1` asks for the first one (the default
     // since the walls of the first room were found drawn in every run with
     // this set and in fewer than half without it).
-    *ON.get_or_init(|| relay() && std::env::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
+    *ON.get_or_init(|| relay() && crate::defaults::var_os("VICTORY_RELAY").is_none_or(|v| v == "2"))
 }
 
 /// Whether the pieces the relay fetches from the card's memory come over the
@@ -2598,7 +2598,7 @@ fn relay_exact() -> bool {
 /// may be in what is fetched, as before.
 fn relay_copy() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_RELAY_COPY").is_some_and(|v| v == "1"))
 }
 
 /// Told when something joins [`LINE`], for the thread that lands flights
@@ -3402,7 +3402,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
 }
 
 /// How many parts of submissions, and lists, the line's thread gives to the
-/// host as one (`VICTORY_JOIN_PARTS=<n>`; 16 by default, 1 turns it off; `VICTORY_JOIN_LISTS`,
+/// host as one (`VICTORY_JOIN_PARTS=<n>`; 8 by default (`crate::defaults`; 16 where those do not apply, the tests), 1 turns it off; `VICTORY_JOIN_LISTS`,
 /// 96).
 ///
 /// The idea is fxceless/victory-fork's, commit 39731795 (GPL-3.0-or-later, as
@@ -3422,7 +3422,7 @@ pub(crate) fn joins() -> (usize, usize) {
 
 fn joins_asked() -> (usize, usize) {
     static MOST: OnceLock<(usize, usize)> = OnceLock::new();
-    let of = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
+    let of = |name: &str| crate::defaults::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok());
     let (parts, lists) = *MOST.get_or_init(|| (of("VICTORY_JOIN_PARTS").unwrap_or(16).max(1), of("VICTORY_JOIN_LISTS").unwrap_or(96).max(1)));
     #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_JOIN_PARTS") {
@@ -4314,7 +4314,7 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those

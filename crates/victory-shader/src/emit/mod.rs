@@ -828,9 +828,11 @@ fn emit_forms_in(
             *form_out = Form::KeptSkipsWide;
             return again.map(|(shader, _)| shader);
         }
+        // (the forms without the skips over loops that the switch keeps: those are the wave-wide
+        // form above, or not at all)
         let forms = [
-            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
-            ("without skips", form("without skips", ir::without_skips(p, false))),
+            ("without early-outs", form("without early-outs", ir::drop_early_outs_as(p, false).0)),
+            ("without skips", form("without skips", ir::drop_skips_as(p, false, false).0)),
         ];
         for (i, (name, f)) in forms.iter().enumerate() {
             if let Some((p, st, io, res)) = f {
@@ -884,7 +886,7 @@ fn emit_forms_in(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on { form("without skips, scalars followed", ir::drop_skips_as(p, true, false).0) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -1000,7 +1002,7 @@ fn emit_forms_in(
         // loops lost the card for programs the approximate forms ran).
         // (`VICTORY_WAVE_WIDE=0` leaves it out.)
         if wide_option.is_none() {
-            let deep = form("without skips, scalars followed", ir::without_skips(p, true));
+            let deep = form("without skips, scalars followed", ir::drop_skips_as(p, true, false).0);
             let again = widen_from(deep.as_ref().map(|f| &f.0), false);
             report("wave-wide branches (last resort)", &again);
             if done(&again) {

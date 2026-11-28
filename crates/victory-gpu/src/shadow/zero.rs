@@ -176,8 +176,9 @@ pub(crate) fn cell_of(range: (u64, u64), address: u64, cell: u64) -> (u64, u64) 
     if b - a <= cell {
         return (a, b - a);
     }
-    let start = (address / cell * cell).max(a);
-    (start, (start + cell).min(b) - start)
+    let grid = address / cell * cell;
+    let start = grid.max(a);
+    (start, (grid + cell).min(b) - start)
 }
 
 thread_local! {

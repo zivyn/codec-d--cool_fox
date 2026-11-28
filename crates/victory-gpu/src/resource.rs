@@ -1106,11 +1106,24 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        match (self.attributes, ALLOCATOR.get()) {
-            (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
-            // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+        // A heap opened on these pages (`crate::inplace`) keeps the memory from being freed: it goes when the lists
+        // that hold it have run. If they never do, the memory is left: a free the system refuses would be worse.
+        #[cfg(windows)]
+        if crate::inplace::any_pinned() && crate::inplace::pinned_in(self.ptr.as_ptr() as u64, self.layout.size() as u64) {
+            let (at, layout, attributes) = (self.ptr.as_ptr() as usize, self.layout, self.attributes);
+            crate::inplace::free_later(at, layout.size(), Box::new(move || free_memory(at as *mut u8, layout, attributes)));
+            return;
         }
+        free_memory(self.ptr.as_ptr(), self.layout, self.attributes);
+    }
+}
+
+/// Gives memory back to the allocator it came from.
+fn free_memory(ptr: *mut u8, layout: Layout, attributes: Option<u64>) {
+    match (attributes, ALLOCATOR.get()) {
+        (Some(attributes), Some(&(_, free))) => free(ptr.cast(), attributes),
+        // SAFETY: allocated in `Memory::new` with this layout.
+        _ => unsafe { dealloc(ptr, layout) },
     }
 }
 
@@ -3125,6 +3138,12 @@ fn hand_out_resource(
         // title writes the buffer, only shaders and our own copies.
         let gpu_only = heap.kind == 1 || (heap.kind == 4 && heap.cpu_pages == 1);
         crate::shadow::register(at, resource.data() as u64, desc.width, gpu_only);
+        // An upload heap and no unordered access: the title's CPU writes it and no shader can
+        // (`VICTORY_ZEROCOPY=2`: the GPU reads the title's own bytes).
+        const UNORDERED_ACCESS: u32 = 4;
+        if heap.kind == 2 && desc.flags & UNORDERED_ACCESS == 0 {
+            crate::shadow::mark_cpu_written(at, resource.data() as u64);
+        }
         // The big ones are named with how they were made: heap type, CPU page
         // property, pool, flags (what the title could write from the CPU).
         if desc.width >= 16 << 20 {

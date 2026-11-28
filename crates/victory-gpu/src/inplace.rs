@@ -167,11 +167,168 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// `VICTORY_ZEROCOPY`: 0 (unset) off. 1: ranges of title memory that the title itself declares read-only to the
+/// GPU (its page protection; the constant rings and dynamic data the title's CPU writes and shaders only read) are
+/// not copied up to the card: the GPU reads the title's own bytes over the bus ([`crate::shadow`]'s `zero`). 2: also
+/// title buffers in the title's CPU-visible heaps that shaders cannot write (no unordered access), whatever their
+/// size. Read once: a range given to the card and a range left to a copy cannot trade places while the title runs
+/// (the pages a heap stands on cannot be guarded, so a copy of them would not see the title's writes).
+pub(crate) fn zero_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| std::env::var("VICTORY_ZEROCOPY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// The most title memory the zero-copy classes hold in place at once, in bytes (`VICTORY_ZEROCOPY_MB`, 512).
+pub(crate) fn zero_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_ZEROCOPY_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20)
+}
+
+/// What the zero-copy classes did, since the start: cells (ranges the title declares read-only to the GPU) placed and
+/// their bytes; title buffers placed and their bytes; asks answered by a cell; refused for the memory (not private
+/// memory committed whole, or a page of it guarded just then); refused by the host; refused over [`zero_most`].
+pub(crate) static ZERO: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+pub(crate) const Z_CELLS: usize = 0;
+pub(crate) const Z_BUFFERS: usize = 2;
+pub(crate) const Z_ASKS: usize = 4;
+pub(crate) const Z_MEMORY: usize = 5;
+pub(crate) const Z_HOST: usize = 6;
+pub(crate) const Z_CAP: usize = 7;
+pub(crate) const Z_VIEW: usize = 8;
+
+/// [`place_for`] for the zero-copy classes: no level to ask, the memory must be private memory committed whole. `None`
+/// with the reason counted: the caller leaves the range to a copy.
+pub(crate) fn place_zero(start: u64, len: u64, window: bool) -> Option<Placed> {
+    if cover(start as usize, len as usize) != Cover::None {
+        ZERO[Z_VIEW].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > zero_most() {
+        ZERO[Z_CAP].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let host = crate::host::host()?;
+    place_zero_on(&host.device, start, len, window)
+}
+
+/// [`place_zero`] on a device (tests make their own).
+pub(crate) fn place_zero_on(device: &ID3D12Device, start: u64, len: u64, window: bool) -> Option<Placed> {
+    match place_part(device, start, len) {
+        Ok(placed) => {
+            let at = if window { 0 } else { 2 };
+            STATS[at].fetch_add(1, Ordering::Relaxed);
+            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            let z = if window { Z_CELLS } else { Z_BUFFERS };
+            ZERO[z].fetch_add(1, Ordering::Relaxed);
+            ZERO[z + 1].fetch_add(len, Ordering::Relaxed);
+            Some(placed)
+        }
+        Err(None) => {
+            ZERO[Z_MEMORY].fetch_add(1, Ordering::Relaxed);
+            None
+        }
+        Err(Some(e)) => {
+            if ZERO[Z_HOST].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "zero copy: title memory not opened in place: a copy instead");
+            }
+            None
+        }
+    }
+}
+
 /// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+pub(crate) fn gone(window: bool, start: u64, bytes: u64) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    let mut pinned = PINNED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = pinned.iter().position(|&(a, n)| a == start && n == bytes) {
+        pinned.swap_remove(i);
+    }
+}
+
+/// The title memory ranges a placed shadow holds open now, (start, bytes):
+/// while a heap stands on pages the title cannot decommit, free or protect
+/// them (`VirtualFree` and `VirtualProtect` fail with error 87), so what is
+/// about to free memory waits for the ranges that cover it ([`unpin_wait`]).
+static PINNED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// A placed shadow of title memory `[start, start + len)` came to be.
+pub(crate) fn pinned(start: u64, len: u64) {
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).push((start, len));
+}
+
+/// Frees of memory that placed shadows still hold open, to be made when they are gone: (start, bytes, the free).
+type Deferred = (u64, u64, Box<dyn FnOnce() + Send>);
+
+static DEFERRED: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
+static DEFERRED_N: AtomicU64 = AtomicU64::new(0);
+
+/// `free` frees title memory `[at, at + len)`, which a placed shadow holds open: what is in place there is let go of,
+/// and `free` runs when it is gone (checked on every sweep), not now: the lists that hold it run in their own time,
+/// and the title's thread that frees must not wait for them.
+pub(crate) fn free_later(at: usize, len: usize, free: Box<dyn FnOnce() + Send>) {
+    title_memory_freeing(at, len);
+    DEFERRED.lock().unwrap_or_else(|e| e.into_inner()).push((at as u64, len as u64, free));
+    DEFERRED_N.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Makes the frees [`free_later`] kept whose memory no placed shadow holds open any more.
+fn run_deferred() {
+    if DEFERRED_N.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let ready: Vec<Deferred> = {
+        let mut all = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ready = Vec::new();
+        let mut i = 0;
+        while i < all.len() {
+            if pinned_in(all[i].0, all[i].1) {
+                i += 1;
+            } else {
+                ready.push(all.swap_remove(i));
+            }
+        }
+        DEFERRED_N.store(all.len() as u64, Ordering::Relaxed);
+        ready
+    };
+    for (.., free) in ready {
+        free();
+    }
+}
+
+/// Whether anything is in place now (a cheap look: the free paths ask it).
+pub(crate) fn any_pinned() -> bool {
+    STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) > 0
+}
+
+/// Whether a placed shadow holds some of `[at, at + len)` open.
+pub(crate) fn pinned_in(at: u64, len: u64) -> bool {
+    let end = at.saturating_add(len.max(1));
+    PINNED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, n)| a < end && a + n > at)
+}
+
+/// What is about to free or decommit title memory `[at, at + len)` calls: what
+/// is in place there is let go of ([`title_memory_freeing`]), and the call
+/// waits (two seconds at most) until the lists that still hold it have run
+/// and gone, which unpins the pages. `false`: still held open at the end;
+/// the caller must not free (a failed free of a pinned allocation is
+/// better left unmade than retried blind).
+pub(crate) fn unpin_wait(at: usize, len: usize) -> bool {
+    if !any_pinned() || !pinned_in(at as u64, len as u64) {
+        return true;
+    }
+    title_memory_freeing(at, len);
+    let started = std::time::Instant::now();
+    while pinned_in(at as u64, len as u64) {
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // The heap lets go of the pages a moment after its last reference.
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    true
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -208,6 +365,31 @@ fn say() {
         s[5],
         s[6],
         s[7]
+    );
+}
+
+/// The line of what the zero-copy classes hold, every ten seconds while [`zero_level`] is on.
+fn say_zero() {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let z: Vec<u64> = ZERO.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "zero copy (VICTORY_ZEROCOPY={}): {} cells of title memory the title declares read-only to the GPU in place, {} MB, answering {} asks (no copy, no send up, no guard);          {} title buffers of CPU-visible heaps in place, {} MB; kept as copies: {} not private memory committed whole or guarded just then, {} refused by the host,          {} over VICTORY_ZEROCOPY_MB, {} view memory; {}",
+        zero_level(),
+        z[Z_CELLS],
+        z[Z_CELLS + 1] >> 20,
+        z[Z_ASKS],
+        z[Z_BUFFERS],
+        z[Z_BUFFERS + 1] >> 20,
+        z[Z_MEMORY],
+        z[Z_HOST],
+        z[Z_CAP],
+        z[Z_VIEW],
+        crate::shadow::zero_report()
     );
 }
 
@@ -1231,8 +1413,12 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
+    run_deferred();
     if level() > 0 {
         say();
+    }
+    if zero_level() > 0 {
+        say_zero();
     }
     if probe_level() == 0 {
         return;
@@ -1467,5 +1653,155 @@ mod tests {
             views_gone(view as usize, 3 * K64);
             mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
         }
+    }
+
+    // ---- zero copy (`VICTORY_ZEROCOPY`) ----
+
+    use crate::shadow::zero::{self, Policy, Watch};
+    use std::sync::Arc;
+
+    const NOW: Policy = Policy { observe: 0, min_up: 0, cell: 64 << 20, min_buffer: 64 << 10, max_buffer: 64 << 20 };
+
+    /// A range the title declares read-only to the GPU, in private memory of the test's own: (base, at, bytes).
+    unsafe fn declared(pages: usize, from: usize, count: usize) -> (*mut u8, usize, usize) {
+        // SAFETY: an allocation of the test's own.
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), pages * K64, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE).cast::<u8>();
+            assert!(!base.is_null());
+            let (at, bytes) = (base as usize + from * K64, count * K64);
+            crate::shadow::title_memory_gpu_readonly(at, bytes);
+            (base, at, bytes)
+        }
+    }
+
+    /// Lets go of the cells over `[at, at + bytes)` and waits for the pages to come free.
+    unsafe fn release(base: *mut u8, at: usize, bytes: usize) {
+        let gone = zero::let_go(at as u64, (at + bytes) as u64);
+        drop(gone);
+        let freed = (0..500).any(|_| {
+            // SAFETY: the test's own allocation.
+            let done = !pinned_in(at as u64, bytes as u64) && unsafe { mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE) } != 0;
+            if !done {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            done
+        });
+        assert!(freed, "the heap keeps the pages");
+        crate::shadow::title_memory_gpu_writable(at, bytes);
+    }
+
+    /// What the card shows of title memory written by the CPU, with nothing refreshing it: the GPU reads the title's
+    /// bytes at the time it reads, the first write and the one after the cell was made. A copy would show the first.
+    #[test]
+    fn warp_a_declared_read_only_range_is_read_by_the_gpu_as_the_title_writes_it() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: allocations of the test's own.
+        unsafe {
+            let (base, at, bytes) = declared(8, 2, 4);
+            fill(at as *mut u8, bytes, 1);
+            let place = |s: u64, l: u64| place_zero_on(&device, s, l, true);
+            // An ask in the middle of the range, and one without a length.
+            let cell = zero::serve_with(at as u64 + 0x1230, at as u64 + 0x1230 + 64, 1, &NOW, &place).expect("a cell");
+            assert!(cell.in_place());
+            let again = zero::serve_with(at as u64 + 5 * 0x1000, at as u64 + 5 * 0x1000 + 1, 2, &NOW, &place).expect("the same cell");
+            assert!(Arc::ptr_eq(&cell, &again), "the range is one cell");
+            let mut rig = Rig::new(&device).unwrap();
+            let first = rig.fetch(&cell.buffer, cell.offset(at as u64), bytes).unwrap();
+            assert!(same(at as *const u8, &first), "the GPU reads the title's bytes");
+            // The title writes again; nothing refreshes, copies or sends.
+            fill(at as *mut u8, bytes, 9);
+            let second = rig.fetch(&cell.buffer, cell.offset(at as u64), bytes).unwrap();
+            assert!(same(at as *const u8, &second), "the GPU reads what the title wrote after");
+            assert_ne!(first, second, "red check: a copy made before the write would have shown the first");
+            // An ask across the edge of the range is not the cell's.
+            assert!(zero::serve_with(at as u64 - 16, at as u64 + 16, 3, &NOW, &place).is_none());
+            assert!(zero::serve_with(at as u64 + bytes as u64 - 16, at as u64 + bytes as u64 + 16, 3, &NOW, &place).is_none());
+            // Memory that is no range's is nobody's.
+            assert!(zero::serve_with(base as u64 + 8, base as u64 + 24, 3, &NOW, &place).is_none());
+            drop((cell, again));
+            release(base, at, bytes);
+        }
+    }
+
+    /// A range is given to the card only once the title is seen to write it; memory the host refuses stays a copy and
+    /// is tried again later.
+    #[test]
+    fn warp_a_range_is_given_when_it_is_written_and_a_refused_one_is_tried_again() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        let watching = Policy { observe: 10, min_up: 1 << 10, cell: 64 << 20, min_buffer: 0, max_buffer: u64::MAX };
+        // SAFETY: allocations of the test's own.
+        unsafe {
+            let (base, at, bytes) = declared(6, 1, 3);
+            let place = |s: u64, l: u64| place_zero_on(&device, s, l, true);
+            let ask = |frame: u64| zero::serve_with(at as u64, at as u64 + 16, frame, &watching, &place);
+            // Nothing sent up into it yet: not given, however long.
+            assert!(ask(1).is_none());
+            assert!(ask(500).is_none());
+            // 64 KiB sent up in each of 12 frames (counted where the copies are brought up to date: the copy's start
+            // and the offsets in it).
+            let first = crate::frame::current();
+            for _ in 0..12 {
+                zero::observe(base as u64, &[(at - base as usize, at - base as usize + K64)]);
+                crate::frame::test_advance();
+            }
+            let w = zero::watch_of(at as u64).expect("watched");
+            assert_eq!(w.bytes, 12 * K64 as u64);
+            assert_eq!(w.end, (at + bytes) as u64);
+            assert!(w.first >= first, "watched from the frame of the first send");
+            // Written enough over long enough: given. Too little, or too short: not.
+            let seen = Watch { last: w.first + 11, ..w.clone() };
+            assert!(zero::due(&watching, &seen, 1_000));
+            assert!(!zero::due(&watching, &Watch { bytes: 100, ..seen.clone() }, 1_000), "written too little");
+            assert!(!zero::due(&watching, &Watch { last: w.first + 5, ..seen.clone() }, 1_000), "watched too short");
+            // (The test's frames are the process's: the watch above ran as long as the loop did.)
+            // A page of it guarded just then: the host is not asked to open it, and the range stays a copy for now.
+            let mut old = 0;
+            assert!(mem::VirtualProtect((at + K64) as *const c_void, K64, mem::PAGE_READONLY, &mut old) != 0);
+            let frame = crate::frame::current() + 1_000;
+            assert!(ask(frame).is_none(), "refused: a page is guarded");
+            let w = zero::watch_of(at as u64).unwrap();
+            assert_eq!(w.failed, 1);
+            assert!(w.retry > frame, "tried again later, not at once");
+            assert!(!w.given);
+            mem::VirtualProtect((at + K64) as *const c_void, K64, mem::PAGE_READWRITE, &mut old);
+            // Before the time: no. After it: the cell.
+            assert!(ask(w.retry - 1).is_none());
+            let cell = ask(w.retry + 1).expect("a cell once the pages are free");
+            assert!(cell.in_place());
+            assert!(zero::watch_of(at as u64).unwrap().given);
+            drop(cell);
+            release(base, at, bytes);
+        }
+    }
+
+    /// The cells of a long range.
+    #[test]
+    fn a_long_range_is_cut_in_cells() {
+        let m = 1u64 << 20;
+        assert_eq!(zero::cell_of((10 * m, 40 * m), 20 * m, 64 * m), (10 * m, 30 * m), "one cell");
+        assert_eq!(zero::cell_of((10 * m, 300 * m), 20 * m, 64 * m), (10 * m, 54 * m), "the first of a grid of 64 MiB");
+        assert_eq!(zero::cell_of((10 * m, 300 * m), 100 * m, 64 * m), (64 * m, 64 * m));
+        assert_eq!(zero::cell_of((10 * m, 300 * m), 290 * m, 64 * m), (256 * m, 44 * m), "the last, short");
+    }
+
+    /// Memory that a placed shadow holds open is told, to the free that waits for it.
+    #[test]
+    fn what_is_pinned_is_told_by_range() {
+        pinned(0x7_9000_0000, 0x20000);
+        assert!(pinned_in(0x7_9000_0000, 1));
+        assert!(pinned_in(0x7_8fff_ff00, 0x200), "a range that reaches into it");
+        assert!(!pinned_in(0x7_9002_0000, 0x1000), "past its end");
+        assert!(!pinned_in(0x7_8fff_0000, 0x10000), "before it");
+        // (Its count is that of `STATS`: nothing was placed, so the free path does not look.)
+        PINNED.lock().unwrap().retain(|&(a, _)| a != 0x7_9000_0000);
+        assert!(!pinned_in(0x7_9000_0000, 1));
     }
 }

@@ -72,6 +72,10 @@ pub(crate) struct Shadow {
     /// units ([`current::Current::seq`]) when a compare last found what
     /// shaders wrote ([`Shadow::note_found`]).
     found_seq: AtomicU64,
+    /// What a refresh of this copy took lately, in microseconds: a moving mean of the last ones
+    /// ([`Shadow::note_refresh_cost`]), 0 until one was timed. For the order a flush's refreshes are given to the
+    /// threads in (`crate::host`, `VICTORY_WAIT_ORDER`).
+    refresh_us: std::sync::atomic::AtomicU32,
     /// Whether a thread of the title was seen to read or write this copy's
     /// buffer while its landing was owed ([`crate::land::owed`]) or by the
     /// probe: its pieces are landed at once from then on.
@@ -2047,8 +2051,12 @@ impl Aside {
         let left = &self.left;
         spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
         let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-        while *n > 0 {
-            n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+        if *n > 0 {
+            let waiting = std::time::Instant::now();
+            while *n > 0 {
+                n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+            }
+            crate::host::waits::joined(waiting.elapsed().as_nanos() as u64);
         }
     }
 }
@@ -2104,6 +2112,7 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
+    let _joining = crate::host::waits::joining(crate::host::waits::Wait::JoinSnapshots);
     wide(copy_jobs(snaps));
 }
 
@@ -2145,6 +2154,7 @@ pub(crate) fn take_snapshots_aside() {
 /// Waits for the snapshots [`take_snapshots_aside`] gave away, if any: at once if they are done or there are none.
 pub(crate) fn snapshots_wait() {
     let aside = SNAPS_ASIDE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let _joining = crate::host::waits::joining(crate::host::waits::Wait::JoinSnapshots);
     drop(aside);
 }
 
@@ -2618,6 +2628,26 @@ fn back_piece(
         }
     }
     Some((first, n))
+}
+
+/// How [`Shadow::merge_under_writes_with`] takes the locks of a copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Locks {
+    /// Waits for them.
+    Wait,
+    /// Takes them if nobody holds them, else leaves the copy ([`Merged::Busy`]).
+    Try,
+}
+
+/// What [`Shadow::merge_under_writes_with`] came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Merged {
+    /// Everything of the range that was stale is in (or nothing was).
+    Done,
+    /// The caller must still settle the flights ([`Shadow::merge_under_writes`] says `true`).
+    Settle,
+    /// The locks of the copy are held by another thread, and [`Locks::Try`] was asked for.
+    Busy,
 }
 
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
@@ -3932,6 +3962,7 @@ impl Shadow {
             quiet_window: AtomicU64::new(0),
             quiet_landing: Default::default(),
             found_seq: AtomicU64::new(0),
+            refresh_us: std::sync::atomic::AtomicU32::new(0),
             title_read: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3952,6 +3983,20 @@ impl Shadow {
             mapped: false,
             place: None,
         }
+    }
+
+    /// A refresh of this copy took `us` microseconds: the moving mean (three parts of what it was, one of this)
+    /// follows. Not atomic as a whole (two refreshes of one copy at once may lose one): it only orders work.
+    pub(crate) fn note_refresh_cost(&self, us: u64) {
+        let us = us.min(u64::from(u32::MAX)) as u32;
+        let was = self.refresh_us.load(Ordering::Relaxed);
+        let now = if was == 0 { us.max(1) } else { ((u64::from(was) * 3 + u64::from(us)) / 4).max(1) as u32 };
+        self.refresh_us.store(now, Ordering::Relaxed);
+    }
+
+    /// What a refresh of this copy took lately, in microseconds (0: not known).
+    pub(crate) fn refresh_cost(&self) -> u32 {
+        self.refresh_us.load(Ordering::Relaxed)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -4473,10 +4518,18 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        self.merge_under_writes_with(address, len, runs_left, Locks::Wait) == Merged::Settle
+    }
+
+    /// [`Shadow::merge_under_writes`], with the copy's locks (`merging`, `before`) taken as `locks` says. With
+    /// [`Locks::Try`] a copy whose locks another thread holds (a landing of it, which holds `merging` shared) is
+    /// left as it is from that range on, [`Merged::Busy`]: what was done before stays done, and a call again, or one
+    /// that waits, does the rest (the pages it finds stale are the same, and those taken are noted).
+    pub(crate) fn merge_under_writes_with(&self, address: usize, len: usize, runs_left: &mut usize, locks: Locks) -> Merged {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return false;
+            return Merged::Done;
         }
         let busy: Vec<(usize, usize)> = self
             .pending
@@ -4487,11 +4540,11 @@ impl Shadow {
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
-            return false;
+            return Merged::Done;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             note_stale(0);
-            return true;
+            return Merged::Settle;
         }
         // The declared ranges overlap (views of the title's whole heap from
         // dozens of offsets): as one range each page is asked about and
@@ -4511,20 +4564,18 @@ impl Shadow {
             let detecting = std::time::Instant::now();
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
                 note_stale(1);
-                return true;
+                return Merged::Settle;
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 stale_pages_in(base, &copied, a, e, &written)
             };
             UNDER[4].fetch_add(detecting.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            UNDER[0].fetch_add(1, Ordering::Relaxed);
-            UNDER[1].fetch_add((e - a) as u64, Ordering::Relaxed);
-            UNDER[2].fetch_add(stale.len() as u64, Ordering::Relaxed);
             if stale.is_empty() {
+                UNDER[0].fetch_add(1, Ordering::Relaxed);
+                UNDER[1].fetch_add((e - a) as u64, Ordering::Relaxed);
                 continue;
             }
-            UNDER[3].fetch_add(1, Ordering::Relaxed);
             // The lock of the copy's reference (the snapshot, or the
             // CPU's side of a copy in the card's memory), from before
             // title memory is read until the title's bytes are in: with
@@ -4534,9 +4585,20 @@ impl Shadow {
             // such a merge and compared after it would take the card's
             // bytes for the title's.
             let locking = std::time::Instant::now();
-            let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
-            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-            UNDER[5].fetch_add(locking.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let Some((merging, mut before)) = self.merge_locks(locks) else {
+                // Not counted: the range is looked at again by the call that follows.
+                return Merged::Busy;
+            };
+            UNDER[0].fetch_add(1, Ordering::Relaxed);
+            UNDER[1].fetch_add((e - a) as u64, Ordering::Relaxed);
+            UNDER[2].fetch_add(stale.len() as u64, Ordering::Relaxed);
+            UNDER[3].fetch_add(1, Ordering::Relaxed);
+            let locked = locking.elapsed().as_nanos() as u64;
+            UNDER[5].fetch_add(locked, Ordering::Relaxed);
+            // (Under a microsecond is the locks taken at once.)
+            if locked > 1_000 {
+                crate::host::waits::note(crate::host::waits::Wait::CopyLocks, locked);
+            }
             let merged = std::time::Instant::now();
             let held = if self.card.is_some() {
                 self.data as usize
@@ -4545,7 +4607,7 @@ impl Shadow {
             };
             if held == 0 {
                 note_stale(3);
-                return true;
+                return Merged::Settle;
             }
             // A page's part in the range, compared and put in: the runs it
             // changed; none for a page that is not there (left as it is, and
@@ -4608,10 +4670,38 @@ impl Shadow {
             UNDER[7].fetch_add(putting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if over.into_inner() {
                 note_stale(2);
-                return true;
+                return Merged::Settle;
             }
         }
-        false
+        Merged::Done
+    }
+
+    /// The locks [`Shadow::merge_under_writes_with`] puts title bytes in under: `merging` alone and then `before`
+    /// (in that order, as everything that takes both). With [`Locks::Try`], `None` if either is held by another thread:
+    /// nothing is kept then.
+    fn merge_locks(&self, locks: Locks) -> Option<(std::sync::RwLockWriteGuard<'_, ()>, std::sync::MutexGuard<'_, Option<Vec<u8>>>)> {
+        use std::sync::TryLockError::{Poisoned, WouldBlock};
+        match locks {
+            Locks::Wait => {
+                let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+                let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                Some((merging, before))
+            }
+            Locks::Try => {
+                let merging = match self.merging.try_write() {
+                    Ok(guard) => guard,
+                    Err(Poisoned(e)) => e.into_inner(),
+                    Err(WouldBlock) => return None,
+                };
+                let before = match self.before.try_lock() {
+                    Ok(guard) => guard,
+                    Err(Poisoned(e)) => e.into_inner(),
+                    // (`merging` is let go as it goes out of scope.)
+                    Err(WouldBlock) => return None,
+                };
+                Some((merging, before))
+            }
+        }
     }
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
@@ -4896,6 +4986,12 @@ impl Shadow {
     #[cfg(test)]
     pub(crate) fn hold_merging(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
         self.merging.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// For the tests of the title's bytes put in under shader writes: the lock of the snapshot, held.
+    #[cfg(test)]
+    pub(crate) fn hold_before(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.before.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The shared lock of landings, taken by a thread that may be in the way

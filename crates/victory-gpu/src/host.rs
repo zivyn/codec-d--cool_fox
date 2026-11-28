@@ -3496,11 +3496,51 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        if under_try() {
+            return merge_under_try_first(spans, &mut runs_left);
+        }
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
     spans.retain(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from));
     spans
+}
+
+/// Whether the title's bytes are put in under flights' writes copy by copy without waiting for a copy that a landing
+/// holds (`VICTORY_UNDER_TRY=1`; off by default): the copies whose locks are free go first and those that were held
+/// are done last, when the landing may be over. The 4 ms a frame the lane spends in this stage waiting
+/// (K6: 25 ms of waits in 6 frames, 5.5 of them for the pages compared on the kept threads, 3.7 for a copy's lock,
+/// the rest for the guards) is mostly where a landing of the same copy is at it (`merging` is held shared by every
+/// piece landed).
+///
+/// (May change while the title runs, `VICTORY_AB`: each submission reads it once; the copies are the same and the
+/// bytes put in are the same either way, only the order and the moment of each differ.)
+fn under_try() -> bool {
+    crate::ab::live_flag!("VICTORY_UNDER_TRY")
+}
+
+/// [`crate::shadow::Shadow::merge_under_writes`] of each of `spans` (a copy, from, to), those whose locks another
+/// thread holds after the others, which wait for them; the spans that still need the flights settled.
+fn merge_under_try_first(
+    spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    runs_left: &mut usize,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    use crate::shadow::{Locks, Merged};
+    let mut settle = Vec::with_capacity(spans.len());
+    let mut later = Vec::new();
+    for span in spans {
+        match span.0.merge_under_writes_with(span.1, span.2 - span.1, runs_left, Locks::Try) {
+            Merged::Done => {}
+            Merged::Settle => settle.push(span),
+            Merged::Busy => later.push(span),
+        }
+    }
+    for span in later {
+        if span.0.merge_under_writes_with(span.1, span.2 - span.1, runs_left, Locks::Wait) == Merged::Settle {
+            settle.push(span);
+        }
+    }
+    settle
 }
 
 /// How many parts of submissions, and lists, the line's thread gives to the
@@ -3809,6 +3849,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     drop(line);
     stood(waiting);
     working(was_working);
+    waits::note(waits::Wait::Flights, waiting.elapsed().as_nanos() as u64);
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
@@ -4020,6 +4061,7 @@ fn late_line(frames: f64) {
     }
     prefetch::line(frames);
     askaside::line(frames);
+    waits::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4153,6 +4195,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 mod askaside;
+pub(crate) mod waits;
 mod combine;
 pub(crate) mod awake;
 mod card_steps;
@@ -6726,7 +6769,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        drop(heaps_synced);
+        waits::timed(waits::Wait::Heaps, || drop(heaps_synced));
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -8566,12 +8609,54 @@ pub(crate) fn spans_by_copy(copies: impl Iterator<Item = usize>) -> Vec<Vec<usiz
 /// thread that has the copy (they would wait for each other's lock), those of
 /// other copies at the same time. `work` gets the number of a span.
 pub(crate) fn wide_each_by_copy(copies: impl Iterator<Item = usize>, work: impl Fn(usize) + Send + Sync + 'static) {
-    let groups = spans_by_copy(copies);
+    wide_each_by_copy_by(copies, None, work);
+}
+
+/// [`wide_each_by_copy`], the copies given to the threads costliest first if `cost` (what each span is expected to take,
+/// by its number) is given: the thread that waits for the last one has the shortest left to wait for
+/// (`VICTORY_WAIT_ORDER`). The spans are the same ones and those of a copy still run in turn.
+pub(crate) fn wide_each_by_copy_by(
+    copies: impl Iterator<Item = usize>,
+    cost: Option<Vec<u64>>,
+    work: impl Fn(usize) + Send + Sync + 'static,
+) {
+    let mut groups = spans_by_copy(copies);
+    if let Some(cost) = &cost {
+        costliest_first(&mut groups, cost);
+    }
+    let _joining = waits::joining(waits::Wait::JoinRefresh);
     crate::shadow::wide_each(groups.len(), move |g| {
         for &i in &groups[g] {
             work(i);
         }
     });
+}
+
+/// Whether the copies of a flush's refreshes are given to the threads costliest first (`VICTORY_WAIT_ORDER=1`; off by
+/// default): the lane works on the jobs beside the kept threads and then waits for the last one that is being run, so
+/// a long job that is taken late is waited for whole (K6: 20 ms of the lane's 77 in 6 frames are the end of such
+/// jobs, the longest 2 to 4 ms; with the copies of a flush in the best order the same jobs would end 0.7 ms a frame
+/// sooner).
+///
+/// (May change while the title runs, `VICTORY_AB`: each flush reads it once; which thread takes which copy first is
+/// all that differs, the copies are independent and the spans of one are still done in turn.)
+fn wait_order() -> bool {
+    crate::ab::live_flag!("VICTORY_WAIT_ORDER")
+}
+
+/// What refreshing `[from, to)` of `shadow` is expected to take, in microseconds: what its refreshes took lately, or,
+/// of a copy not timed yet (its first refresh takes all of the range), the range at about 8 KiB a microsecond.
+fn predicted_us(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> u64 {
+    match shadow.refresh_cost() {
+        0 => (to.saturating_sub(from) >> 13) as u64,
+        us => u64::from(us),
+    }
+}
+
+/// `groups` (of [`spans_by_copy`]) with the costliest first: a group costs what its spans cost (`cost`, by the number
+/// of a span). The groups are not changed, and those that cost the same stay in the order they were.
+pub(crate) fn costliest_first(groups: &mut [Vec<usize>], cost: &[u64]) {
+    groups.sort_by_key(|group| std::cmp::Reverse(group.iter().map(|&i| cost[i]).sum::<u64>()));
 }
 
 /// A table by a copy's address.
@@ -9563,6 +9648,7 @@ impl Batch {
         let _one = crate::timeline::span("a copy's refresh");
         let copied = shadow.update(from, to - from);
         let us = started.elapsed().as_micros() as u64;
+        shadow.note_refresh_cost(us);
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
         PREPARING[0].fetch_add(us, Ordering::Relaxed);
@@ -9696,7 +9782,12 @@ impl Batch {
             Self::lap(&mut lap, crate::copystat::C::FlushAskNs);
         }
         // A job for each copy: its spans one after the other.
-        let groups = spans_by_copy(spans.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize));
+        let mut groups = spans_by_copy(spans.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize));
+        if wait_order() {
+            let cost: Vec<u64> = spans.iter().map(|(shadow, from, to)| predicted_us(shadow, *from, *to)).collect();
+            costliest_first(&mut groups, &cost);
+        }
+        let _joining = waits::joining(waits::Wait::JoinRefresh);
         crate::shadow::wide_each(groups.len() + due.len(), move |g| {
             // The textures first: they are the longer pieces.
             let Some(g) = g.checked_sub(due.len()) else {
@@ -9766,7 +9857,8 @@ impl Batch {
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
         let copies = due.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize).collect::<Vec<_>>();
-        wide_each_by_copy(copies.into_iter(), move |i| {
+        let cost = wait_order().then(|| due.iter().map(|(shadow, from, to)| predicted_us(shadow, *from, *to)).collect());
+        wide_each_by_copy_by(copies.into_iter(), cost, move |i| {
             let (shadow, from, to) = &due[i];
             if !shadow.nothing_new(*from, *to - *from) {
                 Self::update(shadow, *from, *to);
@@ -9916,7 +10008,8 @@ impl Batch {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
                 let copies = refreshes.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize).collect::<Vec<_>>();
-                wide_each_by_copy(copies.into_iter(), move |i| {
+                let cost = wait_order().then(|| refreshes.iter().map(|(shadow, from, to)| predicted_us(shadow, *from, *to)).collect());
+                wide_each_by_copy_by(copies.into_iter(), cost, move |i| {
                     let (shadow, from, to) = &refreshes[i];
                     if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]
@@ -11703,7 +11796,7 @@ mod spare {
 
 #[cfg(test)]
 mod by_copy_tests {
-    use super::{Batch, spans_by_copy, wide_each_by_copy};
+    use super::{Batch, costliest_first, spans_by_copy, wide_each_by_copy, wide_each_by_copy_by};
     use crate::shadow::Shadow;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11716,6 +11809,76 @@ mod by_copy_tests {
     fn spans_are_grouped_by_copy_in_order() {
         assert_eq!(spans_by_copy([5, 7, 5, 9, 7].into_iter()), vec![vec![0, 2], vec![1, 4], vec![3]]);
         assert!(spans_by_copy(std::iter::empty()).is_empty());
+    }
+
+    /// The copies go costliest first, each with all its spans in the order they had, and copies that cost the same in
+    /// the order of their first span; nothing is added or lost.
+    #[test]
+    fn the_copies_go_costliest_first_and_whole() {
+        let mut groups = spans_by_copy([5, 7, 5, 9, 7, 11].into_iter());
+        assert_eq!(groups, vec![vec![0, 2], vec![1, 4], vec![3], vec![5]]);
+        // Span costs: the first copy 3 + 4, the second 10 + 1, the third 7, the fourth 7.
+        costliest_first(&mut groups, &[3, 10, 4, 7, 1, 7]);
+        assert_eq!(groups, vec![vec![1, 4], vec![0, 2], vec![3], vec![5]]);
+        let mut seen: Vec<usize> = groups.iter().flatten().copied().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5]);
+        // Nothing known: as they were.
+        let mut same = spans_by_copy([1, 2, 1, 3].into_iter());
+        costliest_first(&mut same, &[0, 0, 0, 0]);
+        assert_eq!(same, vec![vec![0, 2], vec![1], vec![3]]);
+        costliest_first(&mut [], &[]);
+    }
+
+    /// Whatever the order, every span is run once, and those of a copy one after the other, in their order.
+    #[test]
+    fn every_span_runs_once_in_whatever_order_the_copies_go() {
+        let copies = [1usize, 2, 1, 3, 2, 3, 1];
+        let cost: Vec<u64> = vec![5, 1, 5, 9, 1, 9, 5];
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (done, wait) = std::sync::mpsc::channel();
+        {
+            let ran = ran.clone();
+            std::thread::spawn(move || {
+                wide_each_by_copy_by(copies.into_iter(), Some(cost), move |i| {
+                    ran.lock().unwrap().push(i);
+                });
+                let _ = done.send(());
+            });
+        }
+        assert!(wait.recv_timeout(std::time::Duration::from_secs(30)).is_ok());
+        let ran = ran.lock().unwrap().clone();
+        let mut all = ran.clone();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2, 3, 4, 5, 6], "each span once");
+        for copy in 1..=3usize {
+            let mine: Vec<usize> = ran.iter().copied().filter(|&i| copies[i] == copy).collect();
+            let mut in_order = mine.clone();
+            in_order.sort_unstable();
+            assert_eq!(mine, in_order, "the spans of copy {copy} in turn, in their order");
+        }
+    }
+
+    /// A copy's refreshes are timed: the mean follows what they take, and a copy not timed says 0.
+    #[test]
+    fn what_a_copys_refreshes_took_is_a_moving_mean() {
+        let data = vec![0u8; 4096];
+        let copy = Shadow::unbacked(0x10_0000, data.as_ptr() as *mut u8, 4096, false);
+        assert_eq!(copy.refresh_cost(), 0);
+        copy.note_refresh_cost(800);
+        assert_eq!(copy.refresh_cost(), 800);
+        copy.note_refresh_cost(0);
+        assert_eq!(copy.refresh_cost(), 600);
+        for _ in 0..40 {
+            copy.note_refresh_cost(0);
+        }
+        assert_eq!(copy.refresh_cost(), 1, "never 0 once timed");
+        copy.note_refresh_cost(u64::MAX);
+        assert!(copy.refresh_cost() > 1_000_000_000);
+        // A copy not timed is expected by its range.
+        let fresh = Shadow::unbacked(0x20_0000, data.as_ptr() as *mut u8, 4096, false);
+        assert_eq!(super::predicted_us(&fresh, 0, 8 << 20), 1024);
+        assert_eq!(super::predicted_us(&copy, 0, 8 << 20), u64::from(copy.refresh_cost()));
     }
 
     /// Two spans of one copy (each of more than 1 MiB, which a refresh cuts in
@@ -12051,6 +12214,7 @@ mod refresh_tests {
     /// `VICTORY_TEST_ROUNDS`, if what is landed is noted before it is in.)
     #[test]
     fn landings_title_writes_and_light_refreshes_at_once() {
+        use super::merge_under_try_first;
         use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         assert!(crate::safecopy::on());
         const LEN: usize = 24 * PAGE;
@@ -12142,10 +12306,18 @@ mod refresh_tests {
             let _stop = Stop(&stop);
             let mut random = Random(0xABCD_EF01_2345_6789);
             let check = |round: usize, random: &mut Random, quiet: bool| {
-                for c in &carded {
-                    if c.shadow.writes_pending() {
-                        let mut runs = usize::MAX;
-                        assert!(!c.shadow.merge_under_writes(c.start, c.len, &mut runs), "round {round}");
+                // (One way and the other in turn: the one that leaves a copy a landing holds for the end, `VICTORY_UNDER_TRY`.)
+                if round % 2 == 1 {
+                    let spans: Vec<_> =
+                        carded.iter().filter(|c| c.shadow.writes_pending()).map(|c| (c.shadow.clone(), c.start, c.start + c.len)).collect();
+                    let mut runs = usize::MAX;
+                    assert!(merge_under_try_first(spans, &mut runs).is_empty(), "round {round}");
+                } else {
+                    for c in &carded {
+                        if c.shadow.writes_pending() {
+                            let mut runs = usize::MAX;
+                            assert!(!c.shadow.merge_under_writes(c.start, c.len, &mut runs), "round {round}");
+                        }
                     }
                 }
                 let mut ranges = Vec::new();
@@ -12241,6 +12413,105 @@ mod refresh_tests {
             }
             drop(fly);
         });
+    }
+
+    /// A copy in the card's memory with shaders writing all of it, and a title that writes one dword of it between two
+    /// puttings in of its bytes. A copy whose lock a landing holds is left (`Locks::Try`: `Busy`, not a byte of it
+    /// touched), and the call that follows, or one that waits, does all that was owed.
+    #[test]
+    fn a_copy_that_is_held_is_left_alone_by_a_try_and_done_by_the_next_call() {
+        use crate::shadow::{Locks, Merged};
+        const LEN: usize = 8 * PAGE;
+        let region = title(LEN, true);
+        let c = Carded::new(region, LEN, 0);
+        c.shadow.update(c.start, c.len);
+        c.shadow.writing(c.start, c.len);
+        let mut runs = usize::MAX;
+        // The first look takes the pages whole.
+        assert_eq!(c.shadow.merge_under_writes_with(c.start, c.len, &mut runs, Locks::Wait), Merged::Done);
+        let at = 3 * PAGE + 64;
+        // SAFETY (both): the test's own memory.
+        let word = |from: usize| unsafe { ((from + at) as *const u32).read_volatile() };
+        let put = |v: u32| unsafe { ((c.start + at) as *mut u32).write_volatile(v) };
+        for round in 1..=6u32 {
+            put(0x5000 + round);
+            let was = word(c.data);
+            assert_ne!(was, 0x5000 + round);
+            // A landing holds `merging` (shared, or here alone), or the snapshot's lock is held.
+            {
+                let _held = c.shadow.hold_merging();
+                assert_eq!(c.shadow.merge_under_writes_with(c.start, c.len, &mut runs, Locks::Try), Merged::Busy, "round {round}");
+            }
+            assert_eq!(word(c.data), was, "round {round}: a busy copy was written");
+            {
+                let _held = c.shadow.hold_before();
+                assert_eq!(c.shadow.merge_under_writes_with(c.start, c.len, &mut runs, Locks::Try), Merged::Busy, "round {round}");
+            }
+            assert_eq!(word(c.data), was, "round {round}: a busy copy was written");
+            // Free: the title's word goes in (by the call that tries, or the one that waits).
+            let how = if round % 2 == 0 { Locks::Try } else { Locks::Wait };
+            assert_eq!(c.shadow.merge_under_writes_with(c.start, c.len, &mut runs, how), Merged::Done, "round {round}");
+            assert_eq!(word(c.data), 0x5000 + round, "round {round}: the title's byte is not in");
+            // And nothing is left owed: the same again changes nothing.
+            assert_eq!(c.shadow.merge_under_writes_with(c.start, c.len, &mut runs, Locks::Try), Merged::Done);
+            assert_eq!(word(c.data), 0x5000 + round);
+        }
+    }
+
+    /// With a copy held by a thread of a landing, [`merge_under_try_first`] puts the title's bytes into the others
+    /// first (the held one is waited for last, when the holder lets go, which it does only after the others are
+    /// done), and it names no copy that needs the flights settled.
+    #[test]
+    fn the_copies_that_are_not_held_go_first_and_the_held_one_last() {
+        use super::merge_under_try_first;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const LEN: usize = 8 * PAGE;
+        let region = title(3 * LEN, true);
+        let copies: Vec<Carded> = (0..3).map(|i| Carded::new(region + i * LEN, LEN, i)).collect();
+        for c in &copies {
+            c.shadow.update(c.start, c.len);
+            c.shadow.writing(c.start, c.len);
+        }
+        let spans = || -> Vec<_> { copies.iter().map(|c| (c.shadow.clone(), c.start, c.start + c.len)).collect() };
+        let mut runs = usize::MAX;
+        assert!(merge_under_try_first(spans(), &mut runs).is_empty());
+        let at = 3 * PAGE + 64;
+        // SAFETY (both): the test's own memory.
+        let word = |from: usize| unsafe { ((from + at) as *const u32).read_volatile() };
+        let put = |c: &Carded, v: u32| unsafe { ((c.start + at) as *mut u32).write_volatile(v) };
+        for round in 0..8usize {
+            let value = 0x7000 + round as u32;
+            // Each round another copy is the held one.
+            let held = round % 3;
+            for c in &copies {
+                put(c, value);
+            }
+            let (holding, others_first) = (AtomicBool::new(false), AtomicBool::new(false));
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _held = copies[held].shadow.hold_merging();
+                    holding.store(true, Ordering::Release);
+                    // Let go when the others hold the title's word, or after 10 s (then the test fails).
+                    let began = std::time::Instant::now();
+                    while began.elapsed() < std::time::Duration::from_secs(10) {
+                        if copies.iter().enumerate().filter(|(i, _)| *i != held).all(|(_, c)| word(c.data) == value) {
+                            others_first.store(true, Ordering::Release);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    }
+                });
+                while !holding.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                let left = merge_under_try_first(spans(), &mut runs);
+                assert!(left.is_empty(), "round {round}");
+            });
+            assert!(others_first.load(Ordering::Acquire), "round {round}: the held copy was waited for first");
+            for c in &copies {
+                assert_eq!(word(c.data), value, "round {round}: copy {}", c.class);
+            }
+        }
     }
 
     /// The title's bytes put in under shader writes, for a copy of 174 MB

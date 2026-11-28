@@ -503,4 +503,78 @@ mod tests {
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
     }
+
+    /// Every `VICTORY_*` switch the translator's code names is in the cache key (the list in
+    /// `build`), or says in `ELSEWHERE` how it gets there, or only prints / points at a tool
+    /// (`NOT_THE_TRANSLATION`). A switch that changes the translation and is in neither is served
+    /// from a cache made with the other value of it: an A/B with it shows the first arm twice.
+    #[test]
+    fn every_switch_the_translator_reads_is_in_the_cache_key() {
+        const NOT_THE_TRANSLATION: &[&str] = &[
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_DESC_WHY",
+            "VICTORY_DXIL",
+            "VICTORY_MASK_WHY",
+            "VICTORY_PC_DXC",
+            "VICTORY_REF_PS",
+            "VICTORY_REF_VS",
+            "VICTORY_SHADER_CENSUS",
+            "VICTORY_SHADER_SOURCE_HASH",
+            "VICTORY_SHADER_SWITCHES",
+            "VICTORY_WARP",
+            "VICTORY_WAVE_WHY",
+        ];
+        // (keyed by the value in force: `loop_limit`, `group_sync`, `shader_opt`, `host_settings`)
+        const ELSEWHERE: &[&str] = &[
+            "VICTORY_GROUP_SYNC",
+            "VICTORY_RDNA_FLOAT",
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_SHADER_OPT",
+        ];
+        fn sources(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                    continue;
+                }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name.ends_with(".rs") && !name.contains("test") {
+                    out.push(path);
+                }
+            }
+        }
+        // (the part of this file that is not its tests)
+        let keyed = include_str!("shader_cache.rs").split("#[cfg(test)]").next().unwrap();
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../victory-shader/src"),
+            &mut files,
+        );
+        assert!(!files.is_empty());
+        let mut missing = std::collections::BTreeSet::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("\"VICTORY_") {
+                let tail = &rest[at + 1..];
+                let end = tail
+                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(tail.len());
+                let name = &tail[..end];
+                if tail[end..].starts_with('"')
+                    && !NOT_THE_TRANSLATION.contains(&name)
+                    && !ELSEWHERE.contains(&name)
+                    && !keyed.contains(&format!("\"{name}\""))
+                {
+                    missing.insert(name.to_owned());
+                }
+                rest = &tail[end..];
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "switches the translator reads that the shader cache key does not hold: {missing:?}"
+        );
+    }
 }

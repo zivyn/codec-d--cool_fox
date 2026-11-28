@@ -594,7 +594,7 @@ pub(crate) fn gate_checked(stale: bool) {
     }
 }
 
-/// A place between the two answers of the shadow check of the gate where a test lets another thread's note come in.
+// A place between the two answers of the shadow check of the gate where a test lets another thread's note come in.
 #[cfg(test)]
 thread_local! {
     static SEAM: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };

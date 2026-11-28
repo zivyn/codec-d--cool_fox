@@ -5627,14 +5627,34 @@ fn constants_text(address: u64, size: u32) -> String {
 /// census listed; whether it differs between a banded process and a smooth one is the question.
 #[cfg(feature = "diagnostics")]
 fn placed_words(dimension: u32, format: u32, width: u64, address: u64) -> String {
-    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        std::env::var("VICTORY_CAPTURE_BUFFER_WORDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-    });
+    let limit = buffer_words_limit();
     if limit == 0 || dimension != 1 || format != 0 || width == 0 || width > limit || address == 0 {
         return String::new();
     }
     constants_text(address, width as u32)
+}
+
+/// `VICTORY_CAPTURE_BUFFER_WORDS=<bytes>`: the largest buffer whose words the listing prints (0: none).
+#[cfg(feature = "diagnostics")]
+fn buffer_words_limit() -> u64 {
+    static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_BUFFER_WORDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// EXPO2: the non-zero dwords of a small buffer view (a shader or unordered access view of a buffer of
+/// at most `VICTORY_CAPTURE_BUFFER_WORDS` bytes), as the title's memory holds them now. The 16-byte
+/// block the title's lighting, luminance and composite passes all read (the lux compression info:
+/// the exposure chain's scale) is a buffer view of this kind that no census listed.
+#[cfg(feature = "diagnostics")]
+fn small_buffer_words(range: Option<(u64, u64)>) -> String {
+    match range {
+        Some((address, bytes)) if address != 0 && bytes != 0 && bytes <= buffer_words_limit() => {
+            constants_text(address, bytes as u32)
+        }
+        _ => String::new(),
+    }
 }
 
 /// A view in a few words (diagnostics builds).
@@ -5649,14 +5669,16 @@ fn describe(view: Option<&View>) -> String {
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        Some(v @ View::Shader(r, _)) => texture(*r as This).unwrap_or_else(|| {
+            let range = crate::descriptor::host::buffer_range(v);
+            format!("buffer {range:?}{}", small_buffer_words(range))
+        }),
         Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
             Some(t) => format!("uav texture {t}"),
             None => {
                 let range = crate::descriptor::host::buffer_range(v);
                 crate::capture::note_uav_buffer(range);
-                format!("uav resource {r:#x} buffer {range:?}")
+                format!("uav resource {r:#x} buffer {range:?}{}", small_buffer_words(range))
             }
         },
         Some(View::Placed(u, r, d)) => {

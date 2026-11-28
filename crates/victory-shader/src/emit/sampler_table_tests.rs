@@ -18,6 +18,11 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use super::host::{Dispatch, Host, Root, View};
 
+/// A skip is no pass on the CI runner, which has the SDK's compiler and WARP.
+fn not_on_ci() -> bool {
+    std::env::var_os("GITHUB_ACTIONS").is_none()
+}
+
 fn dxc() -> Option<PathBuf> {
     let dxc = match std::env::var_os("VICTORY_PC_DXC") {
         Some(p) => PathBuf::from(p),
@@ -188,6 +193,10 @@ fn range(
 fn a_sampler_read_through_a_table_is_the_static_sampler_of_its_register() {
     let Some(dxc) = dxc() else {
         eprintln!("no PC dxc.exe; skipped");
+        assert!(
+            not_on_ci(),
+            "no PC dxc.exe on the CI runner: the test did not run"
+        );
         return;
     };
     let dir = std::env::temp_dir().join(format!("victory-sampler-table-{}", std::process::id()));
@@ -326,5 +335,9 @@ fn a_sampler_read_through_a_table_is_the_static_sampler_of_its_register() {
     }
     if ran == 0 {
         eprintln!("no SM 6.6 device; skipped");
+        assert!(
+            not_on_ci(),
+            "no SM 6.6 device (WARP) on the CI runner: the test did not run"
+        );
     }
 }

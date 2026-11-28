@@ -559,15 +559,47 @@ fn the_tail_threads_go_by_the_text_of_the_variable() {
 }
 
 /// Committed memory of ours, released at the end.
-struct Plain(usize, usize);
+struct Plain(usize, usize, bool);
+
+/// What the memory title bytes land in is: plain, as the kernel's write watch sees it (the bits are reset before
+/// each run, as a refresh does), or a view of a section, as the title's heaps are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Memory {
+    Plain,
+    WriteWatch,
+    Section,
+}
 
 impl Plain {
     fn new(len: usize) -> Plain {
+        Plain::of(Memory::Plain, len)
+    }
+
+    fn of(kind: Memory, len: usize) -> Plain {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        if kind == Memory::Section {
+            // SAFETY: a pagefile section of our own and a view of it (never given back: a measurement).
+            let at = unsafe {
+                let section =
+                    CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null());
+                assert!(!section.is_null());
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize
+            };
+            assert_ne!(at, 0);
+            return Plain(at, len, true);
+        }
+        let watch = if kind == Memory::WriteWatch { MEM_WRITE_WATCH } else { 0 };
         // SAFETY: plain allocation.
-        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE) } as usize;
         assert_ne!(at, 0);
-        Plain(at, len)
+        Plain(at, len, false)
+    }
+
+    /// The kernel's write watch of the memory, as a refresh leaves it.
+    fn reset_watch(&self) {
+        // SAFETY: our allocation (a no-op for memory that is not watched).
+        unsafe { windows_sys::Win32::System::Memory::ResetWriteWatch(self.0 as _, self.1) };
     }
 
     fn bytes(&self) -> &[u8] {
@@ -585,8 +617,10 @@ impl Plain {
 impl Drop for Plain {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-        // SAFETY: our allocation.
-        unsafe { VirtualFree(self.0 as _, 0, MEM_RELEASE) };
+        if !self.2 {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.0 as _, 0, MEM_RELEASE) };
+        }
     }
 }
 
@@ -691,12 +725,18 @@ fn every_kernel_lands_a_piece_as_the_plain_loop_does() {
 #[test]
 #[ignore]
 fn land_merge_bench() {
+    bench_landing(Memory::Plain, true);
+    bench_landing(Memory::WriteWatch, false);
+    bench_landing(Memory::Section, false);
+}
+
+fn bench_landing(memory: Memory, every_kernel: bool) {
     assert!(crate::safecopy::on());
     const HEAP: usize = 192 << 20;
     const BLOCKS: usize = HEAP / BLOCK;
     const PIECES: usize = 1140;
     let mut random = Random(0x5eed);
-    let (title, held) = (Plain::new(HEAP), Plain::new(HEAP));
+    let (title, held) = (Plain::of(memory, HEAP), Plain::new(HEAP));
     let held0: Vec<u8> = (0..HEAP / 8).flat_map(|_| (((random.next() as u64) << 24) ^ random.next() as u64).to_le_bytes()).collect();
     let mut title0 = held0.clone();
     for _ in 0..HEAP / 4 / 33 {
@@ -765,6 +805,7 @@ fn land_merge_bench() {
             title.put(from, &title0[from..from + len]);
             held.put(from, &held0[from..from + len]);
         }
+        title.reset_watch();
         cold();
     };
     let (card_at, title_at, held_at) = (card.as_ptr() as usize, title.0, held.0);
@@ -832,35 +873,69 @@ fn land_merge_bench() {
         }
         h
     };
-    println!("land_merge_bench: {PIECES} pieces, {:.1} MB of {} MB, {} jobs", bytes as f64 / 1e6, HEAP >> 20, jobs.len());
+    println!(
+        "land_merge_bench: {memory:?} memory, {PIECES} pieces, {:.1} MB of {} MB, {} jobs",
+        bytes as f64 / 1e6,
+        HEAP >> 20,
+        jobs.len()
+    );
     let mut expect = None;
-    for (name, kernel) in crate::safecopy::kernels() {
+    let all = crate::safecopy::kernels();
+    let chosen: Vec<(&str, crate::safecopy::Kernel)> =
+        if every_kernel { all.to_vec() } else { vec![all[0], all[3]] };
+    for (name, kernel) in chosen {
         for heads in [false, true] {
-            let mut line = format!("land_merge_bench: {name:<10} next heads {heads:<5}");
+            if !every_kernel && heads != (name != "plain") {
+                continue;
+            }
+            let mut line = format!("land_merge_bench: {memory:?} {name:<10} next heads {heads:<5}");
             for threads in [1usize, 3] {
                 let mut best = (f64::MAX, f64::MAX);
+                let mut split = (0.0, 0.0);
                 let mut walls = Vec::new();
                 for _ in 0..5 {
                     reset();
+                    STATS[stat::DIFFER_US].store(0, Ordering::Relaxed);
+                    STATS[stat::KERNEL_US].store(0, Ordering::Relaxed);
                     let (wall, cpu) = run(kernel, heads, threads);
                     walls.push(wall);
                     if wall < best.0 {
                         best = (wall, cpu);
+                        split = (
+                            STATS[stat::DIFFER_US].load(Ordering::Relaxed) as f64 / 1e3,
+                            STATS[stat::KERNEL_US].load(Ordering::Relaxed) as f64 / 1e3,
+                        );
                     }
                     let d = digest();
                     assert_eq!(*expect.get_or_insert(d), d, "{name}: not what the plain loop left");
                 }
                 walls.sort_by(f64::total_cmp);
                 line += &format!(
-                    " | {threads} thread{}: {:.1} ms (median {:.1}), threads' time {:.1} ms, {:.2} GB/s",
+                    " | {threads} thread{}: {:.1} ms (median {:.1}), threads' time {:.1} ms (differ pass {:.1}, page loop {:.1}), {:.2} GB/s",
                     if threads > 1 { "s" } else { "" },
                     best.0,
                     walls[2],
                     best.1,
+                    split.0,
+                    split.1,
                     bytes as f64 / best.0 / 1e6
                 );
             }
             println!("{line}");
         }
+    }
+    if every_kernel {
+        // The floor: the card's bytes copied over title memory, cold, with nothing compared.
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            reset();
+            let started = std::time::Instant::now();
+            for (i, &(from, len)) in pieces.iter().enumerate() {
+                // SAFETY: the piece's bytes in the two memories, which do not overlap.
+                unsafe { std::ptr::copy_nonoverlapping((card_at + at[i]) as *const u8, (title_at + from) as *mut u8, len) };
+            }
+            best = best.min(started.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("land_merge_bench: {memory:?} floor, the card's bytes copied over title memory on one thread: {best:.1} ms, {:.2} GB/s", bytes as f64 / best / 1e6);
     }
 }

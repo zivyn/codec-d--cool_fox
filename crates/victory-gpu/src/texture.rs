@@ -360,8 +360,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`, on by
+/// default through `defaults.rs`; any other value turns it off).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -385,7 +385,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// has recorded the upload from it by then.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -743,9 +743,12 @@ pub(crate) struct Digest(u128);
 
 /// Whether an upload of a texture made level by level records copies only into
 /// the levels the title holds (`VICTORY_UPLOAD_HELD_ONLY=1`; off by default).
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_UPLOAD_HELD_ONLY`: each recording of an upload decides
+/// for itself, and says which it was in the staging buffer's `rec_*` fields, as a recording before a bake always has;
+/// the fill of the buffer after it goes by what the recording said.)
 fn held_only_copies() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_HELD_ONLY").is_some_and(|v| v == "1"))
+    crate::ab::live_flag!("VICTORY_UPLOAD_HELD_ONLY")
 }
 
 /// Copy commands of uploads recorded, left out for levels the title does not
@@ -899,7 +902,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // again if it detiles (the next list then uploads once more).
     {
         let staging = staging.clone();
-        list.defer_host(move || {
+        list.defer_host(crate::host::relax::Kind::UploadNoted, move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
         });
@@ -908,7 +911,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // that show that one are made again once this upload has run.
     if staging.first == staging.level0 && copy.grown.swap(false, Relaxed) {
         let start = staging.memory as u64;
-        list.defer_host(move || crate::descriptor::host::levels_changed_after(start));
+        list.defer_host(crate::host::relax::Kind::LevelsChanged, move || crate::descriptor::host::levels_changed_after(start));
     }
     let noted = staging.clone();
     // Levels on demand (`crate::tiles`): after the check below, in the
@@ -925,11 +928,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
         // Then what the list's copy puts in the host copy is known.
-        list.defer_host(move || noted.note_held());
+        list.defer_host(crate::host::relax::Kind::HeldNoted, move || noted.note_held());
         return;
     };
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
+    list.defer_host(crate::host::relax::Kind::TilesGiven, move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting_cap.store(waiting.unwrap_or(0), Relaxed);
         staging.waiting.store(if waiting.is_some() { crate::host::moment().max(1) } else { 0 }, Relaxed);
@@ -1207,7 +1210,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
         fresh: fresh & !unzeroed,
         ran: std::sync::atomic::AtomicBool::new(false),
     };
-    list.defer_host(move || {
+    list.defer_host(crate::host::relax::Kind::TilesClaimed, move || {
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
     });
@@ -1998,8 +2001,20 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
-        once!(?desc, "texture contents in an XOR mode not uploaded");
+    if !crate::resource::detilable(&layout) {
+        let d = &layout.desc;
+        once!(
+            ?desc,
+            swizzle = d.swizzle.name(),
+            width = d.width,
+            height = d.height,
+            depth_or_slices = d.depth,
+            mips = d.mips,
+            samples = d.samples,
+            element_bytes = d.element_bytes,
+            block = d.block,
+            "texture contents in a layout without addresses (or a XOR mode with VICTORY_XOR_UPLOAD=0) not uploaded"
+        );
         return None;
     }
     let host = host()?;

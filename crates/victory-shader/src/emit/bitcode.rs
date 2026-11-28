@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
+pub mod together;
+#[cfg(test)]
+pub(crate) mod sim;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -49,6 +52,7 @@ pub(crate) enum V {
 }
 
 /// A global variable declaration (thread-group shared memory).
+#[derive(Clone)]
 struct Global {
     name: String,
     ty: Ty,
@@ -192,8 +196,11 @@ pub(crate) enum Attr {
     ReadOnly = 3,
     /// Barriers.
     NoDuplicate = 4,
+    /// The entry point: 32-bit denormals flushed (`"fp32-denorm-mode"="ftz"`, shader model 6.2).
+    Fp32Ftz = 5,
 }
 
+#[derive(Clone)]
 struct Func {
     name: String,
     ty: Ty,
@@ -205,13 +212,14 @@ struct Func {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Md(u32);
 
+#[derive(Clone)]
 enum MdDef {
     Str(String),
     Value(Ty, V),
     Node(Vec<Option<Md>>),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
     type_ids: HashMap<TypeDef, u32>,
@@ -226,6 +234,17 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Values the two host waves of a console wave agree on by an exchange
+    /// ([`Module::mark_together`]).
+    together: std::collections::HashSet<u32>,
+    /// Values the two host waves of one console wave agree on, though other console waves of the
+    /// group may not ([`Module::mark_paired`]), and the blocks where they wait for each other
+    /// ([`Module::mark_wait`]).
+    paired: std::collections::HashSet<u32>,
+    waits: Vec<usize>,
+    /// The blocks a thread stopped by a loop's iteration limit leaves the program through
+    /// ([`Module::mark_abort`]): an error path, not the program's control flow.
+    aborts: Vec<usize>,
 }
 
 impl Module {
@@ -596,9 +615,20 @@ impl Module {
             }
             w.record(3, &r);
         }
+        // (a fifth one only for the entry that asks for flushed denormals: a module without it
+        // is written as before)
+        let ftz = self.funcs.iter().any(|f| f.attr == Some(Attr::Fp32Ftz));
+        if ftz {
+            let mut r = vec![5, 0xFFFF_FFFF, 4];
+            for text in ["fp32-denorm-mode", "ftz"] {
+                r.extend(text.bytes().map(u64::from));
+                r.push(0);
+            }
+            w.record(3, &r);
+        }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=if ftz { 5 } else { 4 } {
             w.record(2, &[id]);
         }
         w.exit();

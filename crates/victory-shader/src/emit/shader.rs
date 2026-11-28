@@ -108,6 +108,27 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes
+/// (`VICTORY_VIEW_INDEX`, `VICTORY_FOLD_VIEWS`): the view heap slot of the
+/// raw view of the title's root SRV of root parameter `slot`. The shader
+/// reads the root view through that slot of the heap (`ResourceDescriptorHeap`)
+/// instead of a descriptor table of the host root signature, so that what
+/// differs between two draws is one more dword of the user data, which a
+/// command signature can set. The view is the sized one the table had: reads
+/// past the host copy's end return zeros as before.
+pub const USER_ROOT_VIEW_INDEX: u32 = 0x107;
+
+/// The root CBV `b<SLOT_FUSE>` in [`ROOT_CBV_SPACE`] of a compute program translated for dispatches made one
+/// (`VICTORY_FUSE_DISPATCH=1`, `lower/fuse.rs`): the table of a run of dispatches of the program. The program reads its
+/// user data from the record of the member of the run its group belongs to, and its group id is the group's number in
+/// that member's dispatch; no other root view is read through a program with this slot.
+pub const SLOT_FUSE: u8 = 250;
+/// The most members of a run: the program finds its member by eight halvings of the table of starts.
+pub const FUSE_MEMBERS: usize = 255;
+/// The rows (16 bytes) a root CBV holds.
+pub const FUSE_ROWS: usize = 4096;
+/// The groups of a row of a run's dispatch: group `(x, y)` of the dispatch is number `y * FUSE_WIDTH + x` of the run.
+pub const FUSE_WIDTH: u32 = 65535;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -261,6 +282,9 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root SRVs read through the view heap by an index in the user data
+    /// ([`USER_ROOT_VIEW_INDEX`]), likewise: no root parameter holds them.
+    pub root_heap_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
@@ -293,7 +317,8 @@ impl Shader {
         let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32, f32, f32, f32, i32]);
         let main_ty = m.func_ty(void, vec![]);
         m.ptr(main_ty);
-        let main = m.function("main", main_ty, None, true);
+        let ftz = super::denorm::f32_ftz().then_some(Attr::Fp32Ftz);
+        let main = m.function("main", main_ty, ftz, true);
         let entry = m.new_block();
         Shader {
             m,
@@ -319,6 +344,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_heap_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
@@ -578,7 +604,7 @@ impl Shader {
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
-        let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        let passes = super::shader_opt() & (super::bitcode::opt::MODULE | super::bitcode::opt::GUARDS);
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
@@ -903,6 +929,7 @@ impl Shader {
         self.m.named_md("dx.shaderModel", vec![sm]);
         self.m.named_md("dx.entryPoints", vec![entry]);
 
+        super::hang::finished(&self.m, super::lower::program_tag());
         let bitcode = self.m.write();
         super::bitcode::census::note(&self.m, &bitcode);
         let mut dxil = Vec::with_capacity(24 + bitcode.len());

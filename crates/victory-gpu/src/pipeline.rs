@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-const PIPELINE_IIDS: [Iid; 4] = [
+pub(crate) const PIPELINE_IIDS: [Iid; 4] = [
     guid(
         0x765a30f3,
         0xf624,
@@ -67,6 +67,12 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// What its code stores to buffers, by descriptor ([`Shader::footprint`]), made when first asked.
+    #[cfg(windows)]
+    footprint: OnceLock<Option<Arc<victory_shader::footprint::Footprint>>>,
+    /// Whether its dispatches may share a run ([`Shader::joins_runs`]), made when first asked.
+    #[cfg(windows)]
+    joins: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +125,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                footprint: OnceLock::new(),
+                #[cfg(windows)]
+                joins: OnceLock::new(),
             })
         })
         .clone()
@@ -183,6 +193,55 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// What the shader's code stores to buffers, by descriptor and byte (`crate::host::precise`); `None` if the code
+    /// could not be gone through (then every view it stores through counts whole). Made on first use, outside the
+    /// translation: never on the recording threads' path unless a precise-writes switch is on.
+    pub(crate) fn footprint(&self) -> Option<&Arc<victory_shader::footprint::Footprint>> {
+        self.footprint
+            .get_or_init(|| {
+                let stage = self.translated()?.host.stage;
+                let program = self.programs()?.into_iter().find(|p| p.stage == stage)?;
+                // (Never a panic on the title's path: a program that cannot be gone through is whole.)
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| victory_shader::footprint::analyze(&program)))
+                    .ok()
+                    .flatten()
+                    .map(Arc::new)
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// Whether the dispatches of this program may be made one with others (`draw::fuse`): it is translated for runs
+    /// (it reads its user data from a run's table), reads no root view of the title, has no part in the stand-in for
+    /// the indirect light, and its code is known to read and write buffers only, through the descriptor tables of the
+    /// title. A texture a dispatch of a run needs in another state than the one before it would be moved before the
+    /// dispatches in front of it, which are made when the run ends.
+    pub(crate) fn joins_runs(&self) -> bool {
+        *self.joins.get_or_init(|| {
+            use victory_shader::footprint::Target;
+            let Some(t) = self.translated() else { return false };
+            let h = &t.host;
+            if h.root_cbvs != [victory_shader::emit::SLOT_FUSE] || !h.root_srvs.is_empty() || !h.root_uavs.is_empty() {
+                return false;
+            }
+            if self.ambient.is_some() || t.threads.is_none() || !h.root_indexed_views.is_empty() {
+                return false;
+            }
+            let Some(f) = self.footprint() else { return false };
+            !f.images_unknown
+                && f.image_reads.is_empty()
+                && f.image_writes.is_empty()
+                && !f.by_address
+                && !f.by_address_loads
+                && f.stores.iter().chain(&f.loads).all(|s| matches!(s.target, Target::Table { .. }))
+        })
     }
 }
 
@@ -304,6 +363,156 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// Hashes of the compute programs whose dispatches are left out
+/// (`VICTORY_SKIP_BVH_SKINNING=1`: the file `skip-bvh-skinning.txt` beside the
+/// executable; `=@path`: that file; off by default). One 16-digit hash a
+/// line, blank lines and `#` comments allowed. The list is the user's and is
+/// not in the repository: it names programs of the title.
+#[cfg(any(windows, test))]
+fn bvh_skin_hashes() -> &'static std::collections::HashSet<String> {
+    static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        // The structure builder (`VICTORY_BVH_BUILDER=1`) needs that skinning: nothing is left out then.
+        if !crate::switch::on("VICTORY_SKIP_BVH_SKINNING") || std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+            return Default::default();
+        }
+        let value = std::env::var("VICTORY_SKIP_BVH_SKINNING").unwrap_or_default();
+        let text = match value.trim().strip_prefix('@') {
+            Some(path) => std::fs::read_to_string(path),
+            None => std::env::current_exe()
+                .and_then(|exe| std::fs::read_to_string(exe.with_file_name("skip-bvh-skinning.txt"))),
+        };
+        let hashes = match text {
+            Ok(text) => parse_hash_lines(&text),
+            Err(e) => {
+                tracing::warn!(error = %e, "VICTORY_SKIP_BVH_SKINNING is on and its list of hashes could not be read: nothing is skipped");
+                Vec::new()
+            }
+        };
+        tracing::info!(count = hashes.len(), "dispatches of the skinning for the structure builder are left out (VICTORY_SKIP_BVH_SKINNING)");
+        hashes.into_iter().collect()
+    })
+}
+
+/// 16-digit shader hashes, one a line, with blank lines and `#` comments
+/// left out; anything else on a line is not a hash and is ignored.
+#[cfg(any(windows, test))]
+fn parse_hash_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+/// Whether `shaders` are one compute program the list names. Only a single
+/// compute program: a pipeline with more stages is never skipped.
+#[cfg(windows)]
+fn skin_listed(shaders: &[Arc<Shader>]) -> bool {
+    let hashes = bvh_skin_hashes();
+    !hashes.is_empty()
+        && matches!(shaders, [shader] if shader.stage == "compute" && hashes.contains(&shader.hash))
+}
+
+/// Dispatches left out since the last line, by program.
+#[cfg(windows)]
+static SKIPPED: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+/// Whether the title's pipeline `this` is a compute program of the skinning
+/// for the structure builder that the list names; a dispatch of it is counted
+/// and left out.
+#[cfg(windows)]
+pub(crate) fn is_bvh_skinning_skipped(this: This) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.bvh_skin {
+        return false;
+    }
+    if let Some(shader) = p.shaders.first() {
+        *SKIPPED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .entry(shader.hash.clone())
+            .or_insert(0) += 1;
+    }
+    true
+}
+
+/// The line: the dispatches left out per frame, by program.
+#[cfg(windows)]
+pub(crate) fn skipped_line(frames: f64) {
+    let Some(skipped) = SKIPPED.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    if frames <= 0.0 {
+        return;
+    }
+    let mut all: Vec<_> = skipped.into_iter().collect();
+    all.sort_by_key(|(hash, n)| (std::cmp::Reverse(*n), hash.clone()));
+    let total: u64 = all.iter().map(|a| a.1).sum();
+    let by: Vec<String> = all.iter().take(8).map(|(hash, n)| format!("{hash} {:.1}", *n as f64 / frames)).collect();
+    tracing::info!(
+        "dispatches of skinning for the structure builder left out per frame (VICTORY_SKIP_BVH_SKINNING): {:.1}; by program: {}",
+        total as f64 / frames,
+        by.join(", ")
+    );
+}
+
+/// Whether the title's programs that shade ray-tracing hits are idle:
+/// `VICTORY_RT_RESOLVE=0`, with no structure builder. Without structures every ray misses,
+/// the programs find nothing to shade (each begins by comparing its thread's number with the
+/// count of hits of its material, which is 0, and ends), and what they write is only for hits:
+/// leaving the dispatch out changes no byte of the picture's inputs. Read at every dispatch, so
+/// that `VICTORY_AB` can flip it (a dispatch left out for want of a pipeline,
+/// `make::left_out`, is the same thing decided once at the pipeline's making, and saves its
+/// compile too: that is what the variable does when it is set before the start).
+#[cfg(windows)]
+pub(crate) fn resolves_idle() -> bool {
+    resolves_are_idle(builder_asked(), crate::ab::live_value!("VICTORY_RT_RESOLVE", bool, crate::ab::unless_zero))
+}
+
+/// [`resolves_idle`] from its parts: the builder is asked for, and the hit shading is to run.
+#[cfg(any(windows, test))]
+fn resolves_are_idle(builder: bool, runs: bool) -> bool {
+    !builder && !runs
+}
+
+/// Whether the title's pipeline `this` is one of the programs that shade ray-tracing hits and
+/// they are idle now ([`resolves_idle`]): no dispatch of it need be recorded.
+#[cfg(windows)]
+pub(crate) fn is_resolve_pending_idle(this: This) -> bool {
+    !this.is_null() && pipeline(this).rt_resolve && resolves_idle()
+}
+
+/// Dispatches of hit shading left out while idle, since the last line.
+#[cfg(windows)]
+static RESOLVES_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`is_resolve_pending_idle`] at a dispatch that is about to run: counted.
+#[cfg(windows)]
+pub(crate) fn is_resolve_idle(this: This) -> bool {
+    let idle = is_resolve_pending_idle(this);
+    if idle {
+        RESOLVES_IDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    idle
+}
+
+/// The line: the dispatches of hit shading left out per frame (while idle).
+#[cfg(windows)]
+pub(crate) fn idle_line(frames: f64) {
+    let n = RESOLVES_IDLE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if n > 0 && frames > 0.0 {
+        tracing::info!(
+            "dispatches of the ray-tracing hit shading left out per frame (VICTORY_RT_RESOLVE=0, no structures built): {:.1}",
+            n as f64 / frames
+        );
+    }
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -322,12 +531,55 @@ pub(crate) fn builder_rests(why: &'static str) {
     }
 }
 
+/// `VICTORY_BVH_BUILDER=1`: the builder is asked for.
+#[cfg(windows)]
+fn builder_asked() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether the title's rays find structures the builder made, which is when
+/// the stand-in for the indirect light (`crate::ambient`) must rest: the
+/// builder is asked for and has run, or runs now. It stays so while the
+/// builder rests for a frame or two after a stage it could not bind
+/// ([`builder_rests`]): the structures of the frames before are still there,
+/// and the stand-in added to the title's own light for those frames would flash.
+/// Before the builder's first run, or when it cannot run, the rays find nothing
+/// and the stand-in is what lights the rooms.
+#[cfg(windows)]
+pub(crate) fn builder_lights() -> bool {
+    rays_find_structures(
+        builder_asked(),
+        || BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole,
+        builder_runs,
+    )
+}
+
+/// [`builder_lights`] from its parts: `has_run` and `runs_now` are only
+/// asked when the builder is asked for (and the second only when the first
+/// says no).
+#[cfg(any(windows, test))]
+fn rays_find_structures(
+    asked: bool,
+    has_run: impl FnOnce() -> bool,
+    runs_now: impl FnOnce() -> bool,
+) -> bool {
+    asked && (has_run() || runs_now())
+}
+
+/// Whether the builder cannot run in this process (`VICTORY_BVH_BUILDER` is
+/// not set to 1): every dispatch of its pipelines is dropped.
+#[cfg(windows)]
+pub(crate) fn builder_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -418,6 +670,16 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A compute program of the title's skinning for the structure builder,
+    /// by the list `VICTORY_SKIP_BVH_SKINNING` names: its dispatches are left
+    /// out ([`is_bvh_skinning_skipped`]).
+    #[cfg(windows)]
+    bvh_skin: bool,
+    /// One of the title's programs that shade ray-tracing hits: its dispatches
+    /// are left out while no structures are built and `VICTORY_RT_RESOLVE` says
+    /// so ([`is_resolve_idle`]).
+    #[cfg(windows)]
+    rt_resolve: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -456,10 +718,38 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The title binds `this` (its thread, as the call is made: the list's words
+/// are translated later by threads of ours, which wait for each program before
+/// reading the next call): its host pipeline is asked for now, so that all that a
+/// list binds are made at once and not one when the call before it was
+/// (`VICTORY_PIPELINE_AHEAD`, see `make::ahead`).
+#[cfg(windows)]
+pub(crate) fn ahead(this: This) {
+    if this.is_null() {
+        return;
+    }
+    let p = pipeline(this);
+    // (The structure builder's programs are made when it runs, the skinning left out never.)
+    if p.builder || p.bvh_skin {
+        return;
+    }
+    make::ahead(&p.host);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn ahead(_: This) {}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// What share of its budget (parts of a thousand) the wait of a frame for the
+/// pipeline of a world draw is given now (`VICTORY_PIPELINE_WAIT_ADAPT`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn wait_permille() -> u32 {
+    make::permille_now()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -488,16 +778,80 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The shader hashes whose draws and dispatches are left out now: the ones
+/// `VICTORY_SKIP_PIPELINES` lists, and, when `VICTORY_LIVE_FILE` names a file,
+/// the ones its `skip=<hash>,<hash>,...` lines list (the file is read again
+/// once a second, so a driver script can switch passes off and on in one
+/// process; an empty or missing file leaves the variable's list). `None`
+/// when nothing is listed, which is all one atomic load.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+fn skip_set() -> Option<Arc<Vec<String>>> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Instant;
+    struct Live {
+        text: String,
+        set: Arc<Vec<String>>,
+    }
+    static ENV: OnceLock<Arc<Vec<String>>> = OnceLock::new();
+    static FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static ANY: AtomicBool = AtomicBool::new(true);
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+    let env = ENV.get_or_init(|| {
+        let set = Arc::new(parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default()));
+        let file = std::env::var_os("VICTORY_LIVE_FILE").filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+        ANY.store(!set.is_empty() || file.is_some(), Ordering::Relaxed);
+        let _ = FILE.set(file);
+        set
     });
-    if hashes.is_empty() {
+    if !ANY.load(Ordering::Relaxed) {
         return None;
     }
+    let Some(Some(file)) = FILE.get() else {
+        return Some(env.clone());
+    };
+    let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let due = NEXT_MS.load(Ordering::Relaxed);
+    if now >= due && NEXT_MS.compare_exchange(due, now + 1000, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if live.as_ref().is_none_or(|l| l.text != text) {
+            let set = Arc::new(live_skip_hashes(&text, env));
+            tracing::info!(
+                file = %file.display(),
+                passes = set.len(),
+                from_file = set.len() - env.len().min(set.len()),
+                "live skip list changed: the draws and dispatches of these programs are left out (VICTORY_LIVE_FILE, skip=)"
+            );
+            *live = Some(Live { text, set });
+        }
+    }
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    Some(live.as_ref().map_or_else(|| env.clone(), |l| l.set.clone())).filter(|set| !set.is_empty())
+}
+
+/// The list a live file makes: the variable's hashes, then those of every
+/// `skip=` line (other keys, comments and bad hashes are ignored).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn live_skip_hashes(text: &str, env: &[String]) -> Vec<String> {
+    let mut all = env.to_vec();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if key.trim() == "skip" {
+            for hash in parse_skip_hashes(value) {
+                if !all.contains(&hash) {
+                    all.push(hash);
+                }
+            }
+        }
+    }
+    all
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    let hashes = skip_set()?;
     p.shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
@@ -567,10 +921,18 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
+    // Skinning for the structure builder, which is off: no host pipeline is
+    // made for it (its translation and compile are CPU for nothing).
     #[cfg(windows)]
-    make::early(&host);
+    let bvh_skin = skin_listed(&shaders);
+    #[cfg(windows)]
+    if !bvh_skin {
+        make::early(&host);
+    }
     #[cfg(windows)]
     let builder = of_builder(&shaders);
+    #[cfg(windows)]
+    let rt_resolve = make::shaders_are_resolve(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
@@ -585,6 +947,10 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        bvh_skin,
+        #[cfg(windows)]
+        rt_resolve,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -631,6 +997,24 @@ pub(crate) extern "system" fn create_compute(
         iid,
         out,
     )
+}
+
+/// A compute pipeline made from a container the layer built itself (the
+/// precompiled programs of `crate::precompiled`), handed out like the title's.
+pub(crate) fn make_compute(container: &[u8], iid: *const Iid, out: *mut This) -> HRESULT {
+    hand_out(
+        vec![shader("compute", container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// The containers of a pipeline's shaders (tests).
+#[cfg(test)]
+pub(crate) fn containers_of(this: This) -> Vec<Vec<u8>> {
+    pipeline(this).shaders.iter().map(|s| s.container.clone()).collect()
 }
 
 /// Device method 0x1f0: the plain compute description plus console
@@ -715,9 +1099,10 @@ pub(crate) extern "system" fn create_stream(
             break;
         };
         if let Some(stage) = stage {
-            // SAFETY: a shader subobject has its bytecode at +8.
-            let code = unsafe { &*desc.stream.add(at + 8).cast::<Bytecode>() };
-            shaders.extend(copy(stage, code));
+            // SAFETY: a shader subobject has its bytecode at +8, which the
+            // stream does not promise to be aligned.
+            let code = unsafe { desc.stream.add(at + 8).cast::<Bytecode>().read_unaligned() };
+            shaders.extend(copy(stage, &code));
         }
         #[cfg(windows)]
         // SAFETY: a whole subobject of this kind lies at `at`.
@@ -760,6 +1145,8 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+pub(crate) mod sampler_table;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
@@ -790,6 +1177,35 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    /// The list of hashes: one a line, comments and blanks left out, case
+    /// folded, what is not a full hash ignored.
+    #[test]
+    fn the_list_of_skinning_hashes_reads_one_hash_a_line() {
+        assert!(super::parse_hash_lines("").is_empty());
+        assert!(super::parse_hash_lines("# a comment\n\n   \n").is_empty());
+        assert_eq!(
+            super::parse_hash_lines("# skinning\n0123456789ABCDEF\n\n0011223344556677 # velocity\ntooshort\n0123456789abcdeg\n"),
+            ["0123456789abcdef", "0011223344556677"]
+        );
+        // Off by default: nothing is listed and nothing is skipped.
+        if !crate::switch::on("VICTORY_SKIP_BVH_SKINNING") {
+            assert!(super::bvh_skin_hashes().is_empty());
+        }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_live_file_adds_its_skip_lines_to_the_variable() {
+        let env = vec!["0011223344556677".to_owned()];
+        assert_eq!(super::live_skip_hashes("", &env), env);
+        assert_eq!(super::live_skip_hashes("# nothing\nambient=0\nno equals sign", &env), env);
+        // Several lines and several hashes a line; repeats and bad hashes are dropped; other keys do not matter.
+        let text = "ambient_air=0\nskip = 0123456789ABCDEF, 0011223344556677,xyz\nskip=89abcdef01234567\nskipx=aaaaaaaaaaaaaaaa\n";
+        assert_eq!(super::live_skip_hashes(text, &env), ["0011223344556677", "0123456789abcdef", "89abcdef01234567"]);
+        // A line that names none leaves nothing listed by the file.
+        assert_eq!(super::live_skip_hashes("skip=\r\n", &[]), Vec::<String>::new());
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
@@ -802,6 +1218,27 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn the_hit_shading_is_idle_only_without_structures_and_when_it_is_not_asked_to_run() {
+        assert!(resolves_are_idle(false, false));
+        assert!(!resolves_are_idle(false, true));
+        // With the builder the hits are real: they always run.
+        assert!(!resolves_are_idle(true, false));
+        assert!(!resolves_are_idle(true, true));
+    }
+
+    #[test]
+    fn the_stand_in_rests_once_the_builder_has_run() {
+        let unasked = || -> bool { panic!("not to be asked") };
+        // The builder is not asked for: the rays find nothing, whatever else.
+        assert!(!rays_find_structures(false, unasked, unasked));
+        // It has run: it counts, without asking whether it runs this frame (it may be resting).
+        assert!(rays_find_structures(true, || true, unasked));
+        // It has not run yet: it counts when it runs now, else the stand-in lights the rooms.
+        assert!(rays_find_structures(true, || false, || true));
+        assert!(!rays_find_structures(true, || false, || false));
+    }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)

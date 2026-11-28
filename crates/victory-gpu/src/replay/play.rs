@@ -1668,7 +1668,7 @@ impl Player {
                 }
             }
         };
-        if std::env::var_os("VICTORY_REPLAY_TRACE_UPLOAD").is_some() {
+        if crate::switch::on("VICTORY_REPLAY_TRACE_UPLOAD") {
             // One part at a time, each waited for: the part that hangs the card is named.
             for part in &textures {
                 if let Err(e) = self.upload(std::slice::from_ref(part), &file, &copy_parts) {
@@ -3593,7 +3593,7 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
                 Ok(()) => layer.iter().for_each(|l| {
                     l.EnableDebugLayer();
                     // Every shader access checked on the card: very slow.
-                    if std::env::var_os("VICTORY_REPLAY_GBV").is_some()
+                    if crate::switch::on("VICTORY_REPLAY_GBV")
                         && let Ok(l) = l.cast::<ID3D12Debug1>()
                     {
                         l.SetEnableGPUBasedValidation(true);

@@ -729,33 +729,69 @@ pub(crate) fn thread_edges(
 /// only when no lane of the wave is left; scalar code has no effects. The
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses.
+/// An early-out over a loop is kept with `VICTORY_KEEP_LOOP_SKIPS` ([`keep_loop_skips`]):
+/// a wave with no lane left does not walk the loop, which may not end for it.
 /// `None` if the program has no such branch.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
+    drop_early_outs(p).0
+}
+
+/// [`without_early_outs`], and the blocks whose early-out was kept only because a loop
+/// follows it (`VICTORY_KEEP_LOOP_SKIPS`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn drop_early_outs(p: &Program) -> (Option<Program>, Vec<usize>) {
+    drop_early_outs_as(p, keep_loop_skips())
+}
+
+/// [`drop_early_outs`] with the early-outs over loops kept (`keep`) or left out.
+pub(crate) fn drop_early_outs_as(p: &Program, keep: bool) -> (Option<Program>, Vec<usize>) {
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
             && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
     };
     let mut blocks = p.blocks.clone();
     let mut any = false;
-    for block in &mut blocks {
+    let mut kept = Vec::new();
+    for (b, block) in blocks.iter_mut().enumerate() {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
         if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+            if keep && loop_after(p, b, not_taken) {
+                kept.push(b);
+                continue;
+            }
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;
         }
     }
     if !any {
-        return None;
+        return (None, kept);
     }
     for block in &mut blocks {
         block.phis.clear();
     }
     link(&mut blocks);
-    split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    if split_irreducible(&mut blocks).is_err() {
+        return (None, kept);
+    }
+    (Some(rename(blocks, p.wave64, p.vgprs)), kept)
+}
+
+/// Whether a loop lies in what the program does after block `b` goes on to `first`: the blocks
+/// reachable from `first` without coming back to `b` hold a cycle.
+fn loop_after(p: &Program, b: usize, first: usize) -> bool {
+    let mut inside = vec![false; p.blocks.len()];
+    let mut stack = vec![first];
+    while let Some(x) = stack.pop() {
+        if x == b || std::mem::replace(&mut inside[x], true) {
+            continue;
+        }
+        stack.extend(p.blocks[x].exit.successors());
+    }
+    loops_in(&p.blocks, &inside)
 }
 
 /// As [`without_early_outs`], and also without the branches that only skip a
@@ -777,7 +813,66 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// the join may have other ways in (an inner branch that ends together with an outer one).
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
+    drop_skips(p, deep).0
+}
+
+/// [`without_skips`], and the blocks whose skip (or early-out) it kept only because a loop lies
+/// in the region it leaves out (`VICTORY_KEEP_LOOP_SKIPS`): the program is not changed there,
+/// and the branch stays a branch on the lanes of the host wave. A form that has to run the code
+/// after it in every lane takes those branches wave-wide ([`crate::emit`]'s `kept_skips_wide`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn drop_skips(p: &Program, deep: bool) -> (Option<Program>, Vec<usize>) {
+    drop_skips_as(p, deep, keep_loop_skips())
+}
+
+/// [`drop_skips`] with the skips over loops kept (`keep`) or left out.
+pub(crate) fn drop_skips_as(p: &Program, deep: bool, keep: bool) -> (Option<Program>, Vec<usize>) {
+    let (out, kept) = skips_left_out(p, deep, keep);
+    if out.is_empty() {
+        return (None, kept);
+    }
+    let mut blocks = p.blocks.clone();
+    for &(b, next, _) in &out {
+        blocks[b].insts.pop();
+        blocks[b].exit = Exit::Jump(next);
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    if split_irreducible(&mut blocks).is_err() {
+        return (None, kept);
+    }
+    (Some(rename(blocks, p.wave64, p.vgprs)), kept)
+}
+
+/// Whether the place `at` (a machine instruction's offset) lies in the region of a skip that only
+/// the `deep` form of [`without_skips`] leaves out (an inner `s_cbranch_execz` skip that ends
+/// together with an outer one).
+///
+/// Where the forms without skips stop at an exchange of the two host waves (a lane mask read as a
+/// number, a first-lane read) in code where not every lane runs, and only such a deep-only skip
+/// keeps that place from some lane, the form "without skips, scalars followed" runs the exchange
+/// in every lane after the lanes branched alone. The cascade-shadow rasters of the title end in
+/// that form on 32-lane hosts; the wave-wide form takes the skip as the console does, by the
+/// whole wave.
+pub(crate) fn deep_skip_holds(p: &Program, at: usize) -> bool {
+    let Some(block) = p.blocks.iter().position(|b| b.insts.iter().any(|i| i.machine.offset == at)) else {
+        return false;
+    };
+    let shallow: Vec<usize> = skips_left_out(p, false, false).0.into_iter().map(|(b, ..)| b).collect();
+    skips_left_out(p, true, false)
+        .0
+        .into_iter()
+        .any(|(b, _, region)| !shallow.contains(&b) && region.get(block).copied().unwrap_or(false))
+}
+
+/// The branches [`drop_skips_as`] leaves out, each with the block its code goes on in and the
+/// region it skipped (empty for an early-out to the end); and the blocks whose skip it kept only
+/// for a loop.
+fn skips_left_out(p: &Program, deep: bool, keep: bool) -> (Vec<(usize, usize, Vec<bool>)>, Vec<usize>) {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -837,6 +932,8 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         v
     };
+    // Whether the last skip asked about was refused for the loop in its region alone.
+    let loop_kept = std::cell::Cell::new(false);
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -885,10 +982,15 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !deep && join.preds.iter().any(|&q| q != b && !inside[q]) {
             return None;
         }
+        // (`VICTORY_KEEP_LOOP_SKIPS`, on unless `=0`: a region with a loop in it keeps its skip, `loops_in`)
+        if keep && loops_in(&p.blocks, &inside) {
+            loop_kept.set(true);
+            return None;
+        }
         Some(inside)
     };
-    let mut blocks = p.blocks.clone();
-    let mut any = false;
+    let mut out = Vec::new();
+    let mut kept = Vec::new();
     for b in 0..n {
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
             continue;
@@ -896,21 +998,81 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
-            blocks[b].insts.pop();
-            blocks[b].exit = Exit::Jump(not_taken);
-            any = true;
+        if ends(taken) {
+            // (an early-out over a loop is kept too: a wave with no lane left does not walk it)
+            if keep && loop_after(p, b, not_taken) {
+                kept.push(b);
+            } else {
+                out.push((b, not_taken, Vec::new()));
+            }
+        } else {
+            loop_kept.set(false);
+            match skipped(b, taken, not_taken) {
+                Some(region) => out.push((b, not_taken, region)),
+                None if loop_kept.get() => kept.push(b),
+                None => {}
+            }
         }
     }
-    if !any {
-        return None;
+    (out, kept)
+}
+
+/// An `s_cbranch_execz` over a region that holds a loop is kept ([`without_skips`]). On unless
+/// `VICTORY_KEEP_LOOP_SKIPS=0` (the A/B of 2026-11-28 on the RTX: the alias copy 19.1 -> 1.9 ms,
+/// the commands of the GPU 166.7 -> 140.2 ms, the picture the same). Part of the translation: the
+/// shader cache keys on the value in force.
+///
+/// The console takes that branch when no lane of the wave is left, and the loop in the region
+/// does not run. With the branch left out the lanes that would have skipped walk the region with
+/// EXEC clear, and a loop whose exit reads a scalar from a lane that holds nothing (a table walk
+/// that ends on `v_readlane` of lane 63, a waterfall) does not end: it runs to its iteration
+/// limit in every wave that has no lane, each round with the exchanges of its two host waves.
+pub(crate) fn keep_loop_skips() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_KEEP_LOOP_SKIPS.get() {
+        return on;
     }
-    for block in &mut blocks {
-        block.phis.clear();
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_LOOP_SKIPS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_KEEP_LOOP_SKIPS`, for its thread only.
+    pub(crate) static TEST_KEEP_LOOP_SKIPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the blocks `inside` hold a cycle (a loop that lies wholly in them).
+fn loops_in(blocks: &[Block], inside: &[bool]) -> bool {
+    // depth-first, 1: on the path, 2: done
+    let mut state = vec![0u8; blocks.len()];
+    for first in (0..blocks.len()).filter(|&b| inside[b]) {
+        if state[first] != 0 {
+            continue;
+        }
+        let mut stack = vec![(first, 0usize)];
+        state[first] = 1;
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            top.1 += 1;
+            match blocks[b].exit.successors().get(i).copied() {
+                Some(s) if !inside[s] => {}
+                Some(s) => match state[s] {
+                    1 => return true,
+                    0 => {
+                        state[s] = 1;
+                        stack.push((s, 0));
+                    }
+                    _ => {}
+                },
+                None => {
+                    state[b] = 2;
+                    stack.pop();
+                }
+            }
+        }
     }
-    link(&mut blocks);
-    split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    false
 }
 
 /// Placeholder before renaming.
@@ -947,9 +1109,19 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    let (mut word, mut bits) = (0, set[0]);
+    std::iter::from_fn(move || loop {
+        if bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            return Some(reg_at(word * 64 + b));
+        }
+        word += 1;
+        if word >= set.len() {
+            return None;
+        }
+        bits = set[word];
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -1762,6 +1934,109 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    /// A loop of 100 rounds that counts in s7.
+    const LOOP: [u32; 4] = [
+        0x8007_8107, // L: s_add_u32 s7, s7, 1
+        0xB607_0064, // s_cmpk_ge_u32 s7, 100
+        0xBF84_FFFD, // s_cbranch_scc0 L
+        0x7E02_0280, // v_mov_b32 v1, 0
+    ];
+
+    #[test]
+    fn a_skip_over_a_loop_is_kept_when_asked() {
+        // the loop's scalars are not read after the join: every lane may walk it (the deep form)
+        let looped = skip(&LOOP, &[]);
+        assert_eq!(skips(&looped), 1);
+        TEST_KEEP_LOOP_SKIPS.set(Some(false));
+        assert_eq!(skips(&without_skips(&looped, true).expect("left out")), 0);
+        // ... unless `VICTORY_KEEP_LOOP_SKIPS` is on (the default): a wave with no lane left does not run the loop
+        TEST_KEEP_LOOP_SKIPS.set(Some(true));
+        assert!(without_skips(&looped, true).is_none());
+        // a region without a loop is left out as before
+        let straight = skip(&[0x7E02_0280], &[]);
+        assert_eq!(skips(&without_skips(&straight, true).expect("left out")), 0);
+        TEST_KEEP_LOOP_SKIPS.set(None);
+    }
+
+    /// The early-out of a wave with no lane left (`s_cbranch_execz` to the end of the program)
+    /// over a loop: with `VICTORY_KEEP_LOOP_SKIPS` on a wave with no lane must not walk the loop
+    /// (it runs to its limit when its exit reads a lane that is off, as the table walk does).
+    /// `without_skips` takes the `ends(taken)` way out before it asks `loops_in`, and
+    /// `without_early_outs` never asks, so both drop this skip.
+    #[test]
+    fn an_early_out_over_a_loop_is_kept_when_asked() {
+        let mut w = vec![
+            0x7D88_0000,                      // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A,                      // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0000 | LOOP.len() as u32,  // s_cbranch_execz to the end
+        ];
+        w.extend_from_slice(&LOOP);
+        w.push(S_ENDPGM);
+        let p = build_words(&w, true);
+        assert_eq!(skips(&p), 1);
+        TEST_KEEP_LOOP_SKIPS.set(Some(true));
+        let by_skips = without_skips(&p, true);
+        let by_early_outs = without_early_outs(&p);
+        TEST_KEEP_LOOP_SKIPS.set(None);
+        assert!(
+            by_skips.as_ref().is_none_or(|q| skips(q) == 1),
+            "without_skips dropped the early-out over a loop"
+        );
+        assert!(
+            by_early_outs.as_ref().is_none_or(|q| skips(q) == 1),
+            "without_early_outs dropped the early-out over a loop"
+        );
+    }
+
+    fn branch_block(p: &Program) -> usize {
+        (0..p.blocks.len())
+            .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"))
+            .expect("the branch")
+    }
+
+    /// The skips and early-outs kept for a loop are named, so that a form can take exactly those
+    /// branches wave-wide; what the scalars after the join keep, or what has no loop, is not.
+    #[test]
+    fn the_branches_kept_for_a_loop_are_named() {
+        const SET: u32 = 0xBE86_0385; // s_mov_b32 s6, 5
+        const READ: u32 = 0x7E04_0206; // v_mov_b32 v2, s6
+        let looped = skip(&LOOP, &[]);
+        let straight = skip(&[0x7E02_0280], &[]);
+        let scalar = skip(&[SET], &[READ]);
+        let mut early = vec![
+            0x7D88_0000,                     // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A,                     // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0000 | LOOP.len() as u32, // s_cbranch_execz to the end
+        ];
+        early.extend_from_slice(&LOOP);
+        early.push(S_ENDPGM);
+        let early = build_words(&early, true);
+        TEST_KEEP_LOOP_SKIPS.set(Some(true));
+        for deep in [true] {
+            let (program, kept) = drop_skips(&looped, deep);
+            assert!(program.is_none(), "deep {deep}: nothing else is left out");
+            assert_eq!(kept, [branch_block(&looped)], "deep {deep}");
+            let (program, kept) = drop_skips(&early, deep);
+            assert!(program.is_none() && kept == [branch_block(&early)], "deep {deep}: the early-out");
+            let (program, kept) = drop_skips(&straight, deep);
+            assert!(program.is_some() && kept.is_empty(), "deep {deep}: no loop");
+            let (program, kept) = drop_skips(&scalar, deep);
+            assert!(program.is_none() && kept.is_empty(), "deep {deep}: the scalar keeps it, not the loop");
+        }
+        let (program, kept) = drop_early_outs(&early);
+        assert!(program.is_none());
+        assert_eq!(kept, [branch_block(&early)]);
+        TEST_KEEP_LOOP_SKIPS.set(Some(false));
+        for deep in [true] {
+            let (program, kept) = drop_skips(&looped, deep);
+            assert!(program.is_some() && kept.is_empty(), "deep {deep}: the switch is off");
+        }
+        let (program, kept) = drop_early_outs(&early);
+        assert_eq!(skips(&program.expect("left out")), 0);
+        assert!(kept.is_empty());
+        TEST_KEEP_LOOP_SKIPS.set(None);
     }
 
     #[test]

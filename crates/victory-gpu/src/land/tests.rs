@@ -552,3 +552,8 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
+
+#[test]
+fn the_tail_threads_go_by_the_text_of_the_variable() {
+    assert_eq!([None, Some("0"), Some(" 6 "), Some("99"), Some("x")].map(tail_of), [0, 0, 6, 16, 0]);
+}

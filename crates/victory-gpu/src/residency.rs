@@ -92,7 +92,7 @@ pub(crate) fn allow_staging_growth(bake: bool) -> bool {
 
 pub(crate) fn limited_host_ram() -> bool {
     static LIMITED: OnceLock<bool> = OnceLock::new();
-    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
+    *LIMITED.get_or_init(|| memory_status().is_some_and(|s| crate::lean::total_physical(s.ullTotalPhys) <= 32 * GIB))
 }
 
 /// `VICTORY_PRESSURE_LEGACY=1`: the bounds of a PC of 32 GiB ([`physical_bounds`])
@@ -137,7 +137,7 @@ pub(crate) fn refresh() {
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
-    let bounds = physical_bounds(status.ullTotalPhys, legacy_bounds());
+    let bounds = physical_bounds(crate::lean::total_physical(status.ullTotalPhys), legacy_bounds());
     let pressure = next_pressure(was, physical, commit, bounds);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);

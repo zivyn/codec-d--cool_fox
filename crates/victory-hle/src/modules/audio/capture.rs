@@ -1,7 +1,9 @@
 //! Debugging aid: `VICTORY_AUDIO_CAPTURE=<file.wav>` records what the title
 //! plays, 48 kHz stereo 16-bit, through process loopback: our own process
 //! tree only, never the rest of the host's mix. Stretches where nothing was
-//! played are written as silence, so the file keeps real time.
+//! played are written as silence, so the file keeps real time, from the
+//! moment the recorder started (about the title's start): the second `t` of
+//! the file is the second `t` of the title's log.
 //!
 //! The recorder runs in a child copy of this executable: an audio client
 //! in the title's process raises that process's timer resolution, which
@@ -66,7 +68,7 @@ pub fn start() {
                 }
             });
     }
-    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
+    if victory_gpu::env_on("VICTORY_AUDIO_CAPTURE")
         && let Err(e) = std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
                 .env(TARGET, std::process::id().to_string())
@@ -181,6 +183,9 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let mut file = File::create(path)?;
         file.write_all(&header(0))?;
         client.Start()?;
+        // Time zero of the file is this moment (about the title's start, and
+        // the time stamp of the log line below), not the first sound.
+        let started = Instant::now();
         tracing::info!(path = %path.display(), "recording the title's audio");
 
         let (mut written, mut first) = (0u64, None);
@@ -192,7 +197,14 @@ fn record(pid: u32, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                 let (mut data, mut frames, mut flags, mut qpc) = (std::ptr::null_mut(), 0, 0, 0);
                 capture.GetBuffer(&mut data, &mut frames, &mut flags, None, Some(&mut qpc))?;
                 // Where this packet belongs, from its time stamp (100 ns).
-                let at = (qpc - *first.get_or_insert(qpc)) * u64::from(RATE) / 10_000_000;
+                let start = *first.get_or_insert_with(|| {
+                    // The packet is at most a poll and its own length old.
+                    let age = started.elapsed().saturating_sub(Duration::from_millis(
+                        u64::from(frames) * 1000 / u64::from(RATE) + 10,
+                    ));
+                    qpc.saturating_sub(age.as_micros() as u64 * 10)
+                });
+                let at = qpc.saturating_sub(start) * u64::from(RATE) / 10_000_000;
                 if at > written + u64::from(RATE / 500) {
                     tracing::debug!(
                         ms = (at - written) * 1000 / u64::from(RATE),

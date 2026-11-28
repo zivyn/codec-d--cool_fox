@@ -66,7 +66,7 @@ What did it, on top of the list below:
   the runs before made 1, and the processor no longer compares 550 to
   710 MB a frame looking for shader writes (25 MB now).
 - Levels on demand ran on the card for the first time
-  (`VICTORY_LEVELS_ON_DEMAND=1`, still off by default; with the fixes of
+  (`VICTORY_LEVELS_ON_DEMAND=1`, still off by default then, on by default since 2026-11-27 (`defaults.rs`); with the fixes of
   pull request #747 by AscilCH): 3.1 GB of the card not allocated for
   texture levels the title does not hold, no device loss.
 - Guarded blocks under storage writes are opened by default; 14 more
@@ -91,7 +91,7 @@ Memory sync between the title's memory and the copies on the card:
 - Writes of the storage layer into physical pages are counted where the title
   has those pages mapped (10,000 to 50,000 guarded blocks of copies lay under
   them in every run) and can open the guards there:
-  `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
+  `VICTORY_PAGE_WRITES=guards` (off by default then; today unset reads as `guards`, on, and `=0` only counts; `1`, `slots`, `all` do more).
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
 
 Card memory (the test card is full from the first frame of the world: 85 to
@@ -105,7 +105,7 @@ use):
 - Refused texture slots are held back for a few seconds so that a pass
   reaches the slots behind them (`VICTORY_FULL_CARD_PASS=0` = as before);
   room can be kept for the card copies of title buffers
-  (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`, off).
+  (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`, off then; on today unless `=0`).
 
 Tools and diagnostics:
 - `victory translate <shader file> --warm all --jobs N` translates every
@@ -114,7 +114,7 @@ Tools and diagnostics:
   build that does not touch the translator starts warm.
 - Counters, all off or diagnostics-only: `VICTORY_MERGE_RACE=1` (title bytes
   a copy-back is about to put back to older values: none found in 138,000
-  copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
+  copy-backs; the switch is gone from the code), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
   of the copies the texture sweep never lets go.
 
 ### What this fork changed (summary)
@@ -304,7 +304,8 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
-The on/off switches below (`...=1`) are off when unset or set to `0`.
+The on/off switches below (`...=1`) are off when unset or set to `0`, except the ones written `...=0`, which are on by default.
+This table is a selection: every `VICTORY_*` variable, with its default, is in [switches.md](switches.md).
 
 | Variable | Effect |
 |----------|--------|
@@ -315,17 +316,36 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCHDOG_HOLD=0` | (any build) our stalls (a frame recording, host pipelines made on a title thread) no longer pause the title's hang watchdog; on by default |
 | `VICTORY_WATCHDOG_HOLD_MAX_S=900` | (any build) how long the pause is kept while the title's heartbeat does not move |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS_FILE=<path>` | holds the keys named in that file (comma separated, `W,Enter`; rewritten live by a driver script, empty or missing = none), focus or not, so a script can press keys without taking the keyboard from the user |
+| `VICTORY_TEXT_ENTRY=default` | (any build) the title's text entry (on-screen keyboard) answers with the title's default text at once instead of opening a host dialog; `cancel` answers as cancelled. For runs nobody sits at |
+| `VICTORY_TRIGGER_RUMBLE=0` | (any build) the title's trigger motors are dropped; by default a trigger's level also drives, at half, the host pad's main motor on its side (XInput has no trigger motors) |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_DUMP_TARGETS=stats` | with the above and `VICTORY_CAPTURE_TRIGGER`, `frame-<n>-targets.tsv` has, for every float target, `max`, `min`, `mean`, `nan`, `inf` and then `over` (color channels past `VICTORY_NONFINITE_LIMIT`, 60000), `first` (the first texel that is no number, infinite or over it), `bbox` and `maxat`; `frame-<n>-bad.tsv` lists the worst texels (16 first, 16 largest) with their channels: where to look with `victory replay --pixel <id>:x,y` |
+| `VICTORY_CAPTURE_CROP=x0,y0,x1,y1[|x0,y0,x1,y1...]` | with `VICTORY_DUMP_TARGETS` (diag): boxes of the picture as fractions (0..1) of a target's width and height; every row of `frame-<n>-targets.tsv` gets one `crop<r>,<g>,<b>,<a>` column per box, the mean color of that patch as the target holds it (float formats as numbers, 8-bit and 10-bit color as 0..1, `crop-` for targets that are no color or volumes), so one patch (a character's hair) is followed through the G-buffer, the light and the post chain |
+| `VICTORY_NAN_SAFE=<bits>` | translation switch (cache key), off: 1 compares, 2 legacy products, 4 clamp, 8 max/min say a NaN or a zero by the bits of the float; the `nan_tests` GPU tests (`-filter nan_tests`) say which ops differ from RDNA2 on a card |
+| `VICTORY_F32_FTZ=1` | translation switch (cache key), off: the entry point asks the driver for the console's float mode, 32-bit denormals flushed (`"fp32-denorm-mode"="ftz"`, shader model 6.2); `nan2_tests` say whether the card honors it |
+| `VICTORY_F16_NEAREST=2` | translation switch (cache key), off: as `=1` (16-bit results round to nearest, as the console), and also for `v_fma_mixlo_f16`/`v_fma_mixhi_f16` and the packed `v_pk_*_f16` results |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_LIVE_FILE=<path>` | with the above (diag build): the file is read again once a second, and its `skip=<hash>,<hash>,...` lines (any number) are added to `VICTORY_SKIP_PIPELINES`, so a driver script can switch passes off and on in one process; an empty or missing file leaves the variable's list; `ambient*` lines belong to the stand-in (`fix/lighting-exposure`) |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
+| `VICTORY_GPU_TIMING_FILE=<path>` | with the above, every kind of command of the last 5-second report (the log lines list only the forty longest of some 1,100), one row each: ms and commands a frame, the longest in ms, the title's queue it ran on (graphics, compute, copy), the pipeline; overwritten at each report. The log has one more line, `the card's time by the title's queue` |
+| `VICTORY_CARD_SPANS=1` | the card's own timestamps, in every build (the release exe too): the frame line "our passes on the card per frame" gives the card's ms and lists for our sends up (and the copies among them), the hash passes after them and the compare passes after each submission; "the card's own stamps" gives its working and idle time |
+| `VICTORY_QUIET_COMPARE=1` | a whole refresh of a long range of a copy no CPU of the title writes stores and sends up only the 4 KiB blocks that differ from the copy's CPU side (the upscaler's 21 MB working buffer went up whole every frame in some processes); `may be named by VICTORY_AB`; the frame line "whole copies of buffers no CPU writes, by comparing" |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | diagnostics build only: translated shader loops of every stage stop after `n` iterations per lane instead of the stage's own limit (pixel 128, vertex and mesh 256, compute 4096; any `n`, 2^20 included, replaces them; own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_LOOP_LIMITS=<entry>,...` | the limit of the loops that are really that long (see `VICTORY_LOOP_NOTES=1`, which names the loops cut at their limit, and `VICTORY_LOOP_WHY=1`, which lists the loops of each program): `cs=<n>` / `ps=` / `vs=` / `ms=` for a stage, `<hash>=<n>` for every loop of a program, `<hash>:<loop>=<n>` for one loop (`<hash>` the first 4-7 hex digits of the program's hash, `<n>` decimal, `0x` hex or `<n>k`, at most 2^20); the most specific entry wins; off unless set (own shader cache entries) |
+| `VICTORY_HANG_GUARD=1` (or a number of rounds) | a diagnostic for a card that is lost (`0x887A0006`) in a loading phase: the translated group barriers of compute programs are counters in shared memory with a wait that gives up after that many rounds (default 2^18), a wave over `VICTORY_HANG_BUDGET` barriers (default 2^16) ends, a loop with a barrier in it is cut at `VICTORY_HANG_LOOP` rounds (default 1024), and the waits of the two host waves of a console wave give up as soon. Each leaves a note in the faults buffer and ends the thread; the host logs `the hang guard ended threads of a shader (hash starts with ...)` once for each program, kind and site. The picture of a run that ends threads is wrong; the point is the program's hash. Off unless set (own shader cache entries) |
+| `VICTORY_HANG_AUDIT=1` (`2`) | the translator (and `victory translate`) prints a line for each module with a group barrier (`HANG-AUDIT #<7 hex of the hash> barriers=.. loops=.. nest=.. differs=.. [..] loaded=.. [..]`, and `HANG-FINAL` for the form a compute program ended in): whether some thread of the group may not reach a barrier (a branch on a value that differs between threads: `differs`; on a value read from memory by each half: `loaded`), how many loops hold a barrier and how deep they nest; `=2` adds the module's control flow. Prints only |
+| `VICTORY_HALF_EXIT=0` | (on by default since 2026-11-28: on the RTX, DefragHeap's loop cut went from 7.78 ms to under 0.5 ms with an identical picture; `=0` is the A/B) a console wave64 run as two host waves of 32 (NVIDIA) whose loop reads the first lane in every round (a waterfall, a scalarisation loop): the half that has no lane left clears its exchange dword on the way out, and a first-lane read in a loop asks both halves which has a lane instead of taking lane 0's; without it the half that finishes later reads the other's last words, matches nothing and runs to the loop's limit, its lanes leaving as killed (own shader cache entries; groups of more than 64 threads are not covered) |
+| `VICTORY_KEEP_LOOP_SKIPS=0` | (on by default since 2026-11-28: on the RTX the alias copy went from 19.1 to 1.9 ms under instrumentation and the GPU commands from 166.7 to 140.2 ms, no errors, an identical picture; `=0` is the A/B) keeps an `s_cbranch_execz` over a region that holds a loop: a wave with no lane left skips the loop, as the console does; without it its lanes walk the region with EXEC clear, and a loop whose exit reads a scalar from a lane that holds nothing (a table walk ending on `v_readlane` of lane 63, a waterfall) runs to its iteration limit in every such wave (own shader cache entries; since the form fix of 2026-11-28 it moves no program out of the form it had without it unless `VICTORY_KEPT_SKIPS_WIDE` is on) |
+| `VICTORY_KEPT_SKIPS_WIDE=1` | (off by default in integ/validation-23; the code of integ/validation-22 had it on for the safe classes: `=0` off, `=all` every class) with `VICTORY_KEEP_LOOP_SKIPS`, the skips and early-outs over loops of a program that has to be retried are kept and taken wave-wide, where no group barrier can be met by half of a group (class a: no barrier in the guarded block; class b: a barrier whose condition is the same in every wave of the group). It is the form that gave the defragmentation pass's loop cut (7.78 -> under 0.5 ms), and the form the title lost the card in while loading (2 of about 4 starts with it on, 0 of about 7 with it off); 91 of its 116 programs have a group barrier behind a divergent branch. In the shader cache key |
+| `VICTORY_LOCAL_EXIT=1` | a console wave64 program that translates only as two host waves of 32 that each run as a wave of their own (the approximate "any mask" form) and has a loop over the lanes left in a mask (a decal list walked bit by bit, a waterfall): the branches that leave the loop are taken by the host wave together, as the console takes them for its wave; without it each lane leaves on its own bit, a lane outside the loop's mask never meets the branch and goes round until the loop's limit (then it leaves as killed and what the code after the loop writes for it is lost), and the code after the loop that reads other lanes runs with the lanes that have left so far (own shader cache entries; `=2` also takes the broader forms. The RTX test passes since the 2026-11-28 fix, 64 of 64 lanes store against 40 of 64 without it, but the blocky hair is no better with it: off) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

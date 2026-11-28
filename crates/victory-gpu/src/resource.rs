@@ -265,17 +265,31 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
+///
+/// `VICTORY_R11G11B10_AS_F16=1` (BAND2, off): the same for R11G11B10_FLOAT (26), which every
+/// host GPU renders to and writes, so the host is not refusing it. The indirect light keeps
+/// its volumes in that format and writes each one back over itself every frame through
+/// filters; how a GPU rounds a float to 11 and 10 bits (D3D leaves it open: truncation is
+/// allowed) decides whether such a loop holds its values or sheds a unit in the last place
+/// a frame. 16-bit float RGBA stands in: more mantissa than either, rounded to nearest.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
+    const STAND_INS: [(u32, u32); 4] = [(86, 28), (115, 28), (67, 10), (26, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, to)| {
+                if f == 26 {
+                    let asked = crate::switch::on("VICTORY_R11G11B10_AS_F16");
+                    if asked {
+                        tracing::info!(format = f, stand_in = to, "VICTORY_R11G11B10_AS_F16: R11G11B10 targets and volumes are made in 16-bit float RGBA");
+                    }
+                    return asked;
+                }
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -319,6 +333,23 @@ pub(crate) fn stands_in(this: This) -> bool {
         && host_resource(this)
             // SAFETY: a live resource.
             .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
+}
+
+/// Whether `this` is a title texture of R11G11B10_FLOAT whose host copy stands in for it in 16-bit float RGBA
+/// (`VICTORY_R11G11B10_AS_F16`): what the title copies into it in its own format is converted ([`crate::standin`]).
+#[cfg(windows)]
+pub(crate) fn stands_in_r11g11b10(this: This) -> bool {
+    !this.is_null() && pc_format(resource(this).desc.format) == 26 && stands_in(this)
+}
+
+/// Whether `this` is a title texture of R11G11B10_FLOAT whose host copy is of that format too (not a stand-in).
+#[cfg(windows)]
+pub(crate) fn holds_r11g11b10(this: This) -> bool {
+    !this.is_null()
+        && pc_format(resource(this).desc.format) == 26
+        && host_resource(this)
+            // SAFETY: a live resource.
+            .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 == 26)
 }
 
 /// Depth textures the title also asks unordered access for (the console
@@ -510,6 +541,8 @@ fn twin_texture(
         return None;
     };
     let _ = crate::host::resident(&host.device, &texture);
+    // Written and read by the frame's depth passes: the last the system moves (`VICTORY_VRAM_HOLD`).
+    crate::vram::prioritize_resource(&host.device, &texture, crate::vram::Class::Max);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -571,6 +604,7 @@ fn twin_texture(
         }
         texture.map(|texture| {
             let _ = crate::host::resident(&host.device, &texture);
+            crate::vram::prioritize_resource(&host.device, &texture, crate::vram::Class::Max);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -677,6 +711,27 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// A footprint of `format` (a DXGI format number), `size` texels (width, height, depth), its rows `row_pitch` bytes
+    /// apart, at `offset` in its buffer.
+    pub(crate) fn new(offset: u64, format: u32, size: [u32; 3], row_pitch: u32) -> PlacedFootprint {
+        PlacedFootprint { offset, format, width: size[0], height: size[1], depth: size[2], row_pitch }
+    }
+
+    /// Its DXGI format number.
+    pub(crate) fn format(&self) -> u32 {
+        self.format
+    }
+
+    /// Its width, height and depth in texels.
+    pub(crate) fn size(&self) -> [u32; 3] {
+        [self.width, self.height, self.depth]
+    }
+
+    /// The bytes between its rows.
+    pub(crate) fn row_pitch(&self) -> u32 {
+        self.row_pitch
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;
@@ -1284,7 +1339,7 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
         return 0;
     };
     let layout = &t.planes[0].layout;
-    if layout.desc.swizzle.xor() {
+    if !detilable(layout) {
         return 0;
     }
     let block = u64::from(layout.desc.block.max(1));
@@ -1294,6 +1349,39 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
         base -= 1;
     }
     base
+}
+
+/// Whether the host reads a texture of `layout` from title memory: every
+/// layout with addresses. The XOR modes (`_X`, `_T`) are in unless
+/// `VICTORY_XOR_UPLOAD=0` (the tile configuration they are laid out by is an
+/// estimate, `victory_formats::texture::Gpu`); `SW_4KB_R_X` and multisampled
+/// ones have no addresses.
+pub(crate) fn detilable(layout: &victory_formats::texture::Layout) -> bool {
+    layout.addressable() && (!layout.desc.swizzle.xor() || xor_upload())
+}
+
+/// `VICTORY_XOR_UPLOAD` is not `0`: the uploads of XOR modes ([`detilable`]).
+pub(crate) fn xor_upload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_XOR_UPLOAD").as_deref() != Ok("0"))
+}
+
+/// `VICTORY_XOR_READBACK` is not `0`: the read-back of textures the title reads on the CPU lands in XOR modes too
+/// (`crate::texback`; with `0` they are left as before the XOR addressing, nothing is landed). Symmetric to
+/// [`xor_upload`], so that the pipe and packer count they are laid out by (an estimate) can be taken out of the
+/// water by itself.
+pub(crate) fn xor_readback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| xor_readback_from(std::env::var("VICTORY_XOR_READBACK").ok().as_deref()))
+}
+
+fn xor_readback_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// Whether a read-back lands in a texture of `layout`: any layout, but the XOR modes with the switch off.
+pub(crate) fn lands_back(layout: &victory_formats::texture::Layout, xor: bool) -> bool {
+    xor || !layout.desc.swizzle.xor()
 }
 
 /// The bytes of title memory a placed texture with the resource description
@@ -1554,9 +1642,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
-            // What the upload can read: a console layout, no XOR mode
-            // (`crate::texture` `staging`).
-            let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // What the upload can read: a console layout with addresses
+            // ([`detilable`], `crate::texture` `staging`).
+            let readable = texture_layout(&r.desc).is_some_and(|t| detilable(&t.planes[0].layout));
             // With the card short of room every such texture is made
             // level by level, whole in title memory or not: the levels
             // that do not fit get no memory ([`level_cap_for`]) and the
@@ -1727,7 +1815,11 @@ fn headroom(memory: Option<[u64; 4]>) -> i64 {
         // used.
         Some([budget, used, ..]) => {
             let line = budget / 100 * room_percent();
-            i64::try_from(line).unwrap_or(i64::MAX).saturating_sub(i64::try_from(card_use(used)).unwrap_or(i64::MAX))
+            let net =
+                i64::try_from(line).unwrap_or(i64::MAX).saturating_sub(i64::try_from(card_use(used)).unwrap_or(i64::MAX));
+            // The free parts of the blocks and heaps count as room above; the card's whole use may not stand
+            // past its budget by more than `VICTORY_VRAM_OVER_MB` (`VICTORY_VRAM_HOLD`).
+            net.min(crate::vram::gross_room(budget, used))
         }
         None if filled < WITHOUT_BUDGET => i64::MAX,
         None => i64::MIN,
@@ -1830,9 +1922,12 @@ pub(crate) fn retry_allowed(now: u64, cap: u64, steps: bool) -> bool {
 
 /// [`retry_allowed`] for the card as it is now (see [`level_cap_lately`]).
 #[cfg(windows)]
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_LEVELS_RETRY=0`: a question asked now of the card as it is
+/// now; what it changes is which textures are uploaded again, so a phase may leave textures to the next that it
+/// would have had in the other way: for the frame time, not for the picture of the run.)
 pub(crate) fn may_retry(cap: u64) -> bool {
-    static STEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let steps = *STEPS.get_or_init(|| std::env::var_os("VICTORY_LEVELS_RETRY").is_none_or(|v| v != "0"));
+    let steps = crate::ab::live_value!("VICTORY_LEVELS_RETRY", bool, crate::ab::unless_zero);
     retry_allowed(level_cap_lately(), cap, steps)
 }
 
@@ -2288,6 +2383,78 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Once a second, after [`let_go_idle`] (`VICTORY_POOL_COMPACT=1`): makes
+/// again the host copies that lie in the blocks of textures being emptied
+/// ([`crate::pool::compact_step`]), up to [`crate::pool::compact_bytes`] a
+/// call. Each is taken out of its title texture as [`want_level`] does for a
+/// copy that is replaced (the slots that show it go on showing it, the host
+/// copy is held for the threads that may be about to record its use), its
+/// staging state goes, and the slots at its memory are made due: the next
+/// use makes the copy anew (in a block that stays, with
+/// `VICTORY_POOL_FIT`), the upload fills it from title memory, and the slots
+/// show it once that has run ([`crate::descriptor::host::levels_changed_after`]).
+/// What the title's CPU never wrote is all that is moved: a copy the host
+/// wrote (its contents are on the card alone), one that stands for another
+/// texture's memory ([`alias_of`]), one made level by level, and one that
+/// was not made in a block is left where it is.
+///
+/// The block is empty once every one of its textures has been made again
+/// and let go of by its slots (a second and a half later); one that stays
+/// is given up after a minute.
+#[cfg(windows)]
+pub(crate) fn compact_pool() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    let Some(victims) = crate::pool::compact_step(crate::host::now_ms()) else {
+        return;
+    };
+    let mut left = crate::pool::compact_bytes();
+    let (mut moved, mut bytes) = (0u64, 0u64);
+    let all = textures();
+    for &at in all.iter() {
+        if left == 0 {
+            break;
+        }
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) {
+            continue;
+        }
+        let Ok(mut made) = r.host.made.try_lock() else {
+            continue;
+        };
+        let hit = made.as_ref().is_some_and(|(host, _)| {
+            host.tiled.is_none() && host.filled && victims.contains(&(host.texture.as_raw() as usize))
+        });
+        if !hit || crate::texture::host_wrote(at) || alias_of(at as This).is_some() {
+            continue;
+        }
+        // Under the lock, as in `want_level` and `let_go_idle`.
+        crate::texture::unstage(at as This);
+        r.host.wanted.store(u32::MAX, Relaxed);
+        r.host.grown.store(true, Relaxed);
+        let Some(old) = made.take() else {
+            continue;
+        };
+        let size = old.0.bytes;
+        left = left.saturating_sub(size.max(1));
+        moved += 1;
+        bytes += size;
+        REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+        drop(made);
+        // The slots at its memory are due from the next frame, as when the
+        // runtime maps memory under them.
+        crate::descriptor::host::remapped(r.data() as usize, footprint(&r.desc).map_or(0, |f| f.size) as usize);
+    }
+    drop(all);
+    if moved > 0 {
+        crate::pool::COMPACTED[1].fetch_add(moved, Relaxed);
+        crate::pool::COMPACTED[4].fetch_add(bytes, Relaxed);
+        crate::host::trail(|| format!("pool compaction: {moved} host copies of textures ({} KiB) made again out of blocks being emptied", bytes >> 10));
+    }
+}
+
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
 #[cfg(windows)]
@@ -2425,6 +2592,37 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
     }
 }
 
+/// Host textures alive that took memory of their own, by what they are, as
+/// a count and the bytes the host gives them: render targets, depth,
+/// unordered access (the colour twins of depth among them), the rest
+/// (textures the title fills, whether they lie in a block or not).
+#[cfg(windows)]
+static ALIVE_KINDS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// [`ALIVE_KINDS`] as (count, bytes) pairs.
+#[cfg(windows)]
+pub(crate) fn alive_kinds() -> [(u64, u64); 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    std::array::from_fn(|i| (ALIVE_KINDS[2 * i].load(Relaxed), ALIVE_KINDS[2 * i + 1].load(Relaxed)))
+}
+
+/// Which of [`ALIVE_KINDS`] a texture with these host flags is.
+#[cfg(any(windows, test))]
+fn kind_of(flags: u32) -> usize {
+    const TARGET: u32 = 0x1;
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    if flags & DEPTH != 0 {
+        1
+    } else if flags & TARGET != 0 {
+        0
+    } else if flags & UNORDERED != 0 {
+        2
+    } else {
+        3
+    }
+}
+
 #[cfg(windows)]
 impl HostTexture {
     pub(crate) fn flags(&self) -> u32 {
@@ -2438,6 +2636,9 @@ impl HostTexture {
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        let kind = kind_of(flags);
+        ALIVE_KINDS[2 * kind].fetch_add(1, Relaxed);
+        ALIVE_KINDS[2 * kind + 1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2485,6 +2686,11 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        if self.tiled.is_none() {
+            let kind = kind_of(self.flags);
+            ALIVE_KINDS[2 * kind].fetch_sub(1, Relaxed);
+            ALIVE_KINDS[2 * kind + 1].fetch_sub(self.bytes, Relaxed);
+        }
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
@@ -2640,7 +2846,7 @@ fn host_texture_as(
         && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
-        && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+        && texture_layout(desc).is_some_and(|t| detilable(&t.planes[0].layout))
         // SAFETY: the description has the host layout, as below.
         && let Some(t) = unsafe {
             crate::pool::texture(
@@ -2704,6 +2910,16 @@ fn host_texture_as(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        // Render targets and depth are written and read by every frame; the other textures made whole
+        // are read by it (`VICTORY_VRAM_HOLD`; a reserved texture's memory is the heaps of tiles').
+        if !reserved {
+            let class = if d.flags & (TARGET | DEPTH) != 0 {
+                crate::vram::Class::Max
+            } else {
+                crate::vram::Class::High
+            };
+            crate::vram::prioritize_resource(&host.device, t, class);
+        }
     }
     texture
 }
@@ -3511,6 +3727,18 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    /// Host textures are told apart for the census by their flags: depth before target before unordered access.
+    #[test]
+    fn host_textures_are_counted_by_what_they_are_for_the_census() {
+        assert_eq!(kind_of(0x1), 0);
+        assert_eq!(kind_of(0x2), 1);
+        assert_eq!(kind_of(0x3), 1, "a depth texture is not a target");
+        assert_eq!(kind_of(0x4), 2);
+        assert_eq!(kind_of(0x5), 0, "a target that shaders write is a target");
+        assert_eq!(kind_of(0x8), 3, "denying shader access makes it no other kind");
+        assert_eq!(kind_of(0), 3);
+    }
+
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {
         // DXGI_FORMAT values: 60 R8_TYPELESS, 61 R8_UNORM, 62 R8_UINT,
@@ -3525,6 +3753,36 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// `VICTORY_XOR_READBACK=0` (and only `0`) leaves the XOR modes out of the read-back, as `VICTORY_XOR_UPLOAD=0`
+    /// leaves them out of the uploads; the modes without XOR are landed either way.
+    #[test]
+    fn the_xor_readback_switch_leaves_out_the_xor_modes_only() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = |swizzle| {
+            Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            })
+            .expect("a layout")
+        };
+        assert!(xor_readback_from(None));
+        assert!(xor_readback_from(Some("1")));
+        assert!(!xor_readback_from(Some("0")));
+        let (plain, xor) = (layout(Swizzle::SW_64KB_S), layout(Swizzle::SW_64KB_S_X));
+        assert!(!plain.desc.swizzle.xor() && xor.desc.swizzle.xor());
+        for (on, plain_lands, xor_lands) in [(true, true, true), (false, true, false)] {
+            assert_eq!(lands_back(&plain, on), plain_lands);
+            assert_eq!(lands_back(&xor, on), xor_lands);
+        }
     }
 
     type Release = extern "system" fn(This) -> u32;

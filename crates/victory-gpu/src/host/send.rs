@@ -19,6 +19,7 @@
 //! sends only what changed makes many of, go as pairs of offset and value,
 //! stored by one dispatch per copy; the others as a copy each.
 
+use super::stage::{self, Staged};
 use super::*;
 use crate::shadow::Shadow;
 
@@ -110,6 +111,9 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    /// The stage the bytes crossed to on the copy queue ([`stage`]), until
+    /// the submission has run.
+    staged: Option<Staged>,
 }
 
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
@@ -120,7 +124,8 @@ static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
 /// At most this much is kept (of the card's memory, with [`on_card`]).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    // (`VICTORY_SEND_SPARE_MB`, `VICTORY_RAM_LEAN`: less.)
+    crate::lean::send_spare_mb(if on_card() { 256 } else { 768 }) << 20
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -156,11 +161,23 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        staged: None,
     })
 }
 
+/// For the memory line: buffers kept for the next submission, their bytes,
+/// and the most bytes that are kept.
+#[cfg(feature = "diagnostics")]
+pub(super) fn spare_kept() -> [u64; 3] {
+    let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+    [spare.len() as u64, spare.iter().map(|m| m.size).sum(), kept()]
+}
+
 /// The submission has run.
-pub(super) fn give_back(memory: Memory) {
+pub(super) fn give_back(mut memory: Memory) {
+    if let Some(staged) = memory.staged.take() {
+        staged.give_back();
+    }
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
@@ -184,10 +201,45 @@ struct Copy {
 pub(super) struct Own {
     memory: Memory,
     copies: Vec<Copy>,
+    /// The bytes are on their way to this stage, which the copies and the
+    /// scatters read in place of the memory.
+    staged: Option<Staged>,
 }
 
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
+
+/// With `VICTORY_LEAN_CARD`: what is moved under this many bytes is moved by the submitting thread alone, as
+/// before; more is shared with the threads that write the pairs.
+const LEAN_MOVES: u64 = 256 << 10;
+
+/// About this many bytes to a piece of work of the moves.
+const MOVE_PIECE: usize = 128 << 10;
+
+/// `moves` (from, to, bytes) cut into pieces of work of about `piece` bytes, long ones cut and short ones together: all the
+/// copies in order, and where each piece of work ends in them.
+fn pieces(moves: Vec<(usize, usize, usize)>, piece: usize) -> (Vec<(usize, usize, usize)>, Vec<usize>) {
+    let mut cuts = Vec::with_capacity(moves.len());
+    let mut ends = Vec::new();
+    let mut bytes = 0;
+    for (src, dst, len) in moves {
+        let mut at = 0;
+        while at < len {
+            let n = (piece - bytes).min(len - at);
+            cuts.push((src + at, dst + at, n));
+            at += n;
+            bytes += n;
+            if bytes >= piece {
+                ends.push(cuts.len());
+                bytes = 0;
+            }
+        }
+    }
+    if ends.last() != Some(&cuts.len()) && !cuts.is_empty() {
+        ends.push(cuts.len());
+    }
+    (cuts, ends)
+}
 
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
@@ -244,13 +296,37 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     };
-    crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    let (bytes, runs) = (moves.iter().map(|m| m.2 as u64).sum::<u64>(), moves.len() as u64);
+    STATS[0].fetch_add(bytes, Ordering::Relaxed);
+    STATS[1].fetch_add(runs, Ordering::Relaxed);
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    if lean_card() && bytes > LEAN_MOVES {
+        // The pairs and the copies in one batch of the threads that write the pairs: a submission sends up some
+        // 3 MB (44 MB a frame, 15 submissions), under what went to threads (4 MB), so it was the
+        // submitting thread's own, into memory the card reads and the bus is written through.
+        let (cuts, ends) = pieces(moves, MOVE_PIECE);
+        let pairs = work.len();
+        let begins = |k: usize| if k == 0 { 0 } else { ends[k - 1] };
+        crate::land::each_under(pairs + ends.len(), &|i| {
+            if i < pairs {
+                return one(i);
+            }
+            let k = i - pairs;
+            for &(src, dst, len) in &cuts[begins(k)..ends[k]] {
+                // SAFETY: as `crate::shadow::copy_all`: ranges of a copy's mapping and of the memory, which do not overlap.
+                unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+            }
+        });
+    } else {
+        crate::land::each_under(work.len(), &one);
+        crate::shadow::copy_all(moves);
+    }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    // The bus leg on the copy queue, started now: the sync list is recorded
+    // while the bytes cross (read once, so that each submission decides
+    // alone: `VICTORY_AB`). Not for memory in the card's own (`on_card`).
+    let staged = if stage::on() && !on_card() { stage::stage(&host.device, &memory.buffer, at) } else { None };
+    Some(Own { memory, copies, staged })
 }
 
 impl Own {
@@ -265,16 +341,29 @@ impl Own {
         host: &Host,
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+        stamps: Option<usize>,
         looked: impl Fn(&Shadow) -> bool,
     ) {
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+        // Where the bytes are read from: the stage in video memory (it is in
+        // the common state when this list begins and when it ends, as the
+        // copy queue needs it), or the submission's upload memory.
+        let source = self.staged.as_ref().map_or(&self.memory.buffer, Staged::buffer);
+        let source_states = D3D12_RESOURCE_STATE_COPY_SOURCE | read;
         let (mut first, mut last) = (Vec::new(), Vec::new());
+        if let Some(staged) = &self.staged {
+            // SAFETY: the caller's; a live buffer.
+            unsafe {
+                list.ResourceBarrier(&[transition(staged.buffer(), D3D12_RESOURCE_STATE_COMMON, source_states)]);
+            }
+            last.push(transition(staged.buffer(), source_states, D3D12_RESOURCE_STATE_COMMON));
+        }
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
@@ -283,7 +372,7 @@ impl Own {
                 }
                 state = Some(write);
             }
-            let hashed = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let hashed = if lean_card() { shadow.has_before() } else { shadow.card_sides().is_some_and(|(_, before, _)| before.is_some()) };
             if let Some(was) = state
                 && hashed
                 && (!copy.runs.is_empty() || copy.pairs.1 > 0)
@@ -293,6 +382,8 @@ impl Own {
         }
         // SAFETY: the caller's; live objects.
         unsafe {
+            // (`VICTORY_CARD_SPANS=1`: the copies are over, the scatter and the barriers follow.)
+            host.pass_stamp(list, stamps, 5);
             if !first.is_empty() {
                 list.ResourceBarrier(&first);
             }
@@ -301,7 +392,7 @@ impl Own {
             {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
-                list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
@@ -322,8 +413,56 @@ impl Own {
         }
     }
 
-    /// The memory, to be kept until the submission has run.
-    pub(super) fn memory(self) -> Memory {
+    /// The drawing queue stands behind the copy of the bytes to their stage,
+    /// if they cross on the copy queue. Before the list that reads them.
+    pub(super) fn wait(&self, queue: &ID3D12CommandQueue) -> windows::core::Result<()> {
+        match &self.staged {
+            Some(staged) => staged.wait(queue),
+            None => Ok(()),
+        }
+    }
+
+    /// The memory (and the stage), to be kept until the submission has run.
+    pub(super) fn memory(mut self) -> Memory {
+        self.memory.staged = self.staged.take();
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod piece_tests {
+    use super::pieces;
+
+    /// The pieces hold every byte of every move once, in order, in works of about the size, the last the rest.
+    #[test]
+    fn moves_cut_into_pieces_hold_the_same_bytes() {
+        let mut seed = 99u64;
+        let mut random = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as usize % n
+        };
+        for _ in 0..500 {
+            let moves: Vec<(usize, usize, usize)> = (0..random(40)).map(|i| (1_000_000 * (i + 1), 90_000_000 + 700_000 * i, random(1000))).collect();
+            let piece = 1 + random(700);
+            let (cuts, ends) = pieces(moves.clone(), piece);
+            // The same bytes, once each, in order.
+            let mut want = Vec::new();
+            for &(s, d, n) in &moves {
+                want.extend((0..n).map(|k| (s + k, d + k)));
+            }
+            let got: Vec<(usize, usize)> = cuts.iter().flat_map(|&(s, d, n)| (0..n).map(move |k| (s + k, d + k))).collect();
+            assert_eq!(got, want);
+            // Works end in order, cover all, and none but the last is under the size.
+            assert!(ends.windows(2).all(|w| w[0] < w[1]));
+            assert_eq!(ends.last().copied().unwrap_or(0), cuts.len());
+            let mut from = 0;
+            for (k, &end) in ends.iter().enumerate() {
+                let bytes: usize = cuts[from..end].iter().map(|c| c.2).sum();
+                assert!(bytes <= piece && (bytes == piece || k + 1 == ends.len()), "{bytes} of {piece}");
+                from = end;
+            }
+        }
     }
 }

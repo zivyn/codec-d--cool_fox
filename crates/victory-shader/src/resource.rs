@@ -366,10 +366,22 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
-            out.waterfall.compares.extend(proof.compares);
-            out.waterfall.reads.extend(proof.reads);
-            out.waterfall.loads.extend(loads);
+        match t.waterfall(block, &accesses, &reads) {
+            Ok(proof) => {
+                out.waterfall.compares.extend(proof.compares);
+                out.waterfall.reads.extend(proof.reads);
+                out.waterfall.loads.extend(loads);
+            }
+            Err(why) => {
+                // (`VICTORY_WAVE_WHY=1`: a loop that reads a descriptor offset at the first
+                // lane and was not proven a waterfall is a loop the translation runs as is)
+                if crate::env_on("VICTORY_WAVE_WHY") {
+                    eprintln!(
+                        "WATERFALL-UNPROVEN at {:#x}: {why}",
+                        t.inst((block, accesses[0])).machine.offset
+                    );
+                }
+            }
         }
     }
     out.lane_copied = t.lane_copied.take();
@@ -2029,6 +2041,13 @@ impl<'a> Tracer<'a> {
         const SELECT: &str = "a waterfall loop whose compares do not select the access's lanes";
         const RETRY: &str = "a waterfall loop whose retry does not keep the lanes still waiting";
         let access = accesses[0];
+        // (`VICTORY_WAVE_WHY=1`: which check refused it)
+        let fail = |n: u32, e: &'static str| {
+            if crate::env_on("VICTORY_WAVE_WHY") {
+                eprintln!("  waterfall check {n} failed ({e})");
+            }
+            e
+        };
         let block = &self.p.blocks[b];
         let lanes = self.lanes.ok_or(LOOP)?;
         let exit = block.insts.last().ok_or(LOOP)?;
@@ -2051,21 +2070,21 @@ impl<'a> Tracer<'a> {
         {
             return Err(SPLIT);
         }
-        let selected = exec(&block.insts[access]).ok_or(SELECT)?;
+        let selected = exec(&block.insts[access]).ok_or_else(|| fail(1, SELECT))?;
         if accesses
             .iter()
             .any(|&i| exec(&block.insts[i]) != Some(selected))
         {
-            return Err(SELECT);
+            return Err(fail(2, SELECT));
         }
-        let retry = exec(exit).ok_or(RETRY)?;
+        let retry = exec(exit).ok_or_else(|| fail(3, RETRY))?;
         let first = self.defs[reads[0].0 as usize].ok_or(LOOP)?;
-        let remaining = exec(self.inst(first)).ok_or(SELECT)?;
+        let remaining = exec(self.inst(first)).ok_or_else(|| fail(4, SELECT))?;
         if reads.iter().any(|v| {
             self.defs[v.0 as usize]
                 .is_none_or(|at| at.1 >= access || exec(self.inst(at)) != Some(remaining))
         }) {
-            return Err(SELECT);
+            return Err(fail(5, SELECT));
         }
         let reach = (lanes.reach[b], true);
         let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
@@ -2124,9 +2143,11 @@ impl<'a> Tracer<'a> {
                     continue;
                 };
                 let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+                    fail(90, "the compare's mask is not tracked");
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
+                    fail(91, "the compare may let a lane the access serves go by");
                     continue;
                 }
                 required.push((matched, true));
@@ -2138,23 +2159,27 @@ impl<'a> Tracer<'a> {
                 }
             }
         }
-        if reads.iter().any(|v| !out.reads.contains(v))
-            || meet(&[reach, (selected, true), (remaining, false)])
-        {
-            return Err(SELECT);
+        if reads.iter().any(|v| !out.reads.contains(v)) {
+            return Err(fail(60, SELECT));
+        }
+        if meet(&[reach, (selected, true), (remaining, false)]) {
+            return Err(fail(61, SELECT));
         }
         // The access must take every match.
         required.extend([reach, (selected, false)]);
         if meet(&required) {
-            return Err(SELECT);
+            return Err(fail(7, SELECT));
         }
         // The retry must keep exactly the lanes that were eligible but did
         // not perform the access.
-        if meet(&[reach, (retry, true), (remaining, false)])
-            || meet(&[reach, (retry, true), (selected, true)])
-            || meet(&[reach, (remaining, true), (selected, false), (retry, false)])
-        {
-            return Err(RETRY);
+        if meet(&[reach, (retry, true), (remaining, false)]) {
+            return Err(fail(80, RETRY));
+        }
+        if meet(&[reach, (retry, true), (selected, true)]) {
+            return Err(fail(81, RETRY));
+        }
+        if meet(&[reach, (remaining, true), (selected, false), (retry, false)]) {
+            return Err(fail(82, RETRY));
         }
         Ok(out)
     }

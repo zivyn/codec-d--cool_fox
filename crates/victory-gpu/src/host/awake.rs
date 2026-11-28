@@ -1,5 +1,5 @@
-//! Keeps the card's clocks up between submissions (`VICTORY_CARD_AWAKE=1`; off
-//! by default). The card stands idle half of every frame, some thirty times for
+//! Keeps the card's clocks up between submissions (`VICTORY_CARD_AWAKE=1`, on by
+//! default through `defaults.rs`; `=0` turns it off). The card stands idle half of every frame, some thirty times for
 //! a millisecond or two each, while the CPU prepares the next submission. The
 //! driver takes that for a light load and lowers the clocks, and what comes
 //! next starts slow: a captured frame whose lists take 30 ms sent in one go
@@ -47,7 +47,14 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 
 fn wanted() -> bool {
     let (last, now) = (LAST.load(Ordering::Relaxed), now_ms());
-    last != 0 && now + 1 < last + QUIET_MS && (mode() != Mode::ByTurns || now / TURN_MS % 2 == 1)
+    last != 0
+        && now + 1 < last + QUIET_MS
+        && (mode() != Mode::ByTurns || now / TURN_MS % 2 == 1)
+        // (Only while the card has nothing of ours to run: it needs no help to stay awake otherwise, and the loop's
+        // dispatch holds a wave slot and a queue of its own beside the title's work.)
+        && (mode() != Mode::Idle || super::card_idle())
+        // (`VICTORY_AB=..,VICTORY_CARD_AWAKE`: off in the phases without its bit.)
+        && crate::ab::pick("VICTORY_CARD_AWAKE").unwrap_or(true)
 }
 
 /// With `VICTORY_CARD_AWAKE=turns`: this long on, this long off.
@@ -59,13 +66,16 @@ enum Mode {
     On,
     /// On and off by turns, to compare the two in one run (the log says when).
     ByTurns,
+    /// `VICTORY_CARD_AWAKE=idle`: on only while the card has run everything sent to it (`super::card_idle`).
+    Idle,
 }
 
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
+    *MODE.get_or_init(|| match crate::defaults::var("VICTORY_CARD_AWAKE").as_deref() {
         Ok("1") => Mode::On,
         Ok("turns") => Mode::ByTurns,
+        Ok("idle") => Mode::Idle,
         _ => Mode::Off,
     })
 }

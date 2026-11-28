@@ -39,13 +39,14 @@ const TICK: Duration = Duration::from_millis(250);
 const LOGGED: Duration = Duration::from_secs(5);
 
 /// A pattern: what must be there (`None`: anything).
-type Pattern = &'static [Option<u8>];
+pub(crate) type Pattern = &'static [Option<u8>];
 
 macro_rules! pattern {
     ($($b:tt),* $(,)?) => { &[$(pattern!(@ $b)),*] };
     (@ _) => { None };
     (@ $b:literal) => { Some($b) };
 }
+pub(crate) use pattern;
 
 /// The handler of the title's two lifecycle events (suspend, resume): the
 /// first `mov` (a 4-byte offset after `0xc6 0x05`, then 1) sets the ping, the
@@ -79,7 +80,7 @@ pub struct Sites {
 
 /// The offsets of every place in `code` (at `rva`) that matches `pattern`,
 /// by its longest fixed run.
-fn matches(code: &[u8], pattern: Pattern) -> Vec<usize> {
+pub(crate) fn matches(code: &[u8], pattern: Pattern) -> Vec<usize> {
     let (mut best, mut run) = ((0, 0), (0, 0));
     for (i, b) in pattern.iter().enumerate() {
         if b.is_some() {

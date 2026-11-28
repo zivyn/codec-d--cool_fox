@@ -28,6 +28,9 @@ use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
+pub mod live;
+pub mod stats;
+use stats::COUNTERS;
 
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
@@ -348,6 +351,8 @@ struct Trace {
     peak: i16,
     /// Milliseconds after enabling when the input ran out.
     ended_ms: Option<u128>,
+    /// When the title last made room in the ring, until it is full again.
+    room_since: Option<Instant>,
 }
 
 struct Xma {
@@ -437,9 +442,11 @@ impl Xma {
                 bad_frames: 0,
                 peak: 0,
                 ended_ms: None,
+                room_since: None,
             },
         });
         drop(slot);
+        COUNTERS.voice_enabled();
         wake_decoder();
     }
 
@@ -450,6 +457,7 @@ impl Xma {
         let Some(voice) = lock(&self.voices[index as usize]).take() else {
             return;
         };
+        COUNTERS.voice_disabled();
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -487,13 +495,22 @@ impl Xma {
             t.taken += blocks as usize;
             t.takes += 1;
             t.partial_takes += u32::from(blocks < size);
+            if blocks > 0 && !voice.ended {
+                voice.trace.room_since.get_or_insert_with(Instant::now);
+            }
+            let samples = blocks.min(size) as usize * SAMPLES_PER_BLOCK / context.channels();
+            COUNTERS.taken(
+                u64::from(blocks.min(size)),
+                samples as u64 * 1_000_000 / u64::from(sample_rate(context)),
+            );
         }
         drop(slot);
         wake_decoder();
     }
 
-    /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    /// Fills every enabled context's output as far as it has room; the
+    /// voices that were enabled and how long it took.
+    fn pump(&self) -> (u32, std::time::Duration) {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
@@ -508,6 +525,7 @@ impl Xma {
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        (active, took)
     }
 }
 
@@ -536,11 +554,17 @@ fn pump(context: Context, voice: &mut Voice) {
         let Some(out) = heap_bytes(address as u32, BLOCK_BYTES) else {
             return;
         };
+        let mut block_peak = 0u16;
         for pair in out.as_chunks_mut::<2>().0 {
             let sample = voice.pcm.pop_front().unwrap_or(0);
-            voice.trace.peak = voice.trace.peak.max(sample.saturating_abs());
+            block_peak = block_peak.max(sample.unsigned_abs());
             pair.copy_from_slice(&sample.to_le_bytes());
         }
+        voice.trace.peak = voice
+            .trace
+            .peak
+            .max(i16::try_from(block_peak).unwrap_or(i16::MAX));
+        COUNTERS.block_out(block_peak);
         voice.trace.produced += SAMPLES_PER_BLOCK / context.channels();
         let write = (write + 1) % size;
         context.set_field(0, 27, 5, write);
@@ -551,8 +575,17 @@ fn pump(context: Context, voice: &mut Voice) {
         if write == context.field(9, 0, 5) % size {
             // Full: nothing more until the title advances its read block.
             context.set_field(1, 31, 1, 0);
+            if let Some(since) = voice.trace.room_since.take() {
+                COUNTERS.refilled(since.elapsed());
+            }
         }
     }
+}
+
+/// A context's sample rate.
+fn sample_rate(context: Context) -> u32 {
+    const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
+    RATES[context.field(1, 27, 2) as usize]
 }
 
 /// Decodes the next frame of the current input into `voice.pcm`; false
@@ -582,6 +615,8 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
                 voice.pcm.extend(tail);
             }
             voice.ended = true;
+            voice.trace.room_since = None;
+            COUNTERS.input_ended();
             voice.trace.ended_ms = Some(voice.trace.since.elapsed().as_millis());
             context.set_field(2, 26, 5, INPUT_INVALID);
             context.set_field(2, 31, 1, 1);
@@ -608,13 +643,14 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let decoder = voice.decoder.get_or_insert_with(|| {
-        const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
-        xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
-    });
+    let decoder = voice
+        .decoder
+        .get_or_insert_with(|| xma::Decoder::new(channels, sample_rate(context)));
     let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
     voice.trace.frames += 1;
-    if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
+    let decoded = decoder.decode(&frame.data, frame.bits, &mut pcm);
+    COUNTERS.frame(decoded.is_ok());
+    if let Err(e) = decoded {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
@@ -682,6 +718,30 @@ fn dump_input(index: u32, context: Context) {
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }
 
+/// The decoding thread runs above the title's ordinary threads: the
+/// hardware it stands for is never starved, and a title that keeps every
+/// core busy (6-9 frames a second here) would otherwise delay the rings
+/// past the mixer's next block. `VICTORY_XMA_PRIORITY=normal` leaves it at
+/// the default; `critical` raises it as far as it goes.
+#[cfg(windows)]
+fn raise_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST, THREAD_PRIORITY_NORMAL,
+        THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let level = match std::env::var("VICTORY_XMA_PRIORITY").as_deref() {
+        Ok("normal") => THREAD_PRIORITY_NORMAL,
+        Ok("critical") => THREAD_PRIORITY_TIME_CRITICAL,
+        _ => THREAD_PRIORITY_HIGHEST,
+    };
+    // SAFETY: the calling thread's own pseudo handle.
+    let done = unsafe { SetThreadPriority(GetCurrentThread(), level) } != 0;
+    tracing::info!(level, done, "XMA decoder thread priority");
+}
+
+#[cfg(not(windows))]
+fn raise_priority() {}
+
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
 fn wake_decoder() {
@@ -691,8 +751,16 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    raise_priority();
+                    let (mut last, mut window) = (Instant::now(), Instant::now());
+                    let mut stats = DecodeStats::new();
                     loop {
-                        xma().pump();
+                        let start = Instant::now();
+                        let (active, took) = xma().pump();
+                        COUNTERS.pass(start - last, start.elapsed());
+                        last = start;
+                        stats::tick(&mut window, active as usize);
+                        stats.pass(active, took);
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
                         std::thread::park_timeout(std::time::Duration::from_millis(2));
                     }
@@ -700,6 +768,56 @@ fn wake_decoder() {
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
         })
         .unpark();
+}
+
+/// What the XMA decoder thread costs, said every 5 s while voices play
+/// (`VICTORY_STREAM_STATS=0`: not said). The console's audio block decodes
+/// for nothing; here one thread of ours does, and this is how much of a core.
+struct DecodeStats {
+    since: Instant,
+    busy: std::time::Duration,
+    longest: std::time::Duration,
+    passes: u32,
+    slow: u32,
+    voices: u32,
+}
+
+impl DecodeStats {
+    fn new() -> DecodeStats {
+        DecodeStats {
+            since: Instant::now(),
+            busy: Default::default(),
+            longest: Default::default(),
+            passes: 0,
+            slow: 0,
+            voices: 0,
+        }
+    }
+
+    /// One pass over the voices; says the line when 5 s have passed.
+    fn pass(&mut self, active: u32, took: std::time::Duration) {
+        self.passes += 1;
+        self.busy += took;
+        self.longest = self.longest.max(took);
+        self.slow += u32::from(took.as_millis() >= 4);
+        self.voices = self.voices.max(active);
+        let elapsed = self.since.elapsed();
+        if elapsed.as_secs() < 5 {
+            return;
+        }
+        if self.voices > 0 && std::env::var_os("VICTORY_STREAM_STATS").is_none_or(|v| v != "0") {
+            tracing::info!(
+                voices = self.voices,
+                cores = format_args!("{:.3}", self.busy.as_secs_f64() / elapsed.as_secs_f64()),
+                passes = self.passes,
+                longest_ms = format_args!("{:.1}", self.longest.as_secs_f64() * 1e3),
+                over_4_ms = self.slow,
+                "XMA decoder: last {:.1} s (VICTORY_STREAM_STATS)",
+                elapsed.as_secs_f64()
+            );
+        }
+        *self = DecodeStats::new();
+    }
 }
 
 /// Runs an XMA command; false for one this does not know.
@@ -872,8 +990,21 @@ extern "system" fn submit(
         _ if xma_command(command, word) => {}
         // shortcut: context updates and the other SHAPE units' commands are
         // acknowledged but not carried out; add them when a title sends
-        // them (each kind is logged once above).
-        _ => {}
+        // them (each kind is logged once above, with its first words, and
+        // counted in the stats).
+        _ => {
+            COUNTERS.unknown_command();
+            static WORDS: Mutex<u64> = Mutex::new(0);
+            let mut seen = lock(&WORDS);
+            if command < 64 && *seen & 1 << command == 0 {
+                *seen |= 1 << command;
+                tracing::info!(
+                    command,
+                    words = ?(0..4).map(|i| word(i).map(|w| format!("{w:08x}"))).collect::<Vec<_>>(),
+                    "coprocessor command not carried out"
+                );
+            }
+        }
     }
     if id != 0 {
         let mut done = [0u8; 16];
@@ -952,6 +1083,22 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_stats_count_a_window_and_start_the_next() {
+        use std::time::Duration;
+        let mut stats = DecodeStats::new();
+        stats.pass(3, Duration::from_millis(1));
+        stats.pass(5, Duration::from_millis(6));
+        stats.pass(2, Duration::from_millis(2));
+        assert_eq!((stats.passes, stats.slow, stats.voices), (3, 1, 5));
+        assert_eq!(stats.busy, Duration::from_millis(9));
+        assert_eq!(stats.longest, Duration::from_millis(6));
+        // Five seconds on: the window is said and begun again.
+        stats.since = Instant::now() - Duration::from_secs(6);
+        stats.pass(1, Duration::from_millis(1));
+        assert_eq!((stats.passes, stats.slow, stats.voices), (0, 0, 0));
+    }
 
     #[test]
     fn heap_maps_every_byte_of_a_block() {
@@ -1238,6 +1385,7 @@ mod tests {
                 S_OK
             );
         };
+        let _ = COUNTERS.take();
         submit(ENABLE_XMA, &[1]);
         xma().pump();
         // Full: all four blocks written (silence), the write block wrapped
@@ -1272,6 +1420,15 @@ mod tests {
 
         submit(DISABLE_XMA, &[1]);
         assert_eq!(produced(&xma()), None);
+        // What the stats saw: one voice, its six frames (all good), the 26
+        // blocks (all silent), the title's takes, the refills after them
+        // and the input running out once.
+        let w = COUNTERS.take();
+        assert_eq!((w.enabled, w.disabled), (1, 1));
+        assert_eq!((w.frames, w.bad_frames, w.input_ended), (6, 0, 1));
+        assert_eq!((w.blocks_out, w.silent_blocks, w.peak), (26, 26, 0));
+        assert!(w.blocks_taken >= 8 && w.taken_us >= 8 * 2_666, "{w:?}");
+        assert!(w.refills >= 1, "{w:?}");
         (m.release)(acp);
         ApuFree(input);
         ApuFree(output);
@@ -1320,6 +1477,7 @@ mod tests {
                 bad_frames: 0,
                 peak: 0,
                 ended_ms: None,
+                room_since: None,
             },
         };
         let mut step = |expect_next: u32| {

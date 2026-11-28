@@ -17,9 +17,13 @@ use opus_pure::OpusDecoder;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 
+use super::audio::live::live_flag;
+use super::audio::stats::COUNTERS;
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
+
+mod pitch;
 
 const E_NOTIMPL: HRESULT = 0x8000_4001_u32 as i32;
 const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
@@ -132,6 +136,8 @@ pub struct Connection {
 
 struct State {
     streams: Vec<Option<OpusDecoder>>,
+    /// The pitch of each stream (`VICTORY_OPUS_PITCH`).
+    pitchers: Vec<pitch::Pitcher>,
     /// Results not yet dequeued, per stream.
     queued: Vec<u32>,
     results: VecDeque<ApuResult>,
@@ -206,6 +212,7 @@ pub extern "system" fn XApuConnect(
         per_stream: input.commands_per_stream,
         state: Mutex::new(State {
             streams: (0..streams).map(|_| None).collect(),
+            pitchers: (0..streams).map(|_| pitch::Pitcher::new(1, 1.0)).collect(),
             queued: vec![0; streams],
             results: VecDeque::new(),
             commands: 0,
@@ -269,11 +276,13 @@ pub extern "system" fn XApuEnqueueCommand(
         input_length: 0,
         input: std::ptr::null(),
     };
+    let state = &mut *state;
     let decoder = &mut state.streams[stream];
     match id.kind {
         ACTIVATE => {
             // SAFETY: an activate command is this struct.
-            let channels = unsafe { command.cast::<Activate>().read_unaligned() }.channels;
+            let activate = unsafe { command.cast::<Activate>().read_unaligned() };
+            let (channels, start_pitch) = (activate.channels, activate.start_pitch);
             tracing::debug!(stream, channels, "Opus stream activated");
             result.error = if decoder.is_some() {
                 ALREADY_ACTIVE
@@ -283,6 +292,8 @@ pub extern "system" fn XApuEnqueueCommand(
                 match OpusDecoder::new(48_000, channels as usize) {
                     Ok(d) => {
                         *decoder = Some(d);
+                        state.pitchers[stream] =
+                            pitch::Pitcher::new(channels as usize, start_pitch);
                         S_OK
                     }
                     Err(_) => E_INVALIDARG,
@@ -294,13 +305,17 @@ pub extern "system" fn XApuEnqueueCommand(
             if let Some(d) = decoder {
                 let _ = d.reset_state();
             }
+            state.pitchers[stream].reset();
         }
         NOTIFY => {}
         PROCESS => {
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
+            // With `VICTORY_OPUS_PITCH` (live in an A/B) the packet is resampled to
+            // the pitch the title asks for; without, the pitch is not applied.
+            let pitcher = live_flag!("VICTORY_OPUS_PITCH").then(|| &mut state.pitchers[stream]);
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(d) => process(d, connection.options, &command, &mut result, pitcher),
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -322,10 +337,16 @@ pub extern "system" fn XApuEnqueueCommand(
 
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+fn process(
+    decoder: &mut OpusDecoder,
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+    pitcher: Option<&mut pitch::Pitcher>,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
-    let (output, output_length) = (command.output, command.output_length);
+    let output = command.output;
     result.input = input;
     result.input_length = input_length;
     result.output = output;
@@ -335,8 +356,56 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
+    let applied = pitcher.is_some();
+    // A packet's room is 46 KB of floats: the thread's own, kept for the
+    // next, not made and zeroed for each (`VICTORY_STREAM_REUSE=0`: as
+    // before).
+    with_pcm(MAX_FRAMES * channels, |pcm| {
+        decode_packet(decoder, packet, options, command, result, pcm, pitcher)
+    });
+    // The pitch (the console's rate conversion) is counted, and without
+    // `VICTORY_OPUS_PITCH` (not applied) the first few are logged, to see
+    // whether a title uses it.
+    let (ramp, target) = (command.pitch_ramp, command.target_pitch);
+    let pitched = ramp != 0.0 || target != 1.0;
+    COUNTERS.opus_packet(result.error != S_OK, pitched);
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if pitched && !applied && LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(ramp, target, "audio decoder: a pitch that is not applied");
+    }
+}
+
+thread_local! {
+    static PCM: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on `len` floats: the thread's kept ones, or new zeros.
+fn with_pcm<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let reuse =
+        *REUSE.get_or_init(|| std::env::var_os("VICTORY_STREAM_REUSE").is_none_or(|v| v != "0"));
+    if !reuse {
+        return f(&mut vec![0f32; len]);
+    }
+    let mut kept = PCM.with_borrow_mut(std::mem::take);
+    kept.resize(len, 0.0);
+    let out = f(&mut kept);
+    PCM.with_borrow_mut(|slot| *slot = kept);
+    out
+}
+
+fn decode_packet(
+    decoder: &mut OpusDecoder,
+    packet: &[u8],
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+    pcm: &mut [f32],
+    pitcher: Option<&mut pitch::Pitcher>,
+) {
+    let channels = decoder.channels();
+    let (output, output_length) = (command.output, command.output_length);
+    let decoded = match decoder.decode(packet, MAX_FRAMES, pcm) {
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;
@@ -344,10 +413,31 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
         }
     };
     let first = (command.first_frame as usize).min(decoded);
-    let frames = (decoded - first)
-        .min(command.frame_count as usize)
-        .min(output_length as usize / (4 * channels));
-    let kept = &pcm[first * channels..(first + frames) * channels];
+    let room = output_length as usize / (4 * channels);
+    let (target, ramp) = (command.target_pitch, command.pitch_ramp);
+    // The packet's frames, resampled when the title's pitch is not 1.
+    let resampled;
+    let (frames, kept) = match pitcher {
+        Some(p) if p.needed(target, ramp) => {
+            let all = &pcm[first * channels..decoded * channels];
+            let limit = (command.frame_count as usize).min(room);
+            resampled = p.process(all, target, ramp, limit);
+            result.pitch = p.pitch;
+            (resampled.len() / channels, &resampled[..])
+        }
+        other => {
+            if let Some(p) = other {
+                // At pitch 1 the packet goes through as it is; the stream's
+                // state is kept up to date for a later change.
+                p.pass(&pcm[first * channels..decoded * channels]);
+                result.pitch = p.pitch;
+            }
+            let frames = (decoded - first)
+                .min(command.frame_count as usize)
+                .min(room);
+            (frames, &pcm[first * channels..(first + frames) * channels])
+        }
+    };
     let bytes = frames * channels * 4;
     if bytes > 0 {
         // SAFETY: `output` is non-null and holds at least `bytes <= output_length` bytes;
@@ -418,6 +508,15 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kept_float_room_is_the_size_asked_each_time() {
+        for len in [MAX_FRAMES, MAX_FRAMES * 2, 960, MAX_FRAMES] {
+            let seen = with_pcm(len, |pcm| (pcm.len(), pcm.iter().all(|s| s.is_finite())));
+            assert_eq!(seen, (len, true));
+            with_pcm(len, |pcm| pcm.fill(0.5));
+        }
+    }
     use opus_pure::{Application, OpusEncoder};
 
     fn id(kind: u32, stream: u32) -> CommandId {

@@ -48,48 +48,28 @@ fn build() -> [u8; 32] {
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        if victory_shader::emit::loop_limit_is_named() {
             tracing::warn!(
                 limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+                "VICTORY_SHADER_LOOP_LIMIT: every translated loop has this limit, whatever its stage"
+            );
+        }
+        if let Some(table) = std::env::var("VICTORY_LOOP_LIMITS")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            tracing::warn!(
+                table,
+                "VICTORY_LOOP_LIMITS: translated loops of these programs and stages stop later"
             );
         }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
-        bytes.extend_from_slice(&limit.to_le_bytes());
-        // Which group barriers wait is part of the translation too.
-        bytes.push(victory_shader::emit::group_sync());
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was
-        // served the translations an earlier run of the same
-        // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_PAIR_SYNC",
-            "VICTORY_PAIR_CLAMP",
-            "VICTORY_PAIR_LEAN",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_LOOP_NOTES",
-            "VICTORY_LOOP_WHY",
-            "VICTORY_PEEK",
-            "VICTORY_BVH_BOUNDS",
-        ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
-        }
-        // And which clean-up passes ran over the translated code.
-        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Every switch the translator's code names, by the text of its variable or by the value in
+        // force (the ones that are on unless `=0`, the form of the kept skips, the loop limit, the
+        // group barriers, the clean-up passes): `emit::translation_fingerprint` lists them from the
+        // code itself, so a switch added to the translator is in the key without a line here.
+        // (`victory-shader`'s `fingerprint_tests` hold it to that.)
+        bytes.extend_from_slice(&victory_shader::emit::translation_fingerprint());
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -476,5 +456,26 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    /// The key is made of the translator's source, the fingerprint of every switch it reads
+    /// (`victory-shader`'s `fingerprint_tests` check that each switch is in it), and what the
+    /// host tells it (`host_settings`, after the device is made). A list of switches kept here
+    /// could fall behind the code: this holds the key to the calls that make it whole.
+    #[test]
+    fn the_key_is_the_source_the_fingerprint_and_the_host_settings() {
+        // (the part of this file that is not its tests)
+        let key = include_str!("shader_cache.rs").split("#[cfg(test)]").next().unwrap();
+        for part in [
+            "env!(\"VICTORY_TRANSLATOR\")",
+            "victory_shader::emit::translation_fingerprint()",
+            "victory_shader::emit::host_settings()",
+            "crate::descriptor::host::probe_view_limit()",
+        ] {
+            assert!(key.contains(part), "the cache key does not hold {part}");
+        }
+        // No list of names of switches here again: it is what fell behind before.
+        assert!(!key.contains("\"VICTORY_WAVE_"), "a switch is named in the key by hand");
+        assert!(!key.contains(".zip("), "two lists are paired in the key");
     }
 }

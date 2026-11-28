@@ -52,6 +52,20 @@ in that order of size:
   never brought back to title memory. Fixed by Geckomacabre's read-back as merged in
   fxceless/victory-fork f5c03f3b; on by default here (`VICTORY_TEXTURE_BACK=0`: off).
   With it the boat stays up through a whole run; without it sank in every one.
+- **The upscaler's clears of its own surfaces were not done.** The console's list has
+  `ClearUnorderedAccessViewUint` and `...Float` at 0x1a8 and 0x1b0; the title's upscaler library calls
+  the first, and every run logged "method not implemented" for that slot with nothing done. They are
+  now made on the host through a slot of the bound view heap and a CPU-only copy of the view (textures
+  and raw or typed buffers; structured buffers and views that are not unordered access are left out, as
+  the host refuses them). `VICTORY_CLEAR_UAV=0`: off. Not yet compared in the game.
+- **One of the water's read-backs failed in every run** (`could not be tiled e=Unsupported`): the
+  tiler had no addressing for the pipe and bank XOR swizzle modes (`_X`, `_T`), which render
+  targets and depth buffers use. They are in now (`victory-formats`, from addrlib's RB+ patterns;
+  the pipes and packers of a Series X are an estimate, `VICTORY_TILE_GPU=8,4` tries others) and
+  the warning names the mode, size and format of the texture.
+  The log prints the pipe and packer pair in use at startup ("XOR swizzle modes are laid out for ...");
+  `VICTORY_XOR_UPLOAD=0` and `VICTORY_XOR_READBACK=0` each leave the XOR modes out of the uploads / of the
+  read-backs, so the water can be compared with and without the guessed pair.
 - **A device loss about every 16 minutes**: a page fault inside a texture made in the same
   tenth of a second. A slot showed it before its upload had run.
   `VICTORY_SHOW_AFTER=1`; none in the sessions since (likely fixed, not proven).
@@ -64,6 +78,16 @@ in that order of size:
 - **Cube reflections too blurred, wrong materials**: DXIL's `Log` is base 2, and
   normalized buffer codes were one step off.
 - **Every ray missed**: the dispatch flag that says counts are threads, not groups.
+- **The view heap is 1,000,000 views on NVIDIA, the title's has 1,245,184** (RTX 4060, resource binding tier 3: the
+  driver takes no heap above 1,000,000, whatever the tier says; the host asks for a heap of each size from 4 M down
+  and searches between 1,000,000 and 1.5 M, `host view heaps hold ...`). The title's slots past the ones the host
+  mirrors are its per-frame tables' ring (records copied in as bytes, a block of 4,096 slots a frame): a draw
+  whose table reaches past them gets a table made afresh in dynamic slots from the title's records, so what it
+  reads is right. A view the title makes there by a call is pinned in the dynamic slot of its index
+  (`VICTORY_TITLE_TAIL=0`: not). What is not covered: a shader that picks a view by an index it computes at or
+  past the host's null slot (999,999) reads a null slot; the one `WARN` of a view lost says so. The line
+  `title view heap use: ...` counts the highest slot written, the 4,096-slot blocks touched, the records past
+  the host's slots by calls and as bytes, and the tables read in place or through snapshots.
 
 ## Measured and not worth it
 

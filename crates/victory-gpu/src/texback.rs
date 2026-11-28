@@ -116,6 +116,12 @@ impl Target {
         let copy = crate::resource::host_copy(resource)?;
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
+        // (`VICTORY_XOR_READBACK=0`: no copy at all for what would not be landed.)
+        if !crate::resource::lands_back(&layout, crate::resource::xor_readback()) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!(swizzle = layout.desc.swizzle.name(), "a texture in a XOR mode is not copied back (VICTORY_XOR_READBACK=0)"));
+            return None;
+        }
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         Some(Self { copy, layout, ticket })
@@ -130,6 +136,8 @@ pub(crate) struct Back {
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     rows: Vec<u32>,
     mips: u32,
+    /// The host copy's DXGI format, for the log.
+    format: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
 }
@@ -194,7 +202,56 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
         // SAFETY: an open list; the texture is in the copy-source state.
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
-    Some(Back { buffer, footprints, rows, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back {
+        buffer,
+        footprints,
+        rows,
+        mips,
+        format: desc.Format.0 as u32,
+        layout: target.layout,
+        ticket: target.ticket,
+    })
+}
+
+/// Says which kind of texture could not be tiled back, once per kind: the
+/// swizzle mode by name, the dimensions and what the host copy is.
+fn refused(back: &Back, error: victory_formats::texture::Error, mip: u32, slice: u32) {
+    static SEEN: Mutex<Vec<[u32; 8]>> = Mutex::new(Vec::new());
+    let d = &back.layout.desc;
+    let kind = [
+        d.swizzle.0,
+        d.width,
+        d.height,
+        d.depth,
+        d.mips,
+        d.element_bytes,
+        d.block,
+        back.format,
+    ];
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&kind) || seen.len() >= 64 {
+            return;
+        }
+        seen.push(kind);
+    }
+    tracing::warn!(
+        ?error,
+        mip,
+        slice,
+        swizzle = d.swizzle.name(),
+        swizzle_number = d.swizzle.0,
+        dimension = ?d.dimension,
+        width = d.width,
+        height = d.height,
+        depth_or_slices = d.depth,
+        mips = d.mips,
+        samples = d.samples,
+        element_bytes = d.element_bytes,
+        block = d.block,
+        dxgi_format = back.format,
+        "a texture copied back could not be tiled"
+    );
 }
 
 /// Once the list has run, tile its texels back into the same title allocation.
@@ -232,8 +289,7 @@ pub(crate) fn land(back: &Back) {
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            refused(back, e, mip, slice);
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;

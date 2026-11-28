@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod bvh_check;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -134,6 +135,11 @@ enum Command {
         /// one per logical core.
         #[arg(long)]
         now: bool,
+        /// Leave the ray-tracing resolves to the title: they are the ~1,000 biggest programs
+        /// (nine tenths of a warm's compile time), and with `VICTORY_RESOLVE_ASYNC=1` the title
+        /// makes the ones a scene binds in the background, without waiting for them.
+        #[arg(long)]
+        skip_resolves: bool,
         /// Say what there is to make and stop.
         #[arg(long)]
         status: bool,
@@ -175,8 +181,36 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
+    /// Check the ray-tracing structures in a dump of the title memory by
+    /// address (`VICTORY_MEMORY_DUMP`, diagnostics builds): which are whole,
+    /// which have a fault, which overlap another.
+    BvhCheck {
+        /// The folder the run wrote `pages.txt` and `arena-<n>.bin` to.
+        folder: PathBuf,
+        /// One line per structure.
+        #[arg(long)]
+        list: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
+    /// Check NVIDIA Streamline, DLSS and DLSS Frame Generation on this PC
+    /// without the title (`VICTORY_STREAMLINE_DIR`, `VICTORY_DLSS_MODE`,
+    /// `VICTORY_DLSS_PRESET`): what loads and what this GPU supports; with
+    /// --device, the host device handed over and DLSS run three times on
+    /// stand-in textures; with --present too, three seconds of presents with
+    /// frame generation in a window of ours.
+    #[cfg(windows)]
+    UpscalerCheck {
+        /// The output size, `<width>x<height>`.
+        #[arg(long, default_value = "2560x1440")]
+        output: String,
+        /// Make the host device and run DLSS on it.
+        #[arg(long)]
+        device: bool,
+        /// Present for three seconds with frame generation (with --device).
+        #[arg(long)]
+        present: bool,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -239,8 +273,34 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, compute, now, status, verify, paths, these, shard } => {
-            warm::run(warm::Ask { jobs, limit, again, used, compute, now, status, verify, paths, these, shard })
+        Command::Warm {
+            jobs,
+            limit,
+            again,
+            used,
+            compute,
+            now,
+            skip_resolves,
+            status,
+            verify,
+            paths,
+            these,
+            shard,
+        } => {
+            warm::run(warm::Ask {
+                jobs,
+                limit,
+                again,
+                used,
+                compute,
+                now,
+                skip_resolves,
+                status,
+                verify,
+                paths,
+                these,
+                shard,
+            })
         }
         Command::Run {
             exe,
@@ -255,7 +315,19 @@ fn main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        Command::BvhCheck { folder, list } => bvh_check::run(&folder, list),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::UpscalerCheck { output, device, present } => {
+            let size = output
+                .split_once(['x', 'X'])
+                .and_then(|(w, h)| Some([w.trim().parse().ok()?, h.trim().parse().ok()?]))
+                .ok_or_else(|| anyhow::anyhow!("--output {output}: not <width>x<height>"))?;
+            for line in victory_hle::streamline::check(size, device || present, present) {
+                println!("{line}");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -278,6 +350,13 @@ fn show_config() -> Result<()> {
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }
+    check_policy(&cfg)
+}
+
+/// Reports each configured path the asset policy refuses, and fails if
+/// there is one, so that `victory config` exits nonzero.
+fn check_policy(cfg: &victory_core::Config) -> Result<()> {
+    let mut violations = 0;
     for p in cfg
         .game_dir
         .iter()
@@ -286,8 +365,13 @@ fn show_config() -> Result<()> {
     {
         if let Err(e) = victory_core::ensure_outside_repo(p) {
             println!("POLICY VIOLATION: {e}");
+            violations += 1;
         }
     }
+    anyhow::ensure!(
+        violations == 0,
+        "{violations} configured path(s) violate the asset policy"
+    );
     Ok(())
 }
 
@@ -303,4 +387,37 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::check_policy;
+
+    fn outside() -> PathBuf {
+        std::env::temp_dir().join("victory-config-test")
+    }
+
+    #[test]
+    fn config_check_passes_paths_outside_the_repository() {
+        let cfg = victory_core::Config {
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        assert!(check_policy(&cfg).is_ok());
+    }
+
+    #[test]
+    fn config_check_fails_a_path_inside_the_repository() {
+        let cfg = victory_core::Config {
+            game_dir: Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("game")),
+            cache_dir: outside().join("cache"),
+            data_dir: outside().join("data"),
+            ..Default::default()
+        };
+        let err = check_policy(&cfg).unwrap_err();
+        assert!(err.to_string().contains("1 configured path"), "{err}");
+    }
 }

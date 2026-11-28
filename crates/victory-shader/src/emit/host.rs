@@ -70,7 +70,7 @@ impl Host {
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
             // refused pipeline's error then carries.
-            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            if crate::env_on("VICTORY_D3D12_DEBUG") {
                 let mut debug: Option<ID3D12Debug> = None;
                 if D3D12GetDebugInterface(&mut debug).is_ok()
                     && let Some(debug) = debug
@@ -652,6 +652,9 @@ pub enum Root {
         sampler: bool,
         index: usize,
     },
+    /// A root UAV over a buffer of this many dwords, zeroed ([`Host::dispatch`] only): what a
+    /// shader that leaves notes in the faults buffer (`SLOT_FAULTS`) is given.
+    Uav(u32),
     /// A root CBV (or with `srv`, a root SRV) over a buffer of these
     /// dwords ([`Host::dispatch`] only).
     View {
@@ -895,7 +898,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1769,6 +1772,15 @@ impl Host {
                         let mut at = h.GetGPUDescriptorHandleForHeapStart();
                         at.ptr += (index * size) as u64;
                         list.SetComputeRootDescriptorTable(*param, at);
+                    }
+                    Root::Uav(dwords) => {
+                        let b = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &buffer(u64::from(*dwords) * 4, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )?;
+                        list.SetComputeRootUnorderedAccessView(*param, b.GetGPUVirtualAddress());
+                        keep.push(b);
                     }
                     Root::View { srv, data } => {
                         let b = upload(data)?;

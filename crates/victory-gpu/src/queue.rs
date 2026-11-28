@@ -9,6 +9,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 mod behind;
+#[cfg(windows)]
+pub(crate) mod timelines;
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
@@ -467,6 +469,83 @@ pub(crate) fn heaps_round() -> u64 {
     behind::round()
 }
 
+/// Whether the refreshes of the submission that comes next are begun while
+/// the one being prepared is sent (`VICTORY_PIPELINE_PREPARE=1`).
+#[cfg(windows)]
+pub(crate) fn pipeline_prepare() -> bool {
+    behind::pipeline_prepare() && behind::on()
+}
+
+/// Whether the next submission's refreshes are offered before the steps of the one being prepared
+/// (`VICTORY_STAGE_A=1`), for the copies it does nothing to.
+#[cfg(windows)]
+pub(crate) fn stage_a() -> bool {
+    behind::stage_a() && behind::on()
+}
+
+/// Whether the whole preparing of the next submission is done beside the sending of this one
+/// (`VICTORY_STAGE_A_STEPS=1` with `VICTORY_STAGE_A`).
+#[cfg(windows)]
+pub(crate) fn stage_front() -> bool {
+    behind::stage_a() && behind::stage_front() && behind::on()
+}
+
+/// Whether the submission done next is named past what stands before it in the line (`VICTORY_STAGE_A_LOOKAHEAD=1`).
+#[cfg(windows)]
+pub(crate) fn lookahead() -> bool {
+    behind::lookahead()
+}
+
+/// The submission that is done after the one being done now: its number, its host lists in the order they
+/// run and where its parts begin, after it took along what it can ([`behind`]). The first of the line, if it is of the queue
+/// being done; with `VICTORY_STAGE_A_LOOKAHEAD` the oldest submission of the line, past what stands before it that
+/// cannot hold it back.
+#[cfg(windows)]
+pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
+    behind::prefold()
+}
+
+/// Why [`prefold_next`] named nothing since the last call, and how many times each reason came.
+#[cfg(windows)]
+pub(crate) fn no_next_taken() -> Vec<(&'static str, u64)> {
+    behind::no_next_taken()
+}
+
+/// Since the last call: the submissions [`prefold_next`] named, those not the first of the line, those of another queue than
+/// the one being done, and those with signals or met waits of their own queue before them (`VICTORY_STAGE_A_LOOKAHEAD`).
+#[cfg(windows)]
+pub(crate) fn named_taken() -> [u64; 4] {
+    behind::named_taken()
+}
+
+/// While our thread does an entry and the first of the line has been named by [`prefold_next`]: the host lists
+/// (addresses, in order) of the entry after it of the same queue, if it is a submission whose lists are known
+/// (`VICTORY_STAGE_A_DEEP`). It stays in the line, at its place.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn deeper_next() -> Option<Vec<usize>> {
+    behind::deeper()
+}
+
+/// [`deeper_next`] with the entry's number.
+#[cfg(windows)]
+pub(crate) fn deeper_next_entry() -> Option<(u64, Vec<usize>)> {
+    behind::deeper_entry()
+}
+
+/// The host lists (addresses) of the submission that comes next after the one
+/// our thread is preparing, asked once ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn take_ahead() -> Option<Vec<usize>> {
+    behind::take_ahead()
+}
+
+/// Puts back what [`take_ahead`] took.
+#[cfg(windows)]
+pub(crate) fn restore_ahead(ahead: Option<Vec<usize>>) {
+    behind::restore_ahead(ahead);
+}
+
 /// Submissions the title made that the host has not begun ([`behind`]).
 #[cfg(windows)]
 pub(crate) fn queued() -> u64 {
@@ -583,6 +662,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        #[cfg(feature = "diagnostics")]
+        if !this.is_null() {
+            crate::list::tag_queue(lists, queue(this).kind);
+        }
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;
@@ -969,9 +1052,18 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
-        if crate::capture::listed(frame) {
+        if crate::probe_watch::due(frame) {
             before_sync();
-            crate::capture::dump_targets(frame);
+            crate::probe_watch::sample(frame);
+        }
+        if crate::bufscan::due(frame) {
+            before_sync();
+            crate::bufscan::sample(frame);
+        }
+        if crate::capture::dump_due(frame) {
+            before_sync();
+            crate::capture::dump_targets(crate::capture::dump_name(frame));
+            crate::capture::window_done(frame);
         }
     }
     #[cfg(windows)]

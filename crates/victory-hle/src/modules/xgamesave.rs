@@ -132,6 +132,15 @@ fn valid_container(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
+/// A prefix of a container name: the name's characters, in any order (empty
+/// is every container).
+fn valid_prefix(prefix: &str) -> bool {
+    prefix.len() <= 256
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'/' | b'.' | b'-'))
+}
+
 /// A committed version of a container.
 struct Version {
     dir: PathBuf,
@@ -410,7 +419,15 @@ impl Provider {
             .join(file_name(config));
         std::fs::create_dir_all(&root).map_err(|_| NO_ACCESS)?;
         let _saves = saves_lock();
-        containers(&root); // converts old containers now
+        let found = containers(&root); // converts old containers now
+        let names: Vec<&str> = found.iter().map(|(n, _)| n.as_str()).take(32).collect();
+        tracing::info!(
+            root = %root.display(),
+            config,
+            containers = found.len(),
+            ?names,
+            "game saves opened"
+        );
         Ok(Provider { root })
     }
 
@@ -461,6 +478,25 @@ fn io_error(dir: &Path, e: &std::io::Error) -> HRESULT {
 impl Update {
     /// Applies the update as one new version of the container.
     fn submit(&self) -> HRESULT {
+        let hr = self.apply();
+        let written: usize = self
+            .changes
+            .iter()
+            .map(|(_, d)| d.as_ref().map_or(0, Vec::len))
+            .sum();
+        let deleted = self.changes.iter().filter(|(_, d)| d.is_none()).count();
+        tracing::info!(
+            container = self.name,
+            blobs = self.changes.len() - deleted,
+            deleted,
+            bytes = written,
+            hr = format_args!("{:#010x}", hr as u32),
+            "game save update submitted"
+        );
+        hr
+    }
+
+    fn apply(&self) -> HRESULT {
         let _saves = saves_lock();
         let current = match current(&self.dir) {
             Ok(v) => v,
@@ -498,7 +534,9 @@ impl Update {
         }
         let replaced: u64 = current.as_ref().map_or(0, |v| {
             let sizes = v.sizes();
-            let changed = sizes.iter().filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
+            let changed = sizes
+                .iter()
+                .filter(|(n, _)| self.changes.iter().any(|(c, _)| c == n));
             changed.map(|(_, size)| size).sum()
         });
         let root = self.dir.parent().unwrap_or(&self.dir);
@@ -523,6 +561,16 @@ impl Update {
 
 /// Deletes a container: renamed away (one step), then removed.
 fn delete(root: &Path, name: &str) -> HRESULT {
+    let hr = remove(root, name);
+    tracing::info!(
+        container = name,
+        hr = format_args!("{:#010x}", hr as u32),
+        "game save container deleted"
+    );
+    hr
+}
+
+fn remove(root: &Path, name: &str) -> HRESULT {
     let _saves = saves_lock();
     let dir = container_dir(root, name);
     match current_named(&dir, name) {
@@ -543,6 +591,31 @@ fn delete(root: &Path, name: &str) -> HRESULT {
 
 /// Reads the named blobs (all of them for `None`) of a container.
 fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8>)>, HRESULT> {
+    let asked = names.as_ref().map(Vec::len);
+    let result = read_blobs_of(c, names);
+    match &result {
+        Ok(blobs) => tracing::info!(
+            container = c.name,
+            asked,
+            blobs = blobs.len(),
+            bytes = blobs.iter().map(|(_, d)| d.len()).sum::<usize>(),
+            "game save read"
+        ),
+        // A container the title probes for and does not have is normal.
+        Err(hr) => tracing::info!(
+            container = c.name,
+            asked,
+            hr = format_args!("{:#010x}", *hr as u32),
+            "game save read failed"
+        ),
+    }
+    result
+}
+
+fn read_blobs_of(
+    c: &Container,
+    names: Option<Vec<String>>,
+) -> Result<Vec<(String, Vec<u8>)>, HRESULT> {
     let _saves = saves_lock();
     let version = current_named(&c.dir, &c.name)
         .map_err(|e| io_error(&c.dir, &e))?
@@ -551,7 +624,11 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
     names
         .into_iter()
         .map(|name| {
-            let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
+            let i = version
+                .blobs
+                .iter()
+                .position(|b| *b == name)
+                .ok_or(BLOB_NOT_FOUND)?;
             let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
             Ok((name, data))
         })
@@ -611,7 +688,12 @@ pub struct BlobInfo {
 
 /// Calls `callback` with the information of each container that passes
 /// `keep` until it returns false; never under our lock (it may call us).
-fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callback: ContainerCallback) {
+fn report(
+    root: &Path,
+    keep: impl Fn(&str) -> bool,
+    context: *mut c_void,
+    callback: ContainerCallback,
+) -> usize {
     let infos: Vec<(CString, CString, u32, u64, i64)> = {
         let _saves = saves_lock();
         containers(root)
@@ -630,6 +712,7 @@ fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callba
             })
             .collect()
     };
+    let count = infos.len();
     for (name, display, blob_count, total_size, last_modified) in &infos {
         let info = ContainerInfo {
             name: name.as_ptr(),
@@ -643,6 +726,7 @@ fn report(root: &Path, keep: impl Fn(&str) -> bool, context: *mut c_void, callba
             break;
         }
     }
+    count
 }
 
 fn cstring(s: &str) -> CString {
@@ -655,6 +739,33 @@ static DELETE: u8 = 0;
 static READ: u8 = 0;
 static SUBMIT: u8 = 0;
 
+/// The provider for the title's only user, under `saves`; none while the
+/// title has no storage folder (nothing may land in the working directory).
+fn open_at(saves: &Path, config: Option<&str>) -> Result<Provider, HRESULT> {
+    if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        Err(NO_ACCESS)
+    } else {
+        Provider::open(saves, config)
+    }
+}
+
+fn open_provider(config: *const c_char) -> Result<Provider, HRESULT> {
+    open_at(&runtime::title().saves(), text(config).as_deref())
+}
+
+/// `XGameSaveInitializeProvider`: the same, answered at once.
+extern "system" fn initialize(
+    _: This,
+    _user: *const c_void,
+    config: *const c_char,
+    _sync_on_demand: bool,
+    out: *mut *mut Provider,
+) -> HRESULT {
+    match open_provider(config) {
+        Ok(provider) => put(out, give(provider)),
+        Err(hr) => hr,
+    }
+}
 extern "system" fn initialize_async(
     _: This,
     _user: *const c_void,
@@ -662,12 +773,7 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let saves = runtime::title().saves();
-    let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
-        Err(NO_ACCESS)
-    } else {
-        Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
-    };
+    let result = open_provider(config).map(|p| xasync::bytes(give(p)));
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -681,6 +787,13 @@ extern "system" fn close_provider(_: This, provider: *mut Provider) {
     take(provider);
 }
 
+/// `XGameSaveGetRemainingQuota`, answered at once.
+extern "system" fn quota(_: This, provider: *const Provider, out: *mut i64) -> HRESULT {
+    match get(provider) {
+        Some(p) => put(out, p.remaining() as i64),
+        None => E_INVALIDARG,
+    }
+}
 extern "system" fn quota_async(
     _: This,
     provider: *const Provider,
@@ -695,17 +808,25 @@ extern "system" fn quota_result(_: This, block: *mut AsyncBlock, out: *mut i64) 
     xasync::result(block, (&raw const QUOTA_CALL).cast(), out)
 }
 
+fn delete_named(provider: *const Provider, name: *const c_char) -> HRESULT {
+    match (get(provider), text(name)) {
+        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
+        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
+        _ => E_INVALIDARG,
+    }
+}
+
+/// `XGameSaveDeleteContainer`, answered at once.
+extern "system" fn delete_now(_: This, provider: *const Provider, name: *const c_char) -> HRESULT {
+    delete_named(provider, name)
+}
 extern "system" fn delete_async(
     _: This,
     provider: *const Provider,
     name: *const c_char,
     block: *mut AsyncBlock,
 ) -> HRESULT {
-    let hr = match (get(provider), text(name)) {
-        (Some(p), Some(name)) if valid_container(&name) => delete(&p.root, &name),
-        (Some(_), Some(_)) => INVALID_CONTAINER_NAME,
-        _ => E_INVALIDARG,
-    };
+    let hr = delete_named(provider, name);
     xasync::finished(block, (&raw const DELETE).cast(), hr)
 }
 extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
@@ -713,22 +834,25 @@ extern "system" fn delete_result(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetResult(block, (&raw const DELETE).cast(), 0, none, none.cast())
 }
 
-/// Reports the container if it exists; a missing one is no error, the
-/// callback just does not run.
+/// The containers whose names start with the text the title passes, the one
+/// named exactly first (a title asking for one container gets it; one asking
+/// for a family of them, such as every slot, gets the family); a missing
+/// one is no error, the callback just does not run.
 extern "system" fn container_info(
     _: This,
     provider: *const Provider,
-    name: *const c_char,
+    prefix: *const c_char,
     context: *mut c_void,
     callback: Option<ContainerCallback>,
 ) -> HRESULT {
-    let (Some(p), Some(name), Some(callback)) = (get(provider), text(name), callback) else {
+    let (Some(p), Some(prefix), Some(callback)) = (get(provider), text(prefix), callback) else {
         return E_INVALIDARG;
     };
-    if !valid_container(&name) {
+    if !valid_prefix(&prefix) {
         return INVALID_CONTAINER_NAME;
     }
-    report(&p.root, |n| n == name, context, callback);
+    let found = report(&p.root, |n| n.starts_with(&prefix), context, callback);
+    tracing::info!(prefix, found, "game save containers listed by name");
     S_OK
 }
 
@@ -741,7 +865,8 @@ extern "system" fn enumerate_containers(
     let (Some(p), Some(callback)) = (get(provider), callback) else {
         return E_INVALIDARG;
     };
-    report(&p.root, |_| true, context, callback);
+    let found = report(&p.root, |_| true, context, callback);
+    tracing::info!(found, "game save containers listed");
     S_OK
 }
 
@@ -756,6 +881,7 @@ extern "system" fn create_container(
         return E_INVALIDARG;
     };
     if !valid_container(&name) {
+        tracing::info!(name, "game save container refused: not a valid name");
         return INVALID_CONTAINER_NAME;
     }
     put(out, give(p.container(&name)))
@@ -931,6 +1057,10 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
     }
 }
 
+/// `XGameSaveSubmitUpdate`, answered at once.
+extern "system" fn submit(_: This, update: *const Update) -> HRESULT {
+    get(update).map_or(E_INVALIDARG, Update::submit)
+}
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
@@ -944,17 +1074,17 @@ static VTABLE: Methods<30> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),         // 0x18 initialize (blocking)
+    initialize as *const (),           // 0x18 (blocking)
     initialize_async as *const (),     // 0x20
     initialize_result as *const (),    // 0x28
     close_provider as *const (),       // 0x30
-    missing::<7> as *const (),         // 0x38 remaining quota (blocking)
+    quota as *const (),                // 0x38 remaining quota (blocking)
     quota_async as *const (),          // 0x40
     quota_result as *const (),         // 0x48
-    missing::<10> as *const (),        // 0x50 delete (blocking)
+    delete_now as *const (),           // 0x50 delete (blocking)
     delete_async as *const (),         // 0x58
     delete_result as *const (),        // 0x60
-    container_info as *const (),       // 0x68
+    container_info as *const (),       // 0x68 by name (prefix)
     enumerate_containers as *const (), // 0x70
     missing::<15> as *const (),        // 0x78 by name prefix
     create_container as *const (),     // 0x80
@@ -968,13 +1098,14 @@ static VTABLE: Methods<30> = Methods([
     close_update as *const (),         // 0xc0
     write_blob as *const (),           // 0xc8
     delete_blob as *const (),          // 0xd0
-    missing::<27> as *const (),        // 0xd8 submit (blocking)
+    submit as *const (),               // 0xd8 (blocking)
     submit_async as *const (),         // 0xe0
     submit_result as *const (),        // 0xe8
 ]);
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
     use std::io::BufRead;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1012,7 +1143,10 @@ mod tests {
     fn a_full_disk_is_not_the_quota() {
         let mb = 1 << 20;
         assert_eq!(no_room(2 * mb, 0, 0, mb), Some(OUT_OF_LOCAL_STORAGE));
-        assert_eq!(no_room(2 * mb, 0, QUOTA - mb, 100 * mb), Some(QUOTA_EXCEEDED));
+        assert_eq!(
+            no_room(2 * mb, 0, QUOTA - mb, 100 * mb),
+            Some(QUOTA_EXCEEDED)
+        );
         // Replacing a blob of the same size fits a full quota.
         assert_eq!(no_room(mb, mb, QUOTA, 100 * mb), None);
         assert_eq!(no_room(mb, 0, 0, mb), None);
@@ -1041,18 +1175,28 @@ mod tests {
     }
 
     fn old_state() -> Option<(String, Vec<(String, String)>)> {
-        Some(("one".into(), vec![("a".into(), "old a".into()), ("b".into(), "old b".into())]))
+        Some((
+            "one".into(),
+            vec![("a".into(), "old a".into()), ("b".into(), "old b".into())],
+        ))
     }
 
     /// Run by the crash test in a child process; does nothing otherwise.
     #[test]
     fn crash_child() {
-        let (Ok(root), Ok(op)) = (std::env::var("VICTORY_SAVE_CHILD"), std::env::var("VICTORY_SAVE_OP")) else {
+        let (Ok(root), Ok(op)) = (
+            std::env::var("VICTORY_SAVE_CHILD"),
+            std::env::var("VICTORY_SAVE_OP"),
+        ) else {
             return;
         };
         let root = PathBuf::from(root);
         let hr = if op == "update" {
-            update(&root, "two", &[("a", Some("new a")), ("b", None), ("c", Some("new c"))])
+            update(
+                &root,
+                "two",
+                &[("a", Some("new a")), ("b", None), ("c", Some("new c"))],
+            )
         } else {
             delete(&root, "Slot")
         };
@@ -1065,15 +1209,25 @@ mod tests {
     /// new one.
     #[test]
     fn a_kill_at_any_step_leaves_old_or_new() {
-        let new = Some(("two".into(), vec![("a".into(), "new a".into()), ("c".into(), "new c".into())]));
+        let new = Some((
+            "two".into(),
+            vec![("a".into(), "new a".into()), ("c".into(), "new c".into())],
+        ));
         for (op, after) in [("update", new), ("delete", None)] {
             let mut seen = (0, 0);
             for stop in 1.. {
                 let dir = tempfile::tempdir().unwrap();
                 let root = dir.path();
-                assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+                assert_eq!(
+                    update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                    S_OK
+                );
                 let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "modules::xgamesave::tests::crash_child", "--nocapture"])
+                    .args([
+                        "--exact",
+                        "modules::xgamesave::tests::crash_child",
+                        "--nocapture",
+                    ])
                     .args(["--test-threads=1"])
                     .env("VICTORY_SAVE_CHILD", root)
                     .env("VICTORY_SAVE_OP", op)
@@ -1149,16 +1303,35 @@ mod tests {
         for good in ["Profile/Slot_1", "a/b/Save-2.sav", "x", &"a".repeat(256)] {
             assert!(valid_container(good), "{good}");
         }
-        for bad in ["a b", "", "a/", "a.", "a..b", "a.b/c", "a-b/c", &"a".repeat(257)] {
+        for bad in [
+            "a b",
+            "",
+            "a/",
+            "a.",
+            "a..b",
+            "a.b/c",
+            "a-b/c",
+            &"a".repeat(257),
+        ] {
             assert!(!valid_container(bad), "{bad}");
         }
 
         // Containers and blobs differing only in case, reserved device
         // names, characters the host forbids, long names: all distinct.
         let dir = tempfile::tempdir().unwrap();
-        let p = Provider { root: dir.path().into() };
+        let p = Provider {
+            root: dir.path().into(),
+        };
         let long = "n".repeat(300);
-        let blobs = ["A", "a", "CON", "nul.txt", "x/y:z*?\"<>|", long.as_str(), "end. "];
+        let blobs = [
+            "A",
+            "a",
+            "CON",
+            "nul.txt",
+            "x/y:z*?\"<>|",
+            long.as_str(),
+            "end. ",
+        ];
         for container in ["Save", "save", "SAVE/CON.x"] {
             let c = p.container(container);
             let u = Update {
@@ -1190,7 +1363,10 @@ mod tests {
     #[test]
     fn the_old_layout_moves_over() {
         let saves = tempfile::tempdir().unwrap();
-        let root = saves.path().join(format!("{:016X}", xuser::XUID)).join("scid");
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
         let old = root.join("Player");
         std::fs::create_dir_all(&old).unwrap();
         std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
@@ -1209,7 +1385,10 @@ mod tests {
             ]
         );
         let v = current_named(&c.dir, "Player").unwrap().unwrap();
-        assert_eq!((v.dir.file_name(), v.display.as_str()), (Some("v1".as_ref()), "Chapter 1"));
+        assert_eq!(
+            (v.dir.file_name(), v.display.as_str()),
+            (Some("v1".as_ref()), "Chapter 1")
+        );
     }
 
     /// An empty configuration id names none. As a folder name it would be
@@ -1283,7 +1462,10 @@ mod tests {
             S_OK
         );
         type Delete = extern "system" fn(This, *mut Update, *const c_char) -> HRESULT;
-        assert_eq!(method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()), S_OK);
+        assert_eq!(
+            method::<Delete>(&OBJECT, 0xd0)(this, update, c"gone".as_ptr()),
+            S_OK
+        );
         type Submit = extern "system" fn(This, *const Update, *mut AsyncBlock) -> HRESULT;
         let mut b = block();
         assert_eq!(method::<Submit>(&OBJECT, 0xe0)(this, update, &mut b), S_OK);
@@ -1428,7 +1610,10 @@ mod tests {
     fn a_noncanonical_folder_does_not_remove_a_committed_save() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+        assert_eq!(
+            update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+            S_OK
+        );
         let slot = container_dir(root, "Slot");
         for stray in ["v01", "v001", "v+1", "v0", "v02"] {
             std::fs::create_dir(slot.join(stray)).unwrap();
@@ -1457,18 +1642,28 @@ mod tests {
         for (what, make) in strays {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
-            assert_eq!(update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]), S_OK);
+            assert_eq!(
+                update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                S_OK
+            );
             let slot = container_dir(root, "Slot");
             make(&slot.join("v2"));
 
             assert_eq!(state(root), old_state(), "{what}: read");
             assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
 
-            assert_eq!(update(root, "two", &[("a", Some("new a"))]), S_OK, "{what}: update");
+            assert_eq!(
+                update(root, "two", &[("a", Some("new a"))]),
+                S_OK,
+                "{what}: update"
+            );
             let blobs = vec![("a".into(), "new a".into()), ("b".into(), "old b".into())];
             let after = Some(("two".into(), blobs));
             assert_eq!(state(root), after, "{what}: after the update");
-            assert!(slot.join("v3").is_dir(), "{what}: the update did not go above v2");
+            assert!(
+                slot.join("v3").is_dir(),
+                "{what}: the update did not go above v2"
+            );
             // Read again: the new version stays the container.
             assert_eq!(state(root), after, "{what}: second read");
         }
@@ -1488,5 +1683,266 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    type Names = Vec<(String, u32, u64)>;
+
+    extern "system" fn collect_containers(
+        info: *const ContainerInfo,
+        context: *mut c_void,
+    ) -> bool {
+        // SAFETY: valid during the callback; the context is the test's vector.
+        let (info, out) = unsafe { (&*info, &mut *context.cast::<Names>()) };
+        out.push((text(info.name).unwrap(), info.blob_count, info.total_size));
+        true
+    }
+
+    extern "system" fn collect_blobs(info: *const BlobInfo, context: *mut c_void) -> bool {
+        // SAFETY: as above.
+        let (info, out) = unsafe { (&*info, &mut *context.cast::<Vec<(String, u32)>>()) };
+        out.push((text(info.name).unwrap(), info.size));
+        true
+    }
+
+    /// What a title does with its saves, step by step over the vtable.
+    struct Title {
+        provider: *mut Provider,
+    }
+
+    impl Title {
+        fn start(saves: &Path) -> Title {
+            let provider = Provider::open(saves, Some("scid")).unwrap();
+            Title {
+                provider: give(provider),
+            }
+        }
+
+        fn list(&self, prefix: Option<&CStr>) -> Result<Names, HRESULT> {
+            let mut found = Names::new();
+            let context = (&raw mut found).cast();
+            let collect = Some(collect_containers as ContainerCallback);
+            let hr = match prefix {
+                None => enumerate_containers(&OBJECT, self.provider, context, collect),
+                Some(p) => container_info(&OBJECT, self.provider, p.as_ptr(), context, collect),
+            };
+            if hr == S_OK { Ok(found) } else { Err(hr) }
+        }
+
+        fn container(&self, name: &CStr) -> *mut Container {
+            let mut container = std::ptr::null_mut();
+            let hr = create_container(&OBJECT, self.provider, name.as_ptr(), &mut container);
+            assert_eq!(hr, S_OK);
+            container
+        }
+
+        /// One update: blobs written (`Some`) or deleted (`None`), then
+        /// submitted the blocking way.
+        fn save(&self, name: &CStr, display: &CStr, changes: &[(&CStr, Option<&[u8]>)]) -> HRESULT {
+            let container = self.container(name);
+            let mut update = std::ptr::null_mut();
+            assert_eq!(
+                create_update(&OBJECT, container, display.as_ptr(), &mut update),
+                S_OK
+            );
+            for (blob, data) in changes {
+                let hr = match data {
+                    Some(data) => {
+                        write_blob(&OBJECT, update, blob.as_ptr(), data.as_ptr(), data.len())
+                    }
+                    None => delete_blob(&OBJECT, update, blob.as_ptr()),
+                };
+                assert_eq!(hr, S_OK);
+            }
+            let hr = submit(&OBJECT, update);
+            close_update(&OBJECT, update);
+            close_container(&OBJECT, container);
+            hr
+        }
+
+        fn blobs(&self, name: &CStr, prefix: &CStr) -> Vec<(String, u32)> {
+            let container = self.container(name);
+            let mut blobs = Vec::new();
+            let context = (&raw mut blobs).cast();
+            let collect = Some(collect_blobs as BlobCallback);
+            let hr = enumerate_blobs(&OBJECT, container, prefix.as_ptr(), context, collect);
+            assert_eq!(hr, S_OK);
+            close_container(&OBJECT, container);
+            blobs
+        }
+
+        /// Reads blobs into a buffer sized from the enumerated sizes, as a
+        /// title must, and parses what the read laid out.
+        fn load(&self, name: &CStr, wanted: &[&CStr]) -> Result<Vec<(String, Vec<u8>)>, HRESULT> {
+            let sizes = self.blobs(name, c"");
+            let want = |n: &str| wanted.iter().any(|w| w.to_str() == Ok(n));
+            let need: usize = sizes
+                .iter()
+                .filter(|(n, _)| want(n))
+                .map(|(n, size)| BLOB + n.len() + 1 + *size as usize)
+                .sum();
+            let mut buffer = vec![0u64; need.div_ceil(8) + 1];
+            let container = self.container(name);
+            let names: Vec<*const c_char> = wanted.iter().map(|w| w.as_ptr()).collect();
+            let mut count = names.len() as u32;
+            let out = buffer.as_mut_ptr().cast::<u8>();
+            let room = buffer.len() * 8;
+            let hr = read_blobs(&OBJECT, container, names.as_ptr(), &mut count, room, out);
+            close_container(&OBJECT, container);
+            if hr != S_OK {
+                return Err(hr);
+            }
+            let mut blobs = Vec::new();
+            for i in 0..count as usize {
+                // SAFETY: the layout the call wrote into `buffer`.
+                unsafe {
+                    let entry = out.add(i * BLOB);
+                    let name = text(entry.cast::<*const c_char>().read_unaligned()).unwrap();
+                    let len = entry.add(8).cast::<u32>().read_unaligned() as usize;
+                    let data = entry.add(16).cast::<*const u8>().read_unaligned();
+                    blobs.push((name, std::slice::from_raw_parts(data, len).to_vec()));
+                }
+            }
+            Ok(blobs)
+        }
+
+        fn quota(&self) -> i64 {
+            let mut left = 0;
+            assert_eq!(quota(&OBJECT, self.provider, &mut left), S_OK);
+            left
+        }
+
+        /// The title quits: its handles close.
+        fn quit(self) {
+            close_provider(&OBJECT, self.provider);
+        }
+    }
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// The flow of a title that keeps a profile and numbered autosave slots:
+    /// create a container, write blobs, commit, list, read, quit, start
+    /// again and find it all, update part of a slot, delete one.
+    #[test]
+    fn a_title_flow_writes_commits_lists_and_reads_back_across_restarts() {
+        let saves = tempfile::tempdir().unwrap();
+        let (data, header) = (pattern(244_128, 7), pattern(296, 9));
+        let profile = (pattern(2012, 1), pattern(296, 2));
+
+        // First run: nothing is there; the profile and the slot are saved.
+        let title = Title::start(saves.path());
+        assert!(title.list(None).unwrap().is_empty());
+        assert!(title.list(Some(c"Player")).unwrap().is_empty());
+        assert_eq!(title.load(c"Slot0015", &[c"Data"]), Err(BLOB_NOT_FOUND));
+        let full = title.quota();
+        let changes: [(&CStr, Option<&[u8]>); 2] =
+            [(c"Data", Some(&profile.0)), (c"Header", Some(&profile.1))];
+        assert_eq!(title.save(c"Player", c"Player", &changes), S_OK);
+        let changes: [(&CStr, Option<&[u8]>); 2] =
+            [(c"Data", Some(&data)), (c"Header", Some(&header))];
+        assert_eq!(title.save(c"Slot0015", c"(Autosave) Start", &changes), S_OK);
+        assert_eq!(title.quota(), full - 244_128 - 296 - 2012 - 296);
+        title.quit();
+
+        // Second run: both are listed, with their sizes, and read back.
+        let title = Title::start(saves.path());
+        let all = title.list(None).unwrap();
+        assert_eq!(
+            all,
+            [
+                ("Player".to_string(), 2, 2012 + 296),
+                ("Slot0015".to_string(), 2, 244_128 + 296)
+            ]
+        );
+        // By name: exactly, as a prefix (every slot), and none.
+        assert_eq!(title.list(Some(c"Player")).unwrap(), all[..1]);
+        assert_eq!(title.list(Some(c"Slot")).unwrap(), all[1..]);
+        assert_eq!(title.list(Some(c"")).unwrap(), all);
+        assert!(title.list(Some(c"Slot9")).unwrap().is_empty());
+        assert_eq!(title.list(Some(c"no good")), Err(INVALID_CONTAINER_NAME));
+        assert_eq!(
+            title.blobs(c"Slot0015", c""),
+            [("Data".to_string(), 244_128), ("Header".to_string(), 296)]
+        );
+        assert_eq!(
+            title.blobs(c"Slot0015", c"He"),
+            [("Header".to_string(), 296)]
+        );
+        assert_eq!(
+            title.load(c"Slot0015", &[c"Header", c"Data"]).unwrap(),
+            [
+                ("Header".to_string(), header.clone()),
+                ("Data".to_string(), data)
+            ]
+        );
+        assert_eq!(title.load(c"Slot0015", &[c"Nothing"]), Err(BLOB_NOT_FOUND));
+
+        // The next autosave replaces the data and keeps the header; the
+        // profile gains a blob and loses one.
+        let newer = pattern(300_000, 3);
+        let changes: [(&CStr, Option<&[u8]>); 1] = [(c"Data", Some(&newer))];
+        assert_eq!(title.save(c"Slot0015", c"(Autosave) Later", &changes), S_OK);
+        let changes: [(&CStr, Option<&[u8]>); 2] = [(c"Header", None), (c"Extra", Some(b"x"))];
+        assert_eq!(title.save(c"Player", c"Player", &changes), S_OK);
+        // A name the console refuses never reaches the disk.
+        let mut container = std::ptr::null_mut();
+        let name = c"bad name".as_ptr();
+        let hr = create_container(&OBJECT, title.provider, name, &mut container);
+        assert_eq!(hr, INVALID_CONTAINER_NAME);
+        title.quit();
+
+        // Third run: the update is what the title finds.
+        let title = Title::start(saves.path());
+        assert_eq!(
+            title.load(c"Slot0015", &[c"Data", c"Header"]).unwrap(),
+            [("Data".to_string(), newer), ("Header".to_string(), header)]
+        );
+        assert_eq!(
+            title.list(Some(c"Player")).unwrap(),
+            [("Player".to_string(), 2, 2012 + 1)]
+        );
+        assert_eq!(
+            title.blobs(c"Player", c""),
+            [("Data".to_string(), 2012), ("Extra".to_string(), 1)]
+        );
+        let slot = c"Slot0015".as_ptr();
+        assert_eq!(delete_now(&OBJECT, title.provider, slot), S_OK);
+        assert_eq!(delete_now(&OBJECT, title.provider, slot), S_OK);
+        let bad = c"bad name".as_ptr();
+        assert_eq!(
+            delete_now(&OBJECT, title.provider, bad),
+            INVALID_CONTAINER_NAME
+        );
+        assert_eq!(title.list(None).unwrap().len(), 1);
+        title.quit();
+    }
+
+    /// The blocking calls are in the table where the public API has them.
+    #[test]
+    fn the_blocking_calls_are_in_the_table() {
+        let at = |offset| method::<usize>(&OBJECT, offset);
+        assert_eq!(at(0x18), initialize as *const () as usize);
+        assert_eq!(at(0x38), quota as *const () as usize);
+        assert_eq!(at(0x50), delete_now as *const () as usize);
+        assert_eq!(at(0xd8), submit as *const () as usize);
+        assert_eq!(at(0xe0), submit_async as *const () as usize);
+    }
+
+    /// With no storage folder there is no provider (and nothing is written
+    /// to the working directory); with one, its saves folder is made.
+    #[test]
+    fn a_provider_needs_the_titles_storage_folder() {
+        assert_eq!(
+            open_at(Path::new("saves"), Some("scid")).err(),
+            Some(NO_ACCESS)
+        );
+        assert_eq!(open_at(Path::new(""), None).err(), Some(NO_ACCESS));
+        let dir = tempfile::tempdir().unwrap();
+        let provider = open_at(&dir.path().join("saves"), Some("scid")).unwrap();
+        assert!(provider.root.is_dir());
+        assert!(provider.root.starts_with(dir.path()));
     }
 }

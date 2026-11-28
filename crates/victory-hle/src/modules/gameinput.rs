@@ -854,7 +854,10 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
+            None => hub
+                .returned
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -944,10 +947,36 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; the title sends trigger levels in slot 0x50.
+
+/// What share of a trigger motor's level goes to the host pad's main motor
+/// on its side (left trigger to the low-frequency one, right to the
+/// high-frequency one), where the host cannot drive trigger motors.
+const TRIGGER_FOLD: f32 = 0.5;
+
+/// `VICTORY_TRIGGER_RUMBLE=0` drops the trigger motors, as a pad without
+/// them does on the console; by default they are folded into the main ones.
+fn fold_triggers() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| !std::env::var("VICTORY_TRIGGER_RUMBLE").is_ok_and(|v| v.trim() == "0"));
+    *ON
+}
+
+/// The host pad's two motors (low frequency, high frequency; 0 to 1) for
+/// the title's four levels (low, high, left trigger, right trigger). XInput
+/// has no trigger motors and the host API that drives them needs WinRT
+/// (`Gamepad.Vibration`), so with `fold` a trigger's level also drives the
+/// main motor on its side, at [`TRIGGER_FOLD`], when that is more than the
+/// title asks of it: the player feels the recoil a trigger would give. Levels
+/// outside 0 to 1 (and NaN) are clamped, as the console does.
+fn host_motors(levels: [f32; 4], fold: bool) -> (f32, f32) {
+    let [low, high, left, right] = levels.map(|l| if l.is_nan() { 0.0 } else { l.clamp(0.0, 1.0) });
+    if fold {
+        (low.max(left * TRIGGER_FOLD), high.max(right * TRIGGER_FOLD))
+    } else {
+        (low, high)
+    }
+}
+
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -955,13 +984,14 @@ extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     if device.index >= PADS && !(one_pad && device.index == FALLBACK) {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let levels = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
-    let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
+    let (low, high) = host_motors(levels, fold_triggers());
+    let speed = |level: f32| (level * f32::from(u16::MAX)) as u16;
     let mut source = lock(&device.hub().source);
     if one_pad {
         // The one pad is every host pad.
@@ -1121,7 +1151,8 @@ mod host {
 
     use windows_sys::Win32::System::Threading::GetCurrentProcessId;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        GetAsyncKeyState, GetKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC_EX, MapVirtualKeyW,
+        ToUnicodeEx,
     };
     use windows_sys::Win32::UI::Input::XboxController::{
         XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_BACK,
@@ -1199,7 +1230,9 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    if let Some(&(_, button)) =
+                        super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk)
+                    {
                         pad.buttons |= button;
                     }
                 }
@@ -1219,14 +1252,22 @@ mod host {
                     .collect();
                 down.extend(held);
             }
+            if down.is_empty() {
+                return Vec::new();
+            }
+            let held = modifiers();
+            let layout = layout();
             down.into_iter()
-                .map(|vk| KeyState {
+                .map(|vk| {
                     // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-                    virtual_key: vk,
-                    // shortcut: no characters (code point 0);
-                    // the title reads scan codes and virtual keys only.
-                    ..Default::default()
+                    let scan_code = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+                    let (code_point, dead_key) = character(vk, scan_code, &held, layout);
+                    KeyState {
+                        scan_code,
+                        code_point,
+                        virtual_key: vk,
+                        dead_key,
+                    }
                 })
                 .collect()
         }
@@ -1241,30 +1282,114 @@ mod host {
         }
     }
 
+    /// The host layout as `ToUnicodeEx` takes it.
+    pub(super) type Layout = *mut std::ffi::c_void;
+
+    /// The host's keyboard layout (the title's window thread's), which
+    /// decides the character a key makes.
+    fn layout() -> Layout {
+        let mut process = 0;
+        // SAFETY: plain queries; a null window has thread 0, the current one.
+        unsafe {
+            GetKeyboardLayout(GetWindowThreadProcessId(
+                GetForegroundWindow(),
+                &mut process,
+            ))
+        }
+    }
+
+    /// The modifier and lock state as `ToUnicodeEx` reads it: bit 7 of an
+    /// entry is "down", bit 0 of a lock key's "on".
+    fn modifiers() -> [u8; 256] {
+        let mut state = [0u8; 256];
+        for vk in [0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5] {
+            // SAFETY: a plain query.
+            if unsafe { GetAsyncKeyState(vk) } < 0 {
+                state[vk as usize] = 0x80;
+            }
+        }
+        for lock in [0x14, 0x90] {
+            // SAFETY: a plain query.
+            state[lock as usize] = (unsafe { GetKeyState(lock) } & 1) as u8;
+        }
+        state
+    }
+
+    /// The character key `vk` (scan code `scan`) makes with `modifiers` held
+    /// on `layout`, as the console's key readings carry it: the code point
+    /// of a printable character, or 0 when the key makes none; and whether it
+    /// is a dead key (an accent waiting for the letter after it), whose code
+    /// point is the accent itself. Control codes (a letter with Ctrl) and
+    /// Alt shortcuts are no text; Ctrl with Alt is AltGr, which is.
+    pub(super) fn character(
+        vk: u8,
+        scan: u32,
+        modifiers: &[u8; 256],
+        layout: Layout,
+    ) -> (u32, bool) {
+        let (ctrl, alt) = (modifiers[0x11] & 0x80 != 0, modifiers[0x12] & 0x80 != 0);
+        if ctrl != alt {
+            return (0, false);
+        }
+        let mut state = *modifiers;
+        state[vk as usize] |= 0x80;
+        let mut out = [0u16; 8];
+        // SAFETY: a 256-entry state and a buffer of the length we pass; bit 2
+        // of the flags leaves the keyboard's dead-key state alone.
+        let n = unsafe {
+            ToUnicodeEx(
+                u32::from(vk),
+                scan & 0x7f,
+                state.as_ptr(),
+                out.as_mut_ptr(),
+                out.len() as i32,
+                0x4,
+                layout,
+            )
+        };
+        let dead = n < 0;
+        let first =
+            char::decode_utf16(out[..n.unsigned_abs().min(8) as usize].iter().copied()).next();
+        match first {
+            Some(Ok(c)) if !c.is_control() => (u32::from(c), dead),
+            _ => (0, false),
+        }
+    }
+
+    /// A key by the name the debugging aids use: a letter, a digit, or
+    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the
+    /// stand-in pad's table maps them to buttons).
+    fn key_vk(name: &str) -> Option<u8> {
+        Some(match name.trim() {
+            "Enter" => 0x0D,
+            "Esc" => 0x1B,
+            "Tab" => 0x09,
+            "Back" => 0x08,
+            "Up" => 0x26,
+            "Down" => 0x28,
+            "Left" => 0x25,
+            "Right" => 0x27,
+            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
+                k.as_bytes()[0].to_ascii_uppercase()
+            }
+            _ => return None,
+        })
+    }
+
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts (`<from>-<to>:<key>`: all that
-    /// time), with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
-    /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
+    /// time), with or without focus. Keys are named as in [`key_vk`].
+    /// `VICTORY_KEYS_FILE=<path>` is the live version for a driver program:
+    /// the keys named in that file (comma separated, rewritten whenever the
+    /// driver likes; empty or missing means none) are held right now, with
+    /// or without focus, so a script can press keys without ever taking the
+    /// keyboard from the user.
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = key_vk(key)?;
                 let time = |t: &str| Duration::try_from_secs_f64(t.trim().parse().ok()?).ok();
                 let (from, to) = match at.split_once('-') {
                     Some((from, to)) => (time(from)?, time(to)?),
@@ -1276,10 +1401,53 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut held: Vec<u8> = keys
+            .iter()
             .filter(|&&(from, to, _)| (from..to).contains(&now))
             .map(|&(_, _, vk)| vk)
-            .collect()
+            .collect();
+        held.extend(file_keys());
+        held
+    }
+
+    /// The keys held by `VICTORY_KEYS_FILE`, read at most every 10 ms (the
+    /// title polls its pads and keys several times a frame).
+    fn file_keys() -> Vec<u8> {
+        static FILE: LazyLock<Option<std::path::PathBuf>> = LazyLock::new(|| {
+            std::env::var_os("VICTORY_KEYS_FILE")
+                .filter(|p| !p.is_empty())
+                .map(Into::into)
+        });
+        static LAST: Mutex<Option<(Instant, Vec<u8>)>> = Mutex::new(None);
+        let Some(path) = &*FILE else {
+            return Vec::new();
+        };
+        let mut last = lock(&LAST);
+        if let Some((at, keys)) = &*last {
+            if at.elapsed() < Duration::from_millis(10) {
+                return keys.clone();
+            }
+        }
+        // A read that fails (the driver is replacing the file) keeps the keys held so far: an empty
+        // reading would release a key for one poll and break a hold.
+        let keys: Vec<u8> = match std::fs::read_to_string(path) {
+            Ok(text) => text
+                .split([',', ' ', '\n', '\r', '\0'])
+                .filter_map(key_vk)
+                .collect(),
+            Err(_) => last
+                .as_ref()
+                .map(|(_, keys)| keys.clone())
+                .unwrap_or_default(),
+        };
+        if last
+            .as_ref()
+            .map_or(!keys.is_empty(), |(_, old)| *old != keys)
+        {
+            tracing::info!(keys = ?keys, "key file");
+        }
+        *last = Some((Instant::now(), keys.clone()));
+        keys
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1290,6 +1458,66 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    #[test]
+    fn key_names_map_to_virtual_keys() {
+        assert_eq!(key_vk("Enter"), Some(0x0D));
+        assert_eq!(key_vk(" w "), Some(b'W'));
+        assert_eq!(key_vk("7"), Some(b'7'));
+        assert_eq!(key_vk(""), None);
+        assert_eq!(key_vk("Shift"), None);
+    }
+
+    /// The US layout, whatever the host's, so the characters are known. A
+    /// layout that cannot be loaded (no such layout on the host) skips the test.
+    #[cfg(test)]
+    fn us_layout() -> Option<Layout> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::LoadKeyboardLayoutW;
+        let name: Vec<u16> = "00000409\0".encode_utf16().collect();
+        // SAFETY: a NUL-terminated layout name; loading without activating.
+        let layout = unsafe { LoadKeyboardLayoutW(name.as_ptr(), 0) };
+        (!layout.is_null()).then_some(layout)
+    }
+
+    #[cfg(test)]
+    fn state(held: &[u8]) -> [u8; 256] {
+        let mut state = [0u8; 256];
+        for &vk in held {
+            state[vk as usize] = 0x80;
+        }
+        state
+    }
+
+    #[test]
+    fn keys_carry_the_character_they_make() {
+        let Some(us) = us_layout() else { return };
+        // SAFETY: a plain query.
+        let scan = |vk: u8| unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+        let of = |vk: u8, held: &[u8]| character(vk, scan(vk), &state(held), us);
+        // Letters: lower case, upper case with Shift, and with Caps Lock.
+        assert_eq!(of(b'A', &[]), (u32::from(b'a'), false));
+        assert_eq!(of(b'A', &[0x10]), (u32::from(b'A'), false));
+        let mut caps = state(&[]);
+        caps[0x14] = 1;
+        assert_eq!(
+            character(b'A', scan(b'A'), &caps, us),
+            (u32::from(b'A'), false)
+        );
+        // Digits and what Shift makes of them; space.
+        assert_eq!(of(b'1', &[]), (u32::from(b'1'), false));
+        assert_eq!(of(b'1', &[0x10]), (u32::from(b'!'), false));
+        assert_eq!(of(0x20, &[]), (u32::from(b' '), false));
+        // Keys that make no text: Enter, Escape, an arrow, a modifier, a
+        // function key, a letter with Ctrl or with Alt.
+        for vk in [0x0D, 0x1B, 0x26, 0xA0, 0x70] {
+            assert_eq!(of(vk, &[]), (0, false), "{vk:#x}");
+        }
+        assert_eq!(of(b'A', &[0x11]), (0, false));
+        assert_eq!(of(b'A', &[0x12]), (0, false));
+        // The call leaves the keyboard's state alone: the same key gives the
+        // same character again.
+        assert_eq!(of(b'A', &[]), (u32::from(b'a'), false));
     }
 
     #[test]
@@ -1587,7 +1815,11 @@ mod tests {
         assert_eq!(pad(hub).left_x, 1.0);
         // A pad is switched on, in any slot: its input arrives, beside the
         // keyboard's, and no device comes or goes.
-        host.lock().unwrap().pads[2] = Some(PadState { buttons: A, left_y: -0.5, ..Default::default() });
+        host.lock().unwrap().pads[2] = Some(PadState {
+            buttons: A,
+            left_y: -0.5,
+            ..Default::default()
+        });
         hub.poll();
         let p = pad(hub);
         assert_eq!((p.buttons, p.left_x, p.left_y), (A, 1.0, -0.5));
@@ -1658,7 +1890,16 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
+            register(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                1,
+                0,
+                context,
+                Some(slow),
+                &mut token
+            ),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1667,7 +1908,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
+        assert!(
+            !unregister(&hub.object, token, 5000),
+            "times out while it runs"
+        );
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);
@@ -1678,6 +1922,35 @@ mod tests {
         assert_eq!(FROM_INSIDE.load(Ordering::SeqCst), 1);
         poller.join().unwrap();
         leave.join().unwrap();
+    }
+
+    /// The trigger motors a host pad lacks go to its main motors, as far as
+    /// the title's own levels do not already ask for more.
+    #[test]
+    fn trigger_motors_fold_into_the_main_ones() {
+        // Main motors alone are as the title sets them.
+        assert_eq!(host_motors([0.25, 0.75, 0.0, 0.0], true), (0.25, 0.75));
+        // A trigger on a quiet pad shakes the motor on its side.
+        assert_eq!(host_motors([0.0, 0.0, 1.0, 0.5], true), (0.5, 0.25));
+        // A louder main motor is not made quieter by a trigger.
+        assert_eq!(host_motors([0.8, 0.1, 1.0, 1.0], true), (0.8, 0.5));
+        // Switched off, the triggers are dropped.
+        assert_eq!(host_motors([0.0, 0.0, 1.0, 1.0], false), (0.0, 0.0));
+        // Levels outside 0 to 1 and NaN are clamped.
+        assert_eq!(host_motors([2.0, -1.0, f32::NAN, 7.0], true), (1.0, 0.5));
+        assert_eq!(host_motors([f32::NAN; 4], true), (0.0, 0.0));
+    }
+
+    #[test]
+    fn trigger_rumble_reaches_the_host_pad() {
+        let (hub, host) = fake();
+        host.lock().unwrap().pads[2] = Some(PadState::default());
+        hub.poll();
+        let device = &hub.devices[2] as *const Device;
+        let rumble = slot::<extern "system" fn(*const Device, *const [f32; 4]), _>(device, 0x50);
+        rumble(device, &[0.0, 0.0, 1.0, 0.5]);
+        rumble(device, &[0.0; 4]);
+        assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 16383), (2, 0, 0)]);
     }
 
     #[test]

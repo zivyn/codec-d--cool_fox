@@ -84,13 +84,13 @@ const HEAP_TILES: u32 = 1024;
 pub(crate) static STATS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
 
 /// Whether textures are made this way: the switch
-/// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
+/// (`VICTORY_LEVELS_ON_DEMAND`; on by default, `=0` turns it off), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
 /// tier 2).
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if !crate::defaults::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
             return false;
         }
         let Some(host) = host() else {
@@ -182,7 +182,13 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         return None;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
+    let found = if crate::pool::fit_best() {
+        // The fullest heap with room: the others empty as their levels go,
+        // and a heap with no tile left goes back to the card ([`trim`]).
+        fullest_with(pool.iter().map(|h| h.as_ref().map(Heap::free_tiles)), count)
+    } else {
+        pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count))
+    };
     let index = match found {
         Some(index) => index,
         None => {
@@ -239,6 +245,15 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         left -= part;
     }
     Some((h.heap.clone(), index, runs))
+}
+
+/// The place of the heap with the fewest free tiles that has `count` free
+/// (the first of them), given each place's free tiles (`None`: no heap there).
+fn fullest_with(free: impl Iterator<Item = Option<u32>>, count: u32) -> Option<usize> {
+    free.enumerate()
+        .filter_map(|(i, free)| free.filter(|&free| free >= count).map(|free| (free, i)))
+        .min()
+        .map(|(_, i)| i)
 }
 
 /// The pool's heap at `index`, if it is still there.
@@ -1254,6 +1269,88 @@ fn census() -> [(u64, u64, u64); 3] {
     out
 }
 
+/// What one tiled texture stands at (diagnostics, [`levels_report`]): the
+/// first level a view may show, the levels the title holds, the levels that
+/// have tiles, the cap plus one under which a held level was left without
+/// (0: not short), the levels in all, and the milliseconds since a table read
+/// it (`u64::MAX`: never) and since an upload came.
+#[cfg(feature = "diagnostics")]
+impl Tiled {
+    fn stand(&self, now: u64) -> (Option<u32>, u32, u32, u64, u32, u64, u64) {
+        let given = self.given.lock().unwrap_or_else(|e| e.into_inner());
+        let tiles = self.with_tiles_locked(&given);
+        drop(given);
+        let sampled = self.sampled.load(Ordering::Relaxed);
+        (
+            self.first_shown(),
+            self.held.load(Ordering::Relaxed),
+            tiles,
+            self.short.load(Ordering::Relaxed),
+            self.levels,
+            if sampled == 0 { u64::MAX } else { now.saturating_sub(sampled) },
+            now.saturating_sub(self.touched.load(Ordering::Relaxed)),
+        )
+    }
+}
+
+/// `VICTORY_CAPTURE_LEVELS=1` (diagnostics, with a capture): at a captured
+/// frame, one line for each texture made level by level whose views start above
+/// level 0 or whose held levels lack tiles (IMG1: a low mip shows ginger hair,
+/// a purple poster, blocks), the biggest first, plus the card's room.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn levels_report() -> Vec<String> {
+    let now = stamp_now();
+    let all: Vec<(u64, std::sync::Arc<crate::resource::HostTexture>)> = {
+        let track = TRACK.lock().unwrap_or_else(|e| e.into_inner());
+        track.iter().filter_map(|(&start, w)| w.upgrade().map(|t| (start, t))).collect()
+    };
+    let mut rows = Vec::new();
+    let (mut total, mut short, mut above) = (0u64, 0u64, 0u64);
+    for (start, texture) in &all {
+        let Some(tiled) = texture.tiled.as_ref() else {
+            continue;
+        };
+        total += 1;
+        let (shown, held, tiles, cap, levels, sampled, touched) = tiled.stand(now);
+        let lacking = held & !tiles;
+        let first = shown.unwrap_or(u32::MAX);
+        if lacking != 0 {
+            short += 1;
+        }
+        if first != 0 {
+            above += 1;
+        }
+        if first == 0 && lacking == 0 {
+            continue;
+        }
+        // SAFETY: a live resource.
+        let d = unsafe { texture.texture.GetDesc() };
+        rows.push((
+            tiled.full,
+            format!(
+                "{start:#x}	{}x{}	f{}	levels{levels}	first_shown{}	held{held:#x}	tiles{tiles:#x}	lacking{lacking:#x}	cap{}	bytes{}	sampled_ms_ago{}	upload_ms_ago{touched}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                if shown.is_some() { first.to_string() } else { "none".to_owned() },
+                if cap == 0 { "-".to_owned() } else { (cap - 1).to_string() },
+                tiled.full,
+                if sampled == u64::MAX { "never".to_owned() } else { sampled.to_string() },
+            ),
+        ));
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let memory = crate::host::host().and_then(|h| h.video_memory());
+    let mut lines = vec![format!(
+        "# textures made level by level: {total}; with a held level lacking tiles: {short}; views starting above level 0: {above}; level cap now {}; headroom {} MB; card (budget, used, ..) {:?}; level cap and headroom as `resource::level_cap_lately` and `headroom_lately`",
+        crate::resource::level_cap_lately(),
+        crate::resource::headroom_lately() >> 20,
+        memory
+    )];
+    lines.extend(rows.into_iter().map(|r| r.1));
+    lines
+}
+
 /// For the log, with the texture queue's line: what this saves, and what
 /// the mapping calls cost since the line before.
 pub(crate) fn status() {
@@ -2239,6 +2336,16 @@ void look() {
         // Only levels named are asked about.
         assert_eq!(tiled.fitting(0b0000_0110, 1 << 20), 0b0000_0110);
         assert_eq!(tiled.fitting(0b0000_0101, 1 << 20), 0b0000_0100);
+    }
+
+    #[test]
+    fn tiles_are_taken_from_the_fullest_heap_that_has_room() {
+        let free = [Some(900), None, Some(40), Some(300), Some(40)];
+        assert_eq!(fullest_with(free.into_iter(), 30), Some(2), "the first of the fullest");
+        assert_eq!(fullest_with(free.into_iter(), 41), Some(3));
+        assert_eq!(fullest_with(free.into_iter(), 301), Some(0));
+        assert_eq!(fullest_with(free.into_iter(), 901), None);
+        assert_eq!(fullest_with(std::iter::empty(), 1), None);
     }
 
     #[test]

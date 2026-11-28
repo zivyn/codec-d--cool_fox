@@ -1,7 +1,7 @@
 //! Which imports do titles need, and which do we cover?
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -60,8 +60,16 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
                 }
             };
             let path = entry.path();
-            if !entry.file_type().is_file() || !looks_like_pe(path) {
+            if !entry.file_type().is_file() {
                 continue;
+            }
+            match looks_like_pe(path) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    failed.push(format!("{}: {e}", path.display()));
+                    continue;
+                }
             }
             // Use the resolved path for deduplication and keep the original for output.
             let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -121,12 +129,14 @@ pub fn run(paths: Vec<PathBuf>, strict: bool, list_missing: bool) -> Result<()> 
 
 /// Cheap pre-filter: an `MZ` header, regardless of extension (console
 /// packages do not always use .exe/.dll).
-fn looks_like_pe(path: &Path) -> bool {
+fn looks_like_pe(path: &Path) -> io::Result<bool> {
+    let mut file = std::fs::File::open(path)?;
     let mut magic = [0u8; 2];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && &magic == b"MZ"
+    match file.read_exact(&mut magic) {
+        Ok(()) => Ok(&magic == b"MZ"),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 fn tally_image(

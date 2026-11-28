@@ -103,11 +103,34 @@ const BUILT: u64 = 4 << 20;
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// pages there are in the first seconds (run light-4). The total was 2,048 for
+/// the whole run, and a run that reached the world had it spent within
+/// seconds, with the shaders then reading zeros for every page they found empty
+/// afterwards: it is 8,192 (512 MiB) now, and `VICTORY_MEMORY_FAULT_PAGES=<n>`
+/// sets it (2048: as it was).
 const FAULTS: usize = 128;
-const FAULTS_ALL: usize = 2048;
+const FAULTS_ALL: usize = 8192;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+
+/// The most pages taken from faults in all: `VICTORY_MEMORY_FAULT_PAGES`, a
+/// number of pages, else [`FAULTS_ALL`].
+fn fault_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        fault_limit_from(std::env::var("VICTORY_MEMORY_FAULT_PAGES").ok().as_deref())
+    })
+}
+
+fn fault_limit_from(value: Option<&str>) -> usize {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(FAULTS_ALL)
+}
+
+/// Whether a page the shaders found empty may be taken now: `made` pages were
+/// taken this frame and `faulted` in all, `limit` the most in all.
+fn takes_fault(made: usize, faulted: usize, limit: usize) -> bool {
+    made < FAULTS && faulted < limit
+}
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -191,6 +214,9 @@ struct Stats {
     from: Option<(std::time::Instant, u64)>,
     uses: [u64; 2],
     faults: u64,
+    /// Pages the limit on pages taken from faults turned away (above 4 GiB:
+    /// the ones below are not memory of the title).
+    starved: u64,
     unknown: u64,
     back: u64,
     /// Pages looked at, bytes that changed, packed structures sent.
@@ -217,6 +243,139 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+}
+
+/// What the notes of the diagnostics in the faults buffer say: the two host waves of a console
+/// wave that gave up waiting for each other (`PAIR_NOTE`, said once for each program), a loop
+/// that reached its iteration limit (`LOOP_NOTE`, `VICTORY_LOOP_NOTES=1`: counted by frames for
+/// each program and loop, said at the first, then at powers of two) and values a program was
+/// asked to show (`PEEK_NOTE`, `VICTORY_PEEK`: 16 bits of a value to a note, said for the first
+/// few frames that have them).
+fn say_notes(notes: &[u32], frame: u64) {
+    static SAID_PAIR: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static CUTS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+    static PEEKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static SAID_HANG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    let mut peeked: Vec<u32> = Vec::new();
+    for &page in notes {
+        if page >= victory_shader::emit::PAIR_NOTE {
+            let mut said = SAID_PAIR.lock().unwrap_or_else(|e| e.into_inner());
+            if !said.contains(&page) {
+                said.push(page);
+                tracing::warn!(
+                    program = format!("{:07x}", page & 0x0FFF_FFFF),
+                    "the two host waves of a console wave gave up waiting for each other in a shader (hash starts with `program`)"
+                );
+            }
+        } else if page >= victory_shader::emit::LOOP_NOTE {
+            let mut cuts = CUTS.lock().unwrap_or_else(|e| e.into_inner());
+            let frames = match cuts.iter_mut().find(|c| c.0 == page) {
+                Some(c) => {
+                    c.1 += 1;
+                    c.1
+                }
+                None => {
+                    cuts.push((page, 1));
+                    1
+                }
+            };
+            if frames.is_power_of_two() {
+                tracing::warn!(
+                    program = format!("{:05x}", page >> 8 & 0x000F_FFFF),
+                    loop_id = page & 0xFF,
+                    frames,
+                    "a shader loop was cut at its limit (hash starts with `program`; `loop_id` is the loop's number in the program, `VICTORY_LOOP_WHY=1` lists them)"
+                );
+            }
+        } else if page >= victory_shader::emit::HANG_NOTE {
+            // (the guard, `VICTORY_HANG_GUARD`: a program that would have hung the card ended)
+            let mut said = SAID_HANG.lock().unwrap_or_else(|e| e.into_inner());
+            if !said.contains(&page) {
+                said.push(page);
+                let (kind, program, site) = victory_shader::emit::say_hang_note(page);
+                tracing::warn!(
+                    program = format!("{program:05x}"),
+                    site,
+                    "the hang guard ended threads of a shader (hash starts with `program`): {} (`site` is the barrier's or the loop's number modulo 16)",
+                    match kind {
+                        1 => "a group barrier waited for threads of the group that never came",
+                        2 => "a wave arrived at more group barriers than the budget (a loop with barriers that does not end)",
+                        3 => "a loop with a group barrier in it reached its bound",
+                        4 => "the two host waves of a console wave gave up waiting for each other",
+                        _ => "unknown note",
+                    }
+                );
+            }
+        } else {
+            peeked.push(page);
+        }
+    }
+    if !peeked.is_empty() && PEEKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+        let mut values: std::collections::BTreeMap<(u32, u32), [u32; 2]> = Default::default();
+        for note in peeked {
+            let (k, r, half) = (note >> 24 & 0xF, note >> 20 & 0xF, note >> 16 & 1);
+            values.entry((k, r)).or_default()[half as usize] = note & 0xFFFF;
+        }
+        let shown: Vec<String> =
+            values.iter().map(|(&(k, r), h)| format!("offset#{k} reg#{r} = {:#010x}", h[1] << 16 | h[0])).collect();
+        tracing::warn!(frame, values = ?shown, "values a program was asked to show (VICTORY_PEEK)");
+    }
+}
+
+/// The faults buffer of shaders that leave notes of the diagnostics but read no title memory by
+/// address, so that no [`Memory`] is made for them. Shaders that do use [`Memory`]'s faults
+/// buffer: this is the same kind of buffer, read once a frame by the draw that binds it.
+struct Notes {
+    buffer: ID3D12Resource,
+    data: *mut u32,
+    gpu: u64,
+    frame: u64,
+}
+
+// SAFETY: the mapping is of memory the struct owns; all access is under the mutex.
+unsafe impl Send for Notes {}
+
+static NOTES: Mutex<Option<Notes>> = Mutex::new(None);
+
+/// The address of the buffer a shader that only leaves notes binds as its faults buffer, made
+/// at the first call (a root view nothing sets is address 0: the first note a shader stores
+/// there lost the card). The notes in it are said once a frame, by the first call of the frame;
+/// `list` keeps the buffer until it has run. None if the host cannot make it.
+pub(crate) fn notes(list: &HostList) -> Option<u64> {
+    let mut guard = NOTES.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let (buffer, data) = host()?.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+        crate::host::name(&buffer, || "notes of diagnostics: faults".into());
+        // SAFETY: a fresh mapping of at least that many bytes; a live buffer.
+        let gpu = unsafe {
+            std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4);
+            buffer.GetGPUVirtualAddress()
+        };
+        *guard = Some(Notes { buffer, data: data.cast::<u32>(), gpu, frame: u64::MAX });
+    }
+    let n = guard.as_mut()?;
+    let frame = crate::frame::current();
+    if n.frame != frame {
+        n.frame = frame;
+        let mut found = Vec::new();
+        for i in 1..MEMORY_FAULTS as usize {
+            // SAFETY: inside the mapping; the GPU may be writing, a note missed now is written
+            // again next frame.
+            let at = unsafe { n.data.add(i) };
+            // SAFETY: as above.
+            let note = unsafe { at.read_volatile() };
+            if note != 0 {
+                if note >= victory_shader::emit::PEEK_NOTE {
+                    found.push(note);
+                }
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            }
+        }
+        say_notes(&found, frame);
+    }
+    list.keep(&n.buffer);
+    Some(n.gpu)
 }
 
 impl Memory {
@@ -658,57 +817,16 @@ impl Memory {
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
         let mut pages = Vec::new();
-        let mut peeked: Vec<u32> = Vec::new();
+        let mut notes: Vec<u32> = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
             // a number missed now is written again next frame.
             let at = unsafe { self.faults.1.add(i) };
             // SAFETY: as above.
             let page = unsafe { at.read_volatile() };
-            if page >= victory_shader::emit::PAIR_NOTE {
-                // Not a page: the two host waves of a console wave in some program waited for
-                // each other until they gave up (`pair_wait`), and went on without what the
-                // other was to give. Said once for each program.
-                static SAID_PAIR: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
-                let mut said = SAID_PAIR.lock().unwrap_or_else(|e| e.into_inner());
-                if !said.contains(&page) {
-                    said.push(page);
-                    tracing::warn!(
-                        program = format!("{:07x}", page & 0x0FFF_FFFF),
-                        "the two host waves of a console wave gave up waiting for each other in a shader (hash starts with `program`)"
-                    );
-                }
-                // SAFETY: as above.
-                unsafe { at.write_volatile(0) };
-            } else if page >= victory_shader::emit::LOOP_NOTE {
-                // Not a page: a loop of a translated shader reached its iteration limit
-                // (`VICTORY_LOOP_NOTES=1`). The frames it did so in are counted for each
-                // program and loop, and said at the first, then at powers of two.
-                static CUTS: std::sync::Mutex<Vec<(u32, u64)>> = std::sync::Mutex::new(Vec::new());
-                let mut cuts = CUTS.lock().unwrap_or_else(|e| e.into_inner());
-                let frames = match cuts.iter_mut().find(|c| c.0 == page) {
-                    Some(c) => {
-                        c.1 += 1;
-                        c.1
-                    }
-                    None => {
-                        cuts.push((page, 1));
-                        1
-                    }
-                };
-                if frames.is_power_of_two() {
-                    tracing::warn!(
-                        program = format!("{:05x}", page >> 8 & 0x000F_FFFF),
-                        loop_id = page & 0xFF,
-                        frames,
-                        "a shader loop was cut at its limit (hash starts with `program`; `loop_id` is the loop's number in the program, `VICTORY_LOOP_WHY=1` lists them)"
-                    );
-                }
-                // SAFETY: as above.
-                unsafe { at.write_volatile(0) };
-            } else if page >= victory_shader::emit::PEEK_NOTE {
-                // Not a page: a value a program was asked to show (`VICTORY_PEEK`), 16 bits of it.
-                peeked.push(page);
+            if page >= victory_shader::emit::PEEK_NOTE {
+                // Not a page: a note of a diagnostic ([`say_notes`]).
+                notes.push(page);
                 // SAFETY: as above.
                 unsafe { at.write_volatile(0) };
             } else if page != 0 {
@@ -717,36 +835,39 @@ impl Memory {
                 unsafe { at.write_volatile(0) };
             }
         }
-        if !peeked.is_empty() {
-            // The values (offset number, register number: 32 bits from two notes), said for the
-            // first few frames that have them.
-            static PEEKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if PEEKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
-                let mut values: std::collections::BTreeMap<(u32, u32), [u32; 2]> = Default::default();
-                for note in peeked {
-                    let (k, r, half) = (note >> 24 & 0xF, note >> 20 & 0xF, note >> 16 & 1);
-                    values.entry((k, r)).or_default()[half as usize] = note & 0xFFFF;
-                }
-                let shown: Vec<String> = values
-                    .iter()
-                    .map(|(&(k, r), h)| format!("offset#{k} reg#{r} = {:#010x}", h[1] << 16 | h[0]))
-                    .collect();
-                tracing::warn!(frame = self.frame, values = ?shown, "values a program was asked to show (VICTORY_PEEK)");
-            }
-        }
+        say_notes(&notes, self.frame);
         if pages.is_empty() {
             return;
         }
+        // Several threads find the same page empty: a page counts once.
         pages.sort_unstable();
+        pages.dedup();
+        let limit = fault_limit();
         let mut made = 0;
+        let mut starved = 0;
         for &page in &pages {
-            if made < FAULTS && self.faulted < FAULTS_ALL && self.copy_of(page).is_none() && self.map(page) {
-                made += 1;
-                self.faulted += 1;
-                self.bring(page, page + 1);
+            if takes_fault(made, self.faulted, limit) {
+                if self.copy_of(page).is_none() && self.map(page) {
+                    made += 1;
+                    self.faulted += 1;
+                    self.bring(page, page + 1);
+                }
+            } else if self.faulted >= limit && page >= 0x1_0000 && self.copy_of(page).is_none() {
+                starved += 1;
             }
         }
         self.stats.faults += pages.len() as u64;
+        self.stats.starved += starved;
+        if starved > 0 {
+            static LIMIT_SAID: std::sync::Once = std::sync::Once::new();
+            LIMIT_SAID.call_once(|| {
+                tracing::warn!(
+                    frame = self.frame,
+                    limit,
+                    "title memory by address: the pages taken from faults reached their limit; a page found empty after it reads zeros (`VICTORY_MEMORY_FAULT_PAGES` raises it)"
+                );
+            });
+        }
         // Each is an access that read 0 or was dropped.
         static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -827,9 +948,9 @@ impl Memory {
         let s = std::mem::take(&mut self.stats);
         tracing::info!(
             "title memory by address: {} pages ({} MB) in {} arenas, {} copies in all; per frame {:.0} dispatches that read, {:.0} that build, \
-             {:.1} pages that had no copy, {:.1} pages turned down, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
+             {:.1} pages that had no copy, {:.1} pages turned down, {:.1} turned away for the limit on faults, {:.1} results brought back; {:.0} pages looked at, {:.1} KB changed, \
              {:.1} packed structures ({} there), {:.2} ms; {} windows; since the last line {} KB of packed structures came and {} of them went, \
-             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {}",
+             and pages for constants {}, views written {}, others {}, upload memory {}, faults in all {} (of {})",
             self.pages.len(),
             (self.pages.len() as u64 * PAGE) >> 20,
             self.arenas.len(),
@@ -838,6 +959,7 @@ impl Memory {
             s.uses[1] as f64 / frames,
             s.faults as f64 / frames,
             s.unknown as f64 / frames,
+            s.starved as f64 / frames,
             s.back as f64 / frames,
             s.looked as f64 / frames,
             s.changed as f64 / 1024.0 / frames,
@@ -851,8 +973,10 @@ impl Memory {
             s.came[1],
             s.came[2],
             s.came[3],
-            self.faulted
+            self.faulted,
+            fault_limit()
         );
+        crate::sizes::report();
         self.stats.from = Some((now, self.frame));
     }
 }
@@ -861,14 +985,17 @@ impl Memory {
 const SIZES: usize = usize::MAX - (9 << 33);
 
 /// Whether a submission that asks for the sizes of structures is waited for,
-/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
+/// and landed, before the title goes on (`VICTORY_BVH_SIZES=wait` or
+/// `VICTORY_BVH_SIZES_WAIT=1`; off), and what else is done about the sizes:
+/// see [`crate::sizes`].
 ///
-/// Off: it does not help. In run light-15, with it, 33 of 154 copies had the
-/// slot's old size still (all of them recorded one frame after the size was
+/// Wait alone: it did not help. In run light-15, with it, 33 of 154 copies had
+/// the slot's old size still (all of them recorded one frame after the size was
 /// asked for) against 53 of 230 in light-11, 48 of 275 dynamic structures
 /// were good, and the title asks in every frame, so every frame waits (109 ms
 /// against 90). The title reads the slot before our submission of the asking
-/// list is through, or reads it for another purpose; not known.
+/// list is through, or reads it for another purpose; not known. The counts of
+/// [`crate::sizes::report`] (`wait_landed`, `wait_unchanged`) say which.
 ///
 /// The title asks for a new structure's compacted size (a program of one
 /// thread stores it into a small buffer), reads it a frame or two later
@@ -879,8 +1006,7 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// asked for two frames earlier and landed in that frame, none of those with
 /// the right size.
 fn sizes_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
+    crate::sizes::mode().on()
 }
 
 /// Whether a dispatch of the builder is its program of a structure's size:
@@ -979,6 +1105,7 @@ pub(crate) fn ready(
         m.take_faults();
         m.look_again();
         m.report();
+        crate::sizes::look(frame);
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
     }
@@ -988,7 +1115,14 @@ pub(crate) fn ready(
     }
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
-        list.first_use(SIZES);
+        // (`asks_size`: the structure's address in the first two constants, what to store in the third.)
+        let wait = match *constants {
+            [low, high, 1, ..] => crate::sizes::asked(frame, u64::from(low) | u64::from(high) << 32, written[0]),
+            _ => crate::sizes::mode() == crate::sizes::Mode::Wait,
+        };
+        if wait {
+            list.first_use(SIZES);
+        }
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
@@ -1043,7 +1177,7 @@ pub(crate) fn ready(
                 }
                 m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
             }
-            list.defer_host(move || {
+            list.defer_host(crate::host::relax::Kind::MemoryLanded, move || {
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     m.land(at);
                 }
@@ -1352,6 +1486,21 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+    }
+
+    #[test]
+    fn the_fault_limit_is_a_number_of_pages() {
+        assert_eq!(fault_limit_from(None), FAULTS_ALL);
+        assert_eq!(fault_limit_from(Some("2048")), 2048);
+        assert_eq!(fault_limit_from(Some(" 100 ")), 100);
+        assert_eq!(fault_limit_from(Some("many")), FAULTS_ALL);
+        assert_eq!(fault_limit_from(Some("")), FAULTS_ALL);
+        // The limit is on the whole run: a page found empty is taken while both it and the frame's have room.
+        assert!(takes_fault(0, 0, 8192));
+        assert!(takes_fault(FAULTS - 1, 8191, 8192));
+        assert!(!takes_fault(FAULTS, 0, 8192));
+        assert!(!takes_fault(0, 8192, 8192));
+        assert!(!takes_fault(0, 0, 0));
     }
 
     #[test]

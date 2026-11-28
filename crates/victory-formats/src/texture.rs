@@ -14,7 +14,10 @@
 //! `GetMipTailDim`, `GetMaxNumMipsInTail`, `HwlComputeSurfaceInfoLinear`,
 //! `ComputeSurfaceAddrFromCoordMacroTiled`), and the 256-byte micro tile
 //! patterns in `MICRO` from `gfx10SwizzlePattern.h` (the RB+ tables, as on
-//! RDNA2). addrlib carries this notice:
+//! RDNA2). The modes with pipe and bank XOR (`_T`, `_X`) also XOR bits of the
+//! block's own coordinates and of the slice into the pipe and bank bits of the
+//! address, by a pattern that depends on the GPU's pipes and packers ([`Gpu`]);
+//! those patterns are in `xor_patterns.rs`. addrlib carries this notice:
 //!
 //! Copyright (C) 2007-2026 Advanced Micro Devices, Inc. All rights reserved.
 //! SPDX-License-Identifier: MIT
@@ -31,10 +34,24 @@
 //! EXPRESS OR IMPLIED.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crate::xor_patterns as xp;
 
 /// A swizzle mode, by its hardware number (addrlib's `ADDR_SW_*` order).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Swizzle(pub u32);
+
+/// The number and the mode's name, so a log of a description says which
+/// mode it was.
+impl std::fmt::Debug for Swizzle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Swizzle")
+            .field(&self.0)
+            .field(&format_args!("{}", self.name()))
+            .finish()
+    }
+}
 
 impl Swizzle {
     pub const LINEAR: Swizzle = Swizzle(0);
@@ -66,6 +83,30 @@ impl Swizzle {
         })
     }
 
+    /// The mode's name in addrlib (`SW_64KB_R_X`), `SW_?` for a number
+    /// GFX10 has no mode for.
+    pub fn name(self) -> &'static str {
+        match self.0 {
+            0 => "SW_LINEAR",
+            1 => "SW_256B_S",
+            2 => "SW_256B_D",
+            5 => "SW_4KB_S",
+            6 => "SW_4KB_D",
+            9 => "SW_64KB_S",
+            10 => "SW_64KB_D",
+            17 => "SW_64KB_S_T",
+            18 => "SW_64KB_D_T",
+            21 => "SW_4KB_S_X",
+            22 => "SW_4KB_D_X",
+            23 => "SW_4KB_R_X",
+            24 => "SW_64KB_Z_X",
+            25 => "SW_64KB_S_X",
+            26 => "SW_64KB_D_X",
+            27 => "SW_64KB_R_X",
+            _ => "SW_?",
+        }
+    }
+
     fn standard(self) -> bool {
         matches!(self.0, 1 | 5 | 9 | 17 | 21 | 25)
     }
@@ -82,6 +123,68 @@ impl Swizzle {
     /// GPU's pipe configuration.
     pub fn xor(self) -> bool {
         self.0 >= 16
+    }
+}
+
+/// The GPU's tile configuration: how many pipes and packers its
+/// `GB_ADDR_CONFIG` names. The XOR modes' addresses depend on it (the other
+/// modes' do not); addrlib has patterns for the RB+ chips' combinations
+/// (`pipes` from `packers` to 4 times `packers`, up to 64 pipes).
+///
+/// shortcut: the console's own values are not known from a source we can
+/// check. A Series X is a half of a Navi 21 (4 shader arrays, 8 RB+: 8 pipes,
+/// 4 packers) and a Series S a half again (4 pipes, 2 packers), which is what
+/// [`Gpu::SERIES_X`] and [`Gpu::SERIES_S`] say. A title whose own code tiles
+/// by the hardware's equations would need the right ones; the XG calls the
+/// title makes here and the read-backs use the same [`Layout`], so they
+/// agree with each other either way. `VICTORY_TILE_GPU=pipes,packers`
+/// (victory-gpu) tries another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Gpu {
+    /// Index into the table of GPUs (`xor_patterns.rs`).
+    index: u8,
+}
+
+impl Gpu {
+    pub const SERIES_X: Gpu = Gpu { index: 7 };
+    pub const SERIES_S: Gpu = Gpu { index: 4 };
+
+    /// From log2 of the pipes and log2 of the packers; `None` when addrlib
+    /// has no pattern for that pair.
+    pub fn new(pipes_log2: u32, packers_log2: u32) -> Option<Gpu> {
+        let index = xp::GPUS
+            .iter()
+            .position(|&(p, k)| u32::from(p) == pipes_log2 && u32::from(k) == packers_log2)?;
+        Some(Gpu { index: index as u8 })
+    }
+
+    /// From counts (powers of two): `Gpu::from_counts(8, 4)` is a Series X's.
+    pub fn from_counts(pipes: u32, packers: u32) -> Option<Gpu> {
+        let log2 = |n: u32| n.is_power_of_two().then_some(n.trailing_zeros());
+        Gpu::new(log2(pipes)?, log2(packers)?)
+    }
+
+    pub fn pipes_log2(self) -> u32 {
+        u32::from(xp::GPUS[self.index as usize].0)
+    }
+
+    pub fn packers_log2(self) -> u32 {
+        u32::from(xp::GPUS[self.index as usize].1)
+    }
+}
+
+static DEFAULT_GPU: AtomicU8 = AtomicU8::new(Gpu::SERIES_X.index);
+
+/// Sets the GPU [`Layout::new`] takes: before the title starts.
+pub fn set_gpu(gpu: Gpu) {
+    DEFAULT_GPU.store(gpu.index, Ordering::Relaxed);
+}
+
+/// The GPU [`Layout::new`] takes: a Series X's unless [`set_gpu`] says
+/// another.
+pub fn gpu() -> Gpu {
+    Gpu {
+        index: DEFAULT_GPU.load(Ordering::Relaxed),
     }
 }
 
@@ -176,9 +279,21 @@ pub struct Layout {
     /// The first mip in the tail; `mips.len()` without one.
     pub first_tail_mip: u32,
     pub mips: Vec<Mip>,
-    /// Byte offsets inside a block for each coordinate, per axis.
-    /// Empty for linear and unsupported modes.
+    /// Byte offsets inside a block for each coordinate inside the block,
+    /// per axis. Empty for linear and unsupported modes.
     pattern: &'static SwizzlePattern,
+    /// XOR modes: for each axis, the offset bits the block's own coordinate
+    /// (the coordinate divided by the block's size) flips. Empty otherwise.
+    high: &'static SwizzlePattern,
+    /// The GPU the XOR patterns are for.
+    gpu: Gpu,
+    /// The XOR of the surface's pipe and bank bits (from its base address
+    /// on the hardware), already moved to its place in the block.
+    pipe_bank: u32,
+    /// Bytes from the start of a block that no row-dependent bit of the
+    /// offset reaches: a run of columns that long is contiguous whatever
+    /// the row.
+    row_free: u32,
 }
 
 type SwizzlePattern = [Vec<u32>; 3];
@@ -264,7 +379,96 @@ fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static S
         .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
 }
 
+/// The table of `xor_patterns.rs` for a XOR mode, `None` for the modes it
+/// has none for (`SW_4KB_R_X`, and `D`/`D_T` in 3D, which GFX10 lacks).
+fn xor_table(swizzle: Swizzle, three_d: bool) -> Option<usize> {
+    Some(match (swizzle.0, three_d) {
+        (21, false) => 0,
+        (22, false) => 1,
+        (17, false) => 2,
+        (18, false) => 3,
+        (25, false) => 4,
+        (26, false) => 5,
+        (27, _) => 6,
+        (24, _) => 7,
+        (21, true) => 8,
+        (17, true) => 9,
+        (25, true) => 10,
+        (26, true) => 11,
+        _ => return None,
+    })
+}
+
+/// A XOR mode's offset tables: for each axis, the offset of each coordinate
+/// inside the block (`low`, as for the other modes, but XOR-combined with
+/// the other axes' rather than added), and the offset bits the block's own
+/// coordinate flips (`high`, indexed by the coordinate divided by the block's
+/// size, its upper bits ignored: no pattern reaches them).
+struct XorPattern {
+    low: SwizzlePattern,
+    high: SwizzlePattern,
+}
+
+/// The pattern text of `table` (see `xor_patterns.rs`) for one GPU and
+/// element size, as the tables of a block of `block` elements.
+fn xor_pattern(gpu: Gpu, table: usize, element_log2: u32, block: [u32; 3]) -> &'static XorPattern {
+    const LEN: usize = xp::GPUS.len() * xp::TABLES * 5;
+    static PATTERNS: [OnceLock<XorPattern>; LEN] = [const { OnceLock::new() }; LEN];
+    let slot = (gpu.index as usize * xp::TABLES + table) * 5 + element_log2 as usize;
+    PATTERNS[slot].get_or_init(|| {
+        let text = xp::PATTERNS
+            [usize::from(xp::INDEX[gpu.index as usize][table * 5 + element_log2 as usize])];
+        // For each axis and coordinate bit, the offset bits it flips.
+        let mut flips = [[0u32; 16]; 3];
+        for (bit, entry) in text.split(',').enumerate() {
+            let mut chars = entry.bytes().peekable();
+            while let Some(axis) = chars.next() {
+                let axis = match axis {
+                    b'x' => 0,
+                    b'y' => 1,
+                    b'z' => 2,
+                    _ => break,
+                };
+                let mut coordinate = 0usize;
+                while let Some(digit) = chars.next_if(u8::is_ascii_digit) {
+                    coordinate = coordinate * 10 + usize::from(digit - b'0');
+                }
+                flips[axis][coordinate] |= 1 << bit;
+            }
+        }
+        let mut low: SwizzlePattern = Default::default();
+        let mut high: SwizzlePattern = Default::default();
+        for axis in 0..3 {
+            let below = block[axis].trailing_zeros() as usize;
+            low[axis] = (0..1usize << below)
+                .map(|c| {
+                    (0..below)
+                        .filter(|b| (c >> b) & 1 != 0)
+                        .fold(0, |all, b| all ^ flips[axis][b])
+                })
+                .collect();
+            let above = flips[axis]
+                .iter()
+                .rposition(|&f| f != 0)
+                .map_or(0, |last| last + 1);
+            let above = above.saturating_sub(below);
+            high[axis] = (0..1usize << above)
+                .map(|v| {
+                    (0..above)
+                        .filter(|j| (v >> j) & 1 != 0)
+                        .fold(0, |all, j| all ^ flips[axis][below + j])
+                })
+                .collect();
+        }
+        XorPattern { low, high }
+    })
+}
+
 const MAX_MIPS: u32 = 16;
+
+/// addrlib's `ColumnBits` and `BankBits`: pipe-bank XOR bits above the pipes.
+const COLUMN_BITS: u32 = 2;
+const BANK_BITS: u32 = 4;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
 /// GFX10's image descriptors hold at most 16384 texels per side, so no
@@ -279,7 +483,13 @@ const BLOCK_256_3D: [[u32; 3]; 5] = [[8, 4, 8], [4, 4, 8], [4, 4, 4], [4, 2, 4],
 const BLOCK_1K_3D: [[u32; 3]; 5] = [[16, 8, 8], [8, 8, 8], [8, 8, 4], [8, 4, 4], [4, 4, 4]];
 
 impl Layout {
+    /// The layout on the GPU [`gpu`] names.
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
+        Layout::with_gpu(desc, gpu())
+    }
+
+    /// The layout on `gpu` (only the XOR modes differ between GPUs).
+    pub fn with_gpu(desc: &Desc, gpu: Gpu) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
         let valid = (1..=MAX_EXTENT).contains(&d.width)
@@ -302,7 +512,40 @@ impl Layout {
         if block_log2 == 0 {
             Ok(Layout::linear(d))
         } else {
-            Ok(Layout::tiled(d, block_log2))
+            Ok(Layout::tiled(d, block_log2, gpu))
+        }
+    }
+
+    /// The layout of a surface whose base address carries the pipe and bank
+    /// XOR `value` (addrlib's `pipeBankXor`): the XOR modes only, others
+    /// are unchanged. Zero for the 64 KiB-aligned surfaces a title makes.
+    pub fn with_pipe_bank_xor(mut self, value: u32) -> Layout {
+        let block_log2 = self.alignment.trailing_zeros();
+        if self.desc.swizzle.xor() && block_log2 > 8 {
+            let pipes = self.gpu.pipes_log2();
+            let bank_bits = block_log2
+                .saturating_sub(8 + pipes + COLUMN_BITS)
+                .min(BANK_BITS);
+            let mask = ((1 << pipes) - 1) | (((1 << bank_bits) - 1) << (pipes + COLUMN_BITS));
+            self.pipe_bank = ((value & mask) << 8) & ((1 << block_log2) - 1);
+            self.row_free = self.row_free_bytes();
+        }
+        self
+    }
+
+    /// Bytes from the start of a block that no bit of an offset which
+    /// depends on the row (or slice) reaches.
+    fn row_free_bytes(&self) -> u32 {
+        let rows = self.pattern[1]
+            .iter()
+            .chain(&self.pattern[2])
+            .chain(&self.high[1])
+            .chain(&self.high[2])
+            .fold(self.pipe_bank, |all, &bits| all | bits);
+        if rows == 0 {
+            self.alignment as u32
+        } else {
+            1 << rows.trailing_zeros()
         }
     }
 
@@ -341,10 +584,14 @@ impl Layout {
             first_tail_mip: d.mips,
             mips,
             pattern: &EMPTY_PATTERN,
+            high: &EMPTY_PATTERN,
+            gpu: Gpu::SERIES_X,
+            pipe_bank: 0,
+            row_free: 256,
         }
     }
 
-    fn tiled(d: Desc, block_log2: u32) -> Layout {
+    fn tiled(d: Desc, block_log2: u32, gpu: Gpu) -> Layout {
         let element_log2 = d.element_bytes.trailing_zeros();
         let bpe = u64::from(d.element_bytes);
         let block_bytes = 1u64 << block_log2;
@@ -501,18 +748,25 @@ impl Layout {
         let slab = if thick { u64::from(block[2]) } else { 1 };
         let slice_size = slice_size * slab;
         let slices = slices / block[2];
-        let addressable = !d.swizzle.xor() && d.samples == 1;
-        let pattern = if addressable {
+        let (pattern, high) = if d.samples != 1 {
+            (&EMPTY_PATTERN, &EMPTY_PATTERN)
+        } else if !d.swizzle.xor() {
             let kind = if thick {
                 2
             } else {
                 usize::from(d.swizzle.display())
             };
-            shared_pattern(kind, element_log2, block_log2)
+            (
+                shared_pattern(kind, element_log2, block_log2),
+                &EMPTY_PATTERN,
+            )
+        } else if let Some(table) = xor_table(d.swizzle, three_d) {
+            let xor = xor_pattern(gpu, table, element_log2, block);
+            (&xor.low, &xor.high)
         } else {
-            &EMPTY_PATTERN
+            (&EMPTY_PATTERN, &EMPTY_PATTERN)
         };
-        Layout {
+        let mut layout = Layout {
             desc: d,
             block,
             thick,
@@ -523,16 +777,21 @@ impl Layout {
             first_tail_mip,
             mips,
             pattern,
-        }
+            high,
+            gpu,
+            pipe_bank: 0,
+            row_free: 0,
+        };
+        layout.row_free = layout.row_free_bytes();
+        layout
     }
 
     /// Whether [`Layout::offset`] and the copies work for this layout:
-    /// linear and the modes without pipe or bank XOR, single-sampled.
+    /// linear and every tiled mode but `SW_4KB_R_X` (addrlib has no pattern
+    /// for it), single-sampled.
     ///
-    /// shortcut: no addressing for the XOR modes (`_X`, `_T`) and MSAA;
-    /// they need the GPU's pipe and bank configuration (Series X and S
-    /// differ). Titles use them for render targets and depth, which the
-    /// host renders; add them when a title copies into or out of one.
+    /// shortcut: no addressing for MSAA (the sample bits are not in the
+    /// patterns used here).
     pub fn addressable(&self) -> bool {
         self.desc.swizzle == Swizzle::LINEAR || !self.pattern[0].is_empty()
     }
@@ -570,27 +829,66 @@ impl Layout {
             let row = u64::from(y) * u64::from(m.pitch) + u64::from(x);
             return Ok(base + row * u64::from(self.desc.element_bytes));
         }
-        Ok(base + self.row(m, y, z) + self.column(m, x))
+        let (row_blocks, row_bits) = self.row_part(m, y, z, slice);
+        let (column_blocks, column_bits) = self.col_part(m, x);
+        Ok(base + row_blocks + column_blocks + u64::from(row_bits ^ column_bits))
     }
 
-    /// The part of an address that depends on the row (and depth in a
-    /// thick block).
-    fn row(&self, m: &Mip, y: u32, z: u32) -> u64 {
+    /// What the block's own coordinate on `axis` flips in an offset (XOR
+    /// modes; nothing for the others).
+    fn flips(&self, axis: usize, coordinate: u32) -> u32 {
+        let table = &self.high[axis];
+        if table.is_empty() {
+            0
+        } else {
+            table[coordinate as usize & (table.len() - 1)]
+        }
+    }
+
+    /// The part of an address that depends on the row, in a thick block the
+    /// depth inside it, and in the XOR modes the slice: the byte offset of
+    /// the row's blocks, and the offset bits inside a block (which the
+    /// column's are XORed with, they overlap in the XOR modes).
+    fn row_part(&self, m: &Mip, y: u32, z: u32, slice: u32) -> (u64, u32) {
         let [bw, bh, _] = self.block;
         let log2 = self.alignment.trailing_zeros();
         // In the tail the pattern of the shifted position gives the mip's
         // offset inside the tail block.
         let y = y + m.tail.map_or(0, |t| t.y);
-        let blocks = u64::from(y / bh) * u64::from(m.pitch / bw);
-        (blocks << log2) + u64::from(self.pattern[1][(y % bh) as usize] | self.pattern[2][z as usize])
+        let row = y / bh;
+        let blocks = u64::from(row) * u64::from(m.pitch / bw);
+        let bits = self.pattern[1][(y % bh) as usize]
+            ^ self.pattern[2][z as usize]
+            ^ self.flips(1, row)
+            ^ self.flips(2, slice)
+            ^ self.pipe_bank;
+        (blocks << log2, bits)
     }
 
-    /// The part of an address that depends on the column.
-    fn column(&self, m: &Mip, x: u32) -> u64 {
+    /// The part of an address that depends on the column, as
+    /// [`Layout::row_part`].
+    fn col_part(&self, m: &Mip, x: u32) -> (u64, u32) {
         let bw = self.block[0];
         let x = x + m.tail.map_or(0, |t| t.x);
-        (u64::from(x / bw) << self.alignment.trailing_zeros())
-            + u64::from(self.pattern[0][(x % bw) as usize])
+        let column = x / bw;
+        (
+            u64::from(column) << self.alignment.trailing_zeros(),
+            self.pattern[0][(x % bw) as usize] ^ self.flips(0, column),
+        )
+    }
+
+    /// The row's part of an address as one number, for the modes where it
+    /// does not overlap the column's.
+    fn row(&self, m: &Mip, y: u32, z: u32, slice: u32) -> u64 {
+        let (blocks, bits) = self.row_part(m, y, z, slice);
+        blocks + u64::from(bits)
+    }
+
+    /// The column's part of an address as one number: the block's offset
+    /// plus the offset bits inside it.
+    fn column(&self, m: &Mip, x: u32) -> u64 {
+        let (blocks, bits) = self.col_part(m, x);
+        blocks + u64::from(bits)
     }
 
     /// Depth slices a subresource of mip `mip` covers: the mip's depth for
@@ -725,6 +1023,30 @@ impl Layout {
             }
             runs.push((first_tiled, first_linear, bytes - first_linear));
         }
+        // XOR modes: the row's offset bits are XORed into the column's, which
+        // is the same as adding them for the run's bytes only when no row bit
+        // is among the bits that vary inside the run (they sit above the
+        // elements' columns of the micro tile in every pattern, so this
+        // splits nothing but, perhaps, a long run starting off its length).
+        let xor = self.desc.swizzle.xor();
+        let block_mask = self.alignment as usize - 1;
+        if xor {
+            let free = self.row_free as usize;
+            let mut split = Vec::with_capacity(runs.len());
+            for &(column, at, len) in &runs {
+                let span = len.next_power_of_two();
+                if span <= free && (column & block_mask).is_multiple_of(span) {
+                    split.push((column, at, len));
+                } else {
+                    split.extend(
+                        (0..len)
+                            .step_by(n)
+                            .map(|k| (column + k, at + k, n.min(len - k))),
+                    );
+                }
+            }
+            runs = split;
+        }
         // A mip can end partway through the last run. Check the other runs
         // once so each row can copy them as fixed-size chunks.
         let (body, last) = runs.split_at(runs.len().saturating_sub(1));
@@ -740,8 +1062,16 @@ impl Layout {
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
+                } else if xor {
+                    let (blocks, bits) = self.row_part(m, y, inner, s);
+                    let row = (base + blocks) as usize;
+                    for &(column, at, len) in &runs {
+                        let tiled =
+                            row + (column & !block_mask) + ((column & block_mask) ^ bits as usize);
+                        copy_run::<DETILE>(src, dst, tiled, linear_row + at, len);
+                    }
                 } else {
-                    let tiled_row = (base + self.row(m, y, inner)) as usize;
+                    let tiled_row = (base + self.row(m, y, inner, s)) as usize;
                     match chunk_size {
                         Some(8) if tiled_row.is_multiple_of(8) => {
                             copy_runs::<8, DETILE>(src, dst, body, tiled_row, linear_row)
@@ -1039,44 +1369,351 @@ mod tests {
             },
         ];
         for d in cases {
-            let l = Layout::new(&d).unwrap();
-            let mut seen = vec![false; l.size as usize];
-            let mut tiled = vec![0u8; l.size as usize];
-            let n = d.element_bytes as usize;
-            let slices = if d.dimension == Dimension::Tex3d { 1 } else { d.depth };
-            for slice in 0..slices {
-                for mip in 0..d.mips {
-                    let m = l.mips[mip as usize];
-                    let active = m.width as usize * n;
-                    let row = active + 13;
-                    let plane = row * m.height as usize + 11;
-                    let linear: Vec<u8> = (0..plane * m.depth as usize)
-                        .map(|i| (i * 7 + mip as usize * 13 + slice as usize) as u8)
-                        .collect();
-                    l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
-                    let mut back = vec![0xcc; linear.len()];
-                    l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
-                    for z in 0..m.depth {
-                        let base = z as usize * plane;
-                        for y in 0..m.height {
-                            let start = base + y as usize * row;
-                            assert_eq!(back[start..start + active], linear[start..start + active]);
-                            assert!(back[start + active..start + row].iter().all(|&b| b == 0xcc));
-                            for x in 0..m.width {
-                                let at = l.offset(mip, x, y, slice + z).unwrap() as usize;
-                                let source = start + x as usize * n;
-                                assert_eq!(tiled[at..at + n], linear[source..source + n]);
-                                assert!(at + n <= seen.len(), "{d:?} mip {mip} outside");
-                                assert!(at.is_multiple_of(n));
-                                assert!(!seen[at], "{d:?} mip {mip} ({x},{y},{z}) twice");
-                                seen[at] = true;
-                            }
+            check_round_trip(&Layout::new(&d).unwrap());
+        }
+    }
+
+    /// Every element has its own place inside the texture, and copies of every subresource
+    /// into and out of tiled memory return the rows and agree with `offset`.
+    fn check_round_trip(l: &Layout) {
+        let d = l.desc;
+        let mut seen = vec![false; l.size as usize];
+        let mut tiled = vec![0u8; l.size as usize];
+        let n = d.element_bytes as usize;
+        let slices = if d.dimension == Dimension::Tex3d {
+            1
+        } else {
+            d.depth
+        };
+        for slice in 0..slices {
+            for mip in 0..d.mips {
+                let m = l.mips[mip as usize];
+                let active = m.width as usize * n;
+                let row = active + 13;
+                let plane = row * m.height as usize + 11;
+                let linear: Vec<u8> = (0..plane * m.depth as usize)
+                    .map(|i| (i * 7 + mip as usize * 13 + slice as usize) as u8)
+                    .collect();
+                l.tile(&mut tiled, mip, slice, &linear, row, plane).unwrap();
+                let mut back = vec![0xcc; linear.len()];
+                l.detile(&tiled, mip, slice, &mut back, row, plane).unwrap();
+                for z in 0..m.depth {
+                    let base = z as usize * plane;
+                    for y in 0..m.height {
+                        let start = base + y as usize * row;
+                        assert_eq!(back[start..start + active], linear[start..start + active]);
+                        assert!(back[start + active..start + row].iter().all(|&b| b == 0xcc));
+                        for x in 0..m.width {
+                            let at = l.offset(mip, x, y, slice + z).unwrap() as usize;
+                            let source = start + x as usize * n;
+                            assert_eq!(tiled[at..at + n], linear[source..source + n]);
+                            assert!(at + n <= seen.len(), "{d:?} mip {mip} outside");
+                            assert!(at.is_multiple_of(n));
+                            assert!(!seen[at], "{d:?} mip {mip} ({x},{y},{z}) twice");
+                            seen[at] = true;
                         }
-                        assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                    }
+                    assert!(
+                        back[base + plane - 11..base + plane]
+                            .iter()
+                            .all(|&b| b == 0xcc)
+                    );
+                }
+            }
+        }
+    }
+
+    const XOR_MODES: [Swizzle; 8] = [
+        Swizzle::SW_64KB_S_T,
+        Swizzle::SW_64KB_D_T,
+        Swizzle::SW_4KB_S_X,
+        Swizzle::SW_4KB_D_X,
+        Swizzle::SW_64KB_Z_X,
+        Swizzle::SW_64KB_S_X,
+        Swizzle::SW_64KB_D_X,
+        Swizzle::SW_64KB_R_X,
+    ];
+
+    /// The XOR modes 3D textures can use (`D_T` and `4KB_D_X` have no 3D pattern).
+    fn has_3d(mode: Swizzle) -> bool {
+        matches!(mode.0, 17 | 21 | 24 | 25 | 26 | 27)
+    }
+
+    /// A small deterministic generator for the random layouts.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u32) -> u32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.0 >> 33) % u64::from(n)) as u32
+        }
+    }
+
+    #[test]
+    fn xor_modes_round_trip_on_random_layouts() {
+        let mut rng = Lcg(0x5eed);
+        let gpus = [Gpu::SERIES_X, Gpu::SERIES_S, Gpu::new(4, 3).unwrap()];
+        for gpu in gpus {
+            for mode in XOR_MODES {
+                for case in 0..5 {
+                    let three_d = has_3d(mode) && rng.below(3) == 0;
+                    let (w, h, depth) = if three_d {
+                        (1 + rng.below(40), 1 + rng.below(40), 1 + rng.below(20))
+                    } else {
+                        (1 + rng.below(150), 1 + rng.below(150), 1 + rng.below(4))
+                    };
+                    let longest = w.max(h).max(if three_d { depth } else { 1 });
+                    let bpe = 1 << rng.below(5);
+                    let d = Desc {
+                        dimension: if three_d {
+                            Dimension::Tex3d
+                        } else {
+                            Dimension::Tex2d
+                        },
+                        width: w,
+                        height: h,
+                        depth,
+                        mips: 1 + rng.below(32 - longest.leading_zeros()),
+                        element_bytes: bpe,
+                        block: if bpe >= 8 && rng.below(3) == 0 { 4 } else { 1 },
+                        samples: 1,
+                        swizzle: mode,
+                    };
+                    let l = Layout::with_gpu(&d, gpu).unwrap();
+                    assert!(l.addressable(), "{d:?}");
+                    check_round_trip(&l);
+                    if case == 1 {
+                        // The base address's XOR only moves elements inside their blocks.
+                        check_round_trip(&l.with_pipe_bank_xor(rng.below(1 << 12)));
                     }
                 }
             }
         }
+    }
+
+    /// Every pattern of every GPU addrlib has one for, in every XOR mode and element size, places
+    /// each element of a small texture (2D with slices, and 3D) in a place of its own.
+    #[test]
+    fn xor_patterns_of_every_gpu_are_bijections() {
+        for index in 0..xp::GPUS.len() {
+            let gpu = Gpu { index: index as u8 };
+            for mode in XOR_MODES {
+                for element_bytes in [1, 2, 4, 8, 16] {
+                    let flat = Desc {
+                        dimension: Dimension::Tex2d,
+                        width: 90,
+                        height: 38,
+                        depth: 3,
+                        mips: 4,
+                        element_bytes,
+                        block: 1,
+                        samples: 1,
+                        swizzle: mode,
+                    };
+                    check_round_trip(&Layout::with_gpu(&flat, gpu).unwrap());
+                    if has_3d(mode) {
+                        let volume = Desc {
+                            dimension: Dimension::Tex3d,
+                            width: 20,
+                            height: 12,
+                            depth: 6,
+                            mips: 3,
+                            ..flat
+                        };
+                        check_round_trip(&Layout::with_gpu(&volume, gpu).unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    // (mode, 3D, bytes per element, texels per element side, [width, height, depth or slices], mips,
+    //  (pipes, packers), (size, first mip in the tail), [(mip, x, y, z, pipe-bank xor, address)])
+    #[rustfmt::skip]
+    type Known = (u32, bool, u32, u32, [u32; 3], u32, (u32, u32), (u64, u32), &'static [(u32, u32, u32, u32, u32, u64)]);
+    #[rustfmt::skip]
+    const ADDRLIB: &[Known] = &[
+        (25, false, 4, 1, [256, 256, 1], 1, (8, 4), (262144, 1), &[(0, 255, 255, 0, 0, 260348), (0, 128, 85, 0, 0, 83024), (0, 58, 48, 0, 0, 14600), (0, 199, 184, 0, 793, 235148), (0, 183, 49, 0, 0, 80796), (0, 247, 137, 0, 747, 216988), (0, 63, 116, 0, 4037, 48332), (0, 215, 173, 0, 0, 237532)]),
+        (25, false, 4, 1, [100, 60, 1], 7, (8, 4), (131072, 1), &[(0, 99, 59, 0, 0, 112188), (0, 50, 20, 0, 0, 76104), (6, 0, 0, 0, 0, 1536), (5, 0, 0, 0, 0, 3072), (2, 20, 13, 0, 0, 19920), (5, 0, 0, 0, 0, 3072), (6, 0, 0, 0, 2480, 42496), (6, 0, 0, 0, 0, 1536)]),
+        (26, false, 8, 1, [300, 200, 1], 9, (8, 4), (1179648, 3), &[(0, 299, 199, 0, 0, 1123000), (0, 150, 66, 0, 3293, 707040), (8, 0, 0, 0, 3173, 25344), (7, 0, 0, 0, 3687, 27392), (5, 2, 0, 0, 0, 8480), (1, 139, 26, 0, 3680, 226472), (6, 3, 2, 0, 0, 4776), (7, 0, 0, 0, 256, 3072)]),
+        (27, false, 4, 1, [1920, 1080, 1], 11, (8, 4), (12648448, 5), &[(0, 1919, 1079, 0, 2191, 12644348), (0, 960, 360, 0, 0, 6255616), (10, 0, 0, 0, 0, 2816), (9, 0, 0, 0, 0, 512), (7, 9, 0, 0, 1428, 43012), (9, 2, 1, 0, 0, 536), (2, 166, 249, 0, 0, 750168), (9, 0, 0, 0, 0, 512)]),
+        (27, false, 16, 1, [64, 64, 1], 7, (8, 4), (131072, 1), &[(0, 63, 63, 0, 0, 129520), (0, 32, 21, 0, 0, 104224), (6, 0, 0, 0, 1899, 11008), (5, 0, 0, 0, 2116, 25600), (6, 0, 0, 0, 2471, 61184), (5, 1, 0, 0, 0, 8208), (4, 3, 1, 0, 0, 880), (0, 42, 8, 0, 0, 123968)]),
+        (24, false, 4, 1, [512, 512, 1], 10, (8, 4), (1441792, 3), &[(0, 511, 511, 0, 0, 1382908), (0, 256, 170, 0, 0, 807968), (9, 0, 0, 0, 0, 4864), (8, 0, 0, 0, 0, 2816), (3, 55, 28, 0, 0, 29908), (2, 85, 75, 0, 0, 119404), (3, 34, 9, 0, 775, 29208), (9, 0, 0, 0, 0, 4864)]),
+        (24, false, 2, 1, [100, 60, 1], 7, (8, 4), (131072, 1), &[(0, 99, 59, 0, 0, 80414), (0, 50, 20, 0, 0, 70984), (6, 0, 0, 0, 0, 256), (5, 0, 0, 0, 0, 5120), (2, 5, 12, 0, 0, 18786), (4, 0, 2, 0, 0, 1040), (1, 34, 14, 0, 2943, 64344), (1, 22, 0, 0, 2241, 17192)]),
+        (17, false, 1, 1, [255, 129, 1], 8, (8, 4), (131072, 1), &[(0, 254, 128, 0, 0, 126734), (0, 127, 43, 0, 0, 76735), (7, 0, 0, 0, 0, 1280), (6, 0, 0, 0, 0, 1536), (6, 2, 1, 0, 3143, 16658), (5, 3, 1, 0, 2486, 43539), (3, 1, 0, 0, 0, 8449), (0, 120, 38, 0, 0, 76648)]),
+        (18, false, 4, 1, [70, 70, 3], 4, (8, 4), (393216, 1), &[(0, 69, 69, 2, 0, 377044), (0, 35, 23, 1, 4, 205244), (3, 0, 0, 0, 0, 8448), (2, 0, 0, 0, 0, 16384), (3, 5, 1, 2, 0, 270676), (1, 13, 0, 1, 0, 164420), (1, 12, 15, 1, 0, 164848), (3, 5, 7, 2, 0, 270836)]),
+        (21, false, 2, 1, [250, 175, 1], 8, (8, 4), (135168, 3), &[(0, 249, 174, 0, 3374, 133858), (0, 125, 58, 0, 0, 59562), (7, 0, 0, 0, 0, 768), (6, 0, 0, 0, 0, 1024), (6, 0, 0, 0, 0, 1024), (2, 56, 7, 0, 3412, 6896), (3, 3, 15, 0, 0, 3446), (0, 248, 119, 0, 0, 100848)]),
+        (22, false, 16, 1, [33, 17, 4], 6, (8, 4), (163840, 3), &[(0, 32, 16, 3, 0, 160768), (0, 16, 5, 2, 0, 102944), (5, 0, 0, 0, 1222, 768), (4, 0, 0, 0, 0, 1536), (2, 6, 3, 1, 927, 45536), (1, 4, 5, 2, 0, 90400), (3, 2, 1, 1, 0, 43104), (3, 0, 0, 1, 2788, 44032)]),
+        (25, false, 4, 1, [128, 128, 7], 4, (8, 4), (917504, 1), &[(0, 127, 127, 6, 499, 858620), (0, 64, 42, 3, 0, 496928), (3, 0, 0, 0, 0, 8448), (2, 0, 0, 0, 0, 16384), (0, 29, 31, 1, 0, 200692), (0, 23, 117, 3, 0, 482524), (1, 49, 14, 4, 0, 568420), (3, 1, 2, 3, 0, 403236)]),
+        (27, false, 8, 1, [77, 91, 33], 3, (8, 4), (6488064, 1), &[(0, 76, 90, 32, 0, 6435776), (0, 38, 30, 16, 0, 3239904), (2, 0, 0, 0, 0, 1024), (1, 0, 0, 0, 0, 33024), (0, 38, 85, 15, 0, 3131504), (2, 15, 9, 7, 0, 1389176), (1, 19, 18, 31, 0, 6129320), (0, 51, 49, 10, 0, 2048824)]),
+        (25, false, 16, 4, [109, 71, 1], 6, (8, 4), (65536, 0), &[(0, 27, 17, 0, 0, 49104), (0, 14, 6, 0, 851, 52384), (5, 0, 0, 0, 0, 1536), (4, 0, 0, 0, 0, 3072), (0, 12, 5, 0, 1328, 44816), (1, 9, 2, 0, 0, 19552), (4, 0, 0, 0, 2695, 35584), (1, 0, 5, 0, 675, 57872)]),
+        (25, true, 4, 1, [64, 32, 16], 7, (8, 4), (262144, 2), &[(0, 63, 31, 15, 0, 261884), (0, 32, 10, 8, 3329, 208672), (6, 0, 0, 0, 3928, 19712), (5, 0, 0, 0, 0, 3584), (0, 54, 23, 3, 2547, 205816), (4, 1, 1, 0, 1592, 13324), (4, 2, 0, 0, 0, 5184), (6, 0, 0, 0, 4064, 60672)]),
+        (26, true, 4, 1, [16, 16, 64], 4, (8, 4), (262144, 0), &[(0, 15, 15, 63, 3716, 228092), (0, 8, 5, 32, 1625, 182024), (3, 0, 0, 0, 3966, 22016), (2, 0, 0, 0, 0, 32768), (3, 0, 0, 0, 0, 12288), (1, 3, 7, 31, 2687, 76028), (3, 1, 1, 7, 0, 14508), (1, 7, 4, 10, 0, 26516)]),
+        (17, true, 1, 1, [33, 17, 40], 6, (8, 4), (262144, 1), &[(0, 32, 16, 39, 0, 246676), (0, 16, 5, 20, 2114, 95624), (5, 0, 0, 0, 0, 3328), (4, 0, 0, 0, 2128, 19968), (3, 0, 1, 4, 0, 5256), (3, 3, 1, 1, 0, 5135), (1, 1, 3, 10, 0, 34105), (3, 0, 1, 1, 0, 5132)]),
+        (21, true, 4, 1, [4, 4, 16], 5, (8, 4), (8192, 0), &[(0, 3, 3, 15, 0, 6908), (0, 2, 1, 8, 2090, 7240), (4, 0, 0, 0, 3416, 0), (3, 0, 0, 0, 329, 0), (3, 0, 0, 0, 640, 256), (2, 0, 0, 2, 0, 640), (1, 1, 0, 6, 0, 1924), (0, 0, 0, 6, 0, 2176)]),
+        (27, true, 4, 1, [64, 64, 32], 6, (8, 4), (2097152, 0), &[(0, 63, 63, 31, 0, 2064124), (0, 32, 21, 16, 0, 1074832), (5, 0, 0, 0, 0, 2816), (4, 0, 0, 0, 235, 57600), (3, 5, 6, 1, 2290, 123620), (2, 3, 13, 0, 2612, 4252), (2, 1, 15, 2, 0, 145076), (4, 3, 3, 1, 0, 67132)]),
+        (24, true, 4, 1, [32, 32, 32], 6, (8, 4), (2097152, 0), &[(0, 31, 31, 31, 0, 2055932), (0, 16, 10, 16, 0, 1069856), (5, 0, 0, 0, 0, 2816), (4, 0, 0, 0, 374, 25600), (1, 7, 5, 4, 0, 295388), (0, 31, 26, 10, 0, 678516), (2, 7, 6, 2, 0, 141044), (5, 0, 0, 0, 0, 2816)]),
+        (25, false, 4, 1, [256, 256, 1], 1, (4, 2), (262144, 1), &[(0, 255, 255, 0, 0, 261372), (0, 128, 85, 0, 0, 83536), (0, 150, 60, 0, 930, 113864), (0, 228, 227, 0, 0, 258224), (0, 19, 193, 0, 0, 149788), (0, 244, 137, 0, 0, 239760), (0, 58, 28, 0, 0, 11336), (0, 39, 121, 0, 0, 30620)]),
+        (25, false, 4, 1, [100, 60, 1], 7, (4, 2), (131072, 1), &[(0, 99, 59, 0, 0, 112444), (0, 50, 20, 0, 0, 77640), (6, 0, 0, 0, 0, 1024), (5, 0, 0, 0, 0, 2304), (1, 44, 7, 0, 0, 41712), (4, 1, 0, 0, 897, 37124), (2, 12, 11, 0, 3625, 25264), (5, 2, 0, 0, 0, 2312)]),
+        (26, false, 8, 1, [300, 200, 1], 9, (4, 2), (1179648, 3), &[(0, 299, 199, 0, 0, 1123256), (0, 150, 66, 0, 0, 657888), (8, 0, 0, 0, 0, 1024), (7, 0, 0, 0, 0, 2304), (8, 0, 0, 0, 1647, 26368), (4, 10, 3, 0, 0, 17072), (0, 55, 108, 0, 0, 618088), (3, 18, 1, 0, 0, 35120)]),
+        (27, false, 4, 1, [1920, 1080, 1], 11, (4, 2), (12648448, 5), &[(0, 1919, 1079, 0, 1465, 12641532), (0, 960, 360, 0, 0, 6248704), (10, 0, 0, 0, 0, 1792), (9, 0, 0, 0, 2493, 45824), (3, 198, 1, 0, 0, 245848), (6, 16, 10, 0, 0, 35360), (7, 1, 5, 0, 0, 4500), (4, 14, 63, 0, 0, 77560)]),
+        (27, false, 16, 1, [64, 64, 1], 7, (4, 2), (131072, 1), &[(0, 63, 63, 0, 0, 130544), (0, 32, 21, 0, 0, 84512), (6, 0, 0, 0, 3548, 50176), (5, 0, 0, 0, 3863, 13056), (2, 14, 10, 0, 0, 46528), (1, 16, 15, 0, 3288, 35744), (2, 6, 6, 0, 0, 36288), (2, 12, 10, 0, 571, 34432)]),
+        (24, false, 4, 1, [512, 512, 1], 10, (4, 2), (1441792, 3), &[(0, 511, 511, 0, 0, 1379836), (0, 256, 170, 0, 0, 805152), (9, 0, 0, 0, 0, 2816), (8, 0, 0, 0, 0, 1792), (4, 18, 17, 0, 0, 33048), (6, 7, 4, 0, 0, 8660), (5, 9, 12, 0, 3691, 32388), (9, 0, 0, 0, 0, 2816)]),
+        (24, false, 2, 1, [100, 60, 1], 7, (4, 2), (131072, 1), &[(0, 99, 59, 0, 0, 81694), (0, 50, 20, 0, 0, 67656), (6, 0, 0, 0, 0, 256), (5, 0, 0, 0, 0, 2304), (1, 16, 11, 0, 0, 17940), (6, 0, 0, 0, 0, 256), (3, 11, 4, 0, 0, 4298), (2, 21, 5, 0, 0, 33382)]),
+        (17, false, 1, 1, [255, 129, 1], 8, (4, 2), (131072, 1), &[(0, 254, 128, 0, 0, 125710), (0, 127, 43, 0, 0, 77247), (7, 0, 0, 0, 2728, 42752), (6, 0, 0, 0, 0, 1024), (2, 60, 11, 0, 0, 19388), (1, 3, 16, 0, 3797, 20483), (7, 0, 0, 0, 1271, 62464), (3, 30, 1, 0, 0, 8734)]),
+        (18, false, 4, 1, [70, 70, 3], 4, (4, 2), (393216, 1), &[(0, 69, 69, 2, 0, 377044), (0, 35, 23, 1, 0, 206524), (3, 0, 0, 0, 3969, 41216), (2, 0, 0, 0, 0, 16384), (1, 9, 3, 1, 0, 164404), (0, 38, 61, 1, 0, 210904), (1, 23, 23, 2, 304, 311292), (2, 12, 4, 2, 1692, 316096)]),
+        (21, false, 2, 1, [250, 175, 1], 8, (4, 2), (135168, 3), &[(0, 249, 174, 0, 0, 133858), (0, 125, 58, 0, 0, 60586), (7, 0, 0, 0, 0, 768), (6, 0, 0, 0, 0, 1536), (2, 40, 1, 0, 3375, 6800), (2, 22, 1, 0, 630, 4124), (3, 10, 14, 0, 0, 2276), (0, 110, 34, 0, 0, 59820)]),
+        (22, false, 16, 1, [33, 17, 4], 6, (4, 2), (163840, 3), &[(0, 32, 16, 3, 0, 160256), (0, 16, 5, 2, 1150, 103200), (5, 0, 0, 0, 0, 1792), (4, 0, 0, 0, 0, 1024), (5, 0, 0, 0, 194, 1280), (2, 4, 3, 1, 0, 45216), (2, 3, 3, 2, 0, 86256), (5, 0, 0, 0, 0, 1792)]),
+        (25, false, 4, 1, [128, 128, 7], 4, (4, 2), (917504, 1), &[(0, 127, 127, 6, 0, 916732), (0, 64, 42, 3, 0, 496416), (3, 0, 0, 0, 1216, 57344), (2, 0, 0, 0, 1941, 53504), (3, 9, 1, 5, 0, 663572), (0, 8, 12, 4, 249, 651840), (0, 48, 91, 6, 0, 880176), (0, 110, 104, 6, 3048, 856968)]),
+        (27, false, 8, 1, [77, 91, 33], 3, (4, 2), (6488064, 1), &[(0, 76, 90, 32, 2427, 6449344), (0, 38, 30, 16, 1512, 3266272), (2, 0, 0, 0, 2966, 4864), (1, 0, 0, 0, 0, 16384), (1, 31, 12, 31, 3559, 6143848), (1, 6, 39, 32, 0, 6342128), (0, 57, 39, 23, 0, 4631704), (2, 6, 0, 18, 3376, 3584352)]),
+        (25, false, 16, 4, [109, 71, 1], 6, (4, 2), (65536, 0), &[(0, 27, 17, 0, 1220, 31184), (0, 14, 6, 0, 0, 35488), (5, 0, 0, 0, 0, 1024), (4, 0, 0, 0, 0, 2304), (4, 0, 0, 0, 3410, 23296), (0, 22, 16, 0, 0, 45696), (4, 0, 0, 0, 1634, 27392), (4, 0, 0, 0, 0, 2304)]),
+        (25, true, 4, 1, [64, 32, 16], 7, (4, 2), (262144, 2), &[(0, 63, 31, 15, 0, 262140), (0, 32, 10, 8, 1614, 223520), (6, 0, 0, 0, 0, 2816), (5, 0, 0, 0, 0, 2048), (0, 10, 9, 8, 0, 145992), (2, 0, 3, 2, 0, 32936), (5, 1, 0, 0, 0, 2052), (2, 7, 6, 2, 0, 33764)]),
+        (26, true, 4, 1, [16, 16, 64], 4, (4, 2), (262144, 0), &[(0, 15, 15, 63, 0, 261884), (0, 8, 5, 32, 0, 165384), (3, 0, 0, 0, 0, 12288), (2, 0, 0, 0, 0, 32768), (0, 4, 9, 55, 0, 211624), (2, 1, 1, 11, 0, 49324), (3, 1, 1, 0, 0, 12300), (3, 0, 1, 3, 0, 12456)]),
+        (17, true, 1, 1, [33, 17, 40], 6, (4, 2), (262144, 1), &[(0, 32, 16, 39, 1660, 241812), (0, 16, 5, 20, 2660, 86408), (5, 0, 0, 0, 0, 2816), (4, 0, 0, 0, 0, 2048), (1, 8, 7, 0, 3762, 12584), (4, 0, 0, 1, 0, 2052), (4, 0, 0, 0, 0, 2048), (3, 1, 0, 1, 736, 61701)]),
+        (21, true, 4, 1, [4, 4, 16], 5, (4, 2), (8192, 0), &[(0, 3, 3, 15, 483, 7932), (0, 2, 1, 8, 0, 6984), (4, 0, 0, 0, 0, 0), (3, 0, 0, 0, 3342, 768), (4, 0, 0, 0, 0, 0), (0, 0, 1, 3, 1173, 2968), (3, 0, 0, 0, 0, 256), (1, 1, 0, 4, 0, 1284)]),
+        (27, true, 4, 1, [64, 64, 32], 6, (4, 2), (2097152, 0), &[(0, 63, 63, 31, 0, 2064380), (0, 32, 21, 16, 0, 1069712), (5, 0, 0, 0, 0, 1792), (4, 0, 0, 0, 0, 512), (3, 2, 6, 0, 0, 8616), (2, 14, 0, 5, 0, 333640), (3, 1, 5, 3, 0, 205716), (0, 18, 18, 0, 0, 16680)]),
+        (24, true, 4, 1, [32, 32, 32], 6, (4, 2), (2097152, 0), &[(0, 31, 31, 31, 0, 2052092), (0, 16, 10, 16, 0, 1067552), (5, 0, 0, 0, 0, 1792), (4, 0, 0, 0, 0, 512), (4, 0, 1, 1, 1903, 90888), (1, 7, 8, 9, 1137, 654164), (4, 0, 0, 1, 0, 65536), (5, 0, 0, 0, 0, 1792)]),
+        (25, false, 4, 1, [256, 256, 1], 1, (16, 8), (262144, 1), &[(0, 255, 255, 0, 0, 258300), (0, 128, 85, 0, 0, 83536), (0, 3, 115, 0, 0, 24124), (0, 18, 32, 0, 0, 4104)]),
+        (27, false, 4, 1, [1920, 1080, 1], 11, (16, 8), (12648448, 5), &[(0, 1919, 1079, 0, 0, 12605948), (0, 960, 360, 0, 0, 6252800), (10, 0, 0, 0, 0, 4864), (9, 0, 0, 0, 1813, 1792)]),
+        (24, false, 2, 1, [100, 60, 1], 7, (16, 8), (131072, 1), &[(0, 99, 59, 0, 0, 80670), (0, 50, 20, 0, 0, 67912), (6, 0, 0, 0, 0, 256), (5, 0, 0, 0, 0, 2048)]),
+        (21, false, 2, 1, [250, 175, 1], 8, (16, 8), (135168, 3), &[(0, 249, 174, 0, 0, 132834), (0, 125, 58, 0, 0, 58282), (7, 0, 0, 0, 2967, 1024), (6, 0, 0, 0, 364, 2048)]),
+        (27, false, 8, 1, [77, 91, 33], 3, (16, 8), (6488064, 1), &[(0, 76, 90, 32, 0, 6451136), (0, 38, 30, 16, 0, 3234784), (2, 0, 0, 0, 0, 1024), (1, 0, 0, 0, 2141, 51456)]),
+        (26, true, 4, 1, [16, 16, 64], 4, (16, 8), (262144, 0), &[(0, 15, 15, 63, 0, 261884), (0, 8, 5, 32, 0, 165384), (3, 0, 0, 0, 0, 12288), (2, 0, 0, 0, 3796, 17408)]),
+        (27, true, 4, 1, [64, 64, 32], 6, (16, 8), (2097152, 0), &[(0, 63, 63, 31, 0, 2062332), (0, 32, 21, 16, 0, 1068944), (5, 0, 0, 0, 0, 4864), (4, 0, 0, 0, 0, 512)]),
+        (25, false, 4, 1, [256, 256, 1], 1, (2, 1), (262144, 1), &[(0, 255, 255, 0, 0, 261884), (0, 128, 85, 0, 0, 83024), (0, 137, 113, 0, 0, 87828), (0, 139, 178, 0, 0, 202540)]),
+        (27, false, 16, 1, [64, 64, 1], 7, (2, 1), (131072, 1), &[(0, 63, 63, 0, 0, 130800), (0, 32, 21, 0, 0, 91424), (6, 0, 0, 0, 0, 2560), (5, 0, 0, 0, 0, 4096)]),
+        (18, false, 4, 1, [70, 70, 3], 4, (2, 1), (393216, 1), &[(0, 69, 69, 2, 0, 377044), (0, 35, 23, 1, 0, 206012), (3, 0, 0, 0, 0, 8192), (2, 0, 0, 0, 0, 16384)]),
+        (27, false, 8, 1, [77, 91, 33], 3, (2, 1), (6488064, 1), &[(0, 76, 90, 32, 0, 6434240), (0, 38, 30, 16, 0, 3226592), (2, 0, 0, 0, 0, 32768), (1, 0, 0, 0, 0, 16384)]),
+        (17, true, 1, 1, [33, 17, 40], 6, (2, 1), (262144, 1), &[(0, 32, 16, 39, 0, 245908), (0, 16, 5, 20, 0, 78216), (5, 0, 0, 0, 3752, 8448), (4, 0, 0, 0, 282, 4864)]),
+        (25, false, 4, 1, [100, 60, 1], 7, (32, 8), (131072, 1), &[(0, 99, 59, 0, 0, 106812), (0, 50, 20, 0, 0, 80968), (6, 0, 0, 0, 738, 33792)]),
+        (24, false, 2, 1, [100, 60, 1], 7, (32, 8), (131072, 1), &[(0, 99, 59, 0, 0, 80670), (0, 50, 20, 0, 0, 67912), (6, 0, 0, 0, 2288, 37120)]),
+        (25, false, 4, 1, [128, 128, 7], 4, (32, 8), (917504, 1), &[(0, 127, 127, 6, 0, 913404), (0, 64, 42, 3, 2810, 464672), (3, 0, 0, 0, 1551, 16128)]),
+        (17, true, 1, 1, [33, 17, 40], 6, (32, 8), (262144, 1), &[(0, 32, 16, 39, 0, 252052), (0, 16, 5, 20, 1640, 76168), (5, 0, 0, 0, 0, 2304)]),
+    ];
+
+    /// Sizes and addresses of the XOR modes against the reference implementation (addrlib,
+    /// built from Mesa's copy and run for these textures and GPUs).
+    #[test]
+    fn xor_modes_match_addrlib() {
+        for &(
+            mode,
+            three_d,
+            element_bytes,
+            block,
+            [width, height, depth],
+            mips,
+            (pipes, packers),
+            expected,
+            points,
+        ) in ADDRLIB
+        {
+            let d = Desc {
+                dimension: if three_d {
+                    Dimension::Tex3d
+                } else {
+                    Dimension::Tex2d
+                },
+                width,
+                height,
+                depth,
+                mips,
+                element_bytes,
+                block,
+                samples: 1,
+                swizzle: Swizzle(mode),
+            };
+            let gpu = Gpu::from_counts(pipes, packers).unwrap();
+            let l = Layout::with_gpu(&d, gpu).unwrap();
+            let name = format!(
+                "{} {d:?} on {pipes} pipes and {packers} packers",
+                d.swizzle.name()
+            );
+            assert_eq!((l.size, l.first_tail_mip), expected, "{name}");
+            for &(mip, x, y, z, pipe_bank_xor, address) in points {
+                let l = l.clone().with_pipe_bank_xor(pipe_bank_xor);
+                assert_eq!(
+                    l.offset(mip, x, y, z),
+                    Ok(address),
+                    "{name} mip {mip} ({x}, {y}, {z}) xor {pipe_bank_xor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn modes_without_a_pattern_are_refused() {
+        let mut d = desc(64, 64, 1, 4, Swizzle::SW_4KB_R_X);
+        let l = Layout::new(&d).unwrap();
+        assert!(!l.addressable());
+        assert_eq!(l.offset(0, 0, 0, 0), Err(Error::Unsupported));
+        let tiled = vec![0; l.size as usize];
+        assert_eq!(
+            l.detile(&tiled, 0, 0, &mut [0; 1024], 256, 0),
+            Err(Error::Unsupported)
+        );
+        // Multisampled XOR modes have sample bits in their patterns, ours have none.
+        d.swizzle = Swizzle::SW_64KB_R_X;
+        d.samples = 4;
+        assert_eq!(
+            Layout::new(&d).unwrap().offset(0, 0, 0, 0),
+            Err(Error::Unsupported)
+        );
+        assert_eq!(Swizzle::SW_64KB_R_X.name(), "SW_64KB_R_X");
+        assert_eq!(Swizzle::SW_64KB_S_T.name(), "SW_64KB_S_T");
+        assert_eq!(Swizzle::LINEAR.name(), "SW_LINEAR");
+        assert_eq!(Swizzle(3).name(), "SW_?");
+    }
+
+    #[test]
+    fn gpus_are_named_by_their_pipes_and_packers() {
+        assert_eq!(
+            (Gpu::SERIES_X.pipes_log2(), Gpu::SERIES_X.packers_log2()),
+            (3, 2)
+        );
+        assert_eq!(
+            (Gpu::SERIES_S.pipes_log2(), Gpu::SERIES_S.packers_log2()),
+            (2, 1)
+        );
+        assert_eq!(Gpu::from_counts(8, 4), Some(Gpu::SERIES_X));
+        assert_eq!(Gpu::from_counts(4, 2), Some(Gpu::SERIES_S));
+        assert_eq!(Gpu::from_counts(6, 4), None);
+        assert_eq!(Gpu::from_counts(2, 8), None);
+        assert_eq!(Gpu::new(7, 4), None);
+        for &(pipes, packers) in &xp::GPUS {
+            let gpu = Gpu::new(u32::from(pipes), u32::from(packers)).unwrap();
+            assert_eq!(
+                (gpu.pipes_log2(), gpu.packers_log2()),
+                (u32::from(pipes), u32::from(packers))
+            );
+        }
+    }
+
+    /// The XOR modes differ between GPUs (the other modes do not), and a surface 64 KiB-aligned
+    /// has no pipe-bank XOR of its own.
+    #[test]
+    fn only_xor_modes_depend_on_the_gpu() {
+        let at = |mode, gpu| {
+            let l = Layout::with_gpu(&desc(256, 256, 1, 4, mode), gpu).unwrap();
+            (0..256)
+                .map(|i| l.offset(0, i, 255 - i, 0).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            at(Swizzle::SW_64KB_S, Gpu::SERIES_X),
+            at(Swizzle::SW_64KB_S, Gpu::SERIES_S)
+        );
+        assert_ne!(
+            at(Swizzle::SW_64KB_S_X, Gpu::SERIES_X),
+            at(Swizzle::SW_64KB_S_X, Gpu::SERIES_S)
+        );
+        let l = Layout::new(&desc(256, 256, 1, 4, Swizzle::SW_64KB_S_X)).unwrap();
+        assert_eq!(l, l.clone().with_pipe_bank_xor(0));
+        assert_ne!(l, l.clone().with_pipe_bank_xor(0x2a5));
+        let plain = Layout::new(&desc(256, 256, 1, 4, Swizzle::SW_64KB_S)).unwrap();
+        assert_eq!(plain, plain.clone().with_pipe_bank_xor(0x2a5));
     }
 
     #[test]
@@ -1379,7 +2016,8 @@ mod tests {
         assert_eq!(t.planes[0].layout.size, 1920 * 1152 * 4);
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
-        assert!(!t.planes[0].layout.addressable());
+        // Z_X is a XOR mode: both planes have addresses.
+        assert!(t.planes.iter().all(|p| p.layout.addressable()));
     }
 
     #[test]

@@ -29,7 +29,7 @@
 
 use super::*;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::replay;
@@ -56,7 +56,7 @@ pub(crate) fn on() -> bool {
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
 }
 
 /// What a title list keeps: the recording being written and the words of it
@@ -96,6 +96,7 @@ impl Front {
         self.closed = false;
         self.submitted = false;
         self.priced.clear();
+        crate::pipeline::ahead(pipeline);
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -188,6 +189,42 @@ fn is_draw(op: u64) -> bool {
         || op == Plain::EXECUTE_INDIRECT as u64
 }
 
+/// What a call does to the title's waits for shader writes that are held
+/// (`VICTORY_PRECISE_BARRIERS`, [`super::lazy`]). Only what is named here sets state
+/// without recording work that reads or writes memory; a call that is not named is
+/// opaque, and so is one added to the list of calls later and forgotten here.
+fn class(op: u64) -> super::lazy::Class {
+    use super::lazy::Class;
+    const QUIET: [u64; 12] = [
+        Plain::TOPOLOGY as u64,
+        Plain::STENCIL_REF as u64,
+        Plain::DEPTH_BOUNDS as u64,
+        Plain::COMPUTE_TABLE as u64,
+        Plain::GRAPHICS_TABLE as u64,
+        Plain::COMPUTE_CONSTANT as u64,
+        Plain::GRAPHICS_CONSTANT as u64,
+        Plain::COMPUTE_VIEW as u64,
+        Plain::GRAPHICS_VIEW as u64,
+        Plain::SET_PIPELINE as u64,
+        Plain::WRITE32 as u64,
+        Plain::WRITE64 as u64,
+    ];
+    if QUIET.contains(&op)
+        || [RESET, UPLOAD, VIEWPORTS, SCISSORS, BLEND_FACTOR, HEAPS, COMPUTE_CONSTANTS, GRAPHICS_CONSTANTS, INDEX_BUFFER, VERTEX_BUFFERS]
+            .contains(&op)
+    {
+        Class::Quiet
+    } else if op == Plain::SYNC as u64 || op == BARRIER_GROUPS {
+        Class::Wait
+    } else if op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64 {
+        Class::Dispatch
+    } else if op == CLOSE {
+        Class::Close
+    } else {
+        Class::Opaque
+    }
+}
+
 /// Streams' memory to use again.
 static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 /// Recordings with words to translate.
@@ -214,6 +251,9 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// The kind of the title's queue it was submitted to (`u32::MAX`: not yet), for the timing report: noted on
+    /// the list of ours it goes to, which is what the card runs and the report reads.
+    queue: AtomicU32,
 }
 
 #[derive(Default)]
@@ -237,7 +277,26 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            queue: AtomicU32::new(u32::MAX),
         }
+    }
+
+    /// The title's queue (`kind`) it is submitted to: told to the list of ours it goes to, or the one it is given
+    /// when translating begins ([`Recording::noting`]). Under the lock that gives it the list, so that one of the
+    /// two sees the other.
+    #[cfg_attr(not(all(windows, feature = "diagnostics")), allow(dead_code))]
+    fn tagging(&self, kind: u32, set: &mut dyn FnMut(usize, u32)) {
+        let inner = held(&self.inner);
+        self.queue.store(kind, Relaxed);
+        if inner.back != 0 {
+            set(inner.back, kind);
+        }
+    }
+
+    /// `back` has just been given to the recording (the lock is held): it takes the queue noted so far, or none: a
+    /// list of ours used before for another queue must not keep that one's.
+    fn noting(&self, back: usize, set: &mut dyn FnMut(usize, u32)) {
+        set(back, self.queue.load(Relaxed));
     }
 
     pub(crate) fn done(&self) -> bool {
@@ -268,11 +327,16 @@ impl Recording {
                 };
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
+                    self.noting(inner.back, &mut tag_back);
                 }
                 (chunk, inner.back as This)
             };
             let began = std::time::Instant::now();
             let (calls, closed) = translate(back, &chunk, || self.abandoned.load(Acquire));
+            if closed {
+                // (Before it is said to be done: from then on the submitting thread may take its host side.)
+                super::summarize(back);
+            }
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
@@ -316,9 +380,42 @@ fn give_back(streams: Vec<Vec<u64>>) {
     }
 }
 
+/// Notes the title's queue on the host side of the list of ours `back` (diagnostics: the timing report sums the
+/// commands' time by it).
+fn tag_back(back: usize, kind: u32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(host) = super::host_list(back as This) {
+        host.set_queue_kind(kind);
+    }
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    let _ = (back, kind);
+}
+
+/// The title list `list` is submitted to the title's queue of kind `kind`: noted on the recording's list of ours
+/// (a thin list has no host list of its own).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn tag_queue(list: This, kind: u32) {
+    if list.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists, and the thread that submits it is the one that recorded it.
+    let front = unsafe { &(*list.cast::<List>()).thin };
+    if let Some(recording) = &front.recording {
+        recording.tagging(kind, &mut tag_back);
+    }
+}
+
 /// A list of ours, closed.
 fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
+    let compute = crate::host::lanes::want_compute(kind);
+    let found = {
+        let mut backs = held(&BACKS);
+        // (The host list that goes with it is of the type the kind wants: `VICTORY_ASYNC_COMPUTE=2`.)
+        // SAFETY: lists of ours nobody uses.
+        let at = backs.iter().rposition(|&b| unsafe { (*(b as *const List)).host.as_ref().is_some_and(|h| h.is_compute() == compute) });
+        at.map(|at| backs.remove(at))
+    };
+    if let Some(back) = found {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
@@ -345,6 +442,7 @@ fn start() {
                         }
                     }
                 };
+                crate::sched::list_sync();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
                 }
@@ -389,6 +487,8 @@ pub(crate) fn line(frames: f64) {
     );
     crate::descriptor::host::view_cache_line(frames);
     super::replay::line(frames);
+    crate::draw::state_filter_line(frames);
+    crate::shadow::world_line(frames);
 }
 
 #[inline]
@@ -460,7 +560,7 @@ plain! {
     GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
-    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
+    SET_PIPELINE set_pipeline_put = super::set_pipeline, (pipeline: This);
     DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
     DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
     DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
@@ -479,6 +579,18 @@ plain! {
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+    BEGIN_QUERY begin_query = super::query_begin, (heap: This, kind: u32, index: u32);
+    END_QUERY end_query = super::query_end, (heap: This, kind: u32, index: u32);
+}
+
+/// A bind of a pipeline, on the title's thread: the host pipeline is asked for
+/// here, as the call is written down, and not when a thread of ours reaches it in
+/// the stream (`VICTORY_PIPELINE_AHEAD`): that thread waits for each program a
+/// dispatch needs before it reads the next call, so the programs a list binds were
+/// made one after another.
+extern "system" fn set_pipeline(this: This, pipeline: This) {
+    crate::pipeline::ahead(pipeline);
+    set_pipeline_put(this, pipeline);
 }
 
 const fn after(n: u64) -> u64 {
@@ -501,6 +613,23 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
+/// Work of ours (`super::external`), boxed.
+const EXTERNAL: u64 = after(18);
+
+/// Writes down work of ours at this place of a title list's stream
+/// ([`super::external`]); gives it back if the list is not written down.
+pub(super) fn put_external(this: This, work: super::External) -> Result<(), super::External> {
+    if !wanted() || !on() {
+        return Err(work);
+    }
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return Err(work);
+    }
+    front.put(EXTERNAL, &[Box::into_raw(Box::new(work)) as u64]);
+    Ok(())
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -677,6 +806,52 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+/// The three words of a view's record as two of the stream's: the memory they lie in is
+/// the record again, which is what the view is looked up by.
+fn view_words(words: [u32; 3]) -> [u64; 2] {
+    [u64::from(words[0]) | u64::from(words[1]) << 32, u64::from(words[2])]
+}
+/// `ClearUnorderedAccessViewUint` and `...Float` (`float`): the view's record as
+/// it is now (the slot may be written again), the resource, the four values
+/// and the rectangles.
+fn clear_uav(this: This, handle: u64, float: bool, values: *const [u32; 4], count: u32, rects: *const Rect) {
+    if handle == 0 || values.is_null() || !super::clear_uav_on() {
+        return;
+    }
+    // Not a view: nothing to clear (the call would be left out then as well).
+    let Some(words) = crate::descriptor::record_at(handle) else {
+        return;
+    };
+    let count = if rects.is_null() { 0 } else { count };
+    let view = view_words(words);
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count) << 1 | u64::from(float)],
+        &[bytes_of(view.as_ptr(), 2), bytes_of(values, 1), bytes_of(rects, count as usize)],
+    );
+}
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, super::view_handle(gpu, cpu), false, values, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, super::view_handle(gpu, cpu), true, values, count, rects);
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -710,29 +885,494 @@ extern "system" fn copy_texture_region_x(
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
+/// Whether runs of executions the title makes one after the other, with
+/// nothing between them, one record each, the next record after the last, are
+/// one execution of all of them (`VICTORY_INDIRECT_RUNS=1`; off by default).
+/// Nothing is between them, so the state they run with is the same, and so
+/// are the draws and their order.
+fn runs_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_RUNS").is_some_and(|v| v == "1"))
+}
+
+/// Whether what the title does between two executions that would be one is
+/// noted (`VICTORY_INDIRECT_LOOK=1`).
+fn look_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| runs_on() || std::env::var_os("VICTORY_INDIRECT_LOOK").is_some_and(|v| v == "1"))
+}
+
+/// Whether runs of executions that differ in the root arguments of their
+/// stages are made one execution (`VICTORY_INDIRECT_FOLD=1`; off by
+/// default; `crate::draw::fold`). Read once per stream: a stream plans and
+/// makes its runs alone, and leaves the host list as the executions one by
+/// one would, so streams translated with the switch on and off can follow
+/// each other on one list.
+fn fold_on() -> bool {
+    crate::ab::live_flag!("VICTORY_INDIRECT_FOLD")
+}
+
+/// The most executions of a run made one.
+const FOLD_MOST: u32 = 64;
+
+/// Whether the dispatches of programs translated for runs (`VICTORY_FUSE_DISPATCH` at translation) that follow one
+/// another are made one dispatch (`VICTORY_FUSE_RUNS=1`; off by default; `crate::draw::fuse`). Read once per stream, as
+/// [`fold_on`]: a stream plans and makes its runs alone.
+fn fuse_runs_on() -> bool {
+    crate::ab::live_flag!("VICTORY_FUSE_RUNS")
+}
+
+/// The dispatches that may be one run, from the one just taken (`at` is the next op): how many there are (that one
+/// included), and where the stream goes on after the last. What may lie between them is what sets the roots the title
+/// sets for each dispatch (tables, constants, views), uploads and the pipeline, and, where the title's waits are held
+/// for what a command needs (`lazy_on`), those waits: nothing that records work.
+fn fuse_run(stream: &[u64], mut at: usize, lazy_on: bool) -> (u32, usize) {
+    let (mut n, mut end) = (1u32, at);
+    while at < stream.len() {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        if stream.get(at + 1..at + 1 + len).is_none() {
+            break;
+        }
+        at += 1 + len;
+        if op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64 {
+            n += 1;
+            end = at;
+            continue;
+        }
+        let between = op == UPLOAD
+            || op == COMPUTE_CONSTANTS
+            || op == Plain::COMPUTE_TABLE as u64
+            || op == Plain::COMPUTE_CONSTANT as u64
+            || op == Plain::COMPUTE_VIEW as u64
+            || op == Plain::SET_PIPELINE as u64
+            || (lazy_on && (op == Plain::SYNC as u64 || op == BARRIER_GROUPS));
+        if !between {
+            break;
+        }
+    }
+    (n, end)
+}
+
+/// The executions that may be one run, from the one with `signature` that was
+/// just taken (`at` is the next op): how many there are (that one included),
+/// and where the stream goes on after the last. What may lie between them is
+/// only what sets roots the title sets for each object (tables, constants,
+/// views), uploads, and the pipeline the list already has (`pipeline`, asked
+/// if one is set): nothing that the host list is told of on its own. The
+/// executions are the ones of one record without a count of one signature.
+fn fold_run(stream: &[u64], mut at: usize, signature: u64, pipeline: &dyn Fn() -> u64) -> (u32, usize) {
+    let (mut n, mut end) = (1u32, at);
+    while at < stream.len() && n < FOLD_MOST {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        let Some(w) = stream.get(at + 1..at + 1 + len) else {
+            break;
+        };
+        at += 1 + len;
+        if op == Plain::EXECUTE_INDIRECT as u64 {
+            if single(w).is_some_and(|(s, ..)| s == signature) {
+                n += 1;
+                end = at;
+                continue;
+            }
+            break;
+        }
+        let roots = [
+            Plain::COMPUTE_TABLE as u64,
+            Plain::GRAPHICS_TABLE as u64,
+            Plain::COMPUTE_CONSTANT as u64,
+            Plain::GRAPHICS_CONSTANT as u64,
+            Plain::COMPUTE_VIEW as u64,
+            Plain::GRAPHICS_VIEW as u64,
+        ];
+        let between = op == UPLOAD
+            || op == COMPUTE_CONSTANTS
+            || op == GRAPHICS_CONSTANTS
+            || roots.contains(&op)
+            || (op == Plain::SET_PIPELINE as u64 && w.first().is_some_and(|&p| p == pipeline()));
+        if !between {
+            break;
+        }
+    }
+    (n, end)
+}
+
+/// Since the last line: executions with one record and no count; each that
+/// is the next record of the one before (same signature and arguments); of
+/// those, with nothing between; runs made one and the executions that saved.
+static RUNS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// What lay between executions that were the next record of the one before
+/// (the first op codes), and how often.
+static BETWEEN: Mutex<Option<std::collections::HashMap<Vec<u8>, u64>>> = Mutex::new(None);
+
+/// The names of the plain ops and the others, by code.
+const NAMES: [&str; 48] = [
+    "topology", "stencil_ref", "depth_bounds", "compute_table", "graphics_table", "compute_constant",
+    "graphics_constant", "compute_view", "graphics_view", "set_pipeline", "draw", "draw_indexed", "dispatch",
+    "dispatch_x", "dispatch_mesh", "dispatch_mesh_x", "copy_buffer", "copy_resource", "copy_resource_x",
+    "copy_memory", "resolve", "resolve_queries", "execute_indirect", "write32", "write64", "wait_value",
+    "wait_value64", "sync", "begin_query", "end_query", "reset", "close", "upload", "barrier",
+    "barrier_groups", "viewports", "scissors",
+    "blend_factor", "heaps", "compute_constants", "graphics_constants", "index_buffer", "vertex_buffers",
+    "targets", "clear_rtv", "clear_dsv", "copy_texture", "clear_uav",
+];
+
+/// The line of what the executions come to, per frame.
+pub(crate) fn runs_line(frames: f64) {
+    #[cfg(windows)]
+    {
+        crate::draw::fold::line(frames);
+        crate::draw::fuse::line(frames);
+    }
+    let r: Vec<u64> = RUNS.iter().map(|r| r.swap(0, Relaxed)).collect();
+    let between = held(&BETWEEN).take();
+    let d: Vec<u64> = DROPS.iter().map(|d| d.swap(0, Relaxed)).collect();
+    if d.iter().sum::<u64>() > 0 && frames > 0.0 {
+        tracing::info!(
+            "calls that only feed dispatches the host drops, left out per frame (VICTORY_DROP_EARLY): {:.0} root parameters set, {:.0} dispatches; {:.0} streams planned",
+            d[0] as f64 / frames,
+            d[1] as f64 / frames,
+            d[2] as f64 / frames,
+        );
+    }
+    if r[0] == 0 || frames <= 0.0 {
+        return;
+    }
+    let per = |v: u64| v as f64 / frames;
+    let mut top = String::new();
+    if let Some(between) = between {
+        let mut all: Vec<_> = between.into_iter().collect();
+        all.sort_by_key(|(k, n)| (std::cmp::Reverse(*n), k.clone()));
+        for (ops, n) in all.into_iter().take(8) {
+            let names: Vec<&str> = ops.iter().map(|&o| NAMES.get(o as usize).copied().unwrap_or("?")).collect();
+            top.push_str(&format!("; {:.1}/frame after [{}]", per(n), names.join(" ")));
+        }
+    }
+    tracing::info!(
+        "executions with one record per frame (VICTORY_INDIRECT_RUNS={}): {:.0}, of them {:.0} the next record of the one before, {:.0} of those with nothing between; {:.0} runs made one, saving {:.0} executions{top}",
+        u8::from(runs_on()),
+        per(r[0]),
+        per(r[1]),
+        per(r[2]),
+        per(r[3]),
+        per(r[4]),
+    );
+}
+
+/// The call `execute_indirect(signature, max, arguments, offset, count,
+/// count offset)` as the words of a stream hold it, if it is one execution
+/// of one record without a count: the signature, the arguments, the offset.
+fn single(w: &[u64]) -> Option<(u64, u64, u64)> {
+    (w.len() >= 6 && w[0] != 0 && w[1] as u32 == 1 && w[2] != 0 && w[4] == 0).then(|| (w[0], w[2], w[3]))
+}
+
+/// How far the run of executions that the one with `first` begins goes in
+/// `stream` from `at` (the next op): how many records it is, and where the
+/// stream goes on. Only uploads (which take no part in what the card does)
+/// may lie between; the ones in the run are `done` as they pass.
+fn run_of(
+    stream: &[u64],
+    mut at: usize,
+    first: (u64, u64, u64),
+    stride: u64,
+    mut done: impl FnMut(&[u64]),
+) -> (u64, usize) {
+    let (signature, arguments, offset) = first;
+    let mut records = 1u64;
+    let mut uploads: Vec<usize> = Vec::new();
+    let mut end = at;
+    while at < stream.len() {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        let Some(w) = stream.get(at + 1..at + 1 + len) else {
+            break;
+        };
+        if op == UPLOAD {
+            uploads.push(at);
+            at += 1 + len;
+            continue;
+        }
+        let next = single(w)
+            .filter(|&(s, a, o)| op == Plain::EXECUTE_INDIRECT as u64 && s == signature && a == arguments && o == offset + records * stride);
+        if next.is_none() {
+            break;
+        }
+        records += 1;
+        at += 1 + len;
+        end = at;
+    }
+    for u in uploads.into_iter().filter(|&u| u < end) {
+        done(&stream[u + 1..u + 1 + (stream[u] >> 16) as usize]);
+    }
+    (records, end)
+}
+
+/// Whether calls that only feed dispatches the host drops are left out
+/// (`VICTORY_DROP_EARLY=1`; off by default; with the structure builder off,
+/// which is what drops them). Read for each stream, so it may change while the
+/// title runs: what a stream leaves out is a stream's own, and the state it
+/// leaves is the same whichever way the switch stands (`dead_ops`).
+fn drop_early_on() -> bool {
+    if !crate::pipeline::builder_disabled() {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_DROP_EARLY") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_EARLY").is_some_and(|v| v == "1"))
+}
+
+/// Since the last line: root parameters set and dispatches left out, and
+/// streams planned.
+static DROPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Which calls of `stream` (by their order, uploads counted) need not be made,
+/// given the pipeline the list has at its start (`start`) and which pipelines
+/// drop their dispatches (`dropped`).
+///
+/// - A dispatch while a dropped pipeline is set does nothing: left out.
+/// - A compute root parameter set (table, view, or constants) is read only by
+///   a dispatch that runs, or an execution that is not dropped. Roots persist
+///   from one dispatch to the next, so one that is replaced whole (a table or
+///   a view; constants only replace the dwords they give) before any such
+///   consumer is read by nobody: left out. At the end of the stream every
+///   parameter counts as read (the next stream goes on from here), and a
+///   consumer reads them all.
+/// - The pipelines the title sets are all kept (they say which dispatch is
+///   dropped), and everything else.
+fn dead_ops(stream: &[u64], start: u64, dropped: &dyn Fn(u64) -> bool) -> Vec<bool> {
+    const SLOTS: u32 = 64;
+    let mut ops: Vec<(u64, &[u64])> = Vec::new();
+    let mut at = 0;
+    while at < stream.len() {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        let Some(w) = stream.get(at + 1..at + 1 + len) else {
+            break;
+        };
+        ops.push((op, w));
+        at += 1 + len;
+    }
+    let (dispatch, dispatch_x, indirect) = (Plain::DISPATCH as u64, Plain::DISPATCH_X as u64, Plain::EXECUTE_INDIRECT as u64);
+    // Forward: each dispatch is dropped or a consumer.
+    let mut cur = start;
+    let mut consumer = vec![false; ops.len()];
+    let mut dead = vec![false; ops.len()];
+    for (i, &(op, w)) in ops.iter().enumerate() {
+        if (op == RESET || op == Plain::SET_PIPELINE as u64) && !w.is_empty() {
+            cur = w[0];
+        } else if op == dispatch || op == dispatch_x {
+            if dropped(cur) {
+                dead[i] = true;
+            } else {
+                consumer[i] = true;
+            }
+        } else if op == indirect {
+            consumer[i] = !dropped(cur);
+        }
+    }
+    // Backward: the parameters something later reads.
+    let mut live = u64::MAX;
+    for (i, &(op, w)) in ops.iter().enumerate().rev() {
+        if consumer[i] {
+            live = u64::MAX;
+            continue;
+        }
+        let slot = match op {
+            o if o == Plain::COMPUTE_TABLE as u64 || o == Plain::COMPUTE_VIEW as u64 || o == Plain::COMPUTE_CONSTANT as u64 => {
+                w.first().map(|&s| s as u32)
+            }
+            o if o == COMPUTE_CONSTANTS => w.first().map(|&s| s as u32),
+            _ => None,
+        };
+        let Some(slot) = slot else { continue };
+        if slot >= SLOTS {
+            continue;
+        }
+        let whole = op == Plain::COMPUTE_TABLE as u64 || op == Plain::COMPUTE_VIEW as u64;
+        if live >> slot & 1 == 0 {
+            dead[i] = true;
+        } else if whole {
+            live &= !(1 << slot);
+        }
+    }
+    dead
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    // The calls that need not be made (`VICTORY_DROP_EARLY`), by their order.
+    let dead = if drop_early_on() && !skip {
+        // SAFETY: a list of ours that no thread but this one records into.
+        let start = held(unsafe { &(*list.cast::<List>()).state }).pipeline_handle();
+        DROPS[2].fetch_add(1, Relaxed);
+        dead_ops(stream, start, &|p| crate::pipeline::is_builder(p as This) || crate::pipeline::is_resolve_pending_idle(p as This))
+    } else {
+        Vec::new()
+    };
+    let mut ordinal = 0usize;
+    // The title's waits for shader writes held for what a command needs (a wait is made
+    // where the title put it with the switch off, and in lists that are not written down).
+    let lazy_on = !skip && super::lazy::on();
+    super::lazy::begin(list, lazy_on);
+    // The execution before: its signature, arguments and where its next
+    // record would be; what came since (op codes, the first few, and how many).
+    let mut last: Option<(u64, u64, u64)> = None;
+    let mut between: Vec<u8> = Vec::new();
+    let mut since = 0u32;
+    // Where the run of executions made one ends (`crate::draw::fold`), 0: none.
+    let mut fold_until = 0usize;
+    // Where the run of dispatches made one ends (`crate::draw::fuse`), 0: none.
+    let mut fuse_until = 0usize;
+    let name_upload = |w: &[u64]| {
+        // SAFETY: made by `allocate_upload`, named once.
+        let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
+        // SAFETY: a list of ours.
+        let uploads = unsafe { &(*list.cast::<List>()).uploads };
+        held(uploads).push(block);
+    };
     while i < stream.len() {
+        if fold_until != 0 && i >= fold_until {
+            super::fold_end(list);
+            fold_until = 0;
+        }
+        if fuse_until != 0 && i >= fuse_until {
+            super::fuse_end(list);
+            fuse_until = 0;
+        }
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;
+        let this_op = ordinal;
+        ordinal += 1;
         if calls % 64 == 0 {
             skip = left();
         }
         if op == UPLOAD {
-            // SAFETY: made by `allocate_upload`, named once.
-            let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
-            // SAFETY: a list of ours.
-            let uploads = unsafe { &(*list.cast::<List>()).uploads };
-            held(uploads).push(block);
+            name_upload(w);
+            continue;
+        }
+        if op == EXTERNAL {
+            // SAFETY: made by `put_external`, named once.
+            let work = *unsafe { Box::from_raw(w[0] as *mut super::External) };
+            // (A recording let go of drops it unrun.)
+            if !skip {
+                super::run_external(list, work);
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {
             continue;
+        }
+        if dead.get(this_op).copied().unwrap_or(false) {
+            DROPS[usize::from(op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64)].fetch_add(1, Relaxed);
+            continue;
+        }
+        if lazy_on {
+            use super::lazy::Class;
+            match class(op) {
+                Class::Quiet | Class::Dispatch | Class::Close => {}
+                Class::Wait => {
+                    // (A group of no barriers waits for nothing.)
+                    if op == Plain::SYNC as u64 || w.first().is_some_and(|&n| n > 0) {
+                        super::lazy::op(list, Class::Wait);
+                    }
+                    // (As the call it stands for would have counted.)
+                    since += 1;
+                    if look_on() && between.len() < 8 {
+                        between.push(op.min(255) as u8);
+                    }
+                    continue;
+                }
+                Class::Opaque => super::lazy::op(list, Class::Opaque),
+            }
+        }
+        if op == Plain::EXECUTE_INDIRECT as u64 {
+            RUNS[0].fetch_add(1, Relaxed);
+            let first = single(w);
+            if let Some((signature, arguments, offset)) = first {
+                if last == Some((signature, arguments, offset)) {
+                    RUNS[1].fetch_add(1, Relaxed);
+                    if since == 0 {
+                        RUNS[2].fetch_add(1, Relaxed);
+                    } else if look_on() {
+                        let mut seen = held(&BETWEEN);
+                        let seen = seen.get_or_insert_with(Default::default);
+                        if seen.len() < 256 {
+                            *seen.entry(between.clone()).or_insert(0) += 1;
+                        }
+                    }
+                }
+                let stride = crate::signature::layout(signature as This).map_or(0, |(stride, _)| u64::from(stride));
+                last = (stride > 0).then_some((signature, arguments, offset + stride));
+                if runs_on() && stride > 0 {
+                    let (records, end) = run_of(stream, i, (signature, arguments, offset), stride, &name_upload);
+                    if records > 1 {
+                        // One execution of all the records; the calls it
+                        // stands for are counted as draws.
+                        calls += records - 1;
+                        RUNS[3].fetch_add(1, Relaxed);
+                        RUNS[4].fetch_add(records - 1, Relaxed);
+                        super::count_draws(records - 1);
+                        super::execute_indirect(
+                            list,
+                            signature as This,
+                            records as u32,
+                            arguments as This,
+                            offset,
+                            std::ptr::null(),
+                            0,
+                        );
+                        i = end;
+                        last = Some((signature, arguments, offset + records * stride));
+                        between.clear();
+                        since = 0;
+                        continue;
+                    }
+                }
+            } else {
+                last = None;
+            }
+            between.clear();
+            since = 0;
+            // The executions after this one that may be one with it.
+            if fold_until == 0
+                && !skip
+                && dead.is_empty()
+                && !runs_on()
+                && let Some((signature, ..)) = first
+                && fold_on()
+            {
+                // SAFETY: a list of ours that no thread but this one records into.
+                let pipeline = || held(unsafe { &(*list.cast::<List>()).state }).pipeline_handle();
+                let (n, end) = fold_run(stream, i, signature, &pipeline);
+                if n >= 2 {
+                    super::fold_begin(list, n);
+                    fold_until = end;
+                }
+            }
+        } else {
+            since += 1;
+            if look_on() && between.len() < 8 {
+                between.push(op.min(255) as u8);
+            }
+        }
+        // The dispatches after this one that may be one run with it.
+        if fuse_until == 0
+            && !skip
+            && dead.is_empty()
+            && (op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64)
+            && fuse_runs_on()
+        {
+            let (n, end) = fuse_run(stream, i, lazy_on);
+            if n >= 2 {
+                super::fuse_begin(list);
+                fuse_until = end;
+            }
         }
         if run_plain(op, list, w) {
             continue;
@@ -743,8 +1383,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 // (Only whether there is an allocator is looked at.)
                 let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
                 super::reset(list, allocator, w[0] as This);
+                // (Its state is new: nothing is held.)
+                super::lazy::begin(list, lazy_on);
             }
             CLOSE => {
+                if lazy_on {
+                    super::lazy::op(list, super::lazy::Class::Close);
+                }
                 super::close(list);
                 closed = true;
             }
@@ -798,6 +1443,18 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            CLEAR_UAV => {
+                // The view's record (two words), the values (two), the rectangles.
+                let rects = (w[0] >> 1) as usize;
+                super::clear_uav(
+                    list,
+                    w[1..].as_ptr() as u64,
+                    w[0] & 1 != 0,
+                    at_or(w, 3),
+                    rects as u32,
+                    at(w, 5, rects),
+                );
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -813,6 +1470,12 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             }
             _ => {}
         }
+    }
+    if fold_until != 0 {
+        super::fold_end(list);
+    }
+    if fuse_until != 0 {
+        super::fuse_end(list);
     }
     (calls, closed)
 }
@@ -834,7 +1497,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 54] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -851,6 +1514,8 @@ const MINE: [(usize, *const ()); 50] = [
     (24, stencil_ref as *const ()),
     (25, set_pipeline as *const ()),
     (26, barrier as *const ()),
+    (28, begin_query as *const ()),
+    (29, end_query as *const ()),
     (30, resolve_queries as *const ()),
     (32, heaps as *const ()),
     (35, compute_table as *const ()),
@@ -870,6 +1535,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
@@ -891,11 +1558,83 @@ const MINE: [(usize, *const ()); 50] = [
 mod tests {
     use super::*;
 
+    /// Work of ours (`super::external`) is written down as one word of a
+    /// stream (a box), under an op no call of the title has, and is taken out
+    /// of it once: dropped unrun if nothing runs it.
+    #[test]
+    fn external_work_is_one_boxed_word_taken_out_once() {
+        use std::sync::atomic::AtomicUsize;
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+        let (dropped, ran) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let make = || -> super::super::External {
+            let guard = Counted(dropped.clone());
+            let ran = ran.clone();
+            Box::new(move |_| {
+                let _kept = &guard;
+                ran.fetch_add(1, Relaxed);
+                true
+            })
+        };
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
+        f.put(Plain::TOPOLOGY as u64, &[4]);
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
+        let w = std::mem::take(&mut f.words);
+        assert_eq!((w[0] & 0xffff, w[0] >> 16), (EXTERNAL, 1));
+        assert_eq!((w[2] & 0xffff, w[2] >> 16), (Plain::TOPOLOGY as u64, 1));
+        assert_eq!((w[4] & 0xffff, w[4] >> 16), (EXTERNAL, 1));
+        // The op is none of the others'.
+        for other in [RESET, CLOSE, UPLOAD, BARRIER, BARRIER_GROUPS, VIEWPORTS, SCISSORS, BLEND_FACTOR, HEAPS, COMPUTE_CONSTANTS, GRAPHICS_CONSTANTS, INDEX_BUFFER, VERTEX_BUFFERS, TARGETS, CLEAR_RTV, CLEAR_DSV, COPY_TEXTURE, CLEAR_UAV] {
+            assert_ne!(other, EXTERNAL);
+        }
+        assert_eq!(class(EXTERNAL), super::super::lazy::Class::Opaque);
+        // Taken out as `translate` does: each box once.
+        for at in [1, 5] {
+            // SAFETY: made above by `Box::into_raw`, named once.
+            let work = *unsafe { Box::from_raw(w[at] as *mut super::super::External) };
+            drop(work);
+        }
+        assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 2));
+        f.recording = None;
+    }
+
+    /// The title's queue is noted on the list of ours a recording goes to, whichever comes first: the submission
+    /// (the list is not given yet, it takes the kind when it is) or the translating (the list is there, the
+    /// submission tells it). A list used before for another queue does not keep that queue's kind.
+    #[test]
+    fn the_queue_a_recording_is_submitted_to_reaches_the_list_it_goes_to_in_either_order() {
+        let log = std::cell::RefCell::new(Vec::<(usize, u32)>::new());
+        let mut note = |back: usize, kind: u32| log.borrow_mut().push((back, kind));
+        // The submission first: there is no list to tell, and the list takes the kind when it is given.
+        let early = Recording::new(0);
+        early.tagging(2, &mut note);
+        assert!(log.borrow().is_empty());
+        early.noting(77, &mut note);
+        assert_eq!(*log.borrow(), [(77, 2)]);
+        // The translating first: the list is told none (it may have served another queue), then the submission
+        // tells it.
+        log.borrow_mut().clear();
+        let late = Recording::new(0);
+        late.noting(88, &mut note);
+        assert_eq!(*log.borrow(), [(88, u32::MAX)]);
+        held(&late.inner).back = 88;
+        late.tagging(0, &mut note);
+        assert_eq!(*log.borrow(), [(88, u32::MAX), (88, 0)]);
+        // (Not a list of ours: the recording must not close it when it is dropped.)
+        held(&late.inner).back = 0;
+    }
+
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 33, 34, 73, 99, 124];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");
@@ -906,6 +1645,306 @@ mod tests {
                 "slot {slot} is written down and not there"
             );
         }
+    }
+
+    fn put(stream: &mut Vec<u64>, op: u64, args: &[u64]) {
+        stream.push(op | (args.len() as u64) << 16);
+        stream.extend_from_slice(args);
+    }
+
+    const EXECUTE: u64 = Plain::EXECUTE_INDIRECT as u64;
+
+    /// The clears of unordered access views are written down, by both slots of the console's list.
+    #[test]
+    fn the_clears_of_unordered_access_views_are_written_down() {
+        for newer in [false, true] {
+            let table = table(newer);
+            assert_eq!(table[53], clear_uav_uint as *const ());
+            assert_eq!(table[54], clear_uav_float as *const ());
+        }
+        assert!(CLEAR_UAV > COPY_TEXTURE && CLEAR_UAV >= Plain::END as u64);
+    }
+
+    /// The record of a view, kept in two words of a stream, is read back as the same record from the
+    /// words' own memory (what the replay hands the lookup).
+    #[test]
+    fn a_views_record_in_the_stream_reads_back_as_the_record() {
+        let tag = u32::from_le_bytes(*b"vVIE");
+        let record = [tag, 0xdead_beef, 0x1234_5678];
+        let stream = view_words(record);
+        assert_eq!(crate::descriptor::record_at(stream.as_ptr() as u64), Some(record));
+        // Another record, another words.
+        assert_ne!(view_words([tag, 1, 2]), view_words([tag, 1, 3]));
+    }
+
+    /// The names go by the codes.
+    #[test]
+    fn the_names_of_the_ops_are_by_their_codes() {
+        assert_eq!(NAMES.len(), CLEAR_UAV as usize + 1);
+        for (op, name) in [
+            (Plain::EXECUTE_INDIRECT as u64, "execute_indirect"),
+            (Plain::DRAW as u64, "draw"),
+            (Plain::SYNC as u64, "sync"),
+            (RESET, "reset"),
+            (UPLOAD, "upload"),
+            (BARRIER_GROUPS, "barrier_groups"),
+            (COPY_TEXTURE, "copy_texture"),
+            (CLEAR_UAV, "clear_uav"),
+        ] {
+            assert_eq!(NAMES[op as usize], name);
+        }
+    }
+
+    /// A run is the executions of one record, one after the other, each the
+    /// next record of the one before; uploads may lie between; anything else
+    /// ends it, as do another signature, other arguments, a gap, a count or
+    /// more records.
+    #[test]
+    fn a_run_is_the_executions_that_follow_one_another_record_by_record() {
+        let call = |signature: u64, max: u64, arguments: u64, offset: u64, count: u64| [signature, max, arguments, offset, count, 0];
+        let mut stream = Vec::new();
+        // The first of the run was taken by the caller; its offset is 0x100, stride 16.
+        put(&mut stream, EXECUTE, &call(7, 1, 9, 0x110, 0));
+        put(&mut stream, UPLOAD, &[0xdead]);
+        put(&mut stream, EXECUTE, &call(7, 1, 9, 0x120, 0));
+        let upto_third = stream.len();
+        put(&mut stream, UPLOAD, &[0xbeef]);
+        put(&mut stream, Plain::DRAW as u64, &[3, 1, 0, 0]);
+        put(&mut stream, EXECUTE, &call(7, 1, 9, 0x130, 0));
+        let mut named = Vec::new();
+        let (records, end) = run_of(&stream, 0, (7, 9, 0x100), 16, |w| named.push(w[0]));
+        assert_eq!((records, end), (3, upto_third));
+        // The upload between the executions was named; the one behind the run was not.
+        assert_eq!(named, [0xdead]);
+        // The same without the draw: the second upload is also between.
+        let mut again = Vec::new();
+        again.extend_from_slice(&stream[..upto_third]);
+        put(&mut again, UPLOAD, &[0xbeef]);
+        put(&mut again, EXECUTE, &call(7, 1, 9, 0x130, 0));
+        let mut named = Vec::new();
+        assert_eq!(run_of(&again, 0, (7, 9, 0x100), 16, |w| named.push(w[0])), (4, again.len()));
+        assert_eq!(named, [0xdead, 0xbeef]);
+        // Each thing that ends a run.
+        for (what, next) in [
+            ("another signature", call(8, 1, 9, 0x110, 0)),
+            ("other arguments", call(7, 1, 10, 0x110, 0)),
+            ("a gap", call(7, 1, 9, 0x120, 0)),
+            ("the same record again", call(7, 1, 9, 0x100, 0)),
+            ("a count", call(7, 1, 9, 0x110, 5)),
+            ("more records", call(7, 2, 9, 0x110, 0)),
+        ] {
+            let mut stream = Vec::new();
+            put(&mut stream, EXECUTE, &next);
+            assert_eq!(run_of(&stream, 0, (7, 9, 0x100), 16, |_| ()), (1, 0), "{what}");
+        }
+        // Nothing after it, and an op cut short.
+        assert_eq!(run_of(&[], 0, (7, 9, 0x100), 16, |_| ()), (1, 0));
+        assert_eq!(run_of(&[EXECUTE | 6 << 16, 7], 0, (7, 9, 0x100), 16, |_| ()), (1, 0));
+    }
+
+    /// A fold is the executions of one signature with only what the title sets for each object between them (roots, uploads, the
+    /// pipeline the list has): anything else, another signature, a count or more records ends it, and it is never longer than the
+    /// most a run holds.
+    #[test]
+    fn a_fold_is_the_executions_with_only_roots_between() {
+        let call = |signature: u64, max: u64, count: u64| [signature, max, 9, 0x40, count, 0];
+        let pipeline = || 5u64;
+        let mut stream = Vec::new();
+        put(&mut stream, Plain::GRAPHICS_CONSTANT as u64, &[3, 7, 0]);
+        put(&mut stream, GRAPHICS_CONSTANTS, &[3, 2, 1]);
+        put(&mut stream, UPLOAD, &[1]);
+        put(&mut stream, EXECUTE, &call(7, 1, 0));
+        put(&mut stream, Plain::GRAPHICS_TABLE as u64, &[1, 0x100]);
+        put(&mut stream, Plain::COMPUTE_VIEW as u64, &[2, 0x200]);
+        put(&mut stream, Plain::SET_PIPELINE as u64, &[5]);
+        put(&mut stream, EXECUTE, &call(7, 1, 0));
+        let upto = stream.len();
+        put(&mut stream, Plain::GRAPHICS_VIEW as u64, &[2, 0x200]);
+        put(&mut stream, Plain::COMPUTE_CONSTANT as u64, &[1, 2, 0]);
+        // (What follows the last execution is not part of the run.)
+        assert_eq!(fold_run(&stream, 0, 7, &pipeline), (3, upto));
+        // Each thing that ends it, right after the execution that was taken.
+        for (what, op, words) in [
+            ("a draw", Plain::DRAW as u64, vec![3, 1, 0, 0]),
+            ("another pipeline", Plain::SET_PIPELINE as u64, vec![6]),
+            ("a barrier", BARRIER, vec![1, 0]),
+            ("targets", TARGETS, vec![1, 1, 0, 0]),
+            ("another signature", EXECUTE, call(8, 1, 0).to_vec()),
+            ("a count", EXECUTE, call(7, 1, 3).to_vec()),
+            ("more records", EXECUTE, call(7, 2, 0).to_vec()),
+        ] {
+            let mut stream = Vec::new();
+            put(&mut stream, op, &words);
+            put(&mut stream, EXECUTE, &call(7, 1, 0));
+            assert_eq!(fold_run(&stream, 0, 7, &pipeline), (1, 0), "{what}");
+        }
+        // Nothing after it, an op cut short, and the most.
+        assert_eq!(fold_run(&[], 0, 7, &pipeline), (1, 0));
+        assert_eq!(fold_run(&[EXECUTE | 6 << 16, 7], 0, 7, &pipeline), (1, 0));
+        let mut long = Vec::new();
+        for _ in 0..FOLD_MOST + 10 {
+            put(&mut long, EXECUTE, &call(7, 1, 0));
+        }
+        let (n, end) = fold_run(&long, 0, 7, &pipeline);
+        assert_eq!(n, FOLD_MOST);
+        assert_eq!(end, (FOLD_MOST as usize - 1) * 7);
+        #[cfg(windows)]
+        assert_eq!(FOLD_MOST, crate::draw::fold::MOST);
+    }
+
+    /// Which calls are executions of one record without a count.
+    #[test]
+    fn one_record_without_a_count_is_a_single() {
+        assert_eq!(single(&[7, 1, 9, 0x40, 0, 0]), Some((7, 9, 0x40)));
+        for w in [[0u64, 1, 9, 0, 0, 0], [7, 2, 9, 0, 0, 0], [7, 1, 0, 0, 0, 0], [7, 1, 9, 0, 3, 0]] {
+            assert_eq!(single(&w), None);
+        }
+        assert_eq!(single(&[7, 1, 9]), None);
+    }
+
+    /// What the compute roots hold, as the state keeps them.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Root {
+        Table(u64),
+        View(u64),
+        Constants(Vec<u32>),
+    }
+
+    type Roots = std::collections::BTreeMap<u32, Root>;
+
+    /// The state a stream leaves, and what each dispatch that runs sees (the
+    /// pipeline and every root), run without the calls in `skip`. Pipelines of
+    /// an even number are dropped.
+    fn model(stream: &[u64], start: u64, skip: &[bool]) -> (Vec<(u64, Roots)>, (u64, Roots)) {
+        let mut roots: Roots = Default::default();
+        let (mut cur, mut seen) = (start, Vec::new());
+        let (mut at, mut k) = (0, 0);
+        while at < stream.len() {
+            let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+            let w = &stream[at + 1..at + 1 + len];
+            at += 1 + len;
+            let this = k;
+            k += 1;
+            if skip.get(this).copied().unwrap_or(false) {
+                continue;
+            }
+            let slot = w.first().map_or(0, |&s| s as u32);
+            match op {
+                o if o == Plain::SET_PIPELINE as u64 || o == RESET => cur = w[0],
+                o if o == Plain::COMPUTE_TABLE as u64 => {
+                    roots.insert(slot, Root::Table(w[1]));
+                }
+                o if o == Plain::COMPUTE_VIEW as u64 => {
+                    roots.insert(slot, Root::View(w[1]));
+                }
+                o if o == Plain::COMPUTE_CONSTANT as u64 || o == COMPUTE_CONSTANTS => {
+                    let (offset, values): (usize, Vec<u32>) = if o == COMPUTE_CONSTANTS {
+                        let count = w[1] as usize;
+                        ((w[0] >> 32) as usize, (0..count).map(|i| (w[2 + i / 2] >> (32 * (i % 2))) as u32).collect())
+                    } else {
+                        (w[2] as usize, vec![w[1] as u32])
+                    };
+                    if !matches!(roots.get(&slot), Some(Root::Constants(_))) {
+                        roots.insert(slot, Root::Constants(Vec::new()));
+                    }
+                    if let Some(Root::Constants(c)) = roots.get_mut(&slot) {
+                        if c.len() < offset + values.len() {
+                            c.resize(offset + values.len(), 0);
+                        }
+                        c[offset..offset + values.len()].copy_from_slice(&values);
+                    }
+                }
+                o if (o == Plain::DISPATCH as u64 || o == Plain::DISPATCH_X as u64) && cur % 2 == 1 => {
+                    seen.push((cur, roots.clone()));
+                }
+                o if o == Plain::EXECUTE_INDIRECT as u64 && cur % 2 == 1 => seen.push((cur, roots.clone())),
+                _ => {}
+            }
+        }
+        (seen, (cur, roots))
+    }
+
+    /// Calls left out change nothing a dispatch that runs, or the next stream,
+    /// can see: the pipeline and every compute root are as without leaving any
+    /// out, at each dispatch and at the end, over many streams of sets and
+    /// dispatches of running and dropped pipelines.
+    #[test]
+    fn the_next_dispatch_that_runs_sees_what_it_saw_with_none_left_out() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let (mut left_out, mut dispatches_out) = (0, 0);
+        for round in 0..400 {
+            let mut stream = Vec::new();
+            for _ in 0..(10 + next(70)) {
+                let slot = next(5);
+                match next(11) {
+                    0 | 1 => put(&mut stream, Plain::SET_PIPELINE as u64, &[1 + next(4)]),
+                    2 | 3 => put(&mut stream, Plain::COMPUTE_TABLE as u64, &[slot, 100 + next(50)]),
+                    4 => put(&mut stream, Plain::COMPUTE_VIEW as u64, &[slot, 200 + next(50)]),
+                    5 => put(&mut stream, Plain::COMPUTE_CONSTANT as u64, &[slot, next(1000), next(3)]),
+                    6 => {
+                        let count = 1 + next(3);
+                        let words: Vec<u64> = (0..count.div_ceil(2)).map(|_| next(1 << 40)).collect();
+                        let mut all = vec![slot | next(3) << 32, count];
+                        all.extend(words);
+                        put(&mut stream, COMPUTE_CONSTANTS, &all);
+                    }
+                    7 | 8 => put(&mut stream, Plain::DISPATCH_X as u64, &[1, 1, 1, 0]),
+                    9 => put(&mut stream, Plain::DISPATCH as u64, &[1, 1, 1]),
+                    _ => match next(3) {
+                        0 => put(&mut stream, UPLOAD, &[1]),
+                        1 => put(&mut stream, Plain::EXECUTE_INDIRECT as u64, &[5, 1, 9, 0, 0, 0]),
+                        _ => put(&mut stream, Plain::DRAW as u64, &[3, 1, 0, 0]),
+                    },
+                }
+            }
+            let start = 1 + next(4);
+            let dead = dead_ops(&stream, start, &|p| p % 2 == 0);
+            assert_eq!(model(&stream, start, &[]), model(&stream, start, &dead), "round {round}");
+            left_out += dead.iter().filter(|&&d| d).count();
+            let (mut at, mut k) = (0, 0);
+            while at < stream.len() {
+                let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+                dispatches_out += usize::from(dead[k] && (op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64));
+                at += 1 + len;
+                k += 1;
+            }
+        }
+        // It is not nothing that is left out: parameters, and dispatches.
+        assert!(left_out > 1000 && dispatches_out > 100, "{left_out} {dispatches_out}");
+    }
+
+    /// The case that matters: stages of the structure builder that are dropped
+    /// set the same parameters one after another, and the dispatch that runs
+    /// after them sets some of its own: only the last set of what it does not
+    /// set is made.
+    #[test]
+    fn stages_that_are_dropped_leave_the_last_set_of_each_parameter() {
+        let mut stream = Vec::new();
+        // The pipeline the list has is a real one (1); 2 is a stage that is dropped.
+        for stage in 0..3u64 {
+            put(&mut stream, Plain::SET_PIPELINE as u64, &[2]);
+            put(&mut stream, Plain::COMPUTE_TABLE as u64, &[0, 10 + stage]);
+            put(&mut stream, Plain::COMPUTE_VIEW as u64, &[1, 20 + stage]);
+            put(&mut stream, Plain::DISPATCH_X as u64, &[8, 1, 1, 0]);
+        }
+        put(&mut stream, Plain::SET_PIPELINE as u64, &[1]);
+        put(&mut stream, Plain::COMPUTE_TABLE as u64, &[0, 99]);
+        put(&mut stream, Plain::DISPATCH as u64, &[1, 1, 1]);
+        let dead = dead_ops(&stream, 1, &|p| p == 2);
+        // Per stage (pipeline, table, view, dispatch): the dispatch always, the
+        // table of slot 0 always (the dispatch that runs sets it), the view of
+        // slot 1 for the stages before the last (that dispatch reads the last).
+        assert_eq!(
+            dead,
+            [false, true, true, true, false, true, true, true, false, true, false, true, false, false, false]
+        );
+        assert_eq!(model(&stream, 1, &[]), model(&stream, 1, &dead));
     }
 
     /// Arguments come out of a stream as they went in.
@@ -940,5 +1979,171 @@ mod tests {
         slot[1] = 99;
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// The calls that only set state are named; every other call, and one this
+    /// table has never heard of, is opaque (it puts out a wait that is held).
+    #[test]
+    fn the_calls_that_set_state_are_named_and_the_rest_are_opaque() {
+        use crate::list::lazy::Class;
+        for op in [
+            Plain::TOPOLOGY as u64,
+            Plain::COMPUTE_TABLE as u64,
+            Plain::COMPUTE_CONSTANT as u64,
+            Plain::SET_PIPELINE as u64,
+            Plain::WRITE32 as u64,
+            RESET,
+            UPLOAD,
+            VIEWPORTS,
+            HEAPS,
+            COMPUTE_CONSTANTS,
+            VERTEX_BUFFERS,
+        ] {
+            assert_eq!(class(op), Class::Quiet, "op {op}");
+        }
+        for op in [Plain::SYNC as u64, BARRIER_GROUPS] {
+            assert_eq!(class(op), Class::Wait);
+        }
+        for op in [Plain::DISPATCH as u64, Plain::DISPATCH_X as u64] {
+            assert_eq!(class(op), Class::Dispatch);
+        }
+        assert_eq!(class(CLOSE), Class::Close);
+        for op in [
+            Plain::DRAW as u64,
+            Plain::DRAW_INDEXED as u64,
+            Plain::DISPATCH_MESH as u64,
+            Plain::DISPATCH_MESH_X as u64,
+            Plain::COPY_BUFFER as u64,
+            Plain::COPY_RESOURCE as u64,
+            Plain::COPY_MEMORY as u64,
+            Plain::RESOLVE as u64,
+            Plain::RESOLVE_QUERIES as u64,
+            Plain::EXECUTE_INDIRECT as u64,
+            Plain::WAIT_VALUE as u64,
+            Plain::BEGIN_QUERY as u64,
+            BARRIER,
+            TARGETS,
+            CLEAR_RTV,
+            CLEAR_DSV,
+            COPY_TEXTURE,
+            Plain::END as u64 + 1000,
+            u64::MAX,
+        ] {
+            assert_eq!(class(op), Class::Opaque, "op {op}");
+        }
+        // Every code up to the last one the front knows is classified in one of the five ways, and the
+        // only ones that are not opaque are those named above.
+        let named = (0..=COPY_TEXTURE).filter(|&op| class(op) != Class::Opaque).count();
+        assert_eq!(named, 12 + 10 + 2 + 2 + 1, "the calls that are not opaque");
+    }
+
+    /// Streams of the title's calls, each through `class` and `feed` as `translate` and `State::dispatch` do, with the
+    /// accesses a dispatch has and "anywhere" for every other call that records work: whatever the stream, two
+    /// commands that conflict with a title wait between them have a wait made between them, and one is only made
+    /// for a title wait.
+    #[test]
+    fn no_hazard_is_left_unordered_over_streams_of_the_titles_calls() {
+        use crate::host::precise::{Access, Span};
+        use crate::lazy_wait::{Lazy, anywhere};
+        use crate::list::lazy::{Class, feed};
+        let mut seed = 0x1234_5678_9abc_def1_u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let codes = [
+            Plain::DISPATCH as u64,
+            Plain::DISPATCH as u64,
+            Plain::DISPATCH_X as u64,
+            Plain::DISPATCH as u64,
+            BARRIER_GROUPS,
+            BARRIER_GROUPS,
+            Plain::SYNC as u64,
+            Plain::COMPUTE_TABLE as u64,
+            Plain::COMPUTE_CONSTANT as u64,
+            Plain::SET_PIPELINE as u64,
+            Plain::WRITE32 as u64,
+            VIEWPORTS,
+            Plain::DRAW as u64,
+            Plain::COPY_BUFFER as u64,
+            Plain::EXECUTE_INDIRECT as u64,
+            Plain::WAIT_VALUE as u64,
+            BARRIER,
+            CLEAR_RTV,
+            Plain::END as u64 + 77,
+        ];
+        let meet = |a: &Option<Vec<Span>>, b: &Option<Vec<Span>>| match (a, b) {
+            (None, None) => true,
+            (None, Some(s)) | (Some(s), None) => !s.is_empty(),
+            (Some(a), Some(b)) => a.iter().any(|x| b.iter().any(|y| x.0 == y.0 && x.1 < y.2 && y.1 < x.2)),
+        };
+        let (mut pairs, mut kept, mut skipped) = (0u64, 0u64, 0u64);
+        for _ in 0..400 {
+            let mut lazy = Lazy::new();
+            // (access, title waits before it, a wait was made in front of it)
+            let mut commands: Vec<(Access, u64, bool)> = Vec::new();
+            let (mut waits, mut since_made) = (0u64, 0u64);
+            for _ in 0..60 {
+                let op = codes[next(codes.len() as u64) as usize];
+                let class = class(op);
+                let access = match class {
+                    Class::Dispatch => Some(Access {
+                        reads: Some(vec![(0, next(16) * 64, next(16) * 64 + 64 * (1 + next(3)))]),
+                        writes: if next(9) == 0 {
+                            None
+                        } else {
+                            let at = next(16) * 64;
+                            Some(vec![(0, at, at + 64 * (1 + next(3)))])
+                        },
+                    }),
+                    _ => None,
+                };
+                // (A read from a range made of two draws of `next` may be empty: make it a span.)
+                let access = access.map(|mut a| {
+                    if let Some(r) = a.reads.as_mut() {
+                        for s in r.iter_mut() {
+                            s.2 = s.2.max(s.1 + 64);
+                        }
+                    }
+                    a
+                });
+                let made = feed(&mut lazy, class, access.as_ref());
+                match class {
+                    Class::Wait => {
+                        waits += 1;
+                        since_made += 1;
+                        assert!(!made);
+                    }
+                    Class::Quiet => assert!(!made),
+                    Class::Close => {}
+                    Class::Dispatch | Class::Opaque => {
+                        if made {
+                            assert!(since_made > 0, "a wait is only made for a wait of the title");
+                            since_made = 0;
+                            kept += 1;
+                        }
+                        commands.push((access.unwrap_or_else(anywhere), waits, made));
+                    }
+                }
+            }
+            skipped += waits.saturating_sub(commands.iter().filter(|c| c.2).count() as u64);
+            for j in 1..commands.len() {
+                for i in 0..j {
+                    let ((a, wi, _), (b, wj, _)) = (&commands[i], &commands[j]);
+                    if wi == wj {
+                        continue;
+                    }
+                    if !(meet(&a.writes, &b.reads) || meet(&a.writes, &b.writes) || meet(&a.reads, &b.writes)) {
+                        continue;
+                    }
+                    pairs += 1;
+                    assert!(commands[i + 1..=j].iter().any(|c| c.2), "commands {i} and {j} conflict across a wait");
+                }
+            }
+        }
+        assert!(pairs > 2000 && kept > 500, "the streams have hazards and waits ({pairs}, {kept})");
+        assert!(skipped > 100, "and some waits are left out ({skipped})");
     }
 }

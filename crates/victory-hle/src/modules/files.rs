@@ -85,7 +85,7 @@ pub fn mount_at(letter: char, root: &Path) {
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
 /// keeps its own). An empty root is the current directory, as it is to a
 /// path joined to it: it is the title's folder when the title is run by its
-/// file name alone (`victory run GTA6.exe`).
+/// file name alone (`victory run title.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
     let root = if root.as_os_str().is_empty() {
         Path::new(".")

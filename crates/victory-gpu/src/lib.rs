@@ -17,8 +17,17 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod bufscan;
+mod asked;
+mod changes;
+pub mod defaults;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod probe_watch;
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+mod capture_window;
 #[cfg(windows)]
 mod compose;
 pub mod console;
@@ -33,6 +42,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -45,9 +56,14 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod lean;
 pub mod list;
 pub mod object;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod occlusion;
 pub mod pipeline;
+mod precompiled;
 #[cfg(windows)]
 mod picked;
 #[cfg(windows)]
@@ -56,6 +72,11 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod barrier;
+mod precise;
+#[cfg(windows)]
+mod lazy_wait;
 #[cfg(windows)]
 mod priority;
 #[cfg(windows)]
@@ -77,13 +98,28 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod sizes;
+#[cfg(windows)]
+mod pagedrive;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod standin;
+#[cfg(windows)]
+mod sites;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
+#[cfg(windows)]
+mod hotkeys;
 mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod ab;
+pub use switch::on as env_on;
+#[cfg(windows)]
+pub mod ab;
+#[cfg(windows)]
+mod echo;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
@@ -93,6 +129,10 @@ pub mod timeline;
 pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
+#[cfg(windows)]
+mod threadcpu;
+#[cfg(windows)]
+mod sched;
 #[cfg(windows)]
 mod readprobe;
 #[cfg(windows)]
@@ -116,10 +156,16 @@ pub fn frame_phase() -> u32 {
     copystat::phase()
 }
 #[cfg(windows)]
+pub mod addrset;
+#[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
+pub use shadow::{title_memory_gpu_readonly, title_memory_gpu_writable};
+#[cfg(windows)]
+pub use watch::mapping_stats;
+#[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    Remapping, kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

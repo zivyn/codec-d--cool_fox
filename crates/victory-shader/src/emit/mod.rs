@@ -97,14 +97,32 @@
 
 #[cfg(all(test, windows))]
 mod bench_tests;
+#[cfg(test)]
+mod fingerprint_tests;
 mod bitcode;
 mod container;
+mod denorm;
+mod f16_level;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
+pub mod form;
+mod hang;
+#[cfg(test)]
+mod hang_tests;
+mod kept_wide;
+mod wide_class;
+pub use form::Form;
+pub use hang::{HANG_NOTE, audit_asked_for as hang_audit, say as say_hang_note};
+#[cfg(all(test, windows))]
+mod form_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod footprint_gpu_tests;
+#[cfg(all(test, windows))]
 mod geometry_tests;
+#[cfg(all(test, windows))]
+mod guards_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -127,11 +145,28 @@ mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
+mod nan_tests;
+#[cfg(all(test, windows))]
+mod nan2_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
+#[cfg(all(test, windows))]
+mod sampler_table_tests;
+#[cfg(all(test, windows))]
+mod view_index_tests;
+#[cfg(all(test, windows))]
+mod fuse_tests;
+#[cfg(all(test, windows))]
+mod loop_limit_tests;
+mod local_exit_form;
+#[cfg(all(test, windows))]
+mod local_exit_tests;
 #[cfg(all(test, windows))]
 mod loop_note_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod wide_auto_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -144,34 +179,204 @@ pub use lower::{
     LOOP_NOTE, PAIR_NOTE, PEEK_NOTE, host_mesh_output_bytes, host_settings, set_host_lds_bytes, set_host_max_wave,
     set_host_mesh_output_bytes, set_host_rdna, set_program_tag,
 };
+pub use lower::fuse::{
+    fuse_dims, fuse_fill, fuse_fill_native, fuse_fits, fuse_locate, fuse_native_rows, fuse_record_rows, fuse_rows,
+    fuse_user_dword,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    FUSE_MEMBERS, FUSE_ROWS, FUSE_WIDTH, SLOT_FUSE, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_ROOT_VIEW_INDEX, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
-/// The loop limit without an override: 2^20.
+/// The loop limit without an override: 2^20 (the "no number given" value; the limits a
+/// program really gets are per stage, see [`loop_limit_for`]).
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
-/// The iteration count after which a translated loop is left, per lane and
-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
-///
-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
-/// every lane of a full-screen pass still runs for seconds (2^20 times a
-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
-/// such loops are what makes a frame slow. The value is part of the
-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
-pub fn loop_limit() -> u32 {
-    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+/// What `VICTORY_SHADER_LOOP_LIMIT` names, in a `diagnostics` build: one limit for the loops
+/// of every stage. None when it is unset or unreadable. Read once.
+fn loop_limit_named() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
     *LIMIT.get_or_init(|| {
         if cfg!(feature = "diagnostics") {
-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
+            parse_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
         } else {
-            lower::LOOP_LIMIT
+            None
         }
     })
+}
+
+/// The iteration count `VICTORY_SHADER_LOOP_LIMIT` names for every loop, as the shader cache
+/// keys it: [`DEFAULT_LOOP_LIMIT`] when it names none. The limit a loop really gets, per stage
+/// and per program, is [`loop_limit_for`]; whether a number was named at all is
+/// [`loop_limit_is_named`].
+///
+/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or `0x` hex, at least
+/// 1) sets it for every stage instead of the stages' own. A loop that hits the limit in every
+/// lane of a full-screen pass still runs for seconds (2^20 times a 4K screen is about 10^13
+/// iterations); a much lower limit shows whether such loops are what makes a frame slow. The
+/// value is part of the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+pub fn loop_limit() -> u32 {
+    loop_limit_named().unwrap_or(lower::LOOP_LIMIT)
+}
+
+/// Whether `VICTORY_SHADER_LOOP_LIMIT` named a limit. Part of the shader cache key beside
+/// [`loop_limit`]: naming the default number is not naming none (the stages' own limits are
+/// far below it, so `0x100000` raised every loop's, where before it was read as "unset" and
+/// changed nothing).
+pub fn loop_limit_is_named() -> bool {
+    loop_limit_named().is_some()
+}
+
+/// The switches that are on unless named `=0` and change the translation (`VICTORY_HALF_EXIT`,
+/// `VICTORY_KEEP_LOOP_SKIPS`, `VICTORY_F32_FTZ`), with the values in force: the shader cache keys on these, not on
+/// the text of the variables, so a cache made with the other default is never served. Each name
+/// comes with its value, so that no list of names has to be paired with this one.
+pub fn default_on_switches() -> [(&'static str, bool); 3] {
+    [
+        ("VICTORY_HALF_EXIT", lower::half_exit()),
+        ("VICTORY_KEEP_LOOP_SKIPS", crate::ir::keep_loop_skips()),
+        ("VICTORY_F32_FTZ", denorm::f32_ftz()),
+    ]
+}
+
+/// `VICTORY_F16_NEAREST` as the level in force (0, 1 or 2; 2 is the default), for the shader cache key.
+pub fn f16_nearest_level() -> u8 {
+    f16_level::level()
+}
+
+/// `VICTORY_KEPT_SKIPS_WIDE` as the value in force (0 off, the default; 1 the safe classes; 2 all),
+/// for the shader cache key.
+pub fn kept_skips_wide_code() -> u8 {
+    form::kept_skips_code()
+}
+
+/// The stage of a translated program, for its loops' limits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LoopStage {
+    Pixel,
+    Vertex,
+    Mesh,
+    Compute,
+}
+
+impl LoopStage {
+    const ALL: [Self; 4] = [Self::Pixel, Self::Vertex, Self::Mesh, Self::Compute];
+
+    /// The default limit of a stage: a loop that never meets its exit runs to it in every
+    /// lane, and a pixel loop of a million iterations hung the card for seconds a draw.
+    // shortcut: a genuine loop of more iterations than this is cut short too (the loops
+    // `VICTORY_LOOP_NOTES=1` names; `VICTORY_LOOP_LIMITS` raises the ones that are real).
+    pub(super) fn default_limit(self) -> u32 {
+        match self {
+            Self::Pixel => 1 << 7,
+            Self::Vertex | Self::Mesh => 1 << 8,
+            Self::Compute => 1 << 12,
+        }
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Pixel => "ps",
+            Self::Vertex => "vs",
+            Self::Mesh => "ms",
+            Self::Compute => "cs",
+        }
+    }
+}
+
+/// The largest limit `VICTORY_LOOP_LIMITS` may set: a loop that never ends runs to its limit
+/// in every lane before the card is reset, and this is the number the first guard used.
+const LOOP_LIMITS_MAX: u32 = 1 << 20;
+
+/// `VICTORY_LOOP_LIMITS=<entry>,<entry>,...`: limits of the loops that are really that long
+/// (the ones `VICTORY_LOOP_NOTES=1` says are cut every frame and `VICTORY_LOOP_WHY=1` lists),
+/// in place of the stage's. An entry is `<stage>=<n>` (`ps`, `vs`, `ms`, `cs`), `<hash>=<n>`
+/// for every loop of a program, or `<hash>:<loop>=<n>` for one of them, where `<hash>` is the
+/// first 4 to 7 hex digits of the program's hash (as the logs and the listing name it) and
+/// `<loop>` the loop's number in the program. `<n>` is decimal or `0x` hex with an optional `k`
+/// (times 1024), from 1 to 2^20 (more is cut to that). The most specific entry wins; a loop no
+/// entry names has the limit `VICTORY_SHADER_LOOP_LIMIT` names, else its stage's. Off unless
+/// set. Part of the translation: the shader cache keys on the text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct LoopLimits {
+    stages: [Option<u32>; 4],
+    /// (hex digits, their value, the one loop it is for, the limit)
+    programs: Vec<(u32, u32, Option<u32>, u32)>,
+}
+
+impl LoopLimits {
+    /// The table `spec` says; entries that make no sense are left out.
+    pub(super) fn parse(spec: &str) -> Self {
+        let mut t = Self::default();
+        for entry in spec.split(',') {
+            let Some((key, n)) = entry.split_once('=') else { continue };
+            let Some(limit) = parse_limit_k(n) else { continue };
+            let limit = limit.min(LOOP_LIMITS_MAX);
+            let key = key.trim().to_ascii_lowercase();
+            if let Some(i) = LoopStage::ALL.iter().position(|s| s.name() == key) {
+                t.stages[i] = Some(limit);
+                continue;
+            }
+            let (hash, each) = match key.split_once(':') {
+                Some((h, l)) => match l.trim().parse::<u32>() {
+                    Ok(l) => (h.trim(), Some(l)),
+                    Err(_) => continue,
+                },
+                None => (key.as_str(), None),
+            };
+            let digits = hash.trim_start_matches("0x");
+            if !(4..=7).contains(&digits.len()) {
+                continue;
+            }
+            let Ok(value) = u32::from_str_radix(digits, 16) else { continue };
+            t.programs.push((digits.len() as u32, value, each, limit));
+        }
+        t
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.stages.iter().all(Option::is_none) && self.programs.is_empty()
+    }
+
+    /// The limit of loop `number` of the program whose tag (28 bits: the first 7 hex digits of
+    /// its hash) is `tag`, in a program of stage `stage`; None when no entry names it.
+    pub(super) fn limit(&self, stage: LoopStage, tag: u32, number: u32) -> Option<u32> {
+        let tag = tag & 0x0FFF_FFFF;
+        // (the longest hash named wins, and the last entry written among equals)
+        let named = |one: bool| {
+            self.programs
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(digits, value, only, _))| {
+                    tag >> (4 * (7 - digits)) == value && only.is_some() == one && only.is_none_or(|l| l == number)
+                })
+                .max_by_key(|&(i, p)| (p.0, i))
+                .map(|(_, p)| p.3)
+        };
+        named(true).or_else(|| named(false)).or(self.stages[stage as usize])
+    }
+}
+
+/// `VICTORY_LOOP_LIMITS`, read once.
+fn loop_limits() -> &'static LoopLimits {
+    static LIMITS: std::sync::OnceLock<LoopLimits> = std::sync::OnceLock::new();
+    LIMITS.get_or_init(|| LoopLimits::parse(&std::env::var("VICTORY_LOOP_LIMITS").unwrap_or_default()))
+}
+
+/// The iteration limit of loop `number` of the program tagged `tag` ([`lower::set_program_tag`]),
+/// of stage `stage`: what `VICTORY_LOOP_LIMITS` says of it, else `VICTORY_SHADER_LOOP_LIMIT`'s,
+/// else the stage's own. `number` is asked only when a table is set.
+pub(super) fn loop_limit_for(stage: LoopStage, tag: u32, number: impl FnOnce() -> u32) -> u32 {
+    #[cfg(test)]
+    if let Some(table) = lower::TEST_LOOP_LIMITS.with_borrow(Clone::clone) {
+        return table.limit(stage, tag, number()).or(loop_limit_named()).unwrap_or(stage.default_limit());
+    }
+    let table = loop_limits();
+    let from_table = if table.is_empty() { None } else { table.limit(stage, tag, number()) };
+    from_table.or(loop_limit_named()).unwrap_or(stage.default_limit())
 }
 
 /// Whether a pixel shader's helper lane reads its own value where the console reads the first
@@ -180,6 +385,55 @@ pub fn loop_limit() -> u32 {
 pub fn helper_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+}
+
+/// Whether `v_mul_legacy_f32` and the like (`0 × anything = 0`) are written as the host's
+/// product where no factor is one the program itself may make an infinity or a NaN of (a
+/// division, a square root, a logarithm...; see `Module::inf_prone`), and with one test of
+/// the zero where one is. Values from memory and from the pipeline are taken to be numbers,
+/// so this is not exact for the title's data that holds an infinity or a NaN next to a
+/// zero. `VICTORY_LEGACY_ASSUME=1` turns it on; off by default. Part of the translation: the
+/// shader cache keys on it.
+pub fn legacy_assume() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::TEST_LEGACY_ASSUME.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_ASSUME").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_NAN_SAFE`: a set of [`nan_safe_bits`] (decimal or `0x` hex; 0, none, when unset)
+/// for the places where the title's float code depends on what a NaN or an infinity does and
+/// the host driver may not do the same: the NaN is spelled out in integer arithmetic (a
+/// driver that treats floats as numbers cannot fold it away). Off by default; a diagnostic for
+/// the hot spot in the hair (`nan_tests` run on the card say which ops need it). Part of the
+/// translation: the shader cache keys on it.
+pub fn nan_safe() -> u32 {
+    #[cfg(test)]
+    if let Some(bits) = lower::TEST_NAN_SAFE.get() {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_NAN_SAFE").ok();
+        parse_set(value.as_deref(), 0, nan_safe_bits::ALL)
+    })
+}
+
+/// The bits of [`nan_safe`].
+pub mod nan_safe_bits {
+    /// The float compares of the unordered family (`v_cmp_u/o/nge/nlg/ngt/nle/neq/nlt`) and the
+    /// ordered ones: a NaN is told by its bits, and never by the compare itself.
+    pub const COMPARE: u32 = 1;
+    /// `v_mul_legacy_f32` and the like: the zero of a factor is told by its bits.
+    pub const LEGACY: u32 = 2;
+    /// The clamp bit of a float result (`DX10_CLAMP`): a NaN gives 0, by its bits.
+    pub const CLAMP: u32 = 4;
+    /// `v_max_f32`/`v_min_f32` (and the 3-operand forms): the operand that is a number is
+    /// chosen by the bits of the other.
+    pub const MAX_MIN: u32 = 8;
+    pub const ALL: u32 = 15;
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -261,12 +515,25 @@ pub fn builder_bounds() -> bool {
 ///   which half has a lane (where every lane has one).
 ///   64 the dwords of one console load read by one call for every four
 ///   (not on unless asked: `127` is every pass with it).
+///   128 the selects that keep a register's old value in lanes nothing
+///   reads it in are their new value (`bitcode/opt/demand.rs`; not on
+///   unless asked: `191` is the usual passes with it, `255` every pass).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.get() {
+        return passes;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`shader_opt`], for its thread only.
+    pub(crate) static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -320,32 +587,85 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
     parsed.map_or(unset, |n| n & all)
 }
 
-/// Everything a translation depends on besides the container: the
-/// translator's own source (hashed at build time), the value of every
-/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
-pub fn translation_fingerprint() -> Vec<u8> {
+/// The `VICTORY_*` names the translator's code reads that never change a translation, so that
+/// the cache key leaves them out: switches that only print (`*_WHY`, the census), paths of tools
+/// and the host's test harness, and the build-time list of switches. `fingerprint_tests` checks
+/// that each of them is read only where it does nothing to the code written.
+pub const NOT_THE_TRANSLATION: &[&str] = &[
+    "VICTORY_D3D12_DEBUG",
+    "VICTORY_DESC_WHY",
+    "VICTORY_DXIL",
+    "VICTORY_HANG_AUDIT",
+    "VICTORY_MASK_WHY",
+    "VICTORY_PC_DXC",
+    "VICTORY_REF_PS",
+    "VICTORY_REF_VS",
+    "VICTORY_SHADER_CENSUS",
+    "VICTORY_SHADER_SWITCHES",
+    "VICTORY_WARP",
+    "VICTORY_WAVE_WHY",
+];
+
+/// The switches the key holds by the value in force and not by the text of the variable
+/// ([`translation_fingerprint`], and [`host_settings`] for `VICTORY_RDNA_FLOAT`): the ones that are on unless
+/// `=0` ([`default_on_switches`]), the ones a number or a mode is made of, and the one that
+/// depends on the host's hardware. `fingerprint_tests` checks that each is in the key.
+pub const KEYED_BY_VALUE: &[&str] = &[
+    "VICTORY_F16_NEAREST",
+    "VICTORY_F32_FTZ",
+    "VICTORY_GROUP_SYNC",
+    "VICTORY_HALF_EXIT",
+    "VICTORY_KEEP_LOOP_SKIPS",
+    "VICTORY_KEPT_SKIPS_WIDE",
+    "VICTORY_RDNA_FLOAT",
+    "VICTORY_SHADER_LOOP_LIMIT",
+    "VICTORY_SHADER_OPT",
+];
+
+/// The text of every switch of [`translation_fingerprint`], `get` being the environment.
+fn switch_texts(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
-    out.push(u8::from(cfg!(feature = "diagnostics")));
-    out.push(u8::from(cfg!(debug_assertions)));
     for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+        if NOT_THE_TRANSLATION.contains(&name) || KEYED_BY_VALUE.contains(&name) {
+            continue;
+        }
         out.extend_from_slice(name.as_bytes());
         out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = get(name) {
             out.extend_from_slice(value.as_encoded_bytes());
         }
         out.push(0);
     }
-    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
-    out.extend_from_slice(&lower::host_rdna().to_le_bytes());
-    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
-    out.extend_from_slice(&shader::raw_views().to_le_bytes());
-    out.extend_from_slice(&loop_limit().to_le_bytes());
-    out.push(group_sync());
-    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out
+}
+
+/// Everything the environment makes of a translation besides the container: the text of every
+/// `VICTORY_*` switch the translator's code names (`build.rs` lists them, so a switch added to
+/// the code is in the key without being named anywhere else), except [`NOT_THE_TRANSLATION`] and
+/// [`KEYED_BY_VALUE`]; and the value in force of the latter ([`default_on_switches`], the form of
+/// the kept skips, the loop limit, the group barriers, the clean-up passes; `VICTORY_RDNA_FLOAT`
+/// is in [`host_settings`]). The shader cache keys on this and on [`host_settings`], which the
+/// device decides and which are read after it is made, beside the translator's own source. The
+/// environment does not change while the title runs: read it once and keep the bytes.
+pub fn translation_fingerprint() -> Vec<u8> {
+    let mut out = switch_texts(|name| std::env::var_os(name));
+    let mut value = |name: &str, bytes: &[u8]| {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(bytes);
+        out.push(0);
+    };
+    for (name, on) in default_on_switches() {
+        value(name, &[u8::from(on)]);
+    }
+    value("VICTORY_F16_NEAREST", &[f16_nearest_level()]);
+    value("VICTORY_KEPT_SKIPS_WIDE", &[kept_skips_wide_code()]);
+    // (naming the default number is not naming none)
+    let mut limit = loop_limit().to_le_bytes().to_vec();
+    limit.push(u8::from(loop_limit_is_named()));
+    value("VICTORY_SHADER_LOOP_LIMIT", &limit);
+    value("VICTORY_GROUP_SYNC", &[group_sync()]);
+    value("VICTORY_SHADER_OPT", &shader_opt().to_le_bytes());
     out
 }
 
@@ -361,19 +681,30 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::DEFAULT, |n| n & bitcode::opt::ALL)
 }
 
-/// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
-/// unreadable or 0. Pure, for testing.
-fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
+/// A limit as the switches write it: decimal or `0x` hex, at least 1; None otherwise.
+fn parse_limit(value: Option<&str>) -> Option<u32> {
+    value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
+        })
+        .filter(|&n| n > 0)
+}
+
+/// [`parse_limit`] with an optional `k` after the number (times 1024).
+fn parse_limit_k(value: &str) -> Option<u32> {
+    let v = value.trim();
+    match v.strip_suffix(['k', 'K']) {
+        Some(n) => parse_limit(Some(n)).and_then(|n| n.checked_mul(1024)),
+        None => parse_limit(Some(v)),
     }
+}
+
+/// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
+/// unreadable or 0. Pure, for testing.
+fn parse_loop_limit(value: Option<&str>) -> u32 {
+    parse_limit(value).unwrap_or(lower::LOOP_LIMIT)
 }
 
 /// A translated shader and what the host binds for it.
@@ -482,6 +813,11 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// A program refused because a mask is read as data where its lanes are elsewhere is emitted once
+/// more with scalar operations on numbers that the structure takes for masks computed
+/// (`lower::with_mask_numbers`), and only such a program: with that on for every program, 66
+/// programs of the title that already translated came out changed.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -489,6 +825,79 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_as(c, native, p, st, io, res).0
+}
+
+/// [`emit`], and the form the program was lowered in ([`Form`]).
+pub fn emit_as(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> (Result<HostShader, ShaderError>, Form) {
+    match emit_forms(c, native, p, st, io, res) {
+        (Err(ShaderError::Unsupported { what, .. }), _) if what == lower::MASK_ELSEWHERE => {
+            lower::with_mask_numbers(|| emit_forms(c, native, p, st, io, res))
+        }
+        other => other,
+    }
+}
+
+/// The program's translation and the form it ended in. With `VICTORY_WAVE_WHY`, a program that
+/// had to be retried says its form on stderr (`WAVE64-FORM-FINAL ~<hash> <label>`), which is
+/// what the corpus run counts.
+fn emit_forms(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> (Result<HostShader, ShaderError>, Form) {
+    let mut form = Form::Original;
+    if hang::reporting() {
+        hang::forget();
+    }
+    let result = emit_forms_in(c, native, p, st, io, res, &mut form, false);
+    if result.is_err() {
+        form = Form::Refused;
+    }
+    if form != Form::Original
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && crate::env_on("VICTORY_WAVE_WHY")
+    {
+        eprintln!("WAVE64-FORM-FINAL ~{} {}", code_digits(c), form.label());
+    }
+    // (`VICTORY_HANG_AUDIT=1`: the audit of the module the program ended in, if it has a group barrier)
+    if native.stage == HwStage::Cs && hang::reporting() {
+        eprintln!(
+            "HANG-FINAL ~{} #{:07x} threads={} {} {}",
+            code_digits(c),
+            lower::program_tag() & 0x0FFF_FFFF,
+            match native.io {
+                crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+                _ => 0,
+            },
+            form.label(),
+            hang::last_audit().map_or("no barriers".to_string(), |a| a.describe())
+        );
+    }
+    (result, form)
+}
+
+fn emit_forms_in(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    form_out: &mut Form,
+    without_kept: bool,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -507,16 +916,26 @@ pub fn emit(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let why = crate::env_on("VICTORY_WAVE_WHY");
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?} ~{}", code_digits(c)),
                     Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
                 }
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // Where the last of the forms below stopped at code the two host waves exchange through (a
+        // lane mask, a first lane...) where not every lane runs (for `VICTORY_WAVE_WIDE_AUTO`).
+        let exchange_at = |r: &Result<(HostShader, Option<u32>), ShaderError>| match r {
+            Err(ShaderError::Unsupported { offset, what }) if what.ends_with("where not every lane runs") => Some(*offset),
+            _ => None,
+        };
+        let mut stopped_at = match &original {
+            Err(ShaderError::Unsupported { offset, what }) if what.ends_with("where not every lane runs") => Some(*offset),
+            _ => None,
+        };
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -573,17 +992,38 @@ pub fn emit(
             };
             Some((p, st, io, res))
         };
+        // The skips over loops that `VICTORY_KEEP_LOOP_SKIPS` keeps, taken by the whole wave, where
+        // that is safe for the thread group ([`kept_wide`]): before the forms without the switch.
+        // Not for a program whose form without the switch is the exact local idiom (each host wave on
+        // its own, no barrier, never degraded by the kept skips): the wide form would only add barriers.
+        if !without_kept && kept_wide::applicable(p) {
+            let mut plain = Form::Original;
+            let result = emit_forms_in(c, native, p, st, io, res, &mut plain, true);
+            if !(result.is_ok() && plain == Form::LocalIdiom)
+                && let Some(again) = kept_wide::attempt(c, native, p, why)
+            {
+                report("kept skips wave-wide", &again);
+                *form_out = Form::KeptSkipsWide;
+                return again.map(|(shader, _)| shader);
+            }
+            *form_out = plain;
+            return result;
+        }
+        // (the forms without the skips over loops that the switch keeps: those are the wave-wide
+        // form above, or not at all)
         let forms = [
-            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
-            ("without skips", form("without skips", ir::without_skips(p, false))),
+            ("without early-outs", form("without early-outs", ir::drop_early_outs_as(p, false).0)),
+            ("without skips", form("without skips", ir::drop_skips_as(p, false, false).0)),
         ];
-        for (name, f) in &forms {
+        for (i, (name, f)) in forms.iter().enumerate() {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
+                    *form_out = if i == 0 { Form::WithoutEarlyOuts } else { Form::WithoutSkips };
                     return again.map(|(shader, _)| shader);
                 }
+                stopped_at = exchange_at(&again);
             }
         }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
@@ -623,16 +1063,49 @@ pub fn emit(
         for exact in [true, false] {
             if !exact {
                 // Before anything approximate, the exact forms that cost group barriers.
+                // The cascade-shadow rasters (`VICTORY_WAVE_WIDE_AUTO`): the forms without skips stopped at
+                // an exchange that only a deep-only skip keeps from some lane, and "without skips,
+                // scalars followed" below would run it in every lane after the lanes branched alone;
+                // the wave takes that skip together, as the console does. Not where that puts a
+                // group barrier of the translator's in a loop (the normal order then stands).
+                if wave_wide_auto(c)
+                    && wide_option.is_none()
+                    && stopped_at.is_some_and(|at| ir::deep_skip_holds(p, at))
+                {
+                    wide_class::set_looped(false);
+                    let again = widen_from(None, false);
+                    let looped = wide_class::looped();
+                    report("wave-wide branches (auto)", &again);
+                    if why {
+                        eprintln!(
+                            "WAVE64-WIDE-AUTO ~{} stopped at {:#x}: {}",
+                            code_digits(c),
+                            stopped_at.unwrap_or(0),
+                            if !done(&again) {
+                                "not lowered"
+                            } else if looped {
+                                "a barrier in a loop, not taken"
+                            } else {
+                                "taken"
+                            }
+                        );
+                    }
+                    if done(&again) && !looped {
+                        *form_out = Form::WaveWideAuto;
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+                let deep = if deep_on { form("without skips, scalars followed", ir::drop_skips_as(p, true, false).0) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
+                        *form_out = Form::WithoutSkipsDeep;
                         return again.map(|(shader, _)| shader);
                     }
                 }
@@ -643,6 +1116,7 @@ pub fn emit(
                     let again = widen_from(deep.as_ref().map(|f| &f.0), driver_loop);
                     report("wave-wide branches", &again);
                     if done(&again) {
+                        *form_out = Form::WaveWide;
                         return again.map(|(shader, _)| shader);
                     }
                 }
@@ -653,13 +1127,27 @@ pub fn emit(
             if !local_on || exact_only {
                 continue;
             }
+            let local_form = if exact { Form::LocalIdiom } else { Form::LocalApproximate };
             for (name, f) in &forms {
-                if let Some((p, st, io, res)) = f
-                    && idiom(p, st) == exact
+                if let Some((fp, fst, fio, fres)) = f
+                    && idiom(fp, fst) == exact
                 {
-                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    let local = lower::with_local_waves(|| emit_program(c, native, fp, fst, fio, fres));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
+                        *form_out = local_form;
+                        // (`VICTORY_LOCAL_EXIT=2`: where this form is the one taken, the lanes of a host wave
+                        // leave the loops together)
+                        if !exact && lower::local_exit_all() {
+                            for (label, q) in [("with its early-outs", p), (*name, fp)] {
+                                if let Some(together) = local_exit_form::local_exit(c, native, q, why, false) {
+                                    report(&format!("local waves (APPROXIMATE, loops left together), {label}"), &together);
+                                    if done(&together) {
+                                        return together.map(|(shader, _)| shader);
+                                    }
+                                }
+                            }
+                        }
                         return local.map(|(shader, _)| shader);
                     }
                 }
@@ -668,6 +1156,15 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
+                    *form_out = local_form;
+                    if !exact && lower::local_exit_all() {
+                        if let Some(together) = local_exit_form::local_exit(c, native, p, why, false) {
+                            report("local waves (APPROXIMATE, loops left together)", &together);
+                            if done(&together) {
+                                return together.map(|(shader, _)| shader);
+                            }
+                        }
+                    }
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -675,11 +1172,25 @@ pub fn emit(
         if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
+                // (`VICTORY_LOCAL_EXIT=1`: where a form of this is the one taken, the lanes of a host wave
+                // leave the loops together: the program itself first, with the early-out the console takes
+                // for a wave with no lane, then that form)
+                let together = |label: &str, q: &ir::Program| {
+                    let t = local_exit_form::local_exit(c, native, q, why, true)?;
+                    report(&format!("local waves (APPROXIMATE, any mask, loops left together), {label}"), &t);
+                    done(&t).then_some(t)
+                };
                 for (name, f) in &forms {
-                    if let Some((p, st, io, res)) = f {
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                    if let Some((fp, fst, fio, fres)) = f {
+                        let local = lower::with_local_waves_any(|| emit_program(c, native, fp, fst, fio, fres));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
+                            *form_out = Form::LocalApproximateAnyMask;
+                            if lower::local_exit()
+                                && let Some(t) = together("with its early-outs", p).or_else(|| together(name, fp))
+                            {
+                                return t.map(|(shader, _)| shader);
+                            }
                             return local.map(|(shader, _)| shader);
                         }
                     }
@@ -687,6 +1198,12 @@ pub fn emit(
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
+                    *form_out = Form::LocalApproximateAnyMask;
+                    if lower::local_exit()
+                        && let Some(t) = together("with its early-outs", p)
+                    {
+                        return t.map(|(shader, _)| shader);
+                    }
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -697,10 +1214,11 @@ pub fn emit(
         // loops lost the card for programs the approximate forms ran).
         // (`VICTORY_WAVE_WIDE=0` leaves it out.)
         if wide_option.is_none() {
-            let deep = form("without skips, scalars followed", ir::without_skips(p, true));
+            let deep = form("without skips, scalars followed", ir::drop_skips_as(p, true, false).0);
             let again = widen_from(deep.as_ref().map(|f| &f.0), false);
             report("wave-wide branches (last resort)", &again);
             if done(&again) {
+                *form_out = Form::WaveWideLastResort;
                 return again.map(|(shader, _)| shader);
             }
         }
@@ -714,9 +1232,12 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
+            let again = widen(c, native, p, crate::env_on("VICTORY_WAVE_WHY"), false);
             match again {
-                Ok(_) => again,
+                Ok(_) => {
+                    *form_out = Form::LaneMaskWide;
+                    again
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
@@ -746,7 +1267,29 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    *form_out = Form::Threaded;
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
+}
+
+/// `VICTORY_WAVE_WIDE_AUTO` for this program: unset or `0`, off (the default); `1`, on for every
+/// program; otherwise a comma-separated list of names as `VICTORY_WAVE_WIDE_FIRST` takes them, on
+/// for the programs named. Part of the translation: the shader cache keys on the text.
+fn wave_wide_auto(c: &Container) -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WAVE_WIDE_AUTO.get() {
+        return on;
+    }
+    match std::env::var("VICTORY_WAVE_WIDE_AUTO").ok().as_deref().map(str::trim) {
+        None | Some("" | "0") => false,
+        Some("1") => true,
+        Some(names) => wide_first(c, names),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_WAVE_WIDE_AUTO`, for its thread only.
+    static TEST_WAVE_WIDE_AUTO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// The programs that take the wave-wide form first unless `VICTORY_WAVE_WIDE_FIRST` says
@@ -796,6 +1339,19 @@ fn widen(
     why: bool,
     active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    widen_seeded(c, native, p, why, active_loop_only, &[])
+}
+
+/// [`widen`] starting from the branches `seed` (the skips `VICTORY_KEEP_LOOP_SKIPS` kept over
+/// a loop, [`ir::drop_skips`]) taken wave-wide.
+fn widen_seeded(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+    active_loop_only: bool,
+    seed: &[usize],
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
@@ -818,20 +1374,28 @@ fn widen(
         }
         _ => return Err(NOT),
     }
-    let mut wide = std::collections::HashSet::new();
+    let mut wide: std::collections::HashSet<usize> = seed.iter().copied().collect();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
+        wide_class::take_barriers();
+        wide_class::take_meetings();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
+        let barriers = wide_class::take_barriers();
+        let meetings = wide_class::take_meetings();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
+            wide_class::set_looped(wide_class::in_a_loop(p, &meetings));
+            if !seed.is_empty() {
+                wide_class::set_last(wide_class::classify(p, &st, native, &wide, &barriers));
+            }
             if why {
                 let order = ir::reverse_postorder(&p.blocks);
                 let mut rpo = vec![0usize; p.blocks.len()];
@@ -889,6 +1453,13 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// The first 8 hex digits of the hash of the program's code, as `translate --list` names it after
+/// the `~` (`VICTORY_WAVE_WHY` lines say which program they are about).
+fn code_digits(c: &Container) -> String {
+    let code = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)).map_or(&[][..], |p| p.data);
+    blake3::hash(code).to_hex()[..8].to_owned()
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -1340,9 +1911,36 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("127")), 127, "the wide loads, not the guards");
+        assert_eq!(parse_shader_opt(Some("191")), usual | 128, "the guards, not the wide loads");
+        assert_eq!(parse_shader_opt(Some("255")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
+    }
+
+    #[test]
+    fn the_loop_limits_table_names_stages_programs_and_loops() {
+        use super::LoopLimits;
+        use super::LoopStage::{Compute, Mesh, Pixel, Vertex};
+        let t = LoopLimits::parse(
+            "cs=64k, ps=0x200 ,02384a=20000,02384a6:2=0x3000,bad,xyz=5,12=7,0238=9,ms=0,vs=3000000,0fffff=5k,0fffff:1=lots",
+        );
+        assert!(!t.is_empty());
+        let tag = 0x0238_4A6;
+        // the loop named beats the program, the longer hash the shorter, the program the stage
+        assert_eq!(t.limit(Compute, tag, 2), Some(0x3000));
+        assert_eq!(t.limit(Compute, tag, 0), Some(20000));
+        assert_eq!(t.limit(Compute, 0x0238_111, 0), Some(9));
+        assert_eq!(t.limit(Compute, 0x0777_777, 0), Some(65536));
+        // (the top four bits of a tag are the notes' marks: not part of the hash)
+        assert_eq!(t.limit(Compute, 0xF000_0000 | tag, 2), Some(0x3000));
+        assert_eq!(t.limit(Pixel, 0x0777_777, 0), Some(512));
+        assert_eq!(t.limit(Vertex, 0x0777_777, 0), Some(1 << 20));
+        assert_eq!(t.limit(Mesh, 0x0777_777, 0), None);
+        assert_eq!(t.limit(Compute, 0x0FFF_FFF, 0), Some(5 * 1024));
+        // (a hash of fewer than 4 digits, an entry with no number, a loop that is no number)
+        assert!(LoopLimits::parse("12=7,xyz=5,cs,cs=,ab:1=3,0fffff:x=3").is_empty());
+        assert!(LoopLimits::parse("").is_empty());
     }
 
     #[test]

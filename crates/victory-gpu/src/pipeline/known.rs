@@ -195,6 +195,12 @@ pub fn seed_compute(dir: &Path, containers: impl IntoIterator<Item = Vec<u8>>) -
     append(&dir, &new).map_or(0, |()| added)
 }
 
+/// Which programs a run leaves out (see `make::left_out`), as text: `seed_compute` skips them, so
+/// a book seeded under other switches lacks the ones left out then.
+pub fn left_out_signature() -> String {
+    super::make::left_out_signature()
+}
+
 /// Calls `f` with each container's stage, hash, place and length; where the
 /// last whole one ends.
 fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
@@ -249,6 +255,52 @@ pub fn keys(dir: &Path) -> Vec<(String, bool)> {
     all
 }
 
+/// What `victory warm` weighs a pipeline of the book by.
+pub struct Weight {
+    /// The size of its shaders' containers: what the driver's compile costs follows it (a program
+    /// of 60 KB takes seconds, one of 4 KB a few hundred ms).
+    pub bytes: u64,
+    /// A ray-tracing resolve (`VICTORY_RESOLVE_ASYNC` makes these in the background, so a warm may
+    /// leave them to the title: `victory warm --skip-resolves`).
+    pub resolve: bool,
+}
+
+/// The [`Weight`] of each pipeline known in `dir`, in the book's order (as [`keys`]). Each
+/// compute container is read once and let go: memory stays at one container.
+pub fn weights(dir: &Path) -> Vec<Weight> {
+    let mut places = HashMap::new();
+    walk_shaders(dir, |_, hash, at, len| {
+        places.insert(hash, (at, len));
+    });
+    let mut file = std::fs::File::open(dir.join(SHADERS)).ok();
+    let mut container = Vec::new();
+    let mut all = Vec::new();
+    walk_pipelines(dir, |_, entry| {
+        let (mut bytes, mut resolve) = (0u64, false);
+        let count = entry.get(16).copied().unwrap_or(0);
+        let mut rest = entry.get(17..).unwrap_or_default();
+        for _ in 0..count {
+            let Some((head, after)) = rest.split_first_chunk::<33>() else { break };
+            rest = after;
+            let mut hash = [0; 32];
+            hash.copy_from_slice(&head[1..]);
+            let Some(&(at, len)) = places.get(&hash) else { continue };
+            bytes += u64::from(len);
+            // (One program alone is the pipeline of a compute shader.)
+            if count == 1
+                && STAGES.get(usize::from(head[0])) == Some(&"compute")
+                && let Some(file) = file.as_mut()
+            {
+                container.resize(len as usize, 0);
+                resolve = file.seek(SeekFrom::Start(at)).and_then(|_| file.read_exact(&mut container)).is_ok()
+                    && super::make::is_resolve(&container);
+            }
+        }
+        all.push(Weight { bytes, resolve });
+    });
+    all
+}
+
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
 pub fn fingerprint() -> String {
@@ -256,6 +308,11 @@ pub fn fingerprint() -> String {
     h.update(&crate::shader_cache::translation());
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
+    }
+    // With the immediate samplers in tables (`sampler_table`) the pipelines that have them are
+    // other pipelines, and go into the library: those made under static samplers are made again.
+    if super::sampler_table::on() {
+        h.update(super::sampler_table::TAG);
     }
     h.finalize().to_hex()[..16].to_owned()
 }
@@ -331,6 +388,12 @@ fn parse(
 pub fn library_counts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
     (super::library::MADE.load(Relaxed), super::library::LOADED.load(Relaxed))
+}
+
+/// A `victory warm` process looks in the cache's pipeline library (the file in `dir`) before it compiles:
+/// a cache copied from the build before has every pipeline whose DXIL did not change.
+pub fn use_cache_library(dir: &Path) -> bool {
+    super::library::use_cache_library(dir)
 }
 
 /// What a `victory warm` process made so far, saved as a library at `path`
@@ -543,6 +606,26 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    #[test]
+    fn the_ray_programs_are_seeded_by_default() {
+        let set = |name| std::env::var(name).ok();
+        if set("VICTORY_RT_RESOLVE").is_some() || set("VICTORY_ACTIVATE_RAYS").is_some() || set("VICTORY_BVH_BUILDER").is_some() {
+            return; // the switches of this process are not the defaults
+        }
+        let dir = std::env::temp_dir().join(format!("victory-seed-rays-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let all = vec![
+            b"a plain compute container".to_vec(),
+            b"x CS_RaytracingResolve_0123abcd x".to_vec(),
+            b"y CS_ScreenProbes_ActivateRays_0123abcd y".to_vec(),
+        ];
+        // The hit shading and the activation of probe rays are in the warm list without any run.
+        assert_eq!(seed_compute(&dir, all), 3);
+        assert_eq!(keys(&dir).len(), 3);
+        assert_eq!(left_out_signature(), "hit shading left out: false, probe ray activation left out: false");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -60,6 +60,11 @@ thread_local! {
 /// more threads, if `VICTORY_LAND_TAIL_THREADS` asks for them.
 pub(crate) struct TailGuard(bool);
 
+/// Whether the thread is at a landing the title waits behind.
+pub(crate) fn in_tail() -> bool {
+    TAIL.get()
+}
+
 pub(crate) fn tail(on: bool) -> TailGuard {
     TailGuard(TAIL.replace(on))
 }
@@ -74,9 +79,16 @@ impl Drop for TailGuard {
 /// counted (`VICTORY_LAND_TAIL_THREADS`; 0, the default: the same as any
 /// landing). Those beyond [`threads`] sleep until such a landing comes: at that
 /// moment the title's threads wait for the landing and the cores are idle.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_LAND_TAIL_THREADS=6`: a batch decides for itself where it
+/// goes; the wide pool is made with the threads of the phase that first needs it, which is the one that names them.)
 fn tail_threads() -> usize {
-    static THREADS: OnceLock<usize> = OnceLock::new();
-    *THREADS.get_or_init(|| std::env::var("VICTORY_LAND_TAIL_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0usize).min(16))
+    crate::ab::live_value!("VICTORY_LAND_TAIL_THREADS", usize, tail_of)
+}
+
+/// The threads of [`tail_threads`] as the text of the variable says (none: 0, at most 16).
+fn tail_of(text: Option<&str>) -> usize {
+    text.and_then(|v| v.trim().parse().ok()).unwrap_or(0usize).min(16)
 }
 
 /// Whether a batch of `count` jobs goes to the wide pool: it is the title's
@@ -192,9 +204,17 @@ pub(crate) mod stat {
     pub(crate) const TAIL_CARD_US: usize = 33;
     pub(crate) const TAIL_PC_US: usize = 34;
     pub(crate) const TAIL_WIDE: usize = 35;
-    pub(crate) const COUNT: usize = 36;
+    /// Of the bytes the tail's landings fetch: those in copies the title was
+    /// seen to read (a read of an owed unit, or the probe's), those in copies
+    /// it was not, and the microseconds of the merge those took (the merge's
+    /// time shared by bytes).
+    pub(crate) const TAIL_READ_BYTES: usize = 36;
+    pub(crate) const TAIL_UNREAD_BYTES: usize = 37;
+    pub(crate) const TAIL_UNREAD_US: usize = 38;
+    pub(crate) const COUNT: usize = 39;
 }
 
+pub(crate) mod owed;
 pub(crate) mod quiet;
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -290,6 +310,32 @@ pub(crate) fn log(frames: f64) {
             ms(stat::TAIL_PC_US) / s[stat::TAIL_N],
             s[stat::TAIL_WIDE],
         );
+        let (seen, unseen) = (s[stat::TAIL_READ_BYTES], s[stat::TAIL_UNREAD_BYTES]);
+        tracing::info!(
+            "bytes the tail's landings fetch, per frame: {:.1} MB in copies the title was seen to read, {:.1} MB in copies it was not (what lazy landing can leave owed): {:.2} ms of their merge (VICTORY_LAND_LAZY={})",
+            mb(seen),
+            mb(unseen),
+            ms(stat::TAIL_UNREAD_US),
+            u8::from(owed::on()),
+        );
+    }
+    if owed::on() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let o: Vec<f64> = owed::STATS.iter().map(|o| o.swap(0, Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "lazy landing per frame (VICTORY_LAND_LAZY=1): {:.1} units owed ({:.1} MB), {:.1} not armed and landed at once; the title or another thread touched {:.2} of them ({:.2} ms landing them in the handler), {:.2} waits for another thread's landing; {:.1} landed by the relay after the title was told ({:.2} ms); verifier (VICTORY_OWED_CHECK={}): {:.1} MB compared, {:.1} dwords differ",
+            o[owed::UNITS_N],
+            mb(o[owed::BYTES]),
+            o[owed::UNARMED],
+            o[owed::TOUCHES],
+            o[owed::TOUCH_US] / 1000.0,
+            o[owed::WAITS],
+            o[owed::BACKGROUND_N],
+            o[owed::BACKGROUND_US] / 1000.0,
+            u8::from(owed::check_on()),
+            mb(o[owed::CHECKED]),
+            o[owed::DIFFERING],
+        );
     }
     crate::readprobe::log();
     if quiet::on() || s[stat::QUIET_PIECES] > 0.0 {
@@ -352,6 +398,12 @@ impl Pool {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
                 crate::cores::prioritize(name, crate::cores::Role::Helper);
+                crate::threadcpu::register(match name {
+                    "victory-land" => "land",
+                    "victory-land-tail" => "land-tail",
+                    "victory-under" => "under",
+                    _ => "pool",
+                });
                 pool.help()
             });
         }
@@ -409,8 +461,12 @@ impl Pool {
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
-        while state.running > 0 {
-            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        if state.running > 0 {
+            let waiting = std::time::Instant::now();
+            while state.running > 0 {
+                state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            crate::host::waits::joined(waiting.elapsed().as_nanos() as u64);
         }
         let panicked = state.panicked;
         drop(state);
@@ -436,9 +492,11 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     static WIDE: OnceLock<&'static Pool> = OnceLock::new();
-    if goes_wide(TAIL.get(), tail_threads(), threads(), count) {
+    // Read once: the pool is made with the number that made the batch go to it, whatever the switch says by then.
+    let wide = tail_threads();
+    if goes_wide(TAIL.get(), wide, threads(), count) {
         crate::land::count(stat::TAIL_WIDE, 1);
-        WIDE.get_or_init(|| Pool::new("victory-land-tail", tail_threads())).each(count, f);
+        WIDE.get_or_init(|| Pool::new("victory-land-tail", wide)).each(count, f);
         return;
     }
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);
@@ -449,6 +507,7 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 /// (`VICTORY_UNDER_THREADS`, 6 with this one).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    let _joining = crate::host::waits::joining(crate::host::waits::Wait::JoinUnder);
     POOL.get_or_init(|| {
         let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
         Pool::new("victory-under", threads.clamp(1, 16))

@@ -4,6 +4,12 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+// 1440p output for the Series X image and the title's FidelityFX path for DLSS
+// (`VICTORY_NATIVE_1440P`, `VICTORY_DLSS`), from DexNom's fork via foxhound.
+#[cfg(windows)]
+#[path = "native_1440p.rs"]
+mod native_1440p;
+
 #[cfg(any(windows, test))]
 const SKIP_CPU_CHECK_ENV: &str = "VICTORY_SKIP_CPU_CHECK";
 
@@ -35,6 +41,38 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Gives the title's settings file the frame rate `VICTORY_TARGET_FPS` names,
+/// if it is set (`victory_game::fps`).
+#[cfg(windows)]
+fn retarget_fps(storage: &Path) {
+    use victory_game::fps::{Applied, ENV, apply, parse, refreshes};
+    let Ok(asked) = std::env::var(ENV) else {
+        return;
+    };
+    let Some(fps) = parse(Some(&asked)) else {
+        eprintln!("{ENV}={asked}: not 15, 20, 30 or 60, left alone");
+        return;
+    };
+    match apply(storage, fps) {
+        Ok(Applied::Changed) => println!(
+            "target fps     {fps} (settings file rewritten: {} refreshes a frame; the original is kept beside it)",
+            refreshes(fps)
+        ),
+        Ok(Applied::Same) => println!("target fps     {fps} (settings file has it already)"),
+        Ok(Applied::NoFile) => println!(
+            "target fps     {fps} requested, but the title has written no settings file yet: run once, then again"
+        ),
+        Ok(Applied::Unreadable(key)) => {
+            eprintln!(
+                "target fps     {fps} requested, but the settings file has no single `{key}` element: left alone"
+            );
+        }
+        Err(e) => eprintln!(
+            "target fps     {fps} requested, but the settings file could not be written: {e}"
+        ),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -52,16 +90,98 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    if execute {
+        // Before the host's own memory (the image read below, the GPU
+        // device, the caches) takes the space the title's 32-bit memory needs.
+        victory_hle::modules::xmem::low_guards::install();
+    }
     let cfg = victory_core::Config::load()?;
+    // DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`): Streamline
+    // is loaded before anything of the title or the host GPU, and fails soft;
+    // only if it offers one of them does the title render through its
+    // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
+    let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    asked.series_s = matches!(console, Console::SeriesS);
+    let available = victory_hle::streamline::init(&asked);
+    // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
+    // scale with its own FidelityFX upscaling (no Streamline): DLSS's
+    // comparison, and on Series X what that path alone looks like.
+    let fsr_path = std::env::var_os("VICTORY_FSR_PATH").is_some_and(|v| v == "1");
+    // (FSR 3 frame generation reads the upscaling's inputs as DLSS Frame
+    // Generation does: the title renders through its FidelityFX path too.)
+    let upscaler = (available.dlss || available.framegen || available.fsr_framegen || fsr_path).then_some(asked.mode);
+    // What this card does for frame generation (also on the picture for the first seconds).
+    for (i, line) in victory_hle::streamline::notice_at_start().iter().enumerate() {
+        println!("{}{line}", if i == 0 { "frame gen      " } else { "               " });
+    }
+    if fsr_path && !asked.any() {
+        println!("upscaling      the title's own FidelityFX at the {} scale (VICTORY_FSR_PATH=1)", asked.mode.name());
+    }
+    if asked.any() {
+        println!(
+            "upscaling      DLSS {}, frame generation {}{}",
+            if available.dlss { "on" } else if asked.dlss { "asked, not available" } else { "off" },
+            if available.framegen { "on" } else if asked.framegen { "asked, not available" } else { "off" },
+            upscaler.map(|m| format!(", scene at the {} scale ({})", m.name(), m.scale())).unwrap_or_default()
+        );
+    }
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
 
-    let images = cfg.cache_subdir("images")?;
+    // A 1440p output instead of the Series X's 4K one (`native_1440p`): the
+    // patched image goes to a folder of its own, beside the stock one.
+    let render_1080p = std::env::var("VICTORY_RENDER_1080P").as_deref() == Ok("1");
+    let native_1440p = render_1080p || std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1");
+    let images = if native_1440p {
+        anyhow::ensure!(matches!(console, Console::SeriesX), "1440p output needs the Series X profile");
+        if upscaler.is_some() && render_1080p {
+            println!("display        VICTORY_RENDER_1080P is left out: VICTORY_DLSS_MODE sets the scene's size");
+        }
+        let (w, h) = native_1440p::prepare(&mut prepared, render_1080p && upscaler.is_none())?;
+        // SAFETY: nothing else runs yet; the title and the display mode list
+        // read these later.
+        unsafe {
+            std::env::set_var("VICTORY_DISPLAY_MODE", format!("{}x{}", native_1440p::WIDTH, native_1440p::HEIGHT));
+            std::env::set_var("VICTORY_NATIVE_1440P", "1");
+        }
+        match upscaler.map(|mode| (mode, native_1440p::prepare_upscaler(&mut prepared, mode))) {
+            Some((mode, Ok(()))) => {
+                let [rw, rh] = mode.render_size([native_1440p::WIDTH, native_1440p::HEIGHT]);
+                println!(
+                    "display        {}x{} SDR, scene {rw}x{rh} through the title's FidelityFX path ({})",
+                    native_1440p::WIDTH,
+                    native_1440p::HEIGHT,
+                    mode.name()
+                );
+                cfg.cache_subdir(&format!("images/native-1440p-upscaler-{}-sdr", mode.name()))?
+            }
+            other => {
+                if let Some((_, Err(e))) = other {
+                    println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                }
+                println!("display        {}x{} SDR, scene {w}x{h}", native_1440p::WIDTH, native_1440p::HEIGHT);
+                cfg.cache_subdir(if render_1080p { "images/1080p-to-1440p-sdr" } else { "images/native-1440p-sdr" })?
+            }
+        }
+    } else if let Some(mode) = upscaler {
+        match native_1440p::prepare_upscaler(&mut prepared, mode) {
+            Ok(()) => {
+                println!("display        the title's output, scene at {} of it through its FidelityFX path ({})", mode.scale(), mode.name());
+                cfg.cache_subdir(&format!("images/upscaler-{}", mode.name()))?
+            }
+            Err(e) => {
+                println!("upscaling      the title's FidelityFX path was not patched in: {e:#}");
+                cfg.cache_subdir("images")?
+            }
+        }
+    } else {
+        cfg.cache_subdir("images")?
+    };
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
     // The program is mapped from the copy `load` wrote: the file's bytes
@@ -96,6 +216,9 @@ pub fn run(
         storage.display(),
         title.storage_bytes >> 20
     );
+    // `VICTORY_TARGET_FPS=<fps>`: the title's settings file asks for that
+    // frame rate (`victory_game::fps`).
+    retarget_fps(&storage);
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
@@ -129,7 +252,7 @@ pub fn run(
         );
         println!("missing dlls   {message}");
         // None of their imports can be bound, so the title stops at its first
-        // call into one (Grand Theft Auto VI 1.0.2.1 at +0x2237178 during
+        // call into one (title build 1.0.2.1 at +0x2237178 during
         // System Init, #930) with nothing saying why. Stubs only if asked for.
         if execute && matches!(unimplemented, Unimplemented::Trap) {
             anyhow::bail!(
@@ -162,7 +285,10 @@ pub fn run(
         show(name, dll.bind_imports(&with_dlls, policy)?);
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // The title's FidelityFX calls go through ours when DLSS or frame
+    // generation is on (bound as before otherwise).
+    let interposed = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
+    show(&exe_name, image.bind_imports(&interposed, policy)?);
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.
@@ -174,6 +300,7 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    size_pools_as_series_x(&image);
     arm_watchdog_hold(&image);
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -196,6 +323,48 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// `VICTORY_TITLE_POOLS=series-x`: the title's start-up sizes its memory pools
+/// as on a Series X while the device stays what `--console` says
+/// (`victory_game::pools`). What the title is told of its memory follows.
+#[cfg(windows)]
+fn size_pools_as_series_x(image: &victory_loader::LoadedImage) {
+    const EXECUTE: u32 = 0x2000_0000;
+    let code: Vec<(u32, u32)> = image
+        .info()
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & EXECUTE != 0)
+        .map(|s| (s.rva, s.virtual_size))
+        .collect();
+    let asked = std::env::var(victory_game::pools::ENV).ok();
+    // SAFETY: the image is mapped and relocated, stays so for the run, and
+    // nothing of it has run yet.
+    let done = unsafe {
+        victory_game::pools::apply(asked.as_deref(), image.base(), &code, |at, was, new| {
+            victory_loader::code_patch::replace(at, was, new)
+        })
+    };
+    use victory_game::pools::Applied;
+    match done {
+        Applied::Off => {}
+        Applied::Patched(rva) => {
+            victory_hle::console::set_pools_of_series_x(true);
+            println!(
+                "title pools    sized as a Series X's (call at +{rva:#x}; {})",
+                victory_game::pools::ENV
+            );
+        }
+        Applied::NotFound => println!(
+            "title pools    {} is set, but this build's routine was not found: left as it is",
+            victory_game::pools::ENV
+        ),
+        Applied::Refused(rva) => println!(
+            "title pools    {} is set, but the call at +{rva:#x} could not be replaced: left as it is",
+            victory_game::pools::ENV
+        ),
+    }
 }
 
 /// Lets our stalls (a frame recording, host pipelines made on a title thread)
@@ -275,7 +444,7 @@ fn watch(base: usize, size: usize) {
 
 /// Debugging aid: `VICTORY_POKE=<rva>:<byte>,...` (hex) writes the byte at
 /// each title+rva twice a second. A title that ends itself when its main
-/// loop has not ticked for a while (Grand Theft Auto VI: 30 s) runs on
+/// loop has not ticked for a while (one such title: 30 s) runs on
 /// through slower frames with its tick flag poked. The address must be
 /// writable title data.
 #[cfg(all(windows, feature = "diagnostics"))]

@@ -255,6 +255,55 @@ static CALLS: Mutex<Vec<(u32, &'static str, String, u64)>> = Mutex::new(Vec::new
 thread_local! {
     /// The pipeline this thread is making (its shaders), for [`CALLS`].
     static LABEL: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Whether the pipeline this thread makes has static samplers
+    /// ([`with_static_samplers`]).
+    static STATIC_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pipelines this thread makes while the guard lives have static
+/// samplers (`samplers`): they are made, never loaded from or stored in the
+/// library, unless `VICTORY_LIBRARY_STATIC_SAMPLERS=1`.
+///
+/// Why: the card's driver (NVIDIA, 4070 SUPER) keeps static samplers in a
+/// table of its own and puts their places in that table into the compiled
+/// pipeline. A pipeline loaded from the library in another process keeps the
+/// places of the process that stored it; where that process made other
+/// static samplers first, they are other samplers. Measured
+/// (the other fork's `lut3d_probe` example, not carried here): a pipeline whose root signature has a point,
+/// a linear and a trilinear sampler, stored, then loaded in a process that
+/// made ten other static samplers before its own, sampled a 3D table
+/// through the linear one unfiltered (every result a table entry); made in
+/// that process instead, filtered. In the title, PS_CompositeNMB loaded so
+/// read its colour-grading tables unfiltered: posterized light in steps of
+/// 0.44 stops with green and magenta fringes (2026-11-26 runs; made in the
+/// run, the image was smooth). Every loaded pipeline with static samplers
+/// may read through another one's: other filters, address modes, levels
+/// and comparisons.
+/// shortcut: they are compiled every run (the driver's own cache on disk
+/// makes that quick); a fixed order of static samplers made before any
+/// pipeline would let the library keep them again.
+pub(crate) fn with_static_samplers(samplers: bool) -> StaticSamplers {
+    StaticSamplers(STATIC_SAMPLERS.replace(samplers && !static_samplers_kept()))
+}
+
+/// While it lives, the pipelines this thread makes skip the library if they
+/// have static samplers ([`with_static_samplers`]); the setting before it
+/// comes back when it is dropped.
+pub(crate) struct StaticSamplers(bool);
+
+impl Drop for StaticSamplers {
+    fn drop(&mut self) {
+        STATIC_SAMPLERS.set(self.0);
+    }
+}
+
+/// `VICTORY_LIBRARY_STATIC_SAMPLERS=1`: pipelines with static samplers are
+/// loaded from and stored in the library too, as before.
+fn static_samplers_kept() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_LIBRARY_STATIC_SAMPLERS").is_some_and(|v| v == "1")
+    })
 }
 
 /// Names the pipeline this thread makes next.
@@ -545,6 +594,20 @@ pub(crate) fn use_shards(files: &[PathBuf]) {
     *SHARDS.write().unwrap_or_else(|e| e.into_inner()) = shards;
 }
 
+/// From now on a pipeline the library does not have is also looked for in the library file `dir` holds
+/// (a cache a build before made, copied or kept): a `victory warm` process, which starts with an empty
+/// library of its own, then loads what the build before compiled with the same DXIL instead of compiling
+/// it again. What it finds is stored into its own library, so its shard carries it into the cache's
+/// library as any pipeline it made. False if there is no such file.
+pub(crate) fn use_cache_library(dir: &std::path::Path) -> bool {
+    let file = dir.join(LIBRARY_FILE);
+    if !file.is_file() {
+        return false;
+    }
+    use_shards(&[file]);
+    true
+}
+
 /// Writes the pipelines this process made, as a library, to `path` (a
 /// `victory warm` process, whose pipelines the merging process takes into the
 /// cache's library): nothing if there is nothing new since the last call.
@@ -570,6 +633,13 @@ pub(crate) fn save_shard(path: &std::path::Path) -> bool {
     true
 }
 
+/// How a pipeline came.
+#[derive(Clone, Copy)]
+enum Kind {
+    Loaded,
+    Made,
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -578,11 +648,27 @@ pub(crate) fn pipeline(
     create: impl FnOnce() -> windows::core::Result<ID3D12PipelineState>,
 ) -> windows::core::Result<ID3D12PipelineState> {
     let wide = HSTRING::from(name);
-    let Some(library) = library() else {
+    let Some(library) = library().filter(|_| !STATIC_SAMPLERS.get()) else {
         MADE.fetch_add(1, Ordering::Relaxed);
         return create();
     };
     let began = std::time::Instant::now();
+    // (For the pipelines line: what compiling and loading took.)
+    let timed = |kind: Kind| {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let us = began.elapsed().as_micros() as u64;
+            let (count, micros) = match kind {
+                Kind::Loaded => (C::PipelineLoads, C::PipelineLoadUs),
+                Kind::Made => (C::PipelineMakes, C::PipelineMakeUs),
+            };
+            add(count, 1);
+            add(micros, us);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = kind;
+    };
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
@@ -595,6 +681,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            timed(Kind::Loaded);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -628,6 +715,7 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    timed(Kind::Made);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(
@@ -871,6 +959,57 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// A cache copied from the build before is safe to use: a program's name in the library is made
+    /// of its DXIL, the root signature and the state, so of 50 programs of which one's DXIL changes,
+    /// exactly that one has another name (a miss), the 49 others have the name they had.
+    #[test]
+    fn of_two_builds_only_the_program_whose_code_changed_has_another_name() {
+        let code = |build: u32, n: u32| format!("dxil of program {n}{}", if build == 2 && n == 17 { " changed" } else { "" });
+        let names = |build| {
+            (0..50)
+                .map(|n| name("compute", b"root", &[code(build, n).as_bytes()], ""))
+                .collect::<Vec<_>>()
+        };
+        let (old, new) = (names(1), names(2));
+        let changed: Vec<usize> = (0..50).filter(|&n| old[n] != new[n]).collect();
+        assert_eq!(changed, [17]);
+        // And no two programs share a name, in either build.
+        assert_eq!(old.iter().collect::<HashSet<_>>().len(), 50);
+        assert_eq!(new.iter().collect::<HashSet<_>>().len(), 50);
+    }
+
+    #[test]
+    fn a_folder_without_a_library_is_not_a_place_to_look() {
+        let dir = std::env::temp_dir().join("victory-no-library-here");
+        assert!(!use_cache_library(&dir));
+    }
+
+    /// A pipeline with static samplers is made, not looked up in the library
+    /// (with or without a host); the guard gives the setting back.
+    #[test]
+    fn pipelines_with_static_samplers_skip_the_library() {
+        let looked = std::cell::Cell::new(false);
+        {
+            let _guard = with_static_samplers(true);
+            let made = pipeline(
+                "with static samplers",
+                |_, _| {
+                    looked.set(true);
+                    Err(windows::core::Error::empty())
+                },
+                || Err(windows::core::Error::empty()),
+            );
+            assert!(made.is_err());
+            assert!(!looked.get(), "the library was asked");
+            {
+                let _inner = with_static_samplers(false);
+                assert!(!STATIC_SAMPLERS.get());
+            }
+            assert!(STATIC_SAMPLERS.get());
+        }
+        assert!(!STATIC_SAMPLERS.get());
     }
 
     #[test]

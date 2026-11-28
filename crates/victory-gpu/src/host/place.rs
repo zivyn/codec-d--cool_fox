@@ -132,6 +132,7 @@ pub(super) fn read_by(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> bo
 /// # Safety
 /// An open list.
 unsafe fn wait_for_all(host: &Host, list: &ID3D12GraphicsCommandList) {
+    crate::host::ours::drain(crate::host::ours::Site::Place);
     static ENHANCED: OnceLock<bool> = OnceLock::new();
     let enhanced = *ENHANCED.get_or_init(|| {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();

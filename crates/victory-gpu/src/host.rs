@@ -791,6 +791,14 @@ fn stood(since: std::time::Instant) {
     CARD_CLOCK_US[2].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Whether the card has run everything sent to it, by the card's clock (set by its watch thread behind the last
+/// signal, cleared at each send): `VICTORY_CARD_AWAKE=idle` keeps the card awake only then.
+static CARD_IDLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn card_idle() -> bool {
+    CARD_IDLE.load(Ordering::Relaxed)
+}
+
 /// What [`CARD_CLOCK_US`] is measured with.
 struct CardClock {
     fence: ID3D12Fence,
@@ -831,6 +839,7 @@ fn card_clock_watch(clock: &'static CardClock) {
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.0 == target && state.1.is_none() {
             state.1 = Some((std::time::Instant::now(), worked()));
+            CARD_IDLE.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -3751,6 +3760,7 @@ mod askaside;
 pub(crate) mod waits;
 mod combine;
 pub(crate) mod awake;
+pub(crate) mod ours;
 mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]

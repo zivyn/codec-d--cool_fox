@@ -503,6 +503,7 @@ fn pass() -> Option<&'static Pass> {
 }
 
 fn uav_barrier(list: &ID3D12GraphicsCommandList) {
+    crate::host::ours::drain(crate::host::ours::Site::Ambient);
     let barrier = D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() };
     // SAFETY: an open list; the barrier names no resource.
     unsafe { list.ResourceBarrier(&[barrier]) };

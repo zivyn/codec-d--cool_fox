@@ -286,7 +286,7 @@ mod tests {
         lazy.title_wait();
         lazy.command(&w(1, 0, 64)); // emitted: earlier lists
         lazy.title_wait();
-        assert!(lazy.command(&w(1, 4096, 4160)) == false);
+        assert!(!lazy.command(&w(1, 4096, 4160)));
         // The wait stands before a write that something after the list may read.
         assert!(lazy.close());
         assert!(!lazy.close(), "once");

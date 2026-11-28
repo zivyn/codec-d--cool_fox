@@ -5839,7 +5839,7 @@ mod many_askers_tests {
     /// CI only (the `stress_guards` input of build.yml): a case of the tests above run again and again with varied
     /// counts of threads (and idle cores taken by spinners every third time), and the runs that lost a write
     /// counted, so that a flake has a rate. `VICTORY_STRESS_CASE` (`mixed_r50_1v`, `mixed_r0_3v`, `mixed_r50_3v`,
-    /// `s64_r50_1v`, `s0_r50_1v`, `s2_r50_1v`), `VICTORY_STRESS_N` runs at most, `VICTORY_STRESS_SECS` at most,
+    /// `s64_r50_1v`, `s0_r50_1v`, `s2_r50_1v`, `s64_r0_1v`, `s2_r0_1v`, `in_stripes`), `VICTORY_STRESS_N` runs at most, `VICTORY_STRESS_SECS` at most,
     /// `VICTORY_STRESS_LEAN=1` for the switches of cpu5. Fails if a run lost a write (or failed otherwise).
     #[test]
     #[ignore = "the stress of the CI job stress-guards"]
@@ -5882,6 +5882,15 @@ mod many_askers_tests {
                     "s64_r50_1v" => one_case::<1>(50, 64, lean_on),
                     "s0_r50_1v" => one_case::<1>(50, 0, lean_on),
                     "s2_r50_1v" => one_case::<1>(50, 2, lean_on),
+                    "s64_r0_1v" => one_case::<1>(0, 64, lean_on),
+                    "s2_r0_1v" => one_case::<1>(0, 2, lean_on),
+                    // The body of `no_write_to_views_is_lost_between_askers_in_stripes`.
+                    "in_stripes" => {
+                        for shards in [64, 2] {
+                            one_case::<1>(0, shards, lean_on);
+                            one_case::<1>(50, shards, lean_on);
+                        }
+                    }
                     unknown => panic!("no such case {unknown}"),
                 });
                 stop.store(true, Relaxed);

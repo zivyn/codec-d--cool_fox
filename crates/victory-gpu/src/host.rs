@@ -5300,6 +5300,7 @@ impl Host {
             }
         }
         work.taken = at;
+        crate::echo::pieces(plan.ranges.iter().filter(|r| r.compared).map(|r| (r.shadow.id(), r.span.first, r.span.pieces)));
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));

@@ -45,6 +45,41 @@ pub(crate) fn skip_refused(why: usize) {
     SKIPS[why.min(4)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Since the last frame-rate line: pieces the compare passes were given, and those of them that no other pass of the same
+/// submission over the same copy was given too.
+static PIECES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A submission's compare passes: (copy, first piece, pieces) of each. A piece two passes of one copy hold is read twice.
+pub(crate) fn pieces(spans: impl Iterator<Item = (u64, u32, u32)>) {
+    let all: Vec<(u64, u32, u32)> = spans.collect();
+    if all.is_empty() {
+        return;
+    }
+    let (given, unique) = given_and_unique(all);
+    PIECES[0].fetch_add(given, std::sync::atomic::Ordering::Relaxed);
+    PIECES[1].fetch_add(unique, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Pieces `all` (copy, first piece, pieces) hold, counted with their repeats and without.
+fn given_and_unique(mut all: Vec<(u64, u32, u32)>) -> (u64, u64) {
+    all.sort_unstable();
+    let (mut given, mut unique) = (0u64, 0u64);
+    let mut reach = (u64::MAX, 0u32);
+    for (copy, first, n) in all {
+        given += u64::from(n);
+        let end = first + n;
+        if reach.0 != copy || first >= reach.1 {
+            unique += u64::from(n);
+            reach = (copy, end);
+        } else if end > reach.1 {
+            unique += u64::from(end - reach.1);
+            reach.1 = end;
+        }
+    }
+    (given, unique)
+}
+
 /// For the frame-rate line, over `frames` frames.
 pub(crate) fn line(frames: f64) {
     let [none, short, stamped, differed, left] =
@@ -57,6 +92,15 @@ pub(crate) fn line(frames: f64) {
             short as f64 / frames,
             stamped as f64 / frames,
             differed as f64 / frames
+        );
+    }
+    let [given, unique] = [0, 1].map(|i| PIECES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    if given > 0 {
+        tracing::info!(
+            "pieces the compare passes were given per frame: {:.0}, of them {:.0} in no other pass of the same submission over the same copy ({:.0} read twice or more)",
+            given as f64 / frames,
+            unique as f64 / frames,
+            (given - unique) as f64 / frames
         );
     }
     let [looked, taken] = [0, 1].map(|i| BYTES[i].swap(0, std::sync::atomic::Ordering::Relaxed));
@@ -278,6 +322,21 @@ mod tests {
         };
         assert_eq!(runs, vec![(0, len)]);
         assert_eq!(held, title);
+    }
+
+    #[test]
+    fn pieces_two_passes_hold_are_counted_once() {
+        // Copy 1: passes over pieces 0..4, 2..6 and 10..11; copy 2: 0..4 (not the same copy as copy 1's).
+        // Given 4 + 4 + 4 + 1 = 13; unique: copy 1 holds 0..6 and 10..11 = 7, copy 2 holds 4.
+        assert_eq!(
+            given_and_unique(vec![(1, 0, 4), (2, 0, 4), (1, 2, 4), (1, 10, 1)]),
+            (13, 11)
+        );
+        // One pass inside another, and the same pass twice.
+        assert_eq!(
+            given_and_unique(vec![(7, 0, 10), (7, 3, 2), (7, 0, 10)]),
+            (22, 10)
+        );
     }
 
     #[test]

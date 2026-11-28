@@ -7754,6 +7754,28 @@ mod quiet_tests {
         title[1 << 20] ^= 1;
         assert_eq!(bare.update(start, LEN), LEN);
     }
+
+    /// A whole copy that takes only what differs (`VICTORY_QUIET_COMPARE`): the copy ends up holding title memory,
+    /// and only the blocks that changed since the last are noted for the card.
+    #[test]
+    fn a_whole_copy_by_comparing_notes_only_the_blocks_that_differ() {
+        let mut title: Vec<u8> = (0..LEN).map(|i| (i % 241) as u8 | 1).collect();
+        let mut held = vec![0u8; LEN];
+        let start = title.as_ptr() as usize;
+        let copy = Shadow::unbacked(start as u64, held.as_mut_ptr(), LEN as u64, true);
+        assert_eq!(copy.copy_differing(start, start + LEN), LEN);
+        assert_eq!(held, title);
+        assert_eq!(copy.take_dirty(), vec![(0, LEN)], "the first time all of it differs");
+        // The same title memory: nothing goes up.
+        assert_eq!(copy.copy_differing(start, start + LEN), LEN);
+        assert!(copy.take_dirty().is_empty());
+        title[5 * 4096 + 7] ^= 1;
+        title[(3 << 20) + 100] ^= 1;
+        title[LEN - 1] ^= 1;
+        copy.copy_differing(start, start + LEN);
+        assert_eq!(held, title);
+        assert_eq!(copy.take_dirty(), vec![(5 * 4096, 6 * 4096), (3 << 20, (3 << 20) + 4096), (LEN - 4096, LEN)]);
+    }
 }
 
 #[cfg(test)]

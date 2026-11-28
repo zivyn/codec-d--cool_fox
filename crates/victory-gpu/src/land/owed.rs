@@ -67,6 +67,9 @@ pub(crate) struct Unit {
     from: usize,
     to: usize,
     state: AtomicU8,
+    /// Whether its pages were made `PAGE_GUARD` (or are being): for
+    /// [`finished_lately`].
+    armed: std::sync::atomic::AtomicBool,
     land: Mutex<Option<Land>>,
     /// Told when a thread other than the lander touches the unit (the copies
     /// of its pieces are then ones the title reads).
@@ -77,6 +80,15 @@ pub(crate) struct Unit {
 static UNITS: RwLock<Vec<Arc<Unit>>> = RwLock::new(Vec::new());
 /// How many are not done.
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// The page ranges (from, to) of units that were done with and forgotten by
+/// [`finish_all`] less than [`GRACE`] ago, and when. A thread that touched an
+/// owed page raised its guard page violation before the unit was done and
+/// reaches [`fault`] after it: the guard is spent, and the access only has to
+/// go on.
+static FINISHED: Mutex<Vec<(usize, usize, std::time::Instant)>> = Mutex::new(Vec::new());
+/// How long [`FINISHED`] remembers a unit: the dispatch of an exception takes
+/// microseconds, a preempted thread's a few time slices.
+const GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 static DONE_CV: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Since the last frame-rate line: units, their bytes, touches that landed one
@@ -145,6 +157,7 @@ pub(crate) fn register(units: Vec<(usize, usize, Land, Box<dyn Fn() + Send + Syn
             from,
             to,
             state: AtomicU8::new(PENDING),
+            armed: std::sync::atomic::AtomicBool::new(true),
             land: Mutex::new(Some(land)),
             touched,
         });
@@ -160,6 +173,7 @@ pub(crate) fn register(units: Vec<(usize, usize, Land, Box<dyn Fn() + Send + Syn
             continue;
         }
         // Not armed: given back, as done.
+        unit.armed.store(false, Ordering::SeqCst);
         STATS[UNARMED].fetch_add(1, Ordering::Relaxed);
         let land = unit.land.lock().unwrap_or_else(|e| e.into_inner()).take();
         unit.state.store(DONE, Ordering::SeqCst);
@@ -259,14 +273,38 @@ pub(crate) fn fault(at: usize) -> bool {
     true
 }
 
-/// (The test's: nothing is remembered.)
-#[cfg(test)]
-static FINISHED: Mutex<Vec<(usize, usize, std::time::Instant)>> = Mutex::new(Vec::new());
-#[cfg(test)]
-const GRACE: std::time::Duration = std::time::Duration::from_millis(250);
-#[cfg(test)]
-pub(crate) fn finished_lately(_at: usize) -> bool {
-    false
+/// For the handler of `crate::watch`, on a guard page violation at `at` that
+/// no unit owed and nothing else armed: whether the page belongs to a unit
+/// that is done (or was a moment ago). The violation was raised while it was
+/// owed, and the unit landed before the handler got here: the guard went with
+/// the access, and the memory is the landing's, so the access goes on.
+pub(crate) fn finished_lately(at: usize) -> bool {
+    let within = |from: usize, to: usize| from <= at && at < to;
+    // (Looked at in this order: `finish_all` notes a unit in `FINISHED`
+    // before it takes it from `UNITS`.)
+    if UNITS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|u| {
+            within(u.from, u.to)
+                && u.state.load(Ordering::SeqCst) == DONE
+                && u.armed.load(Ordering::SeqCst)
+        })
+    {
+        return true;
+    }
+    let now = std::time::Instant::now();
+    FINISHED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(from, to, when)| within(from, to) && now.duration_since(when) < GRACE)
+}
+
+/// Whether any unit is owed.
+pub(crate) fn active() -> bool {
+    ACTIVE.load(Ordering::SeqCst) != 0
 }
 
 /// Before our own read or the kernel's write of title memory `[at, at + len)`:
@@ -307,6 +345,13 @@ pub(crate) fn finish_all() {
     let units: Vec<Arc<Unit>> = {
         let all = UNITS.read().unwrap_or_else(|e| e.into_inner());
         if all.is_empty() {
+            drop(all);
+            // (What was forgotten long ago is let go of.)
+            let mut finished = FINISHED.lock().unwrap_or_else(|e| e.into_inner());
+            if !finished.is_empty() {
+                let now = std::time::Instant::now();
+                finished.retain(|f| now.duration_since(f.2) < GRACE);
+            }
             return;
         }
         all.clone()
@@ -314,10 +359,20 @@ pub(crate) fn finish_all() {
     for unit in &units {
         ensure(unit);
     }
-    UNITS
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|u| u.state.load(Ordering::SeqCst) != DONE);
+    let mut all = UNITS.write().unwrap_or_else(|e| e.into_inner());
+    {
+        let now = std::time::Instant::now();
+        let mut finished = FINISHED.lock().unwrap_or_else(|e| e.into_inner());
+        finished.retain(|f| now.duration_since(f.2) < GRACE);
+        finished.extend(
+            all.iter()
+                .filter(|u| {
+                    u.state.load(Ordering::SeqCst) == DONE && u.armed.load(Ordering::SeqCst)
+                })
+                .map(|u| (u.from, u.to, now)),
+        );
+    }
+    all.retain(|u| u.state.load(Ordering::SeqCst) != DONE);
 }
 
 #[cfg(test)]

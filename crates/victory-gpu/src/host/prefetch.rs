@@ -44,10 +44,14 @@ pub(super) fn on() -> bool {
     crate::queue::pipeline_prepare() && late() && relay_exact()
 }
 
-/// Whether the next submission's refreshes may begin (the test).
-#[cfg(test)]
-pub(super) fn may_offer(_own: bool, _nothing_sent: bool) -> bool {
-    true
+/// Whether the next submission's refreshes may begin once a submission's card
+/// copies are taken: `own` (the bytes were taken into copies of the send's own),
+/// `nothing_sent` (no copy has bytes to go up). Without own copies the list
+/// that brings the card up to date reads the copies' CPU side when the card
+/// runs it, and the refreshes of the next submission write there meanwhile:
+/// the card would get a mix of two frames' bytes.
+pub(super) fn may_offer(own: bool, nothing_sent: bool) -> bool {
+    own || nothing_sent
 }
 
 /// Whether something was ever offered: from then on [`join`] looks at the gate whether the switch is on or not.

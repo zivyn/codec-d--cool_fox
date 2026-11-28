@@ -1843,7 +1843,8 @@ type Job = Box<dyn FnOnce() + Send>;
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    /// Each with the number of the [`wide`] call that made it.
+    jobs: Mutex<std::collections::VecDeque<(u64, Job)>>,
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
@@ -1893,7 +1894,7 @@ fn workers() -> &'static Workers {
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(job) = jobs.pop_front() {
+                            if let Some((_, job)) = jobs.pop_front() {
                                 workers.there.fetch_sub(1, Ordering::AcqRel);
                                 break job;
                             }
@@ -1920,25 +1921,38 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    // The number of this call: the thread that waits below takes only the
+    // jobs of its own call. A job of another call may want a lock that this
+    // thread holds (a copy's `copied`, held across the nested `wide` of
+    // `Shadow::take_all`, and wanted by another span of the same copy in the
+    // outer `wide_each`), and then nobody ever gets out of it.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
+            queue.push_back((
+                call,
+                Box::new(move || {
+                    job();
+                    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *n -= 1;
+                    if *n == 0 {
+                        left.1.notify_all();
+                    }
+                }),
+            ));
         }
     }
     workers.more.notify_all();
     loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        let job = {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            queue.iter().position(|(of, _)| *of == call).and_then(|i| queue.remove(i)).map(|(_, job)| job)
+        };
         match job {
             Some(job) => {
                 workers.there.fetch_sub(1, Ordering::AcqRel);

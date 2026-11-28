@@ -2879,6 +2879,9 @@ pub mod mapping_stats {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // (Told of what was unmapped before, as well: nothing owed is left to
+    // land over the new memory.)
+    crate::land::owed::land_range(at, len);
     crate::texback::remapped(at, len);
     open(&mut title_memory_changed(at, len), at, at.saturating_add(len));
 }
@@ -2889,6 +2892,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// before the unmapping would leave the address guarded, clean and known by
 /// its bits ([`PUBLISHED`]) with no view behind it.
 pub fn title_memory_unmapping(at: usize, len: usize) {
+    // What shaders wrote there and is owed lands while it is the same memory.
+    crate::land::owed::land_range(at, len);
     crate::texback::remapped(at, len);
     let mut g = title_memory_changed(at, len);
     if CHANGING.get().0 && len != 0 {
@@ -2913,6 +2918,12 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // What shaders wrote there and is owed lands now, while it is the title's
+    // memory: after the free it may be another allocation's.
+    if crate::land::owed::active() {
+        let len = if len != 0 { len } else { allocation_end(at, at).saturating_sub(at) };
+        crate::land::owed::land_range(at, len);
+    }
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
@@ -3010,8 +3021,10 @@ pub(crate) fn install() {
         // noted, and the access goes on. Another guard page is not ours.
         if r.ExceptionCode == 0x8000_0001u32 as NTSTATUS && r.NumberParameters >= 2 {
             let write = r.ExceptionInformation[0] == 1;
+            // (Last: a page of a unit that landed since the touch.)
             return if crate::land::owed::fault(r.ExceptionInformation[1])
                 || crate::readprobe::fault(r.ExceptionInformation[1], r.ExceptionAddress as usize, write)
+                || crate::land::owed::finished_lately(r.ExceptionInformation[1])
             {
                 EXCEPTION_CONTINUE_EXECUTION
             } else {

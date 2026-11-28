@@ -4828,7 +4828,7 @@ impl Host {
         declared: &[Declared],
         picked: &crate::picked::Ranges,
         flown: bool,
-        after_take: &mut dyn FnMut(),
+        after_take: &mut dyn FnMut(bool),
     ) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
@@ -4880,8 +4880,10 @@ impl Host {
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
         // What the card is sent is out of the copies: the next submission's
-        // refreshes may begin ([`prefetch`]).
-        after_take();
+        // refreshes may begin ([`prefetch`]). Not if the list below copies
+        // the CPU side itself, when the card runs it (no own copies): the
+        // refreshes would change what it reads.
+        after_take(prefetch::may_offer(own.is_some(), dirty.is_empty()));
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -6484,10 +6486,11 @@ impl Host {
             Vec::new()
         };
         let mut offered = false;
-        let card = self.card_before(&declared, &picked, flown, &mut || {
+        let card = self.card_before(&declared, &picked, flown, &mut |taken| {
             if !offered {
+                // (Told once, as it may not be offered later either.)
                 offered = true;
-                if early {
+                if early && taken {
                     prefetch::offer(&excluding);
                 }
             }

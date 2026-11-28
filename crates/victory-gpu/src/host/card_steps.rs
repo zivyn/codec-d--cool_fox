@@ -177,6 +177,11 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
     if stage() < 2 {
         return Vec::new();
     }
+    copies_in(line)
+}
+
+/// [`copies`] whatever the stage says.
+fn copies_in(line: &Line) -> Vec<Writer> {
     let flying = line.line.iter().filter_map(|l| match l {
         Late::Run(flight) => flight.own.as_ref(),
         _ => None,
@@ -185,25 +190,31 @@ pub(super) fn copies(line: &Line) -> Vec<Writer> {
         shadow: w.shadow.clone(),
         ..*w
     });
-    flying.flat_map(Taken::copied).chain(landing).collect()
+    // (And those of the submissions being sent, not yet flights in the line: the thread of stage A looks at the
+    // next submission while the one before is sent.)
+    let sending = line.pending_copies.iter().flat_map(|p| p.1.iter()).map(|w| Writer {
+        shadow: w.shadow.clone(),
+        ..*w
+    });
+    flying.flat_map(Taken::copied).chain(landing).chain(sending).collect()
 }
 
 /// Whether `runs` refresh another host copy of a destination in `copies`,
 /// or read it in a step that flights are not waited for otherwise
 /// (`Step::Host`): that reads title memory, where the copy is not yet.
-pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
+pub(super) fn copied_read<L: onepass::StepList>(copies: &[Writer], runs: &[L]) -> bool {
     if copies.is_empty() {
         return false;
     }
     runs.iter().any(|list| {
-        list.deferred().copies.iter().any(|step| match step {
+        list.steps(|steps| steps.iter().any(|step| match step {
             Step::Refresh(shadow, at, len) => copies
                 .iter()
                 .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
             Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
             Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
             _ => false,
-        })
+        }))
     })
 }
 
@@ -894,7 +905,7 @@ impl Taken {
         onepass::steps_by_list(self.steps.iter().copied(), &ids)
     }
 
-    fn copied(&self) -> impl Iterator<Item = Writer> {
+    pub(super) fn copied(&self) -> impl Iterator<Item = Writer> {
         self.copied.iter().map(|(shadow, from, to)| Writer {
             shadow: Some(shadow.clone()),
             from: *from,
@@ -1631,6 +1642,37 @@ mod tests {
         // Without gaps allowed only touching reads join.
         assert_eq!(merged_reads(&reads[..3], 0).len(), 3);
         assert_eq!(merged_reads(&[(1, 0, 0, 512), (1, 512, 512, 512)], 0), [(0, 1024)]);
+    }
+
+    /// A submission being sent is not a flight in the line until its send is over, and the thread of stage A looks at the
+    /// next submission meanwhile: the card copies of the one being sent are what it is asked about from the moment they
+    /// are registered, and end with it (rev2).
+    #[test]
+    fn the_card_copies_of_a_submission_being_sent_are_seen_before_it_is_a_flight() {
+        let data: &'static mut [u8] = Box::leak(vec![0u8; 0x4000].into_boxed_slice());
+        let (mine, other) = (Shadow::unbacked(0x1000, data.as_mut_ptr(), 0x4000, false), Shadow::unbacked(0x1000, data.as_mut_ptr(), 0x4000, false));
+        let mut line = Line::new();
+        assert!(copies_in(&line).is_empty());
+        let copy = || Writer { shadow: Some(mine.clone()), from: 0x2000, to: 0x2100, copy: true };
+        let id = line.register_pending_with(vec![(0x2000, 0x2100)], vec![copy()]);
+        let seen = copies_in(&line);
+        assert_eq!(seen.len(), 1);
+        // Another host copy of the destination refreshed by the next submission: it waits. The same host copy, or other
+        // bytes: it does not.
+        let refresh = |shadow: &Arc<Shadow>, at: usize, len: usize| vec![Step::Refresh(shadow.clone(), at, len)];
+        assert!(copied_read(&seen, &[refresh(&other, 0x2040, 0x40)]), "another host copy of the destination");
+        assert!(!copied_read(&seen, &[refresh(&mine, 0x2040, 0x40)]), "the copy's own host copy");
+        assert!(!copied_read(&seen, &[refresh(&other, 0x2100, 0x40)]), "past the destination");
+        // Made a flight (the registration ends under the lock the push holds), or dropped: the line holds its copies
+        // only while it is registered.
+        line.clear_pending(id);
+        assert!(copies_in(&line).is_empty());
+        let id = line.register_pending_with(vec![(0x2000, 0x2100)], vec![copy()]);
+        {
+            let Line { pending, pending_copies, .. } = &mut line;
+            PendingFlight(Some(id)).done(pending, pending_copies);
+        }
+        assert!(copies_in(&line).is_empty() && line.pending_copies.is_empty());
     }
 
     /// A value written behind a flight, or a read-back, is in no host copy

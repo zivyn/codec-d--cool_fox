@@ -45,12 +45,19 @@
 //! 5. **Flights.** What the one before declared written is in the line (`PendingFlight`,
 //!    `VICTORY_PENDING_FLIGHT=1`, which this needs) before the offer, so what the
 //!    thread asks of flights ([`late_blocked`], [`stale_under_flights`], `air`) includes
-//!    it; flights only land from then on (what is written only shrinks), and the thread
+//!    it, and so are the destinations of the copies it does on the card
+//!    (`Line::pending_copies`: until it is a flight in the line, the thread would refresh
+//!    another host copy of them from title memory the copy has not reached yet);
+//!    flights only land from then on (what is written only shrinks), and the thread
 //!    of submissions finds the same or less when it takes what was done.
 //! 6. **Numbers.** The thread takes the submission's number (`STARTED`) before its
 //!    steps; threads that would take one between (a submission that is waited for,
-//!    `Host::execute`) wait until it is taken ([`quiesce`]), so numbers stay in the
-//!    order of the lists.
+//!    `Host::execute`) wait until it is taken ([`lock_quiet`]: decided under the submission
+//!    lock, which is where the thread of submissions takes and offers), so numbers stay in
+//!    the order of the lists.
+//! 7. **A submission that is cut is not offered.** While the first half of a submission cut in two is
+//!    sent, the line's first entry is not the next one (the second half is on the stack): nothing is
+//!    offered then ([`split_pending`]), or the lists the thread prepared would not be those that come next.
 //!
 //! What is not done on the thread: the snapshots, the declarations of picked ranges, the
 //! take (they are stage B), and the submissions that wait for flights.
@@ -90,7 +97,7 @@ static DONE: Mutex<Option<Front>> = Mutex::new(None);
 static OFFERED_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Threads that are not the thread of submissions wait here while stage A of a submission is asked for and not
-/// taken ([`quiesce`]).
+/// taken ([`lock_quiet`]).
 struct Hold {
     held: Mutex<bool>,
     changed: std::sync::Condvar,
@@ -123,6 +130,39 @@ impl Hold {
 }
 
 static HOLD: Hold = Hold::new();
+
+impl Hold {
+    /// Whether stage A of a submission is asked for and not taken.
+    fn is_held(&self) -> bool {
+        *self.held.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+thread_local! {
+    /// On the thread of submissions: how many halves of cut submissions are being sent (the second half waits on the stack).
+    static SPLITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While it lives, the thread of submissions sends the first half of a submission that was cut (`Host::execute_parts`):
+/// [`offer`] asks for nothing, as the line's first entry is not the submission that comes next after this half (the
+/// second half is), and the thread's work for another would be stopped for by [`take`] after its steps were done.
+pub(super) struct SplitPending(());
+
+pub(super) fn split_pending() -> SplitPending {
+    SPLITS.with(|s| s.set(s.get() + 1));
+    SplitPending(())
+}
+
+impl Drop for SplitPending {
+    fn drop(&mut self) {
+        SPLITS.with(|s| s.set(s.get().saturating_sub(1)));
+    }
+}
+
+/// Whether the half of a cut submission is being sent on this thread.
+fn split_pending_here() -> bool {
+    SPLITS.with(|s| s.get() > 0)
+}
 
 thread_local! {
     /// This is the thread of submissions (it asked for stage A of a submission).
@@ -170,7 +210,7 @@ fn same(front: &Front, runs: &[usize], parts: &[usize]) -> bool {
 /// asks the thread to do stage A of the submission that comes next. Whether it was asked (the thread of submissions
 /// then takes it at its turn: [`take`]).
 pub(super) fn offer() -> bool {
-    if !on() {
+    if !on() || split_pending_here() {
         return false;
     }
     let Some((_, lists, parts)) = crate::queue::prefold_next() else {
@@ -240,17 +280,34 @@ impl Front {
     }
 }
 
-/// Before a submission that is waited for takes its number and the submission lock: the threads of the title that
-/// make one (`Host::execute`, an internal upload list) wait until stage A of the next submission of the line has
-/// taken its number and been taken, so that numbers stay in the order of the lists. (At most 200 ms: nothing is waited
-/// for forever.)
-pub(super) fn quiesce() {
-    if LANE.with(|l| l.get()) && crate::queue::line_on() {
-        // (The thread of submissions does not wait for itself.)
-        return;
-    }
-    if OFFERED_EVER.load(Ordering::Acquire) {
-        HOLD.wait(std::time::Duration::from_millis(200));
+/// The submission lock for a submission that is waited for and takes its number under it: the threads of the title
+/// that make one (`Host::execute`, an internal upload list) get it only when stage A of the next submission of the
+/// line is not asked for, so that numbers stay in the order of the lists. (At most 200 ms: nothing is waited for
+/// forever.) `lock` takes the submission lock.
+///
+/// Whether stage A is asked for is decided with the lock held: the thread of submissions takes a submission and offers
+/// the next under it, and a thread that looked before the lock could see "not asked for" in between and get the
+/// lock after the offer (rev2). With stage A asked for, the lock is let go while it is waited for, or the thread of
+/// submissions could not take what was done.
+pub(super) fn lock_quiet<G>(lock: impl FnMut() -> G) -> G {
+    // (The thread of submissions does not wait for itself.)
+    let exempt = (LANE.with(|l| l.get()) && crate::queue::line_on()) || !OFFERED_EVER.load(Ordering::Acquire);
+    acquire(&HOLD, exempt, std::time::Duration::from_millis(200), lock)
+}
+
+fn acquire<G>(hold: &Hold, exempt: bool, most: std::time::Duration, mut lock: impl FnMut() -> G) -> G {
+    let began = std::time::Instant::now();
+    loop {
+        let guard = lock();
+        if exempt || !hold.is_held() {
+            return guard;
+        }
+        let left = most.saturating_sub(began.elapsed());
+        if left.is_zero() {
+            return guard;
+        }
+        drop(guard);
+        hold.wait(left);
     }
 }
 
@@ -409,6 +466,60 @@ mod tests {
         assert!(!same(&front, &[a, b], &[2]), "fewer lists");
         assert!(!same(&front, &[a, b, c], &[1]), "another part");
         assert!(!same(&front, &[a, b, c], &[]), "no part");
+    }
+
+    /// While the first half of a cut submission is sent nothing is offered, and the count nests.
+    #[test]
+    fn nothing_is_offered_while_the_first_half_of_a_cut_submission_is_sent() {
+        assert!(!split_pending_here());
+        let outer = split_pending();
+        assert!(split_pending_here());
+        {
+            let _inner = split_pending();
+            assert!(split_pending_here());
+        }
+        assert!(split_pending_here(), "the outer half is still being sent");
+        // Another thread is not the thread of submissions.
+        assert!(!std::thread::spawn(split_pending_here).join().unwrap());
+        assert!(!offer(), "nothing offered");
+        drop(outer);
+        assert!(!split_pending_here());
+    }
+
+    /// A thread that looked at the hold before it had the lock may find stage A asked for once it has it (the thread of
+    /// submissions offered between): it lets the lock go, waits, and does not return with the lock while stage A is asked
+    /// for; nor does it wait beyond the time given.
+    #[test]
+    fn a_thread_that_waits_for_its_number_decides_under_the_lock() {
+        let hold = std::sync::Arc::new(Hold::new());
+        let lock = std::sync::Arc::new(Mutex::new(0u32));
+        let ms = std::time::Duration::from_millis;
+        // Not asked for: the lock, at once.
+        drop(acquire(&hold, false, ms(500), || lock.lock().unwrap()));
+        // Asked for, and taken while the thread waits: it returns with the lock after, never before. The lock can be
+        // had by others (the thread of submissions) meanwhile.
+        hold.set(true);
+        let waiter = {
+            let (hold, lock) = (hold.clone(), lock.clone());
+            std::thread::spawn(move || {
+                let guard = acquire(&hold, false, ms(10_000), || lock.lock().unwrap());
+                let quiet = !hold.is_held();
+                drop(guard);
+                quiet
+            })
+        };
+        std::thread::sleep(ms(60));
+        assert!(lock.try_lock().is_ok(), "the waiting thread does not hold the lock");
+        assert!(!waiter.is_finished(), "still waiting for stage A to be taken");
+        hold.set(false);
+        assert!(waiter.join().unwrap(), "stage A was not asked for when the lock was returned");
+        // The thread of submissions is not held; nor is a thread that waited the time given.
+        hold.set(true);
+        drop(acquire(&hold, true, ms(500), || lock.lock().unwrap()));
+        let began = std::time::Instant::now();
+        drop(acquire(&hold, false, ms(40), || lock.lock().unwrap()));
+        assert!(began.elapsed() < ms(2000));
+        hold.set(false);
     }
 
     /// Threads that wait for their number wait while stage A is asked for and not taken, at most the time given, and

@@ -111,6 +111,10 @@ pub(crate) struct Ledger {
     dirty: Mutex<BTreeMap<usize, u64>>,
     /// How many pages `dirty` holds (read without the lock).
     count: AtomicUsize,
+    /// The asking number the journal had reached when the ledger was registered: a note numbered up to it may have
+    /// been applied before the ledger existed, and the copy took its bytes after the write (so the ledger lacking it
+    /// is right and the journal's "stale" is not a loss: the shadow check leaves such notes out).
+    since: AtomicU64,
 }
 
 impl Ledger {
@@ -121,7 +125,14 @@ impl Ledger {
             id,
             dirty: Mutex::new(BTreeMap::new()),
             count: AtomicUsize::new(0),
+            since: AtomicU64::new(0),
         })
+    }
+
+    /// The asking number before which notes may have been applied without this ledger (0: none, as a ledger that is
+    /// not registered).
+    pub(crate) fn since(&self) -> u64 {
+        self.since.load(Acquire)
     }
 
     fn dirty(&self) -> std::sync::MutexGuard<'_, BTreeMap<usize, u64>> {
@@ -261,6 +272,8 @@ impl Plane {
         if index.all.insert(ledger.id, ledger.clone()).is_some() {
             return;
         }
+        // (Read once the ledger is in the index: a note numbered above it is queued after, and applied to the ledger.)
+        ledger.since.store(crate::watch::asked_so_far(), Release);
         if ledger.end - ledger.first > BIG {
             index.big.push(ledger.clone());
             return;
@@ -451,7 +464,7 @@ pub(crate) fn check_look(
     copied: &[u64],
     ranged: u64,
 ) {
-    let journal = crate::watch::journal_stale(start, end, base, copied, ranged);
+    let journal = crate::watch::journal_stale(start, end, base, copied, ranged, ledger.since());
     drain();
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let held = first

@@ -101,6 +101,11 @@ fn next_asking() -> u64 {
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
+/// The number of the last asking made (0: none): every note numbered up to it was made before this call.
+pub(crate) fn asked_so_far() -> u64 {
+    ASKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// A title-memory range whose changed pages another subsystem needs to read.
 pub(crate) struct Tracked {
     start: usize,
@@ -1026,15 +1031,16 @@ pub(crate) fn covered(start: usize, end: usize) -> bool {
 
 /// Whether the journal says a page of `[start, end)` was written after the copy with the notes `copied` (from page
 /// `base`) and `ranged` took it (`crate::pagedrive`, mode 1: what the ledger has to hold). Pages never taken are
-/// not counted: they are stale by `copied` alone.
-pub(crate) fn journal_stale(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+/// not counted: they are stale by `copied` alone, nor are notes numbered up to `since` (the ledger's registration: the
+/// copy took the page after those writes, whatever stamp the asking gave it).
+pub(crate) fn journal_stale(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, since: u64) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
     journal().written.range(first..last).any(|(&page, &write)| {
         let at = taken[page - first].max(ranged);
-        at != 0 && write > at
+        at != 0 && write > at && write > since
     })
 }
 

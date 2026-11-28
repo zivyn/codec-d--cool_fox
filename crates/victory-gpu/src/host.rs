@@ -2819,6 +2819,10 @@ struct Line {
     /// registered, and kept there by every rebuilding of `written`, until the
     /// flight is in `line`.
     pending: Vec<(u64, Vec<(usize, usize)>)>,
+    /// The destinations of the copies the registered submissions do on the card ([`card_steps`]), by the same number:
+    /// until the flight is in `line`, nothing else tells that title memory there is not yet what the copy will put
+    /// (rev2: the thread of stage A refreshed another host copy of such a destination).
+    pending_copies: Vec<(u64, Vec<card_steps::Writer>)>,
     pending_next: u64,
 }
 
@@ -2839,16 +2843,26 @@ impl Line {
             in_hand: Vec::new(),
             landing: Vec::new(),
             pending: Vec::new(),
+            pending_copies: Vec::new(),
             pending_next: 0,
         }
     }
 
     /// Declares `ranges` written by a submission being prepared: they are in
     /// `written` now. The number to end it with ([`Line::clear_pending`]).
+    #[cfg(test)]
     fn register_pending(&mut self, ranges: Vec<(usize, usize)>) -> u64 {
+        self.register_pending_with(ranges, Vec::new())
+    }
+
+    /// [`Line::register_pending`] with the destinations of the copies the submission does on the card.
+    fn register_pending_with(&mut self, ranges: Vec<(usize, usize)>, copies: Vec<card_steps::Writer>) -> u64 {
         self.pending_next += 1;
         join_ranges(&mut self.written, ranges.iter().copied());
         self.pending.push((self.pending_next, ranges));
+        if !copies.is_empty() {
+            self.pending_copies.push((self.pending_next, copies));
+        }
         self.pending_next
     }
 
@@ -2857,6 +2871,7 @@ impl Line {
     /// nothing waits for flights that are not there.
     fn clear_pending(&mut self, id: u64) {
         self.pending.retain(|p| p.0 != id);
+        self.pending_copies.retain(|p| p.0 != id);
         if self.line.is_empty() && self.in_hand.is_empty() && !self.settling {
             self.rebuild_written(std::iter::empty());
         }
@@ -2888,14 +2903,20 @@ fn rebuilt(
 struct PendingFlight(Option<u64>);
 
 impl PendingFlight {
+    #[cfg(test)]
     fn register(ranges: Vec<(usize, usize)>) -> PendingFlight {
-        PendingFlight(Some(line().register_pending(ranges)))
+        Self::register_with(ranges, Vec::new())
+    }
+
+    fn register_with(ranges: Vec<(usize, usize)>, copies: Vec<card_steps::Writer>) -> PendingFlight {
+        PendingFlight(Some(line().register_pending_with(ranges, copies)))
     }
 
     /// The flight is in the line: ended under the lock the caller holds.
-    fn done(mut self, pending: &mut Vec<(u64, Vec<(usize, usize)>)>) {
+    fn done(mut self, pending: &mut Vec<(u64, Vec<(usize, usize)>)>, copies: &mut Vec<(u64, Vec<card_steps::Writer>)>) {
         if let Some(id) = self.0.take() {
             pending.retain(|p| p.0 != id);
+            copies.retain(|p| p.0 != id);
         }
     }
 }
@@ -3971,7 +3992,6 @@ static HELPER_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// see it.
 fn late_helper() {
     crate::cores::keep_on_fast_cores("victory-late-wait");
-    HELPER_UP.store(true, Ordering::Release);
     let Some(host) = host() else {
         return;
     };
@@ -3980,6 +4000,8 @@ fn late_helper() {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
         return;
     };
+    // (Only now: the lane leaves the landed lists to this thread, and a thread that returned above gives back none.)
+    HELPER_UP.store(true, Ordering::Release);
     loop {
         let target = {
             let mut line = line();
@@ -4563,8 +4585,8 @@ mod late_tests {
         let held = PendingFlight::register(vec![(0x7000_0000_0000, 0x7000_0000_1000)]);
         {
             let mut line = line();
-            let Line { pending, .. } = &mut *line;
-            held.done(pending);
+            let Line { pending, pending_copies, .. } = &mut *line;
+            held.done(pending, pending_copies);
         }
         assert!(!ours(&line()));
     }
@@ -6409,7 +6431,11 @@ impl Host {
                     let first: Vec<usize> = parts.iter().copied().filter(|&p| p < cut).collect();
                     let second: Vec<usize> = parts.iter().filter(|&&p| p > cut).map(|p| p - cut).collect();
                     let ahead = crate::queue::take_ahead();
+                    // (Nothing is offered to the thread of stage A while the first half is sent: the line's first entry
+                    // is not what comes next, the second half is.)
+                    let half = front::split_pending();
                     self.execute_parts(lists, order, &first);
+                    drop(half);
                     crate::queue::restore_ahead(ahead);
                     self.execute_parts(more, behind, &second);
                 }
@@ -6422,7 +6448,9 @@ impl Host {
                 Ok([(lists, order), (more, behind)]) => {
                     let (first, second) = parts_around(parts, cut);
                     let ahead = crate::queue::take_ahead();
+                    let half = front::split_pending();
                     self.execute_parts(lists, order, &first);
+                    drop(half);
                     crate::queue::restore_ahead(ahead);
                     self.execute_parts(more, behind, &second);
                 }
@@ -6448,7 +6476,7 @@ impl Host {
         let most = {
             let mut line = line();
             let pending = sent.pending.take();
-            let Line { line: items, written, lists: flying, target, pending: registered, .. } = &mut *line;
+            let Line { line: items, written, lists: flying, target, pending: registered, pending_copies, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -6470,7 +6498,7 @@ impl Host {
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             if let Some(pending) = pending {
-                pending.done(registered);
+                pending.done(registered, pending_copies);
             }
             *flying >= late_most()
         };
@@ -6514,7 +6542,7 @@ impl Host {
         {
             let mut line = line();
             let pending = sent.pending.take();
-            let Line { line: items, written, lists: flying, target, pending: registered, .. } = &mut *line;
+            let Line { line: items, written, lists: flying, target, pending: registered, pending_copies, .. } = &mut *line;
             join_ranges(
                 written,
                 sent.back
@@ -6536,7 +6564,7 @@ impl Host {
             }));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             if let Some(pending) = pending {
-                pending.done(registered);
+                pending.done(registered, pending_copies);
             }
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -6754,14 +6782,13 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
-        // (A submission that is waited for takes its number after the one stage A prepared has taken its own.)
-        if !late {
-            front::quiesce();
-        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        // (A submission that is waited for takes its number after the one stage A prepared has taken its own: it gets
+        // the lock when stage A is not asked for.)
         let mut stage = crate::timeline::span("submit: the submission lock");
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let lock = || self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = if late { lock() } else { front::lock_quiet(lock) };
         // The refreshes of this submission begun while the one before was sent
         // are over before anything is asked or refreshed here, and so is
         // everything stage A did of it (`VICTORY_STAGE_A_STEPS`): its asking, its
@@ -6790,9 +6817,7 @@ impl Host {
         // The steps of the lists looked through once, for what to ask, what flights may write, what is refreshed in front
         // and the steps themselves (`VICTORY_ONE_PASS=1`, with `VICTORY_LEAN_STEPS`): read once for the submission.
         let mut pass: Option<scratch::Lean<onepass::Pass>> = (onepass::on() && lean_steps()).then(|| scratch::Lean::of(&onepass::PASS, true));
-        // (Not for a submission stage A prepared: its asking was made, and what is offered here is never joined before
-        // the lane's `ask_once_end`, so it would end the asking of the stage after it and stand over it.)
-        if late && staged_number.is_none() && askaside::on() && crate::watch::once() && !ask_tokens() && flying() {
+        if askaside::wanted(late, staged_number.is_some(), flying) {
             let ranges = match pass.as_mut() {
                 Some(pass) => {
                     pass.add(runs);
@@ -7103,7 +7128,8 @@ impl Host {
             for list in runs {
                 ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
-            PendingFlight::register(ranges)
+            // (With the card's copies of its own steps: stage A of the next submission looks at them too.)
+            PendingFlight::register_with(ranges, own.as_ref().map(|own| own.copied().collect::<Vec<_>>()).unwrap_or_default())
         });
         // The copies this submission still does something to after the card's
         // plan is made: its title buffer copies' places.

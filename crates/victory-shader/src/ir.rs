@@ -829,6 +829,50 @@ pub(crate) fn drop_skips(p: &Program, deep: bool) -> (Option<Program>, Vec<usize
 
 /// [`drop_skips`] with the skips over loops kept (`keep`) or left out.
 pub(crate) fn drop_skips_as(p: &Program, deep: bool, keep: bool) -> (Option<Program>, Vec<usize>) {
+    let (out, kept) = skips_left_out(p, deep, keep);
+    if out.is_empty() {
+        return (None, kept);
+    }
+    let mut blocks = p.blocks.clone();
+    for &(b, next, _) in &out {
+        blocks[b].insts.pop();
+        blocks[b].exit = Exit::Jump(next);
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    if split_irreducible(&mut blocks).is_err() {
+        return (None, kept);
+    }
+    (Some(rename(blocks, p.wave64, p.vgprs)), kept)
+}
+
+/// Whether the place `at` (a machine instruction's offset) lies in the region of a skip that only
+/// the `deep` form of [`without_skips`] leaves out (an inner `s_cbranch_execz` skip that ends
+/// together with an outer one).
+///
+/// Where the forms without skips stop at an exchange of the two host waves (a lane mask read as a
+/// number, a first-lane read) in code where not every lane runs, and only such a deep-only skip
+/// keeps that place from some lane, the form "without skips, scalars followed" runs the exchange
+/// in every lane after the lanes branched alone. The cascade-shadow rasters of the title end in
+/// that form on 32-lane hosts; the wave-wide form takes the skip as the console does, by the
+/// whole wave.
+pub(crate) fn deep_skip_holds(p: &Program, at: usize) -> bool {
+    let Some(block) = p.blocks.iter().position(|b| b.insts.iter().any(|i| i.machine.offset == at)) else {
+        return false;
+    };
+    let shallow: Vec<usize> = skips_left_out(p, false, false).0.into_iter().map(|(b, ..)| b).collect();
+    skips_left_out(p, true, false)
+        .0
+        .into_iter()
+        .any(|(b, _, region)| !shallow.contains(&b) && region.get(block).copied().unwrap_or(false))
+}
+
+/// The branches [`drop_skips_as`] leaves out, each with the block its code goes on in and the
+/// region it skipped (empty for an early-out to the end); and the blocks whose skip it kept only
+/// for a loop.
+fn skips_left_out(p: &Program, deep: bool, keep: bool) -> (Vec<(usize, usize, Vec<bool>)>, Vec<usize>) {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -945,8 +989,7 @@ pub(crate) fn drop_skips_as(p: &Program, deep: bool, keep: bool) -> (Option<Prog
         }
         Some(inside)
     };
-    let mut blocks = p.blocks.clone();
-    let mut any = false;
+    let mut out = Vec::new();
     let mut kept = Vec::new();
     for b in 0..n {
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
@@ -955,38 +998,23 @@ pub(crate) fn drop_skips_as(p: &Program, deep: bool, keep: bool) -> (Option<Prog
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        let leave_out = if ends(taken) {
+        if ends(taken) {
             // (an early-out over a loop is kept too: a wave with no lane left does not walk it)
-            let over_loop = keep && loop_after(p, b, not_taken);
-            if over_loop {
+            if keep && loop_after(p, b, not_taken) {
                 kept.push(b);
+            } else {
+                out.push((b, not_taken, Vec::new()));
             }
-            !over_loop
         } else {
             loop_kept.set(false);
-            let leave_out = skipped(b, taken, not_taken).is_some();
-            if loop_kept.get() {
-                kept.push(b);
+            match skipped(b, taken, not_taken) {
+                Some(region) => out.push((b, not_taken, region)),
+                None if loop_kept.get() => kept.push(b),
+                None => {}
             }
-            leave_out
-        };
-        if leave_out {
-            blocks[b].insts.pop();
-            blocks[b].exit = Exit::Jump(not_taken);
-            any = true;
         }
     }
-    if !any {
-        return (None, kept);
-    }
-    for block in &mut blocks {
-        block.phis.clear();
-    }
-    link(&mut blocks);
-    if split_irreducible(&mut blocks).is_err() {
-        return (None, kept);
-    }
-    (Some(rename(blocks, p.wave64, p.vgprs)), kept)
+    (out, kept)
 }
 
 /// An `s_cbranch_execz` over a region that holds a loop is kept ([`without_skips`]). On unless

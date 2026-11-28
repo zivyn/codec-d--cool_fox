@@ -163,6 +163,8 @@ mod local_exit_tests;
 mod loop_note_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod wide_auto_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -922,6 +924,16 @@ fn emit_forms_in(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // Where the last of the forms below stopped at code the two host waves exchange through (a
+        // lane mask, a first lane...) where not every lane runs (for `VICTORY_WAVE_WIDE_AUTO`).
+        let exchange_at = |r: &Result<(HostShader, Option<u32>), ShaderError>| match r {
+            Err(ShaderError::Unsupported { offset, what }) if what.ends_with("where not every lane runs") => Some(*offset),
+            _ => None,
+        };
+        let mut stopped_at = match &original {
+            Err(ShaderError::Unsupported { offset, what }) if what.ends_with("where not every lane runs") => Some(*offset),
+            _ => None,
+        };
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -1009,6 +1021,7 @@ fn emit_forms_in(
                     *form_out = if i == 0 { Form::WithoutEarlyOuts } else { Form::WithoutSkips };
                     return again.map(|(shader, _)| shader);
                 }
+                stopped_at = exchange_at(&again);
             }
         }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
@@ -1048,6 +1061,38 @@ fn emit_forms_in(
         for exact in [true, false] {
             if !exact {
                 // Before anything approximate, the exact forms that cost group barriers.
+                // The cascade-shadow rasters (`VICTORY_WAVE_WIDE_AUTO`): the forms without skips stopped at
+                // an exchange that only a deep-only skip keeps from some lane, and "without skips,
+                // scalars followed" below would run it in every lane after the lanes branched alone;
+                // the wave takes that skip together, as the console does. Not where that puts a
+                // group barrier of the translator's in a loop (the normal order then stands).
+                if wave_wide_auto(c)
+                    && wide_option.is_none()
+                    && stopped_at.is_some_and(|at| ir::deep_skip_holds(p, at))
+                {
+                    wide_class::set_looped(false);
+                    let again = widen_from(None, false);
+                    let looped = wide_class::looped();
+                    report("wave-wide branches (auto)", &again);
+                    if why {
+                        eprintln!(
+                            "WAVE64-WIDE-AUTO ~{} stopped at {:#x}: {}",
+                            code_digits(c),
+                            stopped_at.unwrap_or(0),
+                            if !done(&again) {
+                                "not lowered"
+                            } else if looped {
+                                "a barrier in a loop, not taken"
+                            } else {
+                                "taken"
+                            }
+                        );
+                    }
+                    if done(&again) && !looped {
+                        *form_out = Form::WaveWideAuto;
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Every skip left out that the code after it cannot see
                 // ([`ir::without_skips`], `deep`): most of the body is then code every
                 // lane runs, where the two host waves can exchange.
@@ -1224,6 +1269,27 @@ fn emit_forms_in(
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
+/// `VICTORY_WAVE_WIDE_AUTO` for this program: unset or `0`, off (the default); `1`, on for every
+/// program; otherwise a comma-separated list of names as `VICTORY_WAVE_WIDE_FIRST` takes them, on
+/// for the programs named. Part of the translation: the shader cache keys on the text.
+fn wave_wide_auto(c: &Container) -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WAVE_WIDE_AUTO.get() {
+        return on;
+    }
+    match std::env::var("VICTORY_WAVE_WIDE_AUTO").ok().as_deref().map(str::trim) {
+        None | Some("" | "0") => false,
+        Some("1") => true,
+        Some(names) => wide_first(c, names),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_WAVE_WIDE_AUTO`, for its thread only.
+    static TEST_WAVE_WIDE_AUTO: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The programs that take the wave-wide form first unless `VICTORY_WAVE_WIDE_FIRST` says
 /// otherwise: the title's lens flare scans, which build a work queue from a ballot and a lane
 /// count (the approximate form of each half writes the queue's same slots, and a bright
@@ -1313,15 +1379,18 @@ fn widen_seeded(
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
         wide_class::take_barriers();
+        wide_class::take_meetings();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
         let barriers = wide_class::take_barriers();
+        let meetings = wide_class::take_meetings();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
+            wide_class::set_looped(wide_class::in_a_loop(p, &meetings));
             if !seed.is_empty() {
                 wide_class::set_last(wide_class::classify(p, &st, native, &wide, &barriers));
             }

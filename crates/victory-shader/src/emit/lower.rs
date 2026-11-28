@@ -4052,7 +4052,7 @@ impl<'a> Lower<'a> {
             None => {
                 let at = match self.def_block.get(&lo) {
                     // Program inputs (EXEC on entry).
-                    None => self.s.entry,
+                    None => self.input_site(),
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
@@ -4855,6 +4855,7 @@ impl<'a> Lower<'a> {
     fn group_sync(&mut self, block: usize) {
         if meeting_mode() & 1 != 0 {
             super::wide_class::note_barrier(self.cur_ir);
+            super::wide_class::note_meeting(self.cur_ir);
         }
         self.barrier_op(block, meeting_mode());
     }
@@ -5082,7 +5083,7 @@ impl<'a> Lower<'a> {
         }
         let made = self.def_block.get(&scc).copied();
         let at = match made {
-            None => self.s.entry,
+            None => self.input_site(),
             Some(b) if b == self.cur_ir => self.cur,
             Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
@@ -5162,6 +5163,19 @@ impl<'a> Lower<'a> {
         let both = self.s.m.bin(c, Bin::Or, lo, hi);
         let z = self.s.m.i32(0);
         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
+    }
+
+    /// Where a lane mask the program is given (EXEC on entry) is asked about: the function's entry
+    /// block, or, where the host waves meet by counters of their own, the program's first block:
+    /// the entry block cannot be split for a meeting, and every lane runs both.
+    fn input_site(&self) -> usize {
+        if self.pair_meet
+            && let Some(b) = self.rpo.iter().position(|&r| r == 0)
+            && let Some(blk) = self.block[b]
+        {
+            return blk;
+        }
+        self.s.entry
     }
 
     /// Whether every lane runs IR block `b` (always true without `exchange`).
@@ -6343,6 +6357,7 @@ impl<'a> Lower<'a> {
         }
         if meeting_mode() & 1 != 0 {
             super::wide_class::note_barrier(self.cur_ir);
+            super::wide_class::note_meeting(self.cur_ir);
         }
         self.barrier_op(self.cur, meeting_mode());
     }

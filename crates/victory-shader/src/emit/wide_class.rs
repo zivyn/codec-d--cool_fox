@@ -189,6 +189,8 @@ thread_local! {
     static WHY: std::cell::RefCell<Vec<(usize, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
     static LAST: std::cell::RefCell<Summary> = const { std::cell::RefCell::new(Vec::new()) };
     static BARRIERS: std::cell::RefCell<BTreeSet<usize>> = const { std::cell::RefCell::new(BTreeSet::new()) };
+    static MEETINGS: std::cell::RefCell<BTreeSet<usize>> = const { std::cell::RefCell::new(BTreeSet::new()) };
+    static LOOPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The lowering put a group barrier (one that waits for the group) in IR block `b`.
@@ -201,6 +203,47 @@ pub(super) fn note_barrier(b: usize) {
 /// The blocks noted since the last call.
 pub(super) fn take_barriers() -> BTreeSet<usize> {
     BARRIERS.take()
+}
+
+/// The lowering put a group barrier of its own (a meeting of the two host waves of a console wave,
+/// not the program's `s_barrier`) in IR block `b`.
+pub(super) fn note_meeting(b: usize) {
+    MEETINGS.with_borrow_mut(|s| {
+        s.insert(b);
+    });
+}
+
+/// The blocks noted by [`note_meeting`] since the last call.
+pub(super) fn take_meetings() -> BTreeSet<usize> {
+    MEETINGS.take()
+}
+
+/// Whether one of the `meetings` (IR blocks of `p`) lies on a cycle of the program's flow: two host
+/// waves that leave such a loop in different rounds wait at the barrier for threads that never
+/// come (a wave-wide form of two particle programs lost the card that way).
+pub(super) fn in_a_loop(p: &Program, meetings: &BTreeSet<usize>) -> bool {
+    meetings.iter().any(|&m| {
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = p.blocks.get(m).map_or_else(Vec::new, |b| b.exit.successors());
+        while let Some(x) = stack.pop() {
+            if x == m {
+                return true;
+            }
+            if !std::mem::replace(&mut seen[x], true) {
+                stack.extend(p.blocks[x].exit.successors());
+            }
+        }
+        false
+    })
+}
+
+/// Whether the last wave-wide lowering of this thread ([`super::widen`]) put a meeting into a loop.
+pub(super) fn looped() -> bool {
+    LOOPED.get()
+}
+
+pub(super) fn set_looped(on: bool) {
+    LOOPED.set(on);
 }
 
 pub(super) fn set_last(summary: Summary) {

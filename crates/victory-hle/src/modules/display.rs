@@ -57,13 +57,37 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 
-/// 2: disabled. We present in SDR, so the title must render SDR.
+/// `XDisplayHdrModeResult` for HDR mode off: we present in SDR, so the title
+/// must render SDR.
+const HDR_DISABLED: u32 = 2;
+
+/// `XDisplayHdrModeInfo`: the display's tone map luminances, in nits.
+#[repr(C)]
+struct HdrModeInfo {
+    min_tone_map_luminance: f32,
+    max_tone_map_luminance: f32,
+    max_full_frame_tone_map_luminance: f32,
+}
+
+/// What an SDR output has to say: black at 0 and white at the 80 nits that
+/// scRGB calls 1.0, over the whole frame as well. With HDR off the title
+/// should not read them; if it does, they describe the display it gets.
+const SDR_INFO: HdrModeInfo = HdrModeInfo {
+    min_tone_map_luminance: 0.0,
+    max_tone_map_luminance: 80.0,
+    max_full_frame_tone_map_luminance: 80.0,
+};
+
 // shortcut: HDR output is not done (see the presentation items in
 // `TODO.md`); report enabled, with the host display's luminance, once the
 // swap chain can present HDR.
-extern "system" fn try_enable_hdr(_: This, preference: u32, _info: *mut c_void) -> u32 {
+extern "system" fn try_enable_hdr(_: This, preference: u32, info: *mut c_void) -> u32 {
     tracing::info!(preference, "HDR mode: disabled (SDR presentation)");
-    2
+    if !info.is_null() {
+        // SAFETY: the title passes room for an `XDisplayHdrModeInfo`.
+        unsafe { info.cast::<HdrModeInfo>().write_unaligned(SDR_INFO) };
+    }
+    HDR_DISABLED
 }
 
 /// Nothing launches URIs for the title: no store, browser or console app
@@ -127,12 +151,18 @@ fn last_error() -> HRESULT {
     (0x8007_0000 | (code & 0xffff)) as i32
 }
 
+/// Screenshots and clips are unavailable: there is no capture service here
+/// (no Game Bar, no captures folder of a console user) and the title's call
+/// asks for the one on the console. The call fails the way the system
+/// reports a service the platform does not have, `ERROR_NOT_SUPPORTED`, and
+/// leaves what the title passed for the result untouched, so a title that
+/// checks the status shows its "could not capture" and goes on.
 // shortcut: screenshots fail as if capture were unavailable. Taking one needs
 // a hook in the GPU side: the last presented frame read back as BGRA8 (size,
 // row pitch, bytes) on request, e.g. `victory_gpu::last_frame() ->
 // Option<Frame>`, copied from the back buffer after `PresentX`.
-extern "system" fn take_screenshot(_: This, _user: *const c_void, _result: *mut c_void) -> HRESULT {
-    tracing::info!("screenshot not taken");
+extern "system" fn capture_unavailable(_: This) -> HRESULT {
+    tracing::info!("capture not available: nothing taken");
     NOT_SUPPORTED
 }
 
@@ -165,9 +195,9 @@ static CAPTURE_VTABLE: Methods<6> = Methods([
     missing::<0> as *const (),
     add_ref as *const (),
     add_ref as *const (),
-    missing::<3> as *const (),    // 0x18 diagnostic screenshot
-    missing::<4> as *const (),    // 0x20 diagnostic clip
-    take_screenshot as *const (), // 0x28
+    capture_unavailable as *const (), // 0x18 diagnostic screenshot
+    capture_unavailable as *const (), // 0x20 diagnostic clip
+    capture_unavailable as *const (), // 0x28 screenshot
 ]);
 
 #[cfg(all(test, windows))]
@@ -175,13 +205,46 @@ mod tests {
     use super::*;
     use crate::modules::xgameruntime::{S_OK, method};
 
+    /// With HDR off the title is told so, with or without room for the
+    /// display's luminances, for either preference; the luminances are an
+    /// SDR display's, never uninitialised.
+    #[test]
+    fn hdr_is_off_and_the_display_is_described_as_sdr() {
+        type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
+        let hdr = method::<Hdr>(&HDR_OBJECT, 0x20);
+        for preference in [0, 1] {
+            assert_eq!(
+                hdr(&HDR_OBJECT, preference, std::ptr::null_mut()),
+                HDR_DISABLED
+            );
+            let mut info = [f32::NAN; 3];
+            assert_eq!(
+                hdr(&HDR_OBJECT, preference, info.as_mut_ptr().cast()),
+                HDR_DISABLED
+            );
+            assert_eq!(info, [0.0, 80.0, 80.0]);
+        }
+        assert_eq!(size_of::<HdrModeInfo>(), 12);
+    }
+
+    /// Every capture call fails as unsupported and leaves the title's
+    /// result alone.
+    #[test]
+    fn captures_are_unsupported_and_write_nothing() {
+        type Capture = extern "system" fn(This, *const c_void, *mut u32) -> HRESULT;
+        for slot in [0x18, 0x20, 0x28] {
+            let mut result = 0x5a5a_5a5a_u32;
+            let call = method::<Capture>(&CAPTURE_OBJECT, slot);
+            assert_eq!(
+                call(&CAPTURE_OBJECT, std::ptr::null(), &mut result),
+                NOT_SUPPORTED
+            );
+            assert_eq!(result, 0x5a5a_5a5a, "slot {slot:#x}");
+        }
+    }
+
     #[test]
     fn sdr_and_display_deferrals() {
-        type Hdr = extern "system" fn(This, u32, *mut c_void) -> u32;
-        assert_eq!(
-            method::<Hdr>(&HDR_OBJECT, 0x20)(&HDR_OBJECT, 0, std::ptr::null_mut()),
-            2
-        );
         type Acquire = extern "system" fn(This, *mut *mut c_void) -> HRESULT;
         type Close = extern "system" fn(This, *mut c_void);
         let mut handle = std::ptr::null_mut();

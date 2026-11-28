@@ -87,6 +87,11 @@ fn lane_branch(over: Over, looped: bool) -> NativeProgram {
 /// The program lowered as the title's are for a host of 32-lane waves, with the skips over loops
 /// kept (`VICTORY_KEEP_LOOP_SKIPS`, the default) or left out, and the form it ended in.
 fn lowered_as(native: &NativeProgram, keep: bool) -> (Result<HostShader, ShaderError>, Form) {
+    lowered_with(native, keep, false)
+}
+
+/// [`lowered_as`], with the kept skips taken wave-wide (`VICTORY_KEPT_SKIPS_WIDE`) or not.
+fn lowered_with(native: &NativeProgram, keep: bool, wide: bool) -> (Result<HostShader, ShaderError>, Form) {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
@@ -96,7 +101,9 @@ fn lowered_as(native: &NativeProgram, keep: bool) -> (Result<HostShader, ShaderE
     lower::set_program_tag(b"a form test");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     ir::TEST_KEEP_LOOP_SKIPS.set(Some(keep));
+    super::form::TEST_KEPT_SKIPS_WIDE.set(Some(wide));
     let result = super::emit_as(&c, native, &p, &st, &io, &res);
+    super::form::TEST_KEPT_SKIPS_WIDE.set(None);
     ir::TEST_KEEP_LOOP_SKIPS.set(None);
     lower::TEST_HOST_WAVE.set(was);
     result
@@ -109,10 +116,11 @@ fn validated(shader: &HostShader) {
     }
 }
 
-/// The form of the program with the switch on and off, translated both ways.
-fn forms(native: &NativeProgram) -> ((HostShader, Form), (HostShader, Form)) {
-    let (on, on_form) = lowered_as(native, true);
-    let (off, off_form) = lowered_as(native, false);
+/// The form of the program with the switch on (the kept skips taken wave-wide or not) and off,
+/// translated each way.
+fn forms(native: &NativeProgram, wide: bool) -> ((HostShader, Form), (HostShader, Form)) {
+    let (on, on_form) = lowered_with(native, true, wide);
+    let (off, off_form) = lowered_with(native, false, false);
     let on = on.unwrap_or_else(|e| panic!("kept skips: {e} (form {on_form:?})"));
     let off = off.unwrap_or_else(|e| panic!("skips left out: {e} (form {off_form:?})"));
     validated(&on);
@@ -120,30 +128,35 @@ fn forms(native: &NativeProgram) -> ((HostShader, Form), (HostShader, Form)) {
     ((on, on_form), (off, off_form))
 }
 
-/// A skip over a loop is kept (the wave that has no lane left does not walk the loop). The form
-/// that keeps it is exact: the branch is taken by the whole wave, the loop is code every lane
-/// runs, and the region's results are the console's. It was an approximate form (each host wave
-/// a wave of its own) for 17 programs of the title, and one with barriers in loops for 15.
+/// A skip over a loop is kept by the switch, and the form of the program is still the exact one
+/// it had without it: the skip left out, every lane walks the loop, no group barrier at a branch.
+/// (It was an approximate form, each host wave a wave of its own, for 17 programs of the title,
+/// and the wave-wide branches for 15, which put group barriers where the card was lost.)
 #[test]
-fn a_skip_over_a_loop_is_kept_in_an_exact_form() {
-    let native = lane_branch(Over::Skip, true);
-    let ((on, on_form), (off, off_form)) = forms(&native);
-    assert_eq!(off_form, Form::WithoutSkips, "the skip left out");
-    assert_eq!(on_form, Form::KeptSkipsWide, "the skip kept");
-    assert!(on_form.exact());
-    assert_ne!(on.dxil, off.dxil, "the skip over the loop is in the translation");
+fn a_skip_over_a_loop_does_not_take_the_exact_form_from_the_program() {
+    for over in [Over::Skip, Over::EarlyOut] {
+        let native = lane_branch(over, true);
+        let ((on, on_form), (off, off_form)) = forms(&native, false);
+        let exact = if over == Over::Skip { Form::WithoutSkips } else { Form::WithoutEarlyOuts };
+        assert_eq!(off_form, exact, "{over:?}: the skip left out");
+        assert_eq!(on_form, Form::LoopSkipsLeftOut, "{over:?}: the skip kept");
+        assert!(on_form.exact());
+        assert_eq!(on.dxil, off.dxil, "{over:?}: the same program as without the switch");
+    }
 }
 
-/// The early-out to the end of the program over a loop is kept as well (the skip to a join was; the
-/// early-out was dropped before the loop was asked about).
+/// With `VICTORY_KEPT_SKIPS_WIDE=1` the kept skip (and the early-out over a loop, which the switch
+/// kept as well) is taken by the whole wave, and the loop is code every lane runs: exact, with
+/// the skip in the translation.
 #[test]
-fn an_early_out_over_a_loop_is_kept_in_an_exact_form() {
-    let native = lane_branch(Over::EarlyOut, true);
-    let ((on, on_form), (off, off_form)) = forms(&native);
-    assert_eq!(off_form, Form::WithoutEarlyOuts, "the early-out left out");
-    assert_eq!(on_form, Form::KeptSkipsWide, "the early-out kept");
-    assert!(on_form.exact());
-    assert_ne!(on.dxil, off.dxil);
+fn a_kept_skip_over_a_loop_taken_wave_wide_is_an_exact_form() {
+    for over in [Over::Skip, Over::EarlyOut] {
+        let native = lane_branch(over, true);
+        let ((on, on_form), (off, _)) = forms(&native, true);
+        assert_eq!(on_form, Form::KeptSkipsWide, "{over:?}");
+        assert!(on_form.exact());
+        assert_ne!(on.dxil, off.dxil, "{over:?}: the skip over the loop is in the translation");
+    }
 }
 
 /// What has no loop in it is as it was: the switch changes nothing.
@@ -151,7 +164,7 @@ fn an_early_out_over_a_loop_is_kept_in_an_exact_form() {
 fn a_skip_or_an_early_out_without_a_loop_is_left_out_whatever_the_switch_says() {
     for (over, form) in [(Over::Skip, Form::WithoutSkips), (Over::EarlyOut, Form::WithoutEarlyOuts)] {
         let native = lane_branch(over, false);
-        let ((on, on_form), (off, off_form)) = forms(&native);
+        let ((on, on_form), (off, off_form)) = forms(&native, false);
         assert_eq!((on_form, off_form), (form, form), "{over:?}");
         assert_eq!(on.dxil, off.dxil, "{over:?}");
     }
@@ -162,7 +175,7 @@ fn a_skip_or_an_early_out_without_a_loop_is_left_out_whatever_the_switch_says() 
 #[test]
 fn a_skip_the_scalars_keep_is_the_last_resort_whatever_the_switch_says() {
     let native = super::wave64_tests::lds_read_after_write_in_a_lane_branch();
-    let ((on, on_form), (off, off_form)) = forms(&native);
+    let ((on, on_form), (off, off_form)) = forms(&native, false);
     assert_eq!((on_form, off_form), (Form::WaveWideLastResort, Form::WaveWideLastResort));
     assert_eq!(on.dxil, off.dxil);
 }
@@ -220,8 +233,9 @@ fn run(shader: &HostShader, host: &Host, below: u32) -> Option<Vec<u32>> {
 fn the_kept_skip_over_a_loop_gives_the_consoles_results_on_the_card() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for over in [Over::Skip, Over::EarlyOut] {
+      for wide in [false, true] {
         let native = lane_branch(over, true);
-        let (on, form) = lowered_as(&native, true);
+        let (on, form) = lowered_with(&native, true, wide);
         let Ok(on) = on else {
             eprintln!("not translated for waves of 32 ({over:?}): the program of the test is refused");
             return;
@@ -238,6 +252,7 @@ fn the_kept_skip_over_a_loop_gives_the_consoles_results_on_the_card() {
             assert_eq!(got, expected(below, over), "{over:?}, {below} lanes take the branch");
         }
         eprintln!("ran on the hardware device ({over:?}, {form:?}): the loop's results in every case");
+      }
     }
 }
 

@@ -919,7 +919,9 @@ fn emit_forms_in(
                 // refused (cross-lane code under a branch each host wave takes on its own): the
                 // same forms with those branches taken by the whole wave stay exact, at two
                 // group barriers per branch, outside the loops. Before any approximate form.
-                if wide_option.as_ref().is_none_or(|v| v != "0") {
+                // (Only with `VICTORY_KEPT_SKIPS_WIDE=1`: by default the forms with the loop skips left
+                // out, which have no group barrier at a branch, come first, below.)
+                if form::kept_skips_wide() && wide_option.as_ref().is_none_or(|v| v != "0") {
                     // (the program itself where nothing was left out: only the kept branches differ)
                     let bases = [
                         (forms[0].1.as_ref().map(|f| &f.0), early_dropped, &early_kept),
@@ -941,9 +943,10 @@ fn emit_forms_in(
                         }
                     }
                 }
-                // Where that does not lower either: the forms as they were before the switch, with
-                // the skips over loops left out (exact; a wave with no lane left walks the loop,
-                // which is what the switch avoids). Still before any approximate form.
+                // The forms as they were before the switch, with the skips over loops left out (exact,
+                // no barrier at a branch; a wave with no lane left walks the loop, which is what the
+                // switch avoids). Before the wave-wide form of the kept skips, which lost the card
+                // as a group-barrier-in-a-loop shape, and before any approximate form.
                 if let Some(again) = left_out_done.take() {
                     *form_out = Form::LoopSkipsLeftOut;
                     return again.map(|(shader, _)| shader);

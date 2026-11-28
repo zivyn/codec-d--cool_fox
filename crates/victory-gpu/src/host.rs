@@ -10386,7 +10386,11 @@ impl Host {
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let ab_shot = crate::ab::take_shot();
+            #[cfg(feature = "diagnostics")]
+            let wanted_frame = crate::capture::wanted(frame);
+            #[cfg(feature = "diagnostics")]
+            let read_now = wanted_frame || crate::capture::listed(frame) || ab_shot.is_some();
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
             let slot = if late_free_present() && !read_now {
@@ -10479,7 +10483,7 @@ impl Host {
                 list.CopyResource(&back, texture);
             }
             #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
+            let capture = (wanted_frame || ab_shot.is_some())
                 .then(|| {
                     if composed {
                         list.ResourceBarrier(&[transition(
@@ -10553,7 +10557,13 @@ impl Host {
             let _ = flown;
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                if wanted_frame {
+                    crate::capture::save_read_back(frame, &buffer, &footprint);
+                }
+                // `VICTORY_AB_SHOTS`: the frame of a phase's end, named by the phase and its arm.
+                if let Some(name) = &ab_shot {
+                    crate::capture::save_read_back_as(name, &buffer, &footprint);
+                }
             }
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);

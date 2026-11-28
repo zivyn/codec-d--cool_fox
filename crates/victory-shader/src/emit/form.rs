@@ -51,7 +51,9 @@ pub(super) enum Mode {
     /// that a branch on a value that differs between threads can keep a thread from.
     Safe,
     /// `=strict`: as `Safe`, and no group barrier behind a branch on a value read from memory
-    /// either (the halves may read it at different times).
+    /// either (the halves may read it at different times), and no loop with a group barrier in
+    /// another loop with one (a loop that runs to its limit costs the limit's number of barriers:
+    /// the square of it in two loops).
     Strict,
     /// `=classes`: the classes alone (what `Safe` was before the audit).
     Classes,

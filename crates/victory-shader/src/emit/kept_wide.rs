@@ -61,7 +61,7 @@ pub(super) fn attempt(
         let audit = hang::last_audit();
         let audited = match mode {
             Mode::Safe => audit.as_ref().is_none_or(|a| a.safe(true)),
-            Mode::Strict => audit.as_ref().is_none_or(|a| a.safe(false)),
+            Mode::Strict => audit.as_ref().is_none_or(|a| a.safe(false) && a.nest <= 1),
             _ => true,
         };
         let safe = mode == Mode::All || wide_class::safe(&classes) && audited;

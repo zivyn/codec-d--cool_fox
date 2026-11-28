@@ -311,7 +311,7 @@ fn the_classes_alone_let_through_a_loop_whose_halves_leave_in_different_rounds()
 #[test]
 fn the_group_barriers_of_the_audited_kept_skips_form_are_reached_by_every_thread() {
     let mut found = Findings::default();
-    for (shape, module) in kept_wide_shapes(Mode::Strict) {
+    for (shape, module) in kept_wide_shapes(Mode::Safe) {
         let audit = module.audit_barriers();
         if audit.barriers == 0 || !audit.safe(false) {
             found.add(format!("{shape:?}: {}", audit.describe()), &module);

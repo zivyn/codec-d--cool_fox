@@ -156,6 +156,54 @@ fn the_lanes_behind_a_loop_see_the_whole_wave() {
     assert_eq!(after, expected);
 }
 
+/// A console wave64 loop over the lanes left in a mask whose end is found behind an inner skip (the
+/// `s_cbranch_scc0` after `s_andn2_b64` of the mask), the whole of it behind a skip taken when no lane
+/// is left (`s_cbranch_execz DONE`). With no lane left the loop never ends (EXEC stays empty, the
+/// inner skip is always taken, the end is never reached), which the console never runs: the
+/// skip must stay where the forms without skips would take it out, with
+/// `VICTORY_KEEP_STALLING_SKIPS`.
+const SKIP_OVER_A_STALLING_LOOP: [u32; 24] = [
+    0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+    0x3602_0087, // v_and_b32 v1, 7, v0
+    0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+    0x7E04_0280, // v_mov_b32 v2, 0
+    0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+    0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    0xBF88_000B, // s_cbranch_execz DONE
+    0xBE94_047E, // s_mov_b64 s[20:21], exec
+    0xBEFE_0414, // L: s_mov_b64 exec, s[20:21]
+    0xBE98_047E, // s_mov_b64 s[24:25], exec
+    0x7DA4_0280, // v_cmpx_eq_u32 exec, 0, v1
+    0xBF88_0002, // s_cbranch_execz SKIP
+    0x8A94_7E14, // s_andn2_b64 s[20:21], s[20:21], exec
+    0xBF84_0004, // s_cbranch_scc0 DONE
+    0x8AFE_7E18, // SKIP: s_andn2_b64 exec, s[24:25], exec
+    0x4A04_0481, // v_add_nc_u32 v2, 1, v2
+    0x4A02_02C1, // v_add_nc_u32 v1, -1, v1
+    0xBF82_FFF6, // s_branch L
+    0xBEFE_040C, // DONE: s_mov_b64 exec, s[12:13]
+    0x7E06_0282, // v_mov_b32 v3, 2
+    0xE070_1000, // buffer_store_dword v3, v4, s[8:11], 0 offen
+    0x8002_0304,
+    0xBF81_0000, // s_endpgm
+    0xBF81_0000,
+];
+
+/// With `VICTORY_KEEP_STALLING_SKIPS` the skip over a loop that never ends with no lane left stays;
+/// without it the form without skips takes it out.
+#[test]
+fn a_skip_over_a_loop_that_never_ends_with_no_lane_left_stays_when_asked() {
+    let native = native_of(&SKIP_OVER_A_STALLING_LOOP, true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let was = ir::TEST_KEEP_STALLING_SKIPS.replace(Some(false));
+    let off = ir::drop_skips_as(&p, true, false);
+    ir::TEST_KEEP_STALLING_SKIPS.set(Some(true));
+    let on = ir::drop_skips_as(&p, true, false);
+    ir::TEST_KEEP_STALLING_SKIPS.set(was);
+    assert!(off.0.is_some(), "without the switch the skip is taken out");
+    assert!(on.0.is_none(), "with it the skip stays");
+}
+
 /// 32 threads of a console wave64: every lane writes `0xDEAD` to `lds[0]`; then the lanes but the
 /// first (the first thread's pixel is not water, say: `v_cmpx_ne_u32 exec, 0, v0` leaves it out)
 /// reach the thread group's set-up, `v_cmpx_eq_u32 exec, 0, v0` and `lds[0] = 0x4D`, which on the

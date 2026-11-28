@@ -4548,6 +4548,9 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
+        if crate::streamline::hudless_wanted() {
+            self.before_shown_target(list, vertices == 3 && instances == 1);
+        }
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -4562,11 +4565,18 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            let frontend = if count == 3 && instances == 1 { self.native_frontend_viewport() } else { None };
+            if let Some(viewport) = frontend {
+                viewports(list, &[viewport]);
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            if frontend.is_some() {
+                viewports(list, &self.viewports);
+            }
             self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4581,6 +4591,71 @@ impl State {
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
         crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+    }
+
+    /// With frame generation (`crate::streamline`), before a draw into one
+    /// colour target without depth: if the target is one the title presents,
+    /// the draw is told there, where the colour without the interface is
+    /// copied in front of the title's interface composite. `triangle`: one
+    /// triangle, one instance (the composite's shape). Only copies and
+    /// barriers are recorded; the target is moved back to a render target by
+    /// the draw's own preparation. From VIctory-NVIDIA (readmet3xt-lab).
+    fn before_shown_target(&self, list: &HostList, triangle: bool) {
+        if self.depth != 0 {
+            return;
+        }
+        let &[target] = self.targets.as_slice() else {
+            return;
+        };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return;
+        };
+        if p.compute || p.mesh {
+            return;
+        }
+        crate::streamline::before_target_draw(list, target as This, p, triangle);
+    }
+
+    /// With a 1440p output (`VICTORY_NATIVE_1440P=1`, set by the runner when
+    /// it patches the image for it): the frontend's last triangle is drawn
+    /// in output pixels, but some screens project it against the legacy
+    /// 3840x2160 canvas; for that draw the viewport is the canvas, so that
+    /// the projection lands on the 2560x1440 target. The scissor and target
+    /// stay 1440p. From DexNom's fork (`State::native_frontend_viewport`,
+    /// GPL-3.0-or-later), by way of VIctory-NVIDIA (readmet3xt-lab).
+    ///
+    /// The draw is known by its shape: no depth, one 2560x1440 viewport, one
+    /// 480-byte constant buffer behind the first table's second descriptor
+    /// whose matrix is the legacy canvas's projection exactly ([`legacy_canvas`]).
+    /// (The fork also named the two shaders by hash; the hashes are not in
+    /// this repository: with `VICTORY_INTERFACE_COMPOSITE` set the pipeline
+    /// must also be that pair.)
+    fn native_frontend_viewport(&self) -> Option<D3D12_VIEWPORT> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("VICTORY_NATIVE_1440P").as_deref() == Ok("1")) || self.depth != 0 {
+            return None;
+        }
+        let [viewport] = self.viewports.as_slice() else {
+            return None;
+        };
+        let canvas = frontend_viewport(viewport)?;
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        if !crate::streamline::composite_wanted(|hash| pipeline.stages.iter().any(|stage| stage.shader.hash == hash)) {
+            return None;
+        }
+        let Root::Table(table) = self.roots_ref(false).first()? else {
+            return None;
+        };
+        let View::Constant(address, 480) = crate::descriptor::view(table.checked_add(64)?)? else {
+            return None;
+        };
+        let mut matrix = [0u8; 64];
+        if !crate::host::read_into(address.checked_add(64)? as *const u8, &mut matrix) || !legacy_canvas(&matrix) {
+            return None;
+        }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| tracing::info!("the frontend's legacy 4K projection drawn on the 1440p target"));
+        Some(canvas)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -4659,6 +4734,9 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
+        if crate::streamline::hudless_wanted() {
+            self.before_shown_target(list, false);
+        }
         // Indexed rectangles are drawn by the rectangle geometry stage
         // alone (nothing expands them on the CPU).
         let lost = self.topology == RECTANGLES && !self.completes_rects();
@@ -5553,6 +5631,34 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
+/// The legacy 3840x2160 canvas's viewport for the frontend's draw into a
+/// 2560x1440 target: the target's viewport (origin and size exactly the
+/// output's) with the canvas's size; `None` for any other viewport.
+fn frontend_viewport(viewport: &D3D12_VIEWPORT) -> Option<D3D12_VIEWPORT> {
+    if (viewport.TopLeftX, viewport.TopLeftY, viewport.Width, viewport.Height) != (0.0, 0.0, 2560.0, 1440.0) {
+        return None;
+    }
+    Some(D3D12_VIEWPORT { Width: 3840.0, Height: 2160.0, ..*viewport })
+}
+
+/// Whether the 64 bytes are, to the bit, the matrix that projects the legacy
+/// 3840x2160 canvas (y down) to clip space.
+fn legacy_canvas(matrix: &[u8; 64]) -> bool {
+    #[rustfmt::skip]
+    let legacy_projection: [f32; 16] = [
+        2.0 / 3840.0, 0.0, 0.0, 0.0,
+        0.0, -2.0 / 2160.0, 0.0, 0.0,
+        0.0, 0.0, -1.0, 0.0,
+        -1.0, 1.0, 0.0, 1.0,
+    ];
+    matrix
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(legacy_projection)
+        .all(|(word, expected)| f32::from_le_bytes(*word) == expected)
+}
+
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
@@ -5599,6 +5705,64 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
         Some(budget) if budget >= 20 * GIB => 384 * MIB,
         Some(budget) if budget > 12 * GIB => 256 * MIB,
         _ => 192 * MIB,
+    }
+}
+
+#[cfg(test)]
+mod frontend_tests {
+    use super::{frontend_viewport, legacy_canvas};
+    use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+
+    fn viewport(x: f32, y: f32, w: f32, h: f32) -> D3D12_VIEWPORT {
+        D3D12_VIEWPORT { TopLeftX: x, TopLeftY: y, Width: w, Height: h, MinDepth: 0.0, MaxDepth: 1.0 }
+    }
+
+    /// The legacy canvas's projection, as the 64 bytes a constant buffer holds.
+    fn canvas_matrix() -> [u8; 64] {
+        #[rustfmt::skip]
+        let words: [f32; 16] = [
+            2.0 / 3840.0, 0.0, 0.0, 0.0,
+            0.0, -2.0 / 2160.0, 0.0, 0.0,
+            0.0, 0.0, -1.0, 0.0,
+            -1.0, 1.0, 0.0, 1.0,
+        ];
+        let mut bytes = [0u8; 64];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn the_frontend_is_drawn_on_the_canvas_only_with_the_output_viewport() {
+        let canvas = frontend_viewport(&viewport(0.0, 0.0, 2560.0, 1440.0)).expect("the output's viewport");
+        assert_eq!((canvas.TopLeftX, canvas.TopLeftY, canvas.Width, canvas.Height), (0.0, 0.0, 3840.0, 2160.0));
+        assert_eq!((canvas.MinDepth, canvas.MaxDepth), (0.0, 1.0));
+        for other in [
+            viewport(0.0, 0.0, 3840.0, 2160.0),
+            viewport(0.0, 0.0, 1920.0, 1080.0),
+            viewport(10.0, 0.0, 2560.0, 1440.0),
+            viewport(0.0, 0.0, 2560.0, 1080.0),
+        ] {
+            assert!(frontend_viewport(&other).is_none(), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_exact_legacy_projection_is_the_canvas() {
+        let matrix = canvas_matrix();
+        assert!(legacy_canvas(&matrix));
+        // Any changed word (a 1440p projection, a moved origin, a scale) is not.
+        for word in 0..16 {
+            let mut other = matrix;
+            other[word * 4 + 3] ^= 0x40;
+            assert!(!legacy_canvas(&other), "word {word}");
+        }
+        assert!(!legacy_canvas(&[0; 64]));
+        // The output's own projection.
+        let mut output = matrix;
+        output[..4].copy_from_slice(&(2.0f32 / 2560.0).to_le_bytes());
+        assert!(!legacy_canvas(&output));
     }
 }
 

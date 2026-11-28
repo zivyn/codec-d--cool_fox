@@ -10,6 +10,7 @@ pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+pub mod footprint;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
@@ -17,6 +18,9 @@ pub mod native;
 pub mod resource;
 pub mod spill;
 pub mod structure;
+
+#[cfg(test)]
+mod footprint_tests;
 
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};

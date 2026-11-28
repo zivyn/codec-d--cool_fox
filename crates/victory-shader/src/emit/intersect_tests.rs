@@ -15,7 +15,7 @@
 //! through the directory, which is only checked to lower and validate.
 
 use super::host::{Dispatch, Host, Root, Stride, View};
-use super::lower::intersect::TEST_MEMORY;
+use super::lower::intersect::{TEST_MEMORY, TEST_MISS};
 use super::{HostShader, lower, validator};
 use crate::bvh::{self, Ray, tests as nodes};
 use crate::native::{
@@ -700,6 +700,168 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
             assert_eq!(what, "a ray-tracing structure that returns triangle ids");
         }
         other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+/// The nodes of a structure that holds nothing, as the title's rays find it while its structure
+/// builder is off: nodes of zeros (a page nobody wrote) as a box in each width and under each
+/// of the four triangles, the builder's own empty slots (no child, inverted infinite bounds), and
+/// the two kinds nothing reads. The rays begin away from the origin, where the zeros lie, so none
+/// of them is through a node's degenerate box.
+fn empty_scene() -> (Scene, Vec<Vec<Case>>) {
+    let mut s = Scene::new();
+    let mut g = Numbers(0xe9);
+    let (up, down) = (f32::INFINITY, f32::NEG_INFINITY);
+    let slot = [up, up, up, down, down, down];
+    let mut at: Vec<(usize, u32)> = Vec::new();
+    at.push((s.add(nodes::box32([0; 4], [[0.0; 6]; 4]), 32), 5));
+    at.push((s.add(nodes::box16([0; 4], [[0.0; 6]; 4]), 16), 4));
+    at.push((s.add(nodes::box32([bvh::NONE; 4], [slot; 4]), 32), 5));
+    let zero = s.add(
+        nodes::triangles(&[[0.0; 3]; 5], 9 | 2 << 8 | 4 << 16 | 9 << 24),
+        16,
+    );
+    at.extend((0..4).map(|k| (zero, k)));
+    at.extend([(zero, 6), (zero, 7)]);
+    let mut cases: Vec<Case> = Vec::new();
+    for &(n, kind) in &at {
+        for _ in 0..10 {
+            let o = g.vector(6.0);
+            let origin = [o[0] + 20.0, o[1] + 23.0, o[2] + 27.0];
+            cases.push(Some((n, kind, Ray::new(origin, g.vector(1.0), 100.0))));
+        }
+    }
+    cases.insert(7, None);
+    cases.push(None);
+    let batches = cases
+        .chunks(THREADS as usize)
+        .map(<[Case]>::to_vec)
+        .collect();
+    (s, batches)
+}
+
+/// Runs [`empty_scene`] through the node test lowered with the short circuit (`miss`,
+/// `VICTORY_BVH_MISS`) or without, on the hardware adapter and WARP: every box answers with no
+/// child and everything else with the triangle miss, and so does the reference, which reads
+/// the nodes: the short circuit changes nothing about an empty structure.
+fn run_empty(miss: bool, wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MISS.set(None);
+        }
+    }
+    TEST_MISS.set(Some(miss));
+    let _reset = Reset;
+    let (shader, _) = build(wide, descriptor).expect("the program lowers");
+    let (scene, batches) = empty_scene();
+    let want_of = |case: &Case| -> [u32; 4] {
+        match case {
+            Some((_, kind, _)) if kind & 6 == 4 => [bvh::NONE; 4],
+            Some(_) => bvh::MISS.map(f32::to_bits),
+            None => BEFORE,
+        }
+    };
+    let all: Vec<&Case> = batches.iter().flatten().collect();
+    assert!(all.iter().filter(|c| c.is_some()).count() > 80, "cases");
+    for &case in &all {
+        assert_eq!(
+            expected(&scene, case, sort),
+            want_of(case),
+            "the reference, {case:x?}"
+        );
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (b, batch) in batches.iter().enumerate() {
+            let data = buffer(&scene, batch, pointers);
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        views: &[
+                            View::Buffer {
+                                data: &data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(4 * THREADS),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            for t in 0..THREADS as usize {
+                let want = batch.get(t).map_or(BEFORE, want_of);
+                let got = &out[0][4 * t..4 * t + 4];
+                assert_eq!(
+                    got,
+                    want,
+                    "{label}, miss {miss}, batch {b} thread {t}: {:x?}",
+                    batch.get(t)
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}
+
+#[test]
+fn an_empty_structure_gives_the_same_answers_with_and_without_the_short_circuit() {
+    for miss in [false, true] {
+        // The node's buffer named by the table's descriptor, in both forms of the instruction.
+        for wide in [true, false] {
+            run_empty(miss, wide, Descriptor::Table, u64::from(NODES), true);
+        }
+        // Title memory, the 64-bit form with the address in the pointer.
+        {
+            let _memory = Memory::at(BASE);
+            run_empty(miss, true, WHOLE, BASE + u64::from(NODES), true);
+        }
+        // And the 32-bit form with it in the descriptor, unsorted.
+        {
+            let base = 0x312_3456_7800u64;
+            let structure = base + u64::from(NODES);
+            let _memory = Memory::at(base);
+            let descriptor = Descriptor::Numbers((structure >> 8) as u32, (structure >> 40) as u32);
+            run_empty(miss, false, descriptor, 0, false);
+        }
+    }
+}
+
+#[test]
+fn the_short_circuit_asks_for_no_title_memory() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_MISS.set(None);
+        }
+    }
+    let _reset = Reset;
+    for wide in [true, false] {
+        // As it reads nodes: the directory of pages, and the list of the pages it found empty.
+        TEST_MISS.set(Some(false));
+        let (shader, _) = build(wide, WHOLE).expect("lowers through the directory");
+        assert!(shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+        // With the short circuit it reads nothing and notes nothing.
+        TEST_MISS.set(Some(true));
+        let (shader, _) = build(wide, WHOLE).expect("lowers without it");
+        assert!(!shader.root_srvs.contains(&super::SLOT_MEMORY));
+        assert!(!shader.root_uavs.contains(&super::SLOT_FAULTS));
     }
 }
 

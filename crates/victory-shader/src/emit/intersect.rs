@@ -39,7 +39,36 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Where the instruction's node is.
+#[cfg(test)]
+thread_local! {
+    /// The tests' way to turn [`bvh_miss`] on or off for the programs this thread lowers.
+    pub(in crate::emit) static TEST_MISS: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_BVH_MISS=1` (off by default): every node test answers "nothing hit" without reading
+/// the node: a box node's four children are none ([`bvh::NONE`]), any other node is the triangle
+/// miss ([`bvh::MISS`]), so a walk ends at the node it began with and the instruction reads no
+/// title memory (no look in the directory of pages, no note of a page found empty).
+///
+/// For runs without the structure builder, whose structures are never built: what lies where the
+/// title's rays look is then zeros (every box a child that is not there, every triangle degenerate:
+/// a miss) or what an earlier structure left, and the answer for zeros is this one already.
+/// Never while the builder runs (`VICTORY_BVH_BUILDER=1`): the structures are real then. Part of
+/// the translation: the shader cache keys on both variables.
+fn bvh_miss() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_MISS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1")
+            && !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")
+    })
+}
+
+/// Where the instruction's node is."""
 #[derive(Clone, Copy)]
 enum NodeAt {
     /// At this byte of a raw buffer of the host.
@@ -123,6 +152,21 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        if bvh_miss() {
+            // Nothing is read: a box (kinds 4 and 5) has no child, every other kind is the
+            // triangle miss, as the full test answers for nodes of zeros.
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let result = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), result, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()

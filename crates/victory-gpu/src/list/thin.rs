@@ -1209,7 +1209,7 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         // SAFETY: a list of ours that no thread but this one records into.
         let start = held(unsafe { &(*list.cast::<List>()).state }).pipeline_handle();
         DROPS[2].fetch_add(1, Relaxed);
-        dead_ops(stream, start, &|p| crate::pipeline::is_builder(p as This))
+        dead_ops(stream, start, &|p| crate::pipeline::is_builder(p as This) || crate::pipeline::is_resolve_pending_idle(p as This))
     } else {
         Vec::new()
     };

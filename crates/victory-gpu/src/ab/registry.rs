@@ -95,6 +95,7 @@ pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_REFRESH_NARROW", Kind::Count),
     ("VICTORY_REFRESH_NOTES", Kind::Flag),
     ("VICTORY_RESIDENT_BATCH", Kind::OnByDefault),
+    ("VICTORY_RT_RESOLVE", Kind::OnByDefault),
     ("VICTORY_SAME_RECORDS", Kind::Flag),
     ("VICTORY_SEND_COPYQ", Kind::Flag),
     ("VICTORY_SNAP_ASIDE", Kind::OnByDefault),

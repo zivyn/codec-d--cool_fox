@@ -461,6 +461,58 @@ pub(crate) fn skipped_line(frames: f64) {
     );
 }
 
+/// Whether the title's programs that shade ray-tracing hits are idle:
+/// `VICTORY_RT_RESOLVE=0`, with no structure builder. Without structures every ray misses,
+/// the programs find nothing to shade (each begins by comparing its thread's number with the
+/// count of hits of its material, which is 0, and ends), and what they write is only for hits:
+/// leaving the dispatch out changes no byte of the picture's inputs. Read at every dispatch, so
+/// that `VICTORY_AB` can flip it (a dispatch left out for want of a pipeline,
+/// `make::left_out`, is the same thing decided once at the pipeline's making, and saves its
+/// compile too: that is what the variable does when it is set before the start).
+#[cfg(windows)]
+pub(crate) fn resolves_idle() -> bool {
+    resolves_are_idle(builder_asked(), crate::ab::live_value!("VICTORY_RT_RESOLVE", bool, crate::ab::unless_zero))
+}
+
+/// [`resolves_idle`] from its parts: the builder is asked for, and the hit shading is to run.
+#[cfg(any(windows, test))]
+fn resolves_are_idle(builder: bool, runs: bool) -> bool {
+    !builder && !runs
+}
+
+/// Whether the title's pipeline `this` is one of the programs that shade ray-tracing hits and
+/// they are idle now ([`resolves_idle`]): no dispatch of it need be recorded.
+#[cfg(windows)]
+pub(crate) fn is_resolve_pending_idle(this: This) -> bool {
+    !this.is_null() && pipeline(this).rt_resolve && resolves_idle()
+}
+
+/// Dispatches of hit shading left out while idle, since the last line.
+#[cfg(windows)]
+static RESOLVES_IDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`is_resolve_pending_idle`] at a dispatch that is about to run: counted.
+#[cfg(windows)]
+pub(crate) fn is_resolve_idle(this: This) -> bool {
+    let idle = is_resolve_pending_idle(this);
+    if idle {
+        RESOLVES_IDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    idle
+}
+
+/// The line: the dispatches of hit shading left out per frame (while idle).
+#[cfg(windows)]
+pub(crate) fn idle_line(frames: f64) {
+    let n = RESOLVES_IDLE.swap(0, std::sync::atomic::Ordering::Relaxed);
+    if n > 0 && frames > 0.0 {
+        tracing::info!(
+            "dispatches of the ray-tracing hit shading left out per frame (VICTORY_RT_RESOLVE=0, no structures built): {:.1}",
+            n as f64 / frames
+        );
+    }
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -623,6 +675,11 @@ struct Pipeline {
     /// out ([`is_bvh_skinning_skipped`]).
     #[cfg(windows)]
     bvh_skin: bool,
+    /// One of the title's programs that shade ray-tracing hits: its dispatches
+    /// are left out while no structures are built and `VICTORY_RT_RESOLVE` says
+    /// so ([`is_resolve_idle`]).
+    #[cfg(windows)]
+    rt_resolve: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -875,6 +932,8 @@ fn hand_out(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
+    let rt_resolve = make::is_resolve(&shaders);
+    #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -890,6 +949,8 @@ fn hand_out(
         builder,
         #[cfg(windows)]
         bvh_skin,
+        #[cfg(windows)]
+        rt_resolve,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -1155,6 +1216,15 @@ mod tests {
 
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn the_hit_shading_is_idle_only_without_structures_and_when_it_is_not_asked_to_run() {
+        assert!(resolves_are_idle(false, false));
+        assert!(!resolves_are_idle(false, true));
+        // With the builder the hits are real: they always run.
+        assert!(!resolves_are_idle(true, false));
+        assert!(!resolves_are_idle(true, true));
+    }
 
     #[test]
     fn the_stand_in_rests_once_the_builder_has_run() {

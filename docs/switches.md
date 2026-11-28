@@ -70,6 +70,7 @@ the card.
 |---|---|---|---|
 | `VICTORY_BVH_BOUNDS` | on (=0 turns off) | cache key (text) | Keeps the ray-structure builder's view accesses near their views and ignores impossible header sizes. |
 | `VICTORY_BVH_FENCES` | on (=0 turns off) | cache key (text) | Puts the structure builder's buffer atomics between two fences. |
+| `VICTORY_BVH_MISS` | off | cache key (text) | Every ray-tracing node test answers "nothing hit" without reading the node (a box has no child, anything else is the triangle miss), so a walk ends where it began and reads no title memory; never while `VICTORY_BVH_BUILDER=1`. |
 | `VICTORY_F16_NEAREST` | **2** (`=0` off, `=1` scalar ops only) since integ/validation-24; off before | cache key (value in force) | Rounds 16-bit float results to nearest, as the console does (2 also covers mixed and packed ops). |
 | `VICTORY_F32_FTZ` | **on** (`=0` off) since integ/validation-24; off before | cache key (value in force) | Asks the driver for the console float mode: 32-bit denormals flushed to zero (shader model 6.2). |
 | `VICTORY_FIRSTLANE_OWN` | off | cache key (text) | =1 takes the host wave's own first lane in wave-wide first-lane reads. |
@@ -305,6 +306,7 @@ translation of shaders.
 | `VICTORY_BVH_BOUNDS` | on (=0 turns off) | flag | yes |  |  | Keeps the ray-structure builder's view accesses near their views and ignores impossible header sizes. |
 | `VICTORY_BVH_BUILDER` | off | flag |  |  |  | Runs the title's ray-tracing structure builder on the host; otherwise its dispatches are dropped. |
 | `VICTORY_BVH_FENCES` | on (=0 turns off) | flag | yes |  |  | Puts the structure builder's buffer atomics between two fences. |
+| `VICTORY_BVH_MISS` | off | flag | yes |  |  | Every ray-tracing node test misses without reading the node, while the structure builder is off; the programs that walk structures then read no title memory. |
 | `VICTORY_BVH_QUARANTINE` | off | flag |  |  |  | Keeps what the structure builder's stages store in host copies, not copied back to title memory. |
 | `VICTORY_BVH_SIZES` | off | text |  |  |  | How compacted structure sizes the title reads are handled: off, wait, predict or both. |
 | `VICTORY_BVH_SIZES_WAIT` | off | flag |  |  |  | Older switch: waits on the card for every compacted-size ask; same as VICTORY_BVH_SIZES=wait. |
@@ -630,7 +632,7 @@ translation of shaders.
 | `VICTORY_ROOT_SRV_DIRECT` | off | flag |  |  |  | Goes back to root descriptors for buffer views instead of the bounded descriptor-table path. |
 | `VICTORY_ROOT_UAV_MB` | no limit | number |  |  |  | Caps in MB the view, refresh and copy-back of a root unordered-access view. |
 | `VICTORY_ROOT_VIEW_MB` | no limit | number |  |  |  | Caps in MB the size taken for a root shader-resource view of a title buffer. |
-| `VICTORY_RT_RESOLVE` | on (=0 leaves the hit-shading programs out) | flag |  |  |  | Whether the ray-tracing hit-shading compute programs run; 0 leaves them out to save compile time. |
+| `VICTORY_RT_RESOLVE` | on (=0 leaves the hit-shading programs out) | flag |  | live |  | Whether the ray-tracing hit-shading compute programs run; 0 leaves them out (never made, their dispatches dropped before they are recorded), which saves their compile time and, with no structures built, changes nothing in the picture: no ray hits, nothing to shade. Live in `VICTORY_AB` (the programs are made, their dispatches left out in the B phases). |
 | `VICTORY_SAFE_COPY` | on (=0 turns off) | flag |  |  |  | Copies title memory with a fault-tolerant routine instead of the kernel's write. |
 | `VICTORY_SAME_RECORDS` | on (=0 turns off) | flag |  | live |  | Skips writing records into title memory that already hold the same bytes. |
 | `VICTORY_SCISSOR_TEST` | off | text |  |  |  | Experiment on the title's scissor rectangles; only the value full enables it. |

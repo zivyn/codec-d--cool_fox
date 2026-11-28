@@ -29,7 +29,7 @@
 
 use super::*;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use super::replay;
@@ -251,6 +251,9 @@ pub(crate) struct Recording {
     done: AtomicBool,
     moved: Condvar,
     abandoned: AtomicBool,
+    /// The kind of the title's queue it was submitted to (`u32::MAX`: not yet), for the timing report: noted on
+    /// the list of ours it goes to, which is what the card runs and the report reads.
+    queue: AtomicU32,
 }
 
 #[derive(Default)]
@@ -274,7 +277,26 @@ impl Recording {
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
+            queue: AtomicU32::new(u32::MAX),
         }
+    }
+
+    /// The title's queue (`kind`) it is submitted to: told to the list of ours it goes to, or the one it is given
+    /// when translating begins ([`Recording::noting`]). Under the lock that gives it the list, so that one of the
+    /// two sees the other.
+    #[cfg_attr(not(all(windows, feature = "diagnostics")), allow(dead_code))]
+    fn tagging(&self, kind: u32, set: &mut dyn FnMut(usize, u32)) {
+        let inner = held(&self.inner);
+        self.queue.store(kind, Relaxed);
+        if inner.back != 0 {
+            set(inner.back, kind);
+        }
+    }
+
+    /// `back` has just been given to the recording (the lock is held): it takes the queue noted so far, or none: a
+    /// list of ours used before for another queue must not keep that one's.
+    fn noting(&self, back: usize, set: &mut dyn FnMut(usize, u32)) {
+        set(back, self.queue.load(Relaxed));
     }
 
     pub(crate) fn done(&self) -> bool {
@@ -305,6 +327,7 @@ impl Recording {
                 };
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
+                    self.noting(inner.back, &mut tag_back);
                 }
                 (chunk, inner.back as This)
             };
@@ -354,6 +377,31 @@ fn give_back(streams: Vec<Vec<u64>>) {
             s.clear();
             words.push(s);
         }
+    }
+}
+
+/// Notes the title's queue on the host side of the list of ours `back` (diagnostics: the timing report sums the
+/// commands' time by it).
+fn tag_back(back: usize, kind: u32) {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if let Some(host) = super::host_list(back as This) {
+        host.set_queue_kind(kind);
+    }
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    let _ = (back, kind);
+}
+
+/// The title list `list` is submitted to the title's queue of kind `kind`: noted on the recording's list of ours
+/// (a thin list has no host list of its own).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn tag_queue(list: This, kind: u32) {
+    if list.is_null() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists, and the thread that submits it is the one that recorded it.
+    let front = unsafe { &(*list.cast::<List>()).thin };
+    if let Some(recording) = &front.recording {
+        recording.tagging(kind, &mut tag_back);
     }
 }
 
@@ -1421,6 +1469,30 @@ const MINE: [(usize, *const ()); 54] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's queue is noted on the list of ours a recording goes to, whichever comes first: the submission
+    /// (the list is not given yet, it takes the kind when it is) or the translating (the list is there, the
+    /// submission tells it). A list used before for another queue does not keep that queue's kind.
+    #[test]
+    fn the_queue_a_recording_is_submitted_to_reaches_the_list_it_goes_to_in_either_order() {
+        let log = std::cell::RefCell::new(Vec::<(usize, u32)>::new());
+        let mut note = |back: usize, kind: u32| log.borrow_mut().push((back, kind));
+        // The submission first: there is no list to tell, and the list takes the kind when it is given.
+        let early = Recording::new(0);
+        early.tagging(2, &mut note);
+        assert!(log.borrow().is_empty());
+        early.noting(77, &mut note);
+        assert_eq!(*log.borrow(), [(77, 2)]);
+        // The translating first: the list is told none (it may have served another queue), then the submission
+        // tells it.
+        log.borrow_mut().clear();
+        let late = Recording::new(0);
+        late.noting(88, &mut note);
+        assert_eq!(*log.borrow(), [(88, u32::MAX)]);
+        held(&late.inner).back = 88;
+        late.tagging(0, &mut note);
+        assert_eq!(*log.borrow(), [(88, u32::MAX), (88, 0)]);
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.

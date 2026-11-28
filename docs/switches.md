@@ -293,7 +293,7 @@ switch is read.
 | `VICTORY_CAPTURE_WORLD_ALSO` | off | list |  |  | diag | More frame offsets counted from the first world frame to capture. |
 | `VICTORY_CARD_ACCOUNTING` | off | flag |  |  |  | Logs an accounting line of the card's memory use when the texture queue finds no room. |
 | `VICTORY_CARD_ALL` | off | flag |  |  |  | Makes every title buffer's host copy live in the card's memory, with no minimum size. |
-| `VICTORY_CARD_AWAKE` | on, 1 (turns = by turns) | text |  |  |  | Keeps the card's clocks up between submissions; turns alternates on and off for comparison. |
+| `VICTORY_CARD_AWAKE` | on, 1 (turns = by turns, idle = only while the card has nothing of ours to run) | text |  | live |  | Keeps the card's clocks up between submissions; turns alternates on and off for comparison; idle sends the loop only while the card is idle by its clock; in `VICTORY_AB` it is a switch of its own. |
 | `VICTORY_CARD_BIG_FIRST` | on (=0 turns off) | flag |  | live |  | Big title buffer copies come first: the texture queue keeps room free for them. |
 | `VICTORY_CARD_BUFFERS` | on (=0 turns off) | flag |  |  |  | Keeps host copies of big title buffers in the card's own memory instead of the PC's. |
 | `VICTORY_CARD_BUFFERS_MB` | derived from VRAM budget (512, 2048 or a quarter of it up to 8192) | number |  |  |  | Most MiB of title buffer copies kept in the card's memory. |
@@ -304,7 +304,7 @@ switch is read.
 | `VICTORY_CARD_REHASH_RUNS` | on, 1 | flag |  |  |  | Hashes pieces sent up to a card copy in runs of touching pieces, once each. |
 | `VICTORY_CARD_ROOM_FOR_BUFFERS` | on (=0 turns off) | flag |  |  |  | Keeps room in the card's budget for title buffer copies and gives up room of copies turned down. |
 | `VICTORY_CARD_ROOM_FOR_TARGETS_MB` | 3072 (at most a quarter of the VRAM budget) | number |  |  |  | MiB of card memory the texture queue leaves free for render targets not yet made. |
-| `VICTORY_CARD_SPANS` | off | flag |  |  |  | Times the card's work on our submissions with timestamps around each submission. |
+| `VICTORY_CARD_SPANS` | off | text |  |  |  | Times the card's work on our submissions with timestamps around each submission (`1`); `2` adds a stamp behind every list of a submission (the card's time by kind of list: card steps, preludes, title lists, compare) and counts our own full waits by site. |
 | `VICTORY_CARD_STEPS` | on, 2 (0 off, 1 constant buffers only) | number |  |  |  | Does submission steps that read title memory on the card in the flights' order, not on the CPU. |
 | `VICTORY_CARD_WINDOWS_LINE` | 80 | number |  |  |  | Hundredths of the card's budget up to which a memory window's card side is made. |
 | `VICTORY_CARD_WINDOWS_MB` | 0 (none) | number |  |  |  | Megabytes of title memory kept in card-side windows; 0 means none. |
@@ -501,6 +501,7 @@ switch is read.
 | `VICTORY_NOTES` | on, 2 | number |  |  |  | How many notes a copy keeps; clamped 1..64. |
 | `VICTORY_NOTES_VOID` | off | text |  |  |  | With range, void only the notes in the written range instead of all of the copy. |
 | `VICTORY_ONE_PAD` | on (=0 turns off) | flag |  |  |  | Present all host pads as one player instead of each as its own. |
+| `VICTORY_ONE_CALL` | off | flag |  | live |  | A submission joined of several parts is given to the queue in one call of `ExecuteCommandLists`, not one for each part. |
 | `VICTORY_ONE_PASS` | off | flag |  | live |  | Prepare a submission from one pass over the steps instead of four walks. |
 | `VICTORY_OPEN_ONE_VIEW` | on (=0 turns off) | flag |  | live |  | Open only the guarded block a write faults on instead of all views of it. |
 | `VICTORY_OPUS_PITCH` | off | flag |  | live |  | Resample audio packets to the pitch the title asks for. |

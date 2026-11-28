@@ -794,6 +794,7 @@ fn record(
     // its call) and are promoted by their first use.
     unsafe {
         if first {
+            crate::host::ours::drain(crate::host::ours::Site::Steps);
             // What earlier lists' shaders wrote, first.
             list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                 Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,

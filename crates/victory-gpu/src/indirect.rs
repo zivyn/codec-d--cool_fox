@@ -631,6 +631,7 @@ pub(crate) fn batch_for(device: &ID3D12Device) -> windows::core::Result<(ID3D12R
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+    crate::host::ours::drain(crate::host::ours::Site::Clamp);
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

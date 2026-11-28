@@ -539,6 +539,9 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        // What each of `lists` is (`VICTORY_CARD_SPANS=2`, [`spans::lap`]).
+        #[cfg(feature = "diagnostics")]
+        let mut kinds: Vec<u8> = Vec::with_capacity(2 * runs.len() + 3);
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::new(lean_steps());
@@ -677,8 +680,18 @@ impl Host {
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude(&mut hand) {
                 lists.push(Some(prelude));
+                #[cfg(feature = "diagnostics")]
+                kinds.push(spans::lap::PRELUDE);
             }
             lists.push(list.list.cast().ok());
+            #[cfg(feature = "diagnostics")]
+            kinds.push(if n == 0 && own.is_some() {
+                spans::lap::STEPS
+            } else if list.is_compute() {
+                spans::lap::TITLE_C
+            } else {
+                spans::lap::TITLE
+            });
         }
         if let Some(route) = route.as_mut() {
             route.hand(hand);
@@ -798,6 +811,8 @@ impl Host {
         }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+            #[cfg(feature = "diagnostics")]
+            kinds.push(spans::lap::CHECK);
         }
         #[cfg(feature = "diagnostics")]
         split.part(4);
@@ -817,6 +832,8 @@ impl Host {
         if let Some((ahead, behind)) = stamp.and_then(stamps::lists).filter(|_| !on_compute) {
             lists.insert(0, Some(ahead));
             lists.push(Some(behind));
+            kinds.insert(0, spans::lap::OTHER);
+            kinds.push(spans::lap::OTHER);
             firsts.iter_mut().for_each(|first| *first += 1);
         }
         #[cfg(feature = "diagnostics")]
@@ -827,9 +844,22 @@ impl Host {
             if let Some([front, behind]) = self.span_lists().filter(|_| !on_compute) {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
+                kinds.insert(0, spans::lap::FRONT);
+                kinds.push(spans::lap::BEHIND);
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
-            let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
+            // A stamp behind each list (`VICTORY_CARD_SPANS=2`).
+            #[cfg(feature = "diagnostics")]
+            if !on_compute {
+                self.lap_lists(&mut lists, &mut firsts, &kinds, &parts);
+            }
+            // (`VICTORY_ONE_CALL=1`: one call of `ExecuteCommandLists` for the whole submission, not one for each of the parts it
+            // joins: the card cannot idle between two calls of one submission, and the queue is given less calls.)
+            let cuts: Vec<usize> = if crate::ab::live_flag!("VICTORY_ONE_CALL") {
+                Vec::new()
+            } else {
+                parts.iter().filter_map(|&n| firsts.get(n).copied()).collect()
+            };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 if let Some(route) = route.as_mut() {

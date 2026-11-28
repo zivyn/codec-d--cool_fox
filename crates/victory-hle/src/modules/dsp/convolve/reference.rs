@@ -96,7 +96,7 @@ pub(in crate::modules::dsp) struct Reference {
 impl Reference {
     /// `None` when the response is not in the layout described above.
     pub(in crate::modules::dsp) fn new(ir: &[f32]) -> Option<Self> {
-        if ir.is_empty() || ir.len() % N != 0 {
+        if ir.is_empty() || ir.len() & (N - 1) != 0 {
             return None;
         }
         let mut blocks = ir.len() / N;

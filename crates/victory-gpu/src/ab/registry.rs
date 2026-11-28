@@ -44,6 +44,8 @@ pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_CLOSED_IDLE", Kind::OnByDefault),
     ("VICTORY_COPY_BESIDE", Kind::Flag),
     ("VICTORY_DROP_EARLY", Kind::Flag),
+    ("VICTORY_DSP_CONVOLVE", Kind::Flag),
+    ("VICTORY_DSP_CONVOLVE_GAIN", Kind::Float),
     ("VICTORY_DSP_REVERB", Kind::Flag),
     ("VICTORY_DSP_REVERB_LEVEL", Kind::Float),
     ("VICTORY_FOLD_VIEWS", Kind::Flag),

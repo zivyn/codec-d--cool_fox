@@ -47,6 +47,16 @@ pub struct Counters {
     reverb_max_us: AtomicU64,
     reverb_gain_ramps: AtomicU64,
     reverb_gain_steps: AtomicU64,
+    convolve_blocks: AtomicU64,
+    convolve_skipped: AtomicU64,
+    convolve_bad_blocks: AtomicU64,
+    convolve_in_peak_milli: AtomicU64,
+    convolve_out_peak_milli: AtomicU64,
+    convolve_us: AtomicU64,
+    convolve_max_us: AtomicU64,
+    convolve_windows: AtomicU64,
+    convolve_gain_ramps: AtomicU64,
+    convolve_gain_steps: AtomicU64,
     opus_packets: AtomicU64,
     opus_errors: AtomicU64,
     opus_pitched: AtomicU64,
@@ -81,6 +91,16 @@ pub struct Window {
     pub reverb_max_us: u64,
     pub reverb_gain_ramps: u64,
     pub reverb_gain_steps: u64,
+    pub convolve_blocks: u64,
+    pub convolve_skipped: u64,
+    pub convolve_bad_blocks: u64,
+    pub convolve_in_peak_milli: u64,
+    pub convolve_out_peak_milli: u64,
+    pub convolve_us: u64,
+    pub convolve_max_us: u64,
+    pub convolve_windows: u64,
+    pub convolve_gain_ramps: u64,
+    pub convolve_gain_steps: u64,
     pub opus_packets: u64,
     pub opus_errors: u64,
     pub opus_pitched: u64,
@@ -120,6 +140,16 @@ impl Counters {
             reverb_max_us,
             reverb_gain_ramps,
             reverb_gain_steps,
+            convolve_blocks,
+            convolve_skipped,
+            convolve_bad_blocks,
+            convolve_in_peak_milli,
+            convolve_out_peak_milli,
+            convolve_us,
+            convolve_max_us,
+            convolve_windows,
+            convolve_gain_ramps,
+            convolve_gain_steps,
             opus_packets,
             opus_errors,
             opus_pitched
@@ -149,6 +179,42 @@ impl Counters {
     pub fn reverb_gains(&self, ramp: bool, step: bool) {
         self.reverb_gain_ramps.fetch_add(u64::from(ramp), Relaxed);
         self.reverb_gain_steps.fetch_add(u64::from(step), Relaxed);
+    }
+
+    /// A block through the computed convolution (`VICTORY_DSP_CONVOLVE`):
+    /// whether there was nothing to compute (silence in the ring), whether
+    /// the input had to be repaired, the largest sample in and out, the
+    /// windows of the response that were summed, the gains (whether they
+    /// differ within the block, and whether they start somewhere other than
+    /// where the stream's last block ended) and the time it took.
+    #[allow(clippy::too_many_arguments)]
+    pub fn convolve_block(
+        &self,
+        skipped: bool,
+        repaired: bool,
+        input_peak: f32,
+        output_peak: f32,
+        windows: usize,
+        gains: (bool, bool),
+        took: Duration,
+    ) {
+        let milli = |v: f32| (v * 1000.0).min(1e12) as u64;
+        let us = took.as_micros() as u64;
+        self.convolve_us.fetch_add(us, Relaxed);
+        self.convolve_max_us.fetch_max(us, Relaxed);
+        self.convolve_blocks.fetch_add(1, Relaxed);
+        self.convolve_skipped.fetch_add(u64::from(skipped), Relaxed);
+        self.convolve_bad_blocks
+            .fetch_add(u64::from(repaired), Relaxed);
+        self.convolve_windows.fetch_add(windows as u64, Relaxed);
+        self.convolve_in_peak_milli
+            .fetch_max(milli(input_peak), Relaxed);
+        self.convolve_out_peak_milli
+            .fetch_max(milli(output_peak), Relaxed);
+        self.convolve_gain_ramps
+            .fetch_add(u64::from(gains.0), Relaxed);
+        self.convolve_gain_steps
+            .fetch_add(u64::from(gains.1), Relaxed);
     }
 
     /// An Opus packet decoded for the title (`xapu`): whether it failed, and
@@ -244,6 +310,16 @@ impl Counters {
             reverb_max_us: t(&self.reverb_max_us),
             reverb_gain_ramps: t(&self.reverb_gain_ramps),
             reverb_gain_steps: t(&self.reverb_gain_steps),
+            convolve_blocks: t(&self.convolve_blocks),
+            convolve_skipped: t(&self.convolve_skipped),
+            convolve_bad_blocks: t(&self.convolve_bad_blocks),
+            convolve_in_peak_milli: t(&self.convolve_in_peak_milli),
+            convolve_out_peak_milli: t(&self.convolve_out_peak_milli),
+            convolve_us: t(&self.convolve_us),
+            convolve_max_us: t(&self.convolve_max_us),
+            convolve_windows: t(&self.convolve_windows),
+            convolve_gain_ramps: t(&self.convolve_gain_ramps),
+            convolve_gain_steps: t(&self.convolve_gain_steps),
             opus_packets: t(&self.opus_packets),
             opus_errors: t(&self.opus_errors),
             opus_pitched: t(&self.opus_pitched),
@@ -309,6 +385,18 @@ pub fn tick(since: &mut Instant, voices: usize) {
         reverb_max_block_ms = w.reverb_max_us as f32 / 1000.0,
         reverb_gain_ramps = w.reverb_gain_ramps,
         reverb_gain_steps = w.reverb_gain_steps,
+        convolve_blocks = w.convolve_blocks,
+        convolve_skipped = w.convolve_skipped,
+        convolve_bad_blocks = w.convolve_bad_blocks,
+        convolve_in_peak = w.convolve_in_peak_milli as f32 / 1000.0,
+        convolve_out_peak = w.convolve_out_peak_milli as f32 / 1000.0,
+        convolve_ms = w.convolve_us as f32 / 1000.0,
+        convolve_max_block_ms = w.convolve_max_us as f32 / 1000.0,
+        // windows summed per block that was computed
+        convolve_windows = w.convolve_windows as f32
+            / w.convolve_blocks.saturating_sub(w.convolve_skipped).max(1) as f32,
+        convolve_gain_ramps = w.convolve_gain_ramps,
+        convolve_gain_steps = w.convolve_gain_steps,
         opus_packets = w.opus_packets,
         opus_errors = w.opus_errors,
         opus_pitched = w.opus_pitched,

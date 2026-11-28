@@ -687,13 +687,17 @@ impl Work for Job {
                 let met = wait.met()
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
-                if !met {
+                // (Counted by cause; with VICTORY_JOIN_WAITS a write along that covers the place meets it.)
+                if !met && !crate::host::precise::value_wait(wait, hosts()) {
                     stopped(STOP_VALUE);
                     return Err(next);
                 }
             }
             &Job::Wait(fence, value) => {
-                if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                if crate::fence::completed(fence as This) < value
+                    && !signals.iter().any(|&(f, v)| f == fence && v >= value)
+                    && !crate::host::precise::fence_wait(fence, value)
+                {
                     stopped(STOP_FENCE);
                     return Err(next);
                 }
@@ -707,7 +711,11 @@ impl Work for Job {
                     Some(STOP_LISTS)
                 } else {
                     use crate::host::NoJoin;
-                    crate::host::join_refusal(hosts(), &runs).map(|no| match no {
+                    let refusal = crate::host::join_refusal(hosts(), &runs);
+                    if let Some(no) = refusal {
+                        crate::host::precise::refused(no, hosts(), &runs);
+                    }
+                    refusal.map(|no| match no {
                         NoJoin::CopyOrRun => STOP_STEP,
                         NoJoin::Written => STOP_WRITTEN,
                         NoJoin::WideOnly => STOP_WIDE,
@@ -1218,6 +1226,7 @@ pub(super) fn line(frames: f64) {
             s[LAG] / 1000.0 / s[PRESENTS]
         );
     }
+    crate::host::precise::line(frames);
     if let Some([splits, before, lists]) = crate::host::take_blocked_splits() {
         tracing::info!(
             "joined submissions that waited for flights, per frame (VICTORY_SPLIT_BLOCKED): {:.2} with parts in front of the wait \

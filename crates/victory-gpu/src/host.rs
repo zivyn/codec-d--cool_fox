@@ -2375,6 +2375,8 @@ struct Deferred {
     /// memory (host copy, address, bytes): declaring them again would
     /// change nothing.
     gpu_written: std::collections::HashSet<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    /// What those ranges would be by the code of the shaders ([`precise`], `VICTORY_PRECISE_LOOK`).
+    precise: precise::Side,
     /// Scratch memory [`HostList::fill_scratch`] fills since the list last
     /// wrote title memory (source, bytes): its host address.
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
@@ -4443,6 +4445,7 @@ pub(crate) mod indirects;
 mod panel;
 mod onepass;
 mod place;
+pub(crate) mod precise;
 mod prefetch;
 mod front;
 mod scratch;
@@ -8387,6 +8390,7 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+            precise::whole(&mut deferred.precise, address, len);
         }
     }
 

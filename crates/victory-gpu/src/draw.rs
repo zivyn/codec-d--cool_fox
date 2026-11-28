@@ -1007,6 +1007,7 @@ macro_rules! once {
     }};
 }
 
+pub(crate) mod access;
 pub(crate) mod fold;
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -1831,6 +1832,11 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            // What the shader stores, by its code and what this draw gives it (`crate::host::precise`).
+            let _precise = crate::host::precise::enter(stage, compute, &|slot, dword| match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(Root::Constants(v)) => v.get(dword as usize).copied(),
+                _ => None,
+            });
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
@@ -2084,7 +2090,7 @@ impl State {
                         None
                     }
                 };
-                if !self.root_uav(list, address, param, compute, writes) {
+                if !self.root_uav(list, address, (slot, param), compute, writes) {
                     return false;
                 }
             }
@@ -2110,7 +2116,7 @@ impl State {
         &mut self,
         list: &HostList,
         address: Option<u64>,
-        param: u32,
+        (slot, param): (u8, u32),
         compute: bool,
         writes: bool,
     ) -> bool {
@@ -2138,7 +2144,7 @@ impl State {
             if writes {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(a, len, self.pipeline);
-                s.gpu_writes(list, a, len);
+                crate::host::precise::declare(list, s, a, len, Some(crate::host::precise::root(slot)));
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -2493,7 +2499,7 @@ impl State {
                         {
                             let was_staged = crate::texture::is_staged(resource);
                             let _ = crate::residency::take_staging_deferred();
-                            readable(list, sampled.kind, &view);
+                            readable(list, sampled.kind, &view, None);
                             let failed = crate::residency::take_staging_deferred() || crate::residency::upload_refused();
                             if !was_staged {
                                 crate::texture::unstage(resource);
@@ -3231,7 +3237,7 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
-                readable(list, sampled.kind, view);
+                readable(list, sampled.kind, view, None);
                 crate::texture::PICKING.set(None);
             }
             // A failed or deferred staging allocation leaves this slot due.
@@ -3417,6 +3423,13 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // The groups the dispatch runs (counted in threads: whole groups of them), for what its shaders can write.
+        let _extent = crate::host::precise::extent(
+            (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
+                .then(|| p.stages.first().and_then(|s| s.translated().threads))
+                .flatten()
+                .map_or([x, y, z], |size| dispatch_groups([x, y, z], size)),
+        );
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3899,7 +3912,7 @@ impl State {
             return;
         };
         if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+            readable(list, u.kind, &view, Some(u));
             // Up to date by this draw: not the texture pass's to make.
             if crate::descriptor::host::is_texture_view(&view) {
                 host.texture_slot_tabled(index, true);
@@ -4023,7 +4036,7 @@ impl State {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u.kind, &view);
+                        readable(list, u.kind, &view, Some(u));
                     }
                 }
                 for k in selected {
@@ -4034,7 +4047,7 @@ impl State {
                     if let Some(view) = crate::descriptor::view(handle)
                         && let Some(kind) = view_kind(&view)
                     {
-                        readable(list, kind, &view);
+                        readable(list, kind, &view, None);
                     }
                 }
                 let depth = TESTED_DEPTH.get().1;
@@ -4112,7 +4125,7 @@ impl State {
                         } else if let Some(view) = crate::descriptor::host::listed_view(recording, words) {
                             let _ = crate::residency::take_staging_deferred();
                             TESTED_DEPTH.set((tested.0, false));
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, group.entry(k));
                             let depth = TESTED_DEPTH.get().1;
                             TESTED_DEPTH.set((tested.0, tested.1 || depth));
                             if kind == ResourceType::Srv && !crate::residency::take_staging_deferred() {
@@ -4152,7 +4165,7 @@ impl State {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
-                            readable(list, kind, &view);
+                            readable(list, kind, &view, used);
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -4960,7 +4973,7 @@ impl RecordHash {
     }
 }
 
-fn readable(list: &HostList, kind: ResourceType, view: &View) {
+fn readable(list: &HostList, kind: ResourceType, view: &View, entry: Option<&UsedResource>) {
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -4974,7 +4987,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             if STORES.get() || !write_skip() {
                 #[cfg(feature = "diagnostics")]
                 crate::host::wide_write(address, len, 0);
-                shadow.gpu_writes(list, address, len);
+                crate::host::precise::declare(list, &shadow, address, len, entry.map(crate::host::precise::table));
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

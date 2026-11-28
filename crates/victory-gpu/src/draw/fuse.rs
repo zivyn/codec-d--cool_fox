@@ -26,15 +26,19 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use victory_shader::emit::{SLOT_FUSE, fuse_fill, fuse_fits, fuse_rows};
+use victory_shader::emit::{
+    SLOT_FUSE, fuse_fill, fuse_fill_native, fuse_fits, fuse_native_rows, fuse_rows,
+};
 
 use super::*;
 use crate::pipeline::host::Stage;
 
 /// Since the last line: runs made, the dispatches in them, their groups, and the runs of one dispatch; runs made
 /// where the next dispatch had another program or other heaps, no room, a wait to be made, the end of the stream's
-/// plan, or nothing to wait for (a dispatch that joins nothing); runs the card could not be given.
-pub(crate) static COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// plan, or nothing to wait for (a dispatch that joins nothing); runs the card could not be given; dispatches of programs
+/// translated for runs that may not join one (a root view, a texture), and dispatches of programs that are not
+/// translated for runs at all.
+pub(crate) static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 /// The line of what the runs came to, per frame (with the one of the executions: [`crate::list::runs_line`]).
 pub(crate) fn line(frames: f64) {
@@ -44,7 +48,7 @@ pub(crate) fn line(frames: f64) {
     }
     let per = |v: u64| v as f64 / frames;
     tracing::info!(
-        "dispatches made one per frame (VICTORY_FUSE_RUNS): {:.0} runs of {:.1} dispatches on average ({:.0} of one dispatch), {:.0} dispatches made {:.0} fewer, {:.0} groups a run; runs ended by {:.0} another program or heaps, {:.0} no room, {:.0} a wait, {:.0} the stream's plan, {:.0} no plan; {:.0} not made",
+        "dispatches made one per frame (VICTORY_FUSE_RUNS): {:.0} runs of {:.1} dispatches on average ({:.0} of one dispatch), {:.0} dispatches made {:.0} fewer, {:.0} groups a run; runs ended by {:.0} another program or heaps, {:.0} no room, {:.0} a wait, {:.0} the stream's plan, {:.0} no plan; {:.0} not made; {:.0} dispatches of programs for runs that cannot join, {:.0} of programs not for runs",
         per(c[0]),
         c[1] as f64 / c[0] as f64,
         per(c[3]),
@@ -57,6 +61,8 @@ pub(crate) fn line(frames: f64) {
         per(c[7]),
         per(c[8]),
         per(c[9]),
+        per(c[10]),
+        per(c[11]),
     );
 }
 
@@ -69,6 +75,11 @@ const ALONE: usize = 8;
 
 /// The groups of a run in all, at most (the program counts them in 31 bits).
 const MOST_GROUPS: u64 = (u32::MAX >> 1) as u64;
+
+/// A dispatch of a program that is not translated for runs.
+pub(super) fn plain() {
+    COUNTS[11].fetch_add(1, Relaxed);
+}
 
 /// What the stage's program was translated for: a table of a run instead of root constants.
 pub(super) fn shaped(stage: &Stage) -> bool {
@@ -195,8 +206,35 @@ impl State {
         run.values.extend_from_slice(&self.fuse.cur);
         run.total += size;
         if !(self.fuse.planned && joinable(stage)) {
+            COUNTS[10].fetch_add(u64::from(!stage.shader.joins_runs()), Relaxed);
             self.fuse_flush(list, ALONE);
         }
+    }
+
+    /// A program translated for runs is to be executed by the title's own arguments (an indirect dispatch, whose group
+    /// counts the card reads from memory): its table is that of a dispatch run as the title made it, set on the host
+    /// list for the execution that follows. False if there is no room for it (the execution is dropped).
+    pub(super) fn fuse_native(&mut self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first() else {
+            return false;
+        };
+        let Some(param) = table_param(stage) else {
+            return false;
+        };
+        let dwords = stage.user_data.map_or(0, |u| u.1 as usize);
+        self.fuse.cur.resize(dwords, 0);
+        let rows = fuse_native_rows(dwords);
+        let Some((gpu, data)) = list.scratch(rows as u64 * 16) else {
+            return false;
+        };
+        // SAFETY: `rows * 16` bytes of mapped upload memory, 256-byte aligned, the list's until it is reset.
+        let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), rows * 4) };
+        if fuse_fill_native(out, dwords, &self.fuse.cur).is_none() {
+            return false;
+        }
+        // SAFETY: an open list with the program's pipeline and root signature set (`bind`).
+        unsafe { list.list.SetComputeRootConstantBufferView(param, gpu) };
+        true
     }
 
     /// The run is made: its table is written into the list's upload memory, and the host list is given its address
@@ -206,12 +244,22 @@ impl State {
             return;
         };
         let n = run.groups.len();
-        let rows = fuse_rows(n, run.dwords);
         let made = (|| {
+            // One dispatch is run as the title made it: its own group ids, whatever its counts.
+            let rows = if n == 1 {
+                fuse_native_rows(run.dwords)
+            } else {
+                fuse_rows(n, run.dwords)
+            };
             let (gpu, data) = list.scratch(rows as u64 * 16)?;
             // SAFETY: `rows * 16` bytes of mapped upload memory, 256-byte aligned, the list's until it is reset.
             let out = unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), rows * 4) };
-            let dims = fuse_fill(out, run.dwords, &run.groups, &run.values)?;
+            let dims = if n == 1 {
+                fuse_fill_native(out, run.dwords, &run.values)?;
+                run.groups[0]
+            } else {
+                fuse_fill(out, run.dwords, &run.groups, &run.values)?
+            };
             // SAFETY: an open list that has the run's pipeline, root signature and heaps (the dispatches that joined
             // were bound with them, and nothing else was recorded since: `fuse_room`).
             unsafe {

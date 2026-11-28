@@ -11,6 +11,9 @@
 //! The table is the root CBV [`SLOT_FUSE`] (`b250` in the root CBV space), 16-byte rows:
 //!
 //! - row 0: the members `n`, the rows of a record `R`, the groups of the whole run, the first row of the records;
+//!   a table with `n` 0 is the table of a dispatch that is run as the title made it (one member, group ids the
+//!   dispatch's own, whatever its group counts: a single dispatch, or one whose counts the card reads from memory):
+//!   its records begin at row 1 and its starts are not there;
 //! - the starts of the members, four to a row from row 1: start `k` is the number of the member's first group in the
 //!   run (ascending, the first 0);
 //! - member `k`: `R` rows from the first row of the records plus `k * R`: its group counts `(x, y, z)` and a pad, then
@@ -118,16 +121,20 @@ impl Lower<'_> {
         let rows = self.s.m.extract(original, header, 1);
         let total = self.s.m.extract(original, header, 2);
         let records = self.s.m.extract(original, header, 3);
-        let (Val::I32(x), Val::I32(y)) = (
+        let (Val::I32(x), Val::I32(y), Val::I32(z)) = (
             self.compute_id("groupId.i32", 94, 0),
             self.compute_id("groupId.i32", 94, 1),
+            self.compute_id("groupId.i32", 94, 2),
         ) else {
             unreachable!()
         };
         let width = self.s.m.i32(FUSE_WIDTH);
         let row = self.s.m.bin(original, Bin::Mul, y, width);
         let group = self.s.m.bin(original, Bin::Add, x, row);
-        let inside = self.s.m.cmp(original, pred::IULT, group, total);
+        // (A table of no members is the title's own dispatch: every group runs, and it has its own ids.)
+        let own = self.s.m.cmp(original, pred::EQ, members, zero);
+        let there = self.s.m.cmp(original, pred::IULT, group, total);
+        let inside = self.s.m.bin(original, Bin::Or, own, there);
         let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
         self.s
             .m
@@ -161,6 +168,9 @@ impl Lower<'_> {
         let rest = self.s.m.bin(body, Bin::UDiv, number, cx);
         let ly = self.s.m.bin(body, Bin::URem, rest, cy);
         let lz = self.s.m.bin(body, Bin::UDiv, rest, cy);
+        let lx = self.s.m.select(body, own, x, lx);
+        let ly = self.s.m.select(body, own, y, ly);
+        let lz = self.s.m.select(body, own, z, lz);
         self.fuse.base = Some(base);
         self.fuse.local = Some([lx, ly, lz]);
     }
@@ -195,6 +205,27 @@ pub const fn fuse_rows(members: usize, dwords: usize) -> usize {
 /// Whether a run of `members` with `dwords` of user data each fits in a root CBV and the program's halvings.
 pub const fn fuse_fits(members: usize, dwords: usize) -> bool {
     members <= FUSE_MEMBERS && fuse_rows(members, dwords) <= FUSE_ROWS
+}
+
+/// Rows of the table of a dispatch run as the title made it ([`fuse_fill_native`]).
+pub const fn fuse_native_rows(dwords: usize) -> usize {
+    1 + fuse_record_rows(dwords)
+}
+
+/// Writes the table of one dispatch that is run as the title made it (its own group ids, whatever its group counts
+/// are, even if they are in memory) into `out` (`fuse_native_rows(dwords) * 4` dwords or more). `None` if `out` is too
+/// short.
+pub fn fuse_fill_native(out: &mut [u32], dwords: usize, user: &[u32]) -> Option<()> {
+    let rows = fuse_record_rows(dwords);
+    if user.len() != dwords || out.len() < fuse_native_rows(dwords) * 4 {
+        return None;
+    }
+    out[..4].copy_from_slice(&[0, rows as u32, 0, 1]);
+    // (Counts of one in each direction: the program cuts the group's number into them and does not use the result.)
+    out[4..8].copy_from_slice(&[1, 1, 1, 0]);
+    out[8..8 + dwords].copy_from_slice(user);
+    out[8 + dwords..4 + rows * 4].fill(0);
+    Some(())
 }
 
 /// The group counts of the dispatch of a run of `total` groups.
@@ -354,6 +385,26 @@ mod tests {
             assert_eq!(fuse_locate(&table, total), None);
             assert_eq!(fuse_locate(&table, total + 7), None);
         }
+    }
+
+    #[test]
+    fn the_table_of_a_dispatch_as_the_title_made_it_has_no_members_and_its_record_at_row_1() {
+        let user = [11, 22, 33, 44, 55, 66];
+        let mut table = vec![0xdead_beef; fuse_native_rows(6) * 4];
+        assert_eq!(fuse_fill_native(&mut table, 6, &user), Some(()));
+        assert_eq!(table[0], 0, "no members");
+        let (rows, records) = (table[1] as usize, table[3] as usize);
+        assert_eq!((rows, records), (fuse_record_rows(6), 1));
+        assert_eq!(
+            &table[records * 4..records * 4 + 3],
+            &[1, 1, 1],
+            "counts the program can divide by"
+        );
+        assert_eq!(&table[records * 4 + 4..records * 4 + 10], &user);
+        assert_eq!(table.len(), (1 + rows) * 4);
+        assert!(table[records * 4 + 10..].iter().all(|&w| w == 0), "the pad");
+        assert_eq!(fuse_fill_native(&mut table[..8], 6, &user), None);
+        assert_eq!(fuse_fill_native(&mut table, 6, &user[..5]), None);
     }
 
     #[test]

@@ -3701,6 +3701,7 @@ impl State {
             if wait {
                 crate::list::emit_uav_wait(list);
             }
+            fuse::plain();
             // SAFETY: an open list with everything set.
             unsafe { list.list.Dispatch(x, y, z) };
         }
@@ -5007,6 +5008,12 @@ impl State {
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
         if kind == MESH {
             self.mesh_scissor(list, true);
+        }
+        // A program translated for runs of dispatches reads its user data from a table; the card reads this
+        // execution's group counts, so the table is that of a dispatch as the title made it (`fuse`).
+        if kind == DISPATCH && p.stages.first().is_some_and(fuse::shaped) && !self.fuse_native(list, p) {
+            why("the table of a program translated for runs of dispatches could not be made");
+            return false;
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.

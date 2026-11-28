@@ -7,7 +7,9 @@
 use super::host::{Dispatch, Host, Root, View};
 use super::lower::fuse::TEST_FUSE;
 use super::valu_tests::ONE_AT_A_TIME;
-use super::{HostShader, SLOT_FUSE, fuse_fill, lower, validator};
+use super::{
+    HostShader, SLOT_FUSE, fuse_fill, fuse_fill_native, fuse_native_rows, lower, validator,
+};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -191,7 +193,13 @@ fn same_bytes(members: &[Member]) {
         "the program reads the same user data either way"
     );
     let slots: u32 = members.iter().map(Member::slots).sum();
-    let dwords = slots * SLOT_BYTES / 4;
+    // (The slots the members write, from the first any of them has to the last.)
+    let extent = members
+        .iter()
+        .map(|m| m.first + m.slots())
+        .max()
+        .unwrap_or(0);
+    let dwords = extent * SLOT_BYTES / 4;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -202,6 +210,7 @@ fn same_bytes(members: &[Member]) {
         // The title's way: one dispatch for each member, each into a zeroed buffer; the members write where
         // the others do not, so the buffer they would all have written is the union.
         let mut want = vec![0u32; dwords as usize];
+        let mut singly = Vec::new();
         for m in members {
             let out = host
                 .dispatch(
@@ -215,6 +224,7 @@ fn same_bytes(members: &[Member]) {
                     },
                 )
                 .expect("dispatch of a member");
+            singly.push(out[0].clone());
             for (w, &o) in want.iter_mut().zip(&out[0]) {
                 if o != 0 {
                     assert_eq!(
@@ -268,6 +278,38 @@ fn same_bytes(members: &[Member]) {
             "{label}: {wrong} of {dwords} dwords differ between the members one by one and the run, for {} members",
             members.len()
         );
+        // A dispatch as the title made it (a table of no members: its own group ids, its own group counts) is that
+        // dispatch too.
+        for (m, one) in members.iter().zip(&singly) {
+            let mut table = vec![0u32; fuse_native_rows(dwords_of_user) * 4];
+            fuse_fill_native(&mut table, dwords_of_user, &user_data(&fused, m)).expect("a table");
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(vec![0xdead_beef; dwords_of_user.max(1)])),
+                            (
+                                1,
+                                Root::View {
+                                    srv: false,
+                                    data: table,
+                                },
+                            ),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: m.groups,
+                    },
+                )
+                .expect("dispatch of a member in its own form");
+            assert!(
+                out[0] == *one,
+                "{label}: the dispatch of {:?} in its own form writes other bytes",
+                m.groups
+            );
+        }
     }
 }
 

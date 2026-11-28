@@ -12,6 +12,11 @@
 //! `VICTORY_AB_BUNDLE=1`: the phases alternate between all the named switches off and all on (a bundle against none),
 //! not every combination.
 //!
+//! `VICTORY_AB_SCREEN=1`: up to 31 switches, the phases following the rows of a Hadamard matrix (each row and then its
+//! complement), so that one run gives the effect of each switch on the frame time with the others on or off half of the
+//! time: after each pair of phases the log says `A/B screen so far`, the switches by the size of their effect with the 95 %
+//! interval of each (`screen`).
+//!
 //! `VICTORY_AB_SHOTS=N` (with `VICTORY_CAPTURE=<folder>`; the pilot's `auto-run.ps1` always has one): a picture of every
 //! phase of every Nth cycle (a cycle is a pair for one switch or a bundle, `2^n` combinations of `n` switches; 1: every
 //! phase), saved by the host's next present a second and a half before the phase ends as `ab-<phase>-<A|B>.png`
@@ -44,6 +49,7 @@
 #![cfg_attr(not(feature = "diagnostics"), allow(dead_code, unused_imports))]
 
 mod registry;
+mod screen;
 
 use registry::{Check, kind_of, nearest};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
@@ -134,7 +140,7 @@ fn parse(text: &str, bundle: bool) -> Result<Asked, Refusal> {
     let reason = if switches.is_empty() {
         Some("no switch is left to flip (none was named, or every entry was dropped)".to_string())
     } else if switches.len() > most && bundle {
-        Some(format!("{} switches are named and a bundle holds at most {most}", switches.len()))
+        Some(format!("{} switches are named and a bundle or a screen holds at most {most}", switches.len()))
     } else if switches.len() > most {
         Some(format!(
             "{} switches are named and every combination of them is a phase, so at most {most} fit: name fewer, or set VICTORY_AB_BUNDLE=1 \
@@ -191,7 +197,7 @@ impl Setup {
         } else if !diagnostics {
             Plan::NoDiagnostics
         } else {
-            match parse(&raw, config.bundle) {
+            match parse(&raw, config.bundle || config.screen) {
                 Ok(asked) => Plan::Run(asked),
                 Err(refusal) => Plan::Refused(refusal),
             }
@@ -276,6 +282,9 @@ struct Config {
     /// `VICTORY_AB_BUNDLE=1`: the phases alternate between every named switch off and every one on, not all
     /// combinations (a bundle against none).
     bundle: bool,
+    /// `VICTORY_AB_SCREEN=1`: the phases follow the rows of a Hadamard matrix and their complements, so that every
+    /// switch has an effect of its own ([`screen`]); with it `bundle` is off.
+    screen: bool,
     /// `VICTORY_AB_SHOTS=N`: a picture of every phase of every Nth cycle (0: none), see [`shot_due`].
     shots: u64,
 }
@@ -299,11 +308,20 @@ impl Config {
         let skip = number("VICTORY_AB_SKIP", "1 s is left out").unwrap_or(1.0);
         let shots = number("VICTORY_AB_SHOTS", "no pictures").map_or(0, |v| v as u64);
         let bundle_text = get("VICTORY_AB_BUNDLE").filter(|v| !v.is_empty());
-        let bundle = bundle_text.as_deref() == Some("1");
+        let mut bundle = bundle_text.as_deref() == Some("1");
         if let Some(text) = bundle_text.filter(|v| v != "1") {
             notes.push(format!("VICTORY_AB_BUNDLE={text:?} is not 1: ignored (every combination of the switches is a phase)"));
         }
-        (Config { start_after, skip, bundle, shots }, notes)
+        let screen_text = get("VICTORY_AB_SCREEN").filter(|v| !v.is_empty());
+        let screen = screen_text.as_deref() == Some("1");
+        if let Some(text) = screen_text.filter(|v| v != "1") {
+            notes.push(format!("VICTORY_AB_SCREEN={text:?} is not 1: ignored"));
+        }
+        if screen && bundle {
+            notes.push("VICTORY_AB_BUNDLE=1 is ignored: VICTORY_AB_SCREEN=1 is a plan of its own (a bundle is its first two phases)".to_string());
+            bundle = false;
+        }
+        (Config { start_after, skip, bundle, screen, shots }, notes)
     }
 }
 
@@ -314,7 +332,13 @@ fn config() -> &'static Config {
 /// The line that says the A/B begins: the whole plan, so that one search of the log confirms what is running.
 fn begins(asked: &Asked, config: &Config, raw: &str) -> String {
     let n = asked.switches.len();
-    let phases = if config.bundle {
+    let phases = if config.screen {
+        format!(
+            "a screen: phase p follows the row p/2 of a Hadamard matrix of order {} (odd phases its complement; phase 0 every switch off, phase 1 every one on), {} phases a cycle,              the effect of each switch fitted from the phases that ended",
+            screen::order(n),
+            screen::cycle(n)
+        )
+    } else if config.bundle {
         "a bundle: even phases have every switch off (A), odd phases every one on (B)".to_string()
     } else {
         format!("every combination: phase p has the switches whose bit is set in p mod {} on, {} phases a cycle", 1u64 << n, 1u64 << n)
@@ -652,7 +676,9 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
         Phase { started: now, number: 0, began: now, last: now, drawn, frames: Vec::new(), draws: 0, means: Vec::new(), shot_armed: false }
     });
     let bits = |number: u64| {
-        if config.bundle {
+        if config.screen {
+            screen::bits(number, asked.switches.len())
+        } else if config.bundle {
             if number % 2 == 1 { (1u32 << asked.switches.len()) - 1 } else { 0 }
         } else {
             (number % (1 << asked.switches.len())) as u32
@@ -669,7 +695,11 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
         let arm_at = (asked.seconds - 1.5).max(config.skip + 0.5);
         if arm_at < asked.seconds
             && (now - p.began).as_secs_f64() >= arm_at
-            && shot_due(p.number, config.shots, cycle_len(asked.switches.len(), config.bundle))
+            && shot_due(
+                p.number,
+                config.shots,
+                if config.screen { screen::cycle(asked.switches.len()) } else { cycle_len(asked.switches.len(), config.bundle) },
+            )
             && can_shoot()
         {
             arm_shot(p.number, bits(p.number));
@@ -712,6 +742,14 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
             e.sd,
             e.plain
         );
+    }
+    // A screen says what it has found after each pair of phases (a row and its complement) once there are more phases
+    // than terms.
+    if config.screen
+        && p.means.len() % 2 == 0
+        && let Some(fit) = screen::fit(&p.means, asked.switches.len())
+    {
+        tracing::info!("{}", screen::line(&asked.switches, &fit));
     }
     for (n, switch) in asked.switches.iter().enumerate() {
         change(switch, was >> n & 1 != 0, will >> n & 1 != 0);
@@ -900,6 +938,34 @@ mod tests {
         assert!(notes[0].starts_with("VICTORY_AB_START=\"soon\"") && notes[3].starts_with("VICTORY_AB_BUNDLE=\"yes\""), "{notes:?}");
         // Unset or empty is the default, without a word.
         assert!(Config::read(&env(&[("VICTORY_AB_START", "")])).1.is_empty());
+    }
+
+    #[test]
+    fn a_screen_names_up_to_thirty_one_switches_and_wins_over_a_bundle() {
+        let real: Vec<&str> =
+            registry::LIVE.iter().filter(|(_, kind)| *kind == registry::Kind::Flag).map(|(name, _)| *name).collect();
+        let many = |n: usize| format!("10,{}", real[..n].join(","));
+        let vars = [("VICTORY_AB", many(31)), ("VICTORY_AB_SCREEN", "1".to_string()), ("VICTORY_AB_SKIP", "2".to_string())];
+        let setup = Setup::read(&|name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone()), true);
+        assert!(setup.config.screen && !setup.config.bundle);
+        let Plan::Run(asked) = &setup.plan else { panic!("31 switches run as a screen") };
+        assert_eq!(asked.switches.len(), 31);
+        let line = begins(asked, &setup.config, &setup.raw);
+        assert!(line.contains("a screen") && line.contains("order 32") && line.contains("64 phases a cycle"), "{line}");
+        // Thirty-two do not fit the bits, as with a bundle.
+        let vars = [("VICTORY_AB", many(32)), ("VICTORY_AB_SCREEN", "1".to_string())];
+        let setup = Setup::read(&|name| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v.clone()), true);
+        let Plan::Refused(refusal) = &setup.plan else { panic!("32 do not fit") };
+        assert!(refusal.reason.contains("32 switches") && refusal.reason.contains("at most 31"), "{}", refusal.reason);
+        // Both asked for: the screen runs, and the bundle is said to be ignored.
+        let (config, notes) = Config::read(&env(&[("VICTORY_AB_SCREEN", "1"), ("VICTORY_AB_BUNDLE", "1")]));
+        assert!(config.screen && !config.bundle);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].starts_with("VICTORY_AB_BUNDLE=1 is ignored"), "{notes:?}");
+        // Not 1 is said and ignored.
+        let (config, notes) = Config::read(&env(&[("VICTORY_AB_SCREEN", "yes")]));
+        assert!(!config.screen);
+        assert!(notes[0].starts_with("VICTORY_AB_SCREEN=\"yes\""), "{notes:?}");
     }
 
     #[test]

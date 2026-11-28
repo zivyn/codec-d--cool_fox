@@ -213,7 +213,6 @@ impl Ledger {
     }
 
     /// The number noted for `page`, if it is held.
-    #[cfg(test)]
     pub(crate) fn noted(&self, page: usize) -> Option<u64> {
         self.dirty().get(&page).copied()
     }
@@ -578,14 +577,44 @@ pub(crate) fn missed_total() -> [u64; 4] {
     [LOOK_MISSED, LIST_MISSED, UNDER_MISSED, GATE_MISSED].map(|i| STATS[i].load(Relaxed))
 }
 
-/// Mode 1: the ledger's gate said a span needs no look (`stale`: the journal says a page of it was written after the
-/// copy took it, which would be a stale byte left behind).
+/// Mode 1: the log of a span the gate said needs no look and the journal calls stale, made before it is counted by
+/// [`gate_checked`] (the first sixteen say everything; the line's count says how many).
+pub(crate) fn gate_missed(report: &str) {
+    if STATS[GATE_MISSED].load(Relaxed) < 16 {
+        tracing::warn!("page refresh: the gate would have left a span stale: {report}");
+    }
+}
+
+/// Mode 1: the ledger's gate said a span needs no look (`stale`: the journal, read before the gate, says a page of it
+/// was written after the copy took it, which would be a stale byte left behind).
 pub(crate) fn gate_checked(stale: bool) {
     count(GATES, 1);
     if stale {
         count(GATE_MISSED, 1);
-        missed("the gate", (0, 0));
     }
+}
+
+// A place between the two answers of the shadow check of the gate where a test lets another thread's note come in.
+#[cfg(test)]
+thread_local! {
+    static SEAM: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The test's step between the gate's answer and the journal's (or the other way round; `None` ends it).
+#[cfg(test)]
+pub(crate) fn on_seam(step: Option<Box<dyn FnMut()>>) {
+    SEAM.with(|s| *s.borrow_mut() = step);
+}
+
+/// Runs the test's step, if it set one, at the seam of the shadow check of the gate.
+#[inline]
+pub(crate) fn seam() {
+    #[cfg(test)]
+    SEAM.with(|s| {
+        if let Some(step) = s.borrow_mut().as_mut() {
+            step();
+        }
+    });
 }
 
 /// Mode 2: a span left out by the gate.

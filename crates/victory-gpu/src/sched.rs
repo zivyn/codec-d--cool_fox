@@ -137,6 +137,8 @@ mod os {
 }
 
 thread_local! {
+    /// What a thread of stage A ran at before [`front_sync`], and whether it is at the highest now.
+    static FRONT_LEVELS: Cell<Option<(i32, bool)>> = const { Cell::new(None) };
     /// The lane's thread says so once; only it reads the switches in [`lane_sync`].
     static IS_LANE: Cell<bool> = const { Cell::new(false) };
     /// What [`lane_sync`] has set on this thread: bit 0 the core, bit 1 the priority.
@@ -194,6 +196,28 @@ pub(crate) fn lane_sync() {
             }
         }
     }
+}
+
+/// A thread of stage A (the thread that prepares the next submission, the one that does the entry after it, the one
+/// that asks for it) looks at `VICTORY_FRONT_HIGH` before each piece of work it takes: with it on its priority is the
+/// highest of the process's, as the lane's is under `VICTORY_LANE_HIGH` (when the machine is full, the frame is the
+/// longer of the lane and the thread of stage A, so neither should wait behind a thread that nothing waits for); off
+/// again it is what it was.
+pub(crate) fn front_sync() {
+    use windows_sys::Win32::System::Threading::THREAD_PRIORITY_HIGHEST;
+    let high = crate::ab::live_flag!("VICTORY_FRONT_HIGH");
+    let (base, was) = FRONT_LEVELS.get().unwrap_or_else(|| (os::priority(), false));
+    if high == was {
+        FRONT_LEVELS.set(Some((base, was)));
+        return;
+    }
+    let level = if high { base.max(THREAD_PRIORITY_HIGHEST) } else { base };
+    if !os::set_priority(level) {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "a thread of stage A's priority could not be set (VICTORY_FRONT_HIGH)");
+        FRONT_LEVELS.set(Some((base, was)));
+        return;
+    }
+    FRONT_LEVELS.set(Some((base, high)));
 }
 
 /// A thread that translates lists looks at `VICTORY_LIST_NICE` before each recording it takes: its priority is

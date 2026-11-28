@@ -2604,11 +2604,18 @@ struct Line {
     /// registered, and kept there by every rebuilding of `written`, until the
     /// flight is in `line`.
     pending: Vec<(u64, Vec<(usize, usize)>)>,
-    /// The destinations of the copies the registered submissions do on the card ([`card_steps`]), by the same number:
-    /// until the flight is in `line`, nothing else tells that title memory there is not yet what the copy will put
-    /// (rev2: the thread of stage A refreshed another host copy of such a destination).
+    /// What the registered submissions write besides the ranges ([`card_steps::Writer`]), by the same number: the
+    /// destinations of the copies they do on the card, what their shaders write through which host copy, their read
+    /// backs and the values written when they are done. Until the flight is in `line`, nothing else tells that title
+    /// memory there is not yet what they will put (rev2: the thread of stage A refreshed another host copy of such a
+    /// destination), and the thread of stage A that plans the next submission for the card (`VICTORY_STAGE_A_PLAN`)
+    /// finds the host copy that holds what they write here, as it would in the flight.
     pending_copies: Vec<(u64, Vec<card_steps::Writer>)>,
     pending_next: u64,
+    /// How many submissions have been registered ever (`VICTORY_STAGE_A_PLAN`): the plan the thread of stage A made for
+    /// the card is against the line as this number says, and stands only while it is the same (a submission registered
+    /// since writes what the plan did not know of).
+    generation: u64,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and host lists nothing records
@@ -2630,6 +2637,7 @@ impl Line {
             pending: Vec::new(),
             pending_copies: Vec::new(),
             pending_next: 0,
+            generation: 0,
         }
     }
 
@@ -2643,6 +2651,7 @@ impl Line {
     /// [`Line::register_pending`] with the destinations of the copies the submission does on the card.
     fn register_pending_with(&mut self, ranges: Vec<(usize, usize)>, copies: Vec<card_steps::Writer>) -> u64 {
         self.pending_next += 1;
+        self.generation += 1;
         join_ranges(&mut self.written, ranges.iter().copied());
         self.pending.push((self.pending_next, ranges));
         if !copies.is_empty() {
@@ -2885,6 +2894,22 @@ fn ask_spans(runs: &[&HostList], lean: bool) -> Vec<(usize, usize)> {
 
 /// [`ask_spans`] for the copies `asked` says yes to (of each, at each of its refreshes), over any lists of steps.
 fn ask_spans_where<L: onepass::StepList>(runs: &[L], lean: bool, asked: impl Fn(&crate::shadow::Shadow) -> bool) -> Vec<(usize, usize)> {
+    ask_spans_each(runs, lean, asked, None)
+}
+
+/// [`ask_spans`] without the refreshes the thread of the entry takes as done (`VICTORY_STAGE_A_FRONT2`: a range that lies
+/// whole inside a span the second thread of stage A asked about and refreshed).
+fn ask_spans_skipping(runs: &[&HostList], lean: bool, skip: &front2::Certified) -> Vec<(usize, usize)> {
+    ask_spans_each(runs, lean, |shadow| shadow.asked_ahead(), (!skip.is_empty()).then_some(skip))
+}
+
+/// [`ask_spans_where`], leaving out the ranges `skip` covers.
+fn ask_spans_each<L: onepass::StepList>(
+    runs: &[L],
+    lean: bool,
+    asked: impl Fn(&crate::shadow::Shadow) -> bool,
+    skip: Option<&front2::Certified>,
+) -> Vec<(usize, usize)> {
     thread_local! {
         static ASKED: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
     }
@@ -2894,6 +2919,7 @@ fn ask_spans_where<L: onepass::StepList>(runs: &[L], lean: bool, asked: impl Fn(
             for step in steps {
                 if let Step::Refresh(shadow, address, len) = step
                     && asked(&**shadow)
+                    && !skip.is_some_and(|skip| skip.covers(std::sync::Arc::as_ptr(shadow) as usize, *address, *address + *len))
                 {
                     let span = spans
                         .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -3734,6 +3760,8 @@ mod place;
 pub(crate) mod precise;
 mod prefetch;
 mod front;
+mod front2;
+mod plan;
 pub(crate) mod relax;
 mod scratch;
 mod send;

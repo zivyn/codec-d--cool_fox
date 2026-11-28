@@ -1146,6 +1146,260 @@ mod copy_tests {
         }
     }
 
+    /// STAGE4: the steps given to the card, planned by the thread of stage A (`VICTORY_STAGE_A_PLAN`). Each round the lane's
+    /// submission K declares a range its shaders write (a flight) and takes what goes up to the card; the thread prepares
+    /// the next submission P beside K's send. A title buffer copy of P whose source is in K's range is done on the card
+    /// (the thread records the refreshes of the two host copies and declares the destination written, as the plan's list
+    /// does; the card runs the copy behind K's shaders), the other copies are done by the CPU, and a fill copies a page of
+    /// title memory into P's own upload memory (a region that no other submission writes or reads). The shaders write the
+    /// range, the card runs P's taken copies behind them, both land, with the title's other threads writing all through
+    /// until then. Every 7th round a submission is registered after the plan was made (forced, between the plan and the
+    /// commit): the thread gives P back before any step and the lane does the whole stage itself. Checked: what the card
+    /// reads for a copy taken from the flight's range is what K's shaders wrote there, and so is the destination at the
+    /// landing; each step ran once, by the CPU or by the card, never both, with none left out; K's upload region is
+    /// untouched by the thread; the lists the thread prepared are those the lane runs; and after the next preparing every
+    /// byte the card holds and every CPU side is the title's. 500 rounds.
+    #[test]
+    fn the_card_steps_planned_by_the_thread_leave_no_stale_byte_and_a_forced_mismatch_is_redone_by_the_lane() {
+        use crate::host::plan::agrees;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        const COPIES: usize = 6;
+
+        type Log = Arc<Mutex<Vec<(usize, usize, &'static str)>>>;
+
+        /// A title buffer copy of one page onto another (copy and page of each).
+        #[derive(Clone, Copy)]
+        struct Page2 {
+            src: (usize, usize),
+            dst: (usize, usize),
+        }
+
+        /// Stage A of P, on whichever thread: the plan (the copies whose source is in K's range are the card's), its look
+        /// at the line's generation before the commit (`gate`: a registration forced between the plan and the commit),
+        /// the refreshes the plan's list holds and the declarations, the CPU's copies in order and the fill. `Err`: the
+        /// submission given back before any step. `Ok`: the copies taken.
+        #[allow(clippy::too_many_arguments)]
+        fn stage_a(
+            pts: Vec<(Arc<Shadow>, usize)>,
+            steps: Vec<Page2>,
+            flight: (usize, usize),
+            fill: ((usize, usize), usize),
+            upload: usize,
+            line_gen: Arc<AtomicU64>,
+            gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+            log: Log,
+            round: usize,
+        ) -> Result<Vec<usize>, ()> {
+            let taken: Vec<usize> = steps.iter().enumerate().filter(|(_, s)| s.src == flight).map(|(i, _)| i).collect();
+            let planned_at = line_gen.load(Ordering::SeqCst);
+            if let Some((told, go)) = gate {
+                told.send(()).unwrap();
+                go.recv().unwrap();
+            }
+            if !agrees(planned_at, line_gen.load(Ordering::SeqCst)) {
+                return Err(());
+            }
+            let ranges: Vec<(usize, usize)> = pts.iter().map(|p| (p.1, p.1 + N * PAGE)).collect();
+            let standing = crate::watch::ask_standing(&ranges, None);
+            // The plan's own list: what it reads and writes is refreshed, then what it writes is declared.
+            for &i in &taken {
+                for (c, _) in [steps[i].src, steps[i].dst] {
+                    refresh(&pts[c].0, pts[c].1, &[(0, N * PAGE)]);
+                }
+            }
+            for &i in &taken {
+                let (c, page) = steps[i].dst;
+                pts[c].0.writing(pts[c].1 + page * PAGE, PAGE);
+            }
+            // The submission's own steps that are left, in order.
+            for (i, s) in steps.iter().enumerate() {
+                if taken.contains(&i) {
+                    continue;
+                }
+                let (dst, src) = (pts[s.dst.0].1 + s.dst.1 * PAGE, pts[s.src.0].1 + s.src.1 * PAGE);
+                for k in (0..PAGE).step_by(64) {
+                    // SAFETY: inside the allocations, which live until the end of the test.
+                    let byte = unsafe { ((src + k) as *const u8).read_volatile() };
+                    write(dst, k, byte);
+                }
+                crate::watch::wrote(dst, PAGE);
+                log.lock().unwrap().push((round, i, "cpu"));
+            }
+            // The fill: a page of title memory into the upload memory of P alone.
+            let ((fc, fp), region) = fill;
+            let src = pts[fc].1 + fp * PAGE;
+            for k in (0..PAGE).step_by(64) {
+                // SAFETY: as above, and the region is this submission's alone.
+                unsafe { ((upload + region * PAGE + k) as *mut u8).write_volatile(((src + k) as *const u8).read_volatile()) };
+            }
+            crate::watch::end_standing(standing);
+            Ok(taken)
+        }
+
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copies: Vec<Held> = (0..COPIES).map(|_| Held::new()).collect();
+        let uploads: &'static mut [u8] = Box::leak(vec![0u8; 2 * PAGE].into_boxed_slice());
+        let upload = uploads.as_mut_ptr() as usize;
+        let mut seed = 0x5eed_0004_91a4_0001u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for c in copies.iter_mut() {
+            refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+            c.take();
+        }
+        let line_gen = Arc::new(AtomicU64::new(1));
+        let log: Log = Arc::default();
+        let (mut by_thread, mut redone, mut on_card, mut on_cpu) = (0usize, 0usize, 0usize, 0usize);
+        for round in 0..500 {
+            // The title writes for both submissions.
+            for _ in 0..(next() % 8) {
+                let c = (next() % COPIES as u64) as usize;
+                write(copies[c].at, (next() % (N * PAGE) as u64) as usize, (next() % 255) as u8 + 1);
+            }
+            // Distinct pages for the flight, the copies' sources and destinations and the fill's source.
+            fn pick(free: &mut Vec<(usize, usize)>, at: u64) -> (usize, usize) {
+                free.swap_remove((at % free.len() as u64) as usize)
+            }
+            let mut free: Vec<(usize, usize)> = (0..COPIES).flat_map(|c| (0..N).map(move |p| (c, p))).collect();
+            let flight = pick(&mut free, next());
+            let steps: Vec<Page2> = (0..1 + next() % 3)
+                .map(|i| {
+                    let src = if i == 0 && next() % 2 == 0 { flight } else { pick(&mut free, next()) };
+                    Page2 { src, dst: pick(&mut free, next()) }
+                })
+                .collect();
+            let fill = (pick(&mut free, next()), round % 2);
+            let pts: Vec<(Arc<Shadow>, usize)> = copies.iter().map(|c| (c.shadow.clone(), c.at)).collect();
+
+            // K: refreshes some copies, declares what its shaders write, takes what goes up to the card.
+            for c in copies.iter().take(2 + (next() % 3) as usize) {
+                refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+            }
+            let flight_at = copies[flight.0].at + flight.1 * PAGE;
+            copies[flight.0].shadow.writing(flight_at, PAGE);
+            for c in copies.iter_mut() {
+                c.take();
+            }
+            // K's own upload region, filled before; the thread does not touch it.
+            let others = ((round + 1) % 2) * PAGE;
+            let marked = vec![(round % 251) as u8 + 1; PAGE];
+            uploads[others..others + PAGE].copy_from_slice(&marked);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let stop = stop.clone();
+                let targets: Vec<usize> = copies.iter().map(|c| c.at).collect();
+                let mut s = next() | 1;
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        write(targets[(s % COPIES as u64) as usize], ((s >> 8) % (N * PAGE) as u64) as usize, (s >> 40) as u8 | 1);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            // The offer: the thread prepares P beside K's send (the card runs K's shaders meanwhile).
+            let forced = round % 7 == 3;
+            let (told_tx, told_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel();
+            let gate = forced.then_some((told_tx, go_rx));
+            let thread = {
+                let (pts, steps, line_gen, log) = (pts.clone(), steps.clone(), line_gen.clone(), log.clone());
+                std::thread::spawn(move || stage_a(pts, steps, flight, fill, upload, line_gen, gate, log, round))
+            };
+            // K's lists run on the card: the shaders write the range.
+            let shaded: Vec<u8> = (0..PAGE).map(|_| (next() % 255) as u8 + 1).collect();
+            copies[flight.0].card[flight.1 * PAGE..(flight.1 + 1) * PAGE].copy_from_slice(&shaded);
+            if forced {
+                // A submission is registered after the plan was made: the line is another generation.
+                told_rx.recv().unwrap();
+                line_gen.fetch_add(1, Ordering::SeqCst);
+                go_tx.send(()).unwrap();
+            }
+            // The lane's next submission: what the thread did, or all of it here.
+            let taken = match thread.join().unwrap() {
+                Ok(taken) => {
+                    assert!(!forced, "round {round}: the plan made before a registration was not given back");
+                    by_thread += 1;
+                    taken
+                }
+                Err(()) => {
+                    assert!(forced, "round {round}: a plan was given back without a registration");
+                    redone += 1;
+                    stage_a(pts.clone(), steps.clone(), flight, fill, upload, line_gen.clone(), None, log.clone(), round).unwrap()
+                }
+            };
+            assert_eq!(&uploads[others..others + PAGE], &marked[..], "round {round}: the other submission's upload memory was written");
+            // P's take, and its own list runs on the card behind K's shaders: each taken copy reads the card's host copy.
+            for c in copies.iter_mut() {
+                c.take();
+            }
+            for &i in &taken {
+                let (s, d) = (steps[i].src, steps[i].dst);
+                let page = copies[s.0].card[s.1 * PAGE..(s.1 + 1) * PAGE].to_vec();
+                if s == flight {
+                    assert!(page == shaded, "round {round}: the copy done on the card read something else than what the shaders wrote");
+                }
+                copies[d.0].card[d.1 * PAGE..(d.1 + 1) * PAGE].copy_from_slice(&page);
+                log.lock().unwrap().push((round, i, "card"));
+            }
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+            // Both land, K first: what the card holds is put into title memory and the journal is told.
+            let land = |copies: &mut Vec<Held>, (c, page): (usize, usize)| {
+                let at = copies[c].at + page * PAGE;
+                for k in 0..PAGE {
+                    write(at, k, copies[c].card[page * PAGE + k]);
+                }
+                crate::watch::wrote(at, PAGE);
+                copies[c].shadow.copy_back_done(&[(at, at + PAGE)]);
+            };
+            land(&mut copies, flight);
+            for &i in &taken {
+                land(&mut copies, steps[i].dst);
+                if steps[i].src == flight {
+                    let at = copies[steps[i].dst.0].at + steps[i].dst.1 * PAGE;
+                    // SAFETY: the allocation; nothing writes it now.
+                    let title = unsafe { std::slice::from_raw_parts(at as *const u8, PAGE) };
+                    assert!(title == &shaded[..], "round {round}: the destination of a copy from the flight's range is not what the shaders wrote");
+                }
+            }
+            // Each step ran once: by the card if it was taken, else by the CPU.
+            let mut ran = std::mem::take(&mut *log.lock().unwrap());
+            ran.sort_unstable();
+            let expected: Vec<(usize, usize, &str)> =
+                (0..steps.len()).map(|i| (round, i, if taken.contains(&i) { "card" } else { "cpu" })).collect();
+            assert_eq!(ran, expected, "round {round}: every step ran once, on the card or on the CPU");
+            on_card += taken.len();
+            on_cpu += steps.len() - taken.len();
+            // The lists prepared are the lists run.
+            let ids: Vec<usize> = (0..steps.len()).collect();
+            assert!(crate::host::front::same_lists(&ids, &[], &ids, &[]));
+            // The next preparing's own asking and refresh, and its take: nothing stale is left.
+            for c in copies.iter_mut() {
+                refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+                c.take();
+            }
+            for (i, c) in copies.iter().enumerate() {
+                assert!(c.card == c.title(), "round {round}: a byte of copy {i} that the card holds is not the title's");
+                assert!(c.side() == c.title(), "round {round}: a byte of copy {i}'s CPU side is not the title's");
+            }
+        }
+        assert_eq!(redone, (0..500).filter(|r| r % 7 == 3).count(), "every forced mismatch was redone by the lane");
+        assert!(by_thread > 400 && on_card > 100 && on_cpu > 100, "the stress had its cases: {by_thread} by the thread, {on_card} on the card, {on_cpu} on the CPU");
+        for c in &copies {
+            // SAFETY: ours.
+            unsafe { VirtualFree(c.at as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
     /// A range the submission declares written is left alone by the thread that is given the copy after the take,
     /// until the flight has landed, whichever of the two stages refreshes it.
     #[test]
@@ -1181,6 +1435,537 @@ mod copy_tests {
         assert!(copy.card == copy.title());
         // SAFETY: ours.
         unsafe { VirtualFree(copy.at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // FRONT2 (`VICTORY_STAGE_A_FRONT2`): three stages. K is in the air (its flight declares a range), E1 is prepared (its
+    // asking, refreshes and steps) while a second thread asks and refreshes the spans of E2 that E1 leaves alone, and E2's
+    // turn comes with what the second thread did taken as done where it still stands.
+
+    /// The grain a copy's pages are taken in, and how many of them a copy of this test has.
+    const G: usize = crate::watch::PAGE;
+    const GN: usize = 6;
+    const SIZE: usize = GN * G;
+
+    /// A copy of several grains: the title's memory, the copy's CPU side (leaked) and what the card holds of it.
+    struct Big {
+        at: usize,
+        shadow: std::sync::Arc<Shadow>,
+        side: usize,
+        card: Vec<u8>,
+    }
+
+    impl Big {
+        fn new() -> Big {
+            // SAFETY: memory of ours, released by the test.
+            let at = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+            assert_ne!(at, 0);
+            let side: &'static mut [u8] = Box::leak(vec![0u8; SIZE].into_boxed_slice());
+            let shadow = Shadow::unbacked(at as u64, side.as_mut_ptr(), SIZE as u64, true);
+            Big { at, shadow, side: side.as_ptr() as usize, card: vec![0u8; SIZE] }
+        }
+
+        fn side(&self) -> &[u8] {
+            // SAFETY: leaked, the length of the allocation; only refreshes write it and the test reads it between them.
+            unsafe { std::slice::from_raw_parts(self.side as *const u8, SIZE) }
+        }
+
+        fn title(&self) -> &[u8] {
+            // SAFETY: the allocation, read when nothing writes it.
+            unsafe { std::slice::from_raw_parts(self.at as *const u8, SIZE) }
+        }
+
+        fn take(&mut self) {
+            // SAFETY: as `side`.
+            let side = unsafe { std::slice::from_raw_parts(self.side as *const u8, SIZE) };
+            for (a, b) in self.shadow.take_dirty() {
+                self.card[a..b].copy_from_slice(&side[a..b]);
+            }
+        }
+    }
+
+    /// Which piece of the rules a round leaves out (the test says that each one is needed).
+    #[derive(Clone, Copy, Default, PartialEq, Debug)]
+    enum Broken {
+        #[default]
+        No,
+        /// The thread is offered spans of copies and ranges the submission before refreshes, declares or writes.
+        Held,
+        /// The later lists and the plan's list are not looked at when the certificate is judged.
+        Extra,
+        /// The number is not compared.
+        Number,
+        /// The flights' declared ranges are not looked at, when the offer is made or when the certificate is judged.
+        Air,
+    }
+
+    /// One round of the three stages, as offsets into the copies: (copy, from, to) unless said.
+    #[derive(Clone, Default)]
+    struct Round {
+        /// E1 refreshes these (and asks about them), declares these written (its flight), copies into title memory at
+        /// (copy, from, bytes).
+        e1_refresh: Vec<(usize, usize, usize)>,
+        e1_declare: Vec<(usize, usize, usize)>,
+        e1_copy: Vec<(usize, usize, usize)>,
+        /// What E2 refreshes ahead of its steps.
+        e2_spans: Vec<(usize, usize, usize)>,
+        /// The title wrote these cells (copy, offset) for E2 before E2 was in the line.
+        entry: Vec<(usize, usize)>,
+        /// K's flight, in the air from before the round to E2's turn.
+        flight: Option<(usize, usize, usize)>,
+        /// The lane declares this range written (a picked view) after the second thread is joined.
+        late_declare: Option<(usize, usize, usize)>,
+        /// A later entry was folded into E2: its list refreshes (copy, from, to), and the title wrote the cell after the
+        /// second thread had refreshed.
+        folded: Option<(usize, usize, usize, usize)>,
+        /// A submission that is not ours wrote this cell (copy, offset) between the two stages, and took a number.
+        other: Option<(usize, usize)>,
+        /// The planning's own list for E1 refreshes this range.
+        plan: Option<(usize, usize, usize)>,
+        broken: Broken,
+    }
+
+    #[derive(Default)]
+    struct Report {
+        /// Spans the certificate had when it was judged, and those taken as done.
+        stood: usize,
+        skipped: usize,
+        /// Spans the second thread was given, and kept back for the submission before and for flights.
+        given: usize,
+        owned: usize,
+        flying: usize,
+        /// Spans dropped from the certificate because something declared them written since.
+        dropped: usize,
+        /// Cells E2 needed that the card did not hold, and why.
+        stale: Vec<String>,
+    }
+
+    fn key_of(shadow: &std::sync::Arc<Shadow>) -> usize {
+        std::sync::Arc::as_ptr(shadow) as usize
+    }
+
+    /// Plays a round through the real pieces (`front2::Held`, `front2::free`, `prefetch::run`, `Cert::usable`,
+    /// `Certified::covers`) and a model of what the thread of the entry does with them (it refreshes each span of its steps
+    /// that the certificate does not cover, as `Batch::refresh_front_skipping` does).
+    fn play(copies: &mut [Big], r: &Round, tag: u8, noise: bool) -> Report {
+        use crate::host::{Step, front2};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let n = copies.len();
+        let bases: Vec<usize> = copies.iter().map(|c| c.at).collect();
+        let shadows: Vec<Arc<Shadow>> = copies.iter().map(|c| c.shadow.clone()).collect();
+        let (tag2, tag3, tagx) = (tag ^ 0x80, tag ^ 0x40, tag ^ 0x20);
+        let mut report = Report::default();
+
+        // K's flight is in the air.
+        if let Some((c, from, to)) = r.flight {
+            shadows[c].writing(bases[c] + from, to - from);
+        }
+        // The title wrote for E2.
+        let mut required: Vec<(usize, usize, u8)> = Vec::new();
+        for &(c, off) in &r.entry {
+            write(bases[c], off, tag);
+            required.push((c, off, tag));
+        }
+        // What E1 does.
+        let mut e1: Vec<Step> = Vec::new();
+        for &(c, f, t) in &r.e1_refresh {
+            e1.push(Step::Refresh(shadows[c].clone(), bases[c] + f, t - f));
+        }
+        for &(c, f, t) in &r.e1_declare {
+            e1.push(Step::GpuWrite(shadows[c].clone(), bases[c] + f, t - f));
+        }
+        for &(c, f, len) in &r.e1_copy {
+            e1.push(Step::Copy(bases[c] + f, bases[c] + f, len));
+        }
+        let mut plan: Vec<Step> = Vec::new();
+        if let Some((c, f, t)) = r.plan {
+            plan.push(Step::Refresh(shadows[c].clone(), bases[c] + f, t - f));
+        }
+        let held = if r.broken == Broken::Held {
+            front2::Held::default()
+        } else {
+            let mut held = front2::Held::default();
+            held.note(e1.iter());
+            held.note(plan.iter());
+            held.finish()
+        };
+        let air_title: Vec<(usize, usize)> = r.flight.iter().map(|&(c, f, t)| (bases[c] + f, bases[c] + t)).collect();
+        let spans: super::Spans = r.e2_spans.iter().map(|&(c, f, t)| (shadows[c].clone(), bases[c] + f, bases[c] + t)).collect();
+        // (The broken version of the flights' rule gives the thread every span: the offer does not look at them.)
+        let (free, owned, flying) = if r.broken == Broken::Air { (spans.clone(), 0, 0) } else { front2::free(spans, &held, &air_title) };
+        (report.given, report.owned, report.flying) = (free.len(), owned, flying);
+        if r.broken == Broken::No {
+            // What the thread may be given, worked out again by grain.
+            let grains = |f: usize, t: usize| f / G..t.div_ceil(G);
+            let (mut whole, mut held_g, mut air_g) = (vec![false; n], vec![[false; GN]; n], vec![[false; GN]; n]);
+            for &(c, ..) in &r.e1_declare {
+                whole[c] = true;
+            }
+            for &(c, f, t) in r.e1_refresh.iter().chain(r.plan.iter()) {
+                grains(f, t).for_each(|g| held_g[c][g] = true);
+            }
+            for &(c, f, len) in &r.e1_copy {
+                grains(f, f + len).for_each(|g| held_g[c][g] = true);
+            }
+            if let Some((c, f, t)) = r.flight {
+                grains(f, t).for_each(|g| air_g[c][g] = true);
+            }
+            for &(c, f, t) in &r.e2_spans {
+                let want = !whole[c] && grains(f, t).all(|g| !held_g[c][g] && !air_g[c][g]);
+                let have = free.iter().any(|(s, a, b)| key_of(s) == key_of(&shadows[c]) && *a == bases[c] + f && *b == bases[c] + t);
+                assert_eq!(have, want, "copy {c} {f:#x}..{t:#x}: given {have}, by grain {want}");
+            }
+        }
+
+        // The title's other threads write all through (cells of their own, which nothing waits for).
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = noise.then(|| {
+            let (stop, targets) = (stop.clone(), bases.clone());
+            let mut s = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(tag);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    write(targets[(s % targets.len() as u64) as usize], (((s >> 8) as usize % (SIZE / 64)) * 64) + 17, (s >> 40) as u8 | 1);
+                    std::thread::yield_now();
+                }
+            })
+        });
+
+        // The second thread asks and refreshes what it was given, while E1 asks and refreshes its own.
+        let beside = {
+            let free = free.clone();
+            std::thread::spawn(move || super::run(free))
+        };
+        for &(c, f, t) in &r.e1_refresh {
+            refresh(&shadows[c], bases[c], &[(f, t)]);
+        }
+        beside.join().unwrap();
+        let cert = front2::Cert::new(7, vec![0x20, 0x21], 100, free);
+
+        // After it asked: E1's steps write title memory (the worst order for what the thread did), and the title and others
+        // write what later entries read.
+        for &(c, f, len) in &r.e1_copy {
+            let mut off = f.next_multiple_of(64) + 3;
+            while off < f + len {
+                write(bases[c], off, tag2);
+                required.push((c, off, tag2));
+                off += 64;
+            }
+            crate::watch::wrote(bases[c] + f, len);
+        }
+        if let Some((c, _, _, cell)) = r.folded {
+            write(bases[c], cell, tag3);
+            required.push((c, cell, tag3));
+        }
+        if let Some((c, cell)) = r.other {
+            write(bases[c], cell, tagx);
+            required.push((c, cell, tagx));
+        }
+        // The lane: E1's declarations (and a picked view's), and E1's take.
+        let mut landing: Vec<(usize, (usize, usize))> = Vec::new();
+        let mut land = |c: usize, f: usize, t: usize| {
+            if !landing.contains(&(c, (f, t))) {
+                landing.push((c, (f, t)));
+            }
+        };
+        for &(c, f, t) in &r.e1_declare {
+            shadows[c].writing(bases[c] + f, t - f);
+            land(c, f, t);
+        }
+        if let Some((c, f, t)) = r.late_declare {
+            shadows[c].writing(bases[c] + f, t - f);
+            land(c, f, t);
+        }
+        if let Some((c, f, t)) = r.flight {
+            land(c, f, t);
+        }
+        for c in copies.iter_mut() {
+            c.take();
+        }
+
+        // E2's turn: the certificate as it stands now.
+        let mut lists = vec![0x20usize, 0x21];
+        let mut later: Vec<Step> = plan;
+        if let Some((c, f, t, _)) = r.folded {
+            lists.push(0x22);
+            later.push(Step::Refresh(shadows[c].clone(), bases[c] + f, t - f));
+        }
+        let extra = if r.broken == Broken::Extra {
+            front2::Held::default()
+        } else {
+            let mut extra = front2::Held::default();
+            extra.note(later.iter());
+            extra.finish()
+        };
+        let started = if r.other.is_some() && r.broken != Broken::Number { 101 } else { 100 };
+        // (Flights in the air when the thread of the entry looks: K's, unless the broken version has it landed already, and E1's.)
+        let mut air_now: Vec<(usize, usize)> = if r.broken == Broken::Air { Vec::new() } else { air_title.clone() };
+        air_now.extend(r.e1_declare.iter().map(|&(c, f, t)| (bases[c] + f, bases[c] + t)));
+        if r.broken == Broken::Air {
+            // (As if the flight had landed before: nothing declares the range any more, and the certificate stands over it.)
+            if let Some((c, f, t)) = r.flight {
+                shadows[c].copy_back_done(&[(bases[c] + f, bases[c] + t)]);
+            }
+        }
+        let certified = cert.usable(7, &lists, started, &air_now, &extra);
+        report.stood = certified.len();
+        if r.broken != Broken::Air {
+            // Whatever is declared written when the thread of the entry looks does not stand, whichever way it is declared.
+            let declared: Vec<(usize, usize, usize)> = r.late_declare.iter().chain(r.e1_declare.iter()).copied().collect();
+            for &(c, f, t) in &r.e2_spans {
+                if declared.iter().any(|&(dc, df, dt)| dc == c && df < t && dt > f) {
+                    assert!(!certified.covers(key_of(&shadows[c]), bases[c] + f, bases[c] + t), "a span of a range declared written stood");
+                    report.dropped += 1;
+                }
+            }
+        }
+        // The flights land (the thread of the entry waits for them before it refreshes what they declared: bit 16).
+        for &(c, (f, t)) in &landing {
+            if r.broken == Broken::Air && r.flight == Some((c, f, t)) {
+                continue;
+            }
+            shadows[c].copy_back_done(&[(bases[c] + f, bases[c] + t)]);
+        }
+        // E2's steps: what the certificate covers is not asked or refreshed again, the rest is.
+        let mut e2: Vec<(usize, usize, usize)> = r.e2_spans.clone();
+        if let Some((c, f, t, _)) = r.folded {
+            e2.push((c, f, t));
+        }
+        for &(c, f, t) in &e2 {
+            if certified.covers(key_of(&shadows[c]), bases[c] + f, bases[c] + t) {
+                report.skipped += 1;
+            } else {
+                refresh(&shadows[c], bases[c], &[(f, t)]);
+            }
+        }
+        if let Some((c, f, t)) = r.plan {
+            refresh(&shadows[c], bases[c], &[(f, t)]);
+        }
+        for c in copies.iter_mut() {
+            c.take();
+        }
+        for &(c, off, value) in &required {
+            if e2.iter().any(|&(rc, f, t)| rc == c && f <= off && off < t) && copies[c].card[off] != value {
+                report.stale.push(format!("copy {c} offset {off:#x}: the card holds {}, E2 needs {value}", copies[c].card[off]));
+            }
+        }
+        // Everything lands and the next preparing asks and refreshes it all: nothing is left behind anywhere.
+        stop.store(true, Ordering::Relaxed);
+        if let Some(writer) = writer {
+            writer.join().unwrap();
+        }
+        for c in copies.iter_mut() {
+            refresh(&c.shadow, c.at, &[(0, SIZE)]);
+            c.take();
+        }
+        for (i, c) in copies.iter().enumerate() {
+            assert!(c.card == c.title(), "a byte of copy {i} that the card holds is not the title's after the round");
+            assert!(c.side() == c.title(), "a byte of copy {i}'s CPU side is not the title's after the round");
+        }
+        report
+    }
+
+    fn fresh_copies(n: usize) -> Vec<Big> {
+        let mut copies: Vec<Big> = (0..n).map(|_| Big::new()).collect();
+        for c in copies.iter_mut() {
+            refresh(&c.shadow, c.at, &[(0, SIZE)]);
+            c.take();
+        }
+        copies
+    }
+
+    fn free_copies(copies: Vec<Big>) {
+        for c in &copies {
+            // SAFETY: ours.
+            unsafe { VirtualFree(c.at as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// Each piece the certificate stands on is needed: with it left out, the card is left a stale byte E2 reads; with it,
+    /// not. (Single rounds, each with the one conflict.)
+    #[test]
+    fn each_condition_a_certificate_stands_on_is_needed_and_enough() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copies = fresh_copies(4);
+        // E1 copies into title memory inside a span that E2 refreshes: the thread must not be given the span (E1's copy
+        // comes after its refresh).
+        let copy_into = Round {
+            e2_spans: vec![(0, G, 3 * G)],
+            e1_copy: vec![(0, 2 * G, 4096)],
+            entry: vec![(0, G + 64 * 5)],
+            ..Round::default()
+        };
+        // A later list folded into E2 refreshes a copy of the certificate, and the title wrote there after it was made.
+        let folded = Round {
+            e2_spans: vec![(1, 0, 2 * G)],
+            folded: Some((1, G, 2 * G, G + 64 * 3 + 8)),
+            entry: vec![(1, 64 * 11)],
+            ..Round::default()
+        };
+        // A submission that is not ours wrote title memory in a span between the two stages and took a number.
+        let numbered = Round { e2_spans: vec![(2, 0, G)], other: Some((2, 64 * 9 + 12)), entry: vec![(2, 64 * 2)], ..Round::default() };
+        // K's flight declares a range inside a span that E2 refreshes; the title wrote there under it.
+        let flying = Round {
+            e2_spans: vec![(3, G, 4 * G)],
+            flight: Some((3, 2 * G, 3 * G)),
+            entry: vec![(3, 2 * G + 64 * 7), (3, G + 64)],
+            ..Round::default()
+        };
+        // (A tag of its own for each play: what an earlier play left in a cell is never what a later one needs.)
+        let mut tag = 0u8;
+        for (name, round, broken) in [
+            ("a copy into a span", copy_into, Broken::Held),
+            ("a folded list", folded, Broken::Extra),
+            ("a number between", numbered, Broken::Number),
+            ("a flight's range", flying, Broken::Air),
+        ] {
+            for _ in 0..2 {
+                tag += 1;
+                let whole = play(&mut copies, &Round { broken: Broken::No, ..round.clone() }, tag, false);
+                assert!(whole.stale.is_empty(), "{name}: stale with everything in place: {:?}", whole.stale);
+                tag += 1;
+                let without = play(&mut copies, &Round { broken, ..round.clone() }, tag, false);
+                assert!(!without.stale.is_empty(), "{name}: the round must go wrong without the rule ({broken:?}), or it tests nothing");
+            }
+        }
+        // A range the lane declares written after the thread asked (a picked view of a copy no step names), and one E1's
+        // flight declares: the span does not stand, whichever way the range is declared.
+        let late = Round {
+            e2_spans: vec![(0, 0, 2 * G), (1, G, 3 * G)],
+            late_declare: Some((0, G, 2 * G)),
+            e1_declare: vec![(1, 2 * G, 3 * G)],
+            entry: vec![(0, G + 64 * 4), (1, G + 64 * 8), (1, 2 * G + 64)],
+            ..Round::default()
+        };
+        let report = play(&mut copies, &late, tag + 1, false);
+        assert!(report.stale.is_empty(), "{:?}", report.stale);
+        assert_eq!(report.dropped, 2, "both spans touch what is declared");
+        assert_eq!(report.stood, 0, "the thread of the entry takes neither as done: its refresh waits for the landing");
+        free_copies(copies);
+    }
+
+    /// The three stages at once, 500 rounds, the title's other threads writing all through, with every conflict drawn at
+    /// random: E1 refreshes, declares and copies into title memory on the same copies E2's spans are on (by grain), K's
+    /// flight declares a range under spans, the lane declares one more after the thread is joined, a later entry is folded into
+    /// E2, another submission takes a number, the plan's own list names a copy. Every cell E2 refreshes holds, at E2's take,
+    /// what the title wrote for it (or what E1's steps and the later entries wrote); every byte of every copy is the
+    /// title's after the next preparing; the spans the thread is given are those no step of E1 and no flight holds, by grain.
+    #[test]
+    fn three_stages_with_forced_conflicts_leave_no_stale_byte_for_the_card() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        const COPIES: usize = 4;
+        let mut copies = fresh_copies(COPIES);
+        let mut seed = 0x0ddb_a115_f20a_77e5u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // (From and to inside a copy, in 4 KiB units; whole grains half of the time.)
+        let range = |next: &mut dyn FnMut() -> u64| -> (usize, usize) {
+            let a = (next() % GN as u64) as usize;
+            let b = (a + 1 + (next() % 3) as usize).min(GN);
+            if next() % 2 == 0 {
+                (a * G, b * G)
+            } else {
+                let (cut_a, cut_b) = ((next() % 8) as usize * 4096, (next() % 8) as usize * 4096);
+                let (from, to) = (a * G + cut_a, b * G - cut_b);
+                (from, to.max(from + 4096))
+            }
+        };
+        let mut total = Report::default();
+        let (mut with_cert, mut flights, mut late, mut folds, mut others, mut plans, mut copied) = (0, 0, 0, 0, 0, 0, 0);
+        for round in 0..500 {
+            let mut r = Round::default();
+            for c in 0..COPIES {
+                if next() % 3 == 0 {
+                    let (f, t) = range(&mut next);
+                    r.e1_refresh.push((c, f, t));
+                }
+                if next() % 6 == 0 {
+                    let (f, t) = range(&mut next);
+                    r.e1_declare.push((c, f, t));
+                }
+                if next() % 4 == 0 {
+                    let g = (next() % GN as u64) as usize;
+                    r.e1_copy.push((c, g * G + (next() % 8) as usize * 4096, 4096 * (1 + (next() % 3) as usize)));
+                }
+                if next() % 4 != 0 {
+                    let (f, t) = range(&mut next);
+                    r.e2_spans.push((c, f, t));
+                }
+            }
+            if r.e2_spans.is_empty() {
+                r.e2_spans.push((0, 0, G));
+            }
+            // What the title wrote for E2 (not where E1 reads: the title does not write what a submission in flight reads).
+            for c in 0..COPIES {
+                for _ in 0..3 {
+                    let off = (next() % (SIZE as u64 / 64)) as usize * 64;
+                    if !r.e1_refresh.iter().any(|&(rc, f, t)| rc == c && off / G >= f / G && off / G < t.div_ceil(G)) {
+                        r.entry.push((c, off));
+                    }
+                }
+            }
+            if next() % 3 == 0 {
+                let g = (next() % GN as u64) as usize;
+                r.flight = Some(((next() % COPIES as u64) as usize, g * G, (g + 1) * G));
+                flights += 1;
+            }
+            if next() % 4 == 0 {
+                let g = (next() % GN as u64) as usize;
+                r.late_declare = Some(((next() % COPIES as u64) as usize, g * G, (g + 1) * G));
+                late += 1;
+            }
+            if next() % 4 == 0 {
+                let (c, f, t) = r.e2_spans[(next() % r.e2_spans.len() as u64) as usize];
+                let cell = f.next_multiple_of(64) + 8 + 64 * (next() % ((t - f) as u64 / 64).max(1)) as usize;
+                if cell < t {
+                    r.folded = Some((c, f, t, cell));
+                    folds += 1;
+                }
+            }
+            if next() % 4 == 0 {
+                let (c, f, t) = r.e2_spans[(next() % r.e2_spans.len() as u64) as usize];
+                let cell = f.next_multiple_of(64) + 12 + 64 * (next() % ((t - f) as u64 / 64).max(1)) as usize;
+                if cell < t {
+                    r.other = Some((c, cell));
+                    others += 1;
+                }
+            }
+            if next() % 4 == 0 {
+                let (f, t) = range(&mut next);
+                r.plan = Some(((next() % COPIES as u64) as usize, f, t));
+                plans += 1;
+            }
+            copied += r.e1_copy.len();
+            let report = play(&mut copies, &r, (round % 250) as u8 + 1, true);
+            assert!(report.stale.is_empty(), "round {round}: {:?}", report.stale);
+            with_cert += usize::from(report.skipped > 0);
+            total.given += report.given;
+            total.owned += report.owned;
+            total.flying += report.flying;
+            total.skipped += report.skipped;
+            total.dropped += report.dropped;
+        }
+        assert!(with_cert > 50, "the certificate was used in {with_cert} rounds");
+        assert!(
+            total.given > 300 && total.owned > 50 && total.flying > 5,
+            "the thread was given {} spans, kept back {} for E1 and {} for flights",
+            total.given,
+            total.owned,
+            total.flying
+        );
+        assert!(total.skipped > 150 && total.dropped > 10, "{} spans taken as done, {} dropped by what was declared since", total.skipped, total.dropped);
+        assert!(
+            flights > 100 && late > 60 && folds > 40 && others > 40 && plans > 60 && copied > 100,
+            "{flights} flights, {late} late declarations, {folds} folds, {others} numbers, {plans} plans, {copied} title copies"
+        );
+        free_copies(copies);
     }
 }
 

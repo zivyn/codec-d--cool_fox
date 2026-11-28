@@ -41,96 +41,145 @@ pub(super) fn wanted(late: bool, staged: bool, flying: impl FnOnce() -> bool) ->
     late && !staged && on() && crate::watch::once() && !ask_tokens() && flying()
 }
 
-/// What is offered to the thread and whether it is at it.
+/// What is offered to a thread and whether it is at it.
 struct State {
     work: Option<Vec<(usize, usize)>>,
     busy: bool,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
-    work: None,
-    busy: false,
-});
-static CHANGED: std::sync::Condvar = std::sync::Condvar::new();
-static ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A thread that asks, and what is offered to it. The lane has one; the thread of stage A has another
+/// (`VICTORY_STAGE_A_ASK_ASIDE`: its asking beside its planning), so that the two never meet at one.
+struct Chan {
+    state: Mutex<State>,
+    changed: std::sync::Condvar,
+    alive: std::sync::atomic::AtomicBool,
+    started: std::sync::Once,
+    name: &'static str,
+    /// Whether the thread runs at the priority of the threads of stage A (`VICTORY_FRONT_HIGH`).
+    front: bool,
+}
+
+impl Chan {
+    const fn new(name: &'static str, front: bool) -> Chan {
+        Chan {
+            state: Mutex::new(State { work: None, busy: false }),
+            changed: std::sync::Condvar::new(),
+            alive: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::Once::new(),
+            name,
+            front,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+static LANE: Chan = Chan::new("victory-ask-aside", false);
+static FRONT: Chan = Chan::new("victory-front-ask", true);
 
 /// Since the last frame-rate line: asks offered, asks made again after a wait for flights, ranges asked after the
-/// join, microseconds the thread worked and microseconds the submissions waited for it.
-static STATS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// join, microseconds the thread worked and microseconds the submissions waited for it; then the same for the thread of
+/// stage A's own (offered, worked, waited).
+static STATS: [std::sync::atomic::AtomicU64; 8] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 const OFFERED: usize = 0;
 const REDONE: usize = 1;
 const MORE: usize = 2;
 const WORKED: usize = 3;
 const WAITED: usize = 4;
+const FRONT_OFFERED: usize = 5;
+const FRONT_WORKED: usize = 6;
+const FRONT_WAITED: usize = 7;
 
+#[cfg(test)]
 fn lock() -> std::sync::MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+    LANE.lock()
 }
 
 /// The work done: the thread is not busy any more, whatever came of it.
-struct Done;
+struct Done(&'static Chan);
 
 impl Drop for Done {
     fn drop(&mut self) {
-        lock().busy = false;
-        CHANGED.notify_all();
+        self.0.lock().busy = false;
+        self.0.changed.notify_all();
     }
 }
 
-fn start() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        let made = std::thread::Builder::new().name("victory-ask-aside".into()).spawn(|| {
-            crate::cores::keep_helper_on_fast_cores("victory-ask-aside");
-            crate::cores::prioritize("victory-ask-aside", crate::cores::Role::Helper);
+fn start(chan: &'static Chan) {
+    chan.started.call_once(|| {
+        let made = std::thread::Builder::new().name(chan.name.into()).spawn(move || {
+            crate::cores::keep_helper_on_fast_cores(chan.name);
+            crate::cores::prioritize(chan.name, crate::cores::Role::Helper);
             loop {
                 let ranges = {
-                    let mut state = lock();
+                    let mut state = chan.lock();
                     loop {
                         if let Some(ranges) = state.work.take() {
                             state.busy = true;
                             break ranges;
                         }
-                        state = CHANGED.wait(state).unwrap_or_else(|e| e.into_inner());
+                        state = chan.changed.wait(state).unwrap_or_else(|e| e.into_inner());
                     }
                 };
+                if chan.front {
+                    crate::sched::front_sync();
+                }
                 let began = std::time::Instant::now();
                 {
-                    let _done = Done;
+                    let _done = Done(chan);
                     let _span = crate::timeline::span("the write watch asked, beside the planning");
                     // (An asking that panicked is made again by the submission, which finds none standing.)
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::watch::ask_once(&ranges)));
                 }
-                STATS[WORKED].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                STATS[if chan.front { FRONT_WORKED } else { WORKED }].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
         });
         match made {
-            Ok(_) => ALIVE.store(true, Ordering::Release),
+            Ok(_) => chan.alive.store(true, Ordering::Release),
             Err(e) => tracing::warn!(error = %e, "no thread to ask the write watch beside the planning: the submissions ask for themselves"),
         }
     });
 }
 
 /// An asking that is being made, or was, which the holder waits for when it drops this.
-pub(super) struct Offered(());
+pub(super) struct Offered(&'static Chan);
 
-/// Offers the asking about `ranges` to the thread; `None` if it has none to give (it is still at the one before, or
-/// there is no thread).
-pub(super) fn begin(ranges: Vec<(usize, usize)>) -> Option<Offered> {
-    start();
-    if !ALIVE.load(Ordering::Acquire) {
+fn offer(chan: &'static Chan, ranges: Vec<(usize, usize)>) -> Option<Offered> {
+    start(chan);
+    if !chan.alive.load(Ordering::Acquire) {
         return None;
     }
-    let mut state = lock();
+    let mut state = chan.lock();
     if state.work.is_some() || state.busy {
         return None;
     }
     state.work = Some(ranges);
     drop(state);
-    CHANGED.notify_all();
-    STATS[OFFERED].fetch_add(1, Ordering::Relaxed);
-    Some(Offered(()))
+    chan.changed.notify_all();
+    STATS[if chan.front { FRONT_OFFERED } else { OFFERED }].fetch_add(1, Ordering::Relaxed);
+    Some(Offered(chan))
+}
+
+/// Offers the asking about `ranges` to the thread; `None` if it has none to give (it is still at the one before, or
+/// there is no thread).
+pub(super) fn begin(ranges: Vec<(usize, usize)>) -> Option<Offered> {
+    offer(&LANE, ranges)
+}
+
+/// [`begin`] for the thread of stage A (`VICTORY_STAGE_A_ASK_ASIDE`), on the thread of its own.
+pub(super) fn begin_front(ranges: Vec<(usize, usize)>) -> Option<Offered> {
+    offer(&FRONT, ranges)
+}
+
+/// Whether the thread of stage A asks beside its planning (`VICTORY_STAGE_A_ASK_ASIDE=1`, with the one asking and not the
+/// standing askings of `VICTORY_ASK_TOKENS`).
+///
+/// (May change while the title runs, `VICTORY_AB`: `Host::front` reads it once for a submission and joins what it offered.)
+pub(super) fn front_wanted() -> bool {
+    crate::ab::live_flag!("VICTORY_STAGE_A_ASK_ASIDE") && crate::watch::once() && !ask_tokens()
 }
 
 impl Offered {
@@ -142,13 +191,14 @@ impl Offered {
 
 impl Drop for Offered {
     fn drop(&mut self) {
+        let chan = self.0;
         let began = std::time::Instant::now();
-        let mut state = lock();
+        let mut state = chan.lock();
         while state.work.is_some() || state.busy {
-            state = CHANGED.wait(state).unwrap_or_else(|e| e.into_inner());
+            state = chan.changed.wait(state).unwrap_or_else(|e| e.into_inner());
         }
         drop(state);
-        STATS[WAITED].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        STATS[if chan.front { FRONT_WAITED } else { WAITED }].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 }
 
@@ -164,7 +214,7 @@ pub(super) fn more(ranges: usize) {
 
 /// For the frame-rate line.
 pub(super) fn line(frames: f64) {
-    let s: Vec<f64> = STATS
+    let s: Vec<f64> = STATS[..FRONT_OFFERED]
         .iter()
         .map(|s| s.swap(0, Ordering::Relaxed) as f64)
         .collect();
@@ -183,6 +233,23 @@ pub(super) fn line(frames: f64) {
     );
 }
 
+/// For the frame-rate line: the thread of stage A's own asking beside its planning (`VICTORY_STAGE_A_ASK_ASIDE`).
+pub(super) fn front_line(frames: f64) {
+    // (Read, not taken: [`line`] has the others.)
+    let s = |n: usize| STATS[n].swap(0, Ordering::Relaxed) as f64;
+    let (offered, worked, waited) = (s(FRONT_OFFERED), s(FRONT_WORKED), s(FRONT_WAITED));
+    if !front_wanted() && offered == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "stage A, the write watch asked beside its planning, per frame (VICTORY_STAGE_A_ASK_ASIDE): {:.2} offered; the thread worked {:.1} ms, the thread of stage A waited {:.1} ms for it (so {:.1} ms of the asking went beside the planning)",
+        offered / frames,
+        worked / 1000.0 / frames,
+        waited / 1000.0 / frames,
+        (worked - waited).max(0.0) / 1000.0 / frames
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +263,30 @@ mod tests {
         assert!(!wanted(true, true, || true));
         assert_eq!(wanted(true, false, || true), on() && crate::watch::once() && !ask_tokens());
         assert!(!wanted(true, false, || false), "nothing in the air");
+    }
+
+    /// The thread of stage A asks on a thread of its own: while the lane's asking is offered, the other can be offered too (a
+    /// single one would refuse it), and each is over when its holder has waited.
+    #[test]
+    fn the_thread_of_stage_a_has_an_asking_thread_of_its_own() {
+        let mut plain = vec![0u8; 4096];
+        let at = plain.as_mut_ptr() as usize;
+        let mut both = 0;
+        for _ in 0..30 {
+            let lane = begin(vec![(at, at + 4096)]);
+            let front = begin_front(vec![(at, at + 2048)]);
+            // (Each is idle again when the loop comes back, so each is offered, if the thread is alive.)
+            assert_eq!(front.is_some(), FRONT.alive.load(Ordering::Acquire), "the thread of stage A's own is free");
+            both += usize::from(lane.is_some() && front.is_some());
+            drop(front);
+            drop(lane);
+            let state = lock();
+            assert!(state.work.is_none() && !state.busy);
+            drop(state);
+            let state = FRONT.lock();
+            assert!(state.work.is_none() && !state.busy);
+        }
+        assert!(both > 0 || !FRONT.alive.load(Ordering::Acquire) || !LANE.alive.load(Ordering::Acquire));
     }
 
     /// What is offered is made before the holder's drop returns, and a second is refused while the first is not over.
@@ -219,7 +310,7 @@ mod tests {
             }
         }
         assert!(
-            made > 0 || !ALIVE.load(Ordering::Acquire),
+            made > 0 || !LANE.alive.load(Ordering::Acquire),
             "a thread that is alive takes what is offered when it is idle"
         );
     }

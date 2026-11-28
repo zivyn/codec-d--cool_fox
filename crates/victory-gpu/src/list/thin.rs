@@ -487,6 +487,7 @@ pub(crate) fn line(frames: f64) {
         s[3]
     );
     crate::descriptor::host::view_cache_line(frames);
+    crate::descriptor::window::line(frames);
     super::replay::line(frames);
     crate::draw::state_filter_line(frames);
     crate::shadow::world_line(frames);

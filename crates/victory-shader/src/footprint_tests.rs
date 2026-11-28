@@ -313,8 +313,10 @@ fn a_program_that_stores_nothing_has_an_empty_footprint() {
     words.extend([0x38 << 26 | 0x0C << 18, 0x80 << 24 | 2 << 16 | 2 << 8]);
     words.push(S_ENDPGM);
     let f = footprint(&words, layout, used, RSRC2_TABLE);
-    assert_eq!(f, Footprint::default());
+    assert!(f.stores.is_empty() && !f.unbounded && !f.by_address);
     assert_eq!(f.ranges(table_target(), &bind([1, 1, 1], None, &none)), Some(vec![]));
+    // (What it reads is the one load.)
+    assert_eq!(f.loads.len(), 1);
 }
 
 #[test]
@@ -329,4 +331,95 @@ fn ranges_are_joined_and_at_most_four() {
     for offset in [0u64, 4, 100, 200, 300, 400, 500] {
         assert!(got.iter().any(|r| r.0 <= offset && offset + 4 <= r.1));
     }
+}
+
+/// `buffer_load_dword v3, <vaddr>, s[8:11], 0` with the given address modes and immediate offset.
+fn load(vaddr: u8, offen: bool, idxen: bool, offset: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x0C << 18 | u32::from(idxen) << 13 | u32::from(offen) << 12 | u32::from(offset),
+        0x80 << 24 | 2 << 16 | 3 << 8 | u32::from(vaddr),
+    ]
+}
+
+#[test]
+fn a_load_and_a_store_each_have_their_own_ranges() {
+    let (layout, used) = table_layout();
+    let mut words = load_descriptor(125).to_vec();
+    words.extend(load(0, false, false, 16));
+    words.extend(store(0, false, false, 0));
+    words.push(S_ENDPGM);
+    let f = footprint(&words, layout, used, RSRC2_TABLE);
+    let b = bind([64, 1, 1], Some([1, 1, 1]), &none);
+    assert_eq!(f.ranges(table_target(), &b), Some(vec![(0, 4)]));
+    assert_eq!(f.load_ranges(table_target(), &b), Some(vec![(16, 20)]));
+    assert_eq!(f.load_ranges(Target::Table { user_data: 9, dword: 0 }, &b), Some(vec![]));
+    assert!(!f.unbounded_loads && !f.by_address_loads && !f.images_unknown);
+}
+
+#[test]
+fn a_load_by_thread_and_an_atomic_that_is_both() {
+    let (layout, used) = table_layout();
+    let mut words = load_descriptor(125).to_vec();
+    words.push(vop2(V_LSHLREV_B32, 1, 0x82, 0)); // v_lshlrev_b32 v1, 2, v0
+    words.extend(load(1, true, false, 0));
+    // buffer_atomic_add v2, v1, s[8:11], 0 offen
+    words.extend([0x38 << 26 | 0x32 << 18 | 1 << 12, 0x80 << 24 | 2 << 16 | 2 << 8 | 1]);
+    words.push(S_ENDPGM);
+    let f = footprint(&words, layout, used, RSRC2_TABLE);
+    let b = bind([64, 1, 1], None, &none);
+    assert_eq!(f.ranges(table_target(), &b), Some(vec![(0, 63 * 4 + 4)]));
+    assert_eq!(f.load_ranges(table_target(), &b), Some(vec![(0, 63 * 4 + 4)]));
+    assert_eq!((f.stores.len(), f.loads.len()), (1, 2));
+}
+
+#[test]
+fn a_scalar_buffer_load_is_a_load_of_its_view() {
+    let (layout, used) = table_layout();
+    let mut words = load_descriptor(125).to_vec();
+    // s_buffer_load_dword s16, s[8:11], 0x40
+    words.extend([0xF420_0404, 0xFA00_0040]);
+    words.push(S_ENDPGM);
+    let f = footprint(&words, layout, used, RSRC2_TABLE);
+    let b = bind([64, 1, 1], None, &none);
+    assert_eq!(f.load_ranges(table_target(), &b), Some(vec![(64, 68)]));
+    // The descriptor's own fetch is not a read of a view.
+    assert_eq!(f.loads.len(), 1);
+    assert!(f.stores.is_empty() && !f.unbounded_loads);
+}
+
+#[test]
+fn a_scalar_load_through_a_root_view_is_a_load_of_it() {
+    let (layout, used) = root_layout();
+    // s_load_dword s6, s[4:5], 0x10
+    let words = [0xF400_0182, 0xFA00_0010, S_ENDPGM];
+    let f = footprint(&words, layout, used, RSRC2_ROOT);
+    let b = bind([64, 1, 1], None, &none);
+    assert_eq!(f.load_ranges(Target::Root { slot: 3 }, &b), Some(vec![(16, 20)]));
+    assert!(!f.by_address_loads && !f.unbounded_loads);
+}
+
+#[test]
+fn image_accesses_name_their_descriptor() {
+    let (layout, used) = table_layout();
+    // s_mov_b32 s5, 0; s_load_dwordx8 s[8:15], s[4:5], null
+    let head = [0xBE85_0380, 0xF40C_0202, 0xFA00_0000];
+    let mut read = head.to_vec();
+    read.extend([0xF000_1700, 0x0002_0D06, S_ENDPGM]); // image_load v[13:15], v6, s[8:15]
+    let f = footprint(&read, layout.clone(), used.clone(), RSRC2_TABLE);
+    assert_eq!((f.image_reads.clone(), f.image_writes.clone(), f.images_unknown), (vec![table_target()], vec![], false));
+    let mut write = head.to_vec();
+    write.extend([0xF020_1108, 0x0002_0300, S_ENDPGM]); // image_store v3, v[0:1], s[8:15] dmask:1 2D
+    let f = footprint(&write, layout, used, RSRC2_TABLE);
+    assert_eq!((f.image_reads, f.image_writes, f.images_unknown), (vec![], vec![table_target()], false));
+}
+
+#[test]
+fn an_indirect_jump_leaves_no_load_known_either() {
+    let (layout, used) = table_layout();
+    let mut words = load_descriptor(125).to_vec();
+    words.extend(load(0, false, false, 0));
+    words.push(0xBE80_2000 | 6); // s_setpc_b64 s[6:7]
+    let f = footprint(&words, layout, used, RSRC2_TABLE);
+    assert!(f.unbounded_loads && f.images_unknown);
+    assert_eq!(f.load_ranges(table_target(), &bind([64, 1, 1], None, &none)), None);
 }

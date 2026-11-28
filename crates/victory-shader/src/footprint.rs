@@ -42,6 +42,22 @@ pub struct Footprint {
     pub unbounded: bool,
     /// A flat or global store: title memory by address, never through views.
     pub by_address: bool,
+    /// The loads (and the atomics, which are both): the same walk over what the program reads
+    /// through buffer descriptors. `bytes` is the widest read.
+    pub loads: Vec<Store>,
+    /// Some load could not be attributed to a descriptor (an indirect jump, an unknown
+    /// instruction): every view may be read anywhere.
+    pub unbounded_loads: bool,
+    /// A flat or global load (or a scalar load by an address no root view gives): memory by
+    /// address, never through views.
+    pub by_address_loads: bool,
+    /// Textures (images) the program reads and writes, by the descriptor they are loaded
+    /// through: the host says a texture is read or written wholly. Atomics are in both.
+    pub image_reads: Vec<Target>,
+    pub image_writes: Vec<Target>,
+    /// An image access whose descriptor could not be attributed: any texture may be read and
+    /// written.
+    pub images_unknown: bool,
 }
 
 /// The descriptor a store goes through, as the host binds it.
@@ -269,40 +285,51 @@ impl Footprint {
     /// through it has an offset that is not known). An empty list: nothing
     /// stores through it.
     pub fn ranges(&self, target: Target, bind: &Bind) -> Option<Vec<(u64, u64)>> {
-        if self.unbounded {
-            return None;
-        }
-        let mut out: Vec<(u64, u64)> = Vec::new();
-        for store in &self.stores {
-            let hit = store.target == target
-                || match (store.target, target) {
-                    (Target::TableAny { user_data: a }, Target::Table { user_data: b, .. })
-                    | (Target::TableAny { user_data: a }, Target::TableAny { user_data: b }) => a == b,
-                    (Target::Table { user_data: a, .. }, Target::TableAny { user_data: b }) => a == b,
-                    _ => false,
-                };
-            if !hit {
-                continue;
-            }
-            let (lo, hi) = store.offset.eval(bind)?;
-            out.push((lo, hi + u64::from(store.bytes)));
-        }
-        out.sort_unstable();
-        let mut joined: Vec<(u64, u64)> = Vec::new();
-        for (lo, hi) in out {
-            match joined.last_mut() {
-                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
-                _ => joined.push((lo, hi)),
-            }
-        }
-        while joined.len() > MAX_RANGES {
-            // The two nearest ranges become one.
-            let at = (1..joined.len()).min_by_key(|&i| joined[i].0 - joined[i - 1].1).unwrap_or(1);
-            let next = joined.remove(at);
-            joined[at - 1].1 = next.1;
-        }
-        Some(joined)
+        gather(&self.stores, self.unbounded, target, bind)
     }
+
+    /// [`Footprint::ranges`] for what the program reads: the loads and
+    /// atomics through the view `target` (an entry of any kind, or a root
+    /// view of any kind), `None` for anywhere in it.
+    pub fn load_ranges(&self, target: Target, bind: &Bind) -> Option<Vec<(u64, u64)>> {
+        gather(&self.loads, self.unbounded_loads, target, bind)
+    }
+}
+
+fn gather(list: &[Store], unbounded: bool, target: Target, bind: &Bind) -> Option<Vec<(u64, u64)>> {
+    if unbounded {
+        return None;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for store in list {
+        let hit = store.target == target
+            || match (store.target, target) {
+                (Target::TableAny { user_data: a }, Target::Table { user_data: b, .. })
+                | (Target::TableAny { user_data: a }, Target::TableAny { user_data: b }) => a == b,
+                (Target::Table { user_data: a, .. }, Target::TableAny { user_data: b }) => a == b,
+                _ => false,
+            };
+        if !hit {
+            continue;
+        }
+        let (lo, hi) = store.offset.eval(bind)?;
+        out.push((lo, hi + u64::from(store.bytes)));
+    }
+    out.sort_unstable();
+    let mut joined: Vec<(u64, u64)> = Vec::new();
+    for (lo, hi) in out {
+        match joined.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => joined.push((lo, hi)),
+        }
+    }
+    while joined.len() > MAX_RANGES {
+        // The two nearest ranges become one.
+        let at = (1..joined.len()).min_by_key(|&i| joined[i].0 - joined[i - 1].1).unwrap_or(1);
+        let next = joined.remove(at);
+        joined[at - 1].1 = next.1;
+    }
+    Some(joined)
 }
 
 /// The program's footprint, or `None` if its front half does not run (the
@@ -314,6 +341,19 @@ pub fn analyze(native: &NativeProgram) -> Option<Footprint> {
 /// [`analyze`], with the cause of the first [`Expr::Top`] of each store (or
 /// `None` where there is none), in the order of [`Footprint::stores`].
 pub fn analyze_causes(native: &NativeProgram) -> Option<(Footprint, Vec<Option<Cause>>)> {
+    analyze_all(native).map(|(f, c)| (f, c.stores))
+}
+
+/// The causes of the [`Expr::Top`] of each store and each load (`None` where there is none), in the
+/// order of [`Footprint::stores`] and [`Footprint::loads`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Causes {
+    pub stores: Vec<Option<Cause>>,
+    pub loads: Vec<Option<Cause>>,
+}
+
+/// [`analyze`] with the causes of the unknown offsets of stores and loads.
+pub fn analyze_all(native: &NativeProgram) -> Option<(Footprint, Causes)> {
     let p = crate::spill::build(native).ok()?;
     let st = crate::structure::structure(&p);
     let res = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok()).ok()?;
@@ -683,10 +723,10 @@ impl<'a> Analysis<'a> {
         }
     }
 
-    /// Every store of the program.
-    fn scan(&self) -> (Footprint, Vec<Option<Cause>>) {
+    /// Every store and load of the program.
+    fn scan(&self) -> (Footprint, Causes) {
         let mut out = Footprint::default();
-        let mut causes = Vec::new();
+        let mut causes = Causes::default();
         let described: HashMap<(usize, usize), &crate::resource::Descriptor> = self
             .res
             .descriptors
@@ -694,56 +734,205 @@ impl<'a> Analysis<'a> {
             .filter(|d| d.role == crate::resource::Role::Resource)
             .map(|d| (d.site, d))
             .collect();
+        // Scalar loads that fetch a descriptor: reads of the descriptor heap, not of a view.
+        let mut fetches: HashSet<(usize, usize)> = HashSet::new();
+        for d in &self.res.descriptors {
+            for leaf in d.source.leaves() {
+                if let Source::Loaded { load, .. } | Source::Fetched { load, .. } = leaf {
+                    fetches.insert(*load);
+                }
+            }
+        }
         for (b, block) in self.p.blocks.iter().enumerate() {
             if block.exit == Exit::Indirect {
                 out.unbounded = true;
+                out.unbounded_loads = true;
+                out.images_unknown = true;
             }
             for (i, inst) in block.insts.iter().enumerate() {
                 let enc = inst.machine.encoding;
                 let name = inst.machine.name();
-                let stores = match enc {
-                    Encoding::Mubuf | Encoding::Mtbuf | Encoding::Smem | Encoding::Flat | Encoding::Global => {
-                        name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+                let site = (b, i);
+                let is = |words: &[&str]| name.is_some_and(|n| words.iter().any(|w| n.contains(w)));
+                match enc {
+                    Encoding::Mubuf | Encoding::Mtbuf => {
+                        if name.is_none() {
+                            out.unbounded = true;
+                            out.unbounded_loads = true;
+                            continue;
+                        }
+                        let store = is(&["store"]) || is(&["atomic"]);
+                        let load = is(&["load"]) || is(&["atomic"]);
+                        if !store && !load {
+                            continue;
+                        }
+                        let Some(d) = described.get(&site) else {
+                            out.unbounded |= store;
+                            out.unbounded_loads |= load;
+                            continue;
+                        };
+                        self.buffer_access(inst, &d.source, store, load, &mut out, &mut causes);
                     }
-                    Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
-                    _ => false,
-                };
-                if !stores {
-                    continue;
-                }
-                match (enc, &inst.fields) {
-                    (Encoding::Mubuf | Encoding::Mtbuf, Fields::Buffer { .. }) if name.is_some() => {
-                        match described.get(&(b, i)) {
-                            Some(d) => self.buffer_store(inst, &d.source, &mut out, &mut causes),
-                            None => out.unbounded = true,
+                    Encoding::Smem => match name {
+                        None => {
+                            out.unbounded = true;
+                            out.unbounded_loads = true;
+                        }
+                        Some(n) if n.contains("store") || n.contains("atomic") => {
+                            out.unbounded = true;
+                            out.unbounded_loads = true;
+                        }
+                        Some(n) if n.contains("load") => {
+                            if !fetches.contains(&site) {
+                                let source = described.get(&site).map(|d| &d.source);
+                                self.scalar_load(inst, site, n, source, &mut out, &mut causes);
+                            }
+                        }
+                        Some(_) => {}
+                    },
+                    Encoding::Flat | Encoding::Global => match name {
+                        None => {
+                            out.unbounded = true;
+                            out.unbounded_loads = true;
+                        }
+                        Some(n) if n.contains("scratch") => {}
+                        Some(n) => {
+                            out.by_address |= n.contains("store") || n.contains("atomic");
+                            out.by_address_loads |= n.contains("load") || n.contains("atomic");
+                        }
+                    },
+                    Encoding::Sop1 => {
+                        if name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")) {
+                            out.unbounded = true;
+                            out.unbounded_loads = true;
+                            out.images_unknown = true;
                         }
                     }
-                    (Encoding::Flat | Encoding::Global, Fields::Flat { .. }) if name.is_some() => out.by_address = true,
-                    _ => out.unbounded = true,
+                    Encoding::Mimg => {
+                        let n = name.unwrap_or("");
+                        let write = n.contains("store") || n.contains("atomic");
+                        let read = !n.contains("store");
+                        if n.starts_with("image_bvh") && !described.contains_key(&site) {
+                            // Nodes in title memory by address.
+                            out.by_address_loads = true;
+                            continue;
+                        }
+                        let targets = described.get(&site).and_then(|d| {
+                            let mut all = Vec::new();
+                            for leaf in d.source.leaves() {
+                                all.push(self.leaf(leaf, exec_of(inst)).map(|l| l.0)?);
+                            }
+                            Some(all)
+                        });
+                        match (name, targets) {
+                            (Some(_), Some(targets)) => {
+                                for t in targets {
+                                    if write && !out.image_writes.contains(&t) {
+                                        out.image_writes.push(t);
+                                    }
+                                    if read && !out.image_reads.contains(&t) {
+                                        out.image_reads.push(t);
+                                    }
+                                }
+                            }
+                            _ => out.images_unknown = true,
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
         (out, causes)
     }
 
-    /// The stores one buffer store or atomic stands for, one per descriptor
-    /// it may go through.
-    fn buffer_store(&self, inst: &Inst, source: &Source, out: &mut Footprint, causes: &mut Vec<Option<Cause>>) {
-        let Fields::Buffer { addr, soffset, offset, offen, idxen, format, lds, .. } = &inst.fields else {
-            out.unbounded = true;
+    /// A scalar-memory load: through a buffer descriptor (`s_buffer_load_*`), or by the address a root
+    /// view gives (`s_load_*`).
+    fn scalar_load(
+        &self,
+        inst: &Inst,
+        site: (usize, usize),
+        name: &str,
+        source: Option<&Source>,
+        out: &mut Footprint,
+        causes: &mut Causes,
+    ) {
+        let Fields::Smem { offset, soffset, .. } = &inst.fields else {
+            out.unbounded_loads = true;
+            return;
+        };
+        let bytes = match name.rsplit("dword").next() {
+            Some("") => 4,
+            Some("x2") => 8,
+            Some("x3") => 12,
+            Some("x4") => 16,
+            Some("x8") => 32,
+            _ => 64,
+        };
+        self.cause.set(None);
+        let ctx = exec_of(inst);
+        if name.starts_with("s_buffer_") {
+            let Some(source) = source else {
+                out.unbounded_loads = true;
+                return;
+            };
+            let mut off = Expr::Const(*offset as u32);
+            if !matches!(soffset, Operand::Scalar { code: NULL, .. } | Operand::Const(128)) {
+                let so = self.operand(inst, soffset, ctx);
+                off = self.mk(Op::Add, off, so);
+            }
+            let base_cause = self.cause.get();
+            for leaf in source.leaves() {
+                self.cause.set(base_cause);
+                let Some((target, _, base, _)) = self.leaf(leaf, ctx) else {
+                    out.unbounded_loads = true;
+                    return;
+                };
+                let at = self.mk(Op::Add, off.clone(), base);
+                causes.loads.push(if at.has_top() { self.cause.get() } else { None });
+                out.loads.push(Store { target, offset: at, bytes });
+            }
+            return;
+        }
+        // By an address: the root parameter it comes from says what is read.
+        let Some(a) = self.scalar.get(&site) else {
+            out.by_address_loads = true;
+            return;
+        };
+        match self.native.layout.get(a.param).map(|rp| (rp.root, rp.slot)) {
+            // Descriptors of a table's own memory.
+            Some((RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap, _)) => {}
+            // The program's own constants.
+            None if a.param == crate::resource::CODE || a.param == crate::resource::GS_TABLE => {}
+            Some((RootType::Descriptor, slot)) if !crate::spill::is_spilled(self.native) => {
+                let mut at = Expr::Const(a.offset);
+                if let Some(d) = a.dynamic {
+                    let d = self.value(d, ctx).unwrap_or_else(|| self.top(Cause::Input));
+                    at = self.mk(Op::Add, at, d);
+                }
+                causes.loads.push(if at.has_top() { self.cause.get() } else { None });
+                out.loads.push(Store { target: Target::Root { slot }, offset: at, bytes });
+            }
+            _ => out.by_address_loads = true,
+        }
+    }
+
+    /// The stores and loads one buffer access stands for, one per descriptor it may go through.
+    fn buffer_access(&self, inst: &Inst, source: &Source, store: bool, load: bool, out: &mut Footprint, causes: &mut Causes) {
+        let Fields::Buffer { addr, soffset, offset, offen, idxen, format, lds, tfe, .. } = &inst.fields else {
+            out.unbounded |= store;
+            out.unbounded_loads |= load;
             return;
         };
         let name = inst.machine.name().unwrap_or("");
-        let typed = format.is_some() || name.contains("format") || *lds;
+        let typed = format.is_some() || name.contains("format") || *lds || *tfe;
         let bytes = if name.contains("atomic") {
             if name.ends_with("_x2") { 8 } else { 4 }
-        } else if name.contains("dwordx4") {
+        } else if name.contains("dwordx4") || name.ends_with("_xyzw") {
             16
-        } else if name.contains("dwordx3") {
+        } else if name.contains("dwordx3") || name.ends_with("_xyz") {
             12
-        } else if name.contains("dwordx2") {
-            8
-        } else if name.contains("byte") || name.contains("short") {
+        } else if name.contains("dwordx2") || name.ends_with("_xy") || name.contains("byte") || name.contains("short") {
+            // (A byte or a short is written as an atomic on the dword that holds it, and may continue in the next.)
             8
         } else {
             4
@@ -772,7 +961,8 @@ impl<'a> Analysis<'a> {
         for leaf in source.leaves() {
             self.cause.set(base_cause);
             let Some((target, used, base, dynamic)) = self.leaf(leaf, ctx) else {
-                out.unbounded = true;
+                out.unbounded |= store;
+                out.unbounded_loads |= load;
                 return;
             };
             let mut at = self.mk(Op::Add, off.clone(), base);
@@ -793,8 +983,15 @@ impl<'a> Analysis<'a> {
             if typed {
                 at = self.top(Cause::Typed);
             }
-            causes.push(if at.has_top() { self.cause.get() } else { None });
-            out.stores.push(Store { target, offset: at, bytes });
+            let why = if at.has_top() { self.cause.get() } else { None };
+            if store {
+                causes.stores.push(why);
+                out.stores.push(Store { target, offset: at.clone(), bytes });
+            }
+            if load {
+                causes.loads.push(why);
+                out.loads.push(Store { target, offset: at, bytes });
+            }
         }
     }
 

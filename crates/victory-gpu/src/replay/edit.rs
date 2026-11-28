@@ -57,7 +57,7 @@ pub fn no_uav_barriers(cmds: Vec<Cmd>) -> (Vec<Cmd>, u32) {
 /// resources.
 pub fn barriers_only(cmds: Vec<Cmd>) -> Vec<Cmd> {
     cmds.into_iter()
-        .filter(|c| matches!(c, Cmd::Barriers { .. }))
+        .filter(Cmd::is_barrier)
         .collect()
 }
 
@@ -87,7 +87,10 @@ pub fn merge_barriers(cmds: Vec<Cmd>) -> (Vec<Cmd>, u32) {
                 }
             }
             c => {
-                if c.works() || matches!(c, Cmd::BeginQuery { .. } | Cmd::EndQuery { .. }) {
+                if c.works()
+                    || c.is_barrier()
+                    || matches!(c, Cmd::BeginQuery { .. } | Cmd::EndQuery { .. })
+                {
                     open = None;
                 }
                 out.push(c);
@@ -670,6 +673,13 @@ mod tests {
                 go()
             ]
         );
+        let with_global_sync = vec![
+            barriers(&[moved(1, 0, 8)]),
+            Cmd::GlobalSync {},
+            barriers(&[moved(1, 8, 64)]),
+        ];
+        assert_eq!(merge_barriers(with_global_sync.clone()), (with_global_sync.clone(), 0));
+        assert_eq!(barriers_only(with_global_sync.clone()), with_global_sync);
         // Parts of a resource are not mixed up.
         let part = |sub, before, after| Barrier::Transition {
             flags: 0,

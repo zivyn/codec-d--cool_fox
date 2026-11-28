@@ -1076,6 +1076,8 @@ fn list_table(t: &mut [usize; hook::SLOTS]) {
         ID3D12GraphicsCommandList_Vtbl.SetPipelineState = set_pipeline
     );
     set!(t, ID3D12GraphicsCommandList_Vtbl.ResourceBarrier = barrier);
+    set!(t, ID3D12GraphicsCommandList7_Vtbl.Barrier = enhanced_barrier);
+    set!(t, ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewFloat = clear_uav_float);
     set!(
         t,
         ID3D12GraphicsCommandList_Vtbl.SetDescriptorHeaps = set_heaps
@@ -1190,7 +1192,6 @@ fn list_rest(t: &mut [usize; hook::SLOTS]) -> &'static [(usize, &'static str)] {
         ID3D12GraphicsCommandList_Vtbl.ExecuteBundle,
         ID3D12GraphicsCommandList_Vtbl.SOSetTargets,
         ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewUint,
-        ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewFloat,
         ID3D12GraphicsCommandList_Vtbl.SetPredication,
         ID3D12GraphicsCommandList1_Vtbl.AtomicCopyBufferUINT,
         ID3D12GraphicsCommandList1_Vtbl.AtomicCopyBufferUINT64,
@@ -1208,7 +1209,6 @@ fn list_rest(t: &mut [usize; hook::SLOTS]) -> &'static [(usize, &'static str)] {
         ID3D12GraphicsCommandList4_Vtbl.DispatchRays,
         ID3D12GraphicsCommandList5_Vtbl.RSSetShadingRate,
         ID3D12GraphicsCommandList5_Vtbl.RSSetShadingRateImage,
-        ID3D12GraphicsCommandList7_Vtbl.Barrier,
         ID3D12GraphicsCommandList8_Vtbl.OMSetFrontAndBackStencilRef,
         ID3D12GraphicsCommandList9_Vtbl.RSSetDepthBias,
         ID3D12GraphicsCommandList9_Vtbl.IASetIndexBufferStripCutValue,
@@ -2317,6 +2317,32 @@ unsafe extern "system" fn barrier(this: Ptr, n: u32, all: *const D3D12_RESOURCE_
     }
 }
 
+unsafe extern "system" fn enhanced_barrier(this: Ptr, n: u32, groups: *const D3D12_BARRIER_GROUP) {
+    // SAFETY: the original call owns these arrays for the duration of the hook.
+    unsafe {
+        own!(this, ID3D12GraphicsCommandList7_Vtbl.Barrier)(this, n, groups);
+        if n == 0 {
+            return;
+        }
+        // This is the full-queue synchronization emitted by host::place.
+        let first = &*groups;
+        if n == 1 && first.Type == D3D12_BARRIER_TYPE_GLOBAL && first.NumBarriers == 1 {
+            let barrier = &*first.Anonymous.pGlobalBarriers;
+            if barrier.SyncBefore == D3D12_BARRIER_SYNC_ALL
+                && barrier.SyncAfter == D3D12_BARRIER_SYNC_ALL
+                && barrier.AccessBefore == D3D12_BARRIER_ACCESS_COMMON
+                && barrier.AccessAfter == D3D12_BARRIER_ACCESS_COMMON
+            {
+                note(this, |_| Cmd::GlobalSync {});
+                return;
+            }
+        }
+        if let Some((r, _)) = of(this) {
+            r.problem("unsupported enhanced Barrier call is not recorded");
+        }
+    }
+}
+
 unsafe extern "system" fn set_heaps(this: Ptr, n: u32, all: *const Ptr) {
     // SAFETY: as above.
     unsafe {
@@ -2609,6 +2635,44 @@ unsafe extern "system" fn clear_target(
             color: color.cast::<[f32; 4]>().read(),
             rects: rects(n, all),
         });
+    }
+}
+
+unsafe extern "system" fn clear_uav_float(
+    this: Ptr,
+    gpu: D3D12_GPU_DESCRIPTOR_HANDLE,
+    cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    res: Ptr,
+    color: *const f32,
+    n: u32,
+    all: *const RECT,
+) {
+    // SAFETY: the original call's pointers live through this hook.
+    unsafe {
+        own!(this, ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewFloat)(
+            this, gpu, cpu, res, color, n, all,
+        );
+        if let Some((r, state)) = of(this)
+            && r.armed.load(Ordering::Relaxed)
+        {
+            let gpu_slot = read(&r.descriptors).gpu(gpu.ptr).map(|(h, i)| (h.id, i));
+            let view = r.view(cpu.ptr);
+            if let Some((heap, index)) = gpu_slot
+                && view.kind == slot::UAV
+                && view.res != NONE
+                && view.res == r.resource(res)
+            {
+                state.push(&Cmd::ClearUavFloat {
+                    heap,
+                    index,
+                    view,
+                    color: color.cast::<[f32; 4]>().read(),
+                    rects: rects(n, all),
+                });
+            } else {
+                r.problem("a floating-point UAV clear has an untracked resource or descriptor");
+            }
+        }
     }
 }
 

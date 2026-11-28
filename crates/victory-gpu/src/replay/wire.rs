@@ -373,12 +373,14 @@ wire_enum! {
         31 Indirect { signature: u32, most: u32, args: u32, at: u64, count: u32, count_at: u64 },
         32 WriteImmediate { all: Vec<(Va, u32, i32)> },
         33 DepthBounds { min: f32, max: f32 },
+        34 GlobalSync {},
+        35 ClearUavFloat { heap: u32, index: u32, view: Slot, color: [f32; 4], rects: Vec<[i32; 4]> },
     }
 }
 
 /// The highest kind number of [`Cmd`].
 #[cfg(test)]
-const LAST_CMD: u8 = 33;
+const LAST_CMD: u8 = 35;
 
 impl Cmd {
     /// The commands of a list's bytes.
@@ -403,10 +405,15 @@ impl Cmd {
                     | Cmd::ResolveRegion { .. }
                     | Cmd::ClearDepth { .. }
                     | Cmd::ClearTarget { .. }
+                    | Cmd::ClearUavFloat { .. }
                     | Cmd::Discard { .. }
                     | Cmd::ResolveQuery { .. }
                     | Cmd::WriteImmediate { .. }
             )
+    }
+
+    pub fn is_barrier(&self) -> bool {
+        matches!(self, Cmd::Barriers { .. } | Cmd::GlobalSync {})
     }
 
     /// Whether it runs the pipeline bound.
@@ -779,7 +786,7 @@ pub(crate) mod tests {
             },
             Cmd::Discard {
                 res: 1,
-                rects,
+                rects: rects.clone(),
                 subs: Some([0, 2]),
             },
             Cmd::BeginQuery {
@@ -814,6 +821,14 @@ pub(crate) mod tests {
             Cmd::DepthBounds {
                 min: 0.25,
                 max: 0.75,
+            },
+            Cmd::GlobalSync {},
+            Cmd::ClearUavFloat {
+                heap: 10,
+                index: 7,
+                view: view(),
+                color: [0.0, 1.0, 0.5, -0.25],
+                rects,
             },
         ]
     }

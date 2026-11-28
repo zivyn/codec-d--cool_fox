@@ -487,10 +487,8 @@ impl Player {
             .iter()
             .filter(|c| {
                 !c.works()
-                    && !matches!(
-                        c,
-                        Cmd::Barriers { .. } | Cmd::BeginQuery { .. } | Cmd::EndQuery { .. }
-                    )
+                    && !c.is_barrier()
+                    && !matches!(c, Cmd::BeginQuery { .. } | Cmd::EndQuery { .. })
             })
             .cloned()
             .collect();

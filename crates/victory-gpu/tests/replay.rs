@@ -26,6 +26,20 @@ use windows::core::{Interface, PCSTR, s, w};
 
 const SIZE: u32 = 128;
 
+fn enhanced_barriers(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+    // SAFETY: a feature structure of the expected size.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    }
+    .is_ok()
+        && options.EnhancedBarriersSupported.as_bool()
+}
+
 const DRAW: &str = r#"
 #define RS "RootConstants(num32BitConstants=2, b0), CBV(b1), DescriptorTable(SRV(t0, numDescriptors=unbounded)), DescriptorTable(Sampler(s0))"
 cbuffer Pick : register(b0) { uint pick; uint pad; };
@@ -718,10 +732,13 @@ impl Scene {
                     ..Default::default()
                 },
                 Alignment: 0,
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
+                    | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT,
             };
             device.CreateHeap(&desc, &mut memory).unwrap();
             let memory = memory.unwrap();
+            let pageable: ID3D12Pageable = memory.cast().unwrap();
+            device.MakeResident(&[Some(pageable)]).unwrap();
             let placed = || {
                 let mut made: Option<ID3D12Resource> = None;
                 let d = texture_desc(16, rgba, D3D12_RESOURCE_FLAG_NONE);
@@ -1319,6 +1336,22 @@ impl Scene {
             );
             l.ClearRenderTargetView(rtv, &[0.1 * n as f32, 0.2, 0.3, 1.0], None);
             l.ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, None);
+            if enhanced_barriers(&self.device) {
+                let list: ID3D12GraphicsCommandList7 = l.cast().unwrap();
+                let global = D3D12_GLOBAL_BARRIER {
+                    SyncBefore: D3D12_BARRIER_SYNC_ALL,
+                    SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                    AccessBefore: D3D12_BARRIER_ACCESS_COMMON,
+                    AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
+                };
+                list.Barrier(&[D3D12_BARRIER_GROUP {
+                    Type: D3D12_BARRIER_TYPE_GLOBAL,
+                    NumBarriers: 1,
+                    Anonymous: D3D12_BARRIER_GROUP_0 {
+                        pGlobalBarriers: &global,
+                    },
+                }]);
+            }
             self.arguments(&l, COMMON);
             self.targets(&l);
             self.quad(&l, 4000, 0, 0);
@@ -1384,6 +1417,36 @@ impl Scene {
             let second = l;
             let l = self.open(2);
             l.SetDescriptorHeaps(&[Some(self.views.clone())]);
+            let clear_heap: ID3D12DescriptorHeap = self.device.CreateDescriptorHeap(
+                &D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    ..Default::default()
+                },
+            ).unwrap();
+            let clear_cpu = clear_heap.GetCPUDescriptorHandleForHeapStart();
+            let clear_slot = 3999;
+            let clear_gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                ptr: self.views.GetGPUDescriptorHandleForHeapStart().ptr
+                    + clear_slot as u64 * self.step as u64,
+            };
+            let clear_view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_FLOAT,
+                ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_UAV {
+                        NumElements: 256,
+                        ..Default::default()
+                    },
+                },
+            };
+            for at in [clear_cpu, self.cpu(clear_slot)] {
+                self.device.CreateUnorderedAccessView(
+                    &self.sum, None::<&ID3D12Resource>, Some(&clear_view), at,
+                );
+            }
+            l.ClearUnorderedAccessViewFloat(clear_gpu, clear_cpu, &self.sum, &[1.0; 4], &[]);
+            l.ResourceBarrier(&[uav_barrier()]);
             l.SetComputeRootSignature(&self.add.root);
             l.SetPipelineState(&self.add.pso);
             l.SetComputeRootShaderResourceView(0, self.shared.0.GetGPUVirtualAddress());
@@ -1706,6 +1769,15 @@ fn a_frame_is_recorded_and_replayed() {
         "{}",
         std::fs::read_to_string(folder.join("notes.txt")).unwrap()
     );
+    let (mut syncs, mut clears) = (0, 0);
+    play::listing(&folder, (0, u32::MAX), &mut |line| {
+        syncs += usize::from(line.contains("GlobalSync"));
+        clears += usize::from(line.contains("ClearUavFloat"));
+    }).unwrap();
+    assert_eq!(clears, 1, "one floating-point UAV clear captured");
+    if enhanced_barriers(&device) {
+        assert_eq!(syncs, 1, "one global synchronization call captured");
+    }
 
     let plain = Options {
         loops: 3,
@@ -1741,7 +1813,7 @@ fn a_frame_is_recorded_and_replayed() {
         );
     }
     assert_eq!(count("dispatches"), 6);
-    assert_eq!(count("clears"), 2);
+    assert_eq!(count("clears"), 3);
     assert!(
         report
             .shaders

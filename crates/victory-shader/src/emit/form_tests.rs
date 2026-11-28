@@ -324,4 +324,5 @@ fn zz_probe_top_exit() {
         let (r, f) = lowered_as(&native, keep);
         eprintln!("PROBE emit keep {keep}: {:?} {:?}", r.as_ref().err(), f);
     }
+    panic!("probe done");
 }

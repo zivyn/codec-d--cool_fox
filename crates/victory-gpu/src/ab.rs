@@ -170,6 +170,12 @@ macro_rules! live_value {
 }
 pub(crate) use live_value;
 
+/// The parse of a switch that is on unless its variable is `0` (`live_value!`; in `VICTORY_AB` name it with `=0`: its
+/// off phases are the unset variable, on).
+pub(crate) fn unless_zero(text: Option<&str>) -> bool {
+    text.is_none_or(|v| v != "0")
+}
+
 /// What the run has seen of the phase under way.
 struct Phase {
     started: Instant,
@@ -426,6 +432,11 @@ mod tests {
         let e = effect(&[m(0, 90.0), m(1, 94.0), m(0, 90.0), m(1, 96.0), m(0, 90.0)]).unwrap();
         assert!((e.mean - 5.0).abs() < 1e-9);
         assert!((e.ci - 12.706).abs() < 1e-6, "{e:?}");
+    }
+
+    #[test]
+    fn a_switch_that_is_on_unless_zero_is_off_only_in_the_phases_that_name_zero() {
+        assert_eq!([None, Some("1"), Some(""), Some("0")].map(unless_zero), [true, true, true, false]);
     }
 
     #[test]

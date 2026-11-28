@@ -1010,6 +1010,42 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// Every how many frames a copy of memory that is not write-watched is refreshed
+/// (`VICTORY_UNWATCHED_FRAMES`; 1: every frame).
+fn unwatched_every() -> u64 {
+    crate::ab::live_value!("VICTORY_UNWATCHED_FRAMES", u64, unwatched_of)
+}
+
+/// [`unwatched_every`] as the text of the variable says (none: 1).
+fn unwatched_of(text: Option<&str>) -> u64 {
+    text.and_then(|v| v.parse().ok()).unwrap_or(1)
+}
+
+/// Whether the refresh of copy `id` over `span` in `frame` is left out because it was refreshed less than `every`
+/// frames ago over all of it: `kept` is what the last pass remembered, `next` what this one does. A copy not left
+/// out is refreshed and noted. With `every` 1 nothing is asked and nothing is noted, so the pass after a switch to
+/// 1 forgets everything, and the first pass after a switch from 1 refreshes every copy.
+fn throttled(
+    kept: &std::collections::HashMap<u64, (u64, u64, u64)>,
+    next: &mut std::collections::HashMap<u64, (u64, u64, u64)>,
+    id: u64,
+    frame: u64,
+    span: (u64, u64),
+    every: u64,
+) -> bool {
+    if let Some(&(last, low, high)) = kept.get(&id)
+        && frame >= last
+        && frame - last < every
+        && low <= span.0
+        && span.1 <= high
+    {
+        next.insert(id, (last, low, high));
+        return true;
+    }
+    next.insert(id, (frame, span.0, span.1));
+    false
+}
+
 /// The pass over the buffer views of `heap` that shaders pick by index
 /// ([`State::heap_buffers`]): their host slots are made, and the host copies
 /// they show are to be refreshed.
@@ -1126,22 +1162,16 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     // the garbage ended runs (the card stopped answering 14-90 frames
     // into the opening cutscene; with every frame it ran on). The pass
     // costs some 30 ms a frame this way.
-    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let every = *EVERY.get_or_init(|| {
-        std::env::var("VICTORY_UNWATCHED_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(1)
-    });
+    //
+    // (May change while the title runs, `VICTORY_AB=..,VICTORY_UNWATCHED_FRAMES=2`: read once for the pass, and what
+    // the pass remembers is only when each copy was last refreshed, kept only while the value is above 1: see
+    // [`throttled`].)
+    let every = unwatched_every();
     let mut found = Vec::with_capacity(spans.len());
     let mut next_unwatched = std::collections::HashMap::new();
     for (shadow, from, to) in spans.values() {
-        if every > 1 && shadow.unwatched() {
-            let id = shadow.id();
-            if let Some(&(last, low, high)) = unwatched.get(&id)
-                && frame >= last && frame - last < every && low <= *from && *to <= high
-            {
-                next_unwatched.insert(id, (last, low, high));
-                continue;
-            }
-            next_unwatched.insert(id, (frame, *from, *to));
+        if every > 1 && shadow.unwatched() && throttled(unwatched, &mut next_unwatched, shadow.id(), frame, (*from, *to), every) {
+            continue;
         }
         found.push((shadow.clone(), *from, (*to).min(*from + shadow.left(*from))));
     }
@@ -5195,6 +5225,35 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_UNWATCHED_FRAMES` while the title runs: a copy is refreshed at once after a change of the value, whichever way.
+    #[test]
+    fn the_refresh_of_unwatched_copies_follows_the_value_at_each_frame() {
+        use std::collections::HashMap;
+        assert_eq!([None, Some("2"), Some("x")].map(super::unwatched_of), [1, 2, 1]);
+        let mut kept = HashMap::new();
+        // Value 3: refreshed at 10, left out at 11 and 12, refreshed at 13 (the span is as before).
+        let step = |kept: &mut HashMap<u64, (u64, u64, u64)>, frame: u64, span: (u64, u64), every: u64| {
+            let mut next = HashMap::new();
+            let left_out = every > 1 && super::throttled(kept, &mut next, 7, frame, span, every);
+            *kept = next;
+            left_out
+        };
+        assert!(!step(&mut kept, 10, (0, 100), 3));
+        assert!(step(&mut kept, 11, (0, 100), 3));
+        assert!(step(&mut kept, 12, (10, 90), 3), "inside what was refreshed");
+        assert!(!step(&mut kept, 13, (0, 100), 3));
+        // A span that grew is refreshed at once.
+        assert!(step(&mut kept, 14, (0, 100), 3));
+        assert!(!step(&mut kept, 15, (0, 200), 3), "past what was refreshed");
+        // Value 1 (the unset variable): everything refreshed, nothing remembered; the first frame back at 3 refreshes again.
+        assert!(!step(&mut kept, 16, (0, 200), 1));
+        assert!(kept.is_empty());
+        assert!(!step(&mut kept, 17, (0, 200), 3), "no stale note from before");
+        assert!(step(&mut kept, 18, (0, 200), 3));
+        // Going from 3 to 2 at frame 19: the note says 17, two frames ago, so it is refreshed now.
+        assert!(!step(&mut kept, 19, (0, 200), 2));
+    }
+
     use super::staging_budget_per_frame;
 
     #[test]

@@ -79,9 +79,16 @@ impl Drop for TailGuard {
 /// counted (`VICTORY_LAND_TAIL_THREADS`; 0, the default: the same as any
 /// landing). Those beyond [`threads`] sleep until such a landing comes: at that
 /// moment the title's threads wait for the landing and the cores are idle.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_LAND_TAIL_THREADS=6`: a batch decides for itself where it
+/// goes; the wide pool is made with the threads of the phase that first needs it, which is the one that names them.)
 fn tail_threads() -> usize {
-    static THREADS: OnceLock<usize> = OnceLock::new();
-    *THREADS.get_or_init(|| std::env::var("VICTORY_LAND_TAIL_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0usize).min(16))
+    crate::ab::live_value!("VICTORY_LAND_TAIL_THREADS", usize, tail_of)
+}
+
+/// The threads of [`tail_threads`] as the text of the variable says (none: 0, at most 16).
+fn tail_of(text: Option<&str>) -> usize {
+    text.and_then(|v| v.trim().parse().ok()).unwrap_or(0usize).min(16)
 }
 
 /// Whether a batch of `count` jobs goes to the wide pool: it is the title's
@@ -481,9 +488,11 @@ fn take(state: &mut State) -> Option<(Work, usize)> {
 pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     static WIDE: OnceLock<&'static Pool> = OnceLock::new();
-    if goes_wide(TAIL.get(), tail_threads(), threads(), count) {
+    // Read once: the pool is made with the number that made the batch go to it, whatever the switch says by then.
+    let wide = tail_threads();
+    if goes_wide(TAIL.get(), wide, threads(), count) {
         crate::land::count(stat::TAIL_WIDE, 1);
-        WIDE.get_or_init(|| Pool::new("victory-land-tail", tail_threads())).each(count, f);
+        WIDE.get_or_init(|| Pool::new("victory-land-tail", wide)).each(count, f);
         return;
     }
     POOL.get_or_init(|| Pool::new("victory-land", threads())).each(count, f);

@@ -801,9 +801,17 @@ fn runs_most() -> usize {
 /// How many presents may be in the line when a present call returns
 /// (`VICTORY_SUBMIT_FRAMES`; 1: the frame before is sent, this one may not be;
 /// 0: both are).
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_SUBMIT_FRAMES=2`: a bound that a present compares the
+/// line with when it comes and while it waits; nothing is kept by it, so the next present meets the new one, and
+/// a line that holds more than the new bound is waited down by the presents that follow.)
 fn frames_most() -> usize {
-    static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| number("VICTORY_SUBMIT_FRAMES").unwrap_or(1))
+    crate::ab::live_value!("VICTORY_SUBMIT_FRAMES", usize, frames_of)
+}
+
+/// [`frames_most`] as the text of the variable says (none: 1).
+fn frames_of(text: Option<&str>) -> usize {
+    text.and_then(|v| v.trim().parse().ok()).unwrap_or(1)
 }
 
 fn number(name: &str) -> Option<usize> {
@@ -1318,6 +1326,34 @@ mod tests {
         assert_eq!(FORCED_HERE.get(), 1);
         let state = lane.lock();
         assert_eq!((state.presents, state.runs, state.items.len()), (0, 0, 0));
+    }
+
+    /// The bound of presents (`VICTORY_SUBMIT_FRAMES`) is read at each present: a larger one lets the title go on at once,
+    /// a smaller one holds it until the line is down to it, and nothing else is kept between two presents.
+    #[test]
+    fn a_bound_of_presents_that_changes_is_met_by_the_next_present() {
+        assert_eq!([None, Some("0"), Some(" 2 "), Some("x")].map(frames_of), [1, 0, 2, 1]);
+        let lane: &'static Lane<T> = Box::leak(Box::new(Lane::new()));
+        std::thread::spawn(|| lane.serve());
+        let log: Log = Default::default();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        lane.push(1, [T::Slow("slow", log.clone(), gate.clone())]);
+        lane.push(1, [T::Present("present 1", log.clone())]);
+        lane.push(1, [T::Present("present 2", log.clone())]);
+        // Two presents in the line behind a submission that stands: a bound of 2 lets this return at once.
+        lane.wait_presents(2);
+        assert!(log.lock().unwrap().is_empty());
+        // The bound goes down to 1 while the line is full: the present that comes waits until the first is sent.
+        let waiter = std::thread::spawn(move || lane.wait_presents(1));
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(!waiter.is_finished(), "held while two presents are in the line");
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        waiter.join().unwrap();
+        // And 0 until the line is empty of presents.
+        lane.wait_presents(0);
+        assert_eq!(*log.lock().unwrap(), ["slow", "present 1", "present 2"]);
+        assert_eq!(lane.lock().presents, 0);
     }
 
     /// With the thread: a fence behind a submission is not reached before the

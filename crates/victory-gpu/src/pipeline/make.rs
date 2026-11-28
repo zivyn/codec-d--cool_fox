@@ -289,9 +289,12 @@ fn waited_for(p: &Pending) -> bool {
 
 /// Whether a wait is skipped that cannot end in the pipeline, and the frame's
 /// own requests go first (`VICTORY_PIPELINE_PRIORITY=0`: as before).
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_PIPELINE_PRIORITY=0`: a wait decides for itself whether to
+/// give up, and a touch moves a queued pipeline up only if it is on: a pipeline moved before the switch went off keeps
+/// its place, one asked for after it is made in the order it came in.)
 fn prioritised() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_PRIORITY").is_none_or(|v| v != "0"))
+    crate::ab::live_value!("VICTORY_PIPELINE_PRIORITY", bool, crate::ab::unless_zero)
 }
 
 fn epoch() -> Instant {

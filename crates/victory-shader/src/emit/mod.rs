@@ -219,6 +219,16 @@ pub fn default_on_switches() -> [bool; 2] {
     [lower::half_exit(), crate::ir::keep_loop_skips()]
 }
 
+/// `VICTORY_F16_NEAREST` as the level in force (0, 1 or 2; 2 is the default), for the shader cache key.
+pub fn f16_nearest_level() -> u8 {
+    f16_level::level()
+}
+
+/// `VICTORY_F32_FTZ` as the value in force (on unless `=0`), for the shader cache key.
+pub fn f32_ftz_on() -> bool {
+    denorm::f32_ftz()
+}
+
 /// `VICTORY_KEPT_SKIPS_WIDE` as the value in force (0 off, the default; 1 the safe classes; 2 all),
 /// for the shader cache key.
 pub fn kept_skips_wide_code() -> u8 {

@@ -43,7 +43,7 @@ How to read it:
 |---|---|---|
 | `VICTORY_KEPT_SKIPS_WIDE` | **on (safe classes) in the code of integ/validation-22, off in integ/validation-23** (`=1` the safe classes, `=all` every class) | Reverted after load-time device removals: with the wave-wide form of the kept skips on (116 programs in the form) the title lost the card while loading in 2 of about 4 starts, against none in about 7 starts of the same builds with it off. An audit found a group barrier behind a divergent branch in 91 of the 116 programs; whether that hangs NVIDIA is not proven. Cost of leaving it off: the defragmentation pass keeps its loop (7.8 ms) until a subset proven safe is found. It is in the cache key. |
 | `VICTORY_LOCAL_EXIT` | off (`=1`, `=2`) | After its fix the RTX test passes (64 of 64 lanes store, 40 of 64 before), but the hair arms with it on were no different from those with it off: it does not fix the blocky hair. `=2` is too broad (it includes a particle program class that took the card down once). |
-| `VICTORY_F16_NEAREST` (`=2` in integ/validation-23), `VICTORY_F32_FTZ` (integ/validation-23), `VICTORY_NAN_SAFE` | off | The RTX tests found the compare and min/max instructions of NaN and infinity exact on the card (0 of 144 differ); the one difference is `v_cvt_f16_f32`, which the card truncates where the console rounds to nearest (24 of 144 cases, one step). `=1` fixes the convert, `=2` also the mixed and packed 16-bit ops. Candidates for the default if the arms being run show no cost and a gain. `F32_FTZ` showed no difference in the one unguarded normalisation tested. |
+| `VICTORY_F16_NEAREST` (`=2`), `VICTORY_F32_FTZ`, `VICTORY_NAN_SAFE` | **`F16_NEAREST` 2 and `F32_FTZ` on since integ/validation-24 (2026-11-28; `=0` turns each off)**, `NAN_SAFE` off | The RTX tests found the compare and min/max instructions of NaN and infinity exact on the card (0 of 144 differ); the one difference is `v_cvt_f16_f32`, which the card truncates where the console rounds to nearest (24 of 144 cases, one step). `=1` fixes the convert, `=2` also the mixed and packed 16-bit ops. Made the default at integ/validation-24 on the evidence of the pilot's alternating runs: with both on (arm D) the picture stayed clean (smooth walls, no banding, no red spot) while 2 of 2 controls without them whited out (final numbers to be added). `F32_FTZ` alone showed no difference in the one unguarded normalisation tested. |
 | `VICTORY_PIPELINE_AHEAD`, `VICTORY_PIPELINE_WIDE` | off | Cold start: 61 % of it is one frame of about 175 compute programs made one at a time. These two queue them ahead and add workers; estimated 21 -> 7-9 minutes, not measured yet. |
 | experiments | off | `ONE_PASS`, `PAGE_REFRESH`, `PRECISE_*`, `JOIN_WAITS`, `INDIRECT_FOLD`, `FOLD_VIEWS` with `VIEW_INDEX`, `STAGE_A*`, `SEND_COPYQ`, `QUIET_COMPARE`, `ASYNC_COMPUTE` (`=2` is a second compute queue), `LANE_CORE`, `LANE_HIGH`, `LIST_NICE`, `WAIT_NICE`, `OPUS_PITCH`, `BVH_BUILDER` with `BVH_SIZES`, `R11G11B10_AS_F16`, `PRECOMPILED`: new or not yet measured (rule 14). |
 
@@ -70,8 +70,8 @@ the card.
 |---|---|---|---|
 | `VICTORY_BVH_BOUNDS` | on (=0 turns off) | cache key (text) | Keeps the ray-structure builder's view accesses near their views and ignores impossible header sizes. |
 | `VICTORY_BVH_FENCES` | on (=0 turns off) | cache key (text) | Puts the structure builder's buffer atomics between two fences. |
-| `VICTORY_F16_NEAREST` | off | cache key (text) | Rounds 16-bit float results to nearest, as the console does (=2 in integ/validation-23 also covers mixed and packed ops). |
-| `VICTORY_F32_FTZ` | off | cache key (text) | (integ/validation-23) Asks the driver for the console float mode: 32-bit denormals flushed to zero (shader model 6.2). |
+| `VICTORY_F16_NEAREST` | **2** (`=0` off, `=1` scalar ops only) since integ/validation-24; off before | cache key (value in force) | Rounds 16-bit float results to nearest, as the console does (2 also covers mixed and packed ops). |
+| `VICTORY_F32_FTZ` | **on** (`=0` off) since integ/validation-24; off before | cache key (value in force) | Asks the driver for the console float mode: 32-bit denormals flushed to zero (shader model 6.2). |
 | `VICTORY_FIRSTLANE_OWN` | off | cache key (text) | =1 takes the host wave's own first lane in wave-wide first-lane reads. |
 | `VICTORY_FIRST_HALF` | on (=0 turns off) | cache key (text) | Removes first-half interpolants only the second half reads before lowering. |
 | `VICTORY_FOLD_VIEWS` | off | cache key (text) | Folds view heap indexing into raw user data in draws and shaders. |
@@ -359,8 +359,8 @@ switch is read.
 | `VICTORY_EFFICIENCY_MODE` | off | flag |  |  |  | =1 leaves the system its choice of efficiency mode for the process. |
 | `VICTORY_EMIT_DUMP` | n/a | path |  |  |  | Directory where emitted shaders and validator reports are dumped. |
 | `VICTORY_EXACT_BACK` | on (=0 turns off) | flag |  |  |  | Writes back only the changed bytes of a range instead of the whole stretch. |
-| `VICTORY_F16_NEAREST` | off | flag | yes |  |  | Rounds 16-bit float results to nearest, as the console does (=2 in integ/validation-23 also covers mixed and packed ops). |
-| `VICTORY_F32_FTZ` | off | flag | yes |  |  | (integ/validation-23) Asks the driver for the console float mode: 32-bit denormals flushed to zero (shader model 6.2). |
+| `VICTORY_F16_NEAREST` | 2 since integ/validation-24 (off before; `=0` off, `=1` scalar ops) | level | yes |  |  | Rounds 16-bit float results to nearest, as the console does (2 also covers mixed and packed ops). |
+| `VICTORY_F32_FTZ` | on since integ/validation-24 (off before; `=0` off) | flag | yes |  |  | Asks the driver for the console float mode: 32-bit denormals flushed to zero (shader model 6.2). |
 | `VICTORY_FAIL_DUMP` | n/a | path |  |  |  | Directory where the first containers of each failure reason are dumped. |
 | `VICTORY_FAST_CORES` | 2 | number |  |  |  | Stage of asking the system to put threads on fast cores; 0 none, 1, 2. |
 | `VICTORY_FAULT_BOOK` | off | path |  |  | diag | File that receives the fault book's report of blocks and timing. |

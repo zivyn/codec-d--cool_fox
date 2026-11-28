@@ -13,16 +13,18 @@
 //!
 //! `VICTORY_F32_FTZ=1` writes the shader model 6.2 function attribute
 //! `"fp32-denorm-mode"="ftz"` on the entry point, which asks the driver for the console's mode.
-//! Off by default; part of the translation (the shader cache keys on it).
+//! On by default since integ/validation-24 (2026-11-28, with `VICTORY_F16_NEAREST=2`; `=0` is off).
+//! Part of the translation (the shader cache keys on the value in force,
+//! [`super::f32_ftz_on`]).
 
-/// Whether the entry point asks for flushed 32-bit denormals (`VICTORY_F32_FTZ=1`).
+/// Whether the entry point asks for flushed 32-bit denormals (on unless `VICTORY_F32_FTZ=0`).
 pub(super) fn f32_ftz() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_F32_FTZ.get() {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F32_FTZ").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_F32_FTZ").is_none_or(|v| v != "0"))
 }
 
 #[cfg(test)]

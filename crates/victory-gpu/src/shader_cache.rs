@@ -82,8 +82,6 @@ fn build() -> [u8; 32] {
             "VICTORY_PAIR_LEAN",
             "VICTORY_UNIFORM_LOADS",
             "VICTORY_WAVE_LOCAL",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_F32_FTZ",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",
@@ -118,6 +116,17 @@ fn build() -> [u8; 32] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
             bytes.push(u8::from(on));
+            bytes.push(0);
+        }
+        // The float modes that are on by default (16-bit results to nearest, 32-bit denormals
+        // flushed), by the value in force.
+        for (name, value) in [
+            ("VICTORY_F16_NEAREST", victory_shader::emit::f16_nearest_level()),
+            ("VICTORY_F32_FTZ", u8::from(victory_shader::emit::f32_ftz_on())),
+        ] {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            bytes.push(value);
             bytes.push(0);
         }
         // The wave-wide form of the kept skips (off unless asked for): by the value in force.

@@ -245,8 +245,10 @@ fn the_kept_skip_over_a_loop_gives_the_consoles_results_on_the_card() {
 /// same round) and reads the first lane of v0 + 1 in its body, which the two host waves of the console wave
 /// exchange (each asks the other whether it has a lane). The exit comes before the exchange in the order the blocks are lowered. After the
 /// loop, `out[0] = s22` (what the last round read: 1).
-const TOP_EXIT: [u32; 10] = [
+const TOP_EXIT: [u32; 12] = [
     0x4A04_0081, // v_add_nc_u32 v2, 1, v0
+    0xD760_0017, // v_readlane_b32 s23, v2, 63 (a read across the halves: they exchange)
+    0x0001_7F02,
     0xBE94_0380, // s_mov_b32 s20, 0
     0xBE96_0380, // s_mov_b32 s22, 0
     0xBF09_0114, // L: s_cmp_ge_u32 s20, s1

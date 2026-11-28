@@ -399,6 +399,12 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// Whether any physical page is shown at more than one address now (`crate::pagedrive` tells the copies of every view
+/// of a page when one is noted written, and looks for views only if there are any).
+pub(crate) fn any_aliases() -> bool {
+    views().pages_twice > 0
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

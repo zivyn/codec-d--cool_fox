@@ -60,6 +60,8 @@ impl Journal {
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         // (A copy's note that it found nothing new in the page is void.)
         stamp(page);
+        // The copies that cover the page are told, in this same step (`VICTORY_PAGE_REFRESH`).
+        crate::pagedrive::noted(page, now);
         let before = self.written.insert(page, now).unwrap_or(0);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -1002,10 +1004,38 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 /// written, with the number of the asking that stands (as [`writes`] gives
 /// it). `None` if the kernel would have to be asked.
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    asked_with(start, end, true)
+}
+
+/// [`asked`] without the list of pages when `list` is false (the caller has the pages from the copies' ledgers,
+/// `crate::pagedrive`, and walks none of the journal's entries).
+pub(crate) fn asked_with(start: usize, end: usize, list: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.covers(first, last)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+    j.covers(first, last).then(|| {
+        (j.ahead_asked, if list { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() } else { Vec::new() })
+    })
+}
+
+/// Whether the journal answers for `[start, end)` without the kernel: an asking that stands holds it, or its blocks
+/// are known by their bits (what [`nothing_new`] needs before it can say anything).
+pub(crate) fn covered(start: usize, end: usize) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    published(start, end) || journal().covers(first, last)
+}
+
+/// Whether the journal says a page of `[start, end)` was written after the copy with the notes `copied` (from page
+/// `base`) and `ranged` took it (`crate::pagedrive`, mode 1: what the ledger has to hold). Pages never taken are
+/// not counted: they are stale by `copied` alone.
+pub(crate) fn journal_stale(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        return false;
+    };
+    journal().written.range(first..last).any(|(&page, &write)| {
+        let at = taken[page - first].max(ranged);
+        at != 0 && write > at
+    })
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -1014,8 +1044,16 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_with(start, end, guarded, true)
+}
+
+/// [`writes`] without the list of pages when `list` is false: the asking is made and noted as it is, and the journal's
+/// entries in the range are not walked (the caller lists the pages from the copy's ledger, `crate::pagedrive`).
+pub(crate) fn writes_with(start: usize, end: usize, guarded: bool, list: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal| -> Vec<(usize, u64)> {
+        if list { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() } else { Vec::new() }
+    };
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| j.covers(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {

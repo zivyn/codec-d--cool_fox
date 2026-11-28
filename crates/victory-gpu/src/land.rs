@@ -215,6 +215,7 @@ pub(crate) mod stat {
 }
 
 pub(crate) mod owed;
+pub(crate) mod own;
 pub(crate) mod quiet;
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -232,6 +233,11 @@ pub(crate) fn spent(which: usize, from: std::time::Instant) -> std::time::Instan
 
 /// For the frame-rate line: where landing went, per frame.
 pub(crate) fn log(frames: f64) {
+    if crate::propcount::on() {
+        let peek: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        crate::propcount::line(frames, &peek);
+    }
+    own::line(frames);
     let t: Vec<f64> = TAKEN.iter().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if t[0] > 0.0 {
         tracing::info!(

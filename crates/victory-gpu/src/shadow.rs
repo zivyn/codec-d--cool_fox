@@ -26,6 +26,10 @@ use crate::watch::PAGE;
 
 mod current;
 use current::Current;
+mod overlap;
+mod own;
+pub(crate) use overlap::{OverlapIndex, overlap_index};
+pub(crate) use own::{CLASSES, OwnClass};
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
@@ -135,6 +139,8 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// With `crate::land::own`: how many landings of this copy's kept pieces our own readers forced.
+    own_forced: std::sync::atomic::AtomicU32,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -4676,6 +4682,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            own_forced: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -6418,6 +6425,7 @@ impl Shadow {
             /// A page of title memory, as read.
             static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
+        let _counted = crate::propcount::taking(self, from, to);
         let Some(card) = self.card.as_ref().filter(|_| self.changes_only.load(Ordering::Relaxed) || send_changed()) else {
             if known && self.card.is_some() && self.landing.load(Ordering::Acquire) && land_echo() && !crate::host::upcheck::on() {
                 return self.take_landed(from, to);
@@ -6950,9 +6958,34 @@ impl Shadow {
         notes: &mut crate::land::Notes,
         patient: bool,
     ) -> u64 {
+        // SAFETY: the caller's.
+        unsafe { self.land_card_skipping(pieces, fetched_after, &[], notes, patient) }
+    }
+
+    /// [`Shadow::land_card_with`], leaving out `extra` too (offsets of the copy: bytes title bytes hold that the pieces
+    /// do not know of, noted when a piece was kept on the card, `crate::land::own`).
+    ///
+    /// What of the pieces another landing still owes is landed first, before the copy's lock is taken: the guard of
+    /// such memory would fault on the first write otherwise, and tell the handler that a thread of the title touched it.
+    ///
+    /// # Safety
+    /// [`Shadow::land_card`]'s.
+    pub(crate) unsafe fn land_card_skipping(
+        &self,
+        pieces: &[(usize, usize, usize)],
+        fetched_after: u64,
+        extra: &[(usize, usize)],
+        notes: &mut crate::land::Notes,
+        patient: bool,
+    ) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
+        for &(lo, hi, _) in pieces {
+            if lo < hi {
+                crate::land::owed::land_range(self.start as usize + lo, hi - lo);
+            }
+        }
         let waiting = std::time::Instant::now();
         let _merging = if patient { self.merging_patient() } else { Some(self.merging.read().unwrap_or_else(|e| e.into_inner())) };
         crate::land::spent(crate::land::stat::LOCK, waiting);
@@ -6962,6 +6995,7 @@ impl Shadow {
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
             let mut skip: Vec<(usize, usize)> = dirty.iter().copied().filter(|&(a, b)| a < to && b > from).collect();
             sent.near(fetched_after, from, to, &mut skip);
+            skip.extend(extra.iter().copied().filter(|&(a, b)| a < to && b > from));
             skip
         };
         let mut put = 0;
@@ -6981,6 +7015,7 @@ impl Shadow {
             self.walls_merged(hi - lo, merged as usize);
             if merged > 0 {
                 self.note_landing(lo, hi);
+                crate::propcount::landed(self, lo, hi, merged);
             }
             put += merged;
         }

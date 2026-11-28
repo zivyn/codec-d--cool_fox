@@ -57,7 +57,8 @@ fn translated(together: bool) -> Result<HostShader, ShaderError> {
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     lower::TEST_LOCAL_EXIT.set(together);
     let result = if together {
-        super::local_exit(&c, &native, &p, true, true).expect("a branch that leaves the loop")
+        super::local_exit_form::local_exit(&c, &native, &p, true, true)
+            .expect("a branch that leaves the loop")
     } else {
         let st = structure::structure(&p).expect("structure");
         let res =
@@ -87,11 +88,15 @@ fn validated(shader: &HostShader) {
 /// What each of the 64 lanes stored, on the host GPU (None without one).
 fn lanes_on_the_card(shader: &HostShader) -> Option<Vec<u32>> {
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        eprintln!(
+            "SKIPPED (no wave32 hardware): no SM 6.6 hardware device; the GPU part of this test did not run"
+        );
         return None;
     };
     let Ok((root, pso)) = host.compute_pipeline(shader) else {
-        eprintln!("the hardware device does not take this program; not run");
+        eprintln!(
+            "SKIPPED (no wave32 hardware): the hardware device does not take this program; the GPU part of this test did not run"
+        );
         return None;
     };
     let user = vec![0u32; shader.user_data_dwords().max(1) as usize];
@@ -108,6 +113,18 @@ fn lanes_on_the_card(shader: &HostShader) -> Option<Vec<u32>> {
         )
         .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
     Some(out[0].to_vec())
+}
+
+/// Which branches the host wave takes together, without a GPU: the exit of the loop (block 2, the
+/// `s_cbranch_scc0`) and the branch in its way (block 1, the `s_cbranch_execz` that only the lanes
+/// with nothing left get past), since the lanes reach the exit in different rounds. Without the
+/// second one the wave is asked by the few lanes that are at the exit that round and they all
+/// say "leave" (the RTX 4060 run of 2026-11-28: 5 of 64 lanes stored).
+#[test]
+fn the_branch_in_the_way_of_a_loops_exit_is_taken_by_the_host_wave_too() {
+    let native = native_of(&MASK_LOOP, true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert_eq!(super::local_exit_form::wide_branches(&p), Some(vec![1, 2]));
 }
 
 /// The switch changes the translation (the branch that leaves the loop is taken by the host wave

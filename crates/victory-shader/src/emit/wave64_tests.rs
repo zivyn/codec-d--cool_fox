@@ -192,7 +192,7 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     assert_ne!(tree[0], in_a_row, "these terms tell the tree from another order");
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        eprintln!("SKIPPED (no wave32 hardware): no SM 6.6 hardware device; not run");
         return;
     };
     let (root, pso) = match host.compute_pipeline(&shader) {
@@ -480,7 +480,7 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
             return;
         };
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            eprintln!("the hardware device does not take this program; not run");
+            eprintln!("SKIPPED (no wave32 hardware): the hardware device does not take this program; not run");
             return;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];

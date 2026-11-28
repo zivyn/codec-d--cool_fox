@@ -456,3 +456,73 @@ fn post_dominators(succ: &[Vec<usize>], seen: &[bool]) -> Vec<u64> {
     }
     pdom
 }
+
+impl Module {
+    /// The module's control flow and instructions as text (a diagnostic, `VICTORY_HANG_AUDIT=2`):
+    /// one line per instruction, `%n` for the instruction numbered `n`, `T` after the ones the
+    /// translation marked as the same in every thread.
+    pub(crate) fn listing(&self) -> String {
+        use std::fmt::Write;
+        let name = |v: V| -> String {
+            match v {
+                V::Inst(i) => format!("%{i}"),
+                V::Const(c) => match &self.consts[c as usize].1 {
+                    super::Const::Int(x) => format!("{x}"),
+                    super::Const::Float(b) => format!("f{b:#x}"),
+                    super::Const::Undef => "undef".into(),
+                    super::Const::Aggregate(_) => "{..}".into(),
+                },
+                V::Global(g) => format!("@{}", self.globals[g as usize].name),
+                V::Func(f) => format!("f{f}"),
+            }
+        };
+        let list = |vs: &[V]| vs.iter().map(|&v| name(v)).collect::<Vec<_>>().join(", ");
+        let n = self.blocks.len();
+        let mut seen = vec![false; n];
+        let mut stack = vec![0usize];
+        if n > 0 {
+            seen[0] = true;
+        }
+        while let Some(b) = stack.pop() {
+            for &s in super::successors(self.blocks[b].term).iter() {
+                if !seen[s] {
+                    seen[s] = true;
+                    stack.push(s);
+                }
+            }
+        }
+        let mut out = String::new();
+        for b in (0..n).filter(|&b| seen[b]) {
+            let blk = &self.blocks[b];
+            let _ = writeln!(out, "B{b}:");
+            for &i in blk.phis.iter().chain(&blk.body) {
+                let inst = &self.insts[i as usize];
+                let text = match &inst.op {
+                    Op::Bin(op, a, c) => format!("{op:?} {}, {}", name(*a), name(*c)),
+                    Op::Cast(op, a) => format!("{op:?} {}", name(*a)),
+                    Op::Cmp(p, a, c) => format!("cmp{p} {}, {}", name(*a), name(*c)),
+                    Op::Select(c, a, d) => format!("select {}, {}, {}", name(*c), name(*a), name(*d)),
+                    Op::Extract(a, k) => format!("extract {}, {k}", name(*a)),
+                    Op::Call(f, args) => format!("call {}({})", self.func_name(*f).trim_start_matches("dx.op."), list(args)),
+                    Op::Phi(inc) => format!(
+                        "phi {}",
+                        inc.iter().map(|(v, b)| format!("[{}, B{b}]", name(*v))).collect::<Vec<_>>().join(", ")
+                    ),
+                    Op::Gep(_, p, idx) => format!("gep {}[{}]", name(*p), list(idx)),
+                    Op::Load(p) => format!("load {}", name(*p)),
+                    Op::Store(p, v) => format!("store {}, {}", name(*p), name(*v)),
+                    Op::AtomicRmw(op, p, v) => format!("atomic {op:?} {}, {}", name(*p), name(*v)),
+                    Op::CmpXchg(p, a, c) => format!("cmpxchg {}, {}, {}", name(*p), name(*a), name(*c)),
+                };
+                let t = if self.together.contains(&i) { " T" } else { "" };
+                let _ = writeln!(out, "  %{i} = {text}{t}");
+            }
+            let _ = match blk.term {
+                Some(Term::Br(t)) => writeln!(out, "  br B{t}"),
+                Some(Term::CondBr(c, t, f)) => writeln!(out, "  br {}, B{t}, B{f}", name(c)),
+                _ => writeln!(out, "  ret"),
+            };
+        }
+        out
+    }
+}

@@ -100,10 +100,15 @@ thread_local! {
     static LAST: RefCell<Option<Audit>> = const { RefCell::new(None) };
 }
 
-/// `VICTORY_HANG_AUDIT=1`: one line on stderr for each module with a group barrier.
-fn printing() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HANG_AUDIT").is_some_and(|v| v == "1"))
+/// `VICTORY_HANG_AUDIT=1`: one line on stderr for each module with a group barrier; `=2` the
+/// module's control flow and instructions too.
+fn printing() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_HANG_AUDIT").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
 }
 
 /// Audits the modules this thread finishes from now on (and forgets the last audit), until
@@ -126,7 +131,7 @@ pub(super) fn last_audit() -> Option<Audit> {
 pub(super) fn finished(m: &super::bitcode::Module, tag: u32) {
     #[cfg(test)]
     TEST_MODULE.set(Some(m.clone()));
-    if !WANT.get() && !printing() {
+    if !WANT.get() && printing() == 0 {
         return;
     }
     let audit = m.audit_barriers();
@@ -134,8 +139,11 @@ pub(super) fn finished(m: &super::bitcode::Module, tag: u32) {
         LAST.take();
         return;
     }
-    if printing() {
+    if printing() > 0 {
         eprintln!("HANG-AUDIT #{:07x} {}", tag & 0x0FFF_FFFF, audit.describe());
+    }
+    if printing() > 1 {
+        eprintln!("{}", m.listing());
     }
     LAST.set(Some(audit));
 }

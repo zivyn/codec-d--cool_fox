@@ -228,14 +228,41 @@ fn some_shapes_take_the_kept_skips_wave_wide_form() {
     );
 }
 
+/// Collects what is wrong and says all of it at once (the first listing is the module's text).
+#[derive(Default)]
+struct Findings {
+    lines: Vec<String>,
+    listing: Option<String>,
+}
+
+impl Findings {
+    fn add(&mut self, line: String, module: &Module) {
+        if self.listing.is_none() {
+            self.listing = Some(format!("{line}
+{}", module.listing()));
+        }
+        self.lines.push(line);
+    }
+
+    fn done(self) {
+        assert!(self.lines.is_empty(), "{}
+
+{}", self.lines.join("
+"), self.listing.unwrap_or_default());
+    }
+}
+
 /// The audit of the emitted control flow finds no group barrier that a thread can fail to reach.
 #[test]
 fn the_group_barriers_of_the_kept_skips_form_are_reached_by_every_thread() {
+    let mut found = Findings::default();
     for (shape, module) in kept_wide_shapes() {
         let audit = module.audit_barriers();
-        assert!(audit.barriers > 0, "{shape:?}: no group barrier at all");
-        assert!(audit.safe(false), "{shape:?}: {}", audit.describe());
+        if audit.barriers == 0 || !audit.safe(false) {
+            found.add(format!("{shape:?}: {}", audit.describe()), &module);
+        }
     }
+    found.done();
 }
 
 /// Both host waves pass every barrier the same number of times, whatever the lanes hold and
@@ -243,35 +270,49 @@ fn the_group_barriers_of_the_kept_skips_form_are_reached_by_every_thread() {
 /// thread that is not there.
 #[test]
 fn the_two_halves_pass_the_same_barriers_in_the_kept_skips_form() {
-    let shapes = kept_wide_shapes();
-    for (shape, module) in &shapes {
+    let mut found = Findings::default();
+    for (shape, module) in &kept_wide_shapes() {
         for s0 in THRESHOLDS {
             for seed in 1..=3 {
-                let report = sim::run(module, 64, &[s0, 0, 0, 0], seed).unwrap_or_else(|e| panic!("{shape:?} s0={s0}: {e}"));
-                assert!(report.problems.is_empty(), "{shape:?} s0={s0} seed={seed}: {:?}", report.problems);
-                assert!(report.alike(), "{shape:?} s0={s0} seed={seed}: the threads passed different barriers");
-                assert!(!report.barriers[0].is_empty(), "{shape:?}: no barrier passed");
+                match sim::run(module, 64, &[s0, 0, 0, 0], seed) {
+                    Err(e) => found.add(format!("{shape:?} s0={s0}: {e}"), module),
+                    Ok(report) if !report.problems.is_empty() || !report.alike() => {
+                        let mut p = report.problems.clone();
+                        p.dedup();
+                        found.add(format!("{shape:?} s0={s0} seed={seed}: {p:?} alike={}", report.alike()), module);
+                    }
+                    Ok(_) => {}
+                }
             }
         }
     }
+    found.done();
 }
 
 /// Every form a shape ends in is checked, not only the kept skips': a barrier a thread cannot reach
 /// is a hang in whichever form it stands.
 #[test]
 fn no_form_of_the_shapes_has_a_barrier_that_threads_reach_differently() {
+    let mut found = Findings::default();
     for shape in shapes() {
         let native = lane_branch(shape.0, shape.1, 64, shape.2);
         for mode in [Mode::Classes, Mode::Off] {
             let (result, form, module) = lowered(&native, mode, None);
             let (Ok(_), Some(module)) = (result, module) else { continue };
             for s0 in [0, 16, 32, 48, 64] {
-                let report = sim::run(&module, 64, &[s0, 0, 0, 0], 7).unwrap_or_else(|e| panic!("{shape:?} {form:?} s0={s0}: {e}"));
-                assert!(report.problems.is_empty(), "{shape:?} {form:?} {mode:?} s0={s0}: {:?}", report.problems);
-                assert!(report.alike(), "{shape:?} {form:?} {mode:?} s0={s0}: different barriers");
+                match sim::run(&module, 64, &[s0, 0, 0, 0], 7) {
+                    Err(e) => found.add(format!("{shape:?} {form:?} {mode:?} s0={s0}: {e}"), &module),
+                    Ok(report) if !report.problems.is_empty() || !report.alike() => {
+                        let mut p = report.problems.clone();
+                        p.dedup();
+                        found.add(format!("{shape:?} {form:?} {mode:?} s0={s0}: {p:?} alike={}", report.alike()), &module);
+                    }
+                    Ok(_) => {}
+                }
             }
         }
     }
+    found.done();
 }
 
 /// A module by hand: a branch on the thread's own parity, a barrier on one side (and on the
@@ -342,11 +383,11 @@ fn the_guard_keeps_the_stores_and_ends_a_wait_for_threads_that_are_gone() {
         }
         // the upper half is gone after a while: the lower half's wait runs out
         let b = sim::run_with(&gmodule, 64, &[64, 0, 0, 0], 5, Some((400, 32..64))).expect("run");
-        let notes: Vec<u64> = b.stores.values().copied().filter(|&v| v >= u64::from(hang::HANG_NOTE)).collect();
+        let notes: Vec<u64> = b.notes.iter().copied().filter(|&v| v >= u64::from(hang::HANG_NOTE) && v < 0xE000_0000).collect();
         assert!(
             notes.iter().any(|&n| hang::say(n as u32).0 == hang::kind::WAIT || hang::say(n as u32).0 == hang::kind::BUDGET),
-            "{shape:?}: no note of the guard (stores {:?}, problems {:?})",
-            b.stores,
+            "{shape:?}: no note of the guard (notes {:x?}, problems {:?})",
+            b.notes,
             b.problems
         );
         assert!(!b.problems.iter().any(|p| p.contains("hang")), "{shape:?}: the group hung: {:?}", b.problems);

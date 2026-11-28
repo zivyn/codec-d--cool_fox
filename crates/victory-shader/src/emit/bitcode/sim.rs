@@ -65,6 +65,9 @@ pub(crate) struct Report {
     pub problems: Vec<String>,
     /// The words the threads stored to buffers, by byte offset.
     pub stores: HashMap<u64, u64>,
+    /// The notes the threads left in the faults buffer (the root UAV 253), in order (a thread's
+    /// note that is not a note is the sink's: the faults buffer's dword 0).
+    pub notes: Vec<u64>,
 }
 
 impl Report {
@@ -392,13 +395,18 @@ impl Sim<'_> {
                             None
                         }
                         "barrier" => None,
-                        n if n.starts_with("createHandle") || n.starts_with("annotateHandle") => Some(Val::I(0)),
+                        // (a handle is the slot of its binding: the root UAV 253 is the faults buffer)
+                        n if n.starts_with("createHandle") || n.starts_with("annotateHandle") => Some(Val::I(a[1])),
                         n if n.starts_with("cbufferLoadLegacy") => {
                             let row = a[2] as usize;
                             Some(Val::Agg((0..4).map(|k| u64::from(self.user.get(row * 4 + k).copied().unwrap_or(0))).collect()))
                         }
                         n if n.starts_with("rawBufferStore") => {
-                            self.report.stores.insert(a[2], a[4]);
+                            if a[1] == 253 {
+                                self.report.notes.push(a[4]);
+                            } else {
+                                self.report.stores.insert(a[2], a[4]);
+                            }
                             None
                         }
                         n if n.starts_with("rawBufferLoad") || n.starts_with("bufferLoad") => Some(Val::Agg(vec![0; 5])),

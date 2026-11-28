@@ -481,6 +481,8 @@ plain! {
     WAIT_VALUE wait_value = super::wait_value, (address: u64, comparison: u32, reference: u64);
     WAIT_VALUE64 wait_value64 = super::wait_value64, (address: u64, comparison: u32, reference: u64);
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
+    BEGIN_QUERY begin_query = super::query_begin, (heap: This, kind: u32, index: u32);
+    END_QUERY end_query = super::query_end, (heap: This, kind: u32, index: u32);
 }
 
 const fn after(n: u64) -> u64 {
@@ -739,12 +741,13 @@ static RUNS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static BETWEEN: Mutex<Option<std::collections::HashMap<Vec<u8>, u64>>> = Mutex::new(None);
 
 /// The names of the plain ops and the others, by code.
-const NAMES: [&str; 45] = [
+const NAMES: [&str; 47] = [
     "topology", "stencil_ref", "depth_bounds", "compute_table", "graphics_table", "compute_constant",
     "graphics_constant", "compute_view", "graphics_view", "set_pipeline", "draw", "draw_indexed", "dispatch",
     "dispatch_x", "dispatch_mesh", "dispatch_mesh_x", "copy_buffer", "copy_resource", "copy_resource_x",
     "copy_memory", "resolve", "resolve_queries", "execute_indirect", "write32", "write64", "wait_value",
-    "wait_value64", "sync", "reset", "close", "upload", "barrier", "barrier_groups", "viewports", "scissors",
+    "wait_value64", "sync", "begin_query", "end_query", "reset", "close", "upload", "barrier",
+    "barrier_groups", "viewports", "scissors",
     "blend_factor", "heaps", "compute_constants", "graphics_constants", "index_buffer", "vertex_buffers",
     "targets", "clear_rtv", "clear_dsv", "copy_texture",
 ];
@@ -1010,7 +1013,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -1027,6 +1030,8 @@ const MINE: [(usize, *const ()); 50] = [
     (24, stencil_ref as *const ()),
     (25, set_pipeline as *const ()),
     (26, barrier as *const ()),
+    (28, begin_query as *const ()),
+    (29, end_query as *const ()),
     (30, resolve_queries as *const ()),
     (32, heaps as *const ()),
     (35, compute_table as *const ()),
@@ -1071,7 +1076,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 33, 34, 73, 99, 124];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");

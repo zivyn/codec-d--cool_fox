@@ -2369,6 +2369,12 @@ struct Deferred {
     /// memory they go to, the bytes of a row, the rows, the title's row
     /// pitch.
     backs: Vec<(ID3D12Resource, usize, [usize; 3])>,
+    /// The occlusion queries the host list has begun and not ended, and their
+    /// heaps ([`crate::occlusion`]).
+    queries: crate::occlusion::Open<ID3D12QueryHeap>,
+    /// Results of occlusion queries among `backs`: the title memory they go
+    /// to and how many 8-byte results (for the totals line).
+    occluded: Vec<(usize, usize)>,
     /// Title textures of the kinds copied back ([`crate::texback`]) that
     /// the list's shaders write, copied when the list closes.
     back_wanted: Vec<crate::texback::Target>,
@@ -4455,6 +4461,12 @@ fn read_backs(list: &HostList) {
                 buffer.Unmap(0, None);
             }
         }
+    }
+    // The samples the occlusion queries of this list put in title memory.
+    for &(at, count) in &list.deferred().occluded {
+        // SAFETY: the title's destination, which the read back above filled.
+        let counts = unsafe { std::slice::from_raw_parts(at as *const u64, count) };
+        crate::occlusion::landed(counts);
     }
 }
 
@@ -7088,6 +7100,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.queries_end();
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -7749,6 +7762,60 @@ impl HostList {
         if deferred.gpu_written.insert(key) || !declare_once() {
             deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
         }
+    }
+
+    /// The title's `BeginQuery` on an occlusion heap of ours, recorded where
+    /// it was called among the draws. A query already open is not begun twice.
+    pub(crate) fn query_begin(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) {
+        let began = self.deferred().queries.begin(heap.as_raw() as usize, heap, kind, index);
+        if !began {
+            crate::occlusion::not_run();
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| {
+            format!("BEGIN QUERY {:#x} type {kind} index {index}", heap.as_raw() as usize)
+        });
+        // SAFETY: an open list; the heap is kept until the list is reset, the
+        // index is inside it (checked by the caller).
+        unsafe { self.list.BeginQuery(heap, D3D12_QUERY_TYPE(kind as i32), index) };
+    }
+
+    /// The title's `EndQuery`: recorded only if this list began the query (a
+    /// list cut between them ended it at the cut).
+    pub(crate) fn query_end(&self, heap: &ID3D12QueryHeap, kind: u32, index: u32) {
+        if !self.deferred().queries.end(heap.as_raw() as usize, kind, index) {
+            crate::occlusion::not_run();
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        self.note_op(|| {
+            format!("END QUERY {:#x} type {kind} index {index}", heap.as_raw() as usize)
+        });
+        // SAFETY: an open list, a heap kept until it is reset.
+        unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE(kind as i32), index) };
+    }
+
+    /// Keeps `heap` until the list is reset (a resolve names it).
+    pub(crate) fn query_keep(&self, heap: &ID3D12QueryHeap) {
+        self.deferred().queries.keep(heap.as_raw() as usize, heap);
+    }
+
+    /// Ends the queries still open: a list may not close with one.
+    fn queries_end(&self) {
+        let open = self.deferred().queries.drain();
+        for (heap, kind, index) in open {
+            // SAFETY: an open list, a heap kept until it is reset.
+            unsafe { self.list.EndQuery(&heap, D3D12_QUERY_TYPE(kind as i32), index) };
+        }
+    }
+
+    /// Occlusion results: once the list has run, the `bytes` of `back` (the
+    /// host buffer the list resolved into) go to title memory at `dst`.
+    pub(crate) fn defer_occlusion_back(&self, back: ID3D12Resource, dst: *mut u8, bytes: usize) {
+        let mut deferred = self.deferred();
+        deferred.backs.push((back, dst as usize, [bytes, 1, bytes]));
+        deferred.occluded.push((dst as usize, bytes / 8));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go

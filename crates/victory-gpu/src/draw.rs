@@ -377,6 +377,9 @@ fn batches() -> u8 {
     })
 }
 
+/// What `first_use` is asked about a list's batch: once per recording.
+const BATCH_USE: usize = usize::MAX - 0x78;
+
 /// The records clamped by the pass opened last ([`batches`]).
 struct Batch {
     table: crate::indirect::batch::Table,
@@ -442,6 +445,8 @@ pub(crate) struct State {
     /// The records clamped in a batch, if later executions may still read
     /// them ([`batches`]).
     batch: Option<Batch>,
+    /// The run of executions being made one (`VICTORY_INDIRECT_FOLD`).
+    fold: fold::Mode,
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -1001,6 +1006,8 @@ macro_rules! once {
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
 }
+
+pub(crate) mod fold;
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
@@ -1716,7 +1723,11 @@ impl State {
             } else {
                 DEPTH_WRITE
             };
-            crate::list::ensure_state(list, self.depth as This, state);
+            // (A run made one that needs the depth target in another state
+            // than a call after its head asks: ends before the move.)
+            if !self.fold_depth(state) {
+                crate::list::ensure_state(list, self.depth as This, state);
+            }
         }
         true
     }
@@ -1884,14 +1895,18 @@ impl State {
                     self.user.clear();
                     self.user.extend_from_slice(values);
                 }
+                // (A call after the head of a run made one: its dwords are in
+                // the run's commands, and the host list is not told.)
+                let quiet = self.fold_note(compute, param, values);
                 // (With the filter: a hash of the dwords and their number says whether the list has them.)
-                let set = state_filter() == 0 || {
-                    let mut h = u64::from(dwords);
-                    for &v in values.iter() {
-                        h = (h.rotate_left(5) ^ u64::from(v)).wrapping_mul(0x517c_c1b7_2722_0a95);
-                    }
-                    self.root_changed(compute, param, 1, h)
-                };
+                let set = !quiet
+                    && (state_filter() == 0 || {
+                        let mut h = u64::from(dwords);
+                        for &v in values.iter() {
+                            h = (h.rotate_left(5) ^ u64::from(v)).wrapping_mul(0x517c_c1b7_2722_0a95);
+                        }
+                        self.root_changed(compute, param, 1, h)
+                    });
                 // SAFETY: an open list; `values` covers the parameter.
                 if set {
                     unsafe {
@@ -4431,7 +4446,6 @@ impl State {
         arguments: u64,
         kind: u32,
     ) -> Option<(ID3D12Resource, u64)> {
-        const BATCH_USE: usize = usize::MAX - 0x78;
         const DISPATCH: u32 = 2;
         // Another host list, or this one after its reset ([`windows`]).
         if list.first_use(BATCH_USE) {
@@ -4452,6 +4466,36 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
+        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        Some((scratch, at))
+    }
+
+    /// As [`State::batched`], for an execution that is one of a run made one
+    /// (`VICTORY_INDIRECT_FOLD`): a job of its own, with a place that
+    /// is one [`SLOT`] after the job before it.
+    fn batched_unique(
+        &mut self,
+        list: &HostList,
+        args: &std::sync::Arc<crate::shadow::Shadow>,
+        arguments: u64,
+        kind: u32,
+    ) -> Option<(ID3D12Resource, u64)> {
+        // Another host list, or this one after its reset ([`windows`]).
+        if list.first_use(BATCH_USE) {
+            self.batch = None;
+        }
+        self.synced();
+        let (id, offset) = (args.id(), args.offset(arguments));
+        if let Some(b) = &mut self.batch
+            && let Some(at) = b.table.place_unique(id, offset, kind)
+        {
+            return Some((b.scratch.clone(), at));
+        }
+        self.batch = None;
+        let (mut table, scratch) = crate::indirect::open_batch(list, (id, &args.buffer), &argument_copies(args))?;
+        self.host_pipeline = 0;
+        self.host_roots[1] = 0;
+        let at = table.place_unique(id, offset, kind)?;
         self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
         Some((scratch, at))
     }
@@ -4552,13 +4596,30 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
+        // The call that begins a run of executions made one, or joins it
+        // (`VICTORY_INDIRECT_FOLD`, [`fold`]).
+        let mut folding = !matches!(self.fold, fold::Mode::Off)
+            && self.fold_step(list, p, (kind, stride), max == 1 && count.is_none() && fold::eligible(p, kind));
         // One record without a count: clamped in a batch (`batches`).
         let batch = if batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
-            self.batched(list, &args, arguments, kind)
+            if folding {
+                self.batched_unique(list, &args, arguments, kind)
+            } else {
+                self.batched(list, &args, arguments, kind)
+            }
         } else {
             None
         };
+        if folding {
+            match &batch {
+                Some((scratch, at)) => folding = self.fold_placed(list, scratch, *at),
+                None => {
+                    self.fold_end(list);
+                    folding = false;
+                }
+            }
+        }
         if batch.is_some() {
             self.window = None;
         }
@@ -4649,6 +4710,19 @@ impl State {
             DISPATCH => self.bind(list, p, true),
             _ => false,
         };
+        if folding {
+            // It joins the run, or ends it: the host list is told of the
+            // run when it is over, not of this call.
+            self.fold_after(list, ran);
+            if !ran {
+                why("prepare failed");
+                return false;
+            }
+            #[cfg(feature = "diagnostics")]
+            list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if !ran {
             why("prepare failed");
             return false;

@@ -16,10 +16,13 @@ use crate::{ShaderError, io, ir, resource, structure};
 /// A console wave64 program of 64 threads of the shape of a tile list's generation: a loop in
 /// which lane `n` goes round `(n & 7) + 1` times and leaves it when its own count is through (the
 /// mask of the lanes still in it, `s[12:13]`, loses the lanes that are through; the loop ends
-/// when it is empty, `s_cbranch_scc1` on the `s_andn2_b64` result), then, with every lane back,
-/// the count of the wave's lanes (`s_bcnt1_i32_b64 exec`) and each lane's rank among them
-/// (`v_mbcnt`), which the lanes store: lane `n` stores `n`, and the count, 64, at `n + 64`.
-const TILE_COUNT_LOOP: [u32; 25] = [
+/// when it is empty, `s_cbranch_scc1` on the `s_andn2_b64` result), then, with every lane back, the
+/// console's wave-wide slot allocation: the rank of each lane among the wave's lanes (`v_mbcnt`),
+/// the count of them (`s_bcnt1_i32_b64 exec`) added to a counter by the first lane alone
+/// (`s_ff1_i32_b64`, `buffer_atomic_add` with the old value returned), that old value read from
+/// the first lane (`v_readfirstlane_b32`) and added to each lane's rank. Each lane stores its
+/// slot at `1 + n` and the counter ends at 64: the slots are `n`, each given once.
+const TILE_SLOT_LOOP: [u32; 40] = [
     0x3602_0087, // v_and_b32 v1, 7, v0
     0x4A02_0281, // v_add_nc_u32 v1, 1, v1
     0x7E04_0280, // v_mov_b32 v2, 0
@@ -34,17 +37,31 @@ const TILE_COUNT_LOOP: [u32; 25] = [
     0x8A8C_7E0C, // s_andn2_b64 s[12:13], s[12:13], exec
     0xBF85_FFF9, // s_cbranch_scc1 L
     0xBEFE_0402, // s_mov_b64 exec, s[2:3]
-    0xBE96_107E, // s_bcnt1_i32_b64 s22, exec
     0xD765_0005, // v_mbcnt_lo_u32_b32 v5, -1, 0
     0x0001_00C1,
+    0xBE82_047E, // s_mov_b64 s[2:3], exec
+    0xBE8E_147E, // s_ff1_i32_b64 s14, exec
+    0xBE8C_047E, // s_mov_b64 s[12:13], exec
     0xD766_0006, // v_mbcnt_hi_u32_b32 v6, -1, v5
     0x0002_0AC1,
-    0x7E0E_0216, // v_mov_b32 v7, s22
+    0x7E0A_0280, // v_mov_b32 v5, 0
+    0x7D24_0C0E, // v_cmpx_eq_i32 exec, s14, v6
+    0xBF88_0005, // s_cbranch_execz SKIP
+    0xBE82_1002, // s_bcnt1_i32_b64 s2, s[2:3]
+    0x7E0A_0202, // v_mov_b32 v5, s2
+    0xE0C8_4000, // buffer_atomic_add v5, v0, s[8:11], 0 glc
+    0x8002_0500,
+    0xBEFE_040C, // SKIP: s_mov_b64 exec, s[12:13]
+    0xD765_0006, // v_mbcnt_lo_u32_b32 v6, exec_lo, 0
+    0x0001_007E,
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x7E04_0505, // v_readfirstlane_b32 s2, v5
+    0xD766_0005, // v_mbcnt_hi_u32_b32 v5, exec_hi, v6
+    0x0002_0C7F,
+    0x4A0A_0A02, // v_add_nc_u32 v5, s2, v5
     0x3408_0082, // v_lshlrev_b32 v4, 2, v0
-    0xE070_1000, // buffer_store_dword v6, v4, s[8:11], 0 offen
-    0x8002_0604,
-    0xE070_1100, // buffer_store_dword v7, v4, s[8:11], 0 offen offset:256
-    0x8002_0704,
+    0xE070_1004, // buffer_store_dword v5, v4, s[8:11], 0 offen offset:4
+    0x8002_0504,
 ];
 
 /// What each of the 128 words of the program's output holds after a dispatch on the host GPU
@@ -69,9 +86,9 @@ fn on_the_card(shader: &HostShader) -> Option<Vec<u32>> {
     Some(out[0].to_vec())
 }
 
-/// What the lanes of `TILE_COUNT_LOOP` store when every lane is back after the loop.
-fn tile_count_expected() -> Vec<u32> {
-    (0..64).chain(std::iter::repeat_n(64, 64)).collect()
+/// What `TILE_SLOT_LOOP` leaves in the output: the counter, 64, then each lane's slot, its own number.
+fn tile_slots_expected() -> Vec<u32> {
+    std::iter::once(64).chain(0..64).chain(std::iter::repeat_n(0, 63)).collect()
 }
 
 /// `native` for a host of 32-lane waves through `emit_program` (the form cascade is not
@@ -106,11 +123,11 @@ fn emitted_wide(
     result.map(|(shader, _)| shader)
 }
 
-/// The branches that leave the loop of `TILE_COUNT_LOOP` are the ones a host wave takes together, and
+/// The branches that leave the loop of `TILE_SLOT_LOOP` are the ones a host wave takes together, and
 /// only those: the structure with them keeps their `when` and names them in `host_wide`.
 #[test]
 fn the_branches_that_leave_a_loop_are_found_and_taken_by_each_host_wave() {
-    let native = native_of(&TILE_COUNT_LOOP, true, 64);
+    let native = native_of(&TILE_SLOT_LOOP, true, 64);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     assert!(st.host_wide.is_empty(), "no branch is the host wave's before the retry");
@@ -131,7 +148,7 @@ fn the_branches_that_leave_a_loop_are_found_and_taken_by_each_host_wave() {
 /// when set; both translations validate.
 #[test]
 fn the_loops_wave_switch_changes_the_translation_only_when_set() {
-    let native = native_of(&TILE_COUNT_LOOP, true, 64);
+    let native = native_of(&TILE_SLOT_LOOP, true, 64);
     let off = emitted(&native, None, false);
     let on = emitted(&native, Some(1), false);
     eprintln!(
@@ -150,19 +167,19 @@ fn the_loops_wave_switch_changes_the_translation_only_when_set() {
     assert_eq!(on.dxil, emitted(&native, Some(2), false).expect("lowered").dxil);
 }
 
-/// On the host GPU: what the lanes of `TILE_COUNT_LOOP` store without and with the loops taken by
+/// On the host GPU: what the lanes of `TILE_SLOT_LOOP` store without and with the loops taken by
 /// each host wave together (printed: the card decides whether the lanes that left the loop early
 /// run on before the others and count themselves as a part of the wave; the one with the switch
 /// must be right).
 #[test]
 fn the_lanes_behind_a_loop_see_the_whole_wave() {
-    let native = native_of(&TILE_COUNT_LOOP, true, 64);
+    let native = native_of(&TILE_SLOT_LOOP, true, 64);
     let Ok(off) = emitted(&native, None, false) else { return };
     let Ok(on) = emitted(&native, Some(1), false) else { return };
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Some(before) = on_the_card(&off) else { return };
     let Some(after) = on_the_card(&on) else { return };
-    let expected = tile_count_expected();
+    let expected = tile_slots_expected();
     let right = |lanes: &[u32]| lanes.iter().zip(&expected).filter(|(a, b)| a == b).count();
     eprintln!("words as the console has them (of 128): without the switch {}, with it {}", right(&before), right(&after));
     eprintln!("without: {before:?}");

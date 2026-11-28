@@ -203,17 +203,17 @@ since `integ/validation-3`, warm caches included.)
 - **Blocky hair, intermittent.** Posterised patches on the top of the hair in some processes; in others the hair is
   smooth in every picture. The loop fix thought to cause it (`VICTORY_LOCAL_EXIT=1`) was run in two arms on the RTX
   and did not change it. The cause is not found.
-- **White-out and red bloom.** In some runs a red dot appears on the character's hair, grows to a red glow and then
-  the whole picture goes white about a minute later (5 of 10 runs of the integration 18 family; builds before it
-  showed it now and then too). What is known: the title's temporal anti-aliasing pass ends each output with
-  `v_med3_f32 x,0,65280`, which turns a NaN into black and an infinity into 65280, and the black pixels in the
-  pictures cover exactly the character, so a NaN reaches that pass from the character's own passes (the hair
-  simulation alone is about 700 dispatches a frame; those are the suspects). It happens with the ray-tracing pair on
-  and off, and with `ClearUnorderedAccessView` implemented and not. The tests on the RTX find the comparisons of NaN
-  and infinity exact; the one difference found is the conversion from 32 to 16 bits, which the card truncates where
-  the console rounds to nearest (24 of 144 cases, one step). `VICTORY_F16_NEAREST=2` (also the mixed and packed 16-bit
-  operations) and `VICTORY_F32_FTZ` (the console flushes 32-bit denormals) are being compared in alternating runs; no
-  result yet. Not fixed.
+- **White-out and red bloom: fixed by the 16-bit rounding and the flushed denormals (2026-11-28).** In some runs a red
+  dot appeared on the character's hair, grew to a red glow, and the whole picture went white about a minute later
+  (5 of 10 runs of the integration 18 family). The title's temporal anti-aliasing pass ends each output with
+  `v_med3_f32 x,0,65280`, which turns a NaN into black, and the black pixels covered exactly the character: a NaN
+  reached that pass from the character's own passes (the hair simulation alone is about 700 dispatches a frame). The
+  card truncates the conversion from 32 to 16 bits where the console rounds to nearest. With
+  `VICTORY_F16_NEAREST=2` (also the mixed and packed 16-bit operations) and `VICTORY_F32_FTZ=1`, both on by default
+  since `integ/validation-24`, two processes were clean (12 of 12 pictures out to 5 minutes: no red spot, no white-out)
+  where the two controls whited out. On the card the rounding fix takes the wrong 16-bit results from 4 of 11 cases
+  to none and the flush alone changes nothing measurable, so the rounding is the likely cause. Two processes are few:
+  more runs are pending. `=0` turns each off.
 - **Orange fog in bright rooms** is most likely the empty ray-tracing structure: the title's builder stages are
   dropped, so every ray misses and the sun and sky are visible from inside the buildings. That is a hypothesis; the
   indirect-light stand-in (`VICTORY_AMBIENT`) was ruled out as the cause. `VICTORY_BVH_BUILDER=1` runs the real
@@ -226,11 +226,10 @@ since `integ/validation-3`, warm caches included.)
   An audit found a group barrier behind a divergent branch in 91 of the 116 programs that take the form; that this
   hangs NVIDIA is not proven. The form is off by default (`VICTORY_KEPT_SKIPS_WIDE`). A detector that limits barriers
   and writes a marker instead of hanging is on the branch `fix/hang1` and not in this build.
-- **Colours band on some processes.** The bands are the state of a process: the volume that holds the lighting probes
-  (a grid of 32x16x64 cells) has blocks of zero values past the depth range, which grow with depth in some processes
-  and not in others. The cause is not found; the candidate is the rounding of the 11-bit-float store inside a loop
-  that filters the volume in place (arms with `VICTORY_R11G11B10_AS_F16` and `VICTORY_F16_NEAREST` are queued, with no
-  result yet).
+- **Colours band on some processes: likely fixed by the same two defaults, more runs pending.** The bands were the
+  state of a process: the volume that holds the lighting probes (a grid of 32x16x64 cells) had blocks of zero values
+  past the depth range, which grew with depth in some processes and not in others. With the 16-bit rounding and the
+  flush on, the walls were smooth (no banding) in the two processes tried; that is too few to call it settled.
 - **Cold start of about 21 minutes** on an empty cache (above); the measurement of the two switches meant to shorten
   it is pending.
 - **The ray-tracing pair costs about 10 ms a frame** and is kept for the picture.

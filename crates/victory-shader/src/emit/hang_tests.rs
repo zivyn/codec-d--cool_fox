@@ -215,11 +215,12 @@ fn kept_wide_shapes(mode: Mode) -> Vec<((Over, Body, bool), Module)> {
 }
 
 #[test]
-fn some_shapes_take_the_kept_skips_wave_wide_form() {
+fn the_shapes_with_a_loop_take_the_kept_skips_wave_wide_form_unless_a_half_can_miss_a_barrier() {
     let found = kept_wide_shapes(Mode::Safe);
     let names: Vec<_> = found.iter().map(|f| f.0).collect();
+    // (no loop: the skip is left out; lanes that need different rounds: the audit refuses)
     assert!(
-        names.len() >= 12,
+        names.len() == 8 && names.iter().all(|s| matches!(s.1, Body::Looped | Body::Nested)),
         "the shapes in the kept skips' form: {names:?} (forms: {:?})",
         shapes()
             .into_iter()

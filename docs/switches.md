@@ -514,6 +514,7 @@ translation of shaders.
 | `VICTORY_LIBRARY_LOCK` | off | flag |  |  |  | Serializes pipeline library calls, one at a time. |
 | `VICTORY_LIBRARY_MAP` | on (=0 turns off) | flag |  |  |  | Reads and writes the pipeline library through a file mapping instead of buffers. |
 | `VICTORY_LIBRARY_TRIM` | on (=0 turns off) | flag |  |  |  | Trims the library's mapped pages from the working set once used. |
+| `VICTORY_LIBRARY_STATIC_SAMPLERS` | off | flag |  |  |  | `=1` loads and stores pipelines with static samplers in the pipeline library too (the behaviour up to integ/validation-24: the driver's place table for static samplers is baked into a stored pipeline and differs between processes, so a loaded one may sample through another sampler; ported from the other fork's a6a302ec9). |
 | `VICTORY_LIGHT_REFRESH` | on (=0 turns off) | flag |  |  |  | Skips refreshing view memory that nothing has written since. |
 | `VICTORY_LINES_ASIDE` | on (=0 turns off) | flag |  |  |  | Writes the copy statistics lines on a worker thread; =0 writes them on the present thread. |
 | `VICTORY_LIST_NICE` | off | number |  | live |  | Runs list-translating threads this many priority levels below the guest's; 0 is normal. |

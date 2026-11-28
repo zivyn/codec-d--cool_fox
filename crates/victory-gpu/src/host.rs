@@ -565,6 +565,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    crate::resource::compact_pool();
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -7209,7 +7210,9 @@ impl Host {
     /// A buffer in the card's own memory that the CPU maps, shaders read and
     /// (with `written`) may write. The CPU should only write it: a read of the
     /// mapping crosses the bus a few bytes at a time.
+    #[track_caller]
     pub(crate) fn mapped_card_buffer(&self, size: u64, written: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        let at = std::panic::Location::caller();
         if !self.mapped_card_memory() {
             return None;
         }
@@ -7258,7 +7261,11 @@ impl Host {
                 })
         };
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(()) => {
+                let buffer = buffer?;
+                crate::vram::census::made(&buffer, crate::vram::census::MAPPED, size, at);
+                Some((buffer, data.cast()))
+            }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
                 None
@@ -7268,7 +7275,9 @@ impl Host {
 
     /// A device-local buffer shaders may write (unordered access) and indirect
     /// execution may read, starting in the common state.
+    #[track_caller]
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let at = std::panic::Location::caller();
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {
@@ -7310,6 +7319,7 @@ impl Host {
             Ok(()) => {
                 if let Some(b) = &buffer {
                     crate::vram::prioritize(&self.device, b, size, crate::vram::Class::High);
+                    crate::vram::census::made(b, crate::vram::census::CARD, size, at);
                 }
                 buffer
             }

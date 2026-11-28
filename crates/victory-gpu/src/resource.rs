@@ -2383,6 +2383,78 @@ pub(crate) fn let_go_idle() {
     }
 }
 
+/// Once a second, after [`let_go_idle`] (`VICTORY_POOL_COMPACT=1`): makes
+/// again the host copies that lie in the blocks of textures being emptied
+/// ([`crate::pool::compact_step`]), up to [`crate::pool::compact_bytes`] a
+/// call. Each is taken out of its title texture as [`want_level`] does for a
+/// copy that is replaced (the slots that show it go on showing it, the host
+/// copy is held for the threads that may be about to record its use), its
+/// staging state goes, and the slots at its memory are made due: the next
+/// use makes the copy anew (in a block that stays, with
+/// `VICTORY_POOL_FIT`), the upload fills it from title memory, and the slots
+/// show it once that has run ([`crate::descriptor::host::levels_changed_after`]).
+/// What the title's CPU never wrote is all that is moved: a copy the host
+/// wrote (its contents are on the card alone), one that stands for another
+/// texture's memory ([`alias_of`]), one made level by level, and one that
+/// was not made in a block is left where it is.
+///
+/// The block is empty once every one of its textures has been made again
+/// and let go of by its slots (a second and a half later); one that stays
+/// is given up after a minute.
+#[cfg(windows)]
+pub(crate) fn compact_pool() {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    let Some(victims) = crate::pool::compact_step(crate::host::now_ms()) else {
+        return;
+    };
+    let mut left = crate::pool::compact_bytes();
+    let (mut moved, mut bytes) = (0u64, 0u64);
+    let all = textures();
+    for &at in all.iter() {
+        if left == 0 {
+            break;
+        }
+        // SAFETY: a texture leaves the table before it is freed, under the
+        // lock held here (`Drop for Resource`).
+        let r = unsafe { &*(at as *const Resource) };
+        if !fills(&r.desc) {
+            continue;
+        }
+        let Ok(mut made) = r.host.made.try_lock() else {
+            continue;
+        };
+        let hit = made.as_ref().is_some_and(|(host, _)| {
+            host.tiled.is_none() && host.filled && victims.contains(&(host.texture.as_raw() as usize))
+        });
+        if !hit || crate::texture::host_wrote(at) || alias_of(at as This).is_some() {
+            continue;
+        }
+        // Under the lock, as in `want_level` and `let_go_idle`.
+        crate::texture::unstage(at as This);
+        r.host.wanted.store(u32::MAX, Relaxed);
+        r.host.grown.store(true, Relaxed);
+        let Some(old) = made.take() else {
+            continue;
+        };
+        let size = old.0.bytes;
+        left = left.saturating_sub(size.max(1));
+        moved += 1;
+        bytes += size;
+        REPLACED.lock().unwrap_or_else(|e| e.into_inner()).push((crate::host::moment(), old));
+        drop(made);
+        // The slots at its memory are due from the next frame, as when the
+        // runtime maps memory under them.
+        crate::descriptor::host::remapped(r.data() as usize, footprint(&r.desc).map_or(0, |f| f.size) as usize);
+    }
+    drop(all);
+    if moved > 0 {
+        crate::pool::COMPACTED[1].fetch_add(moved, Relaxed);
+        crate::pool::COMPACTED[4].fetch_add(bytes, Relaxed);
+        crate::host::trail(|| format!("pool compaction: {moved} host copies of textures ({} KiB) made again out of blocks being emptied", bytes >> 10));
+    }
+}
+
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
 #[cfg(windows)]
@@ -2520,6 +2592,37 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
     }
 }
 
+/// Host textures alive that took memory of their own, by what they are, as
+/// a count and the bytes the host gives them: render targets, depth,
+/// unordered access (the colour twins of depth among them), the rest
+/// (textures the title fills, whether they lie in a block or not).
+#[cfg(windows)]
+static ALIVE_KINDS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// [`ALIVE_KINDS`] as (count, bytes) pairs.
+#[cfg(windows)]
+pub(crate) fn alive_kinds() -> [(u64, u64); 4] {
+    use std::sync::atomic::Ordering::Relaxed;
+    std::array::from_fn(|i| (ALIVE_KINDS[2 * i].load(Relaxed), ALIVE_KINDS[2 * i + 1].load(Relaxed)))
+}
+
+/// Which of [`ALIVE_KINDS`] a texture with these host flags is.
+#[cfg(any(windows, test))]
+fn kind_of(flags: u32) -> usize {
+    const TARGET: u32 = 0x1;
+    const DEPTH: u32 = 0x2;
+    const UNORDERED: u32 = 0x4;
+    if flags & DEPTH != 0 {
+        1
+    } else if flags & TARGET != 0 {
+        0
+    } else if flags & UNORDERED != 0 {
+        2
+    } else {
+        3
+    }
+}
+
 #[cfg(windows)]
 impl HostTexture {
     pub(crate) fn flags(&self) -> u32 {
@@ -2533,6 +2636,9 @@ impl HostTexture {
         let flags = unsafe { texture.GetDesc() }.Flags.0 as u32;
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
+        let kind = kind_of(flags);
+        ALIVE_KINDS[2 * kind].fetch_add(1, Relaxed);
+        ALIVE_KINDS[2 * kind + 1].fetch_add(bytes, Relaxed);
         HostTexture {
             texture,
             state: std::sync::atomic::AtomicU32::new(state),
@@ -2580,6 +2686,11 @@ impl Drop for HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
+        if self.tiled.is_none() {
+            let kind = kind_of(self.flags);
+            ALIVE_KINDS[2 * kind].fetch_sub(1, Relaxed);
+            ALIVE_KINDS[2 * kind + 1].fetch_sub(self.bytes, Relaxed);
+        }
         if self.filled {
             KINDS[0].fetch_sub(1, Relaxed);
             KINDS[1].fetch_sub(self.bytes, Relaxed);
@@ -3615,6 +3726,18 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Host textures are told apart for the census by their flags: depth before target before unordered access.
+    #[test]
+    fn host_textures_are_counted_by_what_they_are_for_the_census() {
+        assert_eq!(kind_of(0x1), 0);
+        assert_eq!(kind_of(0x2), 1);
+        assert_eq!(kind_of(0x3), 1, "a depth texture is not a target");
+        assert_eq!(kind_of(0x4), 2);
+        assert_eq!(kind_of(0x5), 0, "a target that shaders write is a target");
+        assert_eq!(kind_of(0x8), 3, "denying shader access makes it no other kind");
+        assert_eq!(kind_of(0), 3);
+    }
 
     #[test]
     fn a8_unorm_is_not_in_the_r8_typeless_family() {

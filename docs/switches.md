@@ -195,6 +195,7 @@ switch is read.
 | `VICTORY_PIPELINE_PREPARE` | off | yes | Begin the next submission refreshes on another thread while the current one is sent. |
 | `VICTORY_PIPELINE_PRIORITY` | on (=0 turns off) | yes | Pipelines the title waits on or touches go first in the queue. |
 | `VICTORY_PIPELINE_WAIT_ADAPT` | off | yes | Let the per-frame pipeline wait budget follow how the waits end. |
+| `VICTORY_PLACED_CONSTANTS` | off | flag |  | live |  | A constant buffer that reads bytes the list's own placed copy wrote is snapshotted on the card instead of filled from the title's ring behind flights (the 22.7 ms flight wait of the lane). Port of k0ma2k15's VIctory-NVIDIA #34. |
 | `VICTORY_PLACED_ORDER` | off | no | Order placed copies by where they stand in title memory. |
 | `VICTORY_PRECISE_BARRIERS` | off | yes | Hold the title UAV waits as precise barriers. |
 | `VICTORY_PRECISE_LOOK` | off | yes | Make and keep precise write ranges beside the declarations. |

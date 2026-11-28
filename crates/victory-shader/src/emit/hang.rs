@@ -116,6 +116,11 @@ pub(super) fn reporting() -> bool {
     printing() > 0
 }
 
+/// Forgets the last audit (a program starts).
+pub(super) fn forget() {
+    LAST.take();
+}
+
 /// Audits the modules this thread finishes from now on (and forgets the last audit), until
 /// [`stop_auditing`].
 pub(super) fn audit_from_now_on() {

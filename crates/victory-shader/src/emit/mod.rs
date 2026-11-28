@@ -759,6 +759,9 @@ fn emit_forms(
     res: &resource::Resources,
 ) -> (Result<HostShader, ShaderError>, Form) {
     let mut form = Form::Original;
+    if hang::reporting() {
+        hang::forget();
+    }
     let result = emit_forms_in(c, native, p, st, io, res, &mut form, false);
     if result.is_err() {
         form = Form::Refused;

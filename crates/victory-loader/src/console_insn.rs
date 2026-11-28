@@ -132,7 +132,7 @@ fn note_wait_site(at: usize) {
 
 /// The wait instruction `rip` is in the loop of, if one: a loop that spins on `mwaitx` (`pause` in its place) is some
 /// 40 bytes around it.
-#[cfg(feature = "diagnostics")]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn wait_site_near(rip: usize) -> Option<usize> {
     use std::sync::atomic::Ordering::Relaxed;
     WAIT_SITES.iter().map(|s| s.load(Relaxed)).find(|&at| at != 0 && rip + 64 >= at && rip <= at + 16)
@@ -745,7 +745,6 @@ mod tests {
     }
 
     /// A place is remembered once, however often it faults, and a loop around it is found from any of its bytes.
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn a_place_that_faulted_is_found_from_the_loop_around_it() {
         note_wait_site(0x7ff6_1234_5000);

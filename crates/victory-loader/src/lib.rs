@@ -31,9 +31,12 @@ pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
-#[cfg(all(windows, feature = "diagnostics"))]
+// (The code of these two is built, and its tests run, in every build; only the threads that use them are diagnostics.)
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 mod spinsample;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 mod stacks;
 #[cfg(windows)]
 mod threads;

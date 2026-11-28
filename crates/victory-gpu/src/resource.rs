@@ -541,6 +541,8 @@ fn twin_texture(
         return None;
     };
     let _ = crate::host::resident(&host.device, &texture);
+    // Written and read by the frame's depth passes: the last the system moves (`VICTORY_VRAM_HOLD`).
+    crate::vram::prioritize_resource(&host.device, &texture, crate::vram::Class::Max);
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -602,6 +604,7 @@ fn twin_texture(
         }
         texture.map(|texture| {
             let _ = crate::host::resident(&host.device, &texture);
+            crate::vram::prioritize_resource(&host.device, &texture, crate::vram::Class::Max);
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1812,7 +1815,11 @@ fn headroom(memory: Option<[u64; 4]>) -> i64 {
         // used.
         Some([budget, used, ..]) => {
             let line = budget / 100 * room_percent();
-            i64::try_from(line).unwrap_or(i64::MAX).saturating_sub(i64::try_from(card_use(used)).unwrap_or(i64::MAX))
+            let net =
+                i64::try_from(line).unwrap_or(i64::MAX).saturating_sub(i64::try_from(card_use(used)).unwrap_or(i64::MAX));
+            // The free parts of the blocks and heaps count as room above; the card's whole use may not stand
+            // past its budget by more than `VICTORY_VRAM_OVER_MB` (`VICTORY_VRAM_HOLD`).
+            net.min(crate::vram::gross_room(budget, used))
         }
         None if filled < WITHOUT_BUDGET => i64::MAX,
         None => i64::MIN,
@@ -2792,6 +2799,16 @@ fn host_texture_as(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        // Render targets and depth are written and read by every frame; the other textures made whole
+        // are read by it (`VICTORY_VRAM_HOLD`; a reserved texture's memory is the heaps of tiles').
+        if !reserved {
+            let class = if d.flags & (TARGET | DEPTH) != 0 {
+                crate::vram::Class::Max
+            } else {
+                crate::vram::Class::High
+            };
+            crate::vram::prioritize_resource(&host.device, t, class);
+        }
     }
     texture
 }

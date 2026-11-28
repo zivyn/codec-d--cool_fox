@@ -55,6 +55,10 @@
 //!   cannot wait for each other. The switch may flip at any submission: the
 //!   queues and the sequencer stay, and the first submission after a flip to
 //!   serial waits for what the overlap left in the air.
+//! - The landing thread's fetch of pieces of the card's copies ([`fetching`]) is ordered against the compute queue too:
+//!   it waits for the submissions of Q2 in the air that write what it reads, and the submissions of Q2 that come
+//!   after it and write it wait for it. With one queue the fetch sat in the queue's order; with two it would read a
+//!   copy while a dispatch of Q2 wrote it and merge the half-written bytes into title memory.
 //! - Not with stage A's thread (`front`): it prepares a submission's card steps
 //!   before the queue is known.
 
@@ -240,11 +244,64 @@ pub(super) struct Book {
     /// By title lane: number, queue and value of the submissions the title's
     /// waits may name.
     planned: [VecDeque<(u64, usize, u64)>; 2],
+    /// The fetches of pieces of the card's copies not known to be done ([`Book::fetching`]).
+    fetches: Vec<Fetch>,
     stats: Stats,
+}
+
+/// A fence of the host's, held in the book.
+struct Held(ID3D12Fence);
+
+// SAFETY: D3D12 fences are free-threaded.
+unsafe impl Send for Held {}
+
+/// A fetch of pieces of the card's copies: what it reads (whole copies), and the value its fence is signalled with
+/// behind it.
+struct Fetch {
+    reads: Footprint,
+    fence: Held,
+    value: u64,
+}
+
+impl Fetch {
+    fn done(&self) -> bool {
+        // SAFETY: a plain query of a fence of ours.
+        unsafe { self.fence.0.GetCompletedValue() >= self.value }
+    }
 }
 
 /// The most submissions the title's waits may name back.
 const PLANNED: usize = 512;
+
+impl Book {
+    /// A fetch of pieces of the copies `copies` (numbers, whole) is about to be given to a queue, with `value`
+    /// as the signal of its `fence` behind it. Returns the value of Q2's fence it must wait for, 0 for none: the
+    /// newest submission of Q2 in the air (`completed`: what Q2's fence reports now) that writes any of them, or
+    /// may write anywhere. And the fetch is noted from here until its fence reaches `value`: a submission of Q2
+    /// that comes after and writes what it reads waits for it ([`Book::fetches_for`]). Both are done under the
+    /// one lock, so a submission and a fetch that meet are ordered one way or the other.
+    pub(super) fn fetching(&mut self, copies: &[u64], completed: u64, fence: &ID3D12Fence, value: u64) -> u64 {
+        let mut reads = Footprint::default();
+        for &id in copies {
+            reads.card_read(id, 0, u32::MAX);
+        }
+        let reads = reads.sealed();
+        let want = self.flying[1]
+            .iter()
+            .rev()
+            .find(|(v, other)| *v > completed && reads.conflicts(other))
+            .map_or(0, |(v, _)| *v);
+        self.fetches.retain(|f| !f.done());
+        self.fetches.push(Fetch { reads, fence: Held(fence.clone()), value });
+        want
+    }
+
+    /// The fetches not done yet that a submission with the footprint `fp` must wait for: (fence, value).
+    pub(super) fn fetches_for(&mut self, fp: &Footprint) -> Vec<(ID3D12Fence, u64)> {
+        self.fetches.retain(|f| !f.done());
+        self.fetches.iter().filter(|f| fp.conflicts(&f.reads)).map(|f| (f.fence.0.clone(), f.value)).collect()
+    }
+}
 
 impl Book {
     /// What a submission that goes to queue `target` (0 or 1), of title lane
@@ -318,10 +375,26 @@ impl Book {
         want
     }
 
+    /// A submission of queue `target` is about to be given to its queue with `value` as its signal: it counts as in
+    /// the air from here on, for the fetches that look at what is ([`Book::fetching`]) and for the next
+    /// submission's waits. (The signal follows under the lock that numbers them: [`Book::sent`] finds it here.)
+    pub(super) fn announce(&mut self, target: usize, value: u64, fp: &Footprint) {
+        self.note(target, value, fp.clone());
+    }
+
+    /// `value` is in the air on `target` with `fp`: once (a value a submission announced and did not send, because
+    /// it did not go after all, is taken again by the next one).
+    fn note(&mut self, target: usize, value: u64, fp: Footprint) {
+        match self.flying[target].iter_mut().rev().find(|(v, _)| *v == value) {
+            Some(entry) => entry.1 = fp,
+            None => self.flying[target].push((value, fp)),
+        }
+    }
+
     /// A submission went to queue `target` with `value` as its signal.
     pub(super) fn sent(&mut self, target: usize, title: usize, value: u64, fp: Footprint) {
         self.signalled[target] = self.signalled[target].max(value);
-        self.flying[target].push((value, fp));
+        self.note(target, value, fp);
         self.last[title] = Some((target, value));
         self.stats.sent[target] += 1;
     }
@@ -516,12 +589,15 @@ pub(super) struct Route {
     /// What the lists' preludes ask of Q1 ahead of the submission.
     hand: Vec<D3D12_RESOURCE_BARRIER>,
     waited: bool,
+    /// The value the submission's signal will have (the host's number).
+    value: u64,
 }
 
 impl Route {
-    /// For a submission of `runs`: `None` without the switch (or without what it needs): the submission
-    /// goes as it always did. With it every submission has a route: its lists' type says its queue.
-    pub(super) fn begin(host: &Host, runs: &[&HostList]) -> Option<Route> {
+    /// For a submission of `runs` whose signal will be `value`: `None` without the switch (or without what it
+    /// needs): the submission goes as it always did. With it every submission has a route: its lists' type says
+    /// its queue.
+    pub(super) fn begin(host: &Host, runs: &[&HostList], value: u64) -> Option<Route> {
         if !lists_compute() {
             return None;
         }
@@ -548,6 +624,7 @@ impl Route {
             fp: steps_footprint(runs),
             hand: Vec::new(),
             waited: false,
+            value,
         })
     }
 
@@ -647,6 +724,20 @@ impl Route {
                 ));
             }
         }
+        if self.target == 1 {
+            // In the air from here (after the hand-off: a fetch that waits for this submission is queued behind
+            // every wait this one made on Q1), and behind the fetches of the card's copies it would write.
+            let fetches = book(|b| {
+                b.announce(1, self.value, &self.fp);
+                b.fetches_for(&self.fp)
+            });
+            for (fence, value) in fetches {
+                // SAFETY: our queue; a fence of a fetch that signals it behind its list.
+                if let Err(e) = unsafe { queue.Wait(&fence, value) } {
+                    fail(format_args!("the compute queue could not be told to wait for a fetch ({e})"));
+                }
+            }
+        }
     }
 
     /// Behind the submission's lists: the queue's fence takes the
@@ -670,6 +761,22 @@ impl Route {
         book(|b| b.sent(self.target, self.title, value, fp));
         Ok(())
     }
+}
+
+/// For the landing thread's fetch of pieces of the card's copies ([`Host::relay_card_back`]): `copies` are the
+/// numbers of the copies it reads, `fence` the fetch's own, signalled with `value` behind its list. Returns the
+/// fence of Q2 and the value the queue that runs the fetch must wait for before its list, or `None`: nothing of Q2
+/// in the air writes them (or there is no Q2, the switch is off). From here on the submissions of Q2 that write the
+/// copies wait for `fence` to reach `value`.
+pub(super) fn fetching(host: &Host, copies: &[u64], fence: &ID3D12Fence, value: u64) -> Option<(&'static ID3D12Fence, u64)> {
+    if !lists_compute() {
+        return None;
+    }
+    let lanes = lanes(host)?;
+    // SAFETY: a plain query of a fence of ours.
+    let completed = unsafe { lanes.fences[1].GetCompletedValue() };
+    let want = book(|b| b.fetching(copies, completed, fence, value));
+    (want > 0).then_some((&lanes.fences[1], want))
 }
 
 /// Moves textures out of the states of drawing on Q1, in a list of its own,
@@ -843,6 +950,21 @@ mod model_tests {
                 .any(|x| b.iter().any(|y| x.0 == y.0 && x.1 < y.2 && y.1 < x.2));
             assert_eq!(overlaps(&a, &b), brute, "{a:?} {b:?}");
         }
+    }
+
+    /// A submission announced before it is given to its queue is in the air once, announced or sent, and the next
+    /// submission's waits see it from the announcement.
+    #[test]
+    fn a_submission_announced_and_then_sent_is_in_the_air_once() {
+        let mut b = Book::default();
+        let written = fp(&[], &[(0, 10)]);
+        b.announce(1, 5, &written);
+        b.announce(1, 5, &written);
+        assert_eq!((b.flying[1].len(), b.signalled[1]), (1, 0), "in the air, not signalled yet");
+        // A submission of the other queue that shares bytes with it waits for it.
+        assert_eq!(b.waits_for(0, 0, &[], &fp(&[(5, 6)], &[]), [0, 0], false), 5);
+        b.sent(1, 1, 5, written);
+        assert_eq!((b.flying[1].len(), b.signalled[1]), (1, 5));
     }
 
     #[test]

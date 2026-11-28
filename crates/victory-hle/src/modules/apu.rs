@@ -356,19 +356,21 @@ fn process(
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
+    let applied = pitcher.is_some();
     // A packet's room is 46 KB of floats: the thread's own, kept for the
     // next, not made and zeroed for each (`VICTORY_STREAM_REUSE=0`: as
     // before).
     with_pcm(MAX_FRAMES * channels, |pcm| {
         decode_packet(decoder, packet, options, command, result, pcm, pitcher)
     });
-    // The pitch (the console's rate conversion) is not applied: counted, and
-    // the first few are logged, to see whether a title uses it.
+    // The pitch (the console's rate conversion) is counted, and without
+    // `VICTORY_OPUS_PITCH` (not applied) the first few are logged, to see
+    // whether a title uses it.
     let (ramp, target) = (command.pitch_ramp, command.target_pitch);
     let pitched = ramp != 0.0 || target != 1.0;
     COUNTERS.opus_packet(result.error != S_OK, pitched);
     static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if pitched && LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+    if pitched && !applied && LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
         tracing::info!(ramp, target, "audio decoder: a pitch that is not applied");
     }
 }

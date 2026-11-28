@@ -1,6 +1,8 @@
 //! The CPU census: where the process's processor time goes, by thread group, every 5 seconds (a line
-//! of the frame-rate meter, always on; one snapshot of the process's threads and a few calls for each,
-//! tens of microseconds in all).
+//! of the frame-rate meter, always on). The process's own threads are walked with `NtGetNextThread` (a handle
+//! each, a few calls for each thread); the snapshot of every thread of the system that the toolhelp calls take
+//! (thousands of them) is only the way out if that call is not there. The line says what the walk took, and a
+//! walk that takes long is done less often ([`SLOW_MS`]).
 //!
 //! The role line before it ([`super::line`]) counts only the threads that said what they are (the
 //! submitting thread, the pools, the relay): 250 of the ~850 ms of processor time a frame took at the
@@ -17,14 +19,40 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows_sys::Wdk::System::Threading::{NtQueryInformationThread, ThreadQuerySetWin32StartAddress};
-use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
 use windows_sys::Win32::System::LibraryLoader::{
-    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleExW,
+    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW, GetModuleHandleA,
+    GetModuleHandleExW, GetProcAddress,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, GetThreadDescription, GetThreadTimes, OpenThread, THREAD_QUERY_INFORMATION,
+    GetCurrentProcess, GetCurrentProcessId, GetProcessTimes, GetThreadDescription, GetThreadId, GetThreadTimes, OpenThread,
+    THREAD_QUERY_INFORMATION,
 };
+
+/// `NtGetNextThread(process, thread, access, attributes, flags, &next)`: the next thread of `process` after `thread`
+/// (null: the first), as a handle opened with `access`; an NTSTATUS, `STATUS_NO_MORE_ENTRIES` after the last.
+type GetNextThread = unsafe extern "system" fn(HANDLE, HANDLE, u32, u32, u32, *mut HANDLE) -> i32;
+
+/// The call, if this system has it (looked up, not linked: a system without it still starts).
+fn get_next_thread() -> Option<GetNextThread> {
+    static CALL: std::sync::OnceLock<Option<GetNextThread>> = std::sync::OnceLock::new();
+    *CALL.get_or_init(|| {
+        // SAFETY: plain lookups of a module every process has; the function has the signature above.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            if ntdll.is_null() {
+                return None;
+            }
+            GetProcAddress(ntdll, c"NtGetNextThread".as_ptr().cast())
+                .map(|f| std::mem::transmute::<unsafe extern "system" fn() -> isize, GetNextThread>(f))
+        }
+    })
+}
+
+/// A walk that takes longer than this (ms) makes the next lines wait, one more for each time it is over: the census
+/// is a diagnostic and does not cost the frame more than a few ms in all.
+const SLOW_MS: f64 = 2.0;
 
 /// Whose a thread is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -125,6 +153,8 @@ struct State {
     process: (u64, u64),
     frame: u64,
     at: std::time::Instant,
+    /// Lines still to leave out, after a walk that took long ([`SLOW_MS`]).
+    skip: u32,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -175,10 +205,47 @@ fn exe_name() -> &'static str {
 /// Every thread of the process, with what it has run.
 fn snapshot(known: &mut HashMap<u32, (String, Kind)>) -> Vec<Row> {
     let mut rows = Vec::new();
+    if !walk(known, &mut rows) {
+        rows.clear();
+        toolhelp(known, &mut rows);
+    }
+    rows
+}
+
+/// The threads of this process, one handle after the other (`NtGetNextThread`); false if the call is not there or
+/// gives none (then the toolhelp snapshot does it).
+fn walk(known: &mut HashMap<u32, (String, Kind)>, rows: &mut Vec<Row>) -> bool {
+    let Some(next_thread) = get_next_thread() else {
+        return false;
+    };
+    // SAFETY: the pseudo handle of this process.
+    let process = unsafe { GetCurrentProcess() };
+    let mut last: HANDLE = std::ptr::null_mut();
+    loop {
+        let mut next: HANDLE = std::ptr::null_mut();
+        // SAFETY: `last` is null or a thread handle of ours from the call before; `next` is written by the call.
+        let status = unsafe { next_thread(process, last, THREAD_QUERY_INFORMATION, 0, 0, &mut next) };
+        if !last.is_null() {
+            // SAFETY: opened by the call before.
+            unsafe { CloseHandle(last) };
+        }
+        if status < 0 || next.is_null() {
+            // The end of the threads, or no walk at all (not one thread seen).
+            return !rows.is_empty();
+        }
+        // SAFETY: a thread handle of ours with query access.
+        let tid = unsafe { GetThreadId(next) };
+        read(next, tid, known, rows);
+        last = next;
+    }
+}
+
+/// Every thread of the system listed, ours picked out: what there is when `NtGetNextThread` is not.
+fn toolhelp(known: &mut HashMap<u32, (String, Kind)>, rows: &mut Vec<Row>) {
     // SAFETY: a snapshot of this process's threads, closed below.
     let (process, snap) = unsafe { (GetCurrentProcessId(), CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)) };
     if snap == INVALID_HANDLE_VALUE {
-        return rows;
+        return;
     }
     // SAFETY: zeroed is a valid THREADENTRY32; its size is set before use.
     let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
@@ -191,47 +258,9 @@ fn snapshot(known: &mut HashMap<u32, (String, Kind)>) -> Vec<Row> {
             // SAFETY: a thread of this process, opened for reading and closed.
             let thread = unsafe { OpenThread(THREAD_QUERY_INFORMATION, 0, tid) };
             if !thread.is_null() {
-                let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-                let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-                // SAFETY: plain out structures.
-                let ok = unsafe { GetThreadTimes(thread, &mut created, &mut exited, &mut kernel, &mut user) } != 0;
-                let mut name = String::new();
-                let mut text = std::ptr::null_mut();
-                // SAFETY: the system allocates the string; it is freed below.
-                unsafe {
-                    if GetThreadDescription(thread, &mut text) >= 0 && !text.is_null() {
-                        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-                        name = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-                        LocalFree(text.cast());
-                    }
-                }
-                let (group, kind) = match known.get(&tid) {
-                    Some(g) => g.clone(),
-                    None => {
-                        let mut start = 0usize;
-                        // SAFETY: writes one pointer-sized start address.
-                        unsafe {
-                            NtQueryInformationThread(
-                                thread,
-                                ThreadQuerySetWin32StartAddress,
-                                (&raw mut start).cast(),
-                                size_of::<usize>() as u32,
-                                std::ptr::null_mut(),
-                            )
-                        };
-                        let found = group_of(&name, &module_of(start), exe_name());
-                        // A thread of ours that has no name yet is looked at again at the next line.
-                        if !(found.1 == Kind::Ours && name.is_empty()) {
-                            known.insert(tid, found.clone());
-                        }
-                        found
-                    }
-                };
+                read(thread, tid, known, rows);
                 // SAFETY: opened above.
                 unsafe { CloseHandle(thread) };
-                if ok {
-                    rows.push(Row { tid, group, name, kind, user: ticks(user), kernel: ticks(kernel) });
-                }
             }
         }
         // SAFETY: as above.
@@ -239,7 +268,49 @@ fn snapshot(known: &mut HashMap<u32, (String, Kind)>) -> Vec<Row> {
     }
     // SAFETY: opened above.
     unsafe { CloseHandle(snap) };
-    rows
+}
+
+/// What thread `tid` (open as `thread`) has run, and what it is called, as a row.
+fn read(thread: HANDLE, tid: u32, known: &mut HashMap<u32, (String, Kind)>, rows: &mut Vec<Row>) {
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: plain out structures.
+    let ok = unsafe { GetThreadTimes(thread, &mut created, &mut exited, &mut kernel, &mut user) } != 0;
+    let mut name = String::new();
+    let mut text = std::ptr::null_mut();
+    // SAFETY: the system allocates the string; it is freed below.
+    unsafe {
+        if GetThreadDescription(thread, &mut text) >= 0 && !text.is_null() {
+            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
+            name = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
+            LocalFree(text.cast());
+        }
+    }
+    let (group, kind) = match known.get(&tid) {
+        Some(g) => g.clone(),
+        None => {
+            let mut start = 0usize;
+            // SAFETY: writes one pointer-sized start address.
+            unsafe {
+                NtQueryInformationThread(
+                    thread,
+                    ThreadQuerySetWin32StartAddress,
+                    (&raw mut start).cast(),
+                    size_of::<usize>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            let found = group_of(&name, &module_of(start), exe_name());
+            // A thread of ours that has no name yet is looked at again at the next line.
+            if !(found.1 == Kind::Ours && name.is_empty()) {
+                known.insert(tid, found.clone());
+            }
+            found
+        }
+    };
+    if ok {
+        rows.push(Row { tid, group, name, kind, user: ticks(user), kernel: ticks(kernel) });
+    }
 }
 
 /// The text of the first line for `groups` over `frames` frames in `wall_ms`, `process` being the ms of user and
@@ -300,6 +371,12 @@ fn busiest(now: &[Row], last: &HashMap<u32, (u64, u64)>, wall_ms: f64) -> String
         .join(", ")
 }
 
+/// How many lines to leave out after a walk of the threads that took `ms`: none up to [`SLOW_MS`], then one more for
+/// each time it is over, at most 8.
+fn skipped_after(ms: f64) -> u32 {
+    if ms <= SLOW_MS { 0 } else { ((ms / SLOW_MS) as u32).min(8) }
+}
+
 /// The census lines, with the numbers since the line before.
 pub(crate) fn line() {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -309,8 +386,16 @@ pub(crate) fn line() {
         process: (0, 0),
         frame: 0,
         at: std::time::Instant::now(),
+        skip: 0,
     });
+    if state.skip > 0 {
+        state.skip -= 1;
+        return;
+    }
+    let walking = std::time::Instant::now();
     let rows = snapshot(&mut state.known);
+    let took = walking.elapsed().as_secs_f64() * 1e3;
+    state.skip = skipped_after(took);
     let process = process_times();
     let frame = crate::frame::current();
     let wall = state.at.elapsed().as_secs_f64() * 1e3;
@@ -328,7 +413,11 @@ pub(crate) fn line() {
     let spent = (process.0.saturating_sub(was_process.0) as f64 / 1e4, process.1.saturating_sub(was_process.1) as f64 / 1e4);
     let logical = std::thread::available_parallelism().map_or(0, |n| n.get());
     tracing::info!("{}", text(&by, spent, frames, wall, logical));
-    tracing::info!("CPU census, the busiest threads (thread, name, cores over the interval): {}", busiest(&rows, &was, wall));
+    tracing::info!(
+        "CPU census, the busiest threads (thread, name, cores over the interval; the census itself took {took:.2} ms for {} threads): {}",
+        rows.len(),
+        busiest(&rows, &was, wall)
+    );
 }
 
 #[cfg(test)]
@@ -420,5 +509,39 @@ mod tests {
         assert_eq!(g.kind, Kind::Ours);
         assert!(g.busiest > 0.3, "the spinner ran {:.2} of a core", g.busiest);
         assert!(g.user_ms > g.kernel_ms);
+    }
+
+    /// The walk of the process's own threads sees what the system's snapshot sees of them: this thread and one that
+    /// is started, with their names; and a slow walk makes the lines wait, a quick one does not.
+    #[test]
+    fn the_walk_of_our_threads_agrees_with_the_snapshot_and_a_slow_one_is_done_less_often() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<u32>();
+        let sleeper = std::thread::Builder::new()
+            .name("victory-census-walk".into())
+            .spawn(move || {
+                // SAFETY: plain query of the calling thread's id.
+                seen_tx.send(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }).unwrap();
+                let _ = rx.recv();
+            })
+            .unwrap();
+        let tid = seen_rx.recv().unwrap();
+        let (mut known, mut walked, mut listed) = (HashMap::new(), Vec::new(), Vec::new());
+        // (This system has the call: the toolhelp snapshot is only the way out.)
+        assert!(walk(&mut known, &mut walked), "no walk of the threads");
+        toolhelp(&mut known, &mut listed);
+        tx.send(()).unwrap();
+        sleeper.join().unwrap();
+        for rows in [&walked, &listed] {
+            let row = rows.iter().find(|r| r.tid == tid).expect("the thread that was started");
+            assert_eq!(row.name, "victory-census-walk");
+            assert_eq!(row.group, "victory-census-walk");
+        }
+        // Every thread the walk saw is one the snapshot saw, but for those that began or ended between the two.
+        let listed_tids: Vec<u32> = listed.iter().map(|r| r.tid).collect();
+        let missing = walked.iter().filter(|r| !listed_tids.contains(&r.tid)).count();
+        assert!(missing <= 2, "{missing} threads of the walk are not in the snapshot");
+        assert_eq!((skipped_after(0.3), skipped_after(2.0)), (0, 0));
+        assert_eq!((skipped_after(5.0), skipped_after(500.0)), (2, 8));
     }
 }

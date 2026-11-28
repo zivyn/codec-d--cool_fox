@@ -1354,10 +1354,31 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
 /// estimate, `victory_formats::texture::Gpu`); `SW_4KB_R_X` and multisampled
 /// ones have no addresses.
 pub(crate) fn detilable(layout: &victory_formats::texture::Layout) -> bool {
+    layout.addressable() && (!layout.desc.swizzle.xor() || xor_upload())
+}
+
+/// `VICTORY_XOR_UPLOAD` is not `0`: the uploads of XOR modes ([`detilable`]).
+pub(crate) fn xor_upload() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    layout.addressable()
-        && (!layout.desc.swizzle.xor()
-            || *ON.get_or_init(|| std::env::var("VICTORY_XOR_UPLOAD").as_deref() != Ok("0")))
+    *ON.get_or_init(|| std::env::var("VICTORY_XOR_UPLOAD").as_deref() != Ok("0"))
+}
+
+/// `VICTORY_XOR_READBACK` is not `0`: the read-back of textures the title reads on the CPU lands in XOR modes too
+/// (`crate::texback`; with `0` they are left as before the XOR addressing, nothing is landed). Symmetric to
+/// [`xor_upload`], so that the pipe and packer count they are laid out by (an estimate) can be taken out of the
+/// water by itself.
+pub(crate) fn xor_readback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| xor_readback_from(std::env::var("VICTORY_XOR_READBACK").ok().as_deref()))
+}
+
+fn xor_readback_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// Whether a read-back lands in a texture of `layout`: any layout, but the XOR modes with the switch off.
+pub(crate) fn lands_back(layout: &victory_formats::texture::Layout, xor: bool) -> bool {
+    xor || !layout.desc.swizzle.xor()
 }
 
 /// The bytes of title memory a placed texture with the resource description
@@ -3592,6 +3613,36 @@ mod tests {
         // Boundaries: 59 belongs to the preceding family, 66 is unmapped.
         assert_eq!(family(59), 53);
         assert_eq!(family(66), 66);
+    }
+
+    /// `VICTORY_XOR_READBACK=0` (and only `0`) leaves the XOR modes out of the read-back, as `VICTORY_XOR_UPLOAD=0`
+    /// leaves them out of the uploads; the modes without XOR are landed either way.
+    #[test]
+    fn the_xor_readback_switch_leaves_out_the_xor_modes_only() {
+        use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+        let layout = |swizzle| {
+            Layout::new(&Desc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            })
+            .expect("a layout")
+        };
+        assert!(xor_readback_from(None));
+        assert!(xor_readback_from(Some("1")));
+        assert!(!xor_readback_from(Some("0")));
+        let (plain, xor) = (layout(Swizzle::SW_64KB_S), layout(Swizzle::SW_64KB_S_X));
+        assert!(!plain.desc.swizzle.xor() && xor.desc.swizzle.xor());
+        for (on, plain_lands, xor_lands) in [(true, true, true), (false, true, false)] {
+            assert_eq!(lands_back(&plain, on), plain_lands);
+            assert_eq!(lands_back(&xor, on), xor_lands);
+        }
     }
 
     type Release = extern "system" fn(This) -> u32;

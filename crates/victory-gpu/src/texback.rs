@@ -116,6 +116,12 @@ impl Target {
         let copy = crate::resource::host_copy(resource)?;
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
+        // (`VICTORY_XOR_READBACK=0`: no copy at all for what would not be landed.)
+        if !crate::resource::lands_back(&layout, crate::resource::xor_readback()) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::info!(swizzle = layout.desc.swizzle.name(), "a texture in a XOR mode is not copied back (VICTORY_XOR_READBACK=0)"));
+            return None;
+        }
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
         let ticket = track(resource as usize, at, end);
         Some(Self { copy, layout, ticket })

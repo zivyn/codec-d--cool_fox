@@ -205,8 +205,10 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn tag_queue(lists: &[This], kind: u32) {
     for &list in lists {
-        if let Some(host) = host_list(list) {
-            host.set_queue_kind(kind);
+        match host_list(list) {
+            Some(host) => host.set_queue_kind(kind),
+            // (A thin list has none: the lists of ours its recording goes to are the ones the card runs.)
+            None => thin::tag_queue(list, kind),
         }
     }
 }

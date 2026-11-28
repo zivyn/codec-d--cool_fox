@@ -441,7 +441,7 @@ impl Host {
         // Or the reads are done on the card, behind the flights.
         // Which queue the submission goes to (`VICTORY_ASYNC_COMPUTE=2`): lists of the compute type to the compute queue,
         // the others to the host's; with it on everything is joined to the host's fence by the sequencer ([`lanes`]).
-        let mut route = lanes::Route::begin(self, runs);
+        let mut route = lanes::Route::begin(self, runs, *submitted + 1);
         let on_compute = route.as_ref().is_some_and(|r| r.compute());
         let own = if late && staged_number.is_none() { self.card_steps(runs, on_compute) } else { None };
         if let (Some(route), Some(own)) = (route.as_mut(), own.as_ref()) {

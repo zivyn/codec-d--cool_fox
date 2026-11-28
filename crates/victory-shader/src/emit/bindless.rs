@@ -154,7 +154,7 @@ impl<'a> Lower<'a> {
     /// `count` dwords from byte `addr` of the buffer the table entry `src` names, as integers, when the
     /// switch is on and the entry is an SRV of a table that is read as raw dwords: through the window
     /// of the entry if the host made one, else through its view. None: not such an entry, nothing
-    /// was emitted, and the caller reads the view as it always did. Goes on in another block.
+    /// was emitted, and the caller reads the view as it always did.
     pub(super) fn window_dwords(
         &mut self,
         site: Site,
@@ -192,48 +192,42 @@ impl<'a> Lower<'a> {
         let (number, start, len) = self.window_of(load, first)?;
         self.bindless.windowed.insert(entry);
         let (zero, k4) = (self.s.m.i32(0), self.s.m.i32(4));
-
-        // The window: the copy's view, at the view's bytes, each dword inside the view's length.
-        let c = self.cur;
-        let there = self.s.m.cmp(c, pred::NE, number, zero);
-        let at = self.begin_guarded(Some(there));
         let c = self.cur;
         let i32t = self.s.t.i32;
+
+        // One read, no branch: the heap slot is the copy's raw view with a window and the entry's view (its raw
+        // twin, as `handle` makes it) without, and the byte is the window's start past the offset.
+        let valid = self.s.m.cmp(c, pred::NE, number, zero);
+        let none = self.s.m.cmp(c, pred::EQ, number, zero);
+        let index = self.heap_index(load, first, false)?;
+        let (index, bounded) = self.raw_twin(src, index, false, (11, 0));
         let base = self.host_word(RootType::Other(USER_WINDOW_BASE), 0, 0);
         let most = self.s.m.i32(WINDOW_COPIES);
         let copy = self
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[number, most]);
         self.s.m.tag(copy, Tag::Clamp);
-        let slot = self.s.m.bin(c, Bin::Add, base, copy);
-        let h = self.s.heap_handle(c, slot, false, true, (11, 0));
-        let from = self.s.m.bin(c, Bin::Add, start, addr);
+        let copy = self.s.m.bin(c, Bin::Add, base, copy);
+        let slot = self.s.m.select(c, valid, copy, index);
+        let h = self
+            .s
+            .heap_handle_at(c, slot, false, true, (11, 0), bounded);
+        let begin = self.s.m.select(c, valid, start, zero);
+        let from = self.s.m.bin(c, Bin::Add, begin, addr);
         let dwords = self.raw_dwords(h, from, count);
-        let mut inside = Vec::with_capacity(dwords.len());
+        let mut out = Vec::with_capacity(dwords.len());
         for (k, x) in dwords.into_iter().enumerate() {
-            let c = self.cur;
             let off = self.s.m.i32(4 * k as u32);
             let a = self.s.m.bin(c, Bin::Add, addr, off);
-            // Whole inside the view: not past its end (`a <= len`, so the difference does not wrap) and at least
-            // four bytes left.
+            // Through a window a dword must lie whole inside the view's length: not past its end (`a <= len`, so
+            // the difference does not wrap) and at least four bytes left. Without one the view bounds the read.
             let before = self.s.m.cmp(c, pred::IULE, a, len);
             let left = self.s.m.bin(c, Bin::Sub, len, a);
             let room = self.s.m.cmp(c, pred::IUGE, left, k4);
-            let ok = self.s.m.bin(c, Bin::And, before, room);
-            let x = self.s.m.select(c, ok, x, zero);
-            inside.push((x, zero));
+            let inside = self.s.m.bin(c, Bin::And, before, room);
+            let fine = self.s.m.bin(c, Bin::Or, inside, none);
+            out.push(self.s.m.select(c, fine, x, zero));
         }
-        let read = self.end_guarded(at, &inside);
-
-        // No window: the view.
-        let c = self.cur;
-        let none = self.s.m.cmp(c, pred::EQ, number, zero);
-        let at = self.begin_guarded(Some(none));
-        self.bindless.fallback = true;
-        let h = self.handle(site, src, false, (11, 0));
-        self.bindless.fallback = false;
-        let dwords = self.raw_dwords(h?, addr, count);
-        let both: Vec<(V, V)> = dwords.into_iter().zip(read).collect();
-        Ok(Some(self.end_guarded(at, &both)))
+        Ok(Some(out))
     }
 }

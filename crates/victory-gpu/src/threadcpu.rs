@@ -11,6 +11,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+pub(crate) mod census;
+
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
 use windows_sys::Win32::System::Threading::{
     GetCurrentThreadId, GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION,
@@ -103,6 +105,7 @@ fn per_frame() -> Option<(Vec<(&'static str, usize, f64)>, u64, f64)> {
 /// The line: CPU ms per frame of each role, and the lane's share of the wall
 /// time it ran in.
 pub(crate) fn line() {
+    census::line();
     let Some((roles, frames, wall)) = per_frame() else {
         return;
     };

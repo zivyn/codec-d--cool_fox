@@ -120,6 +120,8 @@ mod upload;
 #[cfg(windows)]
 mod threadcpu;
 #[cfg(windows)]
+mod sched;
+#[cfg(windows)]
 mod readprobe;
 #[cfg(windows)]
 mod watch;

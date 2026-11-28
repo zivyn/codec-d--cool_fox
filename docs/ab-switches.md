@@ -193,7 +193,7 @@ resolves running, B the hit shading left out at the dispatch while no structures
 `VICTORY_PIPELINE_RAM_FREE_MB` (perf/cold2: the cold start, read when the pipelines are made), `VICTORY_LIBRARY_STATIC_SAMPLERS` (fix/white3-static-samplers: **the fix is on by
 default**: pipelines with static samplers are neither loaded from nor stored in the pipeline library; `=1` restores the old behaviour, read once when the
 library opens), `VICTORY_SAMPLER_TABLE` (fix/sampler-table, off, read once: immediate samplers become tables of a 64-slot region at the end of each sampler heap, so the library can keep those pipelines again; the library names carry `sampler-table-v1`), and the translation switches `VICTORY_WAVE_WIDE_AUTO` (fix/hairw) and `VICTORY_BVH_MISS` (perf/rt-cost), both off and in the shader cache key by the text, so with
-them unset the emitted code is the one of integ/validation-27 (the corpus of integ/validation-28 says so). fix/water2 (`VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`) is not in this integration.
+them unset the emitted code is the one of integ/validation-27 (the corpus of integ/validation-28 says so). feat/nv2-dlss-hudless (2c721699b: the draw hooks of the HUD-less copy and the frontend's 1440p viewport, behind `VICTORY_FRAMEGEN_HUDLESS`, `VICTORY_NATIVE_1440P` and the DLSS switches) adds no live switch; its later hotkey and A/B commits (`VICTORY_HOTKEYS`, `VICTORY_FRAMEGEN_LIVE`) are not in. fix/water2 (`VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`) is not in this integration.
 
 ## Switches of the lane that are on by default
 

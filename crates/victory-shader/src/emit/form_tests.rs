@@ -242,18 +242,21 @@ fn the_kept_skip_over_a_loop_gives_the_consoles_results_on_the_card() {
 }
 
 /// A loop of `s1` rounds that tests its exit at the top (a scalar test: both host waves leave in the
-/// same round) and reads lane 63 in its body, which the two host waves of the console wave
-/// exchange. The exit comes before the exchange in the order the blocks are lowered. After the
-/// loop, `out[0] = s3` (what the last round read: 63).
-const TOP_EXIT: [u32; 9] = [
-    0xBE84_0380, // s_mov_b32 s4, 0
-    0xBF09_0104, // L: s_cmp_ge_u32 s4, s1
-    0xBF85_0004, // s_cbranch_scc1 DONE
-    0xD760_0003, // v_readlane_b32 s3, v0, 63
-    0x0001_7F00,
-    0x8104_8104, // s_add_i32 s4, s4, 1
-    0xBF82_FFFA, // s_branch L
-    0x7E02_0203, // DONE: v_mov_b32 v1, s3
+/// same round) and reads the first lane of v0 + 1 in its body, which the two host waves of the console wave
+/// exchange (each asks the other whether it has a lane). The exit comes before the exchange in the order the blocks are lowered. After the
+/// loop, `out[0] = s22` (what the last round read: 1).
+const TOP_EXIT: [u32; 12] = [
+    0x4A04_0081, // v_add_nc_u32 v2, 1, v0
+    0xD760_0017, // v_readlane_b32 s23, v2, 63 (a read across the halves: they exchange)
+    0x0001_7F02,
+    0xBE94_0380, // s_mov_b32 s20, 0
+    0xBE96_0380, // s_mov_b32 s22, 0
+    0xBF09_0114, // L: s_cmp_ge_u32 s20, s1
+    0xBF85_0003, // s_cbranch_scc1 DONE
+    0x7E2C_0502, // v_readfirstlane_b32 s22, v2
+    0x8114_8114, // s_add_i32 s20, s20, 1
+    0xBF82_FFFB, // s_branch L
+    0x7E02_0216, // DONE: v_mov_b32 v1, s22
     0x38 << 26 | 0x1C << 18,
 ];
 
@@ -270,7 +273,9 @@ fn top_exit_lowered(half_exit: bool) -> Result<HostShader, ShaderError> {
     lower::set_program_tag(b"a top exit");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     lower::TEST_HALF_EXIT.set(Some(half_exit));
-    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::exit_clear::CLEARS.set((0, 0));
+    let (shader, form) = super::emit_as(&c, &native, &p, &st, &io, &res);
+    eprintln!("top exit, half exit {half_exit}: form {form:?}, (clearings, exits passed first) {:?}", lower::exit_clear::CLEARS.get());
     lower::TEST_HALF_EXIT.set(None);
     lower::TEST_HOST_WAVE.set(was);
     shader
@@ -291,12 +296,12 @@ fn the_half_that_leaves_a_loop_at_its_top_clears_its_exchange_dword() {
     assert!(on.dxil.len() > off.dxil.len());
 }
 
-/// ... and the loop still runs on the card as it did: three rounds, each reading lane 63.
+/// ... and the loop still runs on the card as it did: three rounds, each reading the first lane.
 #[test]
 fn a_loop_with_its_exit_at_the_top_still_exchanges_on_the_card() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let on = top_exit_lowered(true).expect("lowered");
-    for (rounds, expected) in [(3u32, 63u32), (1, 63)] {
+    for (rounds, expected) in [(3u32, 1u32), (1, 1)] {
         let Some(got) = super::wave64_tests::on_the_card(&on, [0, rounds]) else {
             return;
         };

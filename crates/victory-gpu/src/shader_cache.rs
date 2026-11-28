@@ -121,7 +121,8 @@ fn build() -> [u8; 32] {
             bytes.push(0);
         }
         // The wave-wide form of the kept skips (off unless asked for): by the value in force.
-        bytes.extend_from_slice(b"VICTORY_KEPT_SKIPS_WIDE=");
+        bytes.extend_from_slice("VICTORY_KEPT_SKIPS_WIDE".as_bytes());
+        bytes.push(b'=');
         bytes.push(victory_shader::emit::kept_skips_wide_code());
         bytes.push(0);
         // And which clean-up passes ran over the translated code.

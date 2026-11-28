@@ -158,6 +158,7 @@ switch is read.
 
 | switch | default | row in ab-switches.md | purpose |
 |---|---|---|---|
+| `VICTORY_ALIAS_BATCH` | off | yes | The other views of a run of blocks the write guards make read-only are guarded by one change of protection for each run of them side by side. |
 | `VICTORY_ASK_ASIDE` | on (=0 turns off) | yes | Offers the write-watch asking to a side thread and joins it where it used to ask. |
 | `VICTORY_ASK_CACHE` | off | yes | Lets a thread remember more write-watch answers, including windows outside buffers. |
 | `VICTORY_ASK_EARLY` | off | yes | Milliseconds between rounds that ask early about pages the title wrote lately; unset is off. |
@@ -173,6 +174,8 @@ switch is read.
 | `VICTORY_DSP_CONVOLVE` | off | no | Computes the audio DSP's mono 1024-frame convolutions (TVs, phone calls, reverb) from the title's own impulse responses; those streams were silence (`VICTORY_DSP_REVERB` stands in only where this does not apply). From VIctory-NVIDIA#77 (Yve), with a faster convolver. |
 | `VICTORY_DSP_REVERB` | off | no | Runs convolution audio streams through a stand-in algorithmic reverb. |
 | `VICTORY_DSP_REVERB_LEVEL` | 1.0 | no | Output level of the stand-in reverb. |
+| `VICTORY_FAULT_AROUND` | 0 (off) | yes | A write fault opens, with its block, up to n-1 hot blocks beside it (opened by a fault this frame or the last) in one change of protection; 1 only batches the blocks an opening has. |
+| `VICTORY_FAULT_SPIN` | 0 (off) | yes | Microseconds a title thread in the write-fault handler looks for a busy guard stripe before it sleeps on it. |
 | `VICTORY_FOLD_VIEWS` | off | yes | Folds view heap indexing into raw user data in draws and shaders. |
 | `VICTORY_FUSE_RUNS` (needs `VICTORY_FUSE_DISPATCH=1` at translation) | off | yes | The dispatches of one program that follow one another are one table and one dispatch (integ/validation-26). |
 | `VICTORY_GPU_RO_SKIP` | off | yes | Pages the title asked for GPU-read-only are left out of the ranges shaders are declared to write (integ/validation-26). |
@@ -285,6 +288,7 @@ translation of shaders.
 | `VICTORY_AB_SKIP` | 1 (second) | number |  |  | diag | Seconds at the start of each A/B phase whose frame times are left out. |
 | `VICTORY_AB_START` | unset: first phase at the first present | number |  |  | diag | Seconds after the world is found before the first A/B phase begins. |
 | `VICTORY_ACTIVATE_RAYS` | on (=0 turns off) | flag |  |  |  | Runs the title's probe-ray activation compute program; 0 leaves that program out. |
+| `VICTORY_ALIAS_BATCH` | off | flag |  | live |  | The other views of a run of blocks the write guards make read-only are guarded by one change of protection for each run of them side by side. |
 | `VICTORY_ALIAS_COPY` | on (=0 turns off) | number |  |  |  | Finds the texture aliasing a title resource's memory; 0 none, 1 only single-level single-layer textures. |
 | `VICTORY_ALIAS_FAST` | off | flag |  |  |  | Lets page-by-page remapping skip pages that already show the wanted page and do small groups itself. |
 | `VICTORY_AMBIENT` | on, 0.8 (0/off turns off) | text |  |  |  | Stand-in for the title's missing indirect light: share of the estimate, optional floor or constant. |
@@ -414,8 +418,10 @@ translation of shaders.
 | `VICTORY_F32_FTZ` | on since integ/validation-24 (off before; `=0` off) | flag | yes |  |  | Asks the driver for the console float mode: 32-bit denormals flushed to zero (shader model 6.2). |
 | `VICTORY_FAIL_DUMP` | n/a | path |  |  |  | Directory where the first containers of each failure reason are dumped. |
 | `VICTORY_FAST_CORES` | 2 | number |  |  |  | Stage of asking the system to put threads on fast cores; 0 none, 1, 2. |
+| `VICTORY_FAULT_AROUND` | 0 (off) | number |  | live |  | A write fault opens, with its block, up to n-1 hot blocks beside it (opened by a fault this frame or the last) in one change of protection; 1 only batches the blocks an opening has; at most 64. |
 | `VICTORY_FAULT_BOOK` | off | path |  |  | diag | File that receives the fault book's report of blocks and timing. |
 | `VICTORY_FAULT_BOOK_AT` | 150,210,270 | list |  |  | diag | Seconds after start at which the fault book is written. |
+| `VICTORY_FAULT_SPIN` | 0 (off) | number |  | live |  | Microseconds (at most 1000) a title thread in the write-fault handler looks for a busy guard stripe before it sleeps on it. |
 | `VICTORY_FETCH_CHECK` | off | flag |  |  |  | =1 checks fetched pieces by hash against what a flight ended with. |
 | `VICTORY_FETCH_TRIM` | off (on when VICTORY_RAM_LEAN is 1 or 2) | flag |  |  |  | Shrinks the fetch buffers again when a minute never needed a quarter. |
 | `VICTORY_FILL_TITLE` | off | flag |  |  |  | =1 treats small fills of title memory as title data. |

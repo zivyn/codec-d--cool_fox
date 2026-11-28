@@ -30,6 +30,9 @@ use std::collections::BTreeMap;
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
+mod faultstat;
+mod lean;
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -323,6 +326,13 @@ pub(crate) fn lock_waits(frames: f64) -> String {
         all as f64 / frames,
         shards()
     )
+}
+
+/// What the faults that reach the vectored handler cost since the last call, per frame, for the log: by kind, by
+/// thread and by block, and who held the stripes the title's faults waited for.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn fault_lines(frames: f64) -> Vec<String> {
+    faultstat::lines(frames)
 }
 
 /// The page ranges some thread is asking about: asking forgets what it
@@ -2172,7 +2182,16 @@ fn lock_stripe(stripe: usize) -> std::sync::MutexGuard<'static, ()> {
     if let Ok(g) = STRIPE[stripe].0.try_lock() {
         return g;
     }
-    waited(3, || STRIPE[stripe].0.lock().unwrap_or_else(|e| e.into_inner()))
+    // (`VICTORY_FAULT_SPIN`: a title thread in the fault handler looks for it again for a while first.)
+    if let Some(g) = lean::spin_for(&STRIPE[stripe].0) {
+        return g;
+    }
+    #[cfg(feature = "diagnostics")]
+    let (holder, began) = (faultstat::holder(stripe), std::time::Instant::now());
+    let g = waited(3, || STRIPE[stripe].0.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    faultstat::waited_on(holder, began.elapsed());
+    g
 }
 
 fn gate_read() -> std::sync::RwLockReadGuard<'static, ()> {
@@ -2210,7 +2229,10 @@ impl Guards {
         let mut stripes = Vec::with_capacity(mask.count_ones() as usize);
         let mut left = mask;
         while left != 0 {
-            stripes.push(lock_stripe(left.trailing_zeros() as usize));
+            let stripe = left.trailing_zeros() as usize;
+            stripes.push(lock_stripe(stripe));
+            #[cfg(feature = "diagnostics")]
+            faultstat::held(stripe);
             left &= left - 1;
         }
         #[cfg(feature = "diagnostics")]
@@ -2784,8 +2806,12 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// it), a write through it would not be seen: that block is not clean, and
 /// told as written at every asking, until it can. Whether all are covered.
 fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
+    let shown = elsewhere(from * BLOCK, (to - from) * BLOCK);
+    if lean::alias_batch() {
+        return cover_batched(g, &shown);
+    }
     let mut all = true;
-    for (page, others) in elsewhere(from * BLOCK, (to - from) * BLOCK) {
+    for (page, others) in shown {
         let block = page / BLOCK;
         if !g.protected.contains(block) {
             continue; // not there, or not ours to guard
@@ -2805,6 +2831,113 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
         }
     }
     all
+}
+
+/// [`cover`] for the pages `shown` (`elsewhere`) with the other views of the
+/// blocks of a run made read-only by one change of protection for each run of
+/// them that lies side by side (`VICTORY_ALIAS_BATCH`): the same blocks are
+/// guarded and noted as when each is done alone, in fewer calls, and with the
+/// stripes held for less time.
+fn cover_batched(g: &mut Guards, shown: &[(usize, Vec<usize>)]) -> bool {
+    let mut ours: Vec<(usize, Vec<usize>)> = Vec::new();
+    let mut wanted: Vec<usize> = Vec::new();
+    for (page, others) in shown {
+        let block = page / BLOCK;
+        if !g.protected.contains(block) {
+            continue; // not there, or not ours to guard
+        }
+        #[cfg(feature = "diagnostics")]
+        ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        g.aliased.insert(block);
+        let others: Vec<usize> = others.iter().map(|other| other / BLOCK).collect();
+        // (A view whose stripe is not held, one mapped since the stripes
+        // were taken, is not made read-only: the block is not clean.)
+        wanted.extend(others.iter().copied().filter(|&other| g.covers(other)));
+        ours.push((block, others));
+    }
+    let done = protect_aliases(g, &wanted);
+    let mut all = true;
+    for (block, others) in ours {
+        if !others.iter().all(|other| done.binary_search(other).is_ok()) {
+            all = false;
+            g.clean.remove(block);
+        }
+    }
+    all
+}
+
+/// [`protect_alias`] for `blocks`, which the stripes held cover: those of
+/// them that are read-only by our hand now, in order. A run of blocks that
+/// lie side by side is one change of protection (and each alone if that does
+/// not come out as it does for each).
+fn protect_aliases(g: &mut Guards, blocks: &[usize]) -> Vec<usize> {
+    let mut done = Vec::with_capacity(blocks.len());
+    let rest = rest();
+    for (first, past) in lean::runs_of(blocks) {
+        // The run's blocks that are to be made read-only now, side by side.
+        let mut from = first;
+        for block in first..=past {
+            let wanted = block < past && {
+                g.aliased.insert(block);
+                if g.protected.contains(block) {
+                    done.push(block);
+                    false
+                } else {
+                    !(g.left_alone(block) || g.rests(block, rest))
+                }
+            };
+            if wanted {
+                continue;
+            }
+            if from < block {
+                if protect_alias_run(g, from, block) {
+                    done.extend(from..block);
+                } else if block - from > 1 {
+                    for one in from..block {
+                        if protect_alias_run(g, one, one + 1) {
+                            done.push(one);
+                        }
+                    }
+                }
+            }
+            from = block + 1;
+        }
+    }
+    done.sort_unstable();
+    done
+}
+
+/// The core of [`protect_alias`] for the blocks `[first, past)`: read-only by one call, and noted so, or as they were.
+fn protect_alias_run(g: &mut Guards, first: usize, past: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    // Ahead of the protection.
+    (first..past).for_each(|block| PROTECTED.set(block));
+    let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    // SAFETY: title view memory; only its protection changes.
+    let done = unsafe { VirtualProtect((first * BLOCK) as *const _, (past - first) * BLOCK, PAGE_READONLY, &mut old) } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        tally(5, (past - first) as u64);
+        tally(8, started.elapsed().as_nanos() as u64);
+    }
+    // (A page the read probe armed, `crate::readprobe`, is read-only too.)
+    if done && matches!(old & !PAGE_GUARD, PAGE_READWRITE | PAGE_READONLY) {
+        for block in first..past {
+            g.protected.insert(block);
+            #[cfg(feature = "diagnostics")]
+            crate::faultbook::note(crate::faultbook::What::Alias, block, 0, 0);
+        }
+        return true;
+    }
+    if done {
+        // Not for us to guard: as it was.
+        // SAFETY: as above.
+        unsafe { VirtualProtect((first * BLOCK) as *const _, (past - first) * BLOCK, old, &mut old) };
+    }
+    (first..past).for_each(|block| PROTECTED.clear(block));
+    false
 }
 
 /// Makes `block` read-only: another view of a page a copy is about to take
@@ -3003,19 +3136,25 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
         g.clean.remove(block);
         unpublish(block);
     }
-    for &block in blocks {
+    // (`VICTORY_FAULT_AROUND`: the blocks that lie side by side are one change of protection.)
+    let runs = if lean::around() >= 1 {
+        lean::runs_of(blocks)
+    } else {
+        blocks.iter().map(|&block| (block, block + 1)).collect()
+    };
+    for (first, past) in runs {
         let mut old = 0;
-        // SAFETY: a block we made read-only.
+        // SAFETY: blocks we made read-only.
         unsafe {
-            if VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) != 0
+            if VirtualProtect((first * BLOCK) as *const _, (past - first) * BLOCK, PAGE_READWRITE, &mut old) != 0
                 && !matches!(old & !PAGE_GUARD, PAGE_READONLY | PAGE_READWRITE)
             {
                 // Not what we left there: the address is other memory's
                 // (code's, say), which keeps its protection.
-                VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut old);
+                VirtualProtect((first * BLOCK) as *const _, (past - first) * BLOCK, old, &mut old);
             }
         }
-        PROTECTED.clear(block);
+        (first..past).for_each(|block| PROTECTED.clear(block));
     }
     #[cfg(feature = "diagnostics")]
     if !blocks.is_empty() {
@@ -3703,7 +3842,12 @@ pub(crate) fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        use faultstat::{Kind, Probe};
         let _fault = crate::timeline::span("a fault looked at");
+        // (What the trip costs, by kind, in a diagnostics build; and a thread in the handler may look for a busy
+        // stripe for a while, `VICTORY_FAULT_SPIN`.)
+        let mut probe = Probe::begin();
+        let _in_handler = lean::Faulting::enter();
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         // The first touch of a page the read probe armed (`crate::readprobe`):
@@ -3711,14 +3855,12 @@ pub(crate) fn install() {
         if r.ExceptionCode == 0x8000_0001u32 as NTSTATUS && r.NumberParameters >= 2 {
             let write = r.ExceptionInformation[0] == 1;
             // (Last: a page of a unit that landed since the touch.)
-            return if crate::land::owed::fault(r.ExceptionInformation[1])
+            let ours = crate::land::owed::fault(r.ExceptionInformation[1])
                 || crate::readprobe::fault(r.ExceptionInformation[1], r.ExceptionAddress as usize, write)
-                || crate::land::owed::finished_lately(r.ExceptionInformation[1])
-            {
-                EXCEPTION_CONTINUE_EXECUTION
-            } else {
-                EXCEPTION_CONTINUE_SEARCH
-            };
+                || crate::land::owed::finished_lately(r.ExceptionInformation[1]);
+            probe.is(if ours { Kind::Owed } else { Kind::Passed });
+            probe.code(r.ExceptionCode as u32);
+            return if ours { EXCEPTION_CONTINUE_EXECUTION } else { EXCEPTION_CONTINUE_SEARCH };
         }
         const READ: usize = 0;
         const WRITE: usize = 1;
@@ -3737,15 +3879,23 @@ pub(crate) fn install() {
             || r.ExceptionInformation[0] != WRITE
         {
             return match ours {
-                Some(exit) => fail(exit),
+                Some(exit) => {
+                    probe.is(Kind::Own);
+                    fail(exit)
+                }
                 None if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
                     && r.NumberParameters >= 2
                     && r.ExceptionInformation[0] == READ
                     && came_back(r.ExceptionInformation[1], false) =>
                 {
+                    probe.is(Kind::Back);
                     EXCEPTION_CONTINUE_EXECUTION
                 }
-                None => EXCEPTION_CONTINUE_SEARCH,
+                None => {
+                    probe.is(Kind::Passed);
+                    probe.code(r.ExceptionCode as u32);
+                    EXCEPTION_CONTINUE_SEARCH
+                }
             };
         }
         let at = r.ExceptionInformation[1];
@@ -3755,34 +3905,49 @@ pub(crate) fn install() {
             // SAFETY: the context the system passes, to go on from.
             && crate::titlewrite::store(unsafe { &mut *context }, at)
         {
+            probe.is(Kind::Store);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         // Another thread may have opened the block since this one faulted
         // (then nothing waits for the lock), and a copy may have guarded it
         // again since that (then it is ours again, not read-only for some
         // other reason).
+        let frame = crate::frame::current();
         for _ in 0..3 {
             if !PROTECTED.any(block, block + 1) && writable(at) {
                 #[cfg(feature = "diagnostics")]
                 crate::faultbook::note(crate::faultbook::What::Open, block, 0, 0);
+                probe.is(Kind::Seen);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            // (`VICTORY_FAULT_AROUND`: with it, the blocks the title writes beside this one, in runs, in the same
+            // call; without it, this one.)
+            let (first, past) = lean::plan(block, frame);
             #[cfg(feature = "diagnostics")]
             let began = std::time::Instant::now();
             // (Let go again before the next look: the runtime wants the
             // guards to end a change.)
-            let mut g = guards_to_open(block, block + 1, false);
+            let mut g = guards_to_open(first, past, false);
             #[cfg(feature = "diagnostics")]
             let waited = began.elapsed();
-            let opened = open(&mut g, at, at + 1);
+            let opened = open(&mut g, first * BLOCK, past * BLOCK);
             if opened != 0 {
-                opened_block(block);
+                for opened_here in first..past {
+                    opened_block(opened_here);
+                }
                 drop(g);
+                let before = lean::faulted(block, frame);
+                probe.is(Kind::Open);
+                probe.opened(opened, opened.saturating_sub(1));
+                probe.heat(block, frame, before);
+                (first..past).filter(|&beside| beside != block).for_each(|beside| lean::kept(beside, frame));
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
                     let ns = waited.as_nanos().min(u128::from(u32::MAX)) as usize;
                     let held = (began.elapsed() - waited).as_nanos() as u64;
+                    probe.waited(waited.as_nanos() as u64);
+                    probe.held(held);
                     crate::faultbook::note(crate::faultbook::What::Fault, block, opened << 32 | ns, held);
                     crate::faultbook::note(crate::faultbook::What::Site, r.ExceptionAddress as usize, block, 0);
                 }
@@ -3790,12 +3955,23 @@ pub(crate) fn install() {
             }
         }
         if writable(at) {
+            probe.is(Kind::Seen);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         match ours {
-            Some(exit) => fail(exit),
-            None if came_back(at, true) => EXCEPTION_CONTINUE_EXECUTION,
-            None => EXCEPTION_CONTINUE_SEARCH,
+            Some(exit) => {
+                probe.is(Kind::Own);
+                fail(exit)
+            }
+            None if came_back(at, true) => {
+                probe.is(Kind::Back);
+                EXCEPTION_CONTINUE_EXECUTION
+            }
+            None => {
+                probe.is(Kind::Passed);
+                probe.code(r.ExceptionCode as u32);
+                EXCEPTION_CONTINUE_SEARCH
+            }
         }
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -4768,6 +4944,112 @@ mod tests {
         drop_views(section, &[guarded, other], SIZE);
     }
 
+    /// The switches of [`lean`] for the thread of a test, off again when it ends (a test that fails leaves
+    /// nothing behind).
+    struct LeanFor;
+
+    impl LeanFor {
+        fn set(around: usize, spin_us: u64, batch: bool) -> LeanFor {
+            lean::LEAN_IN_TEST.set(lean::Lean { around, spin_us, batch });
+            LeanFor
+        }
+    }
+
+    impl Drop for LeanFor {
+        fn drop(&mut self) {
+            lean::LEAN_IN_TEST.set(lean::Lean::OFF);
+        }
+    }
+
+    /// The pages, of those written, that a check was not told of.
+    fn missed(told: &[usize], wrote: &[usize]) -> Vec<usize> {
+        wrote.iter().copied().filter(|page| !told.contains(page)).collect()
+    }
+
+    /// With `VICTORY_FAULT_AROUND` a fault opens the hot blocks beside the one it is on, in the one trip: what
+    /// the title writes in them next does not fault, and the next check tells of every one of them (and of no
+    /// block it left alone). The kernel's write into a range opens it in one call too.
+    #[test]
+    fn a_fault_opens_the_hot_blocks_beside_it_and_no_write_is_missed() {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        const BLOCKS: usize = 16;
+        let _lean = LeanFor::set(4, 0, false);
+        let (section, guarded, other) = two_views(BLOCKS * BLOCK);
+        let page = |block: usize| guarded / PAGE + block;
+        let end = guarded + BLOCKS * BLOCK;
+        assert_eq!(guard(guarded, end), Some((0..BLOCKS).map(page).collect()));
+        assert_eq!(guard(guarded, end), Some(Vec::new()), "nothing written yet");
+        // Blocks 4 to 7 and 9 were opened by faults in the last frame.
+        let frame = crate::frame::current();
+        for block in [4, 5, 6, 7, 9] {
+            lean::faulted(guarded / BLOCK + block, frame);
+        }
+        let open_in = |view: usize| (0..BLOCKS).filter(|&b| writable(view + b * BLOCK)).collect::<Vec<_>>();
+        assert!(open_in(guarded).is_empty());
+        // One write is one fault, and opens the run it is in: not 9, which has no hot block beside it, and
+        // not the others.
+        // SAFETY: a view of ours, read-write once the handler has opened it.
+        unsafe { ((guarded + 5 * BLOCK + 8) as *mut u64).write_volatile(1) };
+        assert_eq!(open_in(guarded), [4, 5, 6, 7]);
+        // SAFETY: as above; the block is open, so that no fault comes.
+        unsafe { ((guarded + 6 * BLOCK + 16) as *mut u64).write_volatile(2) };
+        // Every block opened is told as written, the two that were and the two that were not.
+        let wrote = [page(5), page(6)];
+        let told = guard(guarded, end).expect("a view");
+        assert_eq!(missed(&told, &wrote), Vec::<usize>::new());
+        assert_eq!(told, (4..8).map(page).collect::<Vec<_>>());
+        assert!(open_in(guarded).is_empty(), "guarded again");
+        assert_eq!(guard(guarded, end), Some(Vec::new()));
+        // A write through the other view of the page opens that view's block and is told at the guarded one.
+        // SAFETY: the second view, read-write once the handler has opened it.
+        unsafe { ((other + 12 * BLOCK + 8) as *mut u64).write_volatile(3) };
+        assert_eq!(guard(guarded, end), Some(vec![page(12)]));
+        // The kernel's write into three blocks opens them in one go.
+        writing(guarded + 10 * BLOCK, 3 * BLOCK);
+        assert_eq!(open_in(guarded), [10, 11, 12]);
+        assert_eq!(guard(guarded, end), Some((10..13).map(page).collect()));
+        // The check can fail: a block made writable behind the guards' back and written is not told of.
+        let mut old = 0;
+        // SAFETY: a block of our view.
+        unsafe { VirtualProtect((guarded + 14 * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: as above.
+        unsafe { ((guarded + 14 * BLOCK + 8) as *mut u64).write_volatile(4) };
+        let told = guard(guarded, end).expect("a view");
+        assert_eq!(missed(&told, &[page(14)]), [page(14)], "a write nobody was told of is found missing");
+        drop_views(section, &[guarded, other], BLOCKS * BLOCK);
+    }
+
+    /// The other views of a run of blocks made read-only in one call are as they are made one by one: the same
+    /// protection, the same blocks told as written after the same writes.
+    #[test]
+    fn views_guarded_in_runs_are_guarded_as_they_are_one_by_one() {
+        use windows_sys::Win32::System::Memory::PAGE_READONLY;
+        const BLOCKS: usize = 6;
+        let run = |batch: bool| {
+            let _lean = LeanFor::set(0, 0, batch);
+            let (section, guarded, other) = two_views(BLOCKS * BLOCK);
+            let end = guarded + BLOCKS * BLOCK;
+            let relative = |told: Option<Vec<usize>>| {
+                told.expect("a view").into_iter().map(|page| page - guarded / PAGE).collect::<Vec<_>>()
+            };
+            let first = relative(guard(guarded, end));
+            let after_first: Vec<u32> = (0..BLOCKS).map(|b| protection(other + b * BLOCK)).collect();
+            assert!(after_first.iter().all(|&p| p == PAGE_READONLY), "{after_first:?}");
+            // SAFETY: the second view, read-write once the handler has opened it.
+            unsafe { ((other + 2 * BLOCK + 8) as *mut u64).write_volatile(1) };
+            // SAFETY: the guarded view, as above.
+            unsafe { ((guarded + 4 * BLOCK + 8) as *mut u64).write_volatile(1) };
+            let second = relative(guard(guarded, end));
+            let after_second: Vec<u32> = (0..BLOCKS).map(|b| protection(other + b * BLOCK)).collect();
+            drop_views(section, &[guarded, other], BLOCKS * BLOCK);
+            (first, second, after_second)
+        };
+        let (one_by_one, in_runs) = (run(false), run(true));
+        assert_eq!(one_by_one.0, (0..BLOCKS).collect::<Vec<_>>());
+        assert_eq!(one_by_one.1, [2, 4]);
+        assert_eq!(in_runs, one_by_one);
+    }
+
     /// A pagefile section of `bytes` mapped twice, 8 MiB apart, so that the
     /// two views lie in stripes of their own (some number of stripes tells
     /// them apart): the section handle, the two addresses.
@@ -5515,6 +5797,22 @@ mod many_askers_tests {
         writes_to_views_are_not_lost::<3>(0);
     }
 
+    /// The same with a fault opening the hot blocks beside the one it is on (`VICTORY_FAULT_AROUND`), the other
+    /// views of a run of blocks guarded in one call (`VICTORY_ALIAS_BATCH`) and a thread in the fault handler
+    /// looking for a busy stripe before it sleeps on it (`VICTORY_FAULT_SPIN`), in the modes of the guards and
+    /// with blocks that rest: no write is lost. (A span of more than three blocks: with blocks opened beside
+    /// the others the bits answer fewer askings.)
+    #[test]
+    fn no_write_is_lost_when_faults_open_runs_and_views_are_guarded_in_runs() {
+        use super::lean::Lean;
+        for (shards, rest) in [(0, 0), (64, 0), (2, 50)] {
+            writes_to_views_are_not_lost_lean::<3, 12, 4>(rest, shards, Lean { around: 8, spin_us: 0, batch: true });
+            writes_to_views_are_not_lost_lean::<1, 12, 4>(rest, shards, Lean { around: 4, spin_us: 40, batch: false });
+        }
+        writes_to_views_are_not_lost_lean::<3, 140, 70>(0, 64, Lean { around: 64, spin_us: 20, batch: true });
+        writes_to_views_are_not_lost_lean::<3, 12, 4>(0, MIXED, Lean { around: 3, spin_us: 5, batch: true });
+    }
+
     /// The mode of the guards that changes with the round (and goes through the gate).
     const MIXED: usize = usize::MAX;
 
@@ -5535,6 +5833,15 @@ mod many_askers_tests {
     /// `PAGES` blocks in each view; a thread asks about up to `SPAN` blocks
     /// either side of the one it wrote.
     fn writes_to_views_are_not_lost_with<const VIEWS: usize, const PAGES: usize, const SPAN: usize>(rest: u64, mode: usize) {
+        writes_to_views_are_not_lost_lean::<VIEWS, PAGES, SPAN>(rest, mode, super::lean::Lean::OFF);
+    }
+
+    /// The same with the switches of `super::lean` as `lean` has them, in every thread.
+    fn writes_to_views_are_not_lost_lean<const VIEWS: usize, const PAGES: usize, const SPAN: usize>(
+        rest: u64,
+        mode: usize,
+        lean: super::lean::Lean,
+    ) {
         tune(mode, 0);
         let rest = std::time::Duration::from_micros(rest);
         const THREADS: usize = 8;
@@ -5566,6 +5873,7 @@ mod many_askers_tests {
             if VIEWS > 1 {
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
+                    super::lean::LEAN_IN_TEST.set(lean);
                     let mut last = [0u64; VIEWS];
                     for round in 0..300usize {
                         tune(mode, round);
@@ -5598,6 +5906,7 @@ mod many_askers_tests {
                 let (by_bits, past, title_beside) = (&by_bits, &past, &title_beside);
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
+                    super::lean::LEAN_IN_TEST.set(lean);
                     let mut last = [[0u64; PAGES]; VIEWS];
                     let mut seed = t as u64 * 7919 + 1;
                     let mut next = |n: usize| {

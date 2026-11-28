@@ -22,6 +22,8 @@ mod changes;
 pub mod defaults;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod probe_watch;
 #[cfg(any(test, all(windows, feature = "diagnostics")))]
 mod capture_window;
 #[cfg(windows)]
@@ -92,6 +94,8 @@ mod memory;
 mod pagedrive;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod standin;
 #[cfg(windows)]
 mod sites;
 #[cfg(windows)]

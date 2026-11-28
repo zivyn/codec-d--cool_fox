@@ -975,7 +975,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
-            if unlike(dst, src) {
+            // A stand-in target takes the title's R11G11B10 texels converted (`crate::standin`).
+            let convert = crate::resource::stands_in_r11g11b10(dst) && crate::resource::holds_r11g11b10(src);
+            if !convert && unlike(dst, src) {
                 return;
             }
             // Two title textures over the same memory have one host
@@ -1017,6 +1019,15 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            if convert {
+                if !crate::standin::copy_whole(list, to, from) {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(?dst, ?src, "copy of an R11G11B10 texture into a stand-in of another size or levels skipped")
+                    });
+                }
+                return;
+            }
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -1103,7 +1114,14 @@ extern "system" fn copy_texture_region(
             }
             return;
         };
-        if unlike(dst.resource, src.resource) {
+        // A stand-in target takes the title's R11G11B10 texels (a footprint of that format, or a texture of it the host
+        // holds as it is) converted (`crate::standin`).
+        // SAFETY: the title's box or null.
+        let src_box = unsafe { source_box.cast::<D3D12_BOX>().as_ref() }.copied();
+        let convert = crate::resource::stands_in_r11g11b10(dst.resource)
+            && if src.kind == FOOTPRINT { src.footprint.format() == 26 } else { crate::resource::holds_r11g11b10(src.resource) };
+        let mut converted = None;
+        if !convert && unlike(dst.resource, src.resource) {
             return;
         }
         let mut from = src;
@@ -1121,6 +1139,13 @@ extern "system" fn copy_texture_region(
             };
             let buffer = match list.place_source(data as usize, bytes as usize) {
                 // What shaders wrote to it, at this place of the list.
+                Some(_) if convert => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        tracing::warn!(dst = ?dst.resource, src = ?src.resource, "copy of R11G11B10 texels shaders wrote into a stand-in skipped (only title memory is converted)")
+                    });
+                    return;
+                }
                 Some(buffer) => buffer,
                 None => {
                     let Some((buffer, staging)) = list.upload(host, bytes) else {
@@ -1135,6 +1160,14 @@ extern "system" fn copy_texture_region(
             };
             from.resource = buffer.as_raw().cast_const().cast();
             from.footprint.offset = 0;
+            if convert {
+                converted = crate::standin::buffer_region(list, &buffer, &from.footprint, src_box.as_ref());
+                if converted.is_none() {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("a copy of R11G11B10 texels from a buffer into a stand-in could not be converted"));
+                    return;
+                }
+            }
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
@@ -1161,6 +1194,14 @@ extern "system" fn copy_texture_region(
                 ensure_state(list, src.resource, COPY_SOURCE);
             }
             from.resource = texture.as_raw().cast_const().cast();
+            if convert {
+                converted = crate::standin::texture_region(list, texture, src.footprint.offset as u32, src_box.as_ref());
+                if converted.is_none() {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("a copy of an R11G11B10 texture into a stand-in could not be converted"));
+                    return;
+                }
+            }
         }
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
@@ -1211,7 +1252,14 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
-        let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        let mut host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+        if let Some(c) = &converted {
+            // The texels, converted, whole: the box was applied to them.
+            from.resource = c.buffer.as_raw().cast_const().cast();
+            from.kind = FOOTPRINT;
+            from.footprint = c.footprint;
+            host_box = None;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let text = || {
@@ -1278,6 +1326,9 @@ fn read_back(
     }
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");
+    }
+    if crate::resource::stands_in(src.resource) {
+        return Err("a stand-in target: its texels are not the footprint's");
     }
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;

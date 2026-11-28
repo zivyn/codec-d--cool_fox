@@ -265,17 +265,31 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
+///
+/// `VICTORY_R11G11B10_AS_F16=1` (BAND2, off): the same for R11G11B10_FLOAT (26), which every
+/// host GPU renders to and writes, so the host is not refusing it. The indirect light keeps
+/// its volumes in that format and writes each one back over itself every frame through
+/// filters; how a GPU rounds a float to 11 and 10 bits (D3D leaves it open: truncation is
+/// allowed) decides whether such a loop holds its values or sheds a unit in the last place
+/// a frame. 16-bit float RGBA stands in: more mantissa than either, rounded to nearest.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
+    const STAND_INS: [(u32, u32); 4] = [(86, 28), (115, 28), (67, 10), (26, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, to)| {
+                if f == 26 {
+                    let asked = crate::switch::on("VICTORY_R11G11B10_AS_F16");
+                    if asked {
+                        tracing::info!(format = f, stand_in = to, "VICTORY_R11G11B10_AS_F16: R11G11B10 targets and volumes are made in 16-bit float RGBA");
+                    }
+                    return asked;
+                }
                 let Some(host) = crate::host::host() else {
                     return false;
                 };
@@ -319,6 +333,23 @@ pub(crate) fn stands_in(this: This) -> bool {
         && host_resource(this)
             // SAFETY: a live resource.
             .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
+}
+
+/// Whether `this` is a title texture of R11G11B10_FLOAT whose host copy stands in for it in 16-bit float RGBA
+/// (`VICTORY_R11G11B10_AS_F16`): what the title copies into it in its own format is converted ([`crate::standin`]).
+#[cfg(windows)]
+pub(crate) fn stands_in_r11g11b10(this: This) -> bool {
+    !this.is_null() && pc_format(resource(this).desc.format) == 26 && stands_in(this)
+}
+
+/// Whether `this` is a title texture of R11G11B10_FLOAT whose host copy is of that format too (not a stand-in).
+#[cfg(windows)]
+pub(crate) fn holds_r11g11b10(this: This) -> bool {
+    !this.is_null()
+        && pc_format(resource(this).desc.format) == 26
+        && host_resource(this)
+            // SAFETY: a live resource.
+            .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 == 26)
 }
 
 /// Depth textures the title also asks unordered access for (the console
@@ -677,6 +708,27 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// A footprint of `format` (a DXGI format number), `size` texels (width, height, depth), its rows `row_pitch` bytes
+    /// apart, at `offset` in its buffer.
+    pub(crate) fn new(offset: u64, format: u32, size: [u32; 3], row_pitch: u32) -> PlacedFootprint {
+        PlacedFootprint { offset, format, width: size[0], height: size[1], depth: size[2], row_pitch }
+    }
+
+    /// Its DXGI format number.
+    pub(crate) fn format(&self) -> u32 {
+        self.format
+    }
+
+    /// Its width, height and depth in texels.
+    pub(crate) fn size(&self) -> [u32; 3] {
+        [self.width, self.height, self.depth]
+    }
+
+    /// The bytes between its rows.
+    pub(crate) fn row_pitch(&self) -> u32 {
+        self.row_pitch
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;

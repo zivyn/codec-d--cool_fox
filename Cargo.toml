@@ -71,6 +71,12 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+# Hot renderer path is CPU-bound on the submission-prep thread; one codegen unit and thin LTO let it inline
+# across crate boundaries (VIctory-NVIDIA #537: with target-cpu=x86-64-v3, a Ryzen 7 5700X + RTX 5080 went from
+# 103.2 to 89.1 ms median frame in one 12-minute run per arm). No panic=abort: the layer has catch_unwind sites.
+lto = "thin"
+codegen-units = 1
+incremental = false
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

@@ -1,2 +1,8 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# The fork already assumes AVX2 (the title-byte compares are AVX2-wide). x86-64-v3 lets the compiler emit AVX2,
+# BMI1/2 and FMA throughout the submission-prep thread's dword comparisons, slot scans and hashing.
+# Change to "native" for a build that will only run on the machine it was built on.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v3"]

@@ -608,6 +608,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// What share of its budget (parts of a thousand) the wait of a frame for the
+/// pipeline of a world draw is given now (`VICTORY_PIPELINE_WAIT_ADAPT`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn wait_permille() -> u32 {
+    make::permille_now()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

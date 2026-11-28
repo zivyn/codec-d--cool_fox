@@ -2193,6 +2193,14 @@ impl ValueWait {
     }
 }
 
+#[cfg(all(test, windows))]
+impl ValueWait {
+    /// A wait for the tests of the queue: `address`, the comparison code, the reference, whether 64 bits.
+    pub(crate) fn test(address: u64, comparison: u32, reference: u64, wide: bool) -> ValueWait {
+        ValueWait { address, comparison, reference, wide }
+    }
+}
+
 /// The waits lists recorded since their last reset, by list.
 static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
 

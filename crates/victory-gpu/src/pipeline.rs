@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// What its code stores to buffers, by descriptor ([`Shader::footprint`]), made when first asked.
+    #[cfg(windows)]
+    footprint: OnceLock<Option<Arc<victory_shader::footprint::Footprint>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,6 +122,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                footprint: OnceLock::new(),
             })
         })
         .clone()
@@ -181,6 +186,26 @@ impl Shader {
                     ),
                 }
                 done.ok()
+            })
+            .as_ref()
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// What the shader's code stores to buffers, by descriptor and byte (`crate::host::precise`); `None` if the code
+    /// could not be gone through (then every view it stores through counts whole). Made on first use, outside the
+    /// translation: never on the recording threads' path unless a precise-writes switch is on.
+    pub(crate) fn footprint(&self) -> Option<&Arc<victory_shader::footprint::Footprint>> {
+        self.footprint
+            .get_or_init(|| {
+                let stage = self.translated()?.host.stage;
+                let program = self.programs()?.into_iter().find(|p| p.stage == stage)?;
+                // (Never a panic on the title's path: a program that cannot be gone through is whole.)
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| victory_shader::footprint::analyze(&program)))
+                    .ok()
+                    .flatten()
+                    .map(Arc::new)
             })
             .as_ref()
     }

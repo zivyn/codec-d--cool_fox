@@ -78,3 +78,20 @@ pub fn arm() -> u32 {
         0
     }
 }
+
+/// Whether a switch is on in its variable, or named by `VICTORY_AB` (so that
+/// it may be on in some phase): what a stream has to prepare at activation
+/// for the phases that turn it on.
+pub fn may_be_on(name: &str) -> bool {
+    if std::env::var_os(name).is_some_and(|v| v == "1") {
+        return true;
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    {
+        victory_gpu::ab::bit(name).is_some()
+    }
+    #[cfg(not(all(windows, feature = "diagnostics")))]
+    {
+        false
+    }
+}

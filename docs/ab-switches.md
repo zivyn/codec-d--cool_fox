@@ -156,9 +156,9 @@ A switch that is **on** in the code (`VICTORY_RESIDENT_BATCH`, `MAKE_ASIDE`, `PI
 `crates/victory-gpu/src/defaults.rs`) is named with its off value, `VICTORY_AB=10,VICTORY_MAKE_ASIDE=0`: its A phases are the unset
 variable (on), its B phases the `=0` (off). Read B minus A with `bin\ab-verdict.py --b off`.
 
-The table above has a row for each switch whose flip at any instant needed an argument written down. Twenty-three more
+The table above has a row for each switch whose flip at any instant needed an argument written down. Twenty-five more
 are read through the same macros and can be named in `VICTORY_AB` too (`ASYNC_SUBMIT`, `CARD_BIG_FIRST`, `COPY_BESIDE`,
-`DSP_REVERB`, `DSP_REVERB_LEVEL`, `GUARD_REST`, `JOIN_PARTS`, `KEEP_SHOWN`, `LAND_ECHO`, `LIST_VIEWS`, `OPEN_ONE_VIEW`,
+`DSP_CONVOLVE`, `DSP_CONVOLVE_GAIN` (a stream's convolver is made at activation when the switch is on or named, and a block is computed whichever arm it falls in; off, the output is silence and the stream's ring is dropped), `DSP_REVERB`, `DSP_REVERB_LEVEL`, `GUARD_REST`, `JOIN_PARTS`, `KEEP_SHOWN`, `LAND_ECHO`, `LIST_VIEWS`, `OPEN_ONE_VIEW`,
 `OPUS_PITCH`, `PLACED_ORDER`, `QUICK_FIND`, `QUIET_COPIES`, `READY_ONCE`, `REFRESH_NOTES`, `SAME_RECORDS`, `STORE_BESIDE`,
 `TAKE_PARTS`, `UNDER_WIDE`, `UPLOAD_AHEAD`, `WIDE_WHOLE`, all with the `VICTORY_` prefix): their reasons are in the doc
 comment where each is read. [switches.md](switches.md) lists every switch with its default, whether it is in the shader
@@ -178,7 +178,7 @@ the title's pipelines are made), `VICTORY_FUSE_DISPATCH` (translation), `VICTORY
 
 ## What integ/validation-27 adds to the A/B (2026-11-28)
 
-`VICTORY_STAGE_A_LOOKAHEAD=1` (needs `VICTORY_STAGE_A_STEPS`; row above) is the one new live switch. It is in `ab/registry.rs` (`LIVE`, 88 entries),
+`VICTORY_STAGE_A_LOOKAHEAD=1` (needs `VICTORY_STAGE_A_STEPS`; row above) is the one new live switch. It is in `ab/registry.rs` (`LIVE`, 90 entries with the two `VICTORY_DSP_CONVOLVE*` of feat/audio-conv, merged after),
 so `VICTORY_AB=10,VICTORY_STAGE_A_LOOKAHEAD` flips it; the isolating A/B holds the whole stage A stack constant on and flips only this.
 **Not live, so compared in pairs of processes:** `VICTORY_POOL_COMPACT` (and `VICTORY_POOL_FIT=best`, `VICTORY_POOL_SLACK_MB`,
 `VICTORY_POOL_COMPACT_MB`) and `VICTORY_BETWEEN_FIT` (read once, `OnceLock`; the pool and the card-steps buffers are sized when they are made).

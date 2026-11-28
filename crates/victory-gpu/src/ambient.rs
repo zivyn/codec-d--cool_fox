@@ -41,6 +41,12 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
+//! `VICTORY_AMBIENT_GAIN=<multiple>` (1) scales the light the stand-in puts in (`<share>`, `floor:` and
+//! `constant:` alike) and can be flipped while the title runs (`VICTORY_AB`, diagnostics builds): the A/B for
+//! "is the picture short of indirect light" without a process pair for each value. It changes nothing else
+//! (not the air, not what the title's own program left); the estimate follows it by the feedback of the frame
+//! before, so the picture moves by more than the multiple in a room the stand-in lights alone.
+//!
 //! `VICTORY_AMBIENT_TRUST=<multiple>` (4) bounds what the program left by that multiple of
 //! the estimate; 0 drops it: the light is the estimate alone (no colour from stale memory).
 //!
@@ -211,6 +217,16 @@ fn trust() -> f32 {
 
 fn parse_trust(set: &str) -> f32 {
     set.trim().parse().ok().filter(|v: &f32| v.is_finite() && (0.0..=64.0).contains(v)).unwrap_or(4.0)
+}
+
+/// `VICTORY_AMBIENT_GAIN`: a multiple above 0 and up to 16; anything else is 1 (no change).
+fn parse_gain(text: Option<&str>) -> f32 {
+    text.and_then(|t| t.trim().parse().ok()).filter(|v: &f32| v.is_finite() && *v > 0.0 && *v <= 16.0).unwrap_or(1.0)
+}
+
+/// The gain now (live in the A/B: read at each dispatch, so the two arms differ from the next frame on).
+fn gain() -> f32 {
+    crate::ab::live_value!("VICTORY_AMBIENT_GAIN", f32, parse_gain)
 }
 
 /// Strength and radius of the creases' shade.
@@ -537,6 +553,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> Result<[u32; 
         Set::Estimate(level, floor) => (level, 0.0f32, floor),
         Set::Constant(level) => (0.0, level, 0.0),
     };
+    let times = gain();
+    let (level, constant, base) = (level * times, constant * times, base * times);
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return Err("the light of the frame before is not kept yet (no program that keeps it ran)");
     }
@@ -735,6 +753,17 @@ mod tests {
     use victory_shader::{ResourceType, RootType, UsedResource};
 
     use super::*;
+
+    #[test]
+    fn the_gain_is_a_positive_multiple_or_nothing() {
+        assert_eq!(parse_gain(None), 1.0);
+        assert_eq!(parse_gain(Some("1.5")), 1.5);
+        assert_eq!(parse_gain(Some(" 0.5 ")), 0.5);
+        assert_eq!(parse_gain(Some("16")), 16.0);
+        for odd in ["", "0", "-1", "17", "nan", "inf", "more"] {
+            assert_eq!(parse_gain(Some(odd)), 1.0, "{odd:?}");
+        }
+    }
 
     #[test]
     fn the_air_setting_has_a_multiple_and_a_most() {

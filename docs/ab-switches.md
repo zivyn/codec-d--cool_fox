@@ -191,6 +191,8 @@ The `vram census` line (every 5 s, always on, no switch) names the card's bytes 
 
 Three new live entries in `ab/registry.rs` (`LIVE`, 93 entries): `VICTORY_RT_RESOLVE` (perf/rt-cost; on in the code, so name it `=0`: A is the
 resolves running, B the hit shading left out at the dispatch while no structures are built), and `VICTORY_FRAMEGEN_LIVE` and `VICTORY_FRAMEGEN_HUDLESS` (feat/nv2-dlss-hudless; frame generation off/on and the HUD-less copy, with `VICTORY_HOTKEYS=1` for the hotkeys; they need the DLSS/FG switches of nv2.md set at the start). Nothing else of the merged branches is live.
+
+fix/expo1-ambient-gain adds one more live entry (`LIVE`, 94 entries): `VICTORY_AMBIENT_GAIN=<multiple>` (`ambient::gain`, read at each stand-in dispatch; A is the unset variable, 1; B is the value, so name it with one: `VICTORY_AB=12,VICTORY_AMBIENT_GAIN=1.6`). It multiplies the light the indirect-light stand-in raises, so a flip at any instant is safe: the next dispatch uses the new multiple, and the estimate (the previous frame's radiance, a slow mean with a 0.04 step) follows within a few seconds, so give a phase 10 s or more and read the picture of its end (`VICTORY_AB_SHOTS`).
 **Not live, so compared in pairs of processes:** `VICTORY_RESOLVE_ASYNC`, `VICTORY_RESOLVE_WORKERS`, `VICTORY_PIPELINE_NOW_FIRST`,
 `VICTORY_PIPELINE_RAM_FREE_MB` (perf/cold2: the cold start, read when the pipelines are made), `VICTORY_LIBRARY_STATIC_SAMPLERS` (fix/white3-static-samplers: **the fix is on by
 default**: pipelines with static samplers are neither loaded from nor stored in the pipeline library; `=1` restores the old behaviour, read once when the

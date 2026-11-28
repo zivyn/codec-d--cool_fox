@@ -18,10 +18,20 @@
 //! pipeline, the signature, the targets and render state (no call that
 //! changes them lies between); the title's root views (a view is a
 //! descriptor table in the host root signature, which no signature can
-//! set; [`State::fold_views`]); the shape of the user data. What differs is
-//! the user-data dwords of the stages, which the run's commands set: the
-//! lowest to the highest dword of each block that differs in the run
-//! ([`ranges`]). A call that would end a run is the head of the next.
+//! set; [`State::fold_views`]), except the root SRVs the shaders read through
+//! the view heap (`VICTORY_FOLD_VIEWS`, below); the shape of the user data.
+//! What differs is the user-data dwords of the stages, which the run's
+//! commands set: the dwords of each block that differ in the run, each
+//! stretch of them one root argument ([`ranges`]). A call that would end a
+//! run is the head of the next.
+//!
+//! Root views: a title root SRV that the shader reads through the view heap
+//! (`VICTORY_VIEW_INDEX=1` or `VICTORY_FOLD_VIEWS=1` when the program is
+//! translated: `victory_shader::emit::USER_ROOT_VIEW_INDEX`) is not a root
+//! parameter of the host: the heap slot of its one-view slot is a dword of
+//! the user data, like the constants, so the views of two calls may differ
+//! in a run (`VICTORY_FOLD_VIEWS=1`, flipped by the A/B: the views then end
+//! a run as the tables did, though the shaders are the same).
 //!
 //! Order: the run is made when it ends, so the host commands the calls after
 //! the first needed to be ready (a texture's transition to the state the
@@ -43,8 +53,9 @@ use crate::indirect::batch::{self, SLOT};
 /// dwords in all their commands; runs ended by what the next call runs
 /// with (pipeline, signature, roots, no room in the batch, its place),
 /// by more root arguments than a command holds, by a call that asks the
-/// depth target for another state, by another shape of user data.
-pub(crate) static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// depth target for another state, by another shape of user data; and,
+/// of those ended by the roots, the ones ended by a root view.
+pub(crate) static COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// The line of what the folds came to, per frame (with the one of the
 /// executions: [`crate::list::runs_line`]).
@@ -55,13 +66,14 @@ pub(crate) fn line(frames: f64) {
     }
     let per = |v: u64| v as f64 / frames;
     tracing::info!(
-        "folded executions per frame (VICTORY_INDIRECT_FOLD): {:.0} runs of {:.1} executions on average, {:.0} executions made {:.0} fewer, {:.1} root-argument dwords a command; runs ended by {:.0} other roots or pipeline, {:.0} no place, {:.0} too many arguments, {:.0} depth state, {:.0} another shape",
+        "folded executions per frame (VICTORY_INDIRECT_FOLD): {:.0} runs of {:.1} executions on average, {:.0} executions made {:.0} fewer, {:.1} root-argument dwords a command; runs ended by {:.0} other roots or pipeline ({:.0} of them by a root view), {:.0} no place, {:.0} too many arguments, {:.0} depth state, {:.0} another shape",
         per(c[0]),
         c[1] as f64 / c[0].max(1) as f64,
         per(c[1]),
         per(c[1].saturating_sub(c[0])),
         c[2] as f64 / c[1].max(1) as f64,
         per(c[3]),
+        per(c[8]),
         per(c[4]),
         per(c[5]),
         per(c[6]),
@@ -71,6 +83,28 @@ pub(crate) fn line(frames: f64) {
 
 /// The most executions of one run (a batch holds 256 jobs).
 pub(crate) const MOST: u32 = 64;
+
+/// Whether the root views the shaders read through the view heap may differ
+/// in a run (`VICTORY_FOLD_VIEWS=1`; the A/B flips it). Read once for each
+/// run, at its head ([`Run::views`]).
+fn views_on() -> bool {
+    crate::ab::live_flag!("VICTORY_FOLD_VIEWS")
+}
+
+/// The title's root parameters of the root SRVs the shader of `t` reads
+/// through the view heap.
+pub(super) fn indexed_slots(t: &crate::pipeline::Translated) -> impl Iterator<Item = u8> + '_ {
+    t.host
+        .user_data
+        .iter()
+        .filter(|u| u.root == RootType::Other(victory_shader::emit::USER_ROOT_VIEW_INDEX))
+        .map(|u| u.slot)
+}
+
+/// Whether a shader of the stage reads a root SRV through the view heap.
+pub(super) fn indexes_views(stage: &crate::pipeline::host::Stage) -> bool {
+    indexed_slots(stage.translated()).next().is_some()
+}
 
 /// Where the host is in making a run.
 #[derive(Default)]
@@ -96,6 +130,9 @@ pub(super) struct Run {
     root: ID3D12RootSignature,
     /// The title's root views, in the order of the stages.
     key: Vec<u64>,
+    /// Whether the root views read through the view heap may differ in the
+    /// run ([`views_on`] at its head); else `key` has them too.
+    views: bool,
     // Where its records are.
     scratch: Option<ID3D12Resource>,
     table: (usize, u32),
@@ -108,11 +145,12 @@ pub(super) struct Run {
     layout: Vec<(u32, u32)>,
     /// The values of all calls, one call after the other.
     values: Vec<u32>,
-    /// Per block, the lowest and the highest dword that differs between calls.
-    vary: Vec<Option<(u32, u32)>>,
+    /// Per block, the dwords that differ between calls (bit n: dword n; a
+    /// root signature holds 64 dwords).
+    vary: Vec<u64>,
     calls: u32,
     // The call being prepared.
-    next_vary: Vec<Option<(u32, u32)>>,
+    next_vary: Vec<u64>,
     capturing: bool,
     cur_layout: Vec<(u32, u32)>,
     cur: Vec<u32>,
@@ -123,10 +161,26 @@ pub(super) struct Run {
     late_depth: Option<u32>,
 }
 
-/// The root arguments the commands of a run set: per block that has dwords
-/// that differ, (root parameter, first dword, dwords).
-pub(crate) fn ranges(layout: &[(u32, u32)], vary: &[Option<(u32, u32)>]) -> Vec<(u32, u32, u32)> {
-    layout.iter().zip(vary).filter_map(|(&(param, _), v)| v.map(|(lo, hi)| (param, lo, hi + 1 - lo))).collect()
+/// The root arguments the commands of a run set: per block, each stretch of
+/// dwords that differ (bits of `vary`), (root parameter, first dword,
+/// dwords). Only the dwords that differ are set: a command has room for few.
+pub(crate) fn ranges(layout: &[(u32, u32)], vary: &[u64]) -> Vec<(u32, u32, u32)> {
+    let mut out = Vec::new();
+    for (&(param, dwords), &mask) in layout.iter().zip(vary) {
+        let mut d = 0;
+        while d < dwords.min(64) {
+            if mask >> d & 1 == 0 {
+                d += 1;
+                continue;
+            }
+            let first = d;
+            while d < dwords.min(64) && mask >> d & 1 == 1 {
+                d += 1;
+            }
+            out.push((param, first, d - first));
+        }
+    }
+    out
 }
 
 /// The dwords of those ranges.
@@ -134,17 +188,16 @@ fn width(ranges: &[(u32, u32, u32)]) -> u32 {
     ranges.iter().map(|r| r.2).sum()
 }
 
-/// What `vary` (per block, the lowest and the highest dword that differs from the head's `head`) becomes with `call` in the
+/// What `vary` (per block, the dwords that differ from the head's `head`) becomes with `call` in the
 /// run, in `out`.
-fn varying_into(layout: &[(u32, u32)], head: &[u32], vary: &[Option<(u32, u32)>], call: &[u32], out: &mut Vec<Option<(u32, u32)>>) {
+fn varying_into(layout: &[(u32, u32)], head: &[u32], vary: &[u64], call: &[u32], out: &mut Vec<u64>) {
     out.clear();
     out.extend_from_slice(vary);
     let mut at = 0usize;
     for (b, &(_, dwords)) in layout.iter().enumerate() {
-        for d in 0..dwords as usize {
+        for d in 0..dwords.min(64) as usize {
             if head[at + d] != call[at + d] {
-                let d = d as u32;
-                out[b] = Some(out[b].map_or((d, d), |(lo, hi)| (lo.min(d), hi.max(d))));
+                out[b] |= 1 << d;
             }
         }
         at += dwords as usize;
@@ -153,15 +206,15 @@ fn varying_into(layout: &[(u32, u32)], head: &[u32], vary: &[Option<(u32, u32)>]
 
 /// [`varying_into`] in a new vector.
 #[cfg(test)]
-pub(crate) fn varying(layout: &[(u32, u32)], head: &[u32], vary: &[Option<(u32, u32)>], call: &[u32]) -> Vec<Option<(u32, u32)>> {
+pub(crate) fn varying(layout: &[(u32, u32)], head: &[u32], vary: &[u64], call: &[u32]) -> Vec<u64> {
     let mut out = Vec::with_capacity(vary.len());
     varying_into(layout, head, vary, call, &mut out);
     out
 }
 
 /// The dwords of the ranges `vary` makes.
-fn varying_width(vary: &[Option<(u32, u32)>]) -> u32 {
-    vary.iter().flatten().map(|&(lo, hi)| hi + 1 - lo).sum()
+fn varying_width(vary: &[u64]) -> u32 {
+    vary.iter().map(|m| m.count_ones()).sum()
 }
 
 /// The words a command of a run puts in front of its record: the dwords of
@@ -201,6 +254,7 @@ impl Run {
             pso: self.pso,
             root: self.root.clone(),
             key: self.key.clone(),
+            views: self.views,
             scratch: None,
             table: (0, 0),
             first: 0,
@@ -307,15 +361,27 @@ impl State {
 
     /// The title's root views a run needs the same (the descriptor tables
     /// of the host's root signature that hold them cannot change in a run),
-    /// in the order of the stages.
-    fn fold_views(&self, p: &HostPipeline) -> impl Iterator<Item = u64> {
+    /// in the order of the stages; and, unless `views` (the run folds
+    /// them), the root SRVs the shaders read through the view heap, which
+    /// are dwords of the user data and could differ.
+    fn fold_views<'a>(&'a self, p: &'a HostPipeline, views: bool) -> impl Iterator<Item = u64> + 'a {
         let roots = self.roots_ref(p.compute);
-        p.stages.iter().flat_map(|s| s.root_cbvs.iter().chain(&s.root_srvs).chain(&s.root_uavs)).map(move |&(slot, _)| {
-            match roots.get(usize::from(slot)) {
-                Some(&Root::View(address)) => address,
-                _ => 0,
-            }
-        })
+        let address = move |slot: u8| match roots.get(usize::from(slot)) {
+            Some(&Root::View(address)) => address,
+            _ => 0,
+        };
+        let tables = p
+            .stages
+            .iter()
+            .flat_map(|s| s.root_cbvs.iter().chain(&s.root_srvs).chain(&s.root_uavs))
+            .map(move |&(slot, _)| address(slot));
+        let indexed = p
+            .stages
+            .iter()
+            .filter(move |_| !views)
+            .flat_map(|s| indexed_slots(s.translated()))
+            .map(move |slot| address(slot));
+        tables.chain(indexed)
     }
 
     /// An execution that may fold arrives (`kind`, the title's `stride`,
@@ -332,13 +398,14 @@ impl State {
                 let batched = self.batch.as_ref().is_some_and(|b| {
                     run.scratch.as_ref().is_some_and(|s| s.as_raw() == b.scratch.as_raw()) && b.table.room() > 0
                 }) && list.used(BATCH_USE);
+                let views_same = self.fold_views(p, run.views).eq(run.key.iter().copied());
                 let same = run.left > 0
                     && can
                     && batched
                     && run.pso == p.pso.as_raw() as usize
                     && run.kind == kind
                     && run.stride == stride
-                    && self.fold_views(p).eq(run.key.iter().copied())
+                    && views_same
                     && self.host_pipeline == run.pso
                     && self.host_roots[usize::from(run.compute)] == run.root.as_raw() as usize;
                 if same {
@@ -351,6 +418,9 @@ impl State {
                     return true;
                 }
                 COUNTS[3].fetch_add(1, Relaxed);
+                if !views_same {
+                    COUNTS[8].fetch_add(1, Relaxed);
+                }
                 let left = run.left;
                 self.fold_make(list, *run);
                 left
@@ -364,6 +434,8 @@ impl State {
             self.fold = Mode::Off;
             return false;
         }
+        // (Read once, here: the run keeps what it began with.)
+        let views = views_on();
         let mut run = Run {
             left: left - 1,
             kind,
@@ -371,7 +443,8 @@ impl State {
             compute: p.compute,
             pso: p.pso.as_raw() as usize,
             root: p.root.clone(),
-            key: self.fold_views(p).collect(),
+            key: self.fold_views(p, views).collect(),
+            views,
             scratch: None,
             table: (0, 0),
             first: 0,
@@ -467,13 +540,14 @@ impl State {
         if run.calls == 0 {
             run.layout = std::mem::take(&mut run.cur_layout);
             run.values = std::mem::take(&mut run.cur);
-            run.vary = vec![None; run.layout.len()];
+            run.vary = vec![0; run.layout.len()];
             run.ats.push(run.cur_at);
             run.calls = 1;
             self.fold = Mode::On(run);
             return;
         }
-        let shape = run.cur_layout == run.layout;
+        // (A root signature holds 64 dwords: the masks of what differs are 64 bits.)
+        let shape = run.cur_layout == run.layout && run.layout.iter().all(|b| b.1 <= 64);
         if shape {
             let total = run.total();
             let mut next = std::mem::take(&mut run.next_vary);
@@ -509,7 +583,7 @@ impl State {
         let mut next = run.successor(run.left);
         next.layout = std::mem::take(&mut run.cur_layout);
         next.values = std::mem::take(&mut run.cur);
-        next.vary = vec![None; next.layout.len()];
+        next.vary = vec![0; next.layout.len()];
         next.ats.push(run.cur_at);
         next.scratch = run.scratch.clone();
         next.table = run.table;
@@ -607,7 +681,7 @@ mod tests {
             let calls = 2 + next() as usize % 20;
             let head: Vec<u32> = (0..10).map(|_| next()).collect();
             let mut values = head.clone();
-            let mut vary = vec![None; layout.len()];
+            let mut vary = vec![0u64; layout.len()];
             let differing = [[round % 7 % 6, (round * 3) % 6], [(round * 5) % 4, 9]];
             for _ in 1..calls {
                 let mut call = head.clone();
@@ -645,7 +719,7 @@ mod tests {
                 let mut at = 0usize;
                 for (b, &(_, dwords)) in layout.iter().enumerate() {
                     for d in 0..dwords {
-                        let inside = vary[b].is_some_and(|(lo, hi)| (lo..=hi).contains(&d));
+                        let inside = vary[b] >> d & 1 == 1;
                         assert!(inside || values[k * 10 + at + d as usize] == head[at + d as usize], "round {round}");
                     }
                     at += dwords as usize;
@@ -655,20 +729,43 @@ mod tests {
     }
 
     /// A run with nothing that differs sets nothing; one dword that differs
-    /// is one range; two blocks that differ are two.
+    /// is one range; stretches of dwords that differ are one range each,
+    /// and two blocks that differ are two.
     #[test]
     fn ranges_are_the_dwords_that_differ() {
         let layout = [(2u32, 8u32), (4, 3)];
-        assert!(ranges(&layout, &[None, None]).is_empty());
-        assert_eq!(ranges(&layout, &[Some((3, 3)), None]), [(2, 3, 1)]);
-        assert_eq!(ranges(&layout, &[Some((1, 5)), Some((0, 2))]), [(2, 1, 5), (4, 0, 3)]);
-        assert_eq!(width(&ranges(&layout, &[Some((1, 5)), Some((0, 2))])), 8);
+        assert!(ranges(&layout, &[0, 0]).is_empty());
+        assert_eq!(ranges(&layout, &[1 << 3, 0]), [(2, 3, 1)]);
+        assert_eq!(ranges(&layout, &[0b11_1110, 0b111]), [(2, 1, 5), (4, 0, 3)]);
+        assert_eq!(width(&ranges(&layout, &[0b11_1110, 0b111])), 8);
+        // A dword that does not differ between two that do is not set (the room of a command is small): the
+        // index of a view in the heap, far from the constants that differ with it.
+        let far = ranges(&layout, &[0b1000_0110, 0b101]);
+        assert_eq!(far, [(2, 1, 2), (2, 7, 1), (4, 0, 1), (4, 2, 1)]);
+        assert_eq!(width(&far), 5);
+        assert_eq!(varying_width(&[0b1000_0110, 0b101]), width(&far));
+        // Bits past the dwords of a block are not dwords.
+        assert!(ranges(&layout, &[1 << 9, 1 << 4]).is_empty());
+    }
+
+    /// The dwords that differ from the head are the bits, whichever call they differ in.
+    #[test]
+    fn varying_marks_the_dwords_that_differ_from_the_head() {
+        let layout = [(0u32, 3u32), (1, 2)];
+        let head = [1u32, 2, 3, 4, 5];
+        let first = varying(&layout, &head, &[0, 0], &[1, 9, 3, 4, 5]);
+        assert_eq!(first, [0b010, 0]);
+        let second = varying(&layout, &head, &first, &[1, 2, 3, 4, 6]);
+        assert_eq!(second, [0b010, 0b10]);
+        // A call that is the head again marks nothing, and what was marked stays.
+        assert_eq!(varying(&layout, &head, &second, &head), second);
+        assert_eq!(ranges(&layout, &second), [(0, 1, 1), (1, 1, 1)]);
     }
 
     /// A command holds the root arguments and the record in its place.
     #[test]
     fn a_command_is_a_place() {
-        for (kind, most) in [(0u32, 4u32), (1, 3), (2, 5), (10, 5)] {
+        for (kind, most) in [(0u32, 12u32), (1, 11), (2, 13), (10, 13)] {
             assert_eq!(room(kind), most, "kind {kind}");
         }
         assert_eq!(room(3), 0, "a kind that is not known has no room");

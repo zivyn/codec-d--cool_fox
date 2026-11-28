@@ -3269,7 +3269,7 @@ void main(uint3 group : SV_GroupID) {
             // The commands: the run's words are the dwords of the calls that differ, from the lowest to the highest.
             let layout = [(0u32, 3u32)];
             let head = call(0);
-            let mut vary = vec![None];
+            let mut vary = vec![0u64];
             let mut values = head.to_vec();
             for k in 1..CALLS {
                 vary = crate::draw::fold::varying(&layout, &head, &vary, &call(k));
@@ -3311,6 +3311,173 @@ void main(uint3 group : SV_GroupID) {
                 let expected = [k as u32 + 1, 777, if extra_varies { 1000 + 7 * k as u32 } else { 5 }, k as u32 + 1];
                 for (i, way) in ["one by one", "folded"].into_iter().enumerate() {
                     let got: Vec<u32> = (0..4).map(|w| word(i * 1024 + k * 8 + w)).collect();
+                    assert_eq!(got, expected, "{what}, {way}, call {k}");
+                }
+            }
+        }
+    }
+
+    /// A run of executions whose root SRVs are read through the view heap by an index in the user data
+    /// (`VICTORY_FOLD_VIEWS`: `ResourceDescriptorHeap[index]`, here a table over the heap that an array of raw
+    /// buffers is indexed in, which is the same read of the same slots) is one execution whose commands set the
+    /// index with the constants that differ: each call's groups read the view of their call, the dwords that do not
+    /// differ between them (one lies between two that do) are not set, and a read past a view's size is zero.
+    #[test]
+    fn warp_folded_executions_with_changing_views() {
+        const CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=5, b0), UAV(u0), DescriptorTable(SRV(t0, numDescriptors=32))"
+cbuffer Call : register(b0) {
+    uint shared_word;
+    uint call;
+    uint which;
+    uint pad;
+    uint extra;
+};
+RWByteAddressBuffer seen : register(u0);
+ByteAddressBuffer views[32] : register(t0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint was;
+    seen.InterlockedAdd(call * 32, 1, was);
+    seen.Store(call * 32 + 4, shared_word);
+    seen.Store(call * 32 + 8, views[which].Load(0));
+    seen.Store(call * 32 + 16, extra);
+    seen.Store(call * 32 + 20, views[which].Load(256 + 4 * group.x));
+    seen.InterlockedMax(call * 32 + 12, group.x + 1, was);
+}
+"#;
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let worker = compile_cs(&warp.device, CS).expect("the worker must compile");
+        // The heap: slot s is a raw view of 256 bytes, the s-th of a buffer, whose first word says which and whose
+        // others are not zero (a read past a view that is not zero would show the next one).
+        let (views_buffer, views_ptr, _) = warp.shared_buffer(32 * 256);
+        // SAFETY: plain heap creation, a mapped buffer of 32 views of 64 words, a descriptor each in the heap.
+        let heap: ID3D12DescriptorHeap = unsafe {
+            warp.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 32,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })
+        }
+        .expect("a view heap");
+        // SAFETY: as above.
+        unsafe {
+            let step = warp.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let start = heap.GetCPUDescriptorHandleForHeapStart();
+            for s in 0..32u32 {
+                for w in 0..64u32 {
+                    let word = if w == 0 { 0x1000 + 7 * s } else { 0xdead_0000 + w };
+                    views_ptr.cast::<u32>().add(s as usize * 64 + w as usize).write_volatile(word);
+                }
+                let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: u64::from(s) * 64,
+                            NumElements: 64,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                warp.device.CreateShaderResourceView(
+                    &views_buffer,
+                    Some(&desc),
+                    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + s as usize * step },
+                );
+            }
+        }
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        let single = warp.signature(2, 12);
+        const CALLS: u32 = 9;
+        for (what, extra_varies) in [("call and extra", true), ("call only", false)] {
+            let (_src, src_ptr, src_gpu) = warp.shared_buffer(64 << 10);
+            let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (back, back_ptr, _) = warp.shared_buffer(2 * 4096);
+            let seen = [warp.default_uav(4096), warp.default_uav(4096)];
+            let dst = [warp.default_uav(64 << 10), warp.default_uav(64 << 10)];
+            let (_t0, t0_ptr, t0_gpu) = warp.shared_buffer(batch::MEMORY);
+            let (_t1, t1_ptr, t1_gpu) = warp.shared_buffer(batch::MEMORY);
+            // The title's records: call k asks k + 1 groups, 32 bytes apart.
+            for k in 0..CALLS {
+                for (w, word) in [k + 1, 1, 1, 0xabcd].into_iter().enumerate() {
+                    // SAFETY: 9 records of 32 bytes in 64 KiB, which nothing reads yet.
+                    unsafe { src_ptr.cast::<u32>().add(k as usize * 8 + w).write_volatile(word) };
+                }
+            }
+            // SAFETY: mapped memory nothing reads yet.
+            unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
+            // The user data of call k: 777 for all, the call, the heap slot of its view, a dword that is the same
+            // between the two that differ, and the extra that may differ.
+            // (The view of call k: the slot of the heap its user data names.)
+            let slot = |k: u32| 2 + 3 * k;
+            let call = |k: u32| [777u32, k, slot(k), 1, if extra_varies { 1000 + 7 * k } else { 5 }];
+            // The passes of both ways, one table each.
+            for (i, table_gpu) in [t0_gpu, t1_gpu].into_iter().enumerate() {
+                batch::record(&pass, &warp.list, (&dst[i], D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            }
+            // SAFETY: the mapped tables; nothing has run.
+            let (mut one, mut run) = unsafe { (batch::Table::new(t0_ptr, 0, [1, 0, 0, 0]), batch::Table::new(t1_ptr, 0, [1, 0, 0, 0])) };
+            let ats: Vec<u64> = (0..CALLS).map(|k| run.place_unique(1, u64::from(k) * 32, 2).unwrap()).collect();
+            assert_eq!(ats, (0..CALLS).map(|k| u64::from(k) * u64::from(batch::SLOT)).collect::<Vec<_>>());
+            for k in 0..CALLS {
+                assert_eq!(one.place(1, u64::from(k) * 32, 2), Some(u64::from(k) * u64::from(batch::SLOT)));
+            }
+            // The commands: the run's words are the dwords of the calls that differ, each stretch of them one argument.
+            let layout = [(0u32, 5u32)];
+            let head = call(0);
+            let mut vary = vec![0u64];
+            let mut values = head.to_vec();
+            for k in 1..CALLS {
+                vary = crate::draw::fold::varying(&layout, &head, &vary, &call(k));
+                values.extend_from_slice(&call(k));
+            }
+            let ranges = crate::draw::fold::ranges(&layout, &vary);
+            assert_eq!(ranges, if extra_varies { vec![(0, 1, 2), (0, 4, 1)] } else { vec![(0, 1, 2)] }, "{what}");
+            for (k, &at) in ats.iter().enumerate() {
+                let words = crate::draw::fold::command_words(&layout, &values[k * 5..k * 5 + 5], &ranges);
+                // SAFETY: the table above, not run.
+                unsafe { batch::fold_words(run.memory().0, run.memory().1, at, &words) };
+            }
+            let folded = crate::draw::fold::make_signature(&warp.device, &worker.root, 2, &ranges)
+                .expect("a signature that sets root constants");
+            // SAFETY: an open list, our root signature and pipeline, live buffers.
+            unsafe {
+                warp.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                warp.list.SetComputeRootSignature(&worker.root);
+                warp.list.SetPipelineState(&worker.pso);
+                warp.list.SetComputeRootDescriptorTable(2, heap.GetGPUDescriptorHandleForHeapStart());
+                // One by one.
+                warp.list.SetComputeRootUnorderedAccessView(1, seen[0].GetGPUVirtualAddress());
+                for k in 0..CALLS {
+                    warp.list.SetComputeRoot32BitConstants(0, 5, call(k).as_ptr().cast(), 0);
+                    warp.list.ExecuteIndirect(&single, 1, &dst[0], u64::from(k) * u64::from(batch::SLOT), None, 0);
+                }
+                // Folded: the head's root arguments are on the list, the rest is in the commands.
+                warp.list.SetComputeRootUnorderedAccessView(1, seen[1].GetGPUVirtualAddress());
+                warp.list.SetComputeRoot32BitConstants(0, 5, head.as_ptr().cast(), 0);
+                warp.list.ExecuteIndirect(&folded, CALLS, &dst[1], 0, None, 0);
+                warp.list.ResourceBarrier(&[uav_barrier()]);
+                for (i, s) in seen.iter().enumerate() {
+                    warp.list.ResourceBarrier(&[transition(s, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    warp.list.CopyBufferRegion(&back, 4096 * i as u64, s, 0, 4096);
+                }
+            }
+            warp.submit_and_wait();
+            // SAFETY: the list has run; mapped words.
+            let word = |at: usize| unsafe { back_ptr.cast::<u32>().add(at).read_volatile() };
+            for k in 0..CALLS as usize {
+                // The count, the shared word, the first word of the view, the most groups, the extra, a read past the
+                // view (the next view's words are not zero).
+                let expected = [k as u32 + 1, 777, 0x1000 + 7 * slot(k as u32), k as u32 + 1, if extra_varies { 1000 + 7 * k as u32 } else { 5 }, 0];
+                for (i, way) in ["one by one", "folded"].into_iter().enumerate() {
+                    let got: Vec<u32> = (0..6).map(|w| word(i * 1024 + k * 8 + w)).collect();
                     assert_eq!(got, expected, "{what}, {way}, call {k}");
                 }
             }

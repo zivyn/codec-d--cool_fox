@@ -21,8 +21,12 @@ use crate::host::transition;
 pub(crate) const JOBS: u32 = 256;
 /// The bytes of its table in upload memory: the count, then the jobs.
 pub(crate) const TABLE: u64 = 16 + 16 * JOBS as u64;
-/// The bytes of a clamped record's place in the scratch buffer.
-pub(crate) const SLOT: u32 = 32;
+/// The bytes of a clamped record's place in the scratch buffer: room for
+/// the record (at most 5 words) and the root arguments a folded execution's
+/// command sets in front of it (`VICTORY_INDIRECT_FOLD`: up to 11 to 13
+/// words; it was 32 bytes, and the dwords of the user data that differ
+/// between the objects, with the heap slots of their views, filled it).
+pub(crate) const SLOT: u32 = 64;
 /// Where the root arguments of folded executions are in the table's memory
 /// (`VICTORY_INDIRECT_FOLD`): after the jobs, [`SLOT`] bytes per job, the
 /// words the job puts in front of its record in its place.
@@ -49,7 +53,7 @@ ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
-// Where a folded job's words are (`PREFIXES`), 32 bytes a job.
+// Where a folded job's words are (`PREFIXES`), 64 bytes a job (`SLOT`).
 static const uint PREFIXES = 4112;
 static const uint GROUPS = 1u << 20;
 groupshared uint costs[64];
@@ -185,7 +189,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     // A folded execution's command: the root arguments it sets, then the record.
     uint prefix = job.w & 15u;
     for (uint p = 0; p < prefix; p++) {
-        dst_args.Store(job.z + p * 4, jobs.Load(PREFIXES + id.x * 32 + p * 4));
+        dst_args.Store(job.z + p * 4, jobs.Load(PREFIXES + id.x * 64 + p * 4));
     }
     for (uint s = 0; s < words; s++) {
         dst_args.Store(job.z + prefix * 4 + s * 4, record[s]);

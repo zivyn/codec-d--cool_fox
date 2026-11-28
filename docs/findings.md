@@ -63,6 +63,9 @@ in that order of size:
   targets and depth buffers use. They are in now (`victory-formats`, from addrlib's RB+ patterns;
   the pipes and packers of a Series X are an estimate, `VICTORY_TILE_GPU=8,4` tries others) and
   the warning names the mode, size and format of the texture.
+  The log prints the pipe and packer pair in use at startup ("XOR swizzle modes are laid out for ...");
+  `VICTORY_XOR_UPLOAD=0` and `VICTORY_XOR_READBACK=0` each leave the XOR modes out of the uploads / of the
+  read-backs, so the water can be compared with and without the guessed pair.
 - **A device loss about every 16 minutes**: a page fault inside a texture made in the same
   tenth of a second. A slot showed it before its upload had run.
   `VICTORY_SHOW_AFTER=1`; none in the sessions since (likely fixed, not proven).

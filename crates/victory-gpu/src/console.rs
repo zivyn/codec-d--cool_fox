@@ -51,22 +51,26 @@ fn tile_gpu(console: Console) -> victory_formats::texture::Gpu {
         Console::SeriesX => Gpu::SERIES_X,
         Console::SeriesS => Gpu::SERIES_S,
     };
-    let Ok(spec) = std::env::var("VICTORY_TILE_GPU") else {
-        return own;
-    };
-    let chosen = spec.split_once(',').and_then(|(pipes, packers)| {
+    let spec = std::env::var("VICTORY_TILE_GPU").ok();
+    let chosen = spec.as_deref().and_then(|spec| {
+        let (pipes, packers) = spec.split_once(',')?;
         Gpu::from_counts(pipes.trim().parse().ok()?, packers.trim().parse().ok()?)
     });
-    match chosen {
-        Some(gpu) => {
-            tracing::info!(%spec, "XOR swizzle modes laid out for this many pipes and packers (VICTORY_TILE_GPU)");
-            gpu
-        }
-        None => {
-            tracing::warn!(%spec, "VICTORY_TILE_GPU is not a pair of pipe and packer counts addrlib has patterns for; the console's is used");
-            own
-        }
+    if let (Some(spec), None) = (&spec, chosen) {
+        tracing::warn!(%spec, "VICTORY_TILE_GPU is not a pair of pipe and packer counts addrlib has patterns for; the console's is used");
     }
+    let gpu = chosen.unwrap_or(own);
+    // What the XOR modes are laid out by, for every run: an estimate unless the variable says another, and the two
+    // switches that take them out again.
+    tracing::info!(
+        pipes = 1u32 << gpu.pipes_log2(),
+        packers = 1u32 << gpu.packers_log2(),
+        source = if chosen.is_some() { "VICTORY_TILE_GPU" } else { "estimate for the console" },
+        xor_upload = crate::resource::xor_upload(),
+        xor_readback = crate::resource::xor_readback(),
+        "XOR swizzle modes are laid out for this many pipes and packers (VICTORY_XOR_UPLOAD=0 and VICTORY_XOR_READBACK=0 leave them out)"
+    );
+    gpu
 }
 
 pub fn current() -> Console {

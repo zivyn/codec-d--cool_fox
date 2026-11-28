@@ -305,7 +305,8 @@ impl Shader {
         let res_ret = m.named_struct("dx.types.ResRet.f32", vec![f32, f32, f32, f32, i32]);
         let main_ty = m.func_ty(void, vec![]);
         m.ptr(main_ty);
-        let main = m.function("main", main_ty, None, true);
+        let ftz = super::denorm::f32_ftz().then_some(Attr::Fp32Ftz);
+        let main = m.function("main", main_ty, ftz, true);
         let entry = m.new_block();
         Shader {
             m,

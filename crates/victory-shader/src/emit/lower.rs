@@ -1056,8 +1056,7 @@ fn f16_nearest_on() -> bool {
     if let Some(on) = TEST_F16_NEAREST.get() {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
+    super::f16_level::level() >= 1
 }
 
 #[cfg(test)]
@@ -9427,9 +9426,13 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                // (to nearest as the console does, with `VICTORY_F16_NEAREST=2`)
+                let h = if super::f16_level::mix_and_packed() {
+                    self.f16_nearest(r)
+                } else {
+                    self.s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r])
+                };
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -10648,8 +10651,12 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                if super::f16_level::mix_and_packed() {
+                    self.f16_nearest(f)
+                } else {
+                    self.s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                }
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {

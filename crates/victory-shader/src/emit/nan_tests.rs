@@ -22,7 +22,7 @@ use super::{HostShader, lower};
 
 /// What an op should give for a case.
 #[derive(Clone, Copy, Debug)]
-enum Want {
+pub(super) enum Want {
     /// These bits, or any NaN where the model says NaN.
     Bits(u32),
     /// Any NaN.
@@ -42,7 +42,7 @@ enum Want {
     Any,
 }
 
-fn f(x: u32) -> f32 {
+pub(super) fn f(x: u32) -> f32 {
     f32::from_bits(x)
 }
 
@@ -59,7 +59,7 @@ fn half_nan(h: u16) -> bool {
     h & 0x7C00 == 0x7C00 && h & 0x3FF != 0
 }
 
-fn judge(got: u32, want: Want) -> bool {
+pub(super) fn judge(got: u32, want: Want) -> bool {
     let g = f(got);
     match want {
         Want::Bits(b) => got == b || g.is_nan() && f(b).is_nan(),
@@ -118,7 +118,7 @@ fn f16_rtz(x: f32) -> u16 {
 }
 
 /// A float as a half, rounded to nearest, ties to even (`v_cvt_f16_f32`).
-fn f16_rne(x: f32) -> u16 {
+pub(super) fn f16_rne(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let e = ((b >> 23) & 0xFF) as i32;
@@ -152,7 +152,7 @@ fn f16_rne(x: f32) -> u16 {
     sign | h as u16
 }
 
-fn max_f(a: f32, b: f32) -> f32 {
+pub(super) fn max_f(a: f32, b: f32) -> f32 {
     if a.is_nan() {
         b
     } else if b.is_nan() {
@@ -186,7 +186,7 @@ fn min_f(a: f32, b: f32) -> f32 {
 }
 
 /// `0 x anything = 0`.
-fn legacy(a: f32, b: f32) -> f32 {
+pub(super) fn legacy(a: f32, b: f32) -> f32 {
     if a == 0.0 || b == 0.0 { 0.0 } else { a * b }
 }
 

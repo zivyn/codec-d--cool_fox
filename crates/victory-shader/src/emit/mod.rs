@@ -99,6 +99,8 @@
 mod bench_tests;
 mod bitcode;
 mod container;
+mod denorm;
+mod f16_level;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 pub mod form;
@@ -136,6 +138,8 @@ mod size_tests;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod nan_tests;
+#[cfg(all(test, windows))]
+mod nan2_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]

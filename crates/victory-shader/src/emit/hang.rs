@@ -116,6 +116,12 @@ pub(super) fn reporting() -> bool {
     printing() > 0
 }
 
+/// Whether the lines of `VICTORY_HANG_AUDIT` are asked for (`victory translate` then tells the
+/// translator which program it is translating, so that the lines name it).
+pub fn audit_asked_for() -> bool {
+    printing() > 0
+}
+
 /// Forgets the last audit (a program starts).
 pub(super) fn forget() {
     LAST.take();

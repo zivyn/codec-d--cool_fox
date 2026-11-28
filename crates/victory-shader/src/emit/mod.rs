@@ -108,7 +108,7 @@ mod hang_tests;
 mod kept_wide;
 mod wide_class;
 pub use form::Form;
-pub use hang::{HANG_NOTE, say as say_hang_note};
+pub use hang::{HANG_NOTE, audit_asked_for as hang_audit, say as say_hang_note};
 #[cfg(all(test, windows))]
 mod form_tests;
 #[cfg(all(test, windows))]

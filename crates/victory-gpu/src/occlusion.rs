@@ -532,11 +532,17 @@ float4 corner(uint id : SV_VertexID) : SV_Position {
         draw(0.3);
         // An end whose begin was in the part before a cut is not recorded.
         list.query_end(&heap, 0, 5);
+        list.close();
+        // The resolve is in the list after it, as the title's is (the end of
+        // the frame): the query that was left open was ended by the close.
+        let Ok(after) = host.new_list() else {
+            return;
+        };
         // The title's buffer: three results and a word that stays as it is.
         let mut title = [0xAAAA_AAAA_AAAA_AAAAu64; 4];
         assert!(super::host::resolve(
             host,
-            &list,
+            &after,
             &heap,
             8,
             0,
@@ -549,7 +555,7 @@ float4 corner(uint id : SV_VertexID) : SV_Position {
         // More than the buffer holds is not resolved.
         assert!(!super::host::resolve(
             host,
-            &list,
+            &after,
             &heap,
             8,
             0,
@@ -559,11 +565,12 @@ float4 corner(uint id : SV_VertexID) : SV_Position {
             0,
             32
         ));
-        list.close();
+        after.close();
         // With the debug layer on: nothing it objects to was recorded.
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
-        host.execute(&[&list]);
+        host.execute(&[&list, &after]);
         list.reset();
+        after.reset();
         let pixels = u64::from(SIZE * SIZE);
         assert_eq!(title[0], pixels, "the draw in front is seen by every pixel");
         assert_eq!(title[1], 0, "the draw behind it by none");

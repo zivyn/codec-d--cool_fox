@@ -1390,8 +1390,96 @@ fn code_digits(c: &Container) -> String {
     blake3::hash(code).to_hex()[..8].to_owned()
 }
 
-/// The translated program, and the wave size it requires of the host.
+/// Which programs get the branches that close or leave their loops taken by each host wave
+/// together where cross-lane code depends on the wave ([`emit_program`]), `VICTORY_LOOPS_WAVE`:
+/// - `1`: console wave64 compute programs on a host of 32-lane waves;
+/// - `2`: every compute program;
+/// - unset or anything else: none (off).
+fn loops_wave(native: &NativeProgram) -> bool {
+    if native.stage != HwStage::Cs {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(mode) = TEST_LOOPS_WAVE.get() {
+        return mode == 2 || mode == 1 && native.wave64 && lower::host_max_wave() == 32;
+    }
+    match std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) {
+        Some("2") => true,
+        Some("1") => native.wave64 && lower::host_max_wave() == 32,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_LOOPS_WAVE`, for its thread only.
+    pub(super) static TEST_LOOPS_WAVE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`emit_program_plain`]; a program that comes out depending on the host's waves is
+/// translated once more with the per-lane branches that close or leave its loops taken by
+/// each host wave together ([`structure::structure_wide_host`]), and that translation is the
+/// one given if it needs no wider waves (`VICTORY_LOOPS_WAVE`, off by default).
+///
+/// Why: the lowering turns the console's wave loops into loops each lane leaves on its own,
+/// and takes the code behind a loop as code the whole wave runs together. On NVIDIA the lanes
+/// that left a loop early run on as a wave of their own, so a ballot, a first-lane read or an
+/// exchange between the halves of a console wave behind the loop saw a part of the wave: in
+/// the water's tile generation (`GenerateTiles`: a loop over a tile's light slots, then a
+/// count of the lanes that found a local light and an atomic add of that count) the tiles with
+/// local lights never counted themselves in, their list stayed empty and those tiles of the
+/// water kept no light: dark rectangles beside lit objects.
+///
+/// (Ported from trustno1-coder/VIctory-NVIDIA, "Water light on, ...", GPL-3.0.)
 fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let first = emit_program_plain(c, native, p, st, io, res);
+    let Ok((_, Some(wave))) = &first else {
+        return first;
+    };
+    if !loops_wave(native) || !st.host_wide.is_empty() {
+        return first;
+    }
+    let loops = lower::loop_branches(p, st);
+    if loops.is_empty() {
+        return first;
+    }
+    let needs = lower::take_needs();
+    let again = structure::structure_wide_host(p, &st.wide, &loops).and_then(|st| {
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_program_plain(c, native, p, &st, io, &res)
+    });
+    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    match again {
+        Ok((shader, Some(w))) if w <= *wave => {
+            if why {
+                eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
+            }
+            lower::take_needs();
+            Ok((shader, Some(w)))
+        }
+        other => {
+            if why {
+                let what = match &other {
+                    Ok((_, w)) => format!("wave {w:?}"),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!("WAVE-LOOPS not taken ({} loop branches): {what}", loops.len());
+            }
+            lower::set_needs(needs);
+            first
+        }
+    }
+}
+
+/// The translated program, and the wave size it requires of the host.
+fn emit_program_plain(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

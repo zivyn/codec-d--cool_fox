@@ -603,6 +603,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        #[cfg(feature = "diagnostics")]
+        if !this.is_null() {
+            crate::list::tag_queue(lists, queue(this).kind);
+        }
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;

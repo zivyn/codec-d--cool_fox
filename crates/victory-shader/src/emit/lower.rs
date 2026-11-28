@@ -7605,11 +7605,8 @@ impl<'a> Lower<'a> {
         };
         let src = Source::Loaded { load: site, first };
         // A descriptor whose words nothing computes with asks no view of it: the query below is cleaned up.
-        let numbers = (0..count).any(|k| {
-            inst.write(Reg::S(code + k as u8))
-                .is_some_and(|v| self.read_as_number(v))
-        });
-        let before = std::mem::replace(&mut self.bindless.fallback, !numbers);
+        let quiet = bindless::on() && !self.words_are_numbers(inst, code, count);
+        let before = std::mem::replace(&mut self.bindless.fallback, quiet);
         let h = self.handle(site, &src, false, props);
         self.bindless.fallback = before;
         let h = h?;

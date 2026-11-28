@@ -60,6 +60,8 @@ pub(super) struct Entries {
     windowed: HashSet<(u8, u32)>,
     /// Entries some access reads through the view.
     viewed: HashSet<(u8, u32)>,
+    /// The values some scalar or vector arithmetic (or a join) reads, found once ([`Lower::words_are_numbers`]).
+    read: Option<HashSet<Value>>,
     /// The view branch of a window access is being made: its handle is no use of the view in itself.
     pub(super) fallback: bool,
 }
@@ -74,6 +76,30 @@ impl Entries {
 }
 
 impl<'a> Lower<'a> {
+    /// Whether the dwords `code..code + count` the scalar load `inst` wrote are read as numbers by some instruction
+    /// (as [`Lower::read_as_number`] says of each, from one pass over the program instead of one for each).
+    pub(super) fn words_are_numbers(&mut self, inst: &Inst, code: u8, count: u32) -> bool {
+        if self.bindless.read.is_none() {
+            let mut read = HashSet::new();
+            for b in &self.x.p.blocks {
+                for p in &b.phis {
+                    read.extend(p.args.iter().copied());
+                }
+                for i in &b.insts {
+                    if matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_)) {
+                        read.extend(i.reads.iter().map(|r| r.1));
+                    }
+                }
+            }
+            self.bindless.read = Some(read);
+        }
+        let read = self.bindless.read.as_ref();
+        (0..count).any(|k| {
+            inst.write(Reg::S(code + k as u8))
+                .is_some_and(|v| read.is_some_and(|r| r.contains(&v)))
+        })
+    }
+
     /// Notes that a handle of the view `src` names is made: its table entries are read through their
     /// views by this program.
     pub(super) fn note_view(&mut self, src: &Source) {

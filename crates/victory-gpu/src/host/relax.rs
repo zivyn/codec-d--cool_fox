@@ -77,6 +77,7 @@ pub(super) fn deep() -> bool {
 /// What a `Host` step is, for what a thread other than the one that submits may do with it (every `HostList::defer_host`
 /// says).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum Kind {
     /// Not said: never done by the thread.
     Other,

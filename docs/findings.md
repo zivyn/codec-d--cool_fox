@@ -175,3 +175,88 @@ before the next is looked at (`VICTORY_LATE_WAIT` off by default, and its two st
 preparing 105 -> 69 ms while the frame stayed put). Two frames in flight end to end —
 `settle`, the relay that lands flights, `copied_read`, the queue behind — is the next thing
 worth measuring, and the only one of these that can plausibly reach 15 fps at Series X.
+
+# What was learned on an RTX 5080 (2026-11-27)
+
+One PC: Ryzen 9 9950X3D (16 cores, 32 threads), 64 GB, RTX 5080 16 GB (driver 621.24),
+Windows 11 26300, NVMe SSD. Series X profile, 2560x1440 output, DLSS Performance, frame
+generation off, diagnostics build at `df2daaf`, pipelines made ahead with `victory warm`.
+Two runs over the same stretch of the title, from the same save: the cutscenes of Lucia's
+arrest, the café and the prison interview, then Jason's introduction on the boat and a
+minute standing still on it. Run A with the launcher's settings, run B the same plus
+`VICTORY_BVH_BUILDER=1` (and `VICTORY_BVH_TRACE=1`). Figures are the log's ten-second lines;
+"steady" is the last 70 s of each run, on the boat, where `draws/frame` agrees within 5 %.
+
+## Without the builder: the card waits for us
+
+| Run A | Median of the run | Steady (boat) |
+|---|---|---|
+| Frames a second | 35.2 (p10 26.1, p90 45.2) | 34-38 |
+| Frame | 28.4 ms | 26-29 ms |
+| `preparing` | 21.1 ms | 20-22 ms |
+| The card busy, by its own clock | 71 % | 68-87 % |
+| Draws dropped without a host pipeline | 127 a frame | 80-90 |
+
+The card is idle 8-9 ms of a frame, and the log names that time as "while the submitting
+thread was working (the card idle behind us)". On this card the frame is the submitting
+thread's, as on the 7900 XTX.
+
+## With the builder: the cost is on the CPU here, not on the card
+
+| Steady, on the boat | A | B (`VICTORY_BVH_BUILDER=1`) |
+|---|---|---|
+| Frames a second | ~35 | ~23.5 |
+| Frame | ~28 ms | ~42 ms |
+| `preparing` | 20.5 ms | 31 ms |
+| The submitting thread worked | 26.5 ms | 44.4 ms |
+| The card busy | 68-87 % | 62-84 % |
+| The card idle behind us | ~8 ms | 8-15 ms |
+| Copies (frame line) | 10.0 ms, 37 MB | 15.1 ms, 41 MB |
+| Copying back (relay) | 5.2 ms | 9.1 ms |
+| Landing: merging what was fetched | 1.6 ms | 4.9 ms |
+| Landing threads waiting for the title's bytes going in | 1.1 ms | 9.5 ms |
+| Draws dropped without a host pipeline | 80-90 a frame | 1 |
+
+On the 7900 XTX the builder cost some 40 ms of the card a frame (`fork-ray-tracing.md`).
+On the RTX 5080 the card keeps its headroom and is still idle behind the submitting thread;
+what grows is our side of title memory by address (23,810 pages, 1.5 GB in 25 arenas, about
+24 pages a frame touched with no copy): copies, copying back and landing. So here 30 fps
+with the title's ray tracing is the same problem as 30 fps without it, the submitting
+thread, plus about 10 ms of landing and copies.
+
+The 127 draws a frame dropped in run A are 1 in run B: they are passes that need the
+builder's pipelines.
+
+## The first minutes with the builder
+
+Run B was made twice; the second time after a `victory warm` that found nothing left to
+make (88,605 pipelines known, all made before). Both times the first three minutes of the
+cutscenes ran at 1-4 frames a second (frames of 270-930 ms), and both times the boat settled
+at the same figures (second run: 21-25 fps, 39-47 ms, `preparing` 27-31 ms). So the slow
+start is not pipelines missing from the driver's cache. What the log shows in it:
+
+- The builder unpacking the shipped static structures: 700-1,040 builder dispatches a
+  frame, 30-75 MB of packed structures arriving every ten seconds, 500-1,050 pages a frame
+  touched that had no copy yet. After about two minutes it falls to 180-280 dispatches.
+- Pipelines still being made: about 1,100 in flight at the start, drained after 3.5 min
+  (run A, same build and book: about 830, drained in one minute).
+- The card 6-20 % busy and, of a 270 ms frame, about 190 ms "while the title had not
+  submitted": the title itself is not giving us work then. What it waits for is not shown
+  by these lines.
+
+Cutscene audio ran on meanwhile while the picture stood still for seconds (for less time in
+the second run). The picture, both times: blown-out light and black patches, more broken
+than without the builder; milder in the second run.
+## The structures' sizes
+
+Of the copies of dynamic structures `VICTORY_BVH_TRACE` recorded, 175 of 2,972 (first run)
+and 63 of 2,967 (second) were of a structure whose compacted size it had seen arrive; it saw
+each size arrive one frame after it was asked (`0x0 -> 0x21300`). Whether the other copies
+used a stale size, or the trace does not tie them to their ask, is not settled by these runs.
+
+## Shaders on 32-lane waves
+
+`victory shaders` with `VICTORY_HOST_WAVE=32`: 25,760 in the cache, 225 do not translate:
+198 containers without a vertex, pixel, compute or mesh program, 22 wave64 programs with no
+wave32 lowering, 5 with a descriptor read only as data. Two of the 22 were created in these
+runs (`6b82bc7d22016cb5`, `a10179ab7eda0dc3`, both compute).

@@ -1485,9 +1485,77 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     let _ = (this, x, y, z, flags);
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: queries are answered when resolved. With
+/// `VICTORY_REAL_OCCLUSION=1` an occlusion query also begins on the host list.
+extern "system" fn query_begin(this: This, heap: This, kind: u32, index: u32) {
+    crate::occlusion::began();
+    #[cfg(windows)]
+    host_query(this, heap, kind, index, true);
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `EndQuery(heap, type, index)`: see [`query_begin`].
+extern "system" fn query_end(this: This, heap: This, kind: u32, index: u32) {
+    crate::occlusion::ended();
+    #[cfg(windows)]
+    host_query(this, heap, kind, index, false);
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// The host list begins or ends the query, if the title heap has a host heap.
+#[cfg(windows)]
+fn host_query(this: This, heap: This, kind: u32, index: u32, begin: bool) {
+    if !crate::occlusion::real() {
+        return;
+    }
+    let (Some(list), Some((host, capacity))) =
+        (host_list(this), crate::query::host_heap_of(heap))
+    else {
+        crate::occlusion::not_run();
+        return;
+    };
+    if begin {
+        crate::occlusion::host::begin(list, &host, capacity, kind, index);
+    } else {
+        crate::occlusion::host::end(list, &host, capacity, kind, index);
+    }
+}
+
+/// With `VICTORY_REAL_OCCLUSION=1`: the resolve of an occlusion heap goes to
+/// the host list, whose samples are copied to the title's buffer when the
+/// list has run. False if it is not one of those (the made-up answer stands).
+#[cfg(windows)]
+fn resolve_on_host(
+    this: This,
+    heap: This,
+    kind: u32,
+    first: u32,
+    count: u32,
+    buffer: This,
+    offset: u64,
+) -> bool {
+    const BINARY: u32 = 1;
+    if !crate::occlusion::real() || kind > BINARY {
+        return false;
+    }
+    let (Some(list), Some((queries, capacity)), Some((data, room)), Some(host)) = (
+        host_list(this),
+        crate::query::host_heap_of(heap),
+        crate::resource::buffer_bytes(buffer),
+        crate::host::host(),
+    ) else {
+        return false;
+    };
+    let done = crate::occlusion::host::resolve(
+        host, list, &queries, capacity, kind, first, count, data, offset, room,
+    );
+    if done {
+        crate::occlusion::resolved(kind, count, heap as usize, true);
+    }
+    done
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -1498,9 +1566,9 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// not measured ones (time spans come out as the submission's length).
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
@@ -1509,6 +1577,13 @@ extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
+    #[cfg(windows)]
+    if resolve_on_host(this, heap, kind, first, count, buffer, offset) {
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = first;
+    crate::occlusion::resolved(kind, count, heap as usize, false);
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
@@ -2345,8 +2420,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, query_begin as *const ()),            // 0xe0 BeginQuery
+    (29, query_end as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310

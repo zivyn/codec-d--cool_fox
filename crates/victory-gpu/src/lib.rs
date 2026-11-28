@@ -53,6 +53,8 @@ mod land;
 mod lean;
 pub mod list;
 pub mod object;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod occlusion;
 pub mod pipeline;
 #[cfg(windows)]
 mod picked;

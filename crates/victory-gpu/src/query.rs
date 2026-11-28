@@ -1,5 +1,6 @@
-//! Query heaps. Nothing runs on a GPU yet, so no query ever produces a
-//! result; the heap only remembers its description.
+//! Query heaps. A heap remembers its description; with
+//! `VICTORY_REAL_OCCLUSION=1` an occlusion heap also has a host heap behind
+//! it ([`crate::occlusion`]). Every other kind produces no result of its own.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUERY_HEAP, Table, This, guid};
@@ -29,6 +30,59 @@ pub(crate) struct Desc {
 struct Heap {
     object: Object,
     desc: Desc,
+    /// The host heap of an occlusion heap, with `VICTORY_REAL_OCCLUSION=1`.
+    #[cfg(windows)]
+    host: Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap>,
+}
+
+/// The host heap behind a title heap and how many queries it holds, if the
+/// title's `heap` is one of ours of the occlusion kind and the switch is on.
+#[cfg(windows)]
+pub(crate) fn host_heap_of(
+    heap: This,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap, u32)> {
+    if heap.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes objects of ours; the first word of any of them
+    // is its table, which tells ours apart before the rest is read.
+    unsafe {
+        if heap.cast::<*const *const ()>().read() != FUNCTIONS.0.as_ptr() {
+            return None;
+        }
+        let heap = &*heap.cast::<Heap>();
+        heap.host.clone().map(|host| (host, heap.desc.count))
+    }
+}
+
+/// The host heap of a heap description: occlusion only, and only when asked.
+#[cfg(windows)]
+fn host_heap(desc: &Desc) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12QueryHeap> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_QUERY_HEAP_DESC, D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+    };
+    const OCCLUSION: u32 = 0;
+    if !crate::occlusion::real() || desc.kind != OCCLUSION || desc.count == 0 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let mut heap = None;
+    // SAFETY: a plain description, a live device.
+    let made = unsafe {
+        host.device.CreateQueryHeap(
+            &D3D12_QUERY_HEAP_DESC {
+                Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+                Count: desc.count,
+                NodeMask: 0,
+            },
+            &mut heap,
+        )
+    };
+    if let Err(e) = made {
+        tracing::warn!(error = %e, count = desc.count, "no host occlusion query heap");
+        return None;
+    }
+    heap
 }
 
 /// Device method.
@@ -46,7 +100,18 @@ pub(crate) extern "system" fn create(
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
         desc,
+        #[cfg(windows)]
+        host: host_heap(&desc),
     });
+    #[cfg(windows)]
+    if crate::occlusion::real() {
+        tracing::info!(
+            kind = desc.kind,
+            count = desc.count,
+            host = heap.host.is_some(),
+            "the title makes a query heap"
+        );
+    }
     object::hand_out(QUERY_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
@@ -117,6 +182,31 @@ mod tests {
             E_NOINTERFACE
         );
         assert!(heap.is_null());
+    }
+
+    /// Only the title's own heaps have a host heap to give, and only with
+    /// `VICTORY_REAL_OCCLUSION=1` (the test process does not set it).
+    #[cfg(windows)]
+    #[test]
+    fn a_heap_has_no_host_heap_unless_asked_for() {
+        assert!(host_heap_of(std::ptr::null()).is_none());
+        let desc = Desc {
+            kind: 0,
+            count: 8,
+            nodes: 0,
+        };
+        let mut heap = std::ptr::null();
+        assert_eq!(
+            create(std::ptr::null(), &desc, &HEAP_IIDS[0], &mut heap),
+            S_OK
+        );
+        if !crate::occlusion::real() {
+            assert!(host_heap_of(heap).is_none());
+        }
+        // Something that is not a heap of ours is not read as one.
+        let not_ours = [0usize; 8];
+        assert!(host_heap_of(not_ours.as_ptr().cast()).is_none());
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap), 0);
     }
 
     #[test]

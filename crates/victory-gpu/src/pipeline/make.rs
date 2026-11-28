@@ -286,7 +286,7 @@ impl Pending {
             self.making_at.store(began.duration_since(epoch()).as_micros() as u64 + 1, Ordering::Relaxed);
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            note_made(began.elapsed());
+            note_made(began.elapsed(), self.background);
             made
         });
         let (lock, done) = &DONE;
@@ -400,9 +400,13 @@ static AVERAGE_US: AtomicU64 = AtomicU64::new(0);
 static WORKERS: AtomicU64 = AtomicU64::new(0);
 static BUSY: AtomicU64 = AtomicU64::new(0);
 
-fn note_made(took: Duration) {
-    let old = AVERAGE_US.load(Ordering::Relaxed);
-    AVERAGE_US.store(averaged(old, took.as_micros() as u64), Ordering::Relaxed);
+fn note_made(took: Duration, background: bool) {
+    // (A resolve made in the background is not what a draw waits for: its seconds would tell
+    // every wait that the pipelines take too long to be worth it.)
+    if !background {
+        let old = AVERAGE_US.load(Ordering::Relaxed);
+        AVERAGE_US.store(averaged(old, took.as_micros() as u64), Ordering::Relaxed);
+    }
     let us = took.as_micros() as u64;
     BATCH_WORK_US.fetch_add(us, Ordering::Relaxed);
     BATCH_MADE.fetch_add(1, Ordering::Relaxed);

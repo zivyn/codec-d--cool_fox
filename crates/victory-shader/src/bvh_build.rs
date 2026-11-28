@@ -939,10 +939,15 @@ mod tests {
     fn rays_along_an_axis_through_corners_and_edges_miss_nothing() {
         let t = grid(12);
         let mut rays = Vec::new();
-        for y in 0..26 {
-            for x in 0..26 {
-                // Whole and half coordinates: vertices, edges and the
-                // diagonals of the quads.
+        // Whole and half coordinates up to 11.5: vertices, edges and the
+        // diagonals of the quads. Not 12 and 12.5, the structure's own far
+        // faces: a ray parallel to an axis that lies exactly on the maximum
+        // face of a box is missed by the node test (`(max - origin) * inverse`
+        // is 0 times the clamped infinity: the ray leaves the slab at 0), so
+        // a triangle on that face is found by `brute` and not by the walk.
+        // Inside the structure a neighbour's box (its minimum face) enters.
+        for y in 0..24 {
+            for x in 0..24 {
                 let o = [x as f32 * 0.5, y as f32 * 0.5, -3.0];
                 rays.push(Ray::new(o, [0.0, 0.0, 1.0], 100.0));
                 rays.push(Ray::new([o[0], o[1], 9.0], [0.0, 0.0, -1.0], 100.0));

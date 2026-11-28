@@ -142,10 +142,8 @@ impl Reverb {
     /// `channels` of them, in the layout asked for) with the reverb of
     /// `input` (silence when null): the mean of the channels in, a channel
     /// of the network's output per channel out, scaled by the command's
-    /// `gains`: for a mono stream a ramp from the first to the second over
-    /// the block (what two gains can mean on one channel, and no step when
-    /// the next block starts where this one ended), for a stereo one a gain
-    /// for each channel.
+    /// `gains`: a ramp from the first to the second over the block, the same
+    /// for every channel (no step where the next block starts at the second).
     ///
     /// # Safety
     /// `output` holds `frames * channels` floats; `input`, if not null,
@@ -167,10 +165,10 @@ impl Reverb {
             }
         };
         let started = std::time::Instant::now();
-        let ramp = channels == 1 && gains[0] != gains[1];
+        let ramp = gains[0] != gains[1];
         let step = self.last_gain.is_some_and(|g| (g - gains[0]).abs() > 1e-4);
         crate::modules::audio::stats::COUNTERS.reverb_gains(ramp, step);
-        self.last_gain = Some(if channels == 1 { gains[1] } else { gains[0] });
+        self.last_gain = Some(gains[1]);
         // A sample that is not a number would stay in the network for good.
         let (mut input_peak, mut output_peak, mut repaired) = (0f32, 0f32, false);
         for n in 0..frames {
@@ -195,16 +193,12 @@ impl Reverb {
                 repaired = true;
             }
             output_peak = output_peak.max(left.abs()).max(right.abs());
+            let gain = gains[0] + (gains[1] - gains[0]) * (n as f32 / frames as f32);
             // SAFETY: as above; every input of this frame is read already.
             unsafe {
-                let gain = if channels == 1 {
-                    gains[0] + (gains[1] - gains[0]) * (n as f32 / frames as f32)
-                } else {
-                    gains[0]
-                };
                 output.add(index(n, 0)).write(left * gain * self.level);
                 if channels > 1 {
-                    output.add(index(n, 1)).write(right * gains[1] * self.level);
+                    output.add(index(n, 1)).write(right * gain * self.level);
                 }
             }
         }
@@ -294,8 +288,8 @@ mod tests {
         assert!(out.iter().all(|&v| v == 0.0));
     }
 
-    /// Stereo: the two channels differ, the gains scale them, and the two
-    /// layouts agree on the same samples.
+    /// Stereo: the two channels differ, and the two layouts agree on the
+    /// same samples.
     #[test]
     fn stereo_channels_are_decorrelated_and_gained() {
         let frames = 4096;
@@ -453,5 +447,45 @@ mod tests {
             }
         }
         assert!(edge <= inside * 1.15, "edge {edge}, inside {inside}");
+    }
+
+    /// Two channels (planar, as a stereo or multichannel stream) take the
+    /// same ramp: with gains that move from block to block, neither
+    /// channel has a step at a block's edge beyond its own jumps inside.
+    #[test]
+    fn stereo_blocks_ramp_their_gains_without_edge_steps() {
+        let (frames, blocks) = (1024, 40);
+        let mut reverb = Reverb::new(2.0, 1.0);
+        let tone = |n: usize| 0.5 * (n as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin();
+        let mut out = [Vec::new(), Vec::new()];
+        for b in 0..blocks {
+            let at = |k: usize| 1.0 - (k % 20) as f32 / 10.0;
+            let gains = [at(b).abs(), at(b + 1).abs()];
+            let input: Vec<f32> = (0..2 * frames)
+                .map(|i| tone(b * frames + i % frames))
+                .collect();
+            let mut block = vec![0f32; 2 * frames];
+            // SAFETY: two channels of `frames` floats each.
+            unsafe {
+                reverb.block(input.as_ptr(), block.as_mut_ptr(), frames, 2, false, gains);
+            }
+            out[0].extend_from_slice(&block[..frames]);
+            out[1].extend_from_slice(&block[frames..]);
+        }
+        for channel in &out {
+            let (mut inside, mut edge) = (0f32, 0f32);
+            for (n, w) in channel.windows(2).enumerate().skip(frames * 8) {
+                let jump = (w[1] - w[0]).abs();
+                if (n + 1) % frames == 0 {
+                    edge = edge.max(jump);
+                } else {
+                    inside = inside.max(jump);
+                }
+            }
+            assert!(
+                inside > 0.0 && edge <= inside * 1.15,
+                "edge {edge}, inside {inside}"
+            );
+        }
     }
 }

@@ -1232,6 +1232,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Whether this recording has any `Step::Placed` copy
+    /// ([`place`]'s `HostList::place_constant`).
+    has_placed: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2352,6 +2355,12 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Ranges `[dst, dst + len)` written on the GPU by `Step::Placed` in
+    /// this recording, in order, with the destination host copy.
+    placed_written: Vec<(usize, usize, std::sync::Arc<crate::shadow::Shadow>)>,
+    /// Current per-recording GPU buffer `(buffer, capacity, used)` for
+    /// inline placed constant snapshots ([`place`]).
+    placed_cbv: Option<(ID3D12Resource, u64, u64)>,
 }
 
 impl Deferred {
@@ -3952,6 +3961,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                has_placed: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -4292,6 +4302,7 @@ impl HostList {
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
+        self.has_placed.store(false, Ordering::Relaxed);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4837,6 +4848,8 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        let copy_dst = dst as usize;
+        deferred.placed_written.retain(|(a, b, _)| *b <= copy_dst || *a >= copy_dst.saturating_add(len));
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one

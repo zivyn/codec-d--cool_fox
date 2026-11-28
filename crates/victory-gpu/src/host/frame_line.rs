@@ -156,12 +156,14 @@ pub(super) fn late_line(frames: f64) {
     crate::land::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        let constants = place::CONSTANTS.swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
-            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote",
+            "title buffer copies at their place in the lists, per frame (VICTORY_COPIES_IN_PLACE): {:.1} of {:.1} KB, {:.1} of them out              of what shaders wrote; {:.2} copies into textures out of what shaders wrote; {:.1} constants read in place (VICTORY_PLACED_CONSTANTS)",
             t[0],
             t[1] / 1024.0,
             t[2],
             t[3],
+            constants,
         );
     }
     card_steps::log(frames);

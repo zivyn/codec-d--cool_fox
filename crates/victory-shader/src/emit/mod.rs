@@ -717,7 +717,11 @@ fn emit_forms(
     if result.is_err() {
         form = Form::Refused;
     }
-    if form != Form::Original && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+    if form != Form::Original
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && std::env::var_os("VICTORY_WAVE_WHY").is_some()
+    {
         eprintln!("WAVE64-FORM-FINAL ~{} {}", code_digits(c), form.label());
     }
     (result, form)
@@ -997,6 +1001,30 @@ fn emit_forms_in(
                 if done(&local) {
                     *form_out = local_form;
                     return local.map(|(shader, _)| shader);
+                }
+            }
+            // The exact local form (no barrier) of the program with the loop skips left out, as
+            // it was before `VICTORY_KEEP_LOOP_SKIPS`: each host wave on its own does not mind
+            // a wave with no lane walking a loop whose exit reads no other lane.
+            if exact && early_kept.len() + skips_kept.len() > 0 {
+                let left_out = [
+                    ("without early-outs, loop skips left out", ir::drop_early_outs_as(p, false).0, !early_kept.is_empty()),
+                    ("without skips, loop skips left out", ir::drop_skips_as(p, false, false).0, !skips_kept.is_empty()),
+                ];
+                for (name, program, kept) in left_out {
+                    if !kept {
+                        continue;
+                    }
+                    if let Some((p, st, io, res)) = form(name, program)
+                        && idiom(&p, &st)
+                    {
+                        let local = lower::with_local_waves(|| emit_program(c, native, &p, &st, &io, &res));
+                        report(&format!("local waves (idiom), {name}"), &local);
+                        if done(&local) {
+                            *form_out = Form::LocalIdiom;
+                            return local.map(|(shader, _)| shader);
+                        }
+                    }
                 }
             }
         }

@@ -2992,6 +2992,20 @@ fn land_aside() -> bool {
     crate::ab::live_flag!("VICTORY_LAND_ASIDE")
 }
 
+/// Whether the snapshots of the ranges shaders may write are copied by the kept threads while the submitting thread
+/// goes on, and waited for before the lists go to the card (`VICTORY_SNAP_ASIDE=1`; off by default): the 3.5 ms a
+/// frame of the "snapshots" stage ([`crate::shadow::take_snapshots_aside`] says why the bytes stay as they are).
+///
+/// The wait ([`crate::shadow::snapshots_wait`]) comes after what the thread does next ("copies in the card's
+/// memory", 12 ms a frame): before it settles flights for the card's results, before the next submission's
+/// refreshes are offered to the prefetch thread, and before the copies the lists put into host copies and the
+/// sending.
+fn snap_aside() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: each submission takes the answer once, and a submission that
+    // gave snapshots away waits for them before it sends, whatever the switch says by then.)
+    crate::ab::live_flag!("VICTORY_SNAP_ASIDE")
+}
+
 /// Whether anything is in the air.
 fn flying() -> bool {
     if !late() {
@@ -3032,6 +3046,28 @@ fn late_blocked_counted(runs: &[&HostList], count: bool) -> Option<usize> {
 fn ask_tokens() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_TOKENS").is_some_and(|v| v == "1"))
+}
+
+/// What a submission's one asking is about ([`crate::watch::once`]): per host copy the span of the ranges its lists
+/// refresh, if the copy is asked ahead; with `lean` ([`lean_steps`]) in tables the thread keeps.
+fn ask_spans(runs: &[&HostList], lean: bool) -> Vec<(usize, usize)> {
+    thread_local! {
+        static ASKED: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
+    }
+    let mut spans = scratch::Lean::of(&ASKED, lean);
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && shadow.asked_ahead()
+            {
+                let span = spans
+                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                    .or_insert((*address, *address + *len));
+                *span = (span.0.min(*address), span.1.max(*address + *len));
+            }
+        }
+    }
+    spans.values().copied().collect()
 }
 
 /// The write watch asked about `ranges` for a submission, in place of its
@@ -3969,6 +4005,7 @@ fn late_line(frames: f64) {
         return;
     }
     prefetch::line(frames);
+    askaside::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4101,6 +4138,7 @@ fn late_line(frames: f64) {
 }
 
 pub(crate) mod aside;
+mod askaside;
 mod combine;
 pub(crate) mod awake;
 mod card_steps;
@@ -6367,6 +6405,22 @@ impl Host {
         let ahead = Split::begin();
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // The write watch asked about what the lists refresh, on a thread of ours, while this one plans the steps it gives
+        // to the card, waits and sweeps (`VICTORY_ASK_ASIDE=1`, only with flights in the air: with none there is nothing to
+        // go beside). What the planning adds to the lists is asked after; a wait for flights, which lands title memory,
+        // makes the asking be made again after it (`flights_waited`).
+        let mut aside: Option<askaside::Offered> = None;
+        let mut aside_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut flights_waited = false;
+        if late && askaside::on() && crate::watch::once() && !ask_tokens() && flying() {
+            let ranges = ask_spans(runs, lean_steps());
+            if !ranges.is_empty() {
+                aside = askaside::begin(ranges.clone());
+                if aside.is_some() {
+                    aside_ranges = ranges;
+                }
+            }
+        }
         stage.next("submit: steps given to the card");
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
@@ -6386,6 +6440,7 @@ impl Host {
         {
             // What the flights land may be descriptors: a round after it.
             early = 0;
+            flights_waited = true;
             if relay_exact() && why == WHY_READ {
                 // Only until the flights that may write what is read have
                 // landed: their copy-back's end, not the card's other work.
@@ -6431,6 +6486,7 @@ impl Host {
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
+            flights_waited = true;
             self.settle(&mut submitted, WHY_SYNC);
             if upcheck::on() {
                 upcheck::at_rest(self);
@@ -6467,28 +6523,39 @@ impl Host {
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             // (With `VICTORY_LEAN_STEPS` the thread's kept table: the ranges are what it holds at the end.)
-            thread_local! {
-                static ASKED: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
-            }
-            let mut spans = scratch::Lean::of(&ASKED, batch.lean);
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
-                    }
-                }
-            }
-            let ranges: Vec<(usize, usize)> = spans.values().copied().collect();
-            drop(spans);
+            // Asked beside the planning (`VICTORY_ASK_ASIDE`): the title's lists were gathered then, and what is
+            // gathered now is the planning's own list, which comes first among `runs`.
+            let (ranges, own_ranges) = if aside.is_some() {
+                let own_ranges = if own.is_some() {
+                    ask_spans(&runs[..1], batch.lean)
+                } else {
+                    Vec::new()
+                };
+                let mut ranges = std::mem::take(&mut aside_ranges);
+                ranges.extend(own_ranges.iter().copied());
+                (ranges, own_ranges)
+            } else {
+                (ask_spans(runs, batch.lean), Vec::new())
+            };
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
-            ask_for_submission(&ranges, &mut asking);
+            match aside.take() {
+                Some(offered) => {
+                    // The asking made beside the planning is over (a drop of the holder waits for it).
+                    offered.join();
+                    if flights_waited {
+                        // What flights landed since is title memory written: everything is asked again, as it was
+                        // after any wait.
+                        askaside::redone();
+                        ask_for_submission(&ranges, &mut asking);
+                    } else if !own_ranges.is_empty() {
+                        askaside::more(own_ranges.len());
+                        crate::watch::ask_more(&own_ranges);
+                    }
+                }
+                None => ask_for_submission(&ranges, &mut asking),
+            }
             #[cfg(feature = "diagnostics")]
             split.part(0);
             stage.next("submit: title bytes under flights' writes");
@@ -6548,7 +6615,11 @@ impl Host {
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
-            crate::shadow::take_snapshots();
+            if snap_aside() {
+                crate::shadow::take_snapshots_aside();
+            } else {
+                crate::shadow::take_snapshots();
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
@@ -6560,6 +6631,8 @@ impl Host {
         // write follows them in the same submission.
         let flown = late && relay();
         if flown && self.card_results_low() {
+            // (Flights landed here write host copies: the snapshots given away are done first.)
+            crate::shadow::snapshots_wait();
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
@@ -6567,6 +6640,9 @@ impl Host {
         // What shaders may write through views they pick: last, so that no
         // refresh of this submission leaves it alone.
         let picked = crate::picked::declare(runs);
+        if !picked.written.is_empty() {
+            crate::shadow::snapshots_wait();
+        }
         for (shadow, at, len) in &picked.written {
             shadow.writing(*at, *len);
         }
@@ -6596,10 +6672,19 @@ impl Host {
                 // (Told once, as it may not be offered later either.)
                 offered = true;
                 if early && taken {
+                    // (The copies it refreshes may be those of declared ranges' neighbours: the snapshots first.)
+                    crate::shadow::snapshots_wait();
                     prefetch::offer(&excluding);
                 }
             }
         });
+        // The snapshots given away are done before the copies the lists put into host copies are written, and
+        // before the lists go anywhere (what it waits is still the snapshots' time of the frame line).
+        #[cfg(feature = "diagnostics")]
+        let snapshots_waited = std::time::Instant::now();
+        crate::shadow::snapshots_wait();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots_waited.elapsed().as_micros() as u64);
         if !offered && early {
             prefetch::offer(&excluding);
         }

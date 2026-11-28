@@ -1976,9 +1976,23 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
-    let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    // The number of this call: the thread that waits below takes only the
+    drop(queue_jobs(jobs));
+}
+
+/// Jobs given to the kept threads ([`queue_jobs`]) whose end the caller waits for later: when it drops this, or at
+/// [`Aside::wait`] before.
+pub(crate) struct Aside {
+    call: u64,
+    left: Arc<(Mutex<usize>, std::sync::Condvar)>,
+}
+
+/// Gives `jobs` to the kept threads and returns; they run in the order given, whoever is free first, until the
+/// caller waits ([`Aside::wait`], or dropping it), which takes the rest of them on its own thread, and returns
+/// when all have run.
+fn queue_jobs(jobs: Vec<Job>) -> Aside {
+    let workers = workers();
+    // The number of this call: the thread that waits takes only the
     // jobs of its own call. A job of another call may want a lock that this
     // thread holds (a copy's `copied`, held across the nested `wide` of
     // `Shadow::take_all`, and wanted by another span of the same copy in the
@@ -2005,23 +2019,43 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
-    loop {
-        let job = {
-            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-            queue.iter().position(|(of, _)| *of == call).and_then(|i| queue.remove(i)).map(|(_, job)| job)
-        };
-        match job {
-            Some(job) => {
-                workers.there.fetch_sub(1, Ordering::AcqRel);
-                job()
+    Aside { call, left }
+}
+
+impl Aside {
+    /// Runs the jobs of this call that no thread has taken, and waits for those that are being run; returns when all
+    /// are done (at once if they were).
+    pub(crate) fn wait(&self) {
+        let workers = workers();
+        loop {
+            let job = {
+                let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                queue
+                    .iter()
+                    .position(|(of, _)| *of == self.call)
+                    .and_then(|i| queue.remove(i))
+                    .map(|(_, job)| job)
+            };
+            match job {
+                Some(job) => {
+                    workers.there.fetch_sub(1, Ordering::AcqRel);
+                    job()
+                }
+                None => break,
             }
-            None => break,
+        }
+        let left = &self.left;
+        spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
+        let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+        while *n > 0 {
+            n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        self.wait();
     }
 }
 
@@ -2071,6 +2105,47 @@ pub(crate) fn take_snapshots() {
         return;
     }
     wide(copy_jobs(snaps));
+}
+
+/// The snapshots [`take_snapshots_aside`] gave to the kept threads and nobody has waited for yet.
+static SNAPS_ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
+
+/// [`take_snapshots`] without the wait (`VICTORY_SNAP_ASIDE=1`): the copies are given to the kept threads and the
+/// submitting thread goes on with what comes next, to wait for them ([`snapshots_wait`]) before anything that may
+/// write the bytes of a declared range or give the lists to the card. The snapshots are the 3.5 ms a frame of the
+/// submitting thread's "snapshots" stage (K6: 7.7 times a frame, 16 MB, 0.46 ms each, mostly the wake-ups and the
+/// wait for the slowest piece).
+///
+/// Why the bytes stay as they are meanwhile: a declared range is left alone by every refresh (a refresh of the
+/// next submission, begun early or not, leaves what is declared written by a submission in the air), the title's
+/// own copies write title memory and not the copy, the placed copies that write a host copy wait for it
+/// ([`snapshots_wait`] comes before them), and the card runs the lists only after it. A range some flight landed
+/// is not in what was noted (`Shadow::writing` takes the bytes no declared range holds yet).
+pub(crate) fn take_snapshots_aside() {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    if snaps.is_empty() {
+        return;
+    }
+    let jobs = copy_jobs(snaps);
+    if jobs.len() < 2 {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    let aside = queue_jobs(jobs);
+    // (An earlier one that nobody waited for is waited for here, outside the lock: there is never more than one.)
+    let earlier = SNAPS_ASIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(aside);
+    drop(earlier);
+}
+
+/// Waits for the snapshots [`take_snapshots_aside`] gave away, if any: at once if they are done or there are none.
+pub(crate) fn snapshots_wait() {
+    let aside = SNAPS_ASIDE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    drop(aside);
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -2301,9 +2376,77 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, queue_jobs, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Jobs given away run once each by the time the wait returns, however many threads are busy with other
+    /// calls of `wide` in between, and a second wait finds nothing to do; dropping the handle waits too.
+    #[test]
+    fn jobs_given_away_have_all_run_when_the_wait_returns() {
+        for n in [1usize, 2, 7, 300] {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let jobs: Vec<Job> = (0..n)
+                .map(|i| {
+                    let ran = ran.clone();
+                    Box::new(move || {
+                        ran.fetch_add(i + 1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            let aside = queue_jobs(jobs);
+            // Work of the caller's own, with a call of `wide` in it: the call takes only its own jobs.
+            let other = Arc::new(AtomicUsize::new(0));
+            let again: Vec<Job> = (0..5)
+                .map(|_| {
+                    let other = other.clone();
+                    Box::new(move || {
+                        other.fetch_add(1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            wide(again);
+            assert_eq!(other.load(Ordering::Relaxed), 5);
+            aside.wait();
+            assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
+            aside.wait();
+            drop(aside);
+            assert_eq!(
+                ran.load(Ordering::Relaxed),
+                n * (n + 1) / 2,
+                "{n} jobs, after the drop"
+            );
+        }
+        // Dropped without a wait of its own.
+        let ran = Arc::new(AtomicUsize::new(0));
+        let jobs: Vec<Job> = (0..40)
+            .map(|_| {
+                let ran = ran.clone();
+                Box::new(move || {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                }) as Job
+            })
+            .collect();
+        drop(queue_jobs(jobs));
+        assert_eq!(ran.load(Ordering::Relaxed), 40);
+    }
+
+    /// Snapshots copied by jobs given away hold the same bytes as those copied by `wide`, when the wait is over.
+    #[test]
+    fn copies_given_away_copy_the_same_bytes() {
+        let len = 3 * WIDE_JOB + 999;
+        let src: Vec<u8> = (0..len).map(|i| (i * 17 + i / 311) as u8).collect();
+        let mut dst = vec![0u8; len];
+        let (s, d) = (src.as_ptr() as usize, dst.as_mut_ptr() as usize);
+        let cuts = [0, 7, 100_000, WIDE_JOB + 1, 2 * WIDE_JOB, len];
+        let copies: Vec<(usize, usize, usize)> = cuts
+            .windows(2)
+            .map(|w| (s + w[0], d + w[0], w[1] - w[0]))
+            .collect();
+        let aside = queue_jobs(copy_jobs(copies));
+        aside.wait();
+        assert!(src == dst);
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.

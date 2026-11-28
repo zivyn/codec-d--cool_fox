@@ -421,6 +421,25 @@ const AHEAD_GAP: usize = (8 << 20) / PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
 
+/// The gap, in pages, under which ranges of one submission are asked about together: [`AHEAD_GAP`] unless
+/// `VICTORY_ASK_GAP_MB=<n>` says another size in MiB. The calls of a frame's lane cost some 23 microseconds
+/// each and about 1.8 microseconds a MiB of range (run K6, 374 calls of the submitting thread: 15 under 1 MiB
+/// 25 us, 101 of 1 to 8 MiB 36 us, 184 of 8 to 32 MiB 51 us, 74 over 32 MiB 152 us), so a gap of a few
+/// tens of MiB pays when it joins two calls.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_ASK_GAP_MB=32`: read once by each asking; ranges asked
+/// together or apart are noted in the journal the same way.)
+fn ask_gap() -> usize {
+    crate::ab::live_value!("VICTORY_ASK_GAP_MB", usize, gap_pages)
+}
+
+/// The gap of [`ask_gap`] as the text of the variable says: [`AHEAD_GAP`] if it is not set, is not a number or is 0.
+fn gap_pages(text: Option<&str>) -> usize {
+    text.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .map_or(AHEAD_GAP, |mb| (mb << 20) / PAGE)
+}
+
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
 /// then answers from the journal until [`ask_ahead_done`]. The world's
@@ -446,13 +465,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let gap = ask_gap();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
         let mut last = pieces[i].1;
         let mut k = i + 1;
         while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
+            && pieces[k].0 <= last + gap
             && last.max(pieces[k].1) - first <= AHEAD_MAX
         {
             last = last.max(pieces[k].1);
@@ -652,8 +672,117 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    if merged() {
+        ask_into(ranges, false);
+        return;
+    }
     ask_ahead(ranges);
     ask_rest(ranges);
+}
+
+/// Whether [`ask_once`] asks in one pass (`VICTORY_ASK_MERGE=1`; off by default): the ranges sorted once, joined by
+/// the gap ([`ask_gap`]) into runs, every run asked (a range that lies alone as well, which [`ask_rest`] asks one
+/// by one after [`ask_ahead`] has left it), under one hold of the ranges and one number. What it notes in the
+/// journal and what it leaves standing are what the two parts leave, with fewer holds, filters and looks at the
+/// ranges asked so far (each range was looked at by every run in turn).
+///
+/// (May change while the title runs, `VICTORY_AB`: each asking takes the answer once, and an asking leaves the same
+/// kind of thing standing either way.)
+fn merged() -> bool {
+    crate::ab::live_flag!("VICTORY_ASK_MERGE")
+}
+
+/// With the asking that stands ([`ask_once`], made before) kept, asks about the `ranges` that it does not hold, and
+/// holds them too: for a submission whose ranges are known in two parts, the first asked on another thread
+/// (`VICTORY_ASK_ASIDE`). With none that stands, asks about all of them as [`ask_once`] does.
+pub(crate) fn ask_more(ranges: &[(usize, usize)]) {
+    if !once() {
+        return;
+    }
+    if !journal().kept {
+        ask_once(ranges);
+        return;
+    }
+    ask_into(ranges, true);
+}
+
+/// Pages `[first, last)` as a run of `pieces`, asked in one call; by halves if it fails (a run across two
+/// reservations or into memory that is not write-watched does), and a piece alone that fails is left to
+/// [`writes`]. Adds what was asked to `asked` and the pages found written to `written`. As [`ask_run`], which
+/// leaves a piece that lies alone to its caller.
+fn ask_run_each(
+    pieces: &[(usize, usize)],
+    asked: &mut Vec<(usize, usize)>,
+    written: &mut Vec<(usize, u16)>,
+) {
+    let Some(first) = pieces.first().map(|p| p.0) else {
+        return;
+    };
+    let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
+    if let Some(pages) = kernel_written(first, last) {
+        written.extend(pages);
+        asked.push((first, last));
+        return;
+    }
+    if pieces.len() < 2 {
+        return;
+    }
+    let (a, b) = pieces.split_at(pieces.len() / 2);
+    ask_run_each(a, asked, written);
+    ask_run_each(b, asked, written);
+}
+
+/// One asking about `ranges` that stands for a submission, in one pass ([`merged`]). With `more`, what the asking
+/// that stands holds already (`Journal::ahead`) is left alone and what is asked is added to it ([`ask_more`]);
+/// without, it is the whole asking, begun after [`ask_once_end`].
+///
+/// The number: one, taken after the last kernel call and used for everything this noted and for the answer the
+/// journal gives from now on (`ahead_asked`), as [`ask_rest`] does for its part. A page the title writes after a
+/// call, before the number is taken, is found by the next asking and is newer than any copy that reads under this
+/// number: it is copied again, never skipped. And the whole is under one hold of the ranges
+/// ([`Asking::hold_all`]), so no other thread asks about any of these pages between the calls and the notes.
+fn ask_into(ranges: &[(usize, usize)], more: bool) {
+    let _all = Asking::hold_all();
+    let mut held = if more {
+        let mut j = journal_mut();
+        std::mem::take(&mut j.ahead)
+    } else {
+        Vec::new()
+    };
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .filter(|&(first, last)| !held.iter().any(|&(a, b)| a <= first && last <= b))
+        .collect();
+    pieces.sort_unstable();
+    let gap = ask_gap();
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        while k < pieces.len()
+            && pieces[k].0 <= last + gap
+            && last.max(pieces[k].1) - first <= AHEAD_MAX
+        {
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        ask_run_each(&pieces[i..k], &mut asked, &mut written);
+        i = k;
+    }
+    note_hot(&written);
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in written {
+        j.note(page, parts, now);
+    }
+    held.extend(asked);
+    j.kept = !held.is_empty();
+    j.ahead = held;
 }
 
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
@@ -739,12 +868,13 @@ pub(crate) fn ask_standing(ranges: &[(usize, usize)], replace: Option<Standing>)
     let (mut asked, mut found) = (Vec::new(), Vec::new());
     if pieces.len() >= 2 {
         pieces.sort_unstable();
+        let gap = ask_gap();
         let mut i = 0;
         while i < pieces.len() {
             let first = pieces[i].0;
             let mut last = pieces[i].1;
             let mut k = i + 1;
-            while k < pieces.len() && pieces[k].0 <= last + AHEAD_GAP && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            while k < pieces.len() && pieces[k].0 <= last + gap && last.max(pieces[k].1) - first <= AHEAD_MAX {
                 last = last.max(pieces[k].1);
                 k += 1;
             }
@@ -5719,5 +5849,215 @@ mod chunk_tests {
         assert_eq!(chunks_of(0, 1, 1), [(0, 1)]);
         let all: Vec<usize> = chunks_of(3, 103, 7).into_iter().flat_map(|(a, b)| a..b).collect();
         assert_eq!(all, (3..103).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(test)]
+mod ask_pass_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    /// The cells of a page, one in each of the kernel's pages.
+    const CELLS: usize = PAGE / KERNEL_PAGE;
+
+    struct Random(u64);
+
+    impl Random {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize % n
+        }
+    }
+
+    /// Write-watched memory that the "title" writes: every write puts a number that only grows into a cell.
+    struct Memory {
+        base: usize,
+        pages: usize,
+        version: u64,
+    }
+
+    impl Memory {
+        fn new(pages: usize) -> Memory {
+            // SAFETY: a fresh write-watched allocation, freed when the model is dropped.
+            let base = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    pages * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(base, 0);
+            Memory {
+                base,
+                pages,
+                version: 0,
+            }
+        }
+
+        fn write(&mut self, page: usize, cell: usize) {
+            self.version += 1;
+            // SAFETY: committed memory of ours, inside the allocation.
+            unsafe {
+                ((self.base + page * PAGE + cell * KERNEL_PAGE) as *mut u64)
+                    .write_volatile(self.version)
+            };
+        }
+
+        fn read(&self, page: usize) -> [u64; CELLS] {
+            // SAFETY: committed memory of ours, inside the allocation.
+            std::array::from_fn(|cell| unsafe {
+                ((self.base + page * PAGE + cell * KERNEL_PAGE) as *const u64).read_volatile()
+            })
+        }
+
+        /// Pages `[first, last)` of it as the addresses a submission asks about.
+        fn bytes(&self, (first, last): (usize, usize)) -> (usize, usize) {
+            (self.base + first * PAGE, self.base + last * PAGE)
+        }
+
+        fn write_some(&mut self, random: &mut Random, most: usize) {
+            for _ in 0..random.below(most) {
+                let (page, cell) = (random.below(self.pages), random.below(CELLS));
+                self.write(page, cell);
+            }
+        }
+    }
+
+    impl Drop for Memory {
+        fn drop(&mut self) {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.base as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// What a host copy holds of a page: the asking it took the page at, and the bytes.
+    type Held = Option<(u64, [u64; CELLS])>;
+
+    /// A refresh of pages `[first, last)` as a copy makes it: the journal's answer (the asking that stands, else the
+    /// kernel) read first, then the pages written since the copy took them read from memory.
+    fn refresh(memory: &Memory, held: &mut [Held], (first, last): (usize, usize)) {
+        let (start, end) = memory.bytes((first, last));
+        let (now, written) = asked(start, end)
+            .or_else(|| writes(start, end, false))
+            .expect("watched");
+        for page in first..last {
+            let at = memory.base / PAGE + page;
+            let write = written.iter().find(|w| w.0 == at).map_or(0, |w| w.1);
+            if held[page].as_ref().is_none_or(|(taken, _)| write > *taken) {
+                held[page] = Some((now, memory.read(page)));
+            }
+        }
+    }
+
+    /// Random writes between askings, and the kinds of asking that stand for a submission: the old two parts, the
+    /// one pass, and a first part asked early (in the middle of title writes) with the rest asked later. Whatever
+    /// way a submission asks, after its refreshes every copy of a page in its ranges holds what the title had
+    /// written by the time the asking began (a cell never holds less than it did), however many askings and
+    /// writes came before and between.
+    #[test]
+    fn what_is_written_before_an_asking_is_in_the_copies_whichever_way_it_asks() {
+        let mut memory = Memory::new(96);
+        let mut held: Vec<Held> = vec![None; memory.pages];
+        let mut random = Random(0x9e37_79b9_7f4a_7c15);
+        for round in 0..400 {
+            memory.write_some(&mut random, 14);
+            let mut ranges: Vec<(usize, usize)> = (0..2 + random.below(7))
+                .map(|_| {
+                    let first = random.below(memory.pages - 1);
+                    (first, first + 1 + random.below(6.min(memory.pages - first)))
+                })
+                .collect();
+            ranges.sort_unstable();
+            // What the title had written when the asking began.
+            let expected: Vec<[u64; CELLS]> =
+                (0..memory.pages).map(|page| memory.read(page)).collect();
+            let all: Vec<(usize, usize)> = ranges.iter().map(|&r| memory.bytes(r)).collect();
+            match round % 3 {
+                0 => {
+                    ask_once_end();
+                    ask_ahead(&all);
+                    ask_rest(&all);
+                }
+                1 => {
+                    ask_once_end();
+                    ask_into(&all, false);
+                }
+                _ => {
+                    let cut = random.below(all.len() + 1);
+                    ask_once_end();
+                    ask_into(&all[..cut], false);
+                    // The title goes on writing while the rest is not asked yet.
+                    memory.write_some(&mut random, 5);
+                    ask_more(&all[cut..]);
+                }
+            }
+            // Refreshes in groups, the title writing between them.
+            for group in ranges.chunks(3) {
+                for &range in group {
+                    refresh(&memory, &mut held, range);
+                }
+                memory.write_some(&mut random, 4);
+            }
+            ask_once_end();
+            for &(first, last) in &ranges {
+                for page in first..last {
+                    let (_, cells) = held[page].expect("refreshed");
+                    for cell in 0..CELLS {
+                        assert!(
+                            cells[cell] >= expected[page][cell],
+                            "round {round} (way {}): page {page} cell {cell} holds {} where {} was written before the asking",
+                            round % 3,
+                            cells[cell],
+                            expected[page][cell]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The runs of the one pass hold what they ask about, and what is asked more is held with it.
+    #[test]
+    fn what_is_asked_more_stands_with_what_was_asked_first() {
+        let memory = Memory::new(64);
+        let at = |first: usize, last: usize| memory.bytes((first, last));
+        let holds = |ahead: &[(usize, usize)], (start, end): (usize, usize)| {
+            ahead
+                .iter()
+                .any(|&(a, b)| a <= start / PAGE && end.div_ceil(PAGE) <= b)
+        };
+        ask_once_end();
+        ask_into(&[at(0, 4), at(40, 44)], false);
+        let first = journal().ahead.clone();
+        ask_into(&[at(0, 2), at(20, 22)], true);
+        let both = journal().ahead.clone();
+        ask_once_end();
+        // (Another test may end the asking in between: then there is nothing to say of it.)
+        if !first.is_empty() && !both.is_empty() {
+            assert!(
+                holds(&first, at(0, 4)) && holds(&first, at(40, 44)),
+                "{first:?}"
+            );
+            assert!(
+                first.iter().all(|r| both.contains(r)),
+                "{first:?} in {both:?}"
+            );
+            assert!(holds(&both, at(20, 22)), "{both:?}");
+        }
+    }
+
+    /// The gap of the variable's text, and the default of none.
+    #[test]
+    fn the_gap_of_the_asking_goes_by_the_text_of_the_variable() {
+        assert_eq!(
+            [None, Some("0"), Some("x"), Some("32"), Some(" 16 ")].map(gap_pages),
+            [AHEAD_GAP, AHEAD_GAP, AHEAD_GAP, 512, 256]
+        );
     }
 }

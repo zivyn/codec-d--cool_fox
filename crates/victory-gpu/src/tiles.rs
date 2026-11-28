@@ -182,7 +182,13 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         return None;
     }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let found = pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count));
+    let found = if crate::pool::fit_best() {
+        // The fullest heap with room: the others empty as their levels go,
+        // and a heap with no tile left goes back to the card ([`trim`]).
+        fullest_with(pool.iter().map(|h| h.as_ref().map(Heap::free_tiles)), count)
+    } else {
+        pool.iter().position(|h| h.as_ref().is_some_and(|h| h.free_tiles() >= count))
+    };
     let index = match found {
         Some(index) => index,
         None => {
@@ -239,6 +245,15 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
         left -= part;
     }
     Some((h.heap.clone(), index, runs))
+}
+
+/// The place of the heap with the fewest free tiles that has `count` free
+/// (the first of them), given each place's free tiles (`None`: no heap there).
+fn fullest_with(free: impl Iterator<Item = Option<u32>>, count: u32) -> Option<usize> {
+    free.enumerate()
+        .filter_map(|(i, free)| free.filter(|&free| free >= count).map(|free| (free, i)))
+        .min()
+        .map(|(_, i)| i)
 }
 
 /// The pool's heap at `index`, if it is still there.
@@ -2321,6 +2336,16 @@ void look() {
         // Only levels named are asked about.
         assert_eq!(tiled.fitting(0b0000_0110, 1 << 20), 0b0000_0110);
         assert_eq!(tiled.fitting(0b0000_0101, 1 << 20), 0b0000_0100);
+    }
+
+    #[test]
+    fn tiles_are_taken_from_the_fullest_heap_that_has_room() {
+        let free = [Some(900), None, Some(40), Some(300), Some(40)];
+        assert_eq!(fullest_with(free.into_iter(), 30), Some(2), "the first of the fullest");
+        assert_eq!(fullest_with(free.into_iter(), 41), Some(3));
+        assert_eq!(fullest_with(free.into_iter(), 301), Some(0));
+        assert_eq!(fullest_with(free.into_iter(), 901), None);
+        assert_eq!(fullest_with(std::iter::empty(), 1), None);
     }
 
     #[test]

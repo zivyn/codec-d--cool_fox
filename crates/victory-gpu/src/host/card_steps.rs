@@ -880,10 +880,49 @@ fn joined_copies<T: Copy>(copies: &[(T, u64, u64, u64)], same: impl Fn(&T, &T) -
     out
 }
 
-/// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes).
+/// The list in front of a submission's, and its buffer ([`BETWEEN`] bytes, or
+/// what the submissions it served needed with `VICTORY_BETWEEN_FIT`).
 struct Own {
     list: HostList,
     between: ID3D12Resource,
+    /// The bytes of `between`.
+    cap: u64,
+}
+
+/// Whether the buffer between is made as big as the submission needs
+/// (`VICTORY_BETWEEN_FIT=1`; off by default), not [`BETWEEN`] (4 MiB) for each
+/// list in the pool: a submission reads some 265 KB of title memory this way
+/// (3,986 KB a frame of 15 submissions, run ARCH2R-a), and the pool holds a list
+/// for each submission that is in the air.
+fn between_fit() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BETWEEN_FIT").is_some_and(|v| v == "1"))
+}
+
+/// The bytes a buffer between is made with for a submission that reads `need`
+/// bytes: the next power of two from 256 KiB, at most [`BETWEEN`].
+fn between_bytes(need: u64) -> u64 {
+    need.max(256 << 10).next_power_of_two().min(BETWEEN)
+}
+
+/// Which of the lists in a pool (their buffers' sizes, and whether each is a
+/// compute list) serves a submission that needs `need` bytes: the smallest
+/// buffer that is big enough; else the biggest that is too small, to be given a
+/// bigger buffer (its list stays).
+fn pooled_for(pool: &[(bool, u64)], compute: bool, need: u64) -> Option<usize> {
+    let fits = pool
+        .iter()
+        .enumerate()
+        .filter(|(_, (c, cap))| *c == compute && *cap >= need)
+        .min_by_key(|(i, (_, cap))| (*cap, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i);
+    fits.or_else(|| {
+        pool.iter()
+            .enumerate()
+            .filter(|(_, (c, _))| *c == compute)
+            .max_by_key(|(i, (_, cap))| (*cap, *i))
+            .map(|(i, _)| i)
+    })
 }
 
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
@@ -1236,7 +1275,7 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
-        let Some(own) = self.own_list(compute) else {
+        let Some(own) = self.own_list_for(compute, end) else {
             return Err("no host list or buffer for it");
         };
         // First every refresh, then the writes: the bytes compared with are
@@ -1298,20 +1337,41 @@ impl Host {
 
     /// A list of ours open for recording, and its buffer.
     fn own_list(&self, compute: bool) -> Option<Own> {
+        self.own_list_for(compute, BETWEEN)
+    }
+
+    /// [`Host::own_list`] for a submission that reads `need` bytes of title
+    /// memory: with `VICTORY_BETWEEN_FIT` the buffer has what that takes (a
+    /// pooled list whose buffer is too small is given a bigger one).
+    fn own_list_for(&self, compute: bool, need: u64) -> Option<Own> {
+        let fit = between_fit();
+        let bytes = if fit { between_bytes(need) } else { BETWEEN };
         // (Of the type the queue it goes to runs: `VICTORY_ASYNC_COMPUTE=2`.)
         let pooled = {
             let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-            let at = pool.iter().rposition(|own| own.list.is_compute() == compute);
+            let at = if fit {
+                let sizes: Vec<(bool, u64)> = pool.iter().map(|own| (own.list.is_compute(), own.cap)).collect();
+                pooled_for(&sizes, compute, bytes)
+            } else {
+                pool.iter().rposition(|own| own.list.is_compute() == compute)
+            };
             at.map(|at| pool.remove(at))
         };
-        if let Some(own) = pooled {
+        if let Some(mut own) = pooled {
             own.list.reset();
+            if own.cap < bytes {
+                // Too small for this one: a bigger buffer, the old one let go.
+                let between = self.uav_buffer(bytes)?;
+                name(&between, || "copies of title memory on the card".into());
+                own.between = between;
+                own.cap = bytes;
+            }
             return Some(own);
         }
-        let between = self.uav_buffer(BETWEEN)?;
+        let between = self.uav_buffer(bytes)?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list_of(compute).ok()?;
-        Some(Own { list, between })
+        Some(Own { list, between, cap: bytes })
     }
 }
 
@@ -1797,6 +1857,32 @@ mod tests {
 
     /// A value written behind a flight, or a read-back, is in no host copy
     /// before it lands.
+    /// The buffer between is made as big as the submission needs, in steps, and a pooled list is chosen by it.
+    #[test]
+    fn the_buffer_between_is_as_big_as_the_submission_needs() {
+        assert_eq!(between_bytes(0), 256 << 10);
+        assert_eq!(between_bytes(265 << 10), 512 << 10);
+        assert_eq!(between_bytes(1 << 20), 1 << 20);
+        assert_eq!(between_bytes(BETWEEN), BETWEEN);
+        assert_eq!(between_bytes(BETWEEN + 1), BETWEEN, "never more than the most a submission may do this way");
+    }
+
+    #[test]
+    fn a_pooled_list_is_chosen_by_the_size_of_its_buffer() {
+        let pool = [(false, 4 << 20), (false, 256 << 10), (true, 512 << 10), (false, 1 << 20)];
+        // The smallest buffer that is big enough, of the right kind of list.
+        assert_eq!(pooled_for(&pool, false, 200 << 10), Some(1));
+        assert_eq!(pooled_for(&pool, false, 300 << 10), Some(3));
+        assert_eq!(pooled_for(&pool, false, 2 << 20), Some(0));
+        assert_eq!(pooled_for(&pool, true, 300 << 10), Some(2));
+        // None big enough: the biggest of the kind, to be given a bigger buffer.
+        assert_eq!(pooled_for(&pool, true, 1 << 20), Some(2));
+        // Of one size, the one that was put back last; of the wrong kind, none.
+        assert_eq!(pooled_for(&[(false, 1 << 20), (false, 1 << 20)], false, 1), Some(1));
+        assert_eq!(pooled_for(&[(true, 1 << 20)], false, 1), None);
+        assert_eq!(pooled_for(&[], false, 1), None);
+    }
+
     #[test]
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];

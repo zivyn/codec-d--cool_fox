@@ -19,6 +19,9 @@
 //!   after the tile heaps, which hold the levels textures read sparsely.
 //! - the policy of [`trim_ready`] (`VICTORY_TILE_TRIM=1`), which `tiles`
 //!   uses to give back heaps of tiles with no tile in them.
+//! - [`census`] (VRAM2): the rest of the card's use by who asked for it (the
+//!   blocks of textures by how full they are, committed textures by kind,
+//!   device-local buffers by the line that made them), and what is left.
 //! - [`os`] (VRAM1): what the system's video memory manager says it did with
 //!   our allocations (the kernel's statistics: demoted bytes by priority
 //!   class, allocations in a segment they do not prefer, evictions) and the
@@ -36,6 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
+pub(crate) mod census;
 mod os;
 
 const MB: u64 = 1 << 20;
@@ -277,10 +281,14 @@ pub(crate) fn occupancy(heaps: impl Iterator<Item = (u32, u32)>) -> [u32; 4] {
 pub(crate) static TRIMMED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Whether wholly free heaps of tiles go back to the card
-/// (`VICTORY_TILE_TRIM=1`; off by default).
+/// (`VICTORY_TILE_TRIM=1`, or with the hold or the pool's compaction; off by default).
 pub(crate) fn trim_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| hold() || std::env::var_os("VICTORY_TILE_TRIM").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        hold()
+            || crate::pool::compact_on()
+            || std::env::var_os("VICTORY_TILE_TRIM").is_some_and(|v| v == "1")
+    })
 }
 
 /// Total moves seen and the last reading.
@@ -394,6 +402,7 @@ pub(crate) fn log() {
         TRIMMED[0].load(Ordering::Relaxed),
         TRIMMED[1].load(Ordering::Relaxed) / MB,
     );
+    census::log(parts.used);
     os::start(host);
     os::log(
         parts.used,

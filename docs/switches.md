@@ -537,6 +537,10 @@ switch is read.
 | `VICTORY_PLACED_FILLER` | off | flag |  |  |  | Keep filler fields of a placed resource description in the lookup key. |
 | `VICTORY_PLACED_ORDER` | off | flag |  | live |  | Order placed copies by where they stand in title memory. |
 | `VICTORY_POKE` | off | list |  |  | diag | Debug aid: write bytes at given RVAs, form rva:byte,... in hex, into title data. |
+| `VICTORY_POOL_COMPACT` | off | flag |  |  |  | Keeps the blocks of textures dense (VRAM2): pieces are cut from the fullest block with room, and while the card is under pressure the blocks with the fewest bytes in use are emptied once a second (`VICTORY_POOL_COMPACT_MB` of textures each), their textures made again in the others and shown after their upload ran; a block that stays after a minute is left alone for two. Gives back the 1.2 to 1.9 GB the blocks hold free at the window spot. |
+| `VICTORY_POOL_COMPACT_MB` | 48 | number |  |  |  | MB of textures the compaction makes again each second (`VICTORY_POOL_COMPACT=1`). |
+| `VICTORY_POOL_FIT` | off (on with `VICTORY_POOL_COMPACT`) | text |  |  |  | `best`: a piece of a texture block is cut from the fullest block that has room, not from the first. |
+| `VICTORY_POOL_SLACK_MB` | 256 | number |  |  |  | MB the blocks of textures keep free (the empty spare blocks among them) before the compaction empties one more block. |
 | `VICTORY_POP_ALL` | off | flag |  |  | diag | Compare every frame for popping textures instead of the asked time ranges. |
 | `VICTORY_POP_FOLDER` | off | path |  |  | diag | Folder for the pictures around a frame where a texture pops. |
 | `VICTORY_POP_WATCH` | off | list |  |  | diag | Time ranges in seconds, from-to, in which presented frames are checked for popping textures. |

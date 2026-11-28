@@ -2300,6 +2300,8 @@ struct CardPlan {
     looks: Option<upcheck::Looks>,
     /// With [`send`]: the memory its sends come from.
     sends: Option<send::Memory>,
+    /// With `VICTORY_CARD_SPANS=1`: the slot of stamps around its passes.
+    stamps: Option<usize>,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4049,6 +4051,18 @@ mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
+
+/// Without diagnostics there are no stamps around our passes (`spans`).
+#[cfg(not(feature = "diagnostics"))]
+impl Host {
+    fn pass_slot(&self) -> Option<usize> {
+        None
+    }
+
+    unsafe fn pass_stamp(&self, _list: &ID3D12GraphicsCommandList, _slot: Option<usize>, _k: usize) {}
+
+    fn pass_read(&self, _slot: Option<usize>) {}
+}
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
@@ -4858,6 +4872,7 @@ impl Host {
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let work = work.as_mut()?;
+        let stamps = self.pass_slot();
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
@@ -4897,6 +4912,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    self.pass_stamp(list, stamps, 0);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
                     }
@@ -4937,6 +4953,7 @@ impl Host {
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
                     }
+                    self.pass_stamp(list, stamps, 1);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -4975,6 +4992,7 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    self.pass_stamp(list, stamps, 2);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4994,6 +5012,7 @@ impl Host {
             sent_as,
             looks,
             sends: own.map(send::Own::memory),
+            stamps,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
@@ -5067,6 +5086,7 @@ impl Host {
                             }),
                         },
                     }]);
+                    self.pass_stamp(list, stamps, 3);
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
@@ -5081,6 +5101,7 @@ impl Host {
                         card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
+                    self.pass_stamp(list, stamps, 4);
                     list.Close()?;
                     list.cast()
                 })()
@@ -5117,6 +5138,7 @@ impl Host {
         if let Some(memory) = plan.sends {
             send::give_back(memory);
         }
+        self.pass_read(plan.stamps);
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
         let Some(work) = work.as_mut() else {
             return;

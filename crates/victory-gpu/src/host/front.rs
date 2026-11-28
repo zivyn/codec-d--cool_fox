@@ -92,6 +92,18 @@
 //!     certificate: when that entry's turn comes this thread takes the spans that still stand as done (neither asked nor
 //!     refreshed again). Ownership of every copy and range across the three stages, and what each condition rests on, is in
 //!     [`front2`].
+//! 13. **The look ahead (`VICTORY_STAGE_A_LOOKAHEAD`, [`crate::queue::prefold_next`]).** The title interleaves queues, so the
+//!     first of the line is mostly an entry of another queue (22 of 26 asks that were not made, ALL-ARCH2R-a). With the switch
+//!     the submission offered is the oldest submission of the whole line (and no other submission can be done before it:
+//!     the lane does the oldest of the first entries of its queues that is free to go, and what stands before it on its own
+//!     queue is a signal or a wait that is met now, which goes first by itself, and is not taken along into it), not only the
+//!     first of the line when it is of the queue being done. Points 1 to 12 hold unchanged for it: the lists stay in the same
+//!     order, `prepared` stops anything being taken into it, `take` compares. A wait that is not met (for a fence or a memory
+//!     value) or a present before it on its queue still names nothing: the lane would stand at it for as long as the card
+//!     or the CPU takes, and a younger submission of another queue would go first; and a wait that a signal ahead is to
+//!     meet is not met by it when the signal goes (the fence is set behind the flights in the air, `late_signal`), so the
+//!     order cannot be told either. What stands before it in the line on other queues is waits, signals and presents
+//!     only (it is the oldest submission): nothing there writes the memory its lists read, so it is no hazard to the work.
 //!
 //! What is not done on the thread: the snapshots, the declarations of picked ranges, the
 //! take (they are stage B), and the submissions that wait for flights unless a bit says wait or the plan is made.
@@ -790,6 +802,7 @@ pub(super) fn frame_line(frames: f64) {
     let kinds: Vec<(&'static str, u64)> = std::mem::take(&mut *KINDS.lock().unwrap_or_else(|e| e.into_inner()));
     let unasked: Vec<(&'static str, u64)> = std::mem::take(&mut *NOT_OFFERED.lock().unwrap_or_else(|e| e.into_inner()));
     let no_next = crate::queue::no_next_taken();
+    let named = crate::queue::named_taken();
     if !crate::queue::stage_front() {
         return;
     }
@@ -801,6 +814,14 @@ pub(super) fn frame_line(frames: f64) {
         "stage A of the next submission, the asks that were not made (VICTORY_STAGE_A_STEPS), per frame: [{}]; of them \"no submission is next\" is by what the line held [{}]",
         by_count(unasked),
         by_count(no_next)
+    );
+    tracing::info!(
+        "stage A of the next submission, who was named (VICTORY_STAGE_A_LOOKAHEAD={}), per frame: {:.2} named, of them {:.2} not the first of the line, {:.2} of another queue than the one being done, {:.2} past signals or met waits of their own queue",
+        u8::from(crate::queue::lookahead()),
+        named[0] as f64 / frames,
+        named[1] as f64 / frames,
+        named[2] as f64 / frames,
+        named[3] as f64 / frames
     );
     let mut why = why;
     why.sort_by_key(|w| std::cmp::Reverse(w.1));

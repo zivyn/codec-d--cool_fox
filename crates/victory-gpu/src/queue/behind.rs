@@ -51,6 +51,16 @@ use std::time::{Duration, Instant};
 
 use super::This;
 
+/// What stands between an entry and its going ([`Work::gate`]).
+pub(super) enum Gate<A> {
+    /// Nothing: it goes when the line is looked at.
+    Go,
+    /// It goes if the ask is met ([`Work::met_now`]); if it is not, this is why.
+    Met(A, &'static str),
+    /// Something else is needed: this.
+    No(&'static str),
+}
+
 /// One thing in the line: what it stands at, if it does, and what it does.
 pub(super) trait Work: Send {
     /// What has to be met before it goes.
@@ -64,6 +74,16 @@ pub(super) trait Work: Send {
     /// What it is, for the counts of why stage A was not offered the first of the line ([`no_next`]).
     fn kind(&self) -> &'static str {
         "an entry"
+    }
+    /// What it takes for it to go by itself the next time the line is looked at, whatever else is done first, and without
+    /// anything the submission behind it on its queue depends on beyond its going (a signal; a wait that is met now). Asked
+    /// of what stands before a submission on its queue ([`Lane::look_ahead`], `VICTORY_STAGE_A_LOOKAHEAD`).
+    fn gate(&self) -> Gate<Self::Ask> {
+        Gate::No("an entry of its queue stands before it")
+    }
+    /// [`Work::met`] for the look ahead: without a wait for the card, which the lane's own look may make.
+    fn met_now(ask: &Self::Ask) -> bool {
+        Self::met(ask)
     }
     /// Whether it stands for other work, which takes its place in the line
     /// once it is free to go ([`Work::unfold`]).
@@ -116,7 +136,7 @@ struct Entry<W> {
     queue: usize,
     /// What [`Work::round`] said when it came in.
     round: u64,
-    /// Runs counted for it that came into it ahead of its turn ([`Lane::prefold`]): they are not entries any more.
+    /// Runs counted for it that came into it ahead of its turn ([`Lane::prefold_with`]): they are not entries any more.
     along: usize,
     /// It took along what it could ahead of its turn and is prepared as it is: nothing more is taken into it.
     prepared: bool,
@@ -138,6 +158,11 @@ struct State<W> {
     /// Presents and submissions in the line or being done.
     presents: usize,
     runs: usize,
+    /// The queue of an entry [`Lane::prefold_with`] has taken out of the line for a moment, to take along what it can: it
+    /// holds its queue as the one being done does (a thread that gives that queue something meanwhile puts it in the line).
+    held: Option<usize>,
+    /// The number of the entry [`Lane::prefold_with`] named last, for [`Lane::deeper_entry`].
+    named: Option<u64>,
 }
 
 thread_local! {
@@ -205,13 +230,37 @@ pub(super) fn stage_front() -> bool {
 
 /// While our thread does an entry: the first of the line, if it is a submission of the same queue, takes along what
 /// it can (as it would when its turn came) and is named: its number, its host lists and where its parts begin.
-/// Nothing more is taken into it after this ([`Lane::prefold`]).
+/// Nothing more is taken into it after this ([`Lane::prefold_with`]).
 pub(super) fn prefold() -> Option<(u64, Vec<usize>, Vec<usize>)> {
     if !DOING.get() {
         no_next("asked off the thread of the line");
         return None;
     }
-    LANE.prefold()
+    LANE.prefold_with(lookahead())
+}
+
+/// Whether the submission that is done next is named past what stands before it in the line (`VICTORY_STAGE_A_LOOKAHEAD=1`,
+/// with `VICTORY_STAGE_A_STEPS`; off by default): the oldest submission of the line, whatever queue it is of, and not only
+/// the first of the line when that is of the queue being done ([`Lane::prefold_with`]). Read once for each naming; what was
+/// named stays what the lane does next whatever the switch says after (the lane's choice does not read it).
+pub(super) fn lookahead() -> bool {
+    crate::ab::live_flag!("VICTORY_STAGE_A_LOOKAHEAD")
+}
+
+/// Since the last frame-rate line: submissions named by [`prefold`]: in all, those that were not the first of the line,
+/// those that were of another queue than the one being done, and those with signals or met waits of their own queue before them.
+static NAMED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn named(at: usize, other_queue: bool, own: bool) {
+    NAMED[0].fetch_add(1, Relaxed);
+    NAMED[1].fetch_add(u64::from(at > 0), Relaxed);
+    NAMED[2].fetch_add(u64::from(other_queue), Relaxed);
+    NAMED[3].fetch_add(u64::from(own), Relaxed);
+}
+
+/// What [`named`] counted since the last call: named, past other entries, of another queue, past entries of its own queue.
+pub(super) fn named_taken() -> [u64; 4] {
+    std::array::from_fn(|i| NAMED[i].swap(0, Relaxed))
 }
 
 /// Since the last frame-rate line: why [`prefold`] named no submission, by reason.
@@ -245,7 +294,7 @@ pub(super) fn deeper_entry() -> Option<(u64, Vec<usize>)> {
     if !DOING.get() {
         return None;
     }
-    LANE.deeper_entry()
+    LANE.deeper_entry_with(lookahead())
 }
 
 /// Tests: stage A's question answers yes.
@@ -291,6 +340,8 @@ impl<W: Work> Lane<W> {
                 served: 0,
                 presents: 0,
                 runs: 0,
+                held: None,
+                named: None,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
@@ -326,7 +377,7 @@ impl<W: Work> Lane<W> {
     /// in between.
     pub(super) fn push_behind(&self, queue: usize, always: bool, what: W, now: impl FnOnce()) {
         let mut state = self.lock();
-        if always || state.running == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
+        if always || state.running == Some(queue) || state.held == Some(queue) || state.items.iter().any(|e| e.queue == queue) {
             Self::put(&mut state, queue, what);
         } else {
             now();
@@ -354,7 +405,7 @@ impl<W: Work> Lane<W> {
             self.lock().items.iter().filter(|e| e.what.folded()).filter_map(|e| e.what.ask()).collect();
         folded.iter().for_each(W::settle);
         let mut state = self.lock();
-        if state.items.is_empty() && state.running.is_none() {
+        if state.items.is_empty() && state.running.is_none() && state.held.is_none() {
             return;
         }
         state.asked += 1;
@@ -430,12 +481,14 @@ impl<W: Work> Lane<W> {
 
     /// What follows `entry` in its queue, if that can go with it: taken along, as
     /// [`Work::take_along`] says. How many submissions that was.
-    fn gather(&self, entry: &mut Entry<W>, limit: u64) -> usize {
+    /// Looking from place `from` of the line on (the entry is out of it: what stands there is what stood behind it).
+    fn gather(&self, entry: &mut Entry<W>, from: usize, limit: u64) -> usize {
         let mut added = 0;
         while entry.what.runs() {
             let next = {
                 let mut state = self.lock();
-                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                let at = state.items.iter().enumerate().skip(from).find(|(_, e)| e.queue == entry.queue && e.number < limit);
+                let at = at.map(|(at, _)| at);
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
@@ -473,22 +526,43 @@ impl<W: Work> Lane<W> {
         added
     }
 
-    /// While the entry being done is, the first of the line is a submission of the same queue: it takes along what
-    /// it can, as it will when its turn comes (what comes in by then is not taken: it is marked `prepared`), so that
-    /// what it is is known: its number, the host lists it will run (as [`Work::peek`] says) and where its parts begin.
-    /// It stays at its place.
-    pub(super) fn prefold(&self) -> Option<(u64, Vec<usize>, Vec<usize>)> {
-        let (mut entry, limit) = loop {
+    /// While the entry being done is, the submission that is done next takes along what it can, as it will when its turn
+    /// comes (what comes in by then is not taken: it is marked `prepared`), so that what it is is known: its number, the
+    /// host lists it will run (as [`Work::peek`] says) and where its parts begin. It stays at its place.
+    ///
+    /// Without `look` that is the first of the line, if it is a submission of the queue being done. With it (`VICTORY_STAGE_A_LOOKAHEAD`)
+    /// it is [`Lane::look_ahead`]: the oldest submission of the line, past waits, signals and presents of other queues, and
+    /// past signals and waits that are met on its own.
+    fn prefold_with(&self, look: bool) -> Option<(u64, Vec<usize>, Vec<usize>)> {
+        let (mut entry, at, limit) = loop {
+            // (Before the lane's lock: it asks the host.)
+            let looked = if look {
+                match self.look_ahead() {
+                    Ok(at) => Some(at),
+                    Err(why) => {
+                        no_next(why);
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
             let mut state = self.lock();
             let queue = state.running?;
-            let Some(first) = state.items.front() else {
-                no_next("the line is empty");
-                return None;
+            let at = if let Some(at) = looked {
+                at
+            } else {
+                let Some(first) = state.items.front() else {
+                    no_next("the line is empty");
+                    return None;
+                };
+                if first.queue != queue {
+                    no_next("the first of the line is of another queue");
+                    return None;
+                }
+                0
             };
-            if first.queue != queue {
-                no_next("the first of the line is of another queue");
-                return None;
-            }
+            let first = &state.items[at];
             if first.what.folded() {
                 // A submission whose lists were translated since it came in stands for its parts until someone unfolds it
                 // ([`Lane::gather`] does when an entry begins; the title's threads put in entries all the while this
@@ -500,8 +574,8 @@ impl<W: Work> Lane<W> {
                     return None;
                 }
                 let mut state = self.lock();
-                let entry = state.items.pop_front()?;
-                Self::unfold(&mut state, 0, entry);
+                let entry = state.items.remove(at)?;
+                Self::unfold(&mut state, at, entry);
                 continue;
             }
             if !first.what.runs() {
@@ -512,19 +586,66 @@ impl<W: Work> Lane<W> {
                 no_next("the first of the line is a submission whose lists are not known");
                 return None;
             }
-            break (state.items.pop_front()?, state.next);
+            let entry = state.items.remove(at)?;
+            state.held = Some(entry.queue);
+            state.named = Some(entry.number);
+            break (entry, at, state.next);
         };
-        // (The queue stays `running`: a thread that gives it something meanwhile puts it in the line.)
+        // (The queue stays `running`, or `held`: a thread that gives it something meanwhile puts it in the line.)
         if !entry.prepared {
-            entry.along += self.gather(&mut entry, limit);
+            // (What stands before it on its queue stays where it is, and goes first: it is not taken along.)
+            entry.along += self.gather(&mut entry, at, limit);
             entry.prepared = true;
         }
         let found = entry.what.peek().map(|lists| (entry.number, lists, entry.what.parts()));
-        self.lock().items.push_front(entry);
+        let mut state = self.lock();
+        let queue = entry.queue;
+        // (Before it, `at` entries stand, so the counts are of what stands before it.)
+        let own = state.items.iter().take(at).any(|e| e.queue == queue);
+        state.items.insert(at, entry);
+        state.held = None;
+        let other_queue = state.running.is_some_and(|running| running != queue);
+        drop(state);
+        if found.is_some() {
+            named(at, other_queue, own);
+        }
         found
     }
 
-    /// While the entry being done is, and the first of the line is the one [`Lane::prefold`] named (a submission of the
+    /// The place in the line of the submission that is done after the one being done now, if that can be known: the oldest
+    /// entry of the line that is a submission (the lane takes the oldest of the first entries of its queues that is free to
+    /// go, so no other submission can go before it, nor can an entry that is not one change that: a submission stands
+    /// behind the first of its queue and is younger), when everything that stands before it **on its own queue** is a
+    /// signal or a wait that is met now (such an entry goes first, by itself, and the submission after it; one that is not
+    /// met would hold its queue for the time the card or the CPU takes, and any younger submission of another queue would go
+    /// first in the meantime: the order cannot be told). The entries of other queues before it are waits that are not met,
+    /// signals and presents: none of them is a submission. If not, why. The place does not change while our thread is at
+    /// an entry: nothing but it takes an entry out of the line, and what comes in goes to the end.
+    fn look_ahead(&self) -> Result<usize, &'static str> {
+        let (at, gates) = {
+            let state = self.lock();
+            let Some(at) = state.items.iter().position(|e| e.what.runs()) else {
+                return Err(if state.items.is_empty() { "the line is empty" } else { "no submission is in the line" });
+            };
+            let queue = state.items[at].queue;
+            let mut gates = Vec::new();
+            for before in state.items.iter().take(at).filter(|e| e.queue == queue) {
+                match before.what.gate() {
+                    Gate::Go => {}
+                    Gate::Met(ask, why) => gates.push((ask, why)),
+                    Gate::No(why) => return Err(why),
+                }
+            }
+            (at, gates)
+        };
+        // (Without the lane's lock: the answer may be the host's, as in `step`.)
+        match gates.iter().find(|(ask, _)| !W::met_now(ask)) {
+            Some((_, why)) => Err(why),
+            None => Ok(at),
+        }
+    }
+
+    /// While the entry being done is, and the first of the line is the one [`Lane::prefold_with`] named (a submission of the
     /// same queue, marked `prepared`): what the next entry of that queue after it is, as the addresses of its host lists
     /// in the order they run, if it is a submission whose lists are known. Nothing is taken or marked.
     pub(super) fn deeper(&self) -> Option<Vec<usize>> {
@@ -533,14 +654,29 @@ impl<W: Work> Lane<W> {
 
     /// [`Lane::deeper`] with the number of the entry.
     pub(super) fn deeper_entry(&self) -> Option<(u64, Vec<usize>)> {
+        self.deeper_entry_with(false)
+    }
+
+    /// [`Lane::deeper_entry`]; with `look` also when the entry named is not the first of the line ([`Lane::prefold_with`]).
+    pub(super) fn deeper_entry_with(&self, look: bool) -> Option<(u64, Vec<usize>)> {
         let state = self.lock();
         let queue = state.running?;
         let first = state.items.front()?;
-        if first.queue != queue || !first.prepared {
+        if first.prepared && first.queue == queue {
+            let next = state.items.iter().skip(1).find(|e| e.queue == queue)?;
+            if next.what.folded() || !next.what.runs() {
+                return None;
+            }
+            return next.what.peek().map(|lists| (next.number, lists));
+        }
+        // The one named past other entries ([`Lane::prefold_with`]): the entry after it is the next submission of the line
+        // (the lane does the oldest that is free to go; whichever queue it is of).
+        if !look {
             return None;
         }
-        let next = state.items.iter().skip(1).find(|e| e.queue == queue)?;
-        if next.what.folded() || !next.what.runs() {
+        let at = state.items.iter().position(|e| e.prepared && Some(e.number) == state.named)?;
+        let next = state.items.iter().skip(at + 1).find(|e| e.what.runs())?;
+        if next.what.folded() {
             return None;
         }
         next.what.peek().map(|lists| (next.number, lists))
@@ -616,14 +752,19 @@ impl<W: Work> Lane<W> {
         // was taken along ahead of its turn, and is being prepared as it is
         // (`VICTORY_STAGE_A`).
         if !forced && !entry.prepared {
-            runs += self.gather(&mut entry, limit);
+            runs += self.gather(&mut entry, 0, limit);
         }
         ROUND.set(entry.round);
         let ahead = if pipeline_prepare() {
             // (Its place does not change before our thread is done with this
             // one; only titles' threads add to the end.)
-            let state = self.lock();
-            state.items.iter().find(|e| e.queue == entry.queue).and_then(|e| e.what.peek())
+            // (With the look ahead: the submission stage A will be offered, which is not always the next of this queue.)
+            let named = if lookahead() {
+                self.look_ahead().ok().and_then(|at| self.lock().items.get(at).and_then(|e| e.what.peek()))
+            } else {
+                None
+            };
+            named.or_else(|| self.lock().items.iter().find(|e| e.queue == entry.queue).and_then(|e| e.what.peek()))
         } else {
             None
         };
@@ -735,6 +876,29 @@ impl Work for Job {
 
     fn runs(&self) -> bool {
         matches!(self, Job::Run(..) | Job::Joined(..) | Job::Lists(..))
+    }
+
+    fn gate(&self) -> Gate<Ask> {
+        match self {
+            &Job::Wait(fence, value) => {
+                Gate::Met(Ask::Wait(fence, value), "a submission stands behind a wait for a fence that is not met")
+            }
+            Job::Value(wait) => {
+                Gate::Met(Ask::Value(*wait), "a submission stands behind a wait for a memory value that is not met")
+            }
+            Job::Signal(..) => Gate::Go,
+            Job::Present(..) => Gate::No("a submission stands behind a present of its queue"),
+            Job::Run(..) | Job::Joined(..) | Job::Lists(..) => Gate::No("a submission stands behind a submission"),
+        }
+    }
+
+    fn met_now(ask: &Ask) -> bool {
+        match ask {
+            // (The lane's own look, `met`, may wait for the card for a value: `late_met`. This one does not, and a "no" is
+            // only "not now".)
+            Ask::Value(wait) => wait.met() || crate::host::late_met_known(wait) == Some(true),
+            _ => Self::met(ask),
+        }
     }
 
     fn kind(&self) -> &'static str {
@@ -1414,6 +1578,14 @@ mod tests {
         fn shows(&self) -> bool {
             matches!(self, T::Present(..))
         }
+        fn gate(&self) -> Gate<(usize, u64)> {
+            match self {
+                &T::Wait(fence, value) => Gate::Met((fence, value), "a test wait is not met"),
+                T::Signal(..) => Gate::Go,
+                T::Present(..) => Gate::No("a test present"),
+                _ => Gate::No("a test submission"),
+            }
+        }
         fn runs(&self) -> bool {
             matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Round(..) | T::Peek(..))
         }
@@ -1608,15 +1780,15 @@ mod tests {
         let part = |name| T::Group(vec![name], log.clone(), Vec::new());
         lane.push(1, [part("a"), part("b"), T::Wait(f, 1), part("c")]);
         // Nothing is being done: nothing is prefolded.
-        assert!(lane.prefold().is_none());
+        assert!(lane.prefold_with(false).is_none());
         lane.lock().running = Some(1);
         // (The entry of the test's own is not in the line: `a` stands for it.)
-        let (number, lists, parts) = lane.prefold().expect("a submission of the queue being done is first");
+        let (number, lists, parts) = lane.prefold_with(false).expect("a submission of the queue being done is first");
         assert_eq!(number, 0);
         assert_eq!(lists, vec![1, 1], "a and b");
         assert!(parts.is_empty());
         // Asked again, it is the same, and takes nothing more.
-        let again = lane.prefold().unwrap();
+        let again = lane.prefold_with(false).unwrap();
         assert_eq!(again.1, vec![1, 1]);
         lane.lock().running = None;
         // The wait is met by now: without the mark `a+b` would take it, and `c` too.
@@ -1636,7 +1808,7 @@ mod tests {
         lane.push(1, [T::Wait(f, 9), T::Peek("a", log.clone())]);
         lane.lock().running = Some(1);
         no_next_taken();
-        assert!(lane.prefold().is_none());
+        assert!(lane.prefold_with(false).is_none());
         let counted = no_next_taken();
         assert!(counted.iter().any(|(why, n)| *why == "a test wait" && *n >= 1), "{counted:?}");
     }
@@ -1654,7 +1826,7 @@ mod tests {
         lane.lock().running = Some(1);
         // The first of the line is not the one named yet (not prefolded).
         assert!(lane.deeper().is_none());
-        let (_, lists, _) = lane.prefold().expect("a submission of the queue being done is first");
+        let (_, lists, _) = lane.prefold_with(false).expect("a submission of the queue being done is first");
         assert_eq!(lists, vec![1, b'a' as usize]);
         // `bb` is the next of queue 1 (queue 2's `cc` does not count), and asking again changes nothing.
         let bb = Some(vec![2usize, b'b' as usize]);
@@ -1670,11 +1842,180 @@ mod tests {
         let f = fence();
         other.push(1, [T::Peek("a", log.clone()), T::Wait(f, 9), T::Peek("c", log.clone())]);
         other.lock().running = Some(1);
-        other.prefold().expect("first");
+        other.prefold_with(false).expect("first");
         assert!(other.deeper().is_none());
         // Another queue running: the first of the line is not its entry.
         other.lock().running = Some(2);
         assert!(other.deeper().is_none());
+    }
+
+    /// With the look ahead the submission done next is the oldest of the line, of whatever queue (the first of the line is
+    /// another queue's here: the old way names nothing), and what stands before it on another queue, a wait that is not
+    /// met or a present, is not in its way.
+    #[test]
+    fn the_next_submission_is_named_past_the_entries_of_other_queues() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        // Queue 3 stands at a wait and a present, queue 2 has a submission, queue 1 is being done and has another behind.
+        lane.push(3, [T::Wait(f, 9), T::Present("present", log.clone())]);
+        lane.push(2, [T::Peek("cc", log.clone())]);
+        lane.push(1, [T::Peek("a", log.clone())]);
+        lane.lock().running = Some(1);
+        assert!(lane.prefold_with(false).is_none(), "the first of the line is of another queue");
+        let (number, lists, parts) = lane.prefold_with(true).expect("queue 2's submission is the oldest");
+        assert_eq!((number, lists, parts), (2, vec![2, b'c' as usize], Vec::new()));
+        {
+            let state = lane.lock();
+            assert_eq!(state.items.len(), 4, "nothing was taken out of the line");
+            let marked: Vec<bool> = state.items.iter().map(|e| e.prepared).collect();
+            assert_eq!(marked, [false, false, true, false], "only the one named is marked, at its place");
+            assert!(state.held.is_none());
+        }
+        // Asked again it is the same one.
+        assert_eq!(lane.prefold_with(true).unwrap().0, 2);
+    }
+
+    /// What stands before the submission on its own queue goes first and is not taken along into it: signals and waits that
+    /// are met let it be named; one that is not met, a present, or a submission that is not known, name nothing, and the
+    /// count says why.
+    #[test]
+    fn what_stands_before_the_named_on_its_queue_goes_first_and_must_not_hold_it() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let (f, g) = (fence(), fence());
+        crate::fence::set(f as This, 1);
+        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        lane.push(1, [T::Signal(g, 1, log.clone()), T::Wait(f, 1), part("a"), T::Signal(g, 2, log.clone()), part("b")]);
+        lane.lock().running = Some(2);
+        let (number, lists, _) = lane.prefold_with(true).expect("a signal and a wait that is met do not hold it");
+        assert_eq!(number, 2);
+        assert_eq!(lists, vec![1, 1], "a and b: what stands behind it is taken along, from its own place on");
+        lane.lock().running = None;
+        look(&lane);
+        assert_eq!(
+            *log.lock().unwrap(),
+            ["signal 1".to_string(), "a+b".to_string()],
+            "the signal before it went first, by itself, and was not made one of its signals"
+        );
+        assert_eq!(value(g), 2, "the signal behind it went with it");
+        assert_eq!(lane.lock().items.len(), 0);
+        // Not met, a present, or a submission that is no more than a submission, before it.
+        for (before, why) in [
+            (T::Wait(f, 9), "a test wait is not met"),
+            (T::Present("present", log.clone()), "a test present"),
+            (T::Run("plain", log.clone()), "the first of the line is a submission whose lists are not known"),
+        ] {
+            let lane = Lane::new();
+            lane.push(1, [before, T::Peek("a", log.clone())]);
+            lane.lock().running = Some(2);
+            assert_eq!(lane.look_ahead(), if why.contains("lists") { Ok(0) } else { Err(why) });
+            assert!(lane.prefold_with(true).is_none(), "{why}");
+            assert_eq!(lane.lock().items.len(), 2);
+        }
+    }
+
+    /// A queue that is given something while its submission is out of the line to take others along keeps its order: what
+    /// it is given goes in the line behind it.
+    #[test]
+    fn a_queue_whose_submission_is_out_of_the_line_for_a_moment_is_still_the_queues() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        lane.lock().held = Some(2);
+        lane.push_behind(2, false, T::Signal(fence(), 1, log.clone()), || panic!("the queue holds a submission"));
+        assert_eq!(lane.lock().items.len(), 1);
+        let mut now = false;
+        lane.push_behind(3, false, T::Signal(fence(), 1, log.clone()), || now = true);
+        assert!(now, "another queue holds nothing");
+    }
+
+    /// The entry after the one named past others is the next submission of the line, whatever its queue.
+    #[test]
+    fn the_entry_after_the_one_named_past_others_is_the_next_submission() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        lane.push(3, [T::Wait(f, 9)]);
+        lane.push(2, [T::Peek("cc", log.clone())]);
+        lane.push(1, [T::Peek("a", log.clone())]);
+        lane.push(2, [T::Peek("ddd", log.clone())]);
+        lane.lock().running = Some(1);
+        assert!(lane.deeper_entry_with(true).is_none(), "nothing is named yet");
+        let (number, ..) = lane.prefold_with(true).unwrap();
+        assert_eq!(number, 1);
+        assert!(lane.deeper_entry().is_none(), "the old way names the entry after the first of the line only");
+        assert_eq!(lane.deeper_entry_with(true), Some((2, vec![1, b'a' as usize])), "queue 1's, the next in the line");
+        assert_eq!(lane.lock().items.len(), 4, "nothing was taken");
+    }
+
+    /// Whatever the lines are, a submission named is the first of all the submissions the lane does, with the waits that
+    /// are met by now and the fences that moved while it waited.
+    #[test]
+    fn the_submission_named_is_done_first_whatever_the_line_and_the_fences_do() {
+        const NAMES: [&str; 12] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |most: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % most
+        };
+        let (mut named_past, mut named_at_first, mut declined) = (0, 0, 0);
+        for round in 0..600 {
+            let lane = Lane::new();
+            let log: Log = Default::default();
+            // (`f` is waited for and only goes up, as a fence does; the signals are on a fence of their own.)
+            let (f, g) = (fence(), fence());
+            crate::fence::set(f as This, next(3));
+            let mut fence_value = 0;
+            let mut made = 0;
+            for _ in 0..4 + next(7) {
+                let queue = 1 + next(3) as usize;
+                let job = match next(8) {
+                    0..=3 if made < NAMES.len() => {
+                        made += 1;
+                        T::Peek(NAMES[made - 1], log.clone())
+                    }
+                    4 => T::Wait(f, next(5)),
+                    5 | 6 => {
+                        fence_value += 1;
+                        T::Signal(g, fence_value, log.clone())
+                    }
+                    7 if next(3) == 0 => T::Present("present", log.clone()),
+                    _ => T::Wait(f, next(3)),
+                };
+                lane.push(queue, [job]);
+            }
+            lane.lock().running = Some(1 + next(3) as usize);
+            let Some((number, lists, _)) = lane.prefold_with(true) else {
+                declined += 1;
+                continue;
+            };
+            // Peek runs are the only submissions named; its name is the entry's.
+            let ours = lane
+                .lock()
+                .items
+                .iter()
+                .find_map(|e| match &e.what {
+                    T::Peek(name, _) if e.number == number => Some(*name),
+                    _ => None,
+                })
+                .expect("a submission");
+            assert_eq!(lists, vec![ours.len(), ours.as_bytes()[0] as usize]);
+            let at = lane.lock().items.iter().position(|e| e.number == number).unwrap();
+            named_past += usize::from(at > 0);
+            named_at_first += usize::from(at == 0);
+            // Time goes by: what the CPU or the card does to the fence while the lane is at the one being done.
+            if next(2) == 0 {
+                crate::fence::set(f as This, value(f) + next(6));
+            }
+            lane.lock().running = None;
+            look(&lane);
+            let done = log.lock().unwrap().iter().find(|l| l.starts_with('r')).cloned();
+            let done = done.unwrap_or_else(|| panic!("round {round}: no submission was done"));
+            assert_eq!(done.split(' ').next(), Some(ours), "round {round}: {ours} was named, {done} was done first");
+        }
+        assert!(named_past > 20 && named_at_first > 20 && declined > 20, "{named_past} {named_at_first} {declined}");
     }
 
     /// A submission takes what follows it in its queue along, up to what it

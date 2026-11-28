@@ -490,8 +490,16 @@ pub(crate) fn stage_front() -> bool {
     behind::stage_a() && behind::stage_front() && behind::on()
 }
 
-/// The first submission of the line, if it is of the queue being done: its number, its host lists in the order they
-/// run and where its parts begin, after it took along what it can ([`behind`]).
+/// Whether the submission done next is named past what stands before it in the line (`VICTORY_STAGE_A_LOOKAHEAD=1`).
+#[cfg(windows)]
+pub(crate) fn lookahead() -> bool {
+    behind::lookahead()
+}
+
+/// The submission that is done after the one being done now: its number, its host lists in the order they
+/// run and where its parts begin, after it took along what it can ([`behind`]). The first of the line, if it is of the queue
+/// being done; with `VICTORY_STAGE_A_LOOKAHEAD` the oldest submission of the line, past what stands before it that
+/// cannot hold it back.
 #[cfg(windows)]
 pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
     behind::prefold()
@@ -501,6 +509,13 @@ pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
 #[cfg(windows)]
 pub(crate) fn no_next_taken() -> Vec<(&'static str, u64)> {
     behind::no_next_taken()
+}
+
+/// Since the last call: the submissions [`prefold_next`] named, those not the first of the line, those of another queue than
+/// the one being done, and those with signals or met waits of their own queue before them (`VICTORY_STAGE_A_LOOKAHEAD`).
+#[cfg(windows)]
+pub(crate) fn named_taken() -> [u64; 4] {
+    behind::named_taken()
 }
 
 /// While our thread does an entry and the first of the line has been named by [`prefold_next`]: the host lists

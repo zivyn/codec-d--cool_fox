@@ -5450,23 +5450,39 @@ impl Shadow {
         // The ledger knows it too (`VICTORY_PAGE_REFRESH`): a copy that holds no page noted since it took the range.
         match crate::pagedrive::mode() {
             0 => false,
-            mode => {
-                let gate = self.page_gate(from, to);
-                if mode == 1 {
-                    // (Shadow: the answer stays the memo's; the journal says whether the gate would have been wrong.)
-                    if gate {
-                        crate::pagedrive::seam();
-                        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                        let stale = crate::watch::journal_stale(from, to, self.start as usize / PAGE, &copied, self.ranged(from, to), self.ledger.since());
-                        crate::pagedrive::gate_checked(stale);
+            1 => {
+                // Shadow: the answer stays the memo's; the journal says whether the gate would have been wrong. The copy's
+                // lock is held over both answers (no refresh of it settles a page, takes one or moves `ranged` between
+                // them) and the journal is read FIRST, as `pagedrive::check_look` does: a note made after that reaches
+                // the ledger the gate reads next and shuts it, so only a page the ledger lacked when the journal had it
+                // is a miss. (PR-shadow2 read the journal after the gate: a write told in between, newer than what the
+                // gate was asked about, was counted as a stale span: 2 of 270,000.)
+                let (gate, stale, report) = {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    let ranged = self.ranged(from, to);
+                    let since = self.ledger.since();
+                    let asked = crate::watch::asked_so_far();
+                    let stale = crate::watch::journal_stale(from, to, start / PAGE, &copied, ranged, since);
+                    crate::pagedrive::seam();
+                    let gate = self.gate_by_ledger(from, to);
+                    let report = (gate && stale).then(|| self.gate_miss_report(from, to, &copied, (ranged, since, asked)));
+                    (gate, stale, report)
+                };
+                // (The flights' ranges are looked at with no lock of the copy's held.)
+                if gate && !self.flight_in(from, to) {
+                    if let Some(report) = report {
+                        crate::pagedrive::gate_missed(&report);
                     }
-                    false
-                } else {
-                    if gate {
-                        crate::pagedrive::gate_hit();
-                    }
-                    gate
+                    crate::pagedrive::gate_checked(stale);
                 }
+                false
+            }
+            _ => {
+                let gate = self.page_gate(from, to);
+                if gate {
+                    crate::pagedrive::gate_hit();
+                }
+                gate
             }
         }
     }
@@ -5476,22 +5492,71 @@ impl Shadow {
     /// declared range touches it, and the asking that stands covers it (one atomic and three short locks, none of the
     /// copy's `copied`, and no walk of anything: `VICTORY_PAGE_REFRESH` stage 3).
     fn page_gate(&self, from: usize, to: usize) -> bool {
+        self.gate_by_ledger(from, to) && !self.flight_in(from, to)
+    }
+
+    /// The first four conditions of [`Shadow::page_gate`]: watched, covered, taken whole, and no page of the range
+    /// noted after that. The coverage comes first, then the notes, then the ledger: a note and the coverage that
+    /// vouches for it come in one step (an asking notes its pages and publishes that it stands), so a coverage seen
+    /// first has all its notes queued before the drain below, and a coverage that comes after is not seen at all
+    /// (rev2: the other order saw an empty ledger, then a coverage whose notes had come in between).
+    fn gate_by_ledger(&self, from: usize, to: usize) -> bool {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
-        // The coverage first, then the notes, then the ledger: a note and the coverage that vouches for it come in
-        // one step (an asking notes its pages and publishes that it stands), so a coverage seen first has all its
-        // notes queued before the drain below, and a coverage that comes after is not seen at all (rev2: the other
-        // order saw an empty ledger, then a coverage whose notes had come in between).
         if !crate::watch::covered(from, to) {
             return false;
         }
         crate::pagedrive::drain();
         let ranged = self.ranged(from, to);
-        if ranged == 0 || self.ledger.any_after(from / PAGE, to.div_ceil(PAGE), ranged) {
-            return false;
+        ranged != 0 && !self.ledger.any_after(from / PAGE, to.div_ceil(PAGE), ranged)
+    }
+
+    /// Whether a flight's declared range (shaders write it) touches `[from, to)`.
+    fn flight_in(&self, from: usize, to: usize) -> bool {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+    }
+
+    /// What the log says of a span the gate would have left stale (shadow mode): the copy, the span, the numbers that
+    /// decided, the pages the journal calls stale with what the ledger and the copy hold of each, and what the gate says
+    /// when asked again now. The copy's lock is held by the caller.
+    fn gate_miss_report(&self, from: usize, to: usize, copied: &[u64], (ranged, since, asked): (u64, u64, u64)) -> String {
+        let base = self.start as usize / PAGE;
+        let (published, covers, ahead) = crate::watch::coverage(from, to);
+        let slots = *self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+        let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+        let mut text = format!(
+            "copy #{} {:#x}+{:#x} (watched {}, card {}, place {}), span {:#x}..{:#x} (pages {first}..{last});              taken whole under asking {ranged} (slots {:?}), ledger since {since}, asking numbers reached {asked} when the journal was read and {} now,              standing asking {ahead}, covered by bits {published} / by an asking {covers}; the ledger holds {} pages, {} of them in the span",
+            self.id,
+            self.start,
+            self.len,
+            self.watched.load(Ordering::Relaxed),
+            self.card.is_some(),
+            self.place.is_some(),
+            from,
+            to,
+            slots,
+            crate::watch::asked_so_far(),
+            self.ledger.len(),
+            self.ledger.dirty_in(first, last).len(),
+        );
+        for (page, written, taken) in crate::watch::journal_stale_pages(from, to, base, copied, ranged, since, 4) {
+            let (lo, hi) = ((page * PAGE).max(self.start as usize), ((page + 1) * PAGE).min((self.start + self.len) as usize));
+            text += &format!(
+                "; page {page} ({:#x}): the journal says written by asking {written}, the copy holds it by {taken} (copied {}),                  the ledger holds {:?}{}{}{}{}, shown at {} views",
+                page * PAGE,
+                copied.get(page - base).copied().unwrap_or(0),
+                self.ledger.noted(page),
+                if written > asked { ", NOTED AFTER THE LOOK" } else { "" },
+                if lo < from || hi > to { ", cut by the span" } else { "" },
+                if lo > page * PAGE || hi < (page + 1) * PAGE { ", cut by the copy" } else { "" },
+                if crate::watch::landed_lately(page * PAGE, PAGE, 2) { ", landed on lately" } else { "" },
+                crate::inplace::pages_of(page * PAGE).len(),
+            );
         }
-        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
+        crate::pagedrive::drain();
+        text += &format!("; asked again now: the gate says {}", self.gate_by_ledger(from, to));
+        text
     }
 
     /// The latest asking after which a range that holds `[from, to)` was

@@ -1044,6 +1044,40 @@ pub(crate) fn journal_stale(start: usize, end: usize, base: usize, copied: &[u64
     })
 }
 
+/// The pages [`journal_stale`] calls stale, at most `limit` of them, as `(page, the asking that last found it written,
+/// the asking the copy holds it by)`: for the log of a span the gate would have left stale.
+pub(crate) fn journal_stale_pages(
+    start: usize,
+    end: usize,
+    base: usize,
+    copied: &[u64],
+    ranged: u64,
+    since: u64,
+    limit: usize,
+) -> Vec<(usize, u64, u64)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
+        return Vec::new();
+    };
+    journal()
+        .written
+        .range(first..last)
+        .filter_map(|(&page, &write)| {
+            let at = taken[page - first].max(ranged);
+            (at != 0 && write > at && write > since).then_some((page, write, at))
+        })
+        .take(limit)
+        .collect()
+}
+
+/// How the journal covers `[start, end)`: by the blocks' bits, by an asking that stands, and the number it gives
+/// (`ahead_asked`). For the log.
+pub(crate) fn coverage(start: usize, end: usize) -> (bool, bool, u64) {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = journal();
+    (published(start, end), j.covers(first, last), j.ahead_asked)
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the

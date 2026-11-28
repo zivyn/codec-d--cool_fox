@@ -592,8 +592,8 @@ mod tests {
         let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap();
         if let Ok(dll) = std::fs::read(system.join("System32").join("D3D12Core.dll")) {
             let v = super::exported_sdk_version(&dll).expect("System32's D3D12Core.dll exports D3D12SDKVersion");
-            assert!(v >= 4, "{v}");
-            assert!((4..=614).contains(&super::os_runtime()));
+            // Older Windows runtimes may export versions below 4.
+            assert_eq!(super::os_runtime(), v.min(614));
         }
         assert_eq!(super::exported_sdk_version(&[0u8; 64]), None);
         assert_eq!(super::exported_sdk_version(b"MZ"), None);

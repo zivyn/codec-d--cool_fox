@@ -465,6 +465,9 @@ pub fn run(
             println!("pair {}: {made}", names.join(" + "));
         }
     }
+    if footprint_stats() {
+        foot_print();
+    }
     let mut lines = t.lines;
     lines.sort();
     for l in lines {
@@ -634,6 +637,9 @@ fn translate(
 fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
+        if footprint_stats() {
+            foot_tally(&p);
+        }
         match victory_shader::spill::build(&p) {
             Ok(program) => {
                 t.translated += 1;
@@ -1081,5 +1087,127 @@ mod tests {
             ),
             "{err}"
         );
+    }
+}
+
+/// `VICTORY_FOOTPRINT_STATS=1`: run the store footprint (`victory_shader::footprint`) on every
+/// program and print what it could bound, to stderr (stdout stays what the comparison tools read).
+fn footprint_stats() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FOOTPRINT_STATS").is_some_and(|v| v == "1"))
+}
+
+/// Counts by name, for compute programs ("cs") and the others ("other").
+static FOOT: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
+
+fn foot_tally(p: &NativeProgram) {
+    use victory_shader::footprint::{Bind, Cause, Expr, Target, analyze_causes};
+    let kind = if p.stage == HwStage::Cs { "cs" } else { "other" };
+    let mut local: BTreeMap<String, usize> = BTreeMap::new();
+    let mut add = |name: &str, n: usize| *local.entry(format!("{kind} {name}")).or_default() += n;
+    add("programs", 1);
+    let Some((f, causes)) = analyze_causes(p) else {
+        add("programs the analysis does not run on", 1);
+        foot_flush(local);
+        return;
+    };
+    if f.unbounded {
+        add("programs unbounded", 1);
+    }
+    if f.by_address {
+        add("programs with stores by address", 1);
+    }
+    if !f.stores.is_empty() {
+        add("programs with view stores", 1);
+    }
+    let threads = match &p.io {
+        victory_shader::native::StageIo::Cs(cs) => cs.threads,
+        _ => [1, 1, 1],
+    };
+    let zero = |_: u8, _: u32| Some(0u32);
+    let none = |_: u8, _: u32| None::<u32>;
+    // Groups and constants known (a dispatch of 16 groups on each axis, constants 0) and not (indirect, unknown).
+    let known = Bind { threads, groups: Some([16, 16, 16]), constants: &zero };
+    let unknown = Bind { threads, groups: None, constants: &none };
+    let mut all_known = !f.stores.is_empty() && !f.unbounded;
+    for (store, cause) in f.stores.iter().zip(&causes) {
+        add("view stores", 1);
+        add(
+            match store.target {
+                Target::Table { .. } => "view stores to a table entry",
+                Target::TableAny { .. } => "view stores to any entry of a table",
+                Target::Root { .. } => "view stores to a root view",
+            },
+            1,
+        );
+        let topless = !store.offset.has_top();
+        if topless {
+            add("view stores with an offset of thread ids, group ids, root constants and constants only", 1);
+            let mut uses = (false, false, false);
+            fn walk(e: &Expr, u: &mut (bool, bool, bool)) {
+                match e {
+                    Expr::Thread(_) => u.0 = true,
+                    Expr::Group(_) => u.1 = true,
+                    Expr::Root { .. } => u.2 = true,
+                    Expr::Add(a, b) | Expr::Sub(a, b) | Expr::Mul(a, b) | Expr::Shl(a, b) | Expr::Shr(a, b) | Expr::And(a, b) | Expr::Or(a, b) | Expr::Min(a, b) | Expr::Max(a, b) | Expr::Select(a, b) => {
+                        walk(a, u);
+                        walk(b, u);
+                    }
+                    Expr::Bfe(a, b, c) => {
+                        walk(a, u);
+                        walk(b, u);
+                        walk(c, u);
+                    }
+                    Expr::Const(_) | Expr::Top => {}
+                }
+            }
+            walk(&store.offset, &mut uses);
+            add(
+                match uses {
+                    (false, false, false) => "  of them constant",
+                    (_, false, false) => "  of them by thread id",
+                    (_, _, false) => "  of them by group id",
+                    (_, _, true) => "  of them using root constants",
+                },
+                1,
+            );
+        } else {
+            let why = match cause {
+                Some(Cause::Loaded) => "loaded value",
+                Some(Cause::Cyclic) => "loop-carried value",
+                Some(Cause::Op) => "operation not followed",
+                Some(Cause::Typed) => "typed or formatted access",
+                Some(Cause::Input) => "other register set by the hardware",
+                Some(Cause::Size) => "expression too big",
+                None => "(masked by a bounding operation)",
+            };
+            add(&format!("view stores with an offset not known: {why}"), 1);
+        }
+        if store.offset.eval(&known).is_some() {
+            add("view stores bounded with groups and constants known", 1);
+        } else {
+            all_known = false;
+        }
+        if store.offset.eval(&unknown).is_some() {
+            add("view stores bounded with groups and constants not known", 1);
+        }
+    }
+    if all_known {
+        add("programs whose every view store is bounded with groups and constants known", 1);
+    }
+    foot_flush(local);
+}
+
+fn foot_flush(local: BTreeMap<String, usize>) {
+    let mut total = FOOT.lock().unwrap_or_else(|e| e.into_inner());
+    for (k, v) in local {
+        *total.entry(k).or_default() += v;
+    }
+}
+
+fn foot_print() {
+    eprintln!("footprint statistics:");
+    for (k, v) in FOOT.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        eprintln!("  {k:<110} {v}");
     }
 }

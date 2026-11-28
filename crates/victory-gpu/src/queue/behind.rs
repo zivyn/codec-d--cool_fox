@@ -94,6 +94,10 @@ pub(super) trait Work: Send {
     fn peek(&self) -> Option<Vec<usize>> {
         None
     }
+    /// Where the parts of a submission that stands for several begin in what [`Work::peek`] says (none for one).
+    fn parts(&self) -> Vec<usize> {
+        Vec::new()
+    }
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
 }
@@ -103,6 +107,10 @@ struct Entry<W> {
     queue: usize,
     /// What [`Work::round`] said when it came in.
     round: u64,
+    /// Runs counted for it that came into it ahead of its turn ([`Lane::prefold`]): they are not entries any more.
+    along: usize,
+    /// It took along what it could ahead of its turn and is prepared as it is: nothing more is taken into it.
+    prepared: bool,
     what: W,
 }
 
@@ -175,6 +183,19 @@ pub(super) fn stage_a() -> bool {
     crate::ab::live_flag!("VICTORY_STAGE_A")
 }
 
+/// Whether the next submission's whole preparing before its lists go to the card is done by a thread of ours while the
+/// one before is sent (`VICTORY_STAGE_A_STEPS=1`, with [`stage_a`]; off by default): see `crate::host::front`.
+pub(super) fn stage_front() -> bool {
+    crate::ab::live_flag!("VICTORY_STAGE_A_STEPS")
+}
+
+/// While our thread does an entry: the first of the line, if it is a submission of the same queue, takes along what
+/// it can (as it would when its turn came) and is named: its number, its host lists and where its parts begin.
+/// Nothing more is taken into it after this ([`Lane::prefold`]).
+pub(super) fn prefold() -> Option<(u64, Vec<usize>, Vec<usize>)> {
+    LANE.prefold()
+}
+
 /// Tests: stage A's question answers yes.
 #[cfg(test)]
 static FORCE_STAGE_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -234,7 +255,7 @@ impl<W: Work> Lane<W> {
         let number = state.next;
         state.next += 1;
         let round = what.round();
-        state.items.push_back(Entry { number, queue, round, what });
+        state.items.push_back(Entry { number, queue, round, along: 0, prepared: false, what });
     }
 
     /// Adds to the end of the line, and has it looked at.
@@ -350,8 +371,76 @@ impl<W: Work> Lane<W> {
         state.runs -= runs;
         state.runs += parts.iter().filter(|p| p.runs()).count();
         for (i, what) in parts.into_iter().enumerate() {
-            state.items.insert(at + i, Entry { number, queue, round, what });
+            state.items.insert(at + i, Entry { number, queue, round, along: 0, prepared: false, what });
         }
+    }
+
+    /// What follows `entry` in its queue, if that can go with it: taken along, as
+    /// [`Work::take_along`] says. How many submissions that was.
+    fn gather(&self, entry: &mut Entry<W>, limit: u64) -> usize {
+        let mut added = 0;
+        while entry.what.runs() {
+            let next = {
+                let mut state = self.lock();
+                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
+                at.and_then(|at| Some((at, state.items.remove(at)?)))
+            };
+            let Some((at, next)) = next else {
+                break;
+            };
+            // (Back where it was: parts of one submission share a number.)
+            if next.what.folded() {
+                let free = next.what.ask().is_none_or(|ask| W::met(&ask));
+                let mut state = self.lock();
+                if free {
+                    Self::unfold(&mut state, at, next);
+                    continue;
+                }
+                state.items.insert(at, next);
+                break;
+            }
+            // (One that took others along ahead of its turn is not taken along itself: its count would be lost.)
+            if next.along > 0 || next.prepared {
+                self.lock().items.insert(at, next);
+                break;
+            }
+            let Entry { number, queue, round, along, prepared, what } = next;
+            match entry.what.take_along(what) {
+                Ok(run) => {
+                    added += usize::from(run);
+                    entry.round = entry.round.max(round);
+                }
+                Err(what) => {
+                    self.lock().items.insert(at, Entry { number, queue, round, along, prepared, what });
+                    break;
+                }
+            }
+        }
+        added
+    }
+
+    /// While the entry being done is, the first of the line is a submission of the same queue: it takes along what
+    /// it can, as it will when its turn comes (what comes in by then is not taken: it is marked `prepared`), so that
+    /// what it is is known: its number, the host lists it will run (as [`Work::peek`] says) and where its parts begin.
+    /// It stays at its place.
+    pub(super) fn prefold(&self) -> Option<(u64, Vec<usize>, Vec<usize>)> {
+        let (mut entry, limit) = {
+            let mut state = self.lock();
+            let queue = state.running?;
+            let first = state.items.front()?;
+            if first.queue != queue || first.what.folded() || !first.what.runs() || first.what.peek().is_none() {
+                return None;
+            }
+            (state.items.pop_front()?, state.next)
+        };
+        // (The queue stays `running`: a thread that gives it something meanwhile puts it in the line.)
+        if !entry.prepared {
+            entry.along += self.gather(&mut entry, limit);
+            entry.prepared = true;
+        }
+        let found = entry.what.peek().map(|lists| (entry.number, lists, entry.what.parts()));
+        self.lock().items.push_front(entry);
+        found
     }
 
     /// Does one entry: the oldest that is the first of its queue and free to
@@ -406,7 +495,7 @@ impl<W: Work> Lane<W> {
             state.running = Some(entry.queue);
             entry
         };
-        let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()));
+        let (shows, mut runs) = (entry.what.shows(), usize::from(entry.what.runs()) + entry.along);
         if entry.what.folded() {
             // Its parts take its place: behind everything before it, before
             // everything after it (they share its number; the first of them
@@ -420,38 +509,11 @@ impl<W: Work> Lane<W> {
             return true;
         }
         // What follows it in its queue, if that can go with it. (Nobody else
-        // takes anything out, and what comes in goes to the end.)
-        while runs > 0 && !forced {
-            let next = {
-                let mut state = self.lock();
-                let at = state.items.iter().position(|e| e.queue == entry.queue && e.number < limit);
-                at.and_then(|at| Some((at, state.items.remove(at)?)))
-            };
-            let Some((at, next)) = next else {
-                break;
-            };
-            // (Back where it was: parts of one submission share a number.)
-            if next.what.folded() {
-                let free = next.what.ask().is_none_or(|ask| W::met(&ask));
-                let mut state = self.lock();
-                if free {
-                    Self::unfold(&mut state, at, next);
-                    continue;
-                }
-                state.items.insert(at, next);
-                break;
-            }
-            let Entry { number, queue, round, what } = next;
-            match entry.what.take_along(what) {
-                Ok(run) => {
-                    runs += usize::from(run);
-                    entry.round = entry.round.max(round);
-                }
-                Err(what) => {
-                    self.lock().items.insert(at, Entry { number, queue, round, what });
-                    break;
-                }
-            }
+        // takes anything out, and what comes in goes to the end.) Not for what
+        // was taken along ahead of its turn, and is being prepared as it is
+        // (`VICTORY_STAGE_A`).
+        if !forced && !entry.prepared {
+            runs += self.gather(&mut entry, limit);
         }
         ROUND.set(entry.round);
         let ahead = if pipeline_prepare() {
@@ -575,8 +637,17 @@ impl Work for Job {
 
     fn peek(&self) -> Option<Vec<usize>> {
         match self {
-            Job::Run(_, lists, order) => Some(order.iter().map(|&i| std::ptr::from_ref(lists[i].host()) as usize).collect()),
+            Job::Run(_, lists, order) | Job::Joined(_, lists, order, ..) => {
+                Some(order.iter().map(|&i| std::ptr::from_ref(lists[i].host()) as usize).collect())
+            }
             _ => None,
+        }
+    }
+
+    fn parts(&self) -> Vec<usize> {
+        match self {
+            Job::Joined(_, _, _, parts, _) => parts.clone(),
+            _ => Vec::new(),
         }
     }
 
@@ -1120,6 +1191,7 @@ mod tests {
         fn peek(&self) -> Option<Vec<usize>> {
             match self {
                 T::Peek(name, _) => Some(vec![name.len(), name.as_bytes()[0] as usize]),
+                T::Group(names, ..) => Some(names.iter().map(|n| n.len()).collect()),
                 _ => None,
             }
         }
@@ -1288,6 +1360,36 @@ mod tests {
         assert!(take_ahead().is_none());
         restore_ahead(held);
         assert_eq!(take_ahead(), Some(vec![7]));
+    }
+
+    /// While one entry is done, the first of the line takes along what it can ahead of its turn and says what it holds;
+    /// when its turn comes nothing more is taken into it (what a wait that is met since would have let it take stays),
+    /// and the counts come out even.
+    #[test]
+    fn the_first_of_the_line_takes_along_ahead_of_its_turn_and_no_more_after() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        let part = |name| T::Group(vec![name], log.clone(), Vec::new());
+        lane.push(1, [part("a"), part("b"), T::Wait(f, 1), part("c")]);
+        // Nothing is being done: nothing is prefolded.
+        assert!(lane.prefold().is_none());
+        lane.lock().running = Some(1);
+        // (The entry of the test's own is not in the line: `a` stands for it.)
+        let (number, lists, parts) = lane.prefold().expect("a submission of the queue being done is first");
+        assert_eq!(number, 0);
+        assert_eq!(lists, vec![1, 1], "a and b");
+        assert!(parts.is_empty());
+        // Asked again, it is the same, and takes nothing more.
+        let again = lane.prefold().unwrap();
+        assert_eq!(again.1, vec![1, 1]);
+        lane.lock().running = None;
+        // The wait is met by now: without the mark `a+b` would take it, and `c` too.
+        crate::fence::set(f as This, 1);
+        look(&lane);
+        assert_eq!(*log.lock().unwrap(), ["a+b".to_string(), "c".to_string()]);
+        let state = lane.lock();
+        assert_eq!((state.runs, state.items.len()), (0, 0), "the counts come out even");
     }
 
     /// A submission takes what follows it in its queue along, up to what it

@@ -4019,6 +4019,7 @@ fn late_line(frames: f64) {
         return;
     }
     prefetch::line(frames);
+    front::frame_line(frames);
     askaside::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
@@ -4161,6 +4162,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 mod prefetch;
+mod front;
 mod scratch;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -6064,6 +6066,8 @@ impl Host {
             return;
         }
         late_threads();
+        // The thread of stage A is done with the submission before any decision is made about it.
+        front::join();
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             card_steps::cut_for(&runs)
@@ -6417,15 +6421,26 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        // (A submission that is waited for takes its number after the one stage A prepared has taken its own.)
+        if !late {
+            front::quiesce();
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         // The refreshes of this submission begun while the one before was sent
-        // are over before anything is asked or refreshed here.
-        if late {
+        // are over before anything is asked or refreshed here, and so is
+        // everything stage A did of it (`VICTORY_STAGE_A_STEPS`): its asking, its
+        // refreshes and its steps, which are not done again.
+        let staged = if late {
             prefetch::join();
-        }
+            front::join();
+            front::take(runs, parts)
+        } else {
+            None
+        };
+        let staged_number = staged.as_ref().map(front::Front::number);
         let was_working = working(true);
         submitting(1, runs.len());
         #[cfg(feature = "diagnostics")]
@@ -6453,11 +6468,11 @@ impl Host {
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
         // Or the reads are done on the card, behind the flights.
-        let own = if late { self.card_steps(runs) } else { None };
+        let own = if late && staged_number.is_none() { self.card_steps(runs) } else { None };
         // The next submission's refreshes of the copies this one does nothing to begin on the thread of
         // `prefetch` now, beside what this one does up to its snapshots (`VICTORY_STAGE_A=1`); they are over
         // at `join_early`, before anything of this submission's that the card sees.
-        if late {
+        if late && staged_number.is_none() {
             prefetch::offer_early(runs, own.as_ref().map(|own| own.list()));
         }
         // A round of the heaps' records asked for as the submission came into
@@ -6469,6 +6484,7 @@ impl Host {
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
         } else if own.is_none()
+            && staged_number.is_none()
             && let Some(why) = late_blocked(runs)
         {
             // What the flights land may be descriptors: a round after it.
@@ -6529,7 +6545,10 @@ impl Host {
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
-        let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        let this_submission = match staged_number {
+            Some(number) => number,
+            None => STARTED.fetch_add(1, Ordering::AcqRel) + 1,
+        };
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -6543,6 +6562,9 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::new(lean_steps());
+        if let Some(staged) = staged {
+            batch.placed = staged.into_placed();
+        }
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -6554,7 +6576,9 @@ impl Host {
         let mut asking: Option<crate::watch::Standing> = None;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
-        if crate::watch::once() {
+        if staged_number.is_some() {
+            // (Asked, refreshed and stepped by the thread of stage A.)
+        } else if crate::watch::once() {
             // (With `VICTORY_LEAN_STEPS` the thread's kept table: the ranges are what it holds at the end.)
             // Asked beside the planning (`VICTORY_ASK_ASIDE`): the title's lists were gathered then, and what is
             // gathered now is the planning's own list, which comes first among `runs`.
@@ -6618,14 +6642,18 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
-        if refresh_front() {
+        if staged_number.is_some() {
+            // (Done by the thread of stage A.)
+        } else if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
         for list in runs {
-            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            if staged_number.is_none() {
+                list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -6701,15 +6729,24 @@ impl Host {
         } else {
             Vec::new()
         };
-        let mut offered = false;
+        // Stage A of the next submission by its own thread (`VICTORY_STAGE_A_STEPS`): it begins once this submission's
+        // places are in the copies (what it writes into title memory and the copies must not be in this one's sends,
+        // or under its places), so only here if there are none to wait for.
+        let by_thread = early && front::on();
+        let mut told: Option<bool> = None;
+        let mut given = false;
         let card = self.card_before(&declared, &picked, flown, &mut |taken| {
-            if !offered {
+            if told.is_none() {
                 // (Told once, as it may not be offered later either.)
-                offered = true;
+                told = Some(taken);
                 if early && taken {
                     // (The copies it refreshes may be those of declared ranges' neighbours: the snapshots first.)
                     crate::shadow::snapshots_wait();
-                    prefetch::offer(&excluding);
+                    if !by_thread {
+                        prefetch::offer(&excluding);
+                    } else if excluding.is_empty() {
+                        given = front::offer();
+                    }
                 }
             }
         });
@@ -6720,13 +6757,18 @@ impl Host {
         crate::shadow::snapshots_wait();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots_waited.elapsed().as_micros() as u64);
-        if !offered && early {
+        if told.is_none() && early && !by_thread {
             prefetch::offer(&excluding);
         }
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
+        }
+        // (Not told: nothing was taken, as for the offer after the take.) Past the places, the copies are the next
+        // submission's to refresh.
+        if by_thread && !given && told.unwrap_or(true) && !front::offer() {
+            prefetch::offer(&[]);
         }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));

@@ -87,13 +87,13 @@ pub(super) fn may_offer(own: bool, nothing_sent: bool) -> bool {
 static OFFERED_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Offered work, being done, and the wait for it to be over.
-struct Gate<W> {
+pub(super) struct Gate<W> {
     state: Mutex<(Option<W>, bool)>,
     changed: std::sync::Condvar,
 }
 
 impl<W> Gate<W> {
-    const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Gate { state: Mutex::new((None, false)), changed: std::sync::Condvar::new() }
     }
 
@@ -102,7 +102,7 @@ impl<W> Gate<W> {
     }
 
     /// Offers `work`: refused (given back) if some is offered or being done.
-    fn offer(&self, work: W) -> Result<(), W> {
+    pub(super) fn offer(&self, work: W) -> Result<(), W> {
         let mut state = self.lock();
         if state.0.is_some() || state.1 {
             return Err(work);
@@ -115,7 +115,7 @@ impl<W> Gate<W> {
 
     /// The thread that does it: waits for work and takes it; it is being done
     /// until [`Gate::done`].
-    fn take(&self) -> W {
+    pub(super) fn take(&self) -> W {
         let mut state = self.lock();
         loop {
             if let Some(work) = state.0.take() {
@@ -126,13 +126,13 @@ impl<W> Gate<W> {
         }
     }
 
-    fn done(&self) {
+    pub(super) fn done(&self) {
         self.lock().1 = false;
         self.changed.notify_all();
     }
 
     /// Waits until nothing is offered or being done; whether it had to.
-    fn join(&self) -> bool {
+    pub(super) fn join(&self) -> bool {
         let mut state = self.lock();
         let waited = state.0.is_some() || state.1;
         while state.0.is_some() || state.1 {
@@ -144,7 +144,7 @@ impl<W> Gate<W> {
 
 /// What is to be refreshed: per host copy, the span, as the next submission's
 /// own refreshing would make it.
-type Spans = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
+pub(super) type Spans = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
 
 /// What the thread is given: whether it is the early offer ([`offer_early`]), and the spans.
 type Offered = (bool, Spans);
@@ -189,7 +189,7 @@ const EARLY_WORKED: usize = 13;
 ///
 /// The addresses name host lists that nothing changes or takes while this
 /// runs ([`crate::queue::take_ahead`]).
-unsafe fn spans_of(lists: &[usize], excluding: &[usize]) -> Spans {
+pub(super) unsafe fn spans_of(lists: &[usize], excluding: &[usize]) -> Spans {
     let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
     let mut touches = Vec::new();
     for &at in lists {
@@ -451,7 +451,7 @@ fn start() {
 
 /// The write watch asked about the copies' spans, and each brought up to date
 /// unless it is known to hold nothing new, as `Batch::refresh_front` does.
-fn run(mut spans: Spans) {
+pub(super) fn run(mut spans: Spans) {
     // Per copy, what is asked about (once, as a submission's own asking is).
     let mut ranges: ByCopy<(usize, usize)> = ByCopy::default();
     for (shadow, from, to) in &spans {

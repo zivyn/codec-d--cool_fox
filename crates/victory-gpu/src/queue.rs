@@ -481,6 +481,20 @@ pub(crate) fn stage_a() -> bool {
     behind::stage_a() && behind::on()
 }
 
+/// Whether the whole preparing of the next submission is done beside the sending of this one
+/// (`VICTORY_STAGE_A_STEPS=1` with `VICTORY_STAGE_A`).
+#[cfg(windows)]
+pub(crate) fn stage_front() -> bool {
+    behind::stage_a() && behind::stage_front() && behind::on()
+}
+
+/// The first submission of the line, if it is of the queue being done: its number, its host lists in the order they
+/// run and where its parts begin, after it took along what it can ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
+    behind::prefold()
+}
+
 /// The host lists (addresses) of the submission that comes next after the one
 /// our thread is preparing, asked once ([`behind`]).
 #[cfg(windows)]

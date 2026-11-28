@@ -75,6 +75,10 @@ const THREAD_KEY: u64 = 1 << 63;
 const CONTEXT_UNWIND: u32 = 0x0010_0000 | 0x1 | 0x2;
 /// `STATUS_NO_MORE_ENTRIES`: the end of the walk of the threads.
 const STATUS_NO_MORE_ENTRIES: i32 = 0x8000_001Au32 as i32;
+/// A thread that did not run for this many rounds is looked at one round in `THIN_EVERY` (a wait costs the
+/// profiler a system call to see, and most of the hundred and more threads wait).
+const THIN_AFTER: u32 = 64;
+const THIN_EVERY: u64 = 8;
 /// The threads and modules are looked up again this often.
 const REFRESH: Duration = Duration::from_millis(250);
 
@@ -96,6 +100,10 @@ pub(crate) struct Config {
     /// Seconds sampled and seconds not, alternating, from the start (the profiler's own cost shows
     /// in the census lines of the two).
     pub duty: Option<(Duration, Duration)>,
+    /// The profile is taken from this long after it started (to leave out the load) until `to`, when
+    /// it writes its files and ends.
+    pub from: Duration,
+    pub to: Option<Duration>,
 }
 
 impl Config {
@@ -131,6 +139,12 @@ impl Config {
             );
             (!on.is_zero() && !off.is_zero()).then_some((on, off))
         });
+        let from = number("VICTORY_PROFILE_FROM")
+            .and_then(secs)
+            .unwrap_or_default();
+        let to = number("VICTORY_PROFILE_TO")
+            .and_then(secs)
+            .filter(|to| *to > from);
         Some(Config {
             hz: hz.clamp(1.0, 5000.0),
             every: secs(number("VICTORY_PROFILE_SECS").unwrap_or(15.0))?
@@ -141,6 +155,8 @@ impl Config {
             lines: (number("VICTORY_PROFILE_LINES").unwrap_or(200_000.0) as usize).max(1000),
             file,
             duty,
+            from,
+            to,
         })
     }
 }
@@ -697,6 +713,8 @@ struct Thr {
     cycles_last: u64,
     cycles_sampled: u64,
     idle: u64,
+    /// Rounds in a row it had not run; a thread that has not for long is looked at one round in `THIN_EVERY`.
+    streak: u32,
     samples: u64,
     phases: [u64; 4],
     /// Processor time, 100 ns, in the windows sampled; and the counters at the last look.
@@ -842,6 +860,7 @@ struct Stats {
     late: u64,
     samples: u64,
     idle: u64,
+    thinned: u64,
     suspends: u64,
     suspend_ticks: i64,
     suspend_max_ticks: i64,
@@ -1013,6 +1032,7 @@ impl State {
             cycles_last: if after && self.on { 0 } else { cycles },
             cycles_sampled: 0,
             idle: 0,
+            streak: 0,
             samples: 0,
             phases: [0; 4],
             user: 0,
@@ -1075,6 +1095,13 @@ impl State {
             if !t.alive || t.tid == self.me || t.handle.is_null() {
                 return;
             }
+            if t.streak >= THIN_AFTER
+                && !force
+                && self.stats.rounds.wrapping_add(u64::from(t.tid)) % THIN_EVERY != 0
+            {
+                self.stats.thinned += 1;
+                return;
+            }
             (t.handle, t.teb, t.root)
         };
         let Some(cycles) = cycles_of(handle) else {
@@ -1083,6 +1110,7 @@ impl State {
         let last = self.threads[i].cycles_last;
         if cycles == last && !force {
             self.threads[i].idle += 1;
+            self.threads[i].streak = self.threads[i].streak.saturating_add(1);
             self.stats.idle += 1;
             return;
         }
@@ -1123,6 +1151,7 @@ impl State {
         self.tree.record(root, &walked, &self.frames, weight);
         let t = &mut self.threads[i];
         t.cycles_last = cycles;
+        t.streak = 0;
         t.cycles_sampled += weight;
         t.samples += 1;
         t.phases[phase] += 1;
@@ -1295,8 +1324,8 @@ impl State {
         );
         let _ = writeln!(
             out,
-            "hz_asked\t{}\nrounds\t{}\nlate_rounds\t{}\nsamples\t{}\nidle_skips\t{}\nlost_samples\t{}\nstacks\t{stacks}",
-            self.cfg.hz, s.rounds, s.late, s.samples, s.idle, self.tree.lost
+            "hz_asked\t{}\nrounds\t{}\nlate_rounds\t{}\nsamples\t{}\nidle_skips\t{}\nthinned_skips\t{}\nlost_samples\t{}\nstacks\t{stacks}",
+            self.cfg.hz, s.rounds, s.late, s.samples, s.idle, s.thinned, self.tree.lost
         );
         let _ = writeln!(
             out,
@@ -1592,8 +1621,13 @@ fn run(mut state: State) {
     let mut next_refresh = Instant::now() + REFRESH;
     let mut next_write = Instant::now() + state.cfg.every;
     eprintln!(
-        "VIctory: the profile begins ({} Hz, to {}, timer {})",
+        "VIctory: the profile is set ({} Hz, from {} s, to {}, file {}, timer {})",
         state.cfg.hz,
+        state.cfg.from.as_secs_f64(),
+        state
+            .cfg
+            .to
+            .map_or("the end".to_string(), |t| format!("{} s", t.as_secs_f64())),
         state.cfg.file.display(),
         if high {
             "high resolution"
@@ -1602,13 +1636,19 @@ fn run(mut state: State) {
         }
     );
     while !STOP.load(Ordering::SeqCst) {
-        let sampling = match state.cfg.duty {
-            None => true,
-            Some((on, off)) => {
-                let phase = state.started.elapsed().as_secs_f64() % (on + off).as_secs_f64();
-                phase < on.as_secs_f64()
-            }
-        };
+        let since = state.started.elapsed();
+        if state.cfg.to.is_some_and(|to| since >= to) {
+            break;
+        }
+        let sampling = since >= state.cfg.from
+            && match state.cfg.duty {
+                None => true,
+                Some((on, off)) => {
+                    // (The cycle begins when the profile does, not when the process does.)
+                    let phase = (since - state.cfg.from).as_secs_f64() % (on + off).as_secs_f64();
+                    phase < on.as_secs_f64()
+                }
+            };
         if sampling {
             state.begin_window();
             state.sample_round(false);
@@ -1620,7 +1660,7 @@ fn run(mut state: State) {
             state.refresh();
             next_refresh = Instant::now() + REFRESH;
         }
-        if now >= next_write {
+        if now >= next_write && state.stats.samples > 0 {
             if let Err(e) = state.write() {
                 eprintln!("VIctory: the profile was not written: {e}");
             }
@@ -1702,6 +1742,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(c.file, Path::new("G:\\runs\\a").join("profile.folded"));
+        // A time to take it from, and a time to end (later than the one it begins).
+        let c = Config::from_env(
+            "100",
+            &env(&[
+                ("VICTORY_PROFILE_FROM", "240"),
+                ("VICTORY_PROFILE_TO", "360.5"),
+            ]),
+            dir,
+        )
+        .unwrap();
+        assert_eq!(
+            (c.from, c.to),
+            (
+                Duration::from_secs(240),
+                Some(Duration::from_millis(360_500))
+            )
+        );
+        let c = Config::from_env(
+            "100",
+            &env(&[
+                ("VICTORY_PROFILE_FROM", "240"),
+                ("VICTORY_PROFILE_TO", "100"),
+            ]),
+            dir,
+        )
+        .unwrap();
+        assert_eq!((c.from, c.to), (Duration::from_secs(240), None));
         // A duty that is not two times is none.
         let c = Config::from_env("100", &env(&[("VICTORY_PROFILE_DUTY", "10")]), dir).unwrap();
         assert_eq!(c.duty, None);
@@ -1919,8 +1986,9 @@ mod tests {
             .unwrap();
         let mut state = State::new(cfg, no_phase).unwrap();
         for round in 0..300 {
-            // The waiter does not run: it is sampled by force, now and then.
-            state.sample_round(round % 20 == 0);
+            // The waiter does not run: it is sampled by force, now and then (and, not having run for a
+            // while, it is looked at one round in eight in between).
+            state.sample_round(round % 100 == 0);
             std::thread::sleep(Duration::from_millis(1));
         }
         state.write().unwrap();
@@ -1977,6 +2045,7 @@ mod tests {
             .sum();
         assert_eq!(in_tree, in_file);
         assert_eq!(in_tree, state.stats.samples);
+        assert!(state.stats.thinned > 20, "{} looks left out", state.stats.thinned);
         // The weights are the cycles the thread used between its first sample's baseline and its last.
         let t = state
             .threads

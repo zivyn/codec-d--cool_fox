@@ -651,9 +651,11 @@ translation of shaders.
 | `VICTORY_PROFILE_DEPTH` | 32 | number |  |  | diag | Frames kept of a stack by the rate profiler (2 to 64); a deeper stack is cut at the outer end and marked `[truncated]`. |
 | `VICTORY_PROFILE_DUTY` | off | list |  |  | diag | `on,off` seconds: the rate profiler samples for `on` seconds, then stops for `off`, alternating from the start, and writes the windows in the report (to read its own cost from the census lines of the two). |
 | `VICTORY_PROFILE_FILE` | `profile.folded` beside the run's capture folder (`VICTORY_CAPTURE`), else in the cache folder | path |  |  | diag | The folded file of the rate profiler; `.cycles` and `.txt` are written beside it. |
+| `VICTORY_PROFILE_FROM` | 0 | number |  |  | diag | Seconds after the title starts at which the rate profiler begins (leave the load out): `VICTORY_PROFILE=1000 VICTORY_PROFILE_FROM=240 VICTORY_PROFILE_TO=360` takes 120 s of the window spot of a warm run. |
 | `VICTORY_PROFILE_LINES` | 200000 | number |  |  | diag | Stacks of the heaviest, by cycles, that the folded files keep (the tables count them all). |
 | `VICTORY_PROFILE_NODES` | 1048576 | number |  |  | diag | Nodes of the rate profiler's tree of stacks (24 bytes each and 8 for the table): its memory is fixed at the start (about 32 MB); a sample that finds no room counts for the deepest node it reached (`lost_samples`). |
 | `VICTORY_PROFILE_SECS` | 15 | number |  |  | diag | Seconds between the writes of the files of the rate profiler (at least 1; one more at exit). |
+| `VICTORY_PROFILE_TO` | off | number |  |  | diag | Seconds after the title starts at which the rate profiler writes its files and ends (later than `VICTORY_PROFILE_FROM`). |
 | `VICTORY_QUEUE_WAIT` | on (=0 turns off) | flag |  |  |  | Queues wait for fences. |
 | `VICTORY_QUICK_FIND` | on (=0 turns off) | flag |  | live |  | Keep the table of found buffers. |
 | `VICTORY_QUICK_MIRROR` | on (=0 turns off) | flag |  |  |  | Skip the mirror step in descriptor copies. |

@@ -51,6 +51,11 @@ const PROGRAM: &[u32] = &[
 
 /// Lowers [`PROGRAM`] (wave32, one thread) with the switch `on` or off.
 fn build(on: bool) -> HostShader {
+    build_program(on, PROGRAM)
+}
+
+/// Lowers `code` (wave32, one thread) with the switch `on` or off.
+fn build_program(on: bool, code: &[u32]) -> HostShader {
     let param = |root, user_data, sgprs, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -79,7 +84,7 @@ fn build(on: bool) -> HostShader {
             rsrc2: 2 << 1,
             threads: [1, 1, 1],
         }),
-        code: PROGRAM.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
@@ -284,4 +289,22 @@ fn a_window_reads_the_copy_at_its_bytes_and_stops_at_its_length() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device available");
+}
+
+/// An entry the program also reads typed (`buffer_load_format_x`), which needs the entry's view, is not one only windows
+/// read: the host must make its view for the program, though the raw loads still go through the window.
+#[test]
+fn an_entry_read_through_its_view_too_is_not_window_only() {
+    let mut code = PROGRAM[..PROGRAM.len() - 1].to_vec();
+    code.extend([
+        0xE000_0000, // buffer_load_format_x v10, off, s[24:27], 0
+        0x8006_0A00,
+        0xE070_0018, // buffer_store_dword v10, off, s[20:23], 0 offset:24
+        0x8005_0A00,
+        0xBF81_0000, // s_endpgm
+    ]);
+    let on = build_program(true, &code);
+    assert_eq!(on.root_srvs, [super::SLOT_VIEW_WINDOWS]);
+    assert!(on.bindless.is_empty(), "{:?}", on.bindless);
+    assert_eq!(build(true).bindless, [(0, 0)]);
 }

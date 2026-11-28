@@ -3727,6 +3727,34 @@ impl State {
         });
     }
 
+    /// `VICTORY_LUX` (`crate::lux`): before the title's program that moves its lux block runs, the ends of its
+    /// range are the wanted value, in the constants the program reads (title memory the title writes again
+    /// before the next frame's dispatch).
+    fn force_lux(&self, p: &HostPipeline) {
+        let Some(value) = crate::lux::forced() else {
+            return;
+        };
+        let Some(stage) = p.stages.first() else {
+            return;
+        };
+        for u in stage.translated().used.iter().filter(|u| u.kind == ResourceType::Cbv && u.root == RootType::Table) {
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(View::Constant(address, size)) = crate::descriptor::view(handle) else {
+                continue;
+            };
+            let needs = crate::lux::NEEDS;
+            if size >= needs && crate::texture::committed(address as *const u8, needs as usize) {
+                once!(value, "VICTORY_LUX: the range of the title's lux block is forced to a value");
+                // SAFETY: the constants are committed title memory of at least NEEDS bytes.
+                unsafe { crate::lux::force(address, value) };
+                return;
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
@@ -3773,6 +3801,9 @@ impl State {
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
             return;
+        }
+        if p.stages.first().is_some_and(|s| s.shader.lux) {
+            self.force_lux(p);
         }
         // The groups the dispatch runs (counted in threads: whole groups of them), for what its shaders can write.
         let groups = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())

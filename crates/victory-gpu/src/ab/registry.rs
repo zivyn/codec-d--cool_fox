@@ -84,6 +84,7 @@ pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_LEVELS_RETRY", Kind::OnByDefault),
     ("VICTORY_LIST_NICE", Kind::Count),
     ("VICTORY_LIST_VIEWS", Kind::Flag),
+    ("VICTORY_LUX", Kind::Float),
     ("VICTORY_MAKE_ASIDE", Kind::OnByDefault),
     ("VICTORY_MAP_THREADS", Kind::Flag),
     ("VICTORY_ONE_CALL", Kind::Flag),

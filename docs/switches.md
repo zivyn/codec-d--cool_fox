@@ -158,6 +158,7 @@ switch is read.
 
 | switch | default | row in ab-switches.md | purpose |
 |---|---|---|---|
+| `VICTORY_AMBIENT_GAIN` | 1 | no | Scales the light the indirect-light stand-in puts in (share, floor and constant); 1 changes nothing. |
 | `VICTORY_ASK_ASIDE` | on (=0 turns off) | yes | Offers the write-watch asking to a side thread and joins it where it used to ask. |
 | `VICTORY_ASK_CACHE` | off | yes | Lets a thread remember more write-watch answers, including windows outside buffers. |
 | `VICTORY_ASK_EARLY` | off | yes | Milliseconds between rounds that ask early about pages the title wrote lately; unset is off. |
@@ -291,6 +292,7 @@ translation of shaders.
 | `VICTORY_ALIAS_FAST` | off | flag |  |  |  | Lets page-by-page remapping skip pages that already show the wanted page and do small groups itself. |
 | `VICTORY_AMBIENT` | on, 0.8 (0/off turns off) | text |  |  |  | Stand-in for the title's missing indirect light: share of the estimate, optional floor or constant. |
 | `VICTORY_AMBIENT_AIR` | 1.5 | text |  |  |  | Multiple of the air's scattering for the stand-in light, with optional max:level cap. |
+| `VICTORY_AMBIENT_GAIN` | 1 | number |  | live |  | Scales the light the indirect-light stand-in puts in (share, floor and constant); 1 changes nothing. |
 | `VICTORY_AMBIENT_SHADE` | 1.0,0.6 | list |  |  |  | Strength and radius in metres of the creases' shade in the stand-in light. |
 | `VICTORY_AMBIENT_TRUST` | 4 | number |  |  |  | Bounds what the title's own program left by this multiple of the estimate; 0 drops it. |
 | `VICTORY_ASK_ASIDE` | on (=0 turns off) | flag |  | live |  | Offers the write-watch asking to a side thread and joins it where it used to ask. |

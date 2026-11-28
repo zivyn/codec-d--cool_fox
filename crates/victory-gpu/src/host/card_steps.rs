@@ -256,6 +256,7 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// Steps of a level are done together, every read before every write; a
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
+#[inline(never)]
 fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
@@ -388,6 +389,11 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
     })
 }
 
+/// [`elsewhere`] for refreshes kept apart from the steps ([`does_of`]).
+fn elsewhere_in(refreshed: &[Refreshed], shadow: usize, from: usize, to: usize) -> bool {
+    refreshed.iter().any(|&(s, a, b)| s != shadow && meet((a, b), (from, to)))
+}
+
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
@@ -475,15 +481,35 @@ fn holder_among<'a>(
     Ok(shadow)
 }
 
+/// A refresh of a host copy among the steps (the copy's address, from, to).
+type Refreshed = (usize, usize, usize);
+
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+///
+/// With `lean` (`VICTORY_LEAN_STEPS`) the refreshes are not among what the
+/// steps do: they are the third answer, in the order they stand in, for
+/// [`elsewhere_in`] (the plan does nothing for a refresh, and a frame has
+/// 21,000 of them for 4,400 copies and fills), and what is returned is made
+/// in room taken once.
+#[inline(never)]
+fn does_of(written: &[(usize, usize)], runs: &[&HostList], lean: bool) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Refreshed>) {
+    let (mut does, mut steps) = if lean {
+        // (Without the refreshes: some thousands, to the 26,000 of the steps.)
+        let all: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
+        (Vec::with_capacity(all.min(8192)), Vec::with_capacity(all.min(8192)))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut refreshed = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
+            if lean && let Step::Refresh(shadow, at, len) = step {
+                refreshed.push((Arc::as_ptr(shadow) as usize, *at, *at + *len));
+                continue;
+            }
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,
@@ -523,7 +549,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
             steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
         }
     }
-    (does, steps)
+    (does, steps, refreshed)
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -541,7 +567,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (does, steps, _) = does_of(&written, runs, false);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -841,7 +867,9 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
+        // (Read once: the way the steps of this submission are looked at and the slots made.)
+        let lean = lean_steps();
+        let (does, steps, refreshed) = does_of(written, runs, lean);
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
@@ -866,11 +894,14 @@ impl Host {
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
-        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
+        // (With `VICTORY_LEAN_STEPS` made with room for what the steps will put in: the tables grow by doubling otherwise,
+        // each doubling a new allocation and every entry put in again.)
+        let (places_room, held_room) = if lean { (chosen.len().min(BETWEEN as usize / 256), chosen.len().min(1024)) } else { (0, 0) };
+        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::with_capacity_and_hasher(places_room, Default::default());
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
-        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = HashMap::default();
+        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::with_capacity_and_hasher(held_room, Default::default());
+        let mut room = HashMap::with_capacity_and_hasher(held_room, Default::default());
         let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
@@ -909,7 +940,7 @@ impl Host {
             let to = match does[i] {
                 Does::Copy { .. } => {
                     let to = holder_of(&writers, dst, dst + len)?;
-                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
+                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) || elsewhere_in(&refreshed, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
                     if !mapped(dst, dst + len, &mut room) {
@@ -999,6 +1030,26 @@ impl Host {
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
         crate::land::each_under(parts, &|part| {
+            if lean {
+                // The hold on the buffer is taken once, the look at the heaps once for each heap: not for each of
+                // thousands of slots, by threads that all do it on the same counter of the same buffer.
+                let mut mine: Vec<(usize, u32, u64, u32)> =
+                    Vec::with_capacity(ops.len() / parts + 1);
+                for op in &ops {
+                    if let To::Slot(heap, index) = &op.to
+                        && *index as usize / 4 % parts == part
+                    {
+                        mine.push((*heap, *index, gpu + op.at, op.len as u32));
+                    }
+                }
+                // (In the steps' order, a heap at a time: the slots of one heap are made one after the other in
+                // that order, as before; those of two heaps have nothing in common.)
+                mine.sort_by_key(|slot| slot.0);
+                for heap in mine.chunk_by(|a, b| a.0 == b.0) {
+                    crate::descriptor::constant_slots(heap[0].0, &own.between, heap.iter().map(|&(_, index, at, len)| (index, at, len)));
+                }
+                return;
+            }
             for op in &ops {
                 if let To::Slot(heap, index) = &op.to
                     && *index as usize / 4 % parts == part
@@ -1312,6 +1363,77 @@ mod tests {
         assert!(plan(&[copy(1000, 1050, 100, true)], 2, true, &mut None).is_err());
         assert!(plan(&[taken], 1, true, &mut None).is_err());
         assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1, true, &mut None).is_err());
+    }
+
+    /// The plan does nothing for a refresh: with the refreshes left out of the
+    /// steps (`does_of` with `lean`) the same steps are chosen, at the same
+    /// levels, or refused for the same reason, and what [`elsewhere_in`] says of
+    /// the refreshes is what [`elsewhere`] says of them among the steps.
+    #[test]
+    fn leaving_the_refreshes_out_of_the_steps_changes_no_choice() {
+        let mut seed = 777u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let (mut done, mut refused, mut behind) = (0, 0, 0);
+        for _ in 0..4000 {
+            let (mut with, mut without) = (Vec::new(), Vec::new());
+            // Where each of `with` is in `without` (none: a refresh).
+            let mut place: Vec<Option<usize>> = Vec::new();
+            for _ in 0..2 + random(9) {
+                for _ in 0..random(3) {
+                    with.push(Does::Refresh { shadow: 1 + random(3) as usize, from: random(60) as usize, to: 60 + random(20) as usize });
+                    place.push(None);
+                }
+                let (at, other, len) = (random(60) as usize, random(60) as usize, 1 + random(8) as usize);
+                let asked = random(4) == 0;
+                let step = match random(10) {
+                    0..4 => copy(at, other, len, asked),
+                    4..6 => fill(at, len, asked),
+                    6 => stuck(at, len),
+                    7 => Does::Read { from: at, to: at + len, asked: false },
+                    8 => Does::Placed { dst: at, src: other, len },
+                    _ => fill(at, len, false),
+                };
+                place.push(Some(without.len()));
+                without.push(step);
+                with.push(step);
+            }
+            for by_order in [true, false] {
+                let (mut found_with, mut found_without) = (None, None);
+                let a = plan(&with, 2, by_order, &mut found_with);
+                let b = plan(&without, 2, by_order, &mut found_without);
+                match (a, b) {
+                    (Ok(a), Ok(b)) => {
+                        done += 1;
+                        let a: Vec<(usize, u32)> = a.iter().map(|&(i, level)| (place[i].expect("a refresh is never taken"), level)).collect();
+                        assert_eq!(a, b, "{with:?}");
+                    }
+                    (Err(a), Err(b)) => {
+                        refused += 1;
+                        assert_eq!(a, b, "{with:?}");
+                    }
+                    other => panic!("{other:?} for {with:?}"),
+                }
+                let found = found_with.map(|(p, i)| (place[p].unwrap(), place[i].unwrap()));
+                assert_eq!(found, found_without, "{with:?}");
+                behind += usize::from(found.is_some());
+            }
+            let refreshed: Vec<Refreshed> = with
+                .iter()
+                .filter_map(|d| if let Does::Refresh { shadow, from, to } = *d { Some((shadow, from, to)) } else { None })
+                .collect();
+            for _ in 0..20 {
+                let (shadow, from) = (random(4) as usize, random(80) as usize);
+                let to = from + 1 + random(10) as usize;
+                assert_eq!(
+                    elsewhere(&with, shadow, from, to),
+                    elsewhere(&without, shadow, from, to) || elsewhere_in(&refreshed, shadow, from, to)
+                );
+            }
+        }
+        assert!(done > 500 && refused > 100, "{done} {refused} {behind}");
     }
 
     #[test]

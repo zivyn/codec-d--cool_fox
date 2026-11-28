@@ -948,6 +948,37 @@ pub(crate) fn constant_slot(
     }
 }
 
+/// [`constant_slot`] for several slots of one heap, `(index, gpu, size)` each,
+/// in order (`VICTORY_LEAN_STEPS`): the buffer is held once for all of them
+/// (a slot that already shows it takes no hold), and the heaps are looked at
+/// once for each sixty-four slots, with their lock held for those (as it is
+/// for each by [`constant_slot`]: a thread that wants the lock to change the
+/// heaps is not kept waiting for thousands of slots).
+#[cfg(windows)]
+pub(crate) fn constant_slots(
+    heap: usize,
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    slots: impl Iterator<Item = (u32, u64, u32)>,
+) {
+    const CHUNK: usize = 64;
+    let held = Some(buffer.clone());
+    let mut slots = slots.peekable();
+    while slots.peek().is_some() {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            for (index, gpu, size) in slots.by_ref().take(CHUNK) {
+                host.constant_at_held(index, buffer, &held, gpu, size);
+            }
+        } else {
+            // (A heap that is gone: nothing can read the slots.)
+            return;
+        }
+    }
+}
+
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {

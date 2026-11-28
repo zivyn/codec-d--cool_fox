@@ -75,6 +75,7 @@ the card.
 | `VICTORY_FIRSTLANE_OWN` | off | cache key (text) | =1 takes the host wave's own first lane in wave-wide first-lane reads. |
 | `VICTORY_FIRST_HALF` | on (=0 turns off) | cache key (text) | Removes first-half interpolants only the second half reads before lowering. |
 | `VICTORY_FOLD_VIEWS` | off | cache key (text) | Folds view heap indexing into raw user data in draws and shaders. |
+| `VICTORY_FUSE_DISPATCH` | off | cache key (text) | Compute programs translated as members of a run of dispatches (integ/validation-26); with it unset the emitted code is the one of integ/validation-25. |
 | `VICTORY_GROUP_SYNC` | 2 (every barrier waits) | cache key (value) | Which group barriers wait for the whole group: 0 none, 1 title's only, 2 all. |
 | `VICTORY_HALF_EXIT` | on (=0 turns off) | cache key (value) | Exchanging host waves clear their exchange dword when leaving a loop. |
 | `VICTORY_HELPER_OWN` | on (=0 turns off) | cache key (text) | Pixel-shader helper lanes read their own value where the console reads the first lane's. |
@@ -158,6 +159,7 @@ switch is read.
 | `VICTORY_ASK_MERGE` | on (=0 turns off) | yes | Asks the write watch about all ranges in one sorted pass instead of per range. |
 | `VICTORY_ASYNC_COMPUTE` | off | yes | Runs the title's compute lists on a compute queue (stage 1 or 2; 2 needs submit line, relay). |
 | `VICTORY_ASYNC_SUBMIT` | on (via VICTORY_THIN default 1) | no | Prepares and sends submissions on a separate thread of ours instead of the title's thread. |
+| `VICTORY_CARD_AWAKE` | on, 1 (`=0` off; named in `VICTORY_AB` it is off in the phases without its bit) | yes | Keeps the card's clocks up between submissions (integ/validation-26: live). |
 | `VICTORY_CARD_BIG_FIRST` | on (=0 turns off) | no | Big title buffer copies come first: the texture queue keeps room free for them. |
 | `VICTORY_CLOSED_IDLE` | on (=0 turns off) | yes | Whether an idle host command list is kept closed instead of open as a reset leaves it. |
 | `VICTORY_COPY_BESIDE` | off | no | Copies of title memory put bytes beside the write guards. |
@@ -165,6 +167,8 @@ switch is read.
 | `VICTORY_DSP_REVERB` | off | no | Runs convolution audio streams through a stand-in algorithmic reverb. |
 | `VICTORY_DSP_REVERB_LEVEL` | 1.0 | no | Output level of the stand-in reverb. |
 | `VICTORY_FOLD_VIEWS` | off | yes | Folds view heap indexing into raw user data in draws and shaders. |
+| `VICTORY_FUSE_RUNS` (needs `VICTORY_FUSE_DISPATCH=1` at translation) | off | yes | The dispatches of one program that follow one another are one table and one dispatch (integ/validation-26). |
+| `VICTORY_GPU_RO_SKIP` | off | yes | Pages the title asked for GPU-read-only are left out of the ranges shaders are declared to write (integ/validation-26). |
 | `VICTORY_GUARD_REST` | on, 3000 (=0 turns off) | no | Microseconds guard takers rest; value must be above 1. |
 | `VICTORY_GUARD_SHARDS` | 0 (one lock) | yes | Number of stripes the write guards are divided in, at most STRIPES. |
 | `VICTORY_HEAPS_EARLY` | off | yes | Asks for a descriptor round ahead of a submission's preparing. |
@@ -187,6 +191,7 @@ switch is read.
 | `VICTORY_LIST_NICE` | off | yes | Runs list-translating threads this many priority levels below the guest's; 0 is normal. |
 | `VICTORY_LIST_VIEWS` | on (=0 turns off) | no | Makes a view its tables hold once per list instead of once per table. |
 | `VICTORY_MAKE_ASIDE` | on (=0 turns off) | yes | Makes a buffer's copy aside from its lock; =0 makes it under the lock. |
+| `VICTORY_ONE_CALL` | off | yes | A submission joined of several parts is given to the queue in one `ExecuteCommandLists` call (integ/validation-26). |
 | `VICTORY_ONE_PASS` | off | yes | Prepare a submission from one pass over the steps instead of four walks. |
 | `VICTORY_OPEN_ONE_VIEW` | on (=0 turns off) | no | Open only the guarded block a write faults on instead of all views of it. |
 | `VICTORY_OPUS_PITCH` | off | no | Resample audio packets to the pitch the title asks for. |
@@ -195,7 +200,7 @@ switch is read.
 | `VICTORY_PIPELINE_PREPARE` | off | yes | Begin the next submission refreshes on another thread while the current one is sent. |
 | `VICTORY_PIPELINE_PRIORITY` | on (=0 turns off) | yes | Pipelines the title waits on or touches go first in the queue. |
 | `VICTORY_PIPELINE_WAIT_ADAPT` | off | yes | Let the per-frame pipeline wait budget follow how the waits end. |
-| `VICTORY_PLACED_CONSTANTS` | off | flag |  | live |  | A constant buffer that reads bytes the list's own placed copy wrote is snapshotted on the card instead of filled from the title's ring behind flights (the 22.7 ms flight wait of the lane). Port of k0ma2k15's VIctory-NVIDIA #34. |
+| `VICTORY_PLACED_CONSTANTS` (needs `VICTORY_COPIES_IN_PLACE`, on) | off | yes | A constant buffer that reads bytes the list's own placed copy wrote is snapshotted on the card (integ/validation-26). |
 | `VICTORY_PLACED_ORDER` | off | no | Order placed copies by where they stand in title memory. |
 | `VICTORY_PRECISE_BARRIERS` | off | yes | Hold the title UAV waits as precise barriers. |
 | `VICTORY_PRECISE_LOOK` | off | yes | Make and keep precise write ranges beside the declarations. |
@@ -249,6 +254,7 @@ translation of shaders.
 | `VICTORY_FRAMEGEN_CYCLE`, `VICTORY_FSR_FRAMEGEN`, `VICTORY_FSR_FRAMEGEN_DEBUG`, `VICTORY_FIDELITYFX_DIR` | off | flag/text |  |  |  | AMD FSR 3 frame generation for cards without DLSS frame generation (module `streamline/fsr.rs`; its host hooks are not ported yet: only the module is there). |
 | `VICTORY_FSR_PATH` | off | flag |  |  |  | `1`: the title's FidelityFX path at `VICTORY_DLSS_MODE`'s scale with its own FidelityFX upscaling and no Streamline: the comparison for DLSS. |
 | `VICTORY_NATIVE_1440P`, `VICTORY_RENDER_1080P` | off | flag |  |  |  | Series X retail image at a 2560x1440 output (scene 2560x1440, or 1920x1080 scaled up by the title): the image is patched before it is mapped and cached apart (`native_1440p.rs`). |
+| `VICTORY_MENU_CONSOLE` | unset | text |  |  |  | `series-s`: the title's Series S menu mode for the DLSS scene size. |
 | `VICTORY_STREAMLINE_DIR` | `C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64` (read only, normally absent) | path |  |  |  | The folder of `sl.interposer.dll`, its plugins and `nvngx_dlss.dll`, `nvngx_dlssg.dll` (NVIDIA's, never in the repository). Use a folder on G:. |
 | `VICTORY_STREAMLINE_LOG` | unset | path |  |  |  | A folder for Streamline's own verbose log files. |
 | `VICTORY_STREAMLINE_PRESENT` | off | flag |  |  |  | `1`: DLSS without frame generation with our swap chain as Streamline's proxy of it (no "presentCommon() was not observed"). |
@@ -399,6 +405,8 @@ translation of shaders.
 | `VICTORY_FOLD_VIEWS` | off | flag | yes | live |  | Folds view heap indexing into raw user data in draws and shaders. |
 | `VICTORY_FOOTPRINT_STATS` | off | flag |  |  |  | Runs the store footprint analysis on every program and prints stats to stderr. |
 | `VICTORY_FULL_CARD_PASS` | on (=0 turns off) | flag |  |  |  | Texture pass puts back every slot needing a new host copy. |
+| `VICTORY_FUSE_DISPATCH` | off | flag | yes |  | key (text) | `1`: compute programs are translated in the form of a member of a run of dispatches (they read user data and group id from a record of a table, the root CBV `SLOT_FUSE`); a run of one when nothing joins. Off: the emitted code is the same as without the switch (checked on the corpus, integ/validation-26). |
+| `VICTORY_FUSE_RUNS` | off | flag |  | live |  | Needs the programs translated with `VICTORY_FUSE_DISPATCH=1`: the dispatches of one program that follow one another are one table and one dispatch of all their groups (`draw/fuse.rs`). |
 | `VICTORY_GAME_DIR` | n/a | path |  |  |  | Directory of the title's files. |
 | `VICTORY_GPU_LOAD_MS` | 0 (off) | number |  |  |  | Milliseconds of artificial card load added per frame. |
 | `VICTORY_GPU_RO_CHECK` | off | flag |  |  |  | Verification for `VICTORY_GPU_RO_SKIP`: declares full ranges and warns if the compare finds a changed piece in title memory the title asked for GPU-read-only. |
@@ -563,6 +571,7 @@ translation of shaders.
 | `VICTORY_PIPELINE_WAIT_SHARED` | on (=0 turns off) | flag |  |  |  | Count the pipeline wait budget over all threads together. |
 | `VICTORY_PIPELINE_WIDE` | off | flag |  |  |  | Add extra pipeline workers while a world pass waits for its compute pipeline. |
 | `VICTORY_PIPELINE_WORKERS` | on, 2/3 of logical CPUs | number |  |  |  | Number of threads making host pipelines; clamp 1..64. |
+| `VICTORY_PLACED_CONSTANTS` | off | flag |  | live |  | A constant buffer that reads bytes the list's own placed copy wrote is snapshotted on the card instead of filled from the title's ring behind flights (the 22.7 ms flight wait of the lane). Port of k0ma2k15's VIctory-NVIDIA #34. |
 | `VICTORY_PLACED_FILLER` | off | flag |  |  |  | Keep filler fields of a placed resource description in the lookup key. |
 | `VICTORY_PLACED_ORDER` | off | flag |  | live |  | Order placed copies by where they stand in title memory. |
 | `VICTORY_POKE` | off | list |  |  | diag | Debug aid: write bytes at given RVAs, form rva:byte,... in hex, into title data. |

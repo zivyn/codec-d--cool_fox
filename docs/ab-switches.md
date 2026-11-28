@@ -164,6 +164,17 @@ comment where each is read. [switches.md](switches.md) lists every switch with i
 cache key and whether it can be flipped here.
 | `VICTORY_PAGE_REFRESH` (`=1` shadow, `=2` driven; name it with its value, `=2`) | `pagedrive::mode`, at each look (`Shadow::nothing_new`), refresh (`update_free`, `copy_stale`) and look under flights' ranges (`stale_under_writes`, `merge_under_writes`) | the copies' ledgers (`pagedrive::Ledger`: the pages noted written since the copy took them, told by `Journal::note` in the same step and by the other views of the page's physical page) are kept from the start whenever the variable is named (in the environment or in `VICTORY_AB`), so a flip finds them exact; only what reads them changes. `=1`: the walk of the journal decides and the ledger is asked beside it, counting `looks`/pages `MISSED` (a page the journal calls stale and the ledger lacks: must be 0) and `extra`; the gate's check (`GATE_MISSED`, the 4th count) holds the copy's lock, reads the journal first and the gate after it, and logs each miss with the copy, the span, the numbers and the ledger's entries (first 16); `=2`: the ledger decides which pages are stale and whether a look finds nothing new, and the journal is asked only whether its asking covers the range, never walked (the answer of a look and the pages of a refresh are the same by the invariant of `pagedrive`; a ledger that holds more than the journal calls stale is looked at again and cleared). Entries are removed only under the copy's `copied` lock by a refresh that took the page under an asking at least as new, so a flip between two decisions of one refresh cannot lose a page | `a_ledger_holds_every_page_the_journal_calls_stale_through_creation_retirement_and_aliases`, `a_note_newer_than_the_refresh_stays_and_an_older_one_goes`, `notes_reach_only_the_copies_that_cover_the_page`, `notes_are_in_the_ledger_when_the_drain_of_the_thread_that_made_them_returns`, `a_refresh_driven_by_the_ledger_ends_as_the_walk_does_and_the_check_misses_nothing`, `what_the_title_wrote_under_a_flights_range_waits_in_the_ledger_for_the_flight_to_land` |
 
+## What integ/validation-26 adds to the A/B (2026-11-28)
+
+New live switches, all off by default (named plain, `VICTORY_AB=<s>,<switch>`; the rows above argue why a flip at any instant is safe):
+`VICTORY_PLACED_CONSTANTS=1` (needs `VICTORY_COPIES_IN_PLACE`, on), `VICTORY_GPU_RO_SKIP=1`, `VICTORY_ONE_CALL=1`, `VICTORY_FUSE_RUNS=1`
+(only for programs translated with `VICTORY_FUSE_DISPATCH=1`, a cache-key switch: set it for both arms), and `VICTORY_CARD_AWAKE`
+(on by default: named, it is on only in the phases with its bit). All five are in `ab/registry.rs` (`fix/ab-loud`: a name that is not
+listed there is dropped with a warning; a bundle may name up to 31 switches). **Not live, so compared in pairs of processes:**
+`VICTORY_VRAM_HOLD` (and `VICTORY_RESIDENCY_PRIORITY`, `VICTORY_TILE_TRIM`, `VICTORY_VRAM_OVER_MB`), `VICTORY_SECTION_MB`,
+`VICTORY_WATCH_LARGE_XMEM` (read when title memory is made), `VICTORY_DLSS*`, `VICTORY_FRAMEGEN*`, `VICTORY_LEAVE_OUT` (chosen when
+the title's pipelines are made), `VICTORY_FUSE_DISPATCH` (translation), `VICTORY_CARD_SPANS=1/2` (diagnostics read once).
+
 ## Switches of the lane that are on by default
 
 Seven switches of the submitting thread's lane are **on** in the code since 2026-11-28 (integ/validation-19), by rule 14.

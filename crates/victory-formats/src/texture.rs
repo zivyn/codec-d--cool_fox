@@ -2016,7 +2016,8 @@ mod tests {
         assert_eq!(t.planes[0].layout.size, 1920 * 1152 * 4);
         assert_eq!(t.planes[1].offset, t.planes[0].layout.size);
         assert_eq!(t.planes[1].layout.size, 2048 * 1280);
-        assert!(!t.planes[0].layout.addressable());
+        // Z_X is a XOR mode: both planes have addresses.
+        assert!(t.planes.iter().all(|p| p.layout.addressable()));
     }
 
     #[test]

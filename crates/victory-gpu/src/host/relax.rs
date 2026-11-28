@@ -299,7 +299,7 @@ pub(super) fn wait_until<T>(lock: &Mutex<T>, changed: &std::sync::Condvar, done:
 
 /// [`wait_until`] on the line of flights ([`LINE_LANDED`] tells when some have landed).
 pub(super) fn wait_flights(done: impl Fn(&Line) -> bool, most: std::time::Duration) -> bool {
-    wait_until(&LINE, &LINE_LANDED, done, most)
+    wait_until(&LINE, &super::landing::LINE_LANDED, done, most)
 }
 
 #[cfg(test)]

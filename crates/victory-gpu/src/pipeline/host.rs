@@ -366,6 +366,10 @@ pub(crate) struct Stage {
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Root parameters of the tables of its immediate samplers (`sampler_table`), in register
+    /// order: (root parameter, slot of the sampler's description in the region). Empty when they
+    /// are static samplers.
+    pub(crate) sampler_tables: Vec<(u32, u32)>,
 }
 
 impl Stage {
@@ -416,6 +420,12 @@ impl HostPipeline {
     /// A host pipeline for vertex (or mesh), geometry and pixel shaders
     /// with the graphics state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        Self::new_in(shaders, g, true)
+    }
+
+    /// [`HostPipeline::new`]; `tables` lets the immediate samplers go through tables of the
+    /// sampler heap where `VICTORY_SAMPLER_TABLE` is on (`sampler_table`), not as static samplers.
+    fn new_in(shaders: &[Arc<Shader>], g: Option<&GraphicsState>, tables: bool) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -470,6 +480,40 @@ impl HostPipeline {
         let host = host()?;
 
         let aniso_point_mip_supported = crate::sampler::aniso_point_mip(&host.device);
+        let static_sampler = |s: &victory_shader::emit::StaticSampler, n: usize, visibility| D3D12_STATIC_SAMPLER_DESC {
+            Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
+            MipLODBias: s.mip_lod_bias,
+            MaxAnisotropy: s.max_anisotropy,
+            ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
+            BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
+            MinLOD: s.min_lod,
+            MaxLOD: s.max_lod,
+            ShaderRegister: n as u32,
+            RegisterSpace: SAMPLER_SPACE,
+            ShaderVisibility: visibility,
+        };
+        // With the table form (`sampler_table`): the region slot of each immediate sampler of each
+        // stage, in register order; None if one has none (all stay static samplers).
+        let table_slots: Option<Vec<Vec<u32>>> = if tables && super::sampler_table::on() {
+            let mut per_stage = Vec::with_capacity(stages.len());
+            for &(shader, visibility) in &stages {
+                let t = &shader.translated()?.host;
+                let descs: Vec<_> =
+                    t.static_samplers.iter().enumerate().map(|(n, s)| static_sampler(s, n, visibility)).collect();
+                match super::sampler_table::slots(&descs) {
+                    Some(slots) => per_stage.push(slots),
+                    None => break,
+                }
+            }
+            (per_stage.len() == stages.len()).then_some(per_stage)
+        } else {
+            None
+        };
+        // Only a pipeline that has immediate samplers has another form (and name) with them.
+        let table_mode = table_slots.as_ref().is_some_and(|p| p.iter().any(|s| !s.is_empty()));
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
@@ -478,7 +522,7 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
+        for (index, &(shader, visibility)) in stages.iter().enumerate() {
             let t = &shader.translated()?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
@@ -486,6 +530,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                sampler_tables: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -578,31 +623,39 @@ impl HostPipeline {
                     });
                 }
             }
-            for (n, s) in t.static_samplers.iter().enumerate() {
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter_for_host(aniso_point_mip_supported) as i32),
-                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
-                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
-                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
-                    ShaderVisibility: visibility,
-                });
+            if let Some(slots) = table_slots.as_ref().filter(|_| table_mode).map(|per_stage| &per_stage[index]) {
+                for (n, &slot) in slots.iter().enumerate() {
+                    ranges.push(Box::new(super::sampler_table::range(n as u32)));
+                    let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                    stage.sampler_tables.push((params.len() as u32, slot));
+                    params.push(super::sampler_table::parameter(range, visibility));
+                }
+            } else {
+                for (n, s) in t.static_samplers.iter().enumerate() {
+                    samplers.push(static_sampler(s, n, visibility));
+                }
             }
             bound.push(stage);
         }
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
+            Err(e) if table_mode => {
+                // (Too many root dwords with the tables, or a runtime that has none with directly
+                // indexed heaps: the static samplers, as without the switch.)
+                tracing::warn!(error = %e, ?shaders, "host root signature with sampler tables refused: made with static samplers");
+                return Self::new_in(shaders, g, false);
+            }
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
+        };
+        // What the library names a pipeline by: its root signature, and for the table form a tag
+        // too (an entry stored for static samplers is never looked up for it).
+        let root_key: Vec<u8> = if table_mode {
+            [root_blob.as_slice(), super::sampler_table::TAG].concat()
+        } else {
+            root_blob.clone()
         };
         // Not from the library if it has static samplers (their places in the
         // driver's table differ between runs: `library::with_static_samplers`).
@@ -630,7 +683,7 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
+            let name = super::library::name("compute", &root_key, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
                 // SAFETY: the description points at live data.
@@ -687,7 +740,7 @@ impl HostPipeline {
             // looked up again.
             let name = super::library::name(
                 "mesh triangles",
-                &root_blob,
+                &root_key,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             );
@@ -770,19 +823,19 @@ impl HostPipeline {
         let name = |gs: Option<&Vec<u8>>| match gs {
             _ if geometry.is_some() => super::library::name(
                 "graphics geometry",
-                &root_blob,
+                &root_key,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1)), &code_bytes(&code(2))],
                 &state,
             ),
             Some(gs) => super::library::name(
                 "graphics rectangles",
-                &root_blob,
+                &root_key,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1)), &gs[..]],
                 &state,
             ),
             None => super::library::name(
                 "graphics",
-                &root_blob,
+                &root_key,
                 &[&code_bytes(&code(0)), &code_bytes(&code(1))],
                 &state,
             ),

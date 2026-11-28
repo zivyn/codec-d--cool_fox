@@ -263,6 +263,11 @@ pub fn fingerprint() -> String {
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
     }
+    // With the immediate samplers in tables (`sampler_table`) the pipelines that have them are
+    // other pipelines, and go into the library: those made under static samplers are made again.
+    if super::sampler_table::on() {
+        h.update(super::sampler_table::TAG);
+    }
     h.finalize().to_hex()[..16].to_owned()
 }
 

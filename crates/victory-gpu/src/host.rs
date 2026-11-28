@@ -4080,7 +4080,8 @@ impl Host {
             .as_ref()
     }
 
-    /// 1-descriptor shader-visible Sampler fallback heap for directly-indexed root signatures.
+    /// Shader-visible Sampler fallback heap for directly-indexed root signatures: a null sampler (and, with
+    /// `VICTORY_SAMPLER_TABLE`, the immediate samplers' region after it).
     pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
         self.fallback_sampler
             .get_or_init(|| {
@@ -4090,7 +4091,13 @@ impl Host {
                         .device
                         .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                             Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                            NumDescriptors: 1,
+                            // The null sampler, then the region of the immediate samplers' tables
+                            // (`pipeline::sampler_table::fallback`).
+                            NumDescriptors: 1 + if crate::pipeline::sampler_table::on() {
+                                crate::pipeline::sampler_table::REGION
+                            } else {
+                                0
+                            },
                             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                             NodeMask: 0,
                         })

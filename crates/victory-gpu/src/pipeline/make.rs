@@ -92,7 +92,8 @@ pub(crate) struct Pending {
 /// waits: it is dropped while the pipeline is being made, as it is when they are left out
 /// (`VICTORY_RT_RESOLVE=0`), and shows again the frame after the pipeline is made. They have
 /// a lane of their own in the queue ([`Queue::resolves`]) that keeps a share of the workers
-/// for the pipelines everything else asks for.
+/// for the pipelines everything else asks for, and they are made only while the host has
+/// memory for them ([`ram_room`]).
 ///
 /// With the structure builder (`VICTORY_BVH_BUILDER=1`) the hits shade what the builder made
 /// and the picture needs them in the frame that asks: they are waited for as every compute
@@ -903,6 +904,29 @@ fn resolve_limit() -> usize {
     resolve_limit_for(WORKERS.load(Ordering::Relaxed) as usize, asked)
 }
 
+/// Whether the host has the memory for one more compile started in the background (by an extra
+/// worker, or for a ray-tracing resolve): each holds hundreds of MB while the driver works on
+/// it, and the title's own use of memory comes first. `available` is the free physical memory,
+/// `None` when it is not known (then there is room).
+fn ram_room(available: Option<u64>, floor: u64) -> bool {
+    available.is_none_or(|bytes| bytes >= floor)
+}
+
+/// The free physical memory below which no compile starts in the background
+/// (`VICTORY_PIPELINE_RAM_FREE_MB`, 1536; 0: no limit).
+fn ram_floor() -> u64 {
+    static FLOOR: OnceLock<u64> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let mb = std::env::var("VICTORY_PIPELINE_RAM_FREE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        mb.unwrap_or(1536) << 20
+    })
+}
+
+fn has_ram() -> bool {
+    let floor = ram_floor();
+    floor == 0 || ram_room(crate::host::available_physical_ram(), floor)
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -1089,12 +1113,15 @@ const SCREEN_WORKERS: usize = 2;
 fn next(role: Role) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if (role != Role::Extra || extra_may_take(COMPUTE_WAITERS.load(Ordering::Relaxed)))
-            && let Some(p) = queue.pop(role == Role::Screen, slow_limit())
+        // (Asked only where it matters: by an extra worker, or with resolves waiting.)
+        let room = (role != Role::Extra && queue.resolves.is_empty()) || has_ram();
+        if (role != Role::Extra || (extra_may_take(COMPUTE_WAITERS.load(Ordering::Relaxed)) && room))
+            && let Some(p) = queue.pop_with(role == Role::Screen, slow_limit(), if room { resolve_limit() } else { 0 })
         {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        // (A timeout: a resolve held back for want of memory is looked at again.)
+        queue = AVAILABLE.wait_timeout(queue, Duration::from_secs(2)).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
@@ -1352,6 +1379,15 @@ mod tests {
         assert!(began.elapsed() < Duration::from_secs(1), "a dispatch waited for its resolve");
         assert!(p.made.get().is_none());
         assert_eq!(NOT_WAITED.load(Ordering::Relaxed), before + 1);
+    }
+
+    #[test]
+    fn background_compiles_need_free_memory_but_an_unknown_amount_is_no_reason_to_stop() {
+        let floor = 1536 << 20;
+        assert!(ram_room(Some(4 << 30), floor));
+        assert!(ram_room(Some(floor), floor));
+        assert!(!ram_room(Some(floor - 1), floor));
+        assert!(ram_room(None, floor));
     }
 
     #[test]

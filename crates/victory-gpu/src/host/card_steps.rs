@@ -210,7 +210,7 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
 /// What a step of a submission does to title memory, as the plan sees it.
 /// `asked`: flights in the air stop it from being done on the CPU now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Does {
+pub(super) enum Does {
     Copy { dst: usize, src: usize, len: usize, asked: bool },
     /// `to`: its memory can be given the bytes on the card.
     Fill { src: usize, len: usize, asked: bool, to: bool },
@@ -494,9 +494,19 @@ type Refreshed = (usize, usize, usize);
 /// in room taken once.
 #[inline(never)]
 fn does_of(written: &[(usize, usize)], runs: &[&HostList], lean: bool) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Refreshed>) {
+    does_of_in(written, runs, lean, |list| std::ptr::from_ref::<HostList>(*list) as usize)
+}
+
+/// [`does_of`] over any lists of steps (`id`: the number the list goes by in the second answer).
+pub(super) fn does_of_in<L: onepass::StepList>(
+    written: &[(usize, usize)],
+    runs: &[L],
+    lean: bool,
+    id: impl Fn(&L) -> usize,
+) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Refreshed>) {
     let (mut does, mut steps) = if lean {
         // (Without the refreshes: some thousands, to the 26,000 of the steps.)
-        let all: usize = runs.iter().map(|list| list.deferred().copies.len()).sum();
+        let all: usize = runs.iter().map(|list| list.steps(|steps| steps.len())).sum();
         (Vec::with_capacity(all.min(8192)), Vec::with_capacity(all.min(8192)))
     } else {
         (Vec::new(), Vec::new())
@@ -505,48 +515,103 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList], lean: bool) -> (Vec<D
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     for list in runs {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
-            if lean && let Step::Refresh(shadow, at, len) = step {
-                refreshed.push((Arc::as_ptr(shadow) as usize, *at, *at + *len));
-                continue;
+        let list_id = id(list);
+        list.steps(|all| {
+            for (i, step) in all.iter().enumerate() {
+                if lean && let Step::Refresh(shadow, at, len) = step {
+                    refreshed.push((Arc::as_ptr(shadow) as usize, *at, *at + *len));
+                    continue;
+                }
+                does.push(match step {
+                    &Step::Copy(dst, src, len) => Does::Copy {
+                        dst,
+                        src,
+                        len,
+                        asked: copy_blocked(written, dst, src, len).is_some(),
+                    },
+                    Step::Fill(_, src, len, to) => Does::Fill {
+                        src: *src,
+                        len: *len,
+                        asked: read_blocked(written, *src, *len),
+                        to: to.is_some(),
+                    },
+                    Step::Texture(staging) => {
+                        let (at, len) = staging.memory();
+                        Does::Read {
+                            from: at,
+                            to: at + len,
+                            asked: touches(written, at, at + len),
+                        }
+                    }
+                    &Step::Plane((at, len), _) => Does::Read {
+                        from: at,
+                        to: at.saturating_add(len),
+                        asked: touches(written, at, at.saturating_add(len)),
+                    },
+                    &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
+                    Step::Refresh(shadow, at, len) => Does::Refresh {
+                        shadow: Arc::as_ptr(shadow) as usize,
+                        from: *at,
+                        to: *at + *len,
+                    },
+                    Step::Run(_) => Does::Run,
+                    Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
+                    Step::GpuWrite(..) | Step::Host(..) => continue,
+                });
+                steps.push((list_id, i));
             }
-            does.push(match step {
-                &Step::Copy(dst, src, len) => Does::Copy {
+        });
+    }
+    (does, steps, refreshed)
+}
+
+/// [`does_of_in`] with `lean`, from the summaries of the lists' steps (`VICTORY_ONE_PASS`): the same answers without
+/// reading the steps of the refreshes.
+pub(super) fn does_of_summarized<L: onepass::StepList>(
+    written: &[(usize, usize)],
+    runs: &[L],
+    id: impl Fn(&L) -> usize,
+) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Refreshed>) {
+    use onepass::Op;
+    let summaries: Vec<_> = runs.iter().map(|list| list.summary()).collect();
+    let all: usize = summaries.iter().map(|summary| summary.ops().len()).sum();
+    let (mut does, mut steps) = (Vec::with_capacity(all.min(8192)), Vec::with_capacity(all.min(8192)));
+    let mut refreshed = Vec::new();
+    for (list, summary) in runs.iter().zip(&summaries) {
+        let list_id = id(list);
+        refreshed.extend(summary.refreshes());
+        for &(i, op) in summary.ops() {
+            does.push(match op {
+                Op::Copy { dst, src, len } => Does::Copy {
                     dst,
                     src,
                     len,
                     asked: copy_blocked(written, dst, src, len).is_some(),
                 },
-                Step::Fill(_, src, len, to) => Does::Fill {
-                    src: *src,
-                    len: *len,
-                    asked: read_blocked(written, *src, *len),
-                    to: to.is_some(),
+                Op::Fill { src, len, to } => Does::Fill {
+                    src,
+                    len,
+                    asked: read_blocked(written, src, len),
+                    to,
                 },
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
+                Op::Texture(k) => {
+                    let (at, len) = summary.texture_memory(k);
                     Does::Read {
                         from: at,
                         to: at + len,
                         asked: touches(written, at, at + len),
                     }
                 }
-                &Step::Plane((at, len), _) => Does::Read {
+                Op::Plane { at, len } => Does::Read {
                     from: at,
                     to: at.saturating_add(len),
                     asked: touches(written, at, at.saturating_add(len)),
                 },
-                &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
-                Step::Refresh(shadow, at, len) => Does::Refresh {
-                    shadow: Arc::as_ptr(shadow) as usize,
-                    from: *at,
-                    to: *at + *len,
-                },
-                Step::Run(_) => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                Step::GpuWrite(..) | Step::Host(..) => continue,
+                Op::Host { from, to } => Does::Read { from, to, asked: false },
+                Op::Run => Does::Run,
+                Op::Placed { dst, src, len } => Does::Placed { dst, src, len },
             });
-            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+            steps.push((list_id, i as usize));
         }
     }
     (does, steps, refreshed)
@@ -602,6 +667,15 @@ type HashMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefau
 /// in it) go.
 fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
     let list = runs.iter().find(|l| std::ptr::from_ref::<HostList>(l) as usize == step.0)?;
+    match list.deferred().copies.get(step.1)? {
+        Step::Fill(_, _, _, to) => to.clone(),
+        _ => None,
+    }
+}
+
+/// [`fill_to`] with the lists found by `run_at` (their addresses to their places among `runs`).
+fn fill_to_at(runs: &[&HostList], run_at: &HashMap<usize, usize>, step: (usize, usize)) -> Option<FillTo> {
+    let list = runs.get(*run_at.get(&step.0)?)?;
     match list.deferred().copies.get(step.1)? {
         Step::Fill(_, _, _, to) => to.clone(),
         _ => None,
@@ -813,6 +887,13 @@ impl Taken {
         self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
     }
 
+    /// The steps it does, for each of `runs`: their places in the list, in order (a list the submission names twice
+    /// has them under both).
+    pub(super) fn by_list(&self, runs: &[&HostList]) -> Vec<Vec<usize>> {
+        let ids: Vec<usize> = runs.iter().map(|list| std::ptr::from_ref::<HostList>(*list) as usize).collect();
+        onepass::steps_by_list(self.steps.iter().copied(), &ids)
+    }
+
     fn copied(&self) -> impl Iterator<Item = Writer> {
         self.copied.iter().map(|(shadow, from, to)| Writer {
             shadow: Some(shadow.clone()),
@@ -869,7 +950,13 @@ impl Host {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         // (Read once: the way the steps of this submission are looked at and the slots made.)
         let lean = lean_steps();
-        let (does, steps, refreshed) = does_of(written, runs, lean);
+        // (With the summaries of the lists' steps [`onepass`] the steps are not walked, and the lists of the fills are found by a table.)
+        let summarized = lean && onepass::on();
+        let (does, steps, refreshed) = if summarized {
+            does_of_summarized(written, runs, |list| std::ptr::from_ref::<HostList>(*list) as usize)
+        } else {
+            does_of(written, runs, lean)
+        };
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
@@ -890,6 +977,16 @@ impl Host {
         let holder_of = |writers: &Vec<Writer>, from: usize, to: usize| match &index {
             Some(index) => holder_indexed(index, writers, from, to),
             None => holder(writers, from, to),
+        };
+        // (The first list of each address: a submission may name a list twice.)
+        let run_at: HashMap<usize, usize> = if summarized {
+            let mut at = HashMap::default();
+            for (n, list) in runs.iter().enumerate() {
+                at.entry(std::ptr::from_ref::<HostList>(*list) as usize).or_insert(n);
+            }
+            at
+        } else {
+            HashMap::default()
         };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
@@ -957,7 +1054,7 @@ impl Host {
                     held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match if summarized { fill_to_at(runs, &run_at, steps[i]) } else { fill_to(runs, steps[i]) } {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,

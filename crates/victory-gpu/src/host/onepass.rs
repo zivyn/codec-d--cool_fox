@@ -64,6 +64,37 @@ pub(super) fn made_on_the_lane() {
     STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The steps the card's plan takes (their lists by address, their places in them) for each of `ids` (the addresses of the
+/// lists of the submission, in order): the places, in order. A list that is named twice has them under both.
+pub(super) fn steps_by_list(
+    steps: impl Iterator<Item = (usize, usize)>,
+    ids: &[usize],
+) -> Vec<Vec<usize>> {
+    let mut at: ByCopy<Vec<usize>> = ByCopy::default();
+    for (n, &id) in ids.iter().enumerate() {
+        at.entry(id).or_default().push(n);
+    }
+    let mut by = vec![Vec::new(); ids.len()];
+    for (list, i) in steps {
+        for &n in at.get(&list).into_iter().flatten() {
+            by[n].push(i);
+        }
+    }
+    by.iter_mut().for_each(|steps| steps.sort_unstable());
+    by
+}
+
+/// Whether a step is one of `mine` (in order), asked for steps in order: one look forward each, not a search.
+pub(super) fn taken_in_order(mine: &[usize]) -> impl FnMut(usize) -> bool + '_ {
+    let mut at = 0;
+    move |i| {
+        while at < mine.len() && mine[at] < i {
+            at += 1;
+        }
+        mine.get(at) == Some(&i)
+    }
+}
+
 /// A list of steps that can be looked through: a host list (under its lock, as the walks always did) or, in tests,
 /// a vector.
 pub(super) trait StepList {
@@ -101,6 +132,14 @@ impl StepList for Vec<Step> {
 pub(super) struct Summary {
     /// How many steps the list had: the summary is of a list that has no other number.
     pub(super) steps: usize,
+    /// The steps that read or write title memory on the CPU or that run something, each with its place in the list, in
+    /// the order of the list: what the planning of the card's steps, the look for what flights stop and the joining of
+    /// parts read of them (the refreshes and the ranges given to shaders are the records below).
+    ops: Vec<(u32, Op)>,
+    /// The ranges given to shaders (`GpuWrite`), in the order of the list: the copy by its number in the list, from, to.
+    writes: Vec<(u32, usize, usize)>,
+    has_placed: bool,
+    has_copy_or_run: bool,
     /// The copies the refreshes and ranges given to shaders name, by their number in the list.
     copies: Vec<Arc<Shadow>>,
     textures: Vec<Arc<crate::texture::Staging>>,
@@ -108,7 +147,88 @@ pub(super) struct Summary {
     recs: Vec<Rec>,
 }
 
+/// A step that is not a refresh or a range given to shaders, as the walks over the steps see it.
+#[derive(Clone, Copy)]
+pub(super) enum Op {
+    Copy {
+        dst: usize,
+        src: usize,
+        len: usize,
+    },
+    Fill {
+        src: usize,
+        len: usize,
+        /// Its memory can be given the bytes on the card.
+        to: bool,
+    },
+    /// A texture, by its place among the list's textures.
+    Texture(u32),
+    Plane {
+        at: usize,
+        len: usize,
+    },
+    /// Work that reads title memory `[from, to)` (not empty) and writes host memory only.
+    Host {
+        from: usize,
+        to: usize,
+    },
+    /// A copy at its place ([`place`]).
+    Placed {
+        dst: usize,
+        src: usize,
+        len: usize,
+    },
+    Run,
+}
+
 impl Summary {
+    /// The steps that read or write title memory on the CPU, with their places, in order.
+    pub(super) fn ops(&self) -> &[(u32, Op)] {
+        &self.ops
+    }
+
+    /// Whether the list has a copy at its place among its steps.
+    pub(super) fn has_placed(&self) -> bool {
+        self.has_placed
+    }
+
+    /// Whether the list has a title buffer copy or work that may write title memory among its steps.
+    pub(super) fn has_copy_or_run(&self) -> bool {
+        self.has_copy_or_run
+    }
+
+    /// The memory of the texture `k` of the list, now (from, bytes).
+    pub(super) fn texture_memory(&self, k: u32) -> (usize, usize) {
+        self.textures[k as usize].memory()
+    }
+
+    /// The refreshes among the steps, in order: the copy's address, from, to.
+    pub(super) fn refreshes(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
+        self.recs
+            .iter()
+            .filter(|rec| rec.what & (WRITE | TEXTURE | EVENT) == 0)
+            .map(|rec| {
+                (
+                    Arc::as_ptr(&self.copies[rec.what as usize]) as usize,
+                    rec.from,
+                    rec.to,
+                )
+            })
+    }
+
+    /// The ranges given to shaders, in order: the copy, from, to.
+    pub(super) fn written(&self) -> impl Iterator<Item = (&Arc<Shadow>, usize, usize)> + '_ {
+        self.writes
+            .iter()
+            .map(|&(copy, from, to)| (&self.copies[copy as usize], from, to))
+    }
+
+    fn note(&mut self, index: usize, op: Op) {
+        self.has_placed |= matches!(op, Op::Placed { .. });
+        self.has_copy_or_run |= matches!(op, Op::Copy { .. } | Op::Run);
+        self.ops.push((index as u32, op));
+    }
+
     /// The summary of `steps`.
     pub(super) fn of(steps: &[Step]) -> Summary {
         thread_local! {
@@ -117,6 +237,10 @@ impl Summary {
         let mut at = scratch::Lean::of(&AT, true);
         let mut summary = Summary {
             steps: steps.len(),
+            ops: Vec::new(),
+            writes: Vec::new(),
+            has_placed: false,
+            has_copy_or_run: false,
             copies: Vec::new(),
             textures: Vec::new(),
             recs: Vec::with_capacity(steps.len()),
@@ -143,23 +267,54 @@ impl Summary {
                 ),
                 Step::Texture(staging) => {
                     summary.textures.push(staging.clone());
+                    let place = summary.textures.len() - 1;
+                    summary.note(index, Op::Texture(place as u32));
                     (
                         None,
                         Rec {
                             what: TEXTURE,
-                            from: summary.textures.len() - 1,
+                            from: place,
                             to: index,
                         },
                     )
                 }
-                _ => (
-                    None,
-                    Rec {
-                        what: EVENT,
-                        from: index,
-                        to: 0,
-                    },
-                ),
+                other => {
+                    match other {
+                        &Step::Copy(dst, src, len) => {
+                            summary.note(index, Op::Copy { dst, src, len })
+                        }
+                        Step::Fill(_, src, len, to) => summary.note(
+                            index,
+                            Op::Fill {
+                                src: *src,
+                                len: *len,
+                                to: to.is_some(),
+                            },
+                        ),
+                        &Step::Plane((at, len), _) => summary.note(index, Op::Plane { at, len }),
+                        &Step::Host(_, (from, to)) if from < to => {
+                            summary.note(index, Op::Host { from, to })
+                        }
+                        Step::Placed(p) => summary.note(
+                            index,
+                            Op::Placed {
+                                dst: p.dst,
+                                src: p.src,
+                                len: p.len,
+                            },
+                        ),
+                        Step::Run(_) => summary.note(index, Op::Run),
+                        _ => {}
+                    }
+                    (
+                        None,
+                        Rec {
+                            what: EVENT,
+                            from: index,
+                            to: 0,
+                        },
+                    )
+                }
             };
             let mut rec = rec;
             if let Some(shadow) = shadow {
@@ -173,6 +328,9 @@ impl Summary {
                     last = (key, number);
                 }
                 rec.what |= last.1;
+                if let Step::GpuWrite(_, address, len) = step {
+                    summary.writes.push((last.1, *address, *address + *len));
+                }
             }
             summary.recs.push(rec);
         }
@@ -667,11 +825,13 @@ mod tests {
                     }
                     let base = 0x10_0000 * (at + 1);
                     let (from, len) = (base + dice.below(3000), 1 + dice.below(500));
-                    steps.push(match dice.below(14) {
+                    steps.push(match dice.below(16) {
                         0 | 1 => Step::GpuWrite(copies[at].clone(), from, len),
                         2 => Step::Copy(base, base + 8, 4),
                         3 => Step::Fill(base, base + 8, 4, None),
                         4 => Step::Run(Box::new(|| {})),
+                        5 => Step::Plane((base + 8, 1 + dice.below(64)), Box::new(|| {})),
+                        6 => Step::Host(Box::new(|| {}), (base + 16, base + 16 + dice.below(40))),
                         _ => Step::Refresh(copies[at].clone(), from, len),
                     });
                 }
@@ -857,6 +1017,101 @@ mod tests {
             refreshes > 1000 && others > 500,
             "{refreshes} refreshes, {others} others"
         );
+    }
+
+    /// What flights stop, what the plan does and what the writes declared are, from the summaries of the lists as from
+    /// their steps: the same `Does` in the same order (with their places), the same refreshes, the same first step that
+    /// stops (or the same copies at their place left to look for), the same ranges declared (copy, ranges, order).
+    #[test]
+    fn the_summaries_answer_what_the_walks_over_the_steps_do() {
+        use super::super::card_steps::{does_of_in, does_of_summarized};
+        let mut dice = Dice(0x5851_f42d_4c95_7f2d);
+        let memory = vec![0u8; 4096];
+        let copies = some_copies(&memory, 9);
+        let id = |list: &Vec<Step>| std::ptr::from_ref::<Vec<Step>>(list) as usize;
+        let (mut blocked, mut free, mut both) = (0, 0, 0);
+        for trial in 0..500 {
+            let mut lists = random_lists(&mut dice, &copies);
+            // (A list with a `Run` stops at it, whatever is written: half of them have none.)
+            if dice.below(2) == 0 {
+                lists
+                    .iter_mut()
+                    .for_each(|list| list.retain(|step| !matches!(step, Step::Run(_))));
+            }
+            let mut written = Vec::new();
+            for _ in 0..dice.below(5) {
+                let at = 0x10_0000 * (1 + dice.below(9)) + dice.below(3000);
+                written.push((at, at + 1 + dice.below(600)));
+            }
+            let mut joined = Vec::new();
+            join_ranges(&mut joined, written);
+            assert_eq!(
+                does_of_in(&joined, &lists, true, id),
+                does_of_summarized(&joined, &lists, id),
+                "trial {trial}: what the steps do"
+            );
+            let walked = blocked_scan(&joined, &lists, false);
+            assert_eq!(
+                Some(walked.clone()),
+                blocked_summarized(&joined, &lists, false),
+                "trial {trial}: what stops"
+            );
+            match walked {
+                Err(_) => blocked += 1,
+                Ok(_) if joined.is_empty() => both += 1,
+                Ok(_) => free += 1,
+            }
+            let declared = |all: Vec<crate::host::Declared>| {
+                all.into_iter()
+                    .map(|(shadow, ranges)| (key(&shadow), ranges))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                declared(declared_writes_steps(&lists)),
+                declared(declared_writes_summarized(&lists)),
+                "trial {trial}: what is declared"
+            );
+            for list in &lists {
+                assert_eq!(
+                    list.summary().has_copy_or_run(),
+                    list.iter()
+                        .any(|s| matches!(s, Step::Copy(..) | Step::Run(_))),
+                    "trial {trial}"
+                );
+            }
+        }
+        assert!(
+            blocked > 30 && free > 20 && both > 5,
+            "{blocked} stopped, {free} free, {both} with nothing written"
+        );
+    }
+
+    /// The steps the plan takes are found by list in order, whichever lists are named twice, and the steps asked for in
+    /// order are answered as a look in the set answers.
+    #[test]
+    fn the_steps_taken_are_found_by_list_in_order() {
+        let mut dice = Dice(0x1405_7b7e_f767_814f);
+        for trial in 0..300 {
+            let ids: Vec<usize> = (0..1 + dice.below(8))
+                .map(|_| 0x1000 * (1 + dice.below(5)))
+                .collect();
+            let set: std::collections::BTreeSet<(usize, usize)> = (0..dice.below(60))
+                .map(|_| (0x1000 * (1 + dice.below(6)), dice.below(40)))
+                .collect();
+            let by = steps_by_list(set.iter().copied(), &ids);
+            assert_eq!(by.len(), ids.len());
+            for (n, mine) in by.iter().enumerate() {
+                assert!(mine.windows(2).all(|w| w[0] < w[1]), "trial {trial}");
+                let mut asked = taken_in_order(mine);
+                for i in 0..45 {
+                    assert_eq!(
+                        asked(i),
+                        set.contains(&(ids[n], i)),
+                        "trial {trial} list {n} step {i}"
+                    );
+                }
+            }
+        }
     }
 
     /// A pass made twice from the same thread's kept one finds nothing of the first, and lets go of its holds.

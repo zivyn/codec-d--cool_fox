@@ -3795,6 +3795,59 @@ mod narrow_tests {
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// A page that two ranges share (one ends in the middle of it, the next begins there): the first range refreshed twice
+    /// must not make the ledger forget a write in the half of the page that belongs to the second. The walk takes the
+    /// half when the second range is refreshed; the ledger must too (rev2: `copy_stale` settles a page the range holds
+    /// only in part with the bound of the range's stamp).
+    #[test]
+    fn a_page_shared_by_two_ranges_keeps_its_write_for_the_second_after_the_first_is_refreshed_twice() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 3;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let half = PAGE / 2;
+        let copies = vec![one(at, N, 0), one(at, N, 2)];
+        let whole = [(at, at + N * PAGE)];
+        // Both copies take everything, twice (fresh memory may be told written by the first asking).
+        for _ in 0..2 {
+            crate::watch::ask_once(&whole);
+            for c in &copies {
+                refresh(c, at, N * PAGE);
+            }
+            crate::watch::ask_once_end();
+        }
+        // The title writes page 1 in the half that belongs to the second range.
+        // SAFETY: inside the allocation.
+        unsafe { ((at + PAGE + half + 8192) as *mut u8).write_volatile(0x5a) };
+        // The first range (page 0 and the first half of page 1) is refreshed twice, each time under an asking.
+        for _ in 0..2 {
+            crate::watch::ask_once(&whole);
+            for c in &copies {
+                refresh(c, at, PAGE + half);
+            }
+            crate::watch::ask_once_end();
+        }
+        // The second range (the other half of page 1 and page 2).
+        crate::watch::ask_once(&whole);
+        for c in &copies {
+            refresh(c, at + PAGE + half, 2 * PAGE - half);
+        }
+        crate::watch::ask_once_end();
+        for c in &copies {
+            assert_eq!(
+                c.side[PAGE + half + 8192],
+                0x5a,
+                "mode {}: the write in the second range's half of the shared page never reached the copy",
+                c.mode
+            );
+        }
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// The gate says a range needs no look when the copy's ledger holds nothing and a range that holds it was taken whole;
     /// a write to the range, once the asking has found it, shuts the gate until the next refresh of the range; a range
     /// outside what was taken whole never passes; shadow mode counts what the journal says of each pass.

@@ -1185,7 +1185,7 @@ mod tests {
             eprintln!("no PC dxc.exe; skipped");
             return;
         };
-        use windows::core::{HSTRING, PCWSTR};
+        use windows::core::{HSTRING, Interface, PCWSTR};
         let dir = tempfile::tempdir().unwrap();
         let cs = |threads: u32| format!("[numthreads({threads}, 1, 1)] void main() {{}}");
         // Build 1: programs of 1 to 4 threads; build 2: the third of them is a program of 9.

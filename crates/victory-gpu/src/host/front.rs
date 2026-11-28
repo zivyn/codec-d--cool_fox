@@ -354,7 +354,7 @@ impl Host {
         let air = line().written.clone();
         batch.refresh_front(&runs, &asked.parts);
         for list in &runs {
-            list.run_deferred(&mut batch, &air, |_| false);
+            list.run_deferred(&mut batch, &air, |_| false, None);
         }
         batch.fill();
         batch.flush();

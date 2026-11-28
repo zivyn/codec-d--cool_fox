@@ -70,6 +70,9 @@ pub(crate) struct Pending {
     seq: AtomicU64,
     /// When a worker began making it, in microseconds since [`epoch`] plus one.
     making_at: AtomicU64,
+    /// Whether a worker took it from the lanes of what draws have asked for
+    /// (a draw is dropped for it now), not from the early ones.
+    taken_asked: AtomicBool,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -178,6 +181,7 @@ impl Pending {
             touched: AtomicU64::new(0),
             seq: AtomicU64::new(0),
             making_at: AtomicU64::new(0),
+            taken_asked: AtomicBool::new(false),
         }
     }
 
@@ -449,16 +453,98 @@ fn wait_for_compute(p: &Pending, limit: Duration) {
         }
     }
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
+    {
+        crate::copystat::add(crate::copystat::C::PipelineWaitUs, waited.as_micros() as u64);
+        crate::copystat::add(crate::copystat::C::PipelineComputeUs, waited.as_micros() as u64);
+        crate::copystat::add(crate::copystat::C::PipelineWaits, 1);
+        if p.made.get().is_none() {
+            crate::copystat::add(crate::copystat::C::PipelineFutile, 1);
+        }
+    }
+}
+
+/// How much of its budget a frame's waits for the pipelines of world draws are
+/// given, in parts of a thousand, and when (ms since [`epoch`]) that last
+/// changed (`VICTORY_PIPELINE_WAIT_ADAPT=1`; off).
+///
+/// A wait that ends with the pipeline made says the next may too; one that ends
+/// at the budget with nothing made says the pipeline needs more than the budget,
+/// and the frame waited all that time to drop its draw anyway. Each such wait
+/// halves the budget (down to `VICTORY_PIPELINE_WAIT_FLOOR_MS`, 100), each made
+/// pipeline doubles it, and four quiet seconds give it back whole. In the store's
+/// entry a thread waited the whole half second of 50 frames in a row (5.0 s of
+/// waiting in each 5.4 s, 25 s in all: the frames were as long as the budget),
+/// for the 20 to 30 pipelines that took 2 to 31 s each to make; the draws they
+/// were dropped for came when the pipelines did, whatever the frames spent.
+/// Dropped draws are drawn again every frame (the passes over the screen and the
+/// dispatches, whose results the title may keep, do not take part), so a shorter
+/// frame shows a pipeline sooner in time and later in frames: the title's own
+/// clock runs on frames.
+static ADAPT: Mutex<(u32, u64)> = Mutex::new((FULL_PERMILLE, 0));
+const FULL_PERMILLE: u32 = 1000;
+const RECOVER_MS: u64 = 4000;
+
+/// Whether the budget follows how the waits end (`VICTORY_PIPELINE_WAIT_ADAPT=1`;
+/// off). May change at any instant (`VICTORY_AB`): it is read once per wait.
+fn adapt() -> bool {
+    crate::ab::live_flag!("VICTORY_PIPELINE_WAIT_ADAPT")
+}
+
+/// The least a wait is given when the budget has gone down
+/// (`VICTORY_PIPELINE_WAIT_FLOOR_MS`, 100).
+fn adapt_floor() -> Duration {
+    static FLOOR: OnceLock<Duration> = OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        let ms = std::env::var("VICTORY_PIPELINE_WAIT_FLOOR_MS").ok().and_then(|v| v.trim().parse().ok());
+        Duration::from_millis(ms.unwrap_or(100))
+    })
+}
+
+fn now_ms() -> u64 {
+    Instant::now().duration_since(epoch()).as_millis() as u64 + 1
+}
+
+/// What the budget is worth now: a share left alone for [`RECOVER_MS`] is whole again.
+fn permille_at(state: (u32, u64), now_ms: u64) -> u32 {
+    if now_ms.saturating_sub(state.1) >= RECOVER_MS { FULL_PERMILLE } else { state.0 }
+}
+
+pub(super) fn permille_now() -> u32 {
+    permille_at(*ADAPT.lock().unwrap_or_else(|e| e.into_inner()), now_ms())
+}
+
+/// The budget after a wait ended: doubled (to whole) with the pipeline made,
+/// halved (to `floor`, in parts of a thousand) without.
+fn permille_after(permille: u32, made: bool, floor: u32) -> u32 {
+    if made { permille.saturating_mul(2).min(FULL_PERMILLE) } else { (permille / 2).max(floor) }
+}
+
+/// `budget` at `permille`, but not under `floor` (nor over `budget`).
+fn scaled(budget: Duration, permille: u32, floor: Duration) -> Duration {
+    (budget * permille / FULL_PERMILLE).max(floor.min(budget))
+}
+
+/// Notes how a wait ended.
+fn note_wait(made: bool, full: Duration) {
+    let floor = adapt_floor().as_millis() * u128::from(FULL_PERMILLE) / full.as_millis().max(1);
+    let floor = floor.min(u128::from(FULL_PERMILLE)) as u32;
+    let now = now_ms();
+    let mut state = ADAPT.lock().unwrap_or_else(|e| e.into_inner());
+    let was = permille_at(*state, now);
+    *state = (permille_after(was, made, floor), now);
 }
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
-    if budget.is_zero() {
+    let full = if screen { screen_budget() } else { wait_budget() };
+    if full.is_zero() {
         return;
     }
+    // (`VICTORY_PIPELINE_WAIT_ADAPT`, off: world draws only; the passes over
+    // the screen and the dispatches keep what they wait.) Read once.
+    let adapted = !screen && adapt();
+    let budget = if adapted { scaled(full, permille_now(), adapt_floor()) } else { full };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
     static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -498,10 +584,22 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    let made = p.made.get().is_some();
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::copystat::add(crate::copystat::C::PipelineWaits, 1);
+        if !made {
+            crate::copystat::add(crate::copystat::C::PipelineFutile, 1);
+        }
+    }
+    // A wait the budget gave its due says whether the next ones are worth it.
+    if adapted && left >= adapt_floor().min(full) {
+        note_wait(made, full);
+    }
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
-            made = p.made.get().is_some(),
+            made,
             shaders = ?p.shaders,
             "a pass over the screen was waited for (VICTORY_SCREEN_WAIT_MS=0: dropped past half a second a frame)"
         );
@@ -633,12 +731,16 @@ impl Queue {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
         };
         let mut p = self.screen.pop_front();
+        // Whether it comes from a lane of what draws have asked for.
+        let mut asked = true;
         if p.is_none() && !screens_only {
             p = unclaimed(&mut self.recent, REQUESTED);
             self.publish();
-            p = p
-                .or_else(|| unclaimed(&mut self.requested, REQUESTED))
-                .or_else(|| unclaimed(&mut self.early, EARLY));
+            p = p.or_else(|| unclaimed(&mut self.requested, REQUESTED));
+            if p.is_none() {
+                asked = false;
+                p = unclaimed(&mut self.early, EARLY);
+            }
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow, EARLY);
                 if let Some(p) = &p {
@@ -648,6 +750,7 @@ impl Queue {
             }
         }
         let p = p?;
+        p.taken_asked.store(asked, Ordering::Relaxed);
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -747,16 +850,23 @@ fn workers() -> bool {
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
                     let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
+                    let mut level = Level::Base;
+                    set_priority(lowest, level);
                     loop {
                         let p = next(screens_only);
                         if !screens_only {
                             BUSY.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // One a draw is dropped for goes at normal priority
+                        // (`VICTORY_PIPELINE_BOOST`).
+                        let wanted = level_for(!screens_only, p.taken_asked.load(Ordering::Relaxed), boost());
+                        if wanted != level {
+                            set_priority(lowest, wanted);
+                            level = wanted;
+                        }
+                        if level == Level::Boosted {
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::add(crate::copystat::C::PipelineBoosted, 1);
                         }
                         p.make();
                         if !screens_only {
@@ -782,6 +892,49 @@ fn workers() -> bool {
         }
         running
     })
+}
+
+/// The priority a worker runs a pipeline at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Level {
+    /// Its own: below the title's threads (or below normal, for the
+    /// passes over the screen).
+    Base,
+    /// Normal, level with the title's threads.
+    Boosted,
+}
+
+/// What a worker runs a pipeline at: normal when `boost` is on and a draw is
+/// dropped for the pipeline now (taken from a lane of what draws asked for), a
+/// worker that is not one of the passes over the screen's. Those pipelines
+/// are the ones frames wait for, up to half a second each, while the process
+/// uses every core: made at the lowest priority a compile that takes a few
+/// hundred ms alone took seconds (the store's entry: 120 first binds in 90 s,
+/// 21 of them 2 to 31 s from first bind to made, and 25 s in which a thread
+/// waited the whole budget of every frame). Early pipelines, made for the
+/// next scene while the title plays, stay at the lowest.
+fn level_for(general_worker: bool, taken_asked: bool, boost: bool) -> Level {
+    if general_worker && taken_asked && boost { Level::Boosted } else { Level::Base }
+}
+
+/// Whether pipelines draws wait for are made at normal priority
+/// (`VICTORY_PIPELINE_BOOST=1`; off). May change at any instant
+/// (`VICTORY_AB`): each pipeline is taken at the level the switch says then.
+fn boost() -> bool {
+    crate::ab::live_flag!("VICTORY_PIPELINE_BOOST")
+}
+
+fn set_priority(lowest: bool, level: Level) {
+    // SAFETY: a plain call on our own thread.
+    unsafe {
+        use windows::Win32::System::Threading::*;
+        let priority = match (level, lowest) {
+            (Level::Boosted, _) => THREAD_PRIORITY_NORMAL,
+            (Level::Base, true) => THREAD_PRIORITY_LOWEST,
+            (Level::Base, false) => THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        let _ = SetThreadPriority(GetCurrentThread(), priority);
+    }
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -989,6 +1142,74 @@ mod tests {
         // Idle workers take the first of the line at once, no more.
         assert_eq!(until_made(ms(100), None, 3, 4, 8), ms(100));
         assert!(until_made(ms(100), None, 4, 4, 8) > ms(100));
+    }
+
+    /// Only a pipeline a draw is dropped for, on a worker that is not one of the passes over the
+    /// screen's, with the switch on, is made at normal priority.
+    #[test]
+    fn only_pipelines_taken_from_the_asked_lanes_are_boosted() {
+        assert_eq!(level_for(true, true, true), Level::Boosted);
+        assert_eq!(level_for(true, true, false), Level::Base);
+        assert_eq!(level_for(true, false, true), Level::Base);
+        assert_eq!(level_for(false, true, true), Level::Base);
+        assert_eq!(level_for(false, false, false), Level::Base);
+    }
+
+    /// A pipeline of the early or slow lane is not taken as asked; one of the lanes of what
+    /// the frame asked for is, and the answer is the one of the take that made it.
+    #[test]
+    fn the_lane_a_pipeline_came_from_is_noted_when_it_is_taken() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (early, asked, slow) = (new(), new(), new());
+        let mut queue = Queue::new();
+        queue.push_as(&early, EARLY, false);
+        queue.push_as(&slow, EARLY, true);
+        queue.push_as(&asked, REQUESTED, false);
+        let first = queue.pop(false, 1).unwrap();
+        assert!(Arc::ptr_eq(&first, &asked));
+        assert!(first.taken_asked.load(Ordering::Relaxed));
+        let second = queue.pop(false, 1).unwrap();
+        assert!(Arc::ptr_eq(&second, &early));
+        assert!(!second.taken_asked.load(Ordering::Relaxed));
+        let third = queue.pop(false, 1).unwrap();
+        assert!(Arc::ptr_eq(&third, &slow));
+        assert!(!third.taken_asked.load(Ordering::Relaxed));
+        // One promoted while it waited in the early lane is taken from the lane of the asked.
+        let (late, other) = (new(), new());
+        queue.push_as(&late, EARLY, false);
+        queue.push_as(&other, EARLY, false);
+        queue.push_as(&late, REQUESTED, false);
+        let taken = queue.pop(false, 1).unwrap();
+        assert!(Arc::ptr_eq(&taken, &late));
+        assert!(taken.taken_asked.load(Ordering::Relaxed));
+        let taken = queue.pop(false, 1).unwrap();
+        assert!(Arc::ptr_eq(&taken, &other));
+        assert!(!taken.taken_asked.load(Ordering::Relaxed));
+    }
+
+    /// The budget of a frame's wait halves with each wait that ends without the pipeline, doubles
+    /// with each that ends with it, stops at its floor and is whole again after quiet seconds.
+    #[test]
+    fn the_budget_of_the_wait_follows_how_the_waits_end() {
+        let ms = Duration::from_millis;
+        let (full, floor) = (ms(500), ms(100));
+        let floor_permille = 200;
+        let mut permille = FULL_PERMILLE;
+        let mut budgets = Vec::new();
+        for made in [false, false, false, false, true, true, true] {
+            budgets.push(scaled(full, permille, floor));
+            permille = permille_after(permille, made, floor_permille);
+        }
+        assert_eq!(budgets, [500, 250, 125, 100, 100, 200, 400].map(ms));
+        assert_eq!(permille, FULL_PERMILLE);
+        // Never over whole, never under the floor, whatever the share says.
+        assert_eq!(permille_after(900, true, floor_permille), FULL_PERMILLE);
+        assert_eq!(permille_after(250, false, floor_permille), 200);
+        assert_eq!(scaled(full, 10, floor), floor);
+        assert_eq!(scaled(ms(50), 500, floor), ms(50));
+        // Four quiet seconds: whole again.
+        assert_eq!(permille_at((200, 1000), 1000 + RECOVER_MS - 1), 200);
+        assert_eq!(permille_at((200, 1000), 1000 + RECOVER_MS), FULL_PERMILLE);
     }
 
     #[test]

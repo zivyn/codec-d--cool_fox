@@ -149,6 +149,20 @@ pub(crate) enum C {
     FlushPruneNs,
     FlushAskNs,
     FlushEachNs,
+    /// Waits for host pipelines, those that ended with the pipeline not made,
+    /// and the microseconds of the waits of dispatches (a part of
+    /// `PipelineWaitUs`); pipelines made at normal priority
+    /// (`VICTORY_PIPELINE_BOOST`).
+    PipelineWaits,
+    PipelineFutile,
+    PipelineComputeUs,
+    PipelineBoosted,
+    /// Host pipelines compiled and loaded from the library, and the
+    /// microseconds each took (`pipeline::library::pipeline`).
+    PipelineMakes,
+    PipelineMakeUs,
+    PipelineLoads,
+    PipelineLoadUs,
 }
 const COUNTERS: usize = 96;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1319,6 +1333,22 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
         c[C::TexHot as usize],
+    );
+    tracing::info!(
+        "host pipelines per frame: {:.2} waits of threads, {:.2} of them over with the pipeline not made, \
+         {:.1} ms waiting in all ({:.1} ms of dispatches); {:.2} compiled ({:.1} ms each), {:.2} loaded from \
+         the library ({:.2} ms each), {:.2} made at normal priority (VICTORY_PIPELINE_BOOST); the budget of \
+         the wait of a frame for a world draw's pipeline stands at {} of 1000 (VICTORY_PIPELINE_WAIT_ADAPT)",
+        c[C::PipelineWaits as usize],
+        c[C::PipelineFutile as usize],
+        ms(c[C::PipelineWaitUs as usize]),
+        ms(c[C::PipelineComputeUs as usize]),
+        c[C::PipelineMakes as usize],
+        ms(c[C::PipelineMakeUs as usize]) / c[C::PipelineMakes as usize].max(1.0),
+        c[C::PipelineLoads as usize],
+        ms(c[C::PipelineLoadUs as usize]) / c[C::PipelineLoads as usize].max(1.0),
+        c[C::PipelineBoosted as usize],
+        crate::pipeline::wait_permille(),
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \

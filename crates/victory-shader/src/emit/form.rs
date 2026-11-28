@@ -44,6 +44,25 @@ pub enum Form {
     Refused,
 }
 
+/// `VICTORY_KEPT_SKIPS_WIDE=1`: the skips and early-outs `VICTORY_KEEP_LOOP_SKIPS` keeps over loops
+/// are taken wave-wide ([`Form::KeptSkipsWide`]) before the forms with the loop skips left out.
+/// Off unless asked for: that form puts group barriers at branches (and its wide set can reach
+/// into loops), the shape that lost the card; the exact form with the skips left out has none.
+/// Part of the translation: the shader cache keys on the variable.
+pub(super) fn kept_skips_wide() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_KEPT_SKIPS_WIDE.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_KEPT_SKIPS_WIDE").is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_KEPT_SKIPS_WIDE`, for its thread only.
+    pub(super) static TEST_KEPT_SKIPS_WIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 impl Form {
     /// Whether every result of the form is the console's (not per half-wave).
     pub fn exact(self) -> bool {

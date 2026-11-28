@@ -97,6 +97,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             "VICTORY_LEGACY_ASSUME",
             "VICTORY_WAVE_WIDE_FIRST",
+            "VICTORY_KEPT_SKIPS_WIDE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

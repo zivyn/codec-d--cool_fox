@@ -447,6 +447,9 @@ pub(crate) struct State {
     batch: Option<Batch>,
     /// The run of executions being made one (`VICTORY_INDIRECT_FOLD`).
     fold: fold::Mode,
+    /// The title's waits for shader writes held for what a command needs
+    /// (`VICTORY_PRECISE_BARRIERS`, [`crate::lazy_wait`]).
+    lazy: Option<crate::lazy_wait::Lazy>,
     /// The user data bound last, of the last stage that has some (for the
     /// report of a removed device, `crate::host::indirects`).
     #[cfg(feature = "diagnostics")]
@@ -1256,6 +1259,25 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
 }
 
 impl State {
+    /// A stream of the list begins: the waits are held (`held`) or, if they were and are
+    /// not any more, a wait goes out now (whether it does).
+    pub(crate) fn lazy_begin(&mut self, held: bool) -> bool {
+        match (held, self.lazy.is_some()) {
+            (true, false) => {
+                self.lazy = Some(crate::lazy_wait::Lazy::new());
+                false
+            }
+            (false, true) => self.lazy.take().is_some_and(|mut lazy| lazy.close()),
+            _ => false,
+        }
+    }
+
+    /// A call of `class` is about to be made (or, for a dispatch, was bound with
+    /// `access`): whether a wait goes in front of it.
+    pub(crate) fn lazy_op(&mut self, class: crate::list::lazy::Class, access: Option<&crate::host::precise::Access>) -> bool {
+        self.lazy.as_mut().is_some_and(|lazy| crate::list::lazy::feed(lazy, class, access))
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -3550,6 +3572,14 @@ impl State {
             if let Some((param, word)) = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X) {
                 // SAFETY: an open list; the root signature has the word.
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
+            }
+        }
+        // The title's waits that are held (`VICTORY_PRECISE_BARRIERS`): one goes in front of this
+        // dispatch if it reads or writes what something before the wait wrote.
+        if self.lazy.is_some() {
+            let access = self.access(p, true);
+            if self.lazy_op(crate::list::lazy::Class::Dispatch, Some(&access)) {
+                crate::list::emit_uav_wait(list);
             }
         }
         // SAFETY: an open list with everything set.

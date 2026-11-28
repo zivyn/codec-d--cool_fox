@@ -6790,7 +6790,9 @@ impl Host {
         // The steps of the lists looked through once, for what to ask, what flights may write, what is refreshed in front
         // and the steps themselves (`VICTORY_ONE_PASS=1`, with `VICTORY_LEAN_STEPS`): read once for the submission.
         let mut pass: Option<scratch::Lean<onepass::Pass>> = (onepass::on() && lean_steps()).then(|| scratch::Lean::of(&onepass::PASS, true));
-        if late && askaside::on() && crate::watch::once() && !ask_tokens() && flying() {
+        // (Not for a submission stage A prepared: its asking was made, and what is offered here is never joined before
+        // the lane's `ask_once_end`, so it would end the asking of the stage after it and stand over it.)
+        if late && staged_number.is_none() && askaside::on() && crate::watch::once() && !ask_tokens() && flying() {
             let ranges = match pass.as_mut() {
                 Some(pass) => {
                     pass.add(runs);

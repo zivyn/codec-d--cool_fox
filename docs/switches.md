@@ -3,7 +3,7 @@
 The census of 2026-11-28: every `VICTORY_*` variable the code reads (547 names, 40 of them only in tests or comments), with the default the code gives it
 when it is unset, whether it changes the translation of shaders (and so is in the shader cache key), whether
 `VICTORY_AB` can flip it inside one running process, and what it is for. It was made by reading the place where each is
-read, on `integ/validation-22` (`b181327a4`), and the few differences of `integ/validation-23` are marked. The defaults in the "What is on" table below are those of `integ/validation-28`, the main candidate, and are unchanged in `integ/validation-29` (the fix for the white-out is the one default that changed after `integ/validation-24`; every switch added from `integ/validation-25` to `-29` is off, and `VICTORY_AMBIENT_GAIN` defaults to 1, which changes nothing). The other
+read, on `integ/validation-22` (`b181327a4`), and the few differences of `integ/validation-23` are marked. The defaults in the "What is on" table below are those of `integ/validation-28`, the main candidate, and are unchanged in `integ/validation-29` (the fix for the white-out is the one default that changed after `integ/validation-24`; every switch added from `integ/validation-25` to `-29` is off, except `VICTORY_LAND_AHEAD` of `integ/validation-29`, which is on and bit-exact with the old loop (`=0` restores it); `VICTORY_AMBIENT_GAIN` defaults to 1, which changes nothing). The other
 documents say more about some of them: [README-fxceless.md](README-fxceless.md) (commands and the debugging table),
 [ab-switches.md](ab-switches.md) (the A/B inside one process, and why each live switch may change at any instant).
 

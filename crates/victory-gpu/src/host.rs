@@ -2286,6 +2286,10 @@ struct CardPlan {
     sends: Option<send::Memory>,
     /// With `VICTORY_CARD_SPANS=1`: the slot of stamps around its passes.
     stamps: Option<usize>,
+    /// With `VICTORY_CARD_GAPS=1`: when the call that sent the sync list was entered and returned (ticks of the PC's
+    /// counter; 0: none), and whether its bytes crossed on a copy queue.
+    #[cfg(feature = "diagnostics")]
+    sync_call: (u64, u64, bool),
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -4004,6 +4008,7 @@ impl Host {
     /// `VICTORY_ASYNC_COMPUTE`): a wait for a signal already queued ahead of
     /// it on this queue is met at once.
     pub(crate) fn queue_wait(&self, fence: &ID3D12Fence, value: u64) {
+        spans::wait_seen(spans::wait_site::LANE_FENCE);
         // SAFETY: our queue and a fence of ours.
         if let Err(e) = unsafe { self.queue.Wait(fence, value) } {
             tracing::warn!(error = %e, "the host queue was not told to wait for a lane");

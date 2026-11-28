@@ -870,12 +870,15 @@ impl Host {
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
+            let mut stamped = false;
+            #[cfg(feature = "diagnostics")]
             if let Some([front, behind]) = self.span_lists().filter(|_| !on_compute) {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 kinds.insert(0, spans::lap::FRONT);
                 kinds.push(spans::lap::BEHIND);
                 firsts.iter_mut().for_each(|first| *first += 1);
+                stamped = true;
             }
             // A stamp behind each list (`VICTORY_CARD_SPANS=2`).
             #[cfg(feature = "diagnostics")]
@@ -889,6 +892,9 @@ impl Host {
             } else {
                 parts.iter().filter_map(|&n| firsts.get(n).copied()).collect()
             };
+            // (`VICTORY_CARD_GAPS=1`: when the CPU was in the calls that gave the card this work.)
+            #[cfg(feature = "diagnostics")]
+            let entered = if stamped && spans::gaps_on() { crate::timeline::ticks() } else { 0 };
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 if let Some(route) = route.as_mut() {
@@ -905,6 +911,11 @@ impl Host {
                     None => self.queue.Signal(&self.fence, *submitted),
                 }
             };
+            #[cfg(feature = "diagnostics")]
+            if entered != 0 {
+                let sync = card.as_ref().and_then(|c| c.stamps.map(|slot| (c.sync_call.0, c.sync_call.1, slot, c.sync_call.2)));
+                self.span_called(entered, crate::timeline::ticks(), sync);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);

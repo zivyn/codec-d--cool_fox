@@ -129,6 +129,7 @@ impl Staged {
 
     /// The drawing queue stands behind the copy.
     pub(super) fn wait(&self, direct: &ID3D12CommandQueue) -> windows::core::Result<()> {
+        spans::wait_seen(spans::wait_site::STAGE);
         match lane() {
             // SAFETY: the queue's own wait on a fence of ours.
             Some(lane) => unsafe { direct.Wait(&lane.fence, self.value) },

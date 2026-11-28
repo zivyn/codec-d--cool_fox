@@ -14,6 +14,7 @@
 #![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
@@ -34,6 +35,12 @@ pub(super) struct Spans {
     ticks_per_ms: f64,
     next: usize,
     sums: Sums,
+    /// With `VICTORY_CARD_GAPS=1`: what the CPU did around each stamped submission, by slot; the slot given last;
+    /// the card's clock against the PC's; and what the gaps add up to.
+    calls: Vec<Calls>,
+    given: usize,
+    clock: Clock,
+    gaps: Gaps,
 }
 
 // SAFETY: free-threaded objects and a mapping only read behind a lock.
@@ -73,7 +80,14 @@ impl Sums {
 
 fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SPANS").is_some_and(|v| v == "1" || v == "2"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_SPANS").is_some_and(|v| v == "1" || v == "2") || gaps_on())
+}
+
+/// `VICTORY_CARD_GAPS=1`: what the card's idle between two brackets of stamps is made of, by the CPU's own times of the
+/// calls of `ExecuteCommandLists` (implies the stamps of `VICTORY_CARD_SPANS=1`). See [`Gaps`].
+pub(crate) fn gaps_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_GAPS").is_some_and(|v| v == "1"))
 }
 
 /// `VICTORY_CARD_SPANS=2`: besides the stamps of `1`, a stamp behind every list of a submission (`Host::lap_lists`).
@@ -111,7 +125,13 @@ impl Host {
             at.add(1).write_volatile(0);
             read
         };
+        let before = spans.sums.last;
         spans.sums.add(start, end);
+        if gaps_on() {
+            let calls = std::mem::take(&mut spans.calls[i]);
+            spans.read_gap(&self.queue, before, start, end, calls);
+        }
+        spans.given = i;
         Some([spans.lists[2 * i].clone(), spans.lists[2 * i + 1].clone()])
     }
 
@@ -144,17 +164,272 @@ impl Host {
                 list.Close()?;
                 lists.push(list.cast()?);
             }
+            let frequency = self.queue.GetTimestampFrequency()?;
+            let (mut card, mut pc) = (0, 0);
+            self.queue.GetClockCalibration(&mut card, &mut pc)?;
             Ok(Spans {
                 _allocator: allocator,
                 _heap: heap,
                 _back: back,
                 data: data as usize,
                 lists,
-                ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
+                ticks_per_ms: frequency as f64 / 1000.0,
                 next: 0,
                 sums: Sums::default(),
+                calls: vec![Calls::default(); SPANS],
+                given: 0,
+                clock: Clock { card0: card, pc0: pc, card, pc, reads: 0, card_frequency: frequency as f64, pc_frequency: pc_frequency() },
+                gaps: Gaps::default(),
             })
         }
+    }
+}
+
+/// What the CPU did around one stamped submission (`VICTORY_CARD_GAPS=1`), in ticks of the PC's counter: when the call
+/// of `ExecuteCommandLists` that sent its lists was entered, and when it and the signals behind it had returned; the
+/// same for the call that sent its sync list (0: no such call), the slot of the stamps of that plan's passes, and
+/// whether the bytes of its sends crossed on a copy queue (the drawing queue stood behind a wait for them).
+#[derive(Clone, Copy, Default)]
+struct Calls {
+    enter: u64,
+    ret: u64,
+    sync_enter: u64,
+    sync_ret: u64,
+    slot: Option<usize>,
+    staged: bool,
+}
+
+/// The card's clock against the PC's: two calibrations (the first one made with the stamps, the latest one renewed
+/// every few submissions) and the two frequencies. The rate between the calibrations is used once they are two
+/// seconds apart, the nominal ratio before.
+struct Clock {
+    card0: u64,
+    pc0: u64,
+    card: u64,
+    pc: u64,
+    reads: u32,
+    card_frequency: f64,
+    pc_frequency: f64,
+}
+
+impl Clock {
+    /// A fresh calibration every 64th read.
+    fn refresh(&mut self, queue: &ID3D12CommandQueue) {
+        self.reads = self.reads.wrapping_add(1);
+        if self.reads % 64 != 1 {
+            return;
+        }
+        let (mut card, mut pc) = (0u64, 0u64);
+        // SAFETY: a plain query with valid out pointers.
+        if unsafe { queue.GetClockCalibration(&mut card, &mut pc) }.is_ok() {
+            self.card = card;
+            self.pc = pc;
+        }
+    }
+
+    /// PC ticks per tick of the card.
+    fn rate(&self) -> f64 {
+        let (dcard, dpc) = (self.card.saturating_sub(self.card0), self.pc.saturating_sub(self.pc0));
+        if dpc as f64 > 2.0 * self.pc_frequency && dcard > 0 {
+            dpc as f64 / dcard as f64
+        } else {
+            self.pc_frequency / self.card_frequency
+        }
+    }
+
+    /// A moment of the card's clock as a moment of the PC's counter.
+    fn pc(&self, card: u64) -> f64 {
+        self.pc as f64 + (i128::from(card) - i128::from(self.card)) as f64 * self.rate()
+    }
+}
+
+/// The PC counter's ticks per second.
+fn pc_frequency() -> f64 {
+    let mut ticks = 0;
+    // SAFETY: a valid out pointer.
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut ticks) };
+    ticks.max(1) as f64
+}
+
+/// A stretch `(a, b)` of the PC's counter in which the card had nothing to run, before work that a call of
+/// `ExecuteCommandLists` entered at `e` and returned at `r` gave it: the time before the call was entered (the CPU had
+/// not sent it yet), the time inside the call, and the time after it returned (the work was handed over and the card
+/// had not begun it: idle with work queued). The three add up to `b - a`.
+fn split_stretch(a: f64, b: f64, e: f64, r: f64) -> (f64, f64, f64) {
+    let r = r.max(e);
+    ((e.min(b) - a).max(0.0), (r.min(b) - e.max(a)).max(0.0), (b - r.max(a)).max(0.0))
+}
+
+/// What the card's idle between brackets (the stamps line's "idle between them") is made of, since the last
+/// frame-rate line (`VICTORY_CARD_GAPS=1`), in ticks of the PC's counter. Between the back stamp of a submission and
+/// the front stamp of the next there is the sync list of the next one (a list of ours: it sends the bytes the title
+/// wrote up to the copies in the card's memory and hashes them), which the stamps count as idle; what is left is
+/// told apart by what the CPU was doing at the time with the call that gave the card its next work.
+#[derive(Default)]
+struct Gaps {
+    /// Submissions read, and those with a gap before them.
+    submissions: u64,
+    gapped: u64,
+    /// The gaps, in all.
+    total: f64,
+    /// Of it: our sync lists running (how many, and how many with their bytes crossing on a copy queue).
+    sync: f64,
+    synced: u64,
+    staged: u64,
+    /// Of it: the card with nothing handed over, the CPU not yet in the call.
+    nothing: f64,
+    /// Of it: the CPU inside the call that gave it the work.
+    in_call: f64,
+    /// Of it: the work handed over and not begun.
+    handed: f64,
+    /// Of `handed`: what stood before a sync list whose bytes crossed on a copy queue.
+    handed_staged: f64,
+    /// Stretches of `handed` over 100 us, and the longest one.
+    long: u64,
+    longest: f64,
+}
+
+impl Gaps {
+    /// A stretch `(a, b)` before work whose call was entered at `enter` and returned at `ret`; `long` ticks make a long one.
+    fn stretch(&mut self, (a, b): (f64, f64), enter: u64, ret: u64, staged: bool, long: f64) {
+        if b <= a {
+            return;
+        }
+        let (nothing, in_call, handed) = split_stretch(a, b, enter as f64, ret as f64);
+        self.nothing += nothing;
+        self.in_call += in_call;
+        self.handed += handed;
+        if staged {
+            self.handed_staged += handed;
+        }
+        if handed > long {
+            self.long += 1;
+        }
+        self.longest = self.longest.max(handed);
+    }
+}
+
+/// The six stamps of a plan's passes (its sync list's begin, after its sends, after its hash passes, the compare's
+/// begin and end, after the sends' copies), if the slot is made.
+fn pass_stamps(slot: usize) -> Option<[u64; PASS_STAMPS]> {
+    let made = PASSES_MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let passes = made.as_ref()?.as_ref()?;
+    // SAFETY: inside the mapping; written by the card at whole words; a slot is not used again for 4,096 plans.
+    Some(unsafe {
+        let at = (passes.data as *const u64).add(slot * PASS_STAMPS);
+        std::array::from_fn(|i| at.add(i).read_volatile())
+    })
+}
+
+impl Spans {
+    /// The submission that ran from `start` to `end` (the card's ticks) after one that ended at `before`, and what the
+    /// CPU did to send it (`VICTORY_CARD_GAPS=1`).
+    fn read_gap(&mut self, queue: &ID3D12CommandQueue, before: u64, start: u64, end: u64, c: Calls) {
+        if before == 0 || start == 0 || end < start || c.enter == 0 {
+            return;
+        }
+        self.clock.refresh(queue);
+        self.gaps.submissions += 1;
+        let (p, f) = (self.clock.pc(before), self.clock.pc(start));
+        if f <= p {
+            return;
+        }
+        self.gaps.gapped += 1;
+        self.gaps.total += f - p;
+        let long = self.clock.pc_frequency / 10_000.0;
+        let sync = c
+            .slot
+            .and_then(pass_stamps)
+            .filter(|s| c.sync_enter != 0 && s[0] != 0 && s[2] >= s[0])
+            .map(|s| (self.clock.pc(s[0]), self.clock.pc(s[2])));
+        match sync {
+            Some((from, to)) if from < f && to > p => {
+                let (from, to) = (from.max(p), to.min(f));
+                self.gaps.sync += to - from;
+                self.gaps.synced += 1;
+                self.gaps.staged += u64::from(c.staged);
+                self.gaps.stretch((p, from), c.sync_enter, c.sync_ret, c.staged, long);
+                self.gaps.stretch((to, f), c.enter, c.ret, false, long);
+            }
+            _ => self.gaps.stretch((p, f), c.enter, c.ret, false, long),
+        }
+    }
+
+    /// The line of what the gaps were made of since the last one.
+    fn gap_line(&mut self, frames: f64) {
+        let g = std::mem::take(&mut self.gaps);
+        let waits: Vec<u64> = WAITS.iter().map(|w| w.swap(0, Ordering::Relaxed)).collect();
+        if g.submissions == 0 {
+            return;
+        }
+        let hz = self.clock.pc_frequency;
+        let ms = |t: f64| t / hz * 1000.0 / frames;
+        let n = |c: u64| c as f64 / frames;
+        let by = wait_site::NAMES
+            .iter()
+            .zip(&waits)
+            .map(|(name, &w)| format!("{name} {:.1}", n(w)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::info!(
+            "the card's idle between brackets, by what ran in it and what the CPU was doing (VICTORY_CARD_GAPS=1, the stamps against the PC's counter; {:.1} submissions a frame, {:.1} with a gap): {:.1} ms in all = our sync lists running {:.1} ms in {:.1} lists ({:.1} with their bytes crossing on a copy queue) + nothing handed over yet, the CPU not in the call {:.1} ms + the CPU inside the call {:.1} ms + handed over and not begun {:.1} ms (the idle with work queued: {:.1} stretches a frame over 100 us, the longest {:.0} us; {:.1} ms of it before a sync list behind the copy queue); GPU-side waits queued on the drawing queue per frame: {by}",
+            n(g.submissions),
+            n(g.gapped),
+            ms(g.total),
+            ms(g.sync),
+            n(g.synced),
+            n(g.staged),
+            ms(g.nothing),
+            ms(g.in_call),
+            ms(g.handed),
+            n(g.long),
+            g.longest / hz * 1e6,
+            ms(g.handed_staged),
+        );
+    }
+}
+
+/// Where a wait is put on the drawing queue (`VICTORY_CARD_GAPS=1` counts them: none stands between a submission's
+/// lists unless one of these switches is on).
+pub(crate) mod wait_site {
+    /// The sync list behind the copy of its bytes on the copy queue (`VICTORY_SEND_COPYQ`).
+    pub const STAGE: usize = 0;
+    /// The landing's fetch behind the compute queue.
+    pub const LANDING: usize = 1;
+    /// A queue behind the other one (`VICTORY_ASYNC_COMPUTE`), or the compute queue behind a fetch.
+    pub const LANES: usize = 2;
+    /// The host queue behind a fence of a lane.
+    pub const LANE_FENCE: usize = 3;
+    pub const NAMES: [&str; 4] = ["copy queue stage", "landing fetch", "queue behind queue", "lane fence"];
+}
+
+static WAITS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A wait was queued at `site` of [`wait_site`].
+pub(crate) fn wait_seen(site: usize) {
+    if gaps_on() {
+        WAITS[site].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Host {
+    /// The CPU's side of the submission whose stamps `span_lists` gave out last (`VICTORY_CARD_GAPS=1`): the call of
+    /// `ExecuteCommandLists` for its lists was entered at `enter` and it, with its signals, returned at `ret` (ticks
+    /// of the PC's counter); `sync` is the call that sent its sync list: entered, returned, the slot of the plan's
+    /// stamps, whether its bytes crossed on a copy queue.
+    pub(super) fn span_called(&self, enter: u64, ret: u64, sync: Option<(u64, u64, usize, bool)>) {
+        if !gaps_on() {
+            return;
+        }
+        let mut made = SPANS_MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Some(spans)) = made.as_mut() else {
+            return;
+        };
+        let i = spans.given;
+        spans.calls[i] = match sync {
+            Some((sync_enter, sync_ret, slot, staged)) => Calls { enter, ret, sync_enter, sync_ret, slot: Some(slot), staged },
+            None => Calls { enter, ret, ..Calls::default() },
+        };
     }
 }
 
@@ -622,11 +897,53 @@ pub(super) fn line(frames: f64) {
         ms(s.between),
         s.longest as f64 / spans.ticks_per_ms
     );
+    if gaps_on() {
+        spans.gap_line(frames);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Sums, between};
+    use super::{Clock, Gaps, Sums, between, split_stretch};
+
+    #[test]
+    fn a_stretch_is_told_apart_by_the_call_that_ended_it() {
+        // The CPU had not entered the call when the card ran out: all of it is the CPU's.
+        assert_eq!(split_stretch(100.0, 200.0, 250.0, 260.0), (100.0, 0.0, 0.0));
+        // Entered before the card ran out, back after: the card waited inside the call.
+        assert_eq!(split_stretch(100.0, 200.0, 50.0, 300.0), (0.0, 100.0, 0.0));
+        // Entered inside the stretch, back inside it: three parts.
+        assert_eq!(split_stretch(100.0, 200.0, 120.0, 150.0), (20.0, 30.0, 50.0));
+        // Back before the card ran out: the work was handed over and the card did not begin it.
+        assert_eq!(split_stretch(100.0, 200.0, 10.0, 20.0), (0.0, 0.0, 100.0));
+        // A return stamp before the entry (clock noise) does not make a negative part.
+        let (a, b, c) = split_stretch(100.0, 200.0, 150.0, 140.0);
+        assert!(a >= 0.0 && b >= 0.0 && c >= 0.0);
+        assert!((a + b + c - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stretches_add_up_to_the_gap() {
+        let mut g = Gaps::default();
+        g.stretch((0.0, 1000.0), 400, 600, false, 100.0);
+        g.stretch((2000.0, 2300.0), 0, 10, true, 100.0);
+        g.stretch((5.0, 5.0), 0, 0, false, 100.0);
+        assert!((g.nothing + g.in_call + g.handed - 1300.0).abs() < 1e-9);
+        assert_eq!((g.nothing, g.in_call, g.handed), (400.0, 200.0, 700.0));
+        assert_eq!((g.handed_staged, g.long, g.longest), (300.0, 2, 400.0));
+    }
+
+    #[test]
+    fn the_cards_clock_is_the_pcs_by_the_rate_between_calibrations() {
+        // Nominal: 1 GHz card, 10 MHz counter.
+        let mut c = Clock { card0: 1_000, pc0: 500, card: 1_000, pc: 500, reads: 0, card_frequency: 1e9, pc_frequency: 1e7 };
+        assert!((c.pc(1_000 + 1_000_000) - (500.0 + 10_000.0)).abs() < 1e-6);
+        // Three seconds on, the card's clock ran a part in a thousand slow: the measured rate wins.
+        c.card = c.card0 + 2_997_000_000;
+        c.pc = c.pc0 + 30_000_000;
+        assert!((c.rate() - 30_000_000.0 / 2_997_000_000.0).abs() < 1e-12);
+        assert!((c.pc(c.card) - c.pc as f64).abs() < 1e-6);
+    }
 
     #[test]
     fn submissions_add_up_without_counting_anything_twice() {

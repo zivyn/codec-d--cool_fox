@@ -912,6 +912,7 @@ impl Host {
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
                     if let Some((compute, value)) = behind_compute {
+                        spans::wait_seen(spans::wait_site::LANDING);
                         queue.Wait(compute, value)?;
                     }
                     queue.ExecuteCommandLists(&lists);
@@ -927,6 +928,7 @@ impl Host {
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some((compute, value)) = behind_compute {
+                    spans::wait_seen(spans::wait_site::LANDING);
                     self.queue.Wait(compute, value)?;
                 }
                 self.queue.ExecuteCommandLists(&lists);

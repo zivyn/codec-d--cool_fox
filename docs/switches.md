@@ -369,6 +369,7 @@ translation of shaders.
 | `VICTORY_CARD_BUFFERS_MB` | derived from VRAM budget (512, 2048 or a quarter of it up to 8192) | number |  |  |  | Most MiB of title buffer copies kept in the card's memory. |
 | `VICTORY_CARD_BUFFERS_MIN_KB` | 64 | number |  |  |  | Smallest title buffer in KiB that gets a host copy in the card's memory. |
 | `VICTORY_CARD_BUFFERS_MIN_MB` | derived from VRAM budget (16, 4 or 1 MiB) | number |  |  |  | Smallest title buffer in MiB that gets a host copy in the card's memory. |
+| `VICTORY_CARD_GAPS` | off | flag |  |  |  | Diagnostics exe: with the stamps of `VICTORY_CARD_SPANS=1` (it turns them on), tells what the stamps line's "idle between them" is made of, by the card's stamps against the CPU's own times of the calls of `ExecuteCommandLists`: our sync lists running (sends up and hash passes, which stand outside the bracket), the card with nothing handed over yet, the CPU inside the call, and work handed over and not begun (the idle with work queued); and counts the waits queued on the drawing queue by site. |
 | `VICTORY_CARD_HASH_LEN` | on (=0 turns off) | flag |  |  |  | Hashes only the title buffer's own length for a card copy; 0 hashes the whole buffer. |
 | `VICTORY_CARD_MEDIUM_KB` | 1024 | number |  |  |  | Size in KiB from which card copies get the big copies' margin and reserve. |
 | `VICTORY_CARD_REHASH_RUNS` | on, 1 | flag |  |  |  | Hashes pieces sent up to a card copy in runs of touching pieces, once each. |

@@ -57,6 +57,10 @@ on:
         description: Seconds after which a stress case stops
         type: string
         default: "1500"
+      stress_suite_n:
+        description: Runs of the whole victory-gpu lib test suite per runner, counting the tests that failed (0 skips it)
+        type: string
+        default: "0"
       stress_cases:
         description: JSON list of stress cases
         type: string
@@ -298,6 +302,47 @@ jobs:
             grep -h "STRESS-PANIC" "$RUNNER_TEMP/stress.log" | head -5 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The whole lib test program run again and again, as the CI's test job runs it (all the tests at once, so that the
+  # tests that map views meet each other), counting which tests failed: the flake may need the others' company.
+  stress-suite:
+    needs: stress-build
+    if: ${{ inputs.stress_guards && inputs.stress_suite_n != '0' }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        threads: [4, 16]
+        runner: [a, b]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: stress-guards-exe
+          path: dist
+      - name: Suite
+        run: |
+          exe="$GITHUB_WORKSPACE/dist/victory_gpu_tests.exe"
+          cd crates/victory-gpu
+          fails=0
+          : > "$RUNNER_TEMP/failed.txt"
+          started=$SECONDS
+          for i in $(seq 1 ${{ inputs.stress_suite_n }}); do
+            if [ $((SECONDS - started)) -gt 2400 ]; then echo "stopped by time after $((i - 1)) runs"; break; fi
+            runs=$i
+            "$exe" --test-threads=${{ matrix.threads }} --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws > "$RUNNER_TEMP/suite.log" 2>&1 && continue
+            fails=$((fails + 1))
+            grep -h '^test .* FAILED' "$RUNNER_TEMP/suite.log" | tee -a "$RUNNER_TEMP/failed.txt"
+            grep -h 'is not after' "$RUNNER_TEMP/suite.log" | head -3 | tee -a "$RUNNER_TEMP/failed.txt"
+          done
+          {
+            echo "## Suite threads=${{ matrix.threads }} ($GITHUB_REF_NAME $GITHUB_SHA)"
+            echo '```'
+            echo "SUITE-RESULT threads=${{ matrix.threads }} runs=${runs:-0} failed_runs=$fails"
+            sort "$RUNNER_TEMP/failed.txt" | uniq -c
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
   # The cost of the audio DSP's convolution on the runner's CPU, optimized
   # (the unit tests run unoptimized): milliseconds a block, first version

@@ -2752,7 +2752,7 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
-const WHY_SYNC: usize = 2;
+pub(crate) const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
 const WHY_VALUE: usize = 4;
 const WHY_STALE: usize = 5;
@@ -6148,7 +6148,7 @@ impl Host {
 
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -6859,6 +6859,14 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Lets the swap chain and what presents with it go, once everything
+    /// sent has run (`victory upscaler-check`: before Streamline is shut
+    /// down; nothing presents afterwards).
+    pub(crate) fn drop_presenter(&self) {
+        settle_now(WHY_SYNC);
+        *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn presenter(

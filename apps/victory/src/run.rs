@@ -35,6 +35,38 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// Gives the title's settings file the frame rate `VICTORY_TARGET_FPS` names,
+/// if it is set (`victory_game::fps`).
+#[cfg(windows)]
+fn retarget_fps(storage: &Path) {
+    use victory_game::fps::{Applied, ENV, apply, parse, refreshes};
+    let Ok(asked) = std::env::var(ENV) else {
+        return;
+    };
+    let Some(fps) = parse(Some(&asked)) else {
+        eprintln!("{ENV}={asked}: not 15, 20, 30 or 60, left alone");
+        return;
+    };
+    match apply(storage, fps) {
+        Ok(Applied::Changed) => println!(
+            "target fps     {fps} (settings file rewritten: {} refreshes a frame; the original is kept beside it)",
+            refreshes(fps)
+        ),
+        Ok(Applied::Same) => println!("target fps     {fps} (settings file has it already)"),
+        Ok(Applied::NoFile) => println!(
+            "target fps     {fps} requested, but the title has written no settings file yet: run once, then again"
+        ),
+        Ok(Applied::Unreadable(key)) => {
+            eprintln!(
+                "target fps     {fps} requested, but the settings file has no single `{key}` element: left alone"
+            );
+        }
+        Err(e) => eprintln!(
+            "target fps     {fps} requested, but the settings file could not be written: {e}"
+        ),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -52,6 +84,11 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    if execute {
+        // Before the host's own memory (the image read below, the GPU
+        // device, the caches) takes the space the title's 32-bit memory needs.
+        victory_hle::modules::xmem::low_guards::install();
+    }
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
@@ -96,6 +133,9 @@ pub fn run(
         storage.display(),
         title.storage_bytes >> 20
     );
+    // `VICTORY_TARGET_FPS=<fps>`: the title's settings file asks for that
+    // frame rate (`victory_game::fps`).
+    retarget_fps(&storage);
     // The console's fixed drives: the package as `G:`, temporary files `T:`.
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
@@ -174,6 +214,7 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    size_pools_as_series_x(&image);
     arm_watchdog_hold(&image);
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
@@ -196,6 +237,48 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// `VICTORY_TITLE_POOLS=series-x`: the title's start-up sizes its memory pools
+/// as on a Series X while the device stays what `--console` says
+/// (`victory_game::pools`). What the title is told of its memory follows.
+#[cfg(windows)]
+fn size_pools_as_series_x(image: &victory_loader::LoadedImage) {
+    const EXECUTE: u32 = 0x2000_0000;
+    let code: Vec<(u32, u32)> = image
+        .info()
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & EXECUTE != 0)
+        .map(|s| (s.rva, s.virtual_size))
+        .collect();
+    let asked = std::env::var(victory_game::pools::ENV).ok();
+    // SAFETY: the image is mapped and relocated, stays so for the run, and
+    // nothing of it has run yet.
+    let done = unsafe {
+        victory_game::pools::apply(asked.as_deref(), image.base(), &code, |at, was, new| {
+            victory_loader::code_patch::replace(at, was, new)
+        })
+    };
+    use victory_game::pools::Applied;
+    match done {
+        Applied::Off => {}
+        Applied::Patched(rva) => {
+            victory_hle::console::set_pools_of_series_x(true);
+            println!(
+                "title pools    sized as a Series X's (call at +{rva:#x}; {})",
+                victory_game::pools::ENV
+            );
+        }
+        Applied::NotFound => println!(
+            "title pools    {} is set, but this build's routine was not found: left as it is",
+            victory_game::pools::ENV
+        ),
+        Applied::Refused(rva) => println!(
+            "title pools    {} is set, but the call at +{rva:#x} could not be replaced: left as it is",
+            victory_game::pools::ENV
+        ),
+    }
 }
 
 /// Lets our stalls (a frame recording, host pipelines made on a title thread)

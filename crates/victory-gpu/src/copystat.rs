@@ -149,6 +149,20 @@ pub(crate) enum C {
     FlushPruneNs,
     FlushAskNs,
     FlushEachNs,
+    /// Waits for host pipelines, those that ended with the pipeline not made,
+    /// and the microseconds of the waits of dispatches (a part of
+    /// `PipelineWaitUs`); pipelines made at normal priority
+    /// (`VICTORY_PIPELINE_BOOST`).
+    PipelineWaits,
+    PipelineFutile,
+    PipelineComputeUs,
+    PipelineBoosted,
+    /// Host pipelines compiled and loaded from the library, and the
+    /// microseconds each took (`pipeline::library::pipeline`).
+    PipelineMakes,
+    PipelineMakeUs,
+    PipelineLoads,
+    PipelineLoadUs,
 }
 const COUNTERS: usize = 96;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -234,15 +248,71 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// their microseconds, and the longest one's.
 static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 
+/// The same commands by the kind of the title's queue their list was
+/// submitted to (`u32::MAX`: not known) as well: `(key, queue)` to how many,
+/// microseconds and the longest.
+static COMMANDS_BY_QUEUE: Mutex<Option<HashMap<(String, u32), (u64, u64, u64)>>> = Mutex::new(None);
+
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
-pub(crate) fn command_took(op: &str, ms: f64) {
+/// `queue` is the kind of the title's queue its list went to.
+pub(crate) fn command_took(op: &str, ms: f64, queue: u32) {
     let us = (ms * 1e3) as u64;
+    let key = command_key(op);
+    let add = |e: &mut (u64, u64, u64)| {
+        e.0 += 1;
+        e.1 += us;
+        e.2 = e.2.max(us);
+    };
+    {
+        let mut by = COMMANDS_BY_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let by = by.get_or_insert_with(HashMap::new);
+        add(by.entry((key.clone(), queue)).or_insert((0, 0, 0)));
+    }
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
-    e.0 += 1;
-    e.1 += us;
-    e.2 = e.2.max(us);
+    let by = by.get_or_insert_with(HashMap::new);
+    add(by.entry(key).or_insert((0, 0, 0)));
+}
+
+/// The name of a title queue kind in the report.
+fn queue_name(kind: u32) -> &'static str {
+    match kind {
+        0 => "graphics",
+        1 => "copy",
+        2 => "compute",
+        _ => "unknown",
+    }
+}
+
+/// The commands' time by the title's queue, and every kind of command with
+/// its queue as lines of a table (`VICTORY_GPU_TIMING_FILE`): per frame, the
+/// milliseconds, the commands, the longest one's milliseconds, the queue and
+/// the key. Longest first; `frames` is what the sums cover.
+fn by_queue_report(by: HashMap<(String, u32), (u64, u64, u64)>, frames: f64) -> (String, String) {
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| a.0.cmp(&b.0)));
+    let mut queues: Vec<(u32, u64, u64)> = Vec::new();
+    let mut table = String::from("ms_per_frame\tcommands_per_frame\tlongest_ms\tqueue\tkey\n");
+    for ((key, queue), (n, us, longest)) in &rows {
+        match queues.iter_mut().find(|q| q.0 == *queue) {
+            Some(q) => (q.1, q.2) = (q.1 + n, q.2 + us),
+            None => queues.push((*queue, *n, *us)),
+        }
+        table.push_str(&format!(
+            "{:.4}\t{:.2}\t{:.3}\t{}\t{key}\n",
+            *us as f64 / 1e3 / frames,
+            *n as f64 / frames,
+            *longest as f64 / 1e3,
+            queue_name(*queue)
+        ));
+    }
+    queues.sort_by_key(|q| std::cmp::Reverse(q.2));
+    let line = queues
+        .iter()
+        .map(|&(q, n, us)| format!("{} {:.1} ms in {:.0}", queue_name(q), us as f64 / 1e3 / frames, n as f64 / frames))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (line, table)
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -466,6 +536,29 @@ mod command_tests {
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
+    }
+
+    /// The report sums by the title's queue and lists every kind of command
+    /// with its queue, longest first; a kind on two queues is two rows.
+    #[test]
+    fn the_time_is_summed_by_the_titles_queue_and_listed_whole() {
+        use super::{by_queue_report, queue_name};
+        use std::collections::HashMap;
+        let mut by: HashMap<(String, u32), (u64, u64, u64)> = HashMap::new();
+        by.insert(("dispatch [compute aa]".into(), 0), (10, 4_000, 900));
+        by.insert(("dispatch [compute aa]".into(), 2), (6, 1_000, 300));
+        by.insert(("indirect [mesh bb]".into(), 0), (20, 6_000, 500));
+        by.insert(("dispatch [compute cc]".into(), u32::MAX), (2, 600, 500));
+        let (line, table) = by_queue_report(by, 2.0);
+        assert_eq!(line, "graphics 5.0 ms in 15, compute 0.5 ms in 3, unknown 0.3 ms in 1");
+        let rows: Vec<&str> = table.lines().collect();
+        assert_eq!(rows[0], "ms_per_frame\tcommands_per_frame\tlongest_ms\tqueue\tkey");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1], "3.0000\t10.00\t0.500\tgraphics\tindirect [mesh bb]");
+        assert_eq!(rows[2], "2.0000\t5.00\t0.900\tgraphics\tdispatch [compute aa]");
+        assert_eq!(rows[3], "0.5000\t3.00\t0.300\tcompute\tdispatch [compute aa]");
+        assert_eq!(rows[4], "0.3000\t1.00\t0.500\tunknown\tdispatch [compute cc]");
+        assert_eq!(queue_name(1), "copy");
     }
 }
 
@@ -735,6 +828,67 @@ fn log_memory_map() {
         groups.len(),
         biggest.join("; ")
     );
+    // Whether the write-combined allocations are ours: the upload buffers
+    // alive ([`crate::sites`]) whose mapping starts inside each.
+    let (mut wc_n, mut wc_bytes, mut wc_ours) = (0u64, 0u64, 0u64);
+    let mut bare: HashMap<usize, (u64, u64)> = HashMap::new();
+    for (base, &(k, bytes)) in &by_allocation {
+        if k != 5 {
+            continue;
+        }
+        let size = whole.get(base).copied().unwrap_or(0);
+        let ours = crate::sites::covered(*base, size);
+        wc_n += 1;
+        wc_bytes += bytes;
+        wc_ours += ours;
+        if ours == 0 {
+            let group = bare.entry(size).or_default();
+            group.0 += 1;
+            group.1 += bytes;
+        }
+    }
+    let mut bare: Vec<(usize, (u64, u64))> = bare.into_iter().collect();
+    bare.sort_by_key(|b| std::cmp::Reverse(b.1.1));
+    let none: u64 = bare.iter().map(|b| b.1.1).sum();
+    let sizes: Vec<String> = bare
+        .iter()
+        .take(8)
+        .map(|(size, (n, bytes))| format!("{n} of {:.2} MB: {} MB", *size as f64 / (1 << 20) as f64, bytes >> 20))
+        .collect();
+    tracing::info!(
+        "memory map, write-combined: {wc_n} allocations {} MB committed; upload buffers of ours alive start in them: {} MB;          the allocations that hold none of ours: {} MB (the driver's: command memory, descriptor heaps, what it keeps), the biggest groups {}",
+        wc_bytes >> 20,
+        wc_ours >> 20,
+        none >> 20,
+        sizes.join("; ")
+    );
+    // The mappings at host addresses of 8 MB or more committed, by file (the
+    // pipeline library, the driver's caches, our own sections), in MB.
+    use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut mapped: HashMap<usize, u64> = HashMap::new();
+    for r in regions.iter().filter(|r| r.3 && r.4 == MEM_MAPPED && r.0 >= HOST) {
+        *mapped.entry(r.0).or_default() += r.2 as u64;
+    }
+    let mut files: HashMap<String, (u64, u64)> = HashMap::new();
+    for (&base, &bytes) in mapped.iter().filter(|m| *m.1 >= 8 << 20) {
+        let mut name = [0u16; 520];
+        // SAFETY: our own process, a buffer of that many characters.
+        let n = unsafe { K32GetMappedFileNameW(GetCurrentProcess(), base as *mut _, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let text = if n == 0 {
+            "no file (memory of the page file)".to_owned()
+        } else {
+            let full = String::from_utf16_lossy(&name[..n]);
+            full.rsplit('\\').next().unwrap_or(&full).to_owned()
+        };
+        let entry = files.entry(text).or_default();
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
+    let mut files: Vec<(String, (u64, u64))> = files.into_iter().collect();
+    files.sort_by_key(|f| std::cmp::Reverse(f.1.1));
+    let text: Vec<String> = files.iter().take(12).map(|(name, (n, bytes))| format!("{name}: {n} of them {} MB", bytes >> 20)).collect();
+    tracing::info!("memory map, mappings at host addresses of 8 MB and more committed, by file: {}", text.join("; "));
 }
 
 /// Logs where the memory is: the process and the PC, then what this crate
@@ -949,6 +1103,68 @@ fn log_memory() {
         mb(copies[3]),
         mb(crate::shadow::window_cover()),
         lists[3],
+    );
+    // Round 4: which lines of code hold the PC's memory the card reaches,
+    // and what is kept for reuse (what `VICTORY_RAM_LEAN` caps).
+    let totals = crate::sites::totals();
+    let biggest: Vec<String> = crate::sites::alive()
+        .iter()
+        .take(14)
+        .map(|s| {
+            format!(
+                "{}:{} {} {} alive {:.0} MB (made {}, {:.0} MB)",
+                s.file.rsplit(['/', '\\']).next().unwrap_or(s.file),
+                s.line,
+                if s.kind == crate::sites::UPLOAD { "upload" } else { "shared" },
+                s.alive,
+                mb(s.alive_bytes),
+                s.made,
+                mb(s.made_bytes),
+            )
+        })
+        .collect();
+    tracing::info!(
+        "memory, buffers of the PC's memory alive, by the line that made them: upload (write-combined)          {} alive {:.0} MB of {} made {:.0} MB; shared (write-back) {} alive {:.0} MB of {} made {:.0} MB;          the biggest: {}",
+        totals[0][0],
+        mb(totals[0][1]),
+        totals[0][2],
+        mb(totals[0][3]),
+        totals[1][0],
+        mb(totals[1][1]),
+        totals[1][2],
+        mb(totals[1][3]),
+        biggest.join("; "),
+    );
+    let heaps: Vec<u64> = crate::descriptor::host::HEAPS.iter().map(|h| h.load(Relaxed)).collect();
+    tracing::info!(
+        "memory, host descriptor heaps alive: {} of {:.0} MB in all (shader visible, write-combined, one for each shader-visible heap          of the title that was used, whatever its own count) and {:.0} MB of per-slot arrays beside them \
+         (VICTORY_HEAP_SPARSE={}: pages of the slots' resources made: {}, {:.0} MB of locks and pointers)",
+        heaps[0],
+        mb(heaps[1]),
+        mb(heaps[2]),
+        u8::from(crate::lean::heap_sparse()),
+        crate::descriptor::sparse::PAGES[0].load(Relaxed),
+        crate::descriptor::sparse::PAGES[1].load(Relaxed) as f64 * 16.0 / (1 << 20) as f64,
+    );
+    let snapshots = crate::shadow::kept_snapshots();
+    let send = crate::host::send_spare();
+    let staging = crate::pool::staging_empty();
+    let fetch: Vec<u64> = crate::host::FETCH_BYTES.iter().map(|b| b.load(Relaxed)).collect();
+    tracing::info!(
+        "memory, kept for reuse (VICTORY_RAM_LEAN={}): snapshots of copies {:.0} MB of at most {:.0} MB;          memory the submissions send up with, {} buffers {:.0} MB of at most {:.0} MB; lists' scratch chunks          nothing holds {:.0} MB; texture staging {} blocks, {} empty (at most {} kept); the buffers the          fetches come down to: {:.0} MB (relay) and {:.0} MB, made smaller again {} times          (VICTORY_FETCH_TRIM)",
+        crate::lean::level(),
+        mb(snapshots[0]),
+        mb(snapshots[1]),
+        send[0],
+        mb(send[1]),
+        mb(send[2]),
+        mb(crate::host::ALIVE[4].load(Relaxed)),
+        staging[0],
+        staging[1],
+        crate::lean::staging_spare(8),
+        mb(fetch[0]),
+        mb(fetch[1]),
+        crate::host::FETCH_TRIMMED.load(Relaxed),
     );
 }
 
@@ -1198,6 +1414,22 @@ pub(crate) fn log(frames: f64) {
         c[C::TexHot as usize],
     );
     tracing::info!(
+        "host pipelines per frame: {:.2} waits of threads, {:.2} of them over with the pipeline not made, \
+         {:.1} ms waiting in all ({:.1} ms of dispatches); {:.2} compiled ({:.1} ms each), {:.2} loaded from \
+         the library ({:.2} ms each), {:.2} made at normal priority (VICTORY_PIPELINE_BOOST); the budget of \
+         the wait of a frame for a world draw's pipeline stands at {} of 1000 (VICTORY_PIPELINE_WAIT_ADAPT)",
+        c[C::PipelineWaits as usize],
+        c[C::PipelineFutile as usize],
+        ms(c[C::PipelineWaitUs as usize]),
+        ms(c[C::PipelineComputeUs as usize]),
+        c[C::PipelineMakes as usize],
+        ms(c[C::PipelineMakeUs as usize]) / c[C::PipelineMakes as usize].max(1.0),
+        c[C::PipelineLoads as usize],
+        ms(c[C::PipelineLoadUs as usize]) / c[C::PipelineLoads as usize].max(1.0),
+        c[C::PipelineBoosted as usize],
+        crate::pipeline::wait_permille(),
+    );
+    tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
          threads); {:.1} ms waiting for pipelines ({:.0} waits skipped as too long); dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
@@ -1355,6 +1587,20 @@ pub(crate) fn log(frames: f64) {
             all as f64 / 1e3 / frames,
             text.join(", ")
         );
+    }
+    // By the title's queue (the compute queue's share is what a second host
+    // queue could overlap with the graphics queue's), and every kind of
+    // command in a file: the forty lines are the top of some 1,100 kinds,
+    // about half of the time.
+    let by_queue = COMMANDS_BY_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(by_queue) = by_queue {
+        let (line, table) = by_queue_report(by_queue, frames);
+        tracing::info!("  the card's time by the title's queue (timing run): {line}");
+        if let Some(path) = std::env::var_os("VICTORY_GPU_TIMING_FILE")
+            && let Err(e) = std::fs::write(&path, table)
+        {
+            tracing::warn!(error = %e, "the table of the card's time by command was not written");
+        }
     }
     for (what, (n, us, longest)) in by.into_iter().take(40) {
         tracing::info!(

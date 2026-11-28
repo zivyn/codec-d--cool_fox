@@ -487,6 +487,61 @@ impl Module {
         }
     }
 
+    /// For a float the program itself may make an infinity or a NaN of: a division
+    /// (by zero), a square root, a reciprocal root, a logarithm or an exponential, the
+    /// inverse and hyperbolic trigonometry (of a number out of its range), or an
+    /// operation on a value that is one, or a value a join picks (not known while the
+    /// lowering is at work). Values that only come from memory, from the pipeline or
+    /// from a constant that is finite are taken to be numbers (the title does not store
+    /// an infinity where a product by zero would meet it). `depth` bounds the walk; a
+    /// value it does not reach is taken to be one that may.
+    pub(crate) fn inf_prone(&self, v: V, depth: u32) -> bool {
+        if let Some(k) = self.float_k(v) {
+            return !k.is_finite();
+        }
+        let V::Inst(i) = v else { return false };
+        let Some(depth) = depth.checked_sub(1) else {
+            return true;
+        };
+        let of = |v: V| self.inf_prone(v, depth);
+        match &self.insts[i as usize].op {
+            // A division is code 3 (`fdiv`) on floats.
+            Op::Bin(Bin::UDiv | Bin::SDiv | Bin::URem, ..) => true,
+            Op::Bin(_, a, b) => of(*a) || of(*b),
+            Op::Cast(Cast::Bitcast, x) => match *x {
+                // A float made through integer operations is taken as it is made;
+                // its constant parts count (the bits of an infinity).
+                V::Inst(j) => match self.insts[j as usize].op {
+                    Op::Cast(Cast::Bitcast, y) if self.type_of(y) == self.type_of(v) => of(y),
+                    _ => false,
+                },
+                _ => false,
+            },
+            Op::Cast(..) => false,
+            Op::Select(_, a, b) => of(*a) || of(*b),
+            // (Its incoming values are not there yet while the lowering is at work.)
+            Op::Phi(_) => true,
+            Op::Call(_, args) => {
+                let Some((_, code)) = args.first().and_then(|a| self.int_k(*a)) else {
+                    return false;
+                };
+                match (code, &args[1..]) {
+                    // Saturate: a number whatever it gets (a NaN gives 0).
+                    (7, _) => false,
+                    // Absolute value, the circular functions, fraction and the
+                    // roundings, minimum and maximum, multiply-add: a number from
+                    // numbers.
+                    (6 | 12 | 13 | 22 | 26..=29 | 35 | 36 | 46 | 47, rest) => rest.iter().any(|&x| of(x)),
+                    // The exponential, tangent, inverse and hyperbolic functions,
+                    // square root, logarithm and reciprocal root.
+                    (14..=21 | 23..=25, _) => true,
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// The constant `x` of the integer type `ty`, kept sign-extended as
     /// [`Module::i32`] and [`Module::bool`] keep theirs.
     fn k(&mut self, ty: Ty, bits: u32, x: u64) -> V {

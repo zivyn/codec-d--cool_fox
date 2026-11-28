@@ -1830,9 +1830,12 @@ pub(crate) fn retry_allowed(now: u64, cap: u64, steps: bool) -> bool {
 
 /// [`retry_allowed`] for the card as it is now (see [`level_cap_lately`]).
 #[cfg(windows)]
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_LEVELS_RETRY=0`: a question asked now of the card as it is
+/// now; what it changes is which textures are uploaded again, so a phase may leave textures to the next that it
+/// would have had in the other way: for the frame time, not for the picture of the run.)
 pub(crate) fn may_retry(cap: u64) -> bool {
-    static STEPS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let steps = *STEPS.get_or_init(|| std::env::var_os("VICTORY_LEVELS_RETRY").is_none_or(|v| v != "0"));
+    let steps = crate::ab::live_value!("VICTORY_LEVELS_RETRY", bool, crate::ab::unless_zero);
     retry_allowed(level_cap_lately(), cap, steps)
 }
 

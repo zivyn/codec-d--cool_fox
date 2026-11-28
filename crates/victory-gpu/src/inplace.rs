@@ -270,7 +270,7 @@ struct Views {
     /// page in every view that shows it. A write through one view of a
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
-    pages: BTreeMap<(usize, u64), Vec<usize>>,
+    pages: BTreeMap<(usize, u64), crate::addrset::AddressSet>,
     /// Of those, how many are shown more than once.
     pages_twice: usize,
     /// Sections by handle: bytes, and whether made committed.
@@ -364,7 +364,7 @@ pub(crate) fn views_gone(at: usize, len: usize) {
             if let Some(pages) = v.pages.get_mut(&key) {
                 let page = base + k * K64;
                 let before = pages.len();
-                pages.retain(|&shown| shown != page);
+                pages.remove(page);
                 let after = pages.len();
                 if after == 0 {
                     v.pages.remove(&key);
@@ -392,11 +392,17 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
                 continue;
             };
             if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
-                out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
+                out.push((page, shown.iter().filter(|&at| at != page).collect()));
             }
         }
     }
     out
+}
+
+/// Whether any physical page is shown at more than one address now (`crate::pagedrive` tells the copies of every view
+/// of a page when one is noted written, and looks for views only if there are any).
+pub(crate) fn any_aliases() -> bool {
+    views().pages_twice > 0
 }
 
 /// The address of the 64 KiB page shown at `page` in every title view that
@@ -410,7 +416,7 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     if within >= bytes || !within.is_multiple_of(K64) {
         return Vec::new();
     }
-    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+    v.pages.get(&(section, offset + within as u64)).map(|shown| shown.iter().collect()).unwrap_or_default()
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +
@@ -428,7 +434,7 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
         if let Some(shown) = v.pages.get(&(section, at))
             && shown.len() <= crate::watch::MANY_VIEWS
         {
-            pages.extend(shown.iter().copied());
+            pages.extend(shown.iter());
         }
         match at.checked_add(K64 as u64) {
             Some(next) => at = next,
@@ -581,7 +587,7 @@ pub(crate) fn beside_page(page: usize) -> Option<(usize, [usize; 8])> {
             let offset = offset + within as u64;
             if let Some(whole) = v.whole.iter().find(|w| w.0 == section) {
                 let mut shown = [0; 8];
-                let all = v.pages.get(&(section, offset))?;
+                let all = v.pages.get(&(section, offset))?.as_slice()?;
                 shown.get_mut(..all.len())?.copy_from_slice(all);
                 return (whole.1 != 0).then(|| (whole.1 + offset as usize, shown));
             }

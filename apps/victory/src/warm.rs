@@ -113,6 +113,10 @@ fn corpus_stamp(paths: &[PathBuf]) -> String {
         let when = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
         stamp += &format!("{} {} {}\n", p.display(), m.map_or(0, |m| m.len()), when.map_or(0, |d| d.as_secs()));
     }
+    // (The programs a run leaves out are not written down: with other switches, or after the
+    // default changed, a book that was seeded lacks some.)
+    stamp += &known::left_out_signature();
+    stamp.push('\n');
     stamp
 }
 

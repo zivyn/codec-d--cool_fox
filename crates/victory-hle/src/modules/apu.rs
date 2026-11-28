@@ -325,7 +325,7 @@ pub extern "system" fn XApuEnqueueCommand(
 fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
-    let (output, output_length) = (command.output, command.output_length);
+    let output = command.output;
     result.input = input;
     result.input_length = input_length;
     result.output = output;
@@ -335,8 +335,44 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
+    // A packet's room is 46 KB of floats: the thread's own, kept for the
+    // next, not made and zeroed for each (`VICTORY_STREAM_REUSE=0`: as
+    // before).
+    with_pcm(MAX_FRAMES * channels, |pcm| {
+        decode_packet(decoder, packet, options, command, result, pcm)
+    });
+}
+
+thread_local! {
+    static PCM: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on `len` floats: the thread's kept ones, or new zeros.
+fn with_pcm<R>(len: usize, f: impl FnOnce(&mut [f32]) -> R) -> R {
+    static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let reuse =
+        *REUSE.get_or_init(|| std::env::var_os("VICTORY_STREAM_REUSE").is_none_or(|v| v != "0"));
+    if !reuse {
+        return f(&mut vec![0f32; len]);
+    }
+    let mut kept = PCM.with_borrow_mut(std::mem::take);
+    kept.resize(len, 0.0);
+    let out = f(&mut kept);
+    PCM.with_borrow_mut(|slot| *slot = kept);
+    out
+}
+
+fn decode_packet(
+    decoder: &mut OpusDecoder,
+    packet: &[u8],
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+    pcm: &mut [f32],
+) {
+    let channels = decoder.channels();
+    let (output, output_length) = (command.output, command.output_length);
+    let decoded = match decoder.decode(packet, MAX_FRAMES, pcm) {
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;
@@ -418,6 +454,15 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kept_float_room_is_the_size_asked_each_time() {
+        for len in [MAX_FRAMES, MAX_FRAMES * 2, 960, MAX_FRAMES] {
+            let seen = with_pcm(len, |pcm| (pcm.len(), pcm.iter().all(|s| s.is_finite())));
+            assert_eq!(seen, (len, true));
+            with_pcm(len, |pcm| pcm.fill(0.5));
+        }
+    }
     use opus_pure::{Application, OpusEncoder};
 
     fn id(kind: u32, stream: u32) -> CommandId {

@@ -7,7 +7,7 @@ use super::wave64_tests::native_of;
 use super::{lower, validator};
 use crate::{io, ir, resource, structure};
 
-fn dxil(body: &[u32], notes: bool) -> Vec<u8> {
+fn dxil(body: &[u32], notes: bool, peek: &[usize]) -> Vec<u8> {
     let native = native_of(body, false, 32);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
@@ -15,6 +15,7 @@ fn dxil(body: &[u32], notes: bool) -> Vec<u8> {
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
     lower::set_program_tag(b"a program");
+    lower::set_peek(peek.to_vec());
     let (was, was_notes) = (
         lower::TEST_HOST_WAVE.replace(Some(32)),
         lower::TEST_LOOP_NOTES.replace(notes),
@@ -68,15 +69,65 @@ const COUNT: [u32; 7] = [
 
 #[test]
 fn a_loop_closed_by_a_branch_notes_its_cut_when_asked() {
-    assert!(dxil(&WAIT, true).len() > dxil(&WAIT, false).len());
+    assert!(dxil(&WAIT, true, &[]).len() > dxil(&WAIT, false, &[]).len());
 }
 
 #[test]
 fn a_loop_closed_by_a_jump_notes_its_cut_when_asked() {
-    assert!(dxil(&COUNT, true).len() > dxil(&COUNT, false).len());
+    assert!(dxil(&COUNT, true, &[]).len() > dxil(&COUNT, false, &[]).len());
 }
 
 #[test]
 fn without_the_switch_the_translation_is_the_same_each_time() {
-    assert_eq!(dxil(&WAIT, false), dxil(&WAIT, false));
+    assert_eq!(dxil(&WAIT, false, &[]), dxil(&WAIT, false, &[]));
+}
+
+/// `VICTORY_PEEK`: an instruction at an offset asked for leaves its values as notes (more code
+/// and the faults buffer), the translation of the same program without the ask is unchanged.
+#[test]
+fn an_instruction_asked_for_leaves_its_values_as_notes() {
+    // (the first instruction of the body, after the 12 bytes the tests' programs start with)
+    let peeked = dxil(&WAIT, false, &[12]);
+    let plain = dxil(&WAIT, false, &[]);
+    assert!(peeked.len() > plain.len());
+    assert_eq!(plain, dxil(&WAIT, false, &[]));
+    // (an offset with no instruction: nothing)
+    assert_eq!(plain, dxil(&WAIT, false, &[1000]));
+}
+
+/// A program with its notes on has the faults buffer as a root view of its own, and a shader
+/// that reads no title memory by address has nothing else to bind it: the host gives it a
+/// buffer (`memory::notes`), for a root view nothing sets is address 0 and the first note
+/// stored there lost the card. Here the loop waits for a flag no one sets, is cut at its limit
+/// and notes it, in the buffer the dispatch binds.
+#[test]
+fn a_loop_cut_at_its_limit_notes_it_in_the_buffer_it_is_given_on_the_card() {
+    use std::collections::HashSet;
+
+    use super::host::{Dispatch, Host, Root, View};
+
+    let native = native_of(&WAIT, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::set_program_tag(b"a program");
+    let was = lower::TEST_LOOP_NOTES.replace(true);
+    let shader = super::wave64_tests::lowered(&native, &p, &HashSet::new());
+    lower::TEST_LOOP_NOTES.set(was);
+    let shader = shader.expect("lower");
+    assert!(shader.root_uavs.contains(&super::SLOT_FAULTS));
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+    let user = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    // (root parameter 0 is the user data, 1 the faults buffer: the only root view)
+    host.dispatch(
+        &root,
+        &pso,
+        &Dispatch {
+            roots: vec![(0, Root::Constants(user)), (1, Root::Uav(super::MEMORY_FAULTS))],
+            views: &[View::RawUav(64)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        },
+    )
+    .expect("a loop cut at its limit, with its notes on, runs to its end");
 }

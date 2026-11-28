@@ -179,6 +179,15 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
+/// The list is closed and complete: its host side makes what the submission's preparing will want of its steps
+/// ([`crate::host::HostList::summarize`]).
+#[cfg(windows)]
+pub(crate) fn summarize(this: This) {
+    if let Some(host) = host_list(this) {
+        host.summarize();
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
@@ -187,6 +196,17 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     }
     // SAFETY: the title passes one of our lists.
     unsafe { (*this.cast::<List>()).host.as_ref() }
+}
+
+/// Notes the kind of the title's queue on the host sides of the lists it is
+/// given (the timing report sums the commands' time by it).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn tag_queue(lists: &[This], kind: u32) {
+    for &list in lists {
+        if let Some(host) = host_list(list) {
+            host.set_queue_kind(kind);
+        }
+    }
 }
 
 /// The host side of a submitted list, taken from it: a queue that waits
@@ -213,10 +233,11 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and whether it was closed when it was put away
+/// (`VICTORY_CLOSED_IDLE`; else it is open, as a reset leaves it).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, bool);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -250,22 +271,58 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
-/// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+/// Whether a list that has run is closed after its reset when it is put away
+/// (on unless `VICTORY_CLOSED_IDLE=0`).
+///
+/// A submission takes the host side of each of its lists (about 215 a frame)
+/// and gives the title's list a new one, closed, for the title's reset to
+/// open (`detach`): the close of a list, 12 us each, 2.7 ms a frame of the
+/// submitting thread's. The lists are reset and put away by the thread that
+/// lands the flights (`recycle`), nearly all of them (1,025 of 1,263 in a
+/// timeline): closed there, they are taken closed, and the thread that
+/// submits does not close them. A list taken to record (a part cut at a wait)
+/// that was put away closed is reset again, on the thread that cuts.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+fn closed_idle() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: each list says whether it is closed, and
+    // whoever takes one makes it as it wants it.)
+    crate::ab::live_value!("VICTORY_CLOSED_IDLE", bool, crate::ab::unless_zero)
+}
+
+/// Takes from `idle` the last that is closed (`want`) or open, else the last
+/// there is: whoever takes it makes it as it wants it.
+#[cfg(windows)]
+fn pick_idle<T>(idle: &mut Vec<T>, closed: impl Fn(&T) -> bool, want: bool) -> Option<T> {
+    match idle.iter().rposition(|i| closed(i) == want) {
+        Some(at) => Some(idle.remove(at)),
+        None => idle.pop(),
+    }
+}
+
+/// A host list for the title's list to take, or to record into: one that has
+/// run, as a title's list is after its reset, or a new one. `closed`: closed (a
+/// title's list that is not recording is, until its reset), else open.
+#[cfg(windows)]
+fn fresh_list(closed: bool) -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        let taken = pick_idle(&mut idle.0, |i| i.2, closed);
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
-    match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+    let (list, is_closed) = match idle {
+        Some(Idle(list, _, is_closed)) => (list, is_closed),
+        None => (crate::host::host().and_then(|h| h.new_list().ok())?, false),
+    };
+    match (closed, is_closed) {
+        (true, false) => list.close(),
+        // (Open again as a title's reset leaves it: the list has run and is empty.)
+        (false, true) => list.reset(),
+        _ => {}
     }
+    Some(list)
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -287,10 +344,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+        // (Closed here, by the thread that lands, and not by the one that submits when the list is taken.)
+        let closed = closed_idle();
+        if closed {
+            host.close();
+        }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, closed));
             idle.1 += bytes;
         }
     }
@@ -328,7 +390,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(false) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -405,12 +467,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it closed.
+        let Some(fresh) = fresh_list(true) else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -477,12 +537,10 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it closed.
+        let Some(fresh) = fresh_list(true) else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -798,6 +856,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             b.kind != 1 && !b.first.is_null() && crate::resource::buffer_bytes(b.first).is_some()
         }) {
             host.push(UAV_BARRIER);
+            crate::barrier::EMITTED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::WaitsForBuffers, 1);
         }
@@ -812,6 +871,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                     host.len(),
                 )
             };
+            crate::barrier::EMITTED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            crate::barrier::EMITTED[1].fetch_add(host.len() as u64, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: an open list and live resources.
             unsafe { list.list.ResourceBarrier(host) };
         }
@@ -826,6 +887,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
     if let Some((texture, before)) = list.transition(resource, state) {
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
+        crate::barrier::EMITTED[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: an open list and a live texture.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
@@ -1481,9 +1543,77 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
     let _ = (this, x, y, z, flags);
 }
 
-/// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
-/// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+/// `BeginQuery(heap, type, index)`: queries are answered when resolved. With
+/// `VICTORY_REAL_OCCLUSION=1` an occlusion query also begins on the host list.
+extern "system" fn query_begin(this: This, heap: This, kind: u32, index: u32) {
+    crate::occlusion::began();
+    #[cfg(windows)]
+    host_query(this, heap, kind, index, true);
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// `EndQuery(heap, type, index)`: see [`query_begin`].
+extern "system" fn query_end(this: This, heap: This, kind: u32, index: u32) {
+    crate::occlusion::ended();
+    #[cfg(windows)]
+    host_query(this, heap, kind, index, false);
+    #[cfg(not(windows))]
+    let _ = (this, heap, kind, index);
+}
+
+/// The host list begins or ends the query, if the title heap has a host heap.
+#[cfg(windows)]
+fn host_query(this: This, heap: This, kind: u32, index: u32, begin: bool) {
+    if !crate::occlusion::real() {
+        return;
+    }
+    let (Some(list), Some((host, capacity))) =
+        (host_list(this), crate::query::host_heap_of(heap))
+    else {
+        crate::occlusion::not_run();
+        return;
+    };
+    if begin {
+        crate::occlusion::host::begin(list, &host, capacity, kind, index);
+    } else {
+        crate::occlusion::host::end(list, &host, capacity, kind, index);
+    }
+}
+
+/// With `VICTORY_REAL_OCCLUSION=1`: the resolve of an occlusion heap goes to
+/// the host list, whose samples are copied to the title's buffer when the
+/// list has run. False if it is not one of those (the made-up answer stands).
+#[cfg(windows)]
+fn resolve_on_host(
+    this: This,
+    heap: This,
+    kind: u32,
+    first: u32,
+    count: u32,
+    buffer: This,
+    offset: u64,
+) -> bool {
+    const BINARY: u32 = 1;
+    if !crate::occlusion::real() || kind > BINARY {
+        return false;
+    }
+    let (Some(list), Some((queries, capacity)), Some((data, room)), Some(host)) = (
+        host_list(this),
+        crate::query::host_heap_of(heap),
+        crate::resource::buffer_bytes(buffer),
+        crate::host::host(),
+    ) else {
+        return false;
+    };
+    let done = crate::occlusion::host::resolve(
+        host, list, &queries, capacity, kind, first, count, data, offset, room,
+    );
+    if done {
+        crate::occlusion::resolved(kind, count, heap as usize, true);
+    }
+    done
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -1494,9 +1624,9 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// not measured ones (time spans come out as the submission's length).
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
@@ -1505,6 +1635,13 @@ extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
+    #[cfg(windows)]
+    if resolve_on_host(this, heap, kind, first, count, buffer, offset) {
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = first;
+    crate::occlusion::resolved(kind, count, heap as usize, false);
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
@@ -1582,6 +1719,7 @@ extern "system" fn sync(this: This, flags: u32, control: u32, address: u64, size
                 }
                 crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
             }
+            crate::barrier::EMITTED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // SAFETY: the same layout; no resource named.
             let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
             // SAFETY: an open list.
@@ -1867,6 +2005,35 @@ fn count_draw() {
     DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `n` draws, for executions made one ([`thin`]).
+fn count_draws(n: u64) {
+    DRAWS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The stream of `this` says `n` executions come that may be made one
+/// ([`thin`], `crate::draw::fold`).
+#[cfg(windows)]
+fn fold_begin(this: This, n: u32) {
+    with_state(this, |_, s| s.fold_begin(n));
+}
+
+/// The run the stream planned is over: made, if one is open.
+#[cfg(windows)]
+fn fold_end(this: This) {
+    with_state(this, |list, s| s.fold_end(list));
+}
+
+#[cfg(not(windows))]
+fn fold_begin(_: This, _: u32) {}
+
+#[cfg(not(windows))]
+fn fold_end(_: This) {}
+
+/// The line of the executions with one record ([`thin::runs_line`]).
+pub(crate) fn runs_line(frames: f64) {
+    thin::runs_line(frames);
+}
+
 /// Draws of the kinds the host does not run yet (indirect, mesh), and
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
@@ -2046,6 +2213,14 @@ impl ValueWait {
     }
 }
 
+#[cfg(all(test, windows))]
+impl ValueWait {
+    /// A wait for the tests of the queue: `address`, the comparison code, the reference, whether 64 bits.
+    pub(crate) fn test(address: u64, comparison: u32, reference: u64, wide: bool) -> ValueWait {
+        ValueWait { address, comparison, reference, wide }
+    }
+}
+
 /// The waits lists recorded since their last reset, by list.
 static VALUE_WAITS: std::sync::Mutex<Vec<(usize, ValueWait)>> = std::sync::Mutex::new(Vec::new());
 
@@ -2140,7 +2315,7 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// title texture (clears, copies) moves its host copy to the state it needs
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2155,13 +2330,28 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         with_state(this, |_, state| state.synced());
-        // SAFETY: the same layout; no resource named.
-        let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
-        // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        // The groups are read (`VICTORY_BARRIER_LOOK`, `VICTORY_GROUP_SKIP`):
+        // a wait for every earlier shader write is left out only for groups
+        // read fully that say no shader wrote before them.
+        let wait = if crate::barrier::looking() {
+            let looks = crate::barrier::decode(groups as usize, count, &|at, out| {
+                crate::host::read_into(at as *const u8, out)
+            });
+            let wait = !crate::barrier::skipping() || looks.as_deref().is_none_or(crate::barrier::needs_wait);
+            crate::barrier::note(looks.as_deref(), wait);
+            wait
+        } else {
+            true
+        };
+        if wait {
+            // SAFETY: the same layout; no resource named.
+            let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+            // SAFETY: an open list.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
     }
     #[cfg(not(windows))]
-    let _ = (this, count);
+    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2220,7 +2410,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(false) else {
             return;
         };
         current.close();
@@ -2315,8 +2505,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, query_begin as *const ()),            // 0xe0 BeginQuery
+    (29, query_end as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
@@ -2449,5 +2639,25 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::pick_idle;
+
+    /// A list is taken in the state it is wanted in if one is put away so, the
+    /// most recent of them; else the most recent, to be made as it is wanted.
+    #[test]
+    fn the_last_list_in_the_state_wanted_is_taken_else_the_last() {
+        // (A number, whether it is closed.)
+        let mut idle = vec![(1, true), (2, false), (3, true), (4, false)];
+        assert_eq!(pick_idle(&mut idle, |i| i.1, true), Some((3, true)));
+        assert_eq!(idle, [(1, true), (2, false), (4, false)]);
+        assert_eq!(pick_idle(&mut idle, |i| i.1, false), Some((4, false)));
+        assert_eq!(pick_idle(&mut idle, |i| i.1, false), Some((2, false)));
+        // None open is left: the last there is, closed.
+        assert_eq!(pick_idle(&mut idle, |i| i.1, false), Some((1, true)));
+        assert_eq!(pick_idle(&mut idle, |i| i.1, true), None);
     }
 }

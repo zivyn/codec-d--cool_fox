@@ -76,7 +76,7 @@ use crate::shadow::Shadow;
 /// made from older bytes is made again. This is why stage 2 is its own.
 pub(super) fn stage() -> u32 {
     static STAGE: OnceLock<u32> = OnceLock::new();
-    *STAGE.get_or_init(|| match std::env::var("VICTORY_CARD_STEPS").ok().as_deref() {
+    *STAGE.get_or_init(|| match crate::defaults::var("VICTORY_CARD_STEPS").ok().as_deref() {
         Some("1") => 1,
         Some("2") => 2,
         _ => 0,
@@ -210,7 +210,7 @@ pub(super) fn copied_read(copies: &[Writer], runs: &[&HostList]) -> bool {
 /// What a step of a submission does to title memory, as the plan sees it.
 /// `asked`: flights in the air stop it from being done on the CPU now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Does {
+pub(super) enum Does {
     Copy { dst: usize, src: usize, len: usize, asked: bool },
     /// `to`: its memory can be given the bytes on the card.
     Fill { src: usize, len: usize, asked: bool, to: bool },
@@ -256,6 +256,7 @@ fn touched(ranges: &[(usize, usize)], r: (usize, usize)) -> bool {
 /// Steps of a level are done together, every read before every write; a
 /// step that writes what an earlier one reads or writes, or reads what it
 /// writes, is of a higher level. Our list does them level by level.
+#[inline(never)]
 fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
     let takes = |d: &Does| match *d {
         Does::Copy { .. } if stage < 2 => Err("a buffer copy (VICTORY_CARD_STEPS=2 does it on the card)"),
@@ -388,12 +389,81 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
     })
 }
 
+/// [`elsewhere`] for refreshes kept apart from the steps ([`does_of`]).
+fn elsewhere_in(refreshed: &[Refreshed], shadow: usize, from: usize, to: usize) -> bool {
+    refreshed.iter().any(|&(s, a, b)| s != shadow && meet((a, b), (from, to)))
+}
+
 /// The host copy that holds `[from, to)` on the card once what `writers`
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+    holder_among(writers.iter().filter(|w| meet((w.from, w.to), (from, to))), from, to)
+}
+
+/// [`holder`] when `index` stands for the first `index.len` of `writers`
+/// (`VICTORY_HOLDER_INDEX=1`): the writers that meet `[from, to)` are found
+/// without looking at all of them, and are looked at in the same order.
+fn holder_indexed(index: &WriterIndex, writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+    let mut at = index.meeting(|i| (writers[i].from, writers[i].to), from, to);
+    at.extend((index.len..writers.len()).filter(|&i| meet((writers[i].from, writers[i].to), (from, to))));
+    holder_among(at.into_iter().map(|i| &writers[i]), from, to)
+}
+
+/// The writers' places by address, to find those that meet a range: indices
+/// sorted by where they begin, and the furthest end of any up to each.
+struct WriterIndex {
+    len: usize,
+    by_from: Vec<usize>,
+    reach: Vec<usize>,
+}
+
+impl WriterIndex {
+    fn new(len: usize, place: impl Fn(usize) -> (usize, usize)) -> WriterIndex {
+        let mut by_from: Vec<usize> = (0..len).collect();
+        by_from.sort_by_key(|&i| (place(i).0, i));
+        let mut reach = Vec::with_capacity(len);
+        let mut far = 0;
+        for &i in &by_from {
+            far = far.max(place(i).1);
+            reach.push(far);
+        }
+        WriterIndex { len, by_from, reach }
+    }
+
+    /// The indices of those that meet `[from, to)`, in order.
+    fn meeting(&self, place: impl Fn(usize) -> (usize, usize), from: usize, to: usize) -> Vec<usize> {
+        let end = self.by_from.partition_point(|&i| place(i).0 < to);
+        let mut out = Vec::new();
+        for k in (0..end).rev() {
+            if self.reach[k] <= from {
+                break;
+            }
+            let i = self.by_from[k];
+            if meet(place(i), (from, to)) {
+                out.push(i);
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+}
+
+/// Whether the writers are found through a [`WriterIndex`]
+/// (`VICTORY_HOLDER_INDEX=1`; off by default).
+fn holder_index_on() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: the index is made and used inside one planning, and holds only what
+    // that planning's writers hold.)
+    crate::ab::live_flag!("VICTORY_HOLDER_INDEX")
+}
+
+fn holder_among<'a>(
+    writers: impl Iterator<Item = &'a Writer>,
+    from: usize,
+    to: usize,
+) -> Result<Arc<Shadow>, &'static str> {
     let mut found: Option<&Arc<Shadow>> = None;
-    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
+    for w in writers {
         match (&w.shadow, found) {
             (None, _) => return Err("a read-back or a value behind a flight is written there"),
             (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
@@ -411,55 +481,140 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
     Ok(shadow)
 }
 
+/// A refresh of a host copy among the steps (the copy's address, from, to).
+type Refreshed = (usize, usize, usize);
+
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+///
+/// With `lean` (`VICTORY_LEAN_STEPS`) the refreshes are not among what the
+/// steps do: they are the third answer, in the order they stand in, for
+/// [`elsewhere_in`] (the plan does nothing for a refresh, and a frame has
+/// 21,000 of them for 4,400 copies and fills), and what is returned is made
+/// in room taken once.
+#[inline(never)]
+fn does_of(written: &[(usize, usize)], runs: &[&HostList], lean: bool) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Refreshed>) {
+    does_of_in(written, runs, lean, |list| std::ptr::from_ref::<HostList>(*list) as usize)
+}
+
+/// [`does_of`] over any lists of steps (`id`: the number the list goes by in the second answer).
+pub(super) fn does_of_in<L: onepass::StepList>(
+    written: &[(usize, usize)],
+    runs: &[L],
+    lean: bool,
+    id: impl Fn(&L) -> usize,
+) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Refreshed>) {
+    let (mut does, mut steps) = if lean {
+        // (Without the refreshes: some thousands, to the 26,000 of the steps.)
+        let all: usize = runs.iter().map(|list| list.steps(|steps| steps.len())).sum();
+        (Vec::with_capacity(all.min(8192)), Vec::with_capacity(all.min(8192)))
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let mut refreshed = Vec::new();
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
     for list in runs {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
-            does.push(match step {
-                &Step::Copy(dst, src, len) => Does::Copy {
+        let list_id = id(list);
+        list.steps(|all| {
+            for (i, step) in all.iter().enumerate() {
+                if lean && let Step::Refresh(shadow, at, len) = step {
+                    refreshed.push((Arc::as_ptr(shadow) as usize, *at, *at + *len));
+                    continue;
+                }
+                does.push(match step {
+                    &Step::Copy(dst, src, len) => Does::Copy {
+                        dst,
+                        src,
+                        len,
+                        asked: copy_blocked(written, dst, src, len).is_some(),
+                    },
+                    Step::Fill(_, src, len, to) => Does::Fill {
+                        src: *src,
+                        len: *len,
+                        asked: read_blocked(written, *src, *len),
+                        to: to.is_some(),
+                    },
+                    Step::Texture(staging) => {
+                        let (at, len) = staging.memory();
+                        Does::Read {
+                            from: at,
+                            to: at + len,
+                            asked: touches(written, at, at + len),
+                        }
+                    }
+                    &Step::Plane((at, len), _) => Does::Read {
+                        from: at,
+                        to: at.saturating_add(len),
+                        asked: touches(written, at, at.saturating_add(len)),
+                    },
+                    &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
+                    Step::Refresh(shadow, at, len) => Does::Refresh {
+                        shadow: Arc::as_ptr(shadow) as usize,
+                        from: *at,
+                        to: *at + *len,
+                    },
+                    Step::Run(_) => Does::Run,
+                    Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
+                    Step::GpuWrite(..) | Step::Host(..) => continue,
+                });
+                steps.push((list_id, i));
+            }
+        });
+    }
+    (does, steps, refreshed)
+}
+
+/// [`does_of_in`] with `lean`, from the summaries of the lists' steps (`VICTORY_ONE_PASS`): the same answers without
+/// reading the steps of the refreshes.
+pub(super) fn does_of_summarized<L: onepass::StepList>(
+    written: &[(usize, usize)],
+    runs: &[L],
+    id: impl Fn(&L) -> usize,
+) -> (Vec<Does>, Vec<(usize, usize)>, Vec<Refreshed>) {
+    use onepass::Op;
+    let summaries: Vec<_> = runs.iter().map(|list| list.summary()).collect();
+    let all: usize = summaries.iter().map(|summary| summary.ops().len()).sum();
+    let (mut does, mut steps) = (Vec::with_capacity(all.min(8192)), Vec::with_capacity(all.min(8192)));
+    let mut refreshed = Vec::new();
+    for (list, summary) in runs.iter().zip(&summaries) {
+        let list_id = id(list);
+        refreshed.extend(summary.refreshes());
+        for &(i, op) in summary.ops() {
+            does.push(match op {
+                Op::Copy { dst, src, len } => Does::Copy {
                     dst,
                     src,
                     len,
                     asked: copy_blocked(written, dst, src, len).is_some(),
                 },
-                Step::Fill(_, src, len, to) => Does::Fill {
-                    src: *src,
-                    len: *len,
-                    asked: read_blocked(written, *src, *len),
-                    to: to.is_some(),
+                Op::Fill { src, len, to } => Does::Fill {
+                    src,
+                    len,
+                    asked: read_blocked(written, src, len),
+                    to,
                 },
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
+                Op::Texture(k) => {
+                    let (at, len) = summary.texture_memory(k);
                     Does::Read {
                         from: at,
                         to: at + len,
                         asked: touches(written, at, at + len),
                     }
                 }
-                &Step::Plane((at, len), _) => Does::Read {
+                Op::Plane { at, len } => Does::Read {
                     from: at,
                     to: at.saturating_add(len),
                     asked: touches(written, at, at.saturating_add(len)),
                 },
-                &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
-                Step::Refresh(shadow, at, len) => Does::Refresh {
-                    shadow: Arc::as_ptr(shadow) as usize,
-                    from: *at,
-                    to: *at + *len,
-                },
-                Step::Run(_) => Does::Run,
-                Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
-                Step::GpuWrite(..) | Step::Host(..) => continue,
+                Op::Host { from, to } => Does::Read { from, to, asked: false },
+                Op::Run => Does::Run,
+                Op::Placed { dst, src, len } => Does::Placed { dst, src, len },
             });
-            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+            steps.push((list_id, i as usize));
         }
     }
-    (does, steps)
+    (does, steps, refreshed)
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -477,7 +632,7 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
+    let (does, steps, _) = does_of(&written, runs, false);
     let mut behind = None;
     if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
         return None;
@@ -518,6 +673,15 @@ fn fill_to(runs: &[&HostList], step: (usize, usize)) -> Option<FillTo> {
     }
 }
 
+/// [`fill_to`] with the lists found by `run_at` (their addresses to their places among `runs`).
+fn fill_to_at(runs: &[&HostList], run_at: &HashMap<usize, usize>, step: (usize, usize)) -> Option<FillTo> {
+    let list = runs.get(*run_at.get(&step.0)?)?;
+    match list.deferred().copies.get(step.1)? {
+        Step::Fill(_, _, _, to) => to.clone(),
+        _ => None,
+    }
+}
+
 /// A step done on the card.
 struct Op {
     from: (Arc<Shadow>, usize),
@@ -535,6 +699,43 @@ enum To {
     Slot(usize, u32),
     /// A buffer's beginning.
     Buffer(ID3D12Resource),
+}
+
+/// Whether the reads of a level that lie together are one copy
+/// (`VICTORY_STEPS_MERGE_READS=1`; off by default).
+fn merge_reads_on() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: each list's reads are recorded in one go, whole or joined.)
+    crate::ab::live_flag!("VICTORY_STEPS_MERGE_READS")
+}
+
+/// Since the last frame line: reads of levels, the copies made of them, and
+/// the bytes of gaps they took along.
+static READS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The most bytes between two reads that are still one copy: the places lie
+/// at multiples of 256 in `between`, and a constant buffer of 480 bytes
+/// leaves 32.
+const MERGE_GAP: u64 = 256;
+
+/// Which of `reads` (buffer, offset in it, offset in `between`, bytes) go in
+/// one copy with the one before: the same buffer, the next bytes of it where
+/// `between` has the next ones too, at most `gap` bytes apart. Returns the
+/// first read of each copy and its bytes. Reads are in the order of their
+/// places in `between`.
+fn merged_reads(reads: &[(usize, u64, u64, u64)], gap: u64) -> Vec<(usize, u64)> {
+    let mut out: Vec<(usize, u64)> = Vec::new();
+    for (i, &(buffer, offset, at, len)) in reads.iter().enumerate() {
+        if let Some(last) = out.last_mut() {
+            let (b, o, a, _) = reads[last.0];
+            let end = a + last.1;
+            if b == buffer && at >= end && at - end <= gap && offset >= o && offset - o == at - a {
+                last.1 = at + len - a;
+                continue;
+            }
+        }
+        out.push((i, len));
+    }
+    out
 }
 
 /// Records a level of what [`stage`] describes into `list` (open): `reads`
@@ -595,8 +796,24 @@ fn record(
         } else {
             list.ResourceBarrier(&[transition(between, constants, dest)]);
         }
-        for &(buffer, offset, at, len) in reads {
-            list.CopyBufferRegion(between, at, buffer, offset, len);
+        if merge_reads_on() && reads.len() > 1 {
+            // Places of one host copy that lie together there and in `between`
+            // are one copy of the bytes from the first to the last (what lies
+            // between them in `between` is nobody's).
+            let keys: Vec<(usize, u64, u64, u64)> =
+                reads.iter().map(|&(b, offset, at, len)| (b.as_raw() as usize, offset, at, len)).collect();
+            let copies = merged_reads(&keys, MERGE_GAP);
+            READS[0].fetch_add(reads.len() as u64, Ordering::Relaxed);
+            READS[1].fetch_add(copies.len() as u64, Ordering::Relaxed);
+            READS[2].fetch_add(copies.iter().map(|c| c.1).sum::<u64>() - reads.iter().map(|r| r.3).sum::<u64>(), Ordering::Relaxed);
+            for (first, len) in copies {
+                let (buffer, offset, at, _) = reads[first];
+                list.CopyBufferRegion(between, at, buffer, offset, len);
+            }
+        } else {
+            for &(buffer, offset, at, len) in reads {
+                list.CopyBufferRegion(between, at, buffer, offset, len);
+            }
         }
         list.ResourceBarrier(&barriers);
         for &(buffer, offset, at, len) in writes {
@@ -670,6 +887,13 @@ impl Taken {
         self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
     }
 
+    /// The steps it does, for each of `runs`: their places in the list, in order (a list the submission names twice
+    /// has them under both).
+    pub(super) fn by_list(&self, runs: &[&HostList]) -> Vec<Vec<usize>> {
+        let ids: Vec<usize> = runs.iter().map(|list| std::ptr::from_ref::<HostList>(*list) as usize).collect();
+        onepass::steps_by_list(self.steps.iter().copied(), &ids)
+    }
+
     fn copied(&self) -> impl Iterator<Item = Writer> {
         self.copied.iter().map(|(shadow, from, to)| Writer {
             shadow: Some(shadow.clone()),
@@ -724,7 +948,15 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
+        // (Read once: the way the steps of this submission are looked at and the slots made.)
+        let lean = lean_steps();
+        // (With the summaries of the lists' steps [`onepass`] the steps are not walked, and the lists of the fills are found by a table.)
+        let summarized = lean && onepass::on();
+        let (does, steps, refreshed) = if summarized {
+            does_of_summarized(written, runs, |list| std::ptr::from_ref::<HostList>(*list) as usize)
+        } else {
+            does_of(written, runs, lean)
+        };
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
@@ -739,14 +971,34 @@ impl Host {
             }));
             all
         };
+        // The writers that exist now, found by address (`VICTORY_HOLDER_INDEX`);
+        // the copies' destinations pushed below are looked at one by one.
+        let index = holder_index_on().then(|| WriterIndex::new(writers.len(), |i| (writers[i].from, writers[i].to)));
+        let holder_of = |writers: &Vec<Writer>, from: usize, to: usize| match &index {
+            Some(index) => holder_indexed(index, writers, from, to),
+            None => holder(writers, from, to),
+        };
+        // (The first list of each address: a submission may name a list twice.)
+        let run_at: HashMap<usize, usize> = if summarized {
+            let mut at = HashMap::default();
+            for (n, list) in runs.iter().enumerate() {
+                at.entry(std::ptr::from_ref::<HostList>(*list) as usize).or_insert(n);
+            }
+            at
+        } else {
+            HashMap::default()
+        };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
-        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::default();
+        // (With `VICTORY_LEAN_STEPS` made with room for what the steps will put in: the tables grow by doubling otherwise,
+        // each doubling a new allocation and every entry put in again.)
+        let (places_room, held_room) = if lean { (chosen.len().min(BETWEEN as usize / 256), chosen.len().min(1024)) } else { (0, 0) };
+        let mut places: HashMap<(usize, usize, usize, u32), u64> = HashMap::with_capacity_and_hasher(places_room, Default::default());
         // Some 2,800 fills a frame, of a few hundred places: what holds each
         // is looked for once, as long as no copy is added to the writers.
-        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::default();
-        let mut room = HashMap::default();
+        let mut held: HashMap<(usize, usize), Arc<Shadow>> = HashMap::with_capacity_and_hasher(held_room, Default::default());
+        let mut room = HashMap::with_capacity_and_hasher(held_room, Default::default());
         let mut end = 0u64;
         for &(i, level) in &chosen {
             let Some(((src, _), (dst, _))) = reads_writes(&does[i]) else {
@@ -761,7 +1013,7 @@ impl Host {
             let from = match held.get(&(src, len)) {
                 Some(from) => from.clone(),
                 None => {
-                    let from = holder(&writers, src, src + len)?;
+                    let from = holder_of(&writers, src, src + len)?;
                     held.insert((src, len), from.clone());
                     from
                 }
@@ -784,8 +1036,8 @@ impl Host {
             };
             let to = match does[i] {
                 Does::Copy { .. } => {
-                    let to = holder(&writers, dst, dst + len)?;
-                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) {
+                    let to = holder_of(&writers, dst, dst + len)?;
+                    if elsewhere(&does, Arc::as_ptr(&to) as usize, dst, dst + len) || elsewhere_in(&refreshed, Arc::as_ptr(&to) as usize, dst, dst + len) {
                         return Err("another host copy of what it writes is read");
                     }
                     if !mapped(dst, dst + len, &mut room) {
@@ -802,7 +1054,7 @@ impl Host {
                     held.clear();
                     To::Copy(to, dst)
                 }
-                _ => match fill_to(runs, steps[i]) {
+                _ => match if summarized { fill_to_at(runs, &run_at, steps[i]) } else { fill_to(runs, steps[i]) } {
                     Some(FillTo::Slot(heap, index)) => To::Slot(heap, index),
                     Some(FillTo::Buffer(buffer)) => To::Buffer(buffer),
                     None => continue,
@@ -875,6 +1127,26 @@ impl Host {
         // order.)
         let parts = if ops.len() < 256 { 1 } else { 8 };
         crate::land::each_under(parts, &|part| {
+            if lean {
+                // The hold on the buffer is taken once, the look at the heaps once for each heap: not for each of
+                // thousands of slots, by threads that all do it on the same counter of the same buffer.
+                let mut mine: Vec<(usize, u32, u64, u32)> =
+                    Vec::with_capacity(ops.len() / parts + 1);
+                for op in &ops {
+                    if let To::Slot(heap, index) = &op.to
+                        && *index as usize / 4 % parts == part
+                    {
+                        mine.push((*heap, *index, gpu + op.at, op.len as u32));
+                    }
+                }
+                // (In the steps' order, a heap at a time: the slots of one heap are made one after the other in
+                // that order, as before; those of two heaps have nothing in common.)
+                mine.sort_by_key(|slot| slot.0);
+                for heap in mine.chunk_by(|a, b| a.0 == b.0) {
+                    crate::descriptor::constant_slots(heap[0].0, &own.between, heap.iter().map(|&(_, index, at, len)| (index, at, len)));
+                }
+                return;
+            }
             for op in &ops {
                 if let To::Slot(heap, index) = &op.to
                     && *index as usize / 4 % parts == part
@@ -955,6 +1227,15 @@ pub(super) fn log(frames: f64) {
             "copies recorded for steps done on the card per frame (VICTORY_STEP_MERGE=1): {:.0} planned, {:.0} recorded after joining those that continue each other",
             j[0],
             j[1],
+        );
+    }
+    if merge_reads_on() {
+        let r: Vec<f64> = READS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "reads of steps done on the card per frame (VICTORY_STEPS_MERGE_READS=1): {:.0} places read, {:.0} copies after joining those a few bytes apart, {:.1} KB of gaps read with them",
+            r[0],
+            r[1],
+            r[2] / 1024.0,
         );
     }
     #[cfg(feature = "diagnostics")]
@@ -1181,12 +1462,175 @@ mod tests {
         assert!(plan(&[fill(1000, 4, true), copy(1000, 5000, 100, false)], 1, true, &mut None).is_err());
     }
 
+    /// The plan does nothing for a refresh: with the refreshes left out of the
+    /// steps (`does_of` with `lean`) the same steps are chosen, at the same
+    /// levels, or refused for the same reason, and what [`elsewhere_in`] says of
+    /// the refreshes is what [`elsewhere`] says of them among the steps.
+    #[test]
+    fn leaving_the_refreshes_out_of_the_steps_changes_no_choice() {
+        let mut seed = 777u32;
+        let mut random = move |n: u32| {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            (seed >> 16) % n
+        };
+        let (mut done, mut refused, mut behind) = (0, 0, 0);
+        for _ in 0..4000 {
+            let (mut with, mut without) = (Vec::new(), Vec::new());
+            // Where each of `with` is in `without` (none: a refresh).
+            let mut place: Vec<Option<usize>> = Vec::new();
+            for _ in 0..2 + random(9) {
+                for _ in 0..random(3) {
+                    with.push(Does::Refresh { shadow: 1 + random(3) as usize, from: random(60) as usize, to: 60 + random(20) as usize });
+                    place.push(None);
+                }
+                let (at, other, len) = (random(60) as usize, random(60) as usize, 1 + random(8) as usize);
+                let asked = random(4) == 0;
+                let step = match random(10) {
+                    0..4 => copy(at, other, len, asked),
+                    4..6 => fill(at, len, asked),
+                    6 => stuck(at, len),
+                    7 => Does::Read { from: at, to: at + len, asked: false },
+                    8 => Does::Placed { dst: at, src: other, len },
+                    _ => fill(at, len, false),
+                };
+                place.push(Some(without.len()));
+                without.push(step);
+                with.push(step);
+            }
+            for by_order in [true, false] {
+                let (mut found_with, mut found_without) = (None, None);
+                let a = plan(&with, 2, by_order, &mut found_with);
+                let b = plan(&without, 2, by_order, &mut found_without);
+                match (a, b) {
+                    (Ok(a), Ok(b)) => {
+                        done += 1;
+                        let a: Vec<(usize, u32)> = a.iter().map(|&(i, level)| (place[i].expect("a refresh is never taken"), level)).collect();
+                        assert_eq!(a, b, "{with:?}");
+                    }
+                    (Err(a), Err(b)) => {
+                        refused += 1;
+                        assert_eq!(a, b, "{with:?}");
+                    }
+                    other => panic!("{other:?} for {with:?}"),
+                }
+                let found = found_with.map(|(p, i)| (place[p].unwrap(), place[i].unwrap()));
+                assert_eq!(found, found_without, "{with:?}");
+                behind += usize::from(found.is_some());
+            }
+            let refreshed: Vec<Refreshed> = with
+                .iter()
+                .filter_map(|d| if let Does::Refresh { shadow, from, to } = *d { Some((shadow, from, to)) } else { None })
+                .collect();
+            for _ in 0..20 {
+                let (shadow, from) = (random(4) as usize, random(80) as usize);
+                let to = from + 1 + random(10) as usize;
+                assert_eq!(
+                    elsewhere(&with, shadow, from, to),
+                    elsewhere(&without, shadow, from, to) || elsewhere_in(&refreshed, shadow, from, to)
+                );
+            }
+        }
+        assert!(done > 500 && refused > 100, "{done} {refused} {behind}");
+    }
+
     #[test]
     fn a_refresh_of_another_host_copy_is_seen() {
         let does = [Does::Refresh { shadow: 7, from: 100, to: 200 }];
         assert!(!elsewhere(&does, 7, 100, 200));
         assert!(elsewhere(&does, 8, 199, 300));
         assert!(!elsewhere(&does, 8, 200, 300));
+    }
+
+    /// The writers found through the index are those a linear look finds, in
+    /// the same order, and `holder_indexed` answers as `holder` does (the
+    /// same host copy, or the same refusal) for any set of writers and ranges.
+    #[test]
+    fn the_index_of_writers_finds_what_a_look_at_all_of_them_finds() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m) as usize
+        };
+        let data: &'static mut [u8] = Box::leak(vec![0u8; 0x10000].into_boxed_slice());
+        let shadows = [
+            Shadow::unbacked(0x1000, data.as_mut_ptr(), 0x10000, false),
+            Shadow::unbacked(0x1000, data.as_mut_ptr(), 0x10000, false),
+        ];
+        for round in 0..40 {
+            let n = next(60) + 1;
+            let mut writers: Vec<Writer> = (0..n)
+                .map(|_| {
+                    let from = 0x1000 + next(0xf000);
+                    let len = if next(8) == 0 { next(0x8000) } else { next(0x200) };
+                    Writer {
+                        shadow: match next(10) {
+                            0 => None,
+                            k if k < 8 => Some(shadows[0].clone()),
+                            _ => Some(shadows[1].clone()),
+                        },
+                        from,
+                        to: from + len,
+                        copy: next(3) == 0,
+                    }
+                })
+                .collect();
+            let index = WriterIndex::new(writers.len(), |i| (writers[i].from, writers[i].to));
+            // Some pushed after the index was made, as the copies' destinations are.
+            for _ in 0..next(5) {
+                let from = 0x1000 + next(0xf000);
+                writers.push(Writer { shadow: Some(shadows[0].clone()), from, to: from + 1 + next(0x400), copy: true });
+            }
+            for _ in 0..200 {
+                let from = 0x1000 + next(0xf000);
+                let to = (from + 1 + if next(6) == 0 { next(0x4000) } else { next(0x100) }).min(0x11000);
+                let slow = holder(&writers, from, to);
+                let fast = holder_indexed(&index, &writers, from, to);
+                match (slow, fast) {
+                    (Ok(a), Ok(b)) => assert!(Arc::ptr_eq(&a, &b), "round {round}: {from:#x}..{to:#x}"),
+                    (Err(a), Err(b)) => assert_eq!(a, b, "round {round}: {from:#x}..{to:#x}"),
+                    (a, b) => panic!("round {round}: {from:#x}..{to:#x}: {:?} against {:?}", a.is_ok(), b.is_ok()),
+                }
+                let all: Vec<usize> = (0..index.len).filter(|&i| meet((writers[i].from, writers[i].to), (from, to))).collect();
+                assert_eq!(index.meeting(|i| (writers[i].from, writers[i].to), from, to), all);
+            }
+        }
+    }
+
+    /// Reads that lie together in their host copy and in the buffer between
+    /// are one copy; nothing else is, and the bytes the copies read cover
+    /// every byte the reads did, and only gaps of at most 256 more.
+    #[test]
+    fn reads_that_lie_together_are_one_copy() {
+        // (buffer, offset in it, offset in between, bytes): constants of 480
+        // bytes in a ring at multiples of 512, then one elsewhere, then another buffer.
+        let reads = [
+            (1usize, 4096u64, 0u64, 480u64),
+            (1, 4608, 512, 480),
+            (1, 5120, 1024, 480),
+            (1, 9000, 1536, 480), // other place of the buffer: not the next bytes
+            (2, 5632, 2048, 480), // another buffer
+            (2, 6144, 2560, 480),
+            (2, 8192, 3072, 100), // between is next, the buffer's offset is not
+        ];
+        let merged = merged_reads(&reads, 256);
+        assert_eq!(merged, [(0, 1504), (3, 480), (4, 992), (6, 100)]);
+        // What was read is read, and what is added lies in the gaps.
+        let covered = |at: u64| merged.iter().any(|&(i, len)| at >= reads[i].2 && at < reads[i].2 + len);
+        for &(_, _, at, len) in &reads {
+            assert!((at..at + len).all(|x| covered(x)));
+        }
+        let bytes: u64 = merged.iter().map(|m| m.1).sum();
+        let wanted: u64 = reads.iter().map(|r| r.3).sum();
+        assert!(bytes - wanted <= 256 * (reads.len() as u64 - merged.len() as u64));
+        // A gap past the limit, a place behind the last, and nothing.
+        assert_eq!(merged_reads(&[(1, 0, 0, 100), (1, 1000, 1000, 100)], 256).len(), 2);
+        assert_eq!(merged_reads(&[(1, 0, 100, 100), (1, 0, 0, 100)], 256).len(), 2);
+        assert!(merged_reads(&[], 256).is_empty());
+        // Without gaps allowed only touching reads join.
+        assert_eq!(merged_reads(&reads[..3], 0).len(), 3);
+        assert_eq!(merged_reads(&[(1, 0, 0, 512), (1, 512, 512, 512)], 0), [(0, 1024)]);
     }
 
     /// A value written behind a flight, or a read-back, is in no host copy

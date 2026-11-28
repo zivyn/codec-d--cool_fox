@@ -860,6 +860,10 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 return None;
             }
         }
+        // (`VICTORY_KEEP_LOOP_SKIPS`, on unless `=0`: a region with a loop in it keeps its skip, `loops_in`)
+        if keep_loop_skips() && loops_in(&p.blocks, &inside) {
+            return None;
+        }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
         for phi in &join.phis {
@@ -913,6 +917,64 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     Some(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// An `s_cbranch_execz` over a region that holds a loop is kept ([`without_skips`]). On unless
+/// `VICTORY_KEEP_LOOP_SKIPS=0` (the A/B of 2026-11-28 on the RTX: the alias copy 19.1 -> 1.9 ms,
+/// the commands of the GPU 166.7 -> 140.2 ms, the picture the same). Part of the translation: the
+/// shader cache keys on the value in force.
+///
+/// The console takes that branch when no lane of the wave is left, and the loop in the region
+/// does not run. With the branch left out the lanes that would have skipped walk the region with
+/// EXEC clear, and a loop whose exit reads a scalar from a lane that holds nothing (a table walk
+/// that ends on `v_readlane` of lane 63, a waterfall) does not end: it runs to its iteration
+/// limit in every wave that has no lane, each round with the exchanges of its two host waves.
+pub(crate) fn keep_loop_skips() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_KEEP_LOOP_SKIPS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_LOOP_SKIPS").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_KEEP_LOOP_SKIPS`, for its thread only.
+    pub(crate) static TEST_KEEP_LOOP_SKIPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the blocks `inside` hold a cycle (a loop that lies wholly in them).
+fn loops_in(blocks: &[Block], inside: &[bool]) -> bool {
+    // depth-first, 1: on the path, 2: done
+    let mut state = vec![0u8; blocks.len()];
+    for first in (0..blocks.len()).filter(|&b| inside[b]) {
+        if state[first] != 0 {
+            continue;
+        }
+        let mut stack = vec![(first, 0usize)];
+        state[first] = 1;
+        while let Some(top) = stack.last_mut() {
+            let (b, i) = *top;
+            top.1 += 1;
+            match blocks[b].exit.successors().get(i).copied() {
+                Some(s) if !inside[s] => {}
+                Some(s) => match state[s] {
+                    1 => return true,
+                    0 => {
+                        state[s] = 1;
+                        stack.push((s, 0));
+                    }
+                    _ => {}
+                },
+                None => {
+                    state[b] = 2;
+                    stack.pop();
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
 /// Scalar codes 0-255 (from [`PARKED`] up: parked scalars), SCC, VGPRs 0-255.
@@ -947,9 +1009,19 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    let (mut word, mut bits) = (0, set[0]);
+    std::iter::from_fn(move || loop {
+        if bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            return Some(reg_at(word * 64 + b));
+        }
+        word += 1;
+        if word >= set.len() {
+            return None;
+        }
+        bits = set[word];
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.
@@ -1762,6 +1834,30 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    /// A loop of 100 rounds that counts in s7.
+    const LOOP: [u32; 4] = [
+        0x8007_8107, // L: s_add_u32 s7, s7, 1
+        0xB607_0064, // s_cmpk_ge_u32 s7, 100
+        0xBF84_FFFD, // s_cbranch_scc0 L
+        0x7E02_0280, // v_mov_b32 v1, 0
+    ];
+
+    #[test]
+    fn a_skip_over_a_loop_is_kept_when_asked() {
+        // the loop's scalars are not read after the join: every lane may walk it (the deep form)
+        let looped = skip(&LOOP, &[]);
+        assert_eq!(skips(&looped), 1);
+        TEST_KEEP_LOOP_SKIPS.set(Some(false));
+        assert_eq!(skips(&without_skips(&looped, true).expect("left out")), 0);
+        // ... unless `VICTORY_KEEP_LOOP_SKIPS` is on (the default): a wave with no lane left does not run the loop
+        TEST_KEEP_LOOP_SKIPS.set(Some(true));
+        assert!(without_skips(&looped, true).is_none());
+        // a region without a loop is left out as before
+        let straight = skip(&[0x7E02_0280], &[]);
+        assert_eq!(skips(&without_skips(&straight, true).expect("left out")), 0);
+        TEST_KEEP_LOOP_SKIPS.set(None);
     }
 
     #[test]

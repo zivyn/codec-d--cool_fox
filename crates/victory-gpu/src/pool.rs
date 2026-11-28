@@ -38,6 +38,34 @@ const STAGING_KEPT: usize = 8;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
+/// Empty blocks of staging that may be held past the spare ones for a while
+/// ([`staging_hold_ms`]): 2 GiB of them.
+const HOLD_MOST: usize = 32;
+
+/// How long an empty block of staging past the spare ones is held before it is
+/// let go, in milliseconds (`VICTORY_STAGING_HOLD_MS`; 0, off: at once).
+///
+/// While the card stands over 85 % of its budget (every scene on a 4060 of 8 GB:
+/// 7.75-7.95 of 7.19 GB) only [`SPARE`] empty blocks stay, and a scene entry that
+/// sends up 1-2 GB of texture data a frame needs those blocks back within
+/// seconds: 9-28 blocks of 64 MiB were let go and made again in every 5 s of
+/// the minute of entry (run NAV2-a, the store: 0.6-1.8 GB of fresh upload
+/// memory per 5 s, against 0-0.6 GB in a steady scene), each one a driver call
+/// and 16,384 first-touch page faults of the 42-64k faults a frame the entry
+/// shows (the process's kernel time 123 -> 497 ms a frame). Held, the blocks are
+/// there for the next burst. Staging is the PC's memory, not the card's:
+/// nothing is held under memory pressure ([`crate::residency::pressured`]) or
+/// in the lean levels ([`crate::lean`]), and never more than [`HOLD_MOST`]
+/// past the spare ones.
+fn staging_hold_ms(strict: bool) -> u64 {
+    if strict || crate::lean::level() >= 1 {
+        return 0;
+    }
+    crate::ab::live_value!("VICTORY_STAGING_HOLD_MS", u64, |v| v
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0))
+}
+
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
@@ -52,7 +80,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
         pool.reclaim(tick, limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
-        let staging_limit = if crate::residency::critical_commit() {
+        // (`VICTORY_STAGING_SPARE`, `VICTORY_RAM_LEAN`: fewer.)
+        pool.most = crate::lean::staging_spare(STAGING_KEPT);
+        let critical = crate::residency::critical_commit();
+        pool.hold = staging_hold_ms(critical || pressure);
+        let staging_limit = if critical {
             0
         } else if pressure {
             1
@@ -188,6 +220,9 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// When a look found it empty (ms; 0: not seen empty since a piece was
+    /// last taken from it), for [`Pool::hold`].
+    empty_at: u64,
 }
 
 struct Pool<B> {
@@ -199,11 +234,14 @@ struct Pool<B> {
     spare: usize,
     most: usize,
     retry_growth_at: u64,
+    /// How long (ms) an empty block past `spare` is held before it is let go
+    /// (0: it goes at once).
+    hold: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0, hold: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -272,6 +310,7 @@ impl<B: Clone> Pool<B> {
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
+        block.empty_at = 0;
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
@@ -294,7 +333,8 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] =
+            Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms(), empty_at: 0 });
         i
     }
 
@@ -325,11 +365,21 @@ impl<B: Clone> Pool<B> {
         if sweep || any || most < previous {
             let mut spare = 0;
             for block in &mut self.blocks {
-                if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
-                    spare += 1;
-                    if spare > most {
-                        *block = None;
-                    }
+                let Some(b) = block else { continue };
+                if !b.free.whole(BLOCK) {
+                    b.empty_at = 0;
+                    continue;
+                }
+                if b.empty_at == 0 {
+                    b.empty_at = now.max(1);
+                }
+                spare += 1;
+                // Past the spare ones a block goes when it has been empty for
+                // the hold (at once without one, or when far past them).
+                if spare > most
+                    && (self.hold == 0 || now.saturating_sub(b.empty_at) >= self.hold || spare > most + HOLD_MOST)
+                {
+                    *block = None;
                 }
             }
         }
@@ -370,6 +420,15 @@ pub(crate) fn texture_bytes() -> u64 {
 
 pub(crate) fn staging_bytes() -> u64 {
     lock(&STAGING).blocks() as u64 * BLOCK
+}
+
+/// For the memory line: the blocks of staging buffers, and of them how many
+/// are empty (kept for the next ask).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staging_empty() -> [u64; 2] {
+    let pool = lock(&STAGING);
+    let empty = pool.blocks.iter().flatten().filter(|b| b.free.whole(BLOCK)).count();
+    [pool.blocks() as u64, empty as u64]
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -651,6 +710,81 @@ mod tests {
         pool.give(held, REST);
         pool.reclaim(2 * REST, 0, true);
         assert_eq!(pool.blocks(), 0);
+    }
+
+    /// With a hold, the empty blocks past the spare ones stay until they have
+    /// been empty that long; without one they go at the first look.
+    #[test]
+    fn empty_blocks_past_the_spare_ones_are_held_for_the_hold() {
+        let mut pool: Pool<u32> = Pool::new(STAGING_KEPT);
+        pool.hold = 5000;
+        for i in 0..6 {
+            pool.add(i, 0);
+        }
+        // First seen empty at 1000.
+        pool.reclaim(1000, 2, true);
+        assert_eq!(pool.blocks(), 6);
+        pool.reclaim(5999, 2, true);
+        assert_eq!(pool.blocks(), 6);
+        pool.reclaim(6000, 2, true);
+        assert_eq!(pool.blocks(), 2);
+        // The same without a hold: at the first look.
+        let mut plain: Pool<u32> = Pool::new(STAGING_KEPT);
+        for i in 0..6 {
+            plain.add(i, 0);
+        }
+        plain.reclaim(1000, 2, true);
+        assert_eq!(plain.blocks(), 2);
+    }
+
+    /// A block that is used begins its hold again when it is empty again; one in use is never let go.
+    #[test]
+    fn a_held_block_that_is_used_begins_its_hold_again() {
+        let mut pool: Pool<u32> = Pool::new(STAGING_KEPT);
+        pool.hold = 5000;
+        for i in 0..3 {
+            pool.add(i, 0);
+        }
+        // All three seen empty at 1000: one is the spare one, two are held.
+        pool.reclaim(1000, 1, true);
+        assert_eq!(pool.blocks(), 3);
+        // A piece is taken from the first block (the lowest is used first).
+        let (piece, _, _) = pool.take(1024, 512, 4000, || None).unwrap();
+        assert_eq!(piece.block, 0);
+        // Held since 1000 for 5000 ms: the third goes, the second is the spare one, the first is in use.
+        pool.reclaim(7000, 1, true);
+        assert_eq!(pool.blocks(), 2);
+        // The piece comes back (it rests REST ms): the first block is empty at 9500 and is the first
+        // to be counted, so it is the spare one, and the second (empty since 1000) goes.
+        pool.give(piece, 7000);
+        pool.reclaim(7000 + REST, 1, true);
+        assert_eq!(pool.blocks(), 1);
+        // A new block is held from its first look.
+        pool.add(1, 0);
+        pool.reclaim(10_000, 1, true);
+        assert_eq!(pool.blocks(), 2);
+        pool.reclaim(14_999, 1, true);
+        assert_eq!(pool.blocks(), 2);
+        pool.reclaim(15_000, 1, true);
+        assert_eq!(pool.blocks(), 1);
+    }
+
+    /// Far past the spare ones nothing is held: the hold has a cap.
+    #[test]
+    fn the_hold_has_a_cap() {
+        let mut pool: Pool<u32> = Pool::new(STAGING_KEPT);
+        pool.hold = 60_000;
+        for i in 0..(HOLD_MOST + 10) as u32 {
+            pool.add(i, 0);
+        }
+        pool.reclaim(1000, 2, true);
+        assert_eq!(pool.blocks(), 2 + HOLD_MOST);
+    }
+
+    /// Under memory pressure nothing is held, whatever the switch says.
+    #[test]
+    fn the_hold_is_off_under_pressure() {
+        assert_eq!(staging_hold_ms(true), 0);
     }
 
     #[test]

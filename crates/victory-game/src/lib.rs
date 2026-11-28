@@ -3,6 +3,8 @@
 //! offsets or byte-pattern signatures). What may and may not be stored here
 //! is defined in docs/asset-policy.md.
 
+pub mod pools;
+pub mod fps;
 pub mod sgd5;
 pub mod watchdog;
 

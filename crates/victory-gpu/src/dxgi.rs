@@ -152,6 +152,16 @@ extern "system" fn adapter_description(_: This, out: *mut AdapterDescription) ->
     // shortcut: memory sizes are the title's split (GPU-optimal, standard),
     // not measured; revisit once memory is emulated.
     let (gpu_optimal, standard) = crate::console::current().title_memory();
+    // Said once: whether the title asks, and what a Series S tells it (no
+    // dedicated video memory), is not known from the title's imports.
+    static ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(
+            dedicated_mb = gpu_optimal >> 20,
+            shared_mb = standard >> 20,
+            "the title asks for the adapter's description (IDXGIAdapter::GetDesc)"
+        );
+    }
     let description = AdapterDescription {
         name,
         vendor: AMD,

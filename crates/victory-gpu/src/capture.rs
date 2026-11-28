@@ -48,31 +48,126 @@ pub(crate) fn listed(n: u64) -> bool {
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
     named
+        || in_window(n)
         || n == TRIGGERED.load(std::sync::atomic::Ordering::Relaxed)
         || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
 
-/// The frame a trigger file asked for (`VICTORY_CAPTURE_TRIGGER`), or `u64::MAX`.
+/// The frame a trigger file asked for, or `u64::MAX` (no longer set: a
+/// trigger opens a window, [`triggered`]; only the frames of
+/// `VICTORY_CAPTURE_FRAMES` and the world's are single frames).
 static TRIGGERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// `VICTORY_CAPTURE_TRIGGER=<file>` (with `VICTORY_CAPTURE`): when the file
-/// appears it is deleted, and the frame two presents on is captured as the
-/// frames of `VICTORY_CAPTURE_FRAMES` are (picture, `-ops.txt`, and with
-/// `VICTORY_DUMP_TARGETS` its targets and `-targets.tsv`). The file can be
-/// made again for another frame. Called at every present.
-fn triggered(frame: u64) {
+/// The first and last present of the window a trigger opened ([`triggered`]);
+/// 1 and 0 when none is open.
+static WINDOW_AT: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(1), std::sync::atomic::AtomicU64::new(0)];
+
+/// The number its files are named by: the window's last present when it
+/// opened (the window may be extended; the name stays).
+static WINDOW_NAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the open window counted.
+static WINDOW: std::sync::Mutex<Option<crate::capture_window::Window>> = std::sync::Mutex::new(None);
+
+fn in_window(n: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
+    n >= WINDOW_AT[0].load(Relaxed) && n <= WINDOW_AT[1].load(Relaxed)
+}
+
+/// The number in an environment variable, or `default`.
+fn env_number(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// `VICTORY_CAPTURE_TRIGGER=<file>` (with `VICTORY_CAPTURE`): when the file
+/// appears it is deleted and a window opens: from the next present, for
+/// `VICTORY_CAPTURE_WINDOW` presents (4), every operation of every list of
+/// every queue goes to `frame-<last present>-ops.txt` (with a `PRESENT n` line
+/// at each present) and the targets and values are dumped at the last present
+/// ([`dump_due`]). The window must hold whole frames (`VICTORY_CAPTURE_MIN_OPS`
+/// operations, 5000, and each pass of `VICTORY_CAPTURE_REQUIRE`, the grade
+/// pass `6318f669`): if not it is extended up to three times, and the dump
+/// says it is partial if it still is. The file can be made again for another
+/// window. Called at every present.
+fn triggered(frame: u64) {
     static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
     let Some(file) = FILE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_TRIGGER").map(PathBuf::from)) else {
         return;
     };
-    let pending = TRIGGERED.load(Relaxed);
-    if pending != u64::MAX && pending >= frame || !file.exists() {
+    if in_window(frame + 1) || WINDOW.lock().unwrap_or_else(|e| e.into_inner()).is_some() || !file.exists() {
         return;
     }
     if std::fs::remove_file(file).is_ok() {
-        TRIGGERED.store(frame + 2, Relaxed);
-        tracing::info!(frame = frame + 2, "capture trigger found: this frame is captured");
+        use std::sync::atomic::Ordering::Relaxed;
+        let required: Vec<String> = std::env::var("VICTORY_CAPTURE_REQUIRE")
+            .unwrap_or_else(|_| "6318f669".to_owned())
+            .split(',')
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect();
+        let window = crate::capture_window::Window::armed(frame, env_number("VICTORY_CAPTURE_WINDOW", 4), &required);
+        WINDOW_AT[0].store(window.start, Relaxed);
+        WINDOW_AT[1].store(window.end, Relaxed);
+        WINDOW_NAME.store(window.end, Relaxed);
+        tracing::info!(start = window.start, end = window.end, "capture trigger found: the window is open");
+        *WINDOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(window);
+    }
+}
+
+/// At the present of `frame`: whether the frame's targets are dumped now: a
+/// frame named by `VICTORY_CAPTURE_FRAMES` or the world's, or the last
+/// present of a trigger's window if the window holds whole frames (else it
+/// is extended, up to three times, and dumped as partial).
+pub(crate) fn dump_due(frame: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !in_window(frame) {
+        return listed(frame);
+    }
+    if frame < WINDOW_AT[1].load(Relaxed) {
+        return false;
+    }
+    let mut guard = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(window) = guard.as_mut() else {
+        return false;
+    };
+    let min_ops = env_number("VICTORY_CAPTURE_MIN_OPS", 5000);
+    match window.verdict(min_ops) {
+        crate::capture_window::Verdict::Partial(why) if window.retries < 3 => {
+            window.extend();
+            WINDOW_AT[1].store(window.end, Relaxed);
+            tracing::warn!(why, now = %window.summary(), "frame looks partial: the window is extended");
+            false
+        }
+        verdict => {
+            match verdict {
+                crate::capture_window::Verdict::Complete => {
+                    tracing::info!(frame, "frame complete: {}", window.summary());
+                }
+                crate::capture_window::Verdict::Partial(why) => {
+                    tracing::warn!(frame, why, "frame PARTIAL after the extensions: {}", window.summary());
+                }
+            }
+            true
+        }
+    }
+}
+
+/// The number the files of the dump at the present of `frame` are named by.
+pub(crate) fn dump_name(frame: u64) -> u64 {
+    if in_window(frame) { WINDOW_NAME.load(std::sync::atomic::Ordering::Relaxed) } else { frame }
+}
+
+/// After the dump at the present of `frame`: closes the window if that was its last.
+pub(crate) fn window_done(frame: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if frame >= WINDOW_AT[1].load(Relaxed)
+        && in_window(frame)
+        && WINDOW.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    {
+        WINDOW_AT[0].store(1, Relaxed);
+        WINDOW_AT[1].store(0, Relaxed);
+        *WINDOW.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -118,18 +213,34 @@ pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
     let Some(folder) = folder() else {
         return;
     };
-    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
     let what = what();
+    // In a trigger's window every operation goes to the one file of its last present.
+    let name = if in_window(frame) {
+        if let Some(window) = WINDOW.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            window.note(list, &what);
+        }
+        WINDOW_NAME.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        frame
+    };
+    write_ops_line(folder, name, &format!("list {list:#x} {what}"));
+}
+
+/// One numbered line of `frame-<name>-ops.txt`.
+#[cfg(feature = "diagnostics")]
+fn write_ops_line(folder: &std::path::Path, name: u64, line: &str) {
+    use std::io::Write;
+    static FILE: std::sync::Mutex<Option<(u64, u64, std::fs::File)>> = std::sync::Mutex::new(None);
     let mut file = FILE.lock().unwrap_or_else(|e| e.into_inner());
-    if file.as_ref().is_none_or(|f| f.0 != frame) {
-        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{frame}-ops.txt"))) else {
+    if file.as_ref().is_none_or(|f| f.0 != name) {
+        let Ok(made) = std::fs::File::create(folder.join(format!("frame-{name}-ops.txt"))) else {
             return;
         };
-        *file = Some((frame, 0, made));
+        *file = Some((name, 0, made));
     }
     if let Some((_, n, f)) = file.as_mut() {
         *n += 1;
-        let _ = writeln!(f, "{n} list {list:#x} {what}");
+        let _ = writeln!(f, "{n} {line}");
     }
 }
 
@@ -155,6 +266,12 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     triggered(frame);
+    #[cfg(feature = "diagnostics")]
+    if in_window(frame)
+        && let Some(folder) = folder()
+    {
+        write_ops_line(folder, WINDOW_NAME.load(Relaxed), &format!("PRESENT {frame} draws {drawn}"));
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
@@ -350,6 +467,15 @@ pub(crate) fn save_read_back(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
+    save_read_back_as(&format!("frame-{frame}"), buffer, footprint);
+}
+
+/// [`save_read_back`] as `<name>.png` in the capture folder (`VICTORY_AB_SHOTS`: `ab-<phase>-<arm>`).
+pub(crate) fn save_read_back_as(
+    name: &str,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
@@ -368,7 +494,7 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        save_as(name, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
     }
 }
@@ -401,9 +527,82 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// The buffers (title address, bytes) the captured operations write through
+/// UAVs, up to 4 MiB each ([`dump_uavs`]).
+static UAV_BUFFERS: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes a buffer a listed operation writes through a UAV, for
+/// `VICTORY_CAPTURE_UAVS=1`.
+pub(crate) fn note_uav_buffer(range: Option<(u64, u64)>) {
+    let Some((at, len)) = range else { return };
+    if len == 0 || len > 4 << 20 || !crate::switch::on("VICTORY_CAPTURE_UAVS") {
+        return;
+    }
+    let mut buffers = UAV_BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    if buffers.len() < 256 && !buffers.contains(&(at, len)) {
+        buffers.push((at, len));
+    }
+}
+
+/// `VICTORY_CAPTURE_UAVS=1` (with a capture): at the dump, one line per buffer
+/// the captured operations write through UAVs, to `frame-<n>-uavs.tsv`: what
+/// the title's memory holds of it now (all the submissions have run and
+/// landed: what the title's CPU would read), and what its copy is. The
+/// terrain's feedback list (`VICTORY_CAPTURE_UAVS` and the ops file name it by
+/// address) is read this way: a list that is all zeros with the feedback
+/// passes running means nothing was asked for, or never landed.
+/// Columns: address, bytes, mapped, nonzero dwords, nonzero dwords in each
+/// 64 KiB, the first 12 nonzero dwords as `index=hex`, the copy.
+fn dump_uavs(frame: u64, folder: &std::path::Path) {
+    let buffers = std::mem::take(&mut *UAV_BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
+    if buffers.is_empty() {
+        return;
+    }
+    let mut text = String::new();
+    for (at, len) in buffers {
+        let (p, n) = (at as *const u8, len as usize);
+        let mapped = crate::texture::mapped_bytes(p, n);
+        let mut line = format!("{at:#x}	{len}	{mapped}");
+        if mapped == len && n.is_multiple_of(4) {
+            // SAFETY: `n` committed bytes of title memory.
+            let words = unsafe { std::slice::from_raw_parts(at as *const u32, n / 4) };
+            let per_block: Vec<usize> =
+                words.chunks(16 << 10).map(|c| c.iter().filter(|&&w| w != 0).count()).collect();
+            let first: Vec<String> = words
+                .iter()
+                .enumerate()
+                .filter(|&(_, &w)| w != 0)
+                .take(12)
+                .map(|(i, w)| format!("{i}={w:x}"))
+                .collect();
+            line += &format!("	{}	{:?}	[{}]", per_block.iter().sum::<usize>(), per_block, first.join(" "));
+        } else {
+            line += "	not all mapped	-	-";
+        }
+        line += &format!("	{}
+", crate::shadow::describe_copy(at, len));
+        text += &line;
+    }
+    let _ = std::fs::write(folder.join(format!("frame-{frame}-uavs.tsv")), text);
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    if crate::switch::on("VICTORY_CAPTURE_UAVS")
+        && let Some(folder) = folder()
+    {
+        dump_uavs(frame, folder);
+    }
+    if crate::switch::on("VICTORY_CAPTURE_LEVELS")
+        && let Some(folder) = folder()
+    {
+        let lines = crate::tiles::levels_report();
+        crate::tiles::status();
+        let _ = std::fs::write(folder.join(format!("frame-{frame}-levels.tsv")), lines.join("
+"));
+        tracing::info!(frame, rows = lines.len().saturating_sub(1), "levels report written");
+    }
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
@@ -411,7 +610,10 @@ pub(crate) fn dump_targets(frame: u64) {
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
         if d.SampleDesc.Count > 1
-            || !matches!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+            || !matches!(
+                d.Dimension,
+                D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            )
         {
             continue;
         }
@@ -528,7 +730,7 @@ fn texel_bytes(format: u32) -> Option<usize> {
         1..=4 => 16,
         5..=8 => 12,
         9..=22 => 8,
-        23..=47 | 87..=93 => 4,
+        23..=47 | 67 | 87..=93 => 4,
         48..=59 => 2,
         60..=65 => 1,
         _ => return None,
@@ -657,7 +859,7 @@ struct Range {
 
 /// [`Range`] of the rows of a float format (`None` for any other).
 fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Range> {
-    // Channels, and how a channel is read: 32-bit, 16-bit, or R11G11B10.
+    // Channels, and how a channel is read: 32-bit, 16-bit, R11G11B10, or R9G9B9E5 (9).
     let (channels, kind) = match format {
         2 => (4, 32),
         6 => (3, 32),
@@ -667,6 +869,7 @@ fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Op
         34 => (2, 16),
         54 => (1, 16),
         26 => (3, 11),
+        67 => (3, 9),
         _ => return None,
     };
     let bytes = match kind {
@@ -685,6 +888,12 @@ fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Op
                     32 => {
                         let f = f32::from_le_bytes(t[4 * c..4 * c + 4].try_into().unwrap_or([0; 4]));
                         (f, f.is_nan(), f.is_infinite())
+                    }
+                    9 => {
+                        // Three 9-bit mantissas and one shared exponent: no NaN, no infinity.
+                        let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
+                        let m = (w >> (9 * c)) & 511;
+                        (m as f32 * 2f32.powi((w >> 27) as i32 - 24), false, false)
                     }
                     16 => {
                         let b = u16::from_le_bytes([t[2 * c], t[2 * c + 1]]);
@@ -753,9 +962,15 @@ fn target_stats(
     });
     // Float targets: the range of their values, the columns after the flatness ones
     // (`max`, `min` and `mean` over the color channels; `nan` and `inf` count channels).
-    let range = float_range(format, w, h, pitch, rows).map_or(String::new(), |r| {
-        format!("	max{:.4e}	min{:.4e}	mean{:.4e}	nan{}	inf{}", r.max, r.min, r.mean, r.nan, r.inf)
-    });
+    // (An R32_UINT target may be the title's diffuse light, which it packs as R9G9B9E5: its
+    // `e5max` and `e5mean` read the words that way, and mean nothing for any other counter.)
+    let range = if format == 42 {
+        float_range(67, w, h, pitch, rows).map_or(String::new(), |r| format!("	e5max{:.4e}	e5mean{:.4e}", r.max, r.mean))
+    } else {
+        float_range(format, w, h, pitch, rows).map_or(String::new(), |r| {
+            format!("	max{:.4e}	min{:.4e}	mean{:.4e}	nan{}	inf{}", r.max, r.min, r.mean, r.nan, r.inf)
+        })
+    };
     let line = format!(
         "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%{range}",
         d.Width,
@@ -768,6 +983,27 @@ fn target_stats(
         if capped { "+" } else { "" },
         top_n as f64 * 100.0 / (w * h) as f64,
     );
+    // Small targets (exposure and tone tables, a 4096-entry curve, light parameters): every
+    // texel as the card holds it, in hex, in `frame-<n>-values.tsv`, to compare processes.
+    if w * h <= 65536 && bytes <= 16 {
+        let mut values = String::new();
+        for y in 0..h {
+            for x in 0..w {
+                let t = &rows[y * pitch + x * bytes..][..bytes];
+                for b in t.iter().rev() {
+                    values.push_str(&format!("{b:02x}"));
+                }
+                values.push(' ');
+            }
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(folder.join(format!("frame-{frame}-values.tsv")))
+        {
+            let _ = writeln!(file, "{i}	{resource:?}	{}x{}	f{format}	{}", d.Width, d.Height, values.trim_end());
+        }
+    }
     tracing::debug!(frame, "target {line}");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -843,6 +1079,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -855,6 +1092,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -873,12 +1111,20 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            // The PNG drops alpha: its range and how many texels have each
+            // channel zero are logged.
+            let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
+                    for c in 0..4 {
+                        (low[c], high[c]) = (low[c].min(p[c]), high[c].max(p[c]));
+                        zero[c] += usize::from(p[c] == 0);
+                    }
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
+            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
@@ -1147,6 +1393,56 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn half_classifies_special_and_finite_values() {
+        use super::half;
+
+        assert!(half(0x7c01).is_nan());
+        assert!(half(0xfe00).is_nan());
+        assert_eq!(half(0x7c00), f32::INFINITY);
+        assert_eq!(half(0xfc00), f32::NEG_INFINITY);
+        assert_eq!(half(0x0000).to_bits(), 0.0f32.to_bits());
+        assert_eq!(half(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(half(0x0001), 2f32.powi(-24));
+        assert_eq!(half(0xbe00), -1.5);
+    }
+
+    #[test]
+    fn packed_float_classifies_special_and_finite_values() {
+        use super::small_float;
+
+        for mantissa_bits in [5, 6] {
+            let special = 31 << mantissa_bits;
+            assert!(small_float(special | 1, mantissa_bits).is_nan());
+            assert!(small_float(special | (1 << (mantissa_bits - 1)), mantissa_bits).is_nan());
+            assert_eq!(small_float(special, mantissa_bits), f32::INFINITY);
+            assert_eq!(small_float(0, mantissa_bits).to_bits(), 0.0f32.to_bits());
+            assert_eq!(small_float(1, mantissa_bits), 2f32.powi(-14 - mantissa_bits as i32));
+            assert_eq!(small_float(15 << mantissa_bits, mantissa_bits), 1.0);
+        }
+    }
+
+    #[test]
+    fn hdr_targets_render_nan_and_infinity_as_distinct_channel_values() {
+        // R16G16B16A16_FLOAT: [NaN, +Inf, NaN], [1, 0.5, 0].
+        let half = [0x7c01u16, 0x7c00, 0xfe00, 0, 0x3c00, 0x3800, 0, 0];
+        let half: Vec<_> = half.into_iter().flat_map(u16::to_le_bytes).collect();
+        // R11G11B10_FLOAT: the same values with 6-bit and 5-bit mantissas.
+        let packed = [
+            0x7c1u32 | (0x7c0 << 11) | (0x3e1 << 22),
+            0x3c0 | (0x380 << 11),
+        ];
+        let packed: Vec<_> = packed.into_iter().flat_map(u32::to_le_bytes).collect();
+        let expected = [0, 255, 0, 255, 255, 127, 0, 255];
+        for (format, row) in [(10, half), (26, packed)] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, row.len(), &row).as_deref(),
+                Some(&expected[..]),
+                "format {format}"
+            );
+        }
+    }
+
+    #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
     }
@@ -1238,6 +1534,13 @@ mod stats_tests {
         let r = float_range(41, 4, 1, 16, &rows).unwrap();
         assert_eq!((r.nan, r.inf, r.max, r.min, r.mean), (1, 1, 4.0, -2.0, 1.0));
         assert!(float_range(28, 1, 1, 4, &[0; 4]).is_none());
+        // R9G9B9E5: red 511 x 2^(31-24) = 65408 (the largest), green 1 x 2^7, blue 0.
+        let w = 511u32 | 1 << 9 | 31 << 27;
+        let r = float_range(67, 1, 1, 4, &w.to_le_bytes()).unwrap();
+        assert_eq!((r.nan, r.inf, r.max, r.min), (0, 0, 65408.0, 0.0));
+        let one = 256u32 | 15 << 27; // red 256 x 2^(15-24) = 0.5; green and blue 0
+        let r = float_range(67, 1, 1, 4, &one.to_le_bytes()).unwrap();
+        assert_eq!((r.max, r.min), (0.5, 0.0));
     }
 
     #[test]

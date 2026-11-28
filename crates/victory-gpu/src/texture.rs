@@ -385,7 +385,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// has recorded the upload from it by then.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -743,9 +743,12 @@ pub(crate) struct Digest(u128);
 
 /// Whether an upload of a texture made level by level records copies only into
 /// the levels the title holds (`VICTORY_UPLOAD_HELD_ONLY=1`; off by default).
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_UPLOAD_HELD_ONLY`: each recording of an upload decides
+/// for itself, and says which it was in the staging buffer's `rec_*` fields, as a recording before a bake always has;
+/// the fill of the buffer after it goes by what the recording said.)
 fn held_only_copies() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_UPLOAD_HELD_ONLY").is_some_and(|v| v == "1"))
+    crate::ab::live_flag!("VICTORY_UPLOAD_HELD_ONLY")
 }
 
 /// Copy commands of uploads recorded, left out for levels the title does not

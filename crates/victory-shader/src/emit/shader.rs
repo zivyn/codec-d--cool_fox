@@ -108,6 +108,15 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes
+/// (`VICTORY_VIEW_INDEX`, `VICTORY_FOLD_VIEWS`): the view heap slot of the
+/// raw view of the title's root SRV of root parameter `slot`. The shader
+/// reads the root view through that slot of the heap (`ResourceDescriptorHeap`)
+/// instead of a descriptor table of the host root signature, so that what
+/// differs between two draws is one more dword of the user data, which a
+/// command signature can set. The view is the sized one the table had: reads
+/// past the host copy's end return zeros as before.
+pub const USER_ROOT_VIEW_INDEX: u32 = 0x107;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -261,6 +270,9 @@ pub(crate) struct Shader {
     pub root_cbvs: Vec<(u8, V)>,
     /// Root SRVs (raw buffers) read, likewise.
     pub root_srvs: Vec<(u8, V)>,
+    /// Root SRVs read through the view heap by an index in the user data
+    /// ([`USER_ROOT_VIEW_INDEX`]), likewise: no root parameter holds them.
+    pub root_heap_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
     pub flags: u64,
@@ -319,6 +331,7 @@ impl Shader {
             cmp_samplers: 0,
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_heap_srvs: Vec::new(),
             root_uavs: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,

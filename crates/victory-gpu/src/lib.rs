@@ -17,8 +17,13 @@
 
 #[cfg(windows)]
 mod ambient;
+mod asked;
+mod changes;
+pub mod defaults;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(any(test, all(windows, feature = "diagnostics")))]
+mod capture_window;
 #[cfg(windows)]
 mod compose;
 pub mod console;
@@ -45,8 +50,12 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod land;
+#[cfg(windows)]
+mod lean;
 pub mod list;
 pub mod object;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod occlusion;
 pub mod pipeline;
 #[cfg(windows)]
 mod picked;
@@ -56,6 +65,9 @@ mod pool;
 mod popwatch;
 #[cfg(windows)]
 mod primitive;
+#[cfg(windows)]
+mod barrier;
+mod precise;
 #[cfg(windows)]
 mod priority;
 #[cfg(windows)]
@@ -77,13 +89,19 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod pagedrive;
+#[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod sites;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
 mod switch;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 mod ab;
+#[cfg(windows)]
+mod echo;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
@@ -93,6 +111,8 @@ pub mod timeline;
 pub mod titlewrite;
 #[cfg(windows)]
 mod upload;
+#[cfg(windows)]
+mod threadcpu;
 #[cfg(windows)]
 mod readprobe;
 #[cfg(windows)]
@@ -116,10 +136,14 @@ pub fn frame_phase() -> u32 {
     copystat::phase()
 }
 #[cfg(windows)]
+pub mod addrset;
+#[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
+pub use watch::mapping_stats;
+#[cfg(windows)]
 pub use watch::{
-    kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
+    Remapping, kernel_writing, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

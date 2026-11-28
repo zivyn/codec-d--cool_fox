@@ -62,6 +62,8 @@ pub(crate) struct Shadow {
     quiet: Mutex<Option<(usize, usize, u64)>>,
     /// Whether the buffer is such ([`Shadow::mark_gpu_only`]).
     gpu_only: std::sync::atomic::AtomicBool,
+    /// When [`Shadow::probe`] last said (ms).
+    probed: AtomicU64,
     /// The next window of the range [`Shadow::quiet_skip`] compares.
     quiet_window: AtomicU64,
     /// Whether its landings are left out ([`crate::land::quiet`]).
@@ -70,6 +72,14 @@ pub(crate) struct Shadow {
     /// units ([`current::Current::seq`]) when a compare last found what
     /// shaders wrote ([`Shadow::note_found`]).
     found_seq: AtomicU64,
+    /// What a refresh of this copy took lately, in microseconds: a moving mean of the last ones
+    /// ([`Shadow::note_refresh_cost`]), 0 until one was timed. For the order a flush's refreshes are given to the
+    /// threads in (`crate::host`, `VICTORY_WAIT_ORDER`).
+    refresh_us: std::sync::atomic::AtomicU32,
+    /// Whether a thread of the title was seen to read or write this copy's
+    /// buffer while its landing was owed ([`crate::land::owed`]) or by the
+    /// probe: its pieces are landed at once from then on.
+    title_read: std::sync::atomic::AtomicBool,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -106,6 +116,9 @@ pub(crate) struct Shadow {
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
+    /// The pages of title memory noted written since the copy took them
+    /// (`VICTORY_PAGE_REFRESH`, [`crate::pagedrive`]).
+    ledger: Arc<crate::pagedrive::Ledger>,
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
@@ -148,6 +161,9 @@ struct Card {
     /// Shared with [`CARDED`]'s entry, so that [`card_dirty`] need not take a
     /// strong hold of each of the 950 copies to ask.
     touched: Arc<std::sync::atomic::AtomicBool>,
+    /// The copy itself, weakly, set when it is noted in [`CARDED`]: what puts
+    /// it in [`TOUCHED`] when `touched` is set.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -390,7 +406,7 @@ fn card_limits() -> (u64, u64) {
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
         // in the PC's memory every load, store and atomic a shader does on
         // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
+        if let Some(kib) = crate::defaults::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
             && kib > 0
         {
             min_bytes = kib << 10;
@@ -487,9 +503,20 @@ pub(crate) fn card_room_kept() -> u64 {
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<(std::sync::Weak<Shadow>, Arc<std::sync::atomic::AtomicBool>)>> = Mutex::new(Vec::new());
 
+/// The copies whose `touched` went from false to true since it was last
+/// taken ([`card_dirty`]): kept whichever way [`card_dirty`] looks for them, so
+/// that it may change at any instant (`VICTORY_LEAN_CARD`). A copy is in it
+/// once while it is touched, and what takes it out sets `touched` false.
+static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
 /// Notes `shadow` (a copy in the card's memory) in [`CARDED`].
 fn carded_note(shadow: &Arc<Shadow>) {
     if let Some(card) = &shadow.card {
+        let _ = card.me.set(Arc::downgrade(shadow));
+        // (Touched before it was noted: it is in the queue as well.)
+        if card.touched.load(Ordering::Acquire) {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+        }
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push((Arc::downgrade(shadow), card.touched.clone()));
     }
 }
@@ -834,22 +861,32 @@ impl SentRuns {
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
-    let mut out = Vec::new();
+    // (The queue is emptied first, whichever way the copies are looked for: a copy touched from here on is in it.)
+    let queue = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let out = dirty_of(&mut carded, queue, crate::host::lean_card(), sent_as);
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    if CALLS.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+        // (The copies that are gone: those the look at all of them finds, and lets go of, each time.)
+        carded.retain(|(weak, _)| weak.strong_count() > 0);
+    }
+    out
+}
+
+/// [`card_dirty`] over `carded` (all the copies in the card's memory) and `queue` (those touched since the last): with
+/// `lean` only the queue's are looked at (`VICTORY_LEAN_CARD`: not the 900 copies for each of the 28 submissions a frame,
+/// each of whose allocations was held to ask if it lives), else all of them as before, and then
+/// the queue is of no use. Either way the copies come in the order they were made.
+fn dirty_of(
+    carded: &mut Vec<(std::sync::Weak<Shadow>, Arc<std::sync::atomic::AtomicBool>)>,
+    queue: Vec<std::sync::Weak<Shadow>>,
+    lean: bool,
+    sent_as: u64,
+) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|(weak, touched)| {
-        if weak.strong_count() == 0 {
-            return false;
-        }
-        // Not touched: no hold on it (an atomic add and a subtract on a
-        // line the lists share), no lock.
-        if !touched.load(Ordering::Acquire) {
-            return true;
-        }
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
+    // What a copy hands over, if it was touched.
+    let take = |shadow: &Arc<Shadow>| -> Vec<(usize, usize)> {
+        shadow
             .card
             .as_ref()
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
@@ -863,7 +900,35 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 }
                 ranges
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    if lean {
+        for weak in queue {
+            let Some(shadow) = weak.upgrade() else {
+                continue;
+            };
+            let ranges = take(&shadow);
+            if !ranges.is_empty() {
+                out.push((shadow, ranges));
+            }
+        }
+        out.sort_by_key(|(shadow, _)| shadow.id);
+        return out;
+    }
+    carded.retain(|(weak, touched)| {
+        if weak.strong_count() == 0 {
+            return false;
+        }
+        // Not touched: no hold on it (an atomic add and a subtract on a
+        // line the lists share), no lock.
+        if !touched.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(shadow) = weak.upgrade() else {
+            return false;
+        };
+        let ranges = take(&shadow);
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
@@ -871,6 +936,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
     });
     out
 }
+
 
 /// Diagnostics (`crate::host::upcheck`, nothing in the air): copies whose
 /// pages the write watch and the guards hold for unchanged since they were
@@ -1181,7 +1247,7 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2"))
+    *ON.get_or_init(|| crate::defaults::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2"))
 }
 
 /// The submission being prepared (its number among those started): what
@@ -1829,7 +1895,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default; `VICTORY_WIDE_BACK=0` turns it off.
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;
@@ -1837,7 +1903,8 @@ type Job = Box<dyn FnOnce() + Send>;
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    /// Each with the number of the [`wide`] call that made it.
+    jobs: Mutex<std::collections::VecDeque<(u64, Job)>>,
     more: std::sync::Condvar,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
@@ -1846,9 +1913,13 @@ struct Workers {
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
 /// most (0, the default: not at all): asleep, a thread is woken in 50 us and
 /// more, 95 times a frame.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_WIDE_SPIN=200`: read at each wait, which keeps nothing.)
 fn spin(there: impl Fn() -> bool) {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    fn micros(text: Option<&str>) -> u64 {
+        text.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    }
+    let most = crate::ab::live_value!("VICTORY_WIDE_SPIN", u64, micros);
     if most == 0 {
         return;
     }
@@ -1877,6 +1948,7 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                crate::threadcpu::register("wide");
                 crate::cores::prioritize("victory-wide", crate::cores::Role::Helper);
                 let workers = WORKERS.get().expect("made above");
                 loop {
@@ -1886,7 +1958,7 @@ fn workers() -> &'static Workers {
                         spin(|| workers.there.load(Ordering::Acquire) > 0);
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(job) = jobs.pop_front() {
+                            if let Some((_, job)) = jobs.pop_front() {
                                 workers.there.fetch_sub(1, Ordering::AcqRel);
                                 break job;
                             }
@@ -1911,39 +1983,90 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
-    let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
+    drop(queue_jobs(jobs));
+}
+
+/// Jobs given to the kept threads ([`queue_jobs`]) whose end the caller waits for later: when it drops this, or at
+/// [`Aside::wait`] before.
+pub(crate) struct Aside {
+    call: u64,
+    left: Arc<(Mutex<usize>, std::sync::Condvar)>,
+}
+
+/// Gives `jobs` to the kept threads and returns; they run in the order given, whoever is free first, until the
+/// caller waits ([`Aside::wait`], or dropping it), which takes the rest of them on its own thread, and returns
+/// when all have run.
+fn queue_jobs(jobs: Vec<Job>) -> Aside {
+    let workers = workers();
+    // The number of this call: the thread that waits takes only the
+    // jobs of its own call. A job of another call may want a lock that this
+    // thread holds (a copy's `copied`, held across the nested `wide` of
+    // `Shadow::take_all`, and wanted by another span of the same copy in the
+    // outer `wide_each`), and then nobody ever gets out of it.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
             workers.there.fetch_add(1, Ordering::AcqRel);
-            queue.push_back(Box::new(move || {
-                job();
-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-                *n -= 1;
-                if *n == 0 {
-                    left.1.notify_all();
-                }
-            }));
+            queue.push_back((
+                call,
+                Box::new(move || {
+                    job();
+                    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+                    *n -= 1;
+                    if *n == 0 {
+                        left.1.notify_all();
+                    }
+                }),
+            ));
         }
     }
     workers.more.notify_all();
-    loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
-        match job {
-            Some(job) => {
-                workers.there.fetch_sub(1, Ordering::AcqRel);
-                job()
+    Aside { call, left }
+}
+
+impl Aside {
+    /// Runs the jobs of this call that no thread has taken, and waits for those that are being run; returns when all
+    /// are done (at once if they were).
+    pub(crate) fn wait(&self) {
+        let workers = workers();
+        loop {
+            let job = {
+                let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                queue
+                    .iter()
+                    .position(|(of, _)| *of == self.call)
+                    .and_then(|i| queue.remove(i))
+                    .map(|(_, job)| job)
+            };
+            match job {
+                Some(job) => {
+                    workers.there.fetch_sub(1, Ordering::AcqRel);
+                    job()
+                }
+                None => break,
             }
-            None => break,
+        }
+        let left = &self.left;
+        spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
+        let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+        if *n > 0 {
+            let waiting = std::time::Instant::now();
+            while *n > 0 {
+                n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+            }
+            crate::host::waits::joined(waiting.elapsed().as_nanos() as u64);
         }
     }
-    spin(|| left.0.try_lock().is_ok_and(|n| *n == 0));
-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
-    while *n > 0 {
-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
+}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        self.wait();
     }
 }
 
@@ -1992,7 +2115,50 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
+    let _joining = crate::host::waits::joining(crate::host::waits::Wait::JoinSnapshots);
     wide(copy_jobs(snaps));
+}
+
+/// The snapshots [`take_snapshots_aside`] gave to the kept threads and nobody has waited for yet.
+static SNAPS_ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
+
+/// [`take_snapshots`] without the wait (`VICTORY_SNAP_ASIDE=1`): the copies are given to the kept threads and the
+/// submitting thread goes on with what comes next, to wait for them ([`snapshots_wait`]) before anything that may
+/// write the bytes of a declared range or give the lists to the card. The snapshots are the 3.5 ms a frame of the
+/// submitting thread's "snapshots" stage (K6: 7.7 times a frame, 16 MB, 0.46 ms each, mostly the wake-ups and the
+/// wait for the slowest piece).
+///
+/// Why the bytes stay as they are meanwhile: a declared range is left alone by every refresh (a refresh of the
+/// next submission, begun early or not, leaves what is declared written by a submission in the air), the title's
+/// own copies write title memory and not the copy, the placed copies that write a host copy wait for it
+/// ([`snapshots_wait`] comes before them), and the card runs the lists only after it. A range some flight landed
+/// is not in what was noted (`Shadow::writing` takes the bytes no declared range holds yet).
+pub(crate) fn take_snapshots_aside() {
+    let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
+    if snaps.is_empty() {
+        return;
+    }
+    let jobs = copy_jobs(snaps);
+    if jobs.len() < 2 {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    let aside = queue_jobs(jobs);
+    // (An earlier one that nobody waited for is waited for here, outside the lock: there is never more than one.)
+    let earlier = SNAPS_ASIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .replace(aside);
+    drop(earlier);
+}
+
+/// Waits for the snapshots [`take_snapshots_aside`] gave away, if any: at once if they are done or there are none.
+pub(crate) fn snapshots_wait() {
+    let aside = SNAPS_ASIDE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let _joining = crate::host::waits::joining(crate::host::waits::Wait::JoinSnapshots);
+    drop(aside);
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
@@ -2223,9 +2389,77 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, queue_jobs, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Jobs given away run once each by the time the wait returns, however many threads are busy with other
+    /// calls of `wide` in between, and a second wait finds nothing to do; dropping the handle waits too.
+    #[test]
+    fn jobs_given_away_have_all_run_when_the_wait_returns() {
+        for n in [1usize, 2, 7, 300] {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let jobs: Vec<Job> = (0..n)
+                .map(|i| {
+                    let ran = ran.clone();
+                    Box::new(move || {
+                        ran.fetch_add(i + 1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            let aside = queue_jobs(jobs);
+            // Work of the caller's own, with a call of `wide` in it: the call takes only its own jobs.
+            let other = Arc::new(AtomicUsize::new(0));
+            let again: Vec<Job> = (0..5)
+                .map(|_| {
+                    let other = other.clone();
+                    Box::new(move || {
+                        other.fetch_add(1, Ordering::Relaxed);
+                    }) as Job
+                })
+                .collect();
+            wide(again);
+            assert_eq!(other.load(Ordering::Relaxed), 5);
+            aside.wait();
+            assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
+            aside.wait();
+            drop(aside);
+            assert_eq!(
+                ran.load(Ordering::Relaxed),
+                n * (n + 1) / 2,
+                "{n} jobs, after the drop"
+            );
+        }
+        // Dropped without a wait of its own.
+        let ran = Arc::new(AtomicUsize::new(0));
+        let jobs: Vec<Job> = (0..40)
+            .map(|_| {
+                let ran = ran.clone();
+                Box::new(move || {
+                    ran.fetch_add(1, Ordering::Relaxed);
+                }) as Job
+            })
+            .collect();
+        drop(queue_jobs(jobs));
+        assert_eq!(ran.load(Ordering::Relaxed), 40);
+    }
+
+    /// Snapshots copied by jobs given away hold the same bytes as those copied by `wide`, when the wait is over.
+    #[test]
+    fn copies_given_away_copy_the_same_bytes() {
+        let len = 3 * WIDE_JOB + 999;
+        let src: Vec<u8> = (0..len).map(|i| (i * 17 + i / 311) as u8).collect();
+        let mut dst = vec![0u8; len];
+        let (s, d) = (src.as_ptr() as usize, dst.as_mut_ptr() as usize);
+        let cuts = [0, 7, 100_000, WIDE_JOB + 1, 2 * WIDE_JOB, len];
+        let copies: Vec<(usize, usize, usize)> = cuts
+            .windows(2)
+            .map(|w| (s + w[0], d + w[0], w[1] - w[0]))
+            .collect();
+        let aside = queue_jobs(copy_jobs(copies));
+        aside.wait();
+        assert!(src == dst);
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -2399,9 +2633,42 @@ fn back_piece(
     Some((first, n))
 }
 
+/// How [`Shadow::merge_under_writes_with`] takes the locks of a copy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Locks {
+    /// Waits for them.
+    Wait,
+    /// Takes them if nobody holds them, else leaves the copy ([`Merged::Busy`]).
+    Try,
+}
+
+/// What [`Shadow::merge_under_writes_with`] came to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Merged {
+    /// Everything of the range that was stale is in (or nothing was).
+    Done,
+    /// The caller must still settle the flights ([`Shadow::merge_under_writes`] says `true`).
+    Settle,
+    /// The locks of the copy are held by another thread, and [`Locks::Try`] was asked for.
+    Busy,
+}
+
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: the
+/// declared ranges of flights it looked at, their bytes, the pages of them that
+/// were stale (the title wrote them since the copy took them), and the ranges
+/// that had any.
+static UNDER: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// [`UNDER`], taken: ranges, their bytes, stale pages, ranges with any, then
+/// the nanoseconds of finding what is stale, of getting the copy's locks, of
+/// comparing and putting the pages in, and of noting what goes up.
+pub(crate) fn under_stats() -> [u64; 8] {
+    std::array::from_fn(|i| UNDER[i].swap(0, Ordering::Relaxed))
+}
 
 /// Why [`Shadow::merge_under_writes`] last left the caller to wait.
 static STALE_WHY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2932,6 +3199,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        crate::pagedrive::retire(&self.ledger);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3069,9 +3337,14 @@ static KEPT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// snapshots are the PC's memory, all of it resident).
 fn kept_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_KEEP_SNAPSHOTS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
-    })
+    // 1024, unless the variable or `VICTORY_RAM_LEAN` ([`crate::lean`]) says.
+    *MOST.get_or_init(|| crate::lean::snapshots_mb(1024) << 20)
+}
+
+/// For the memory line: bytes of snapshots kept now, and the most that may be.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn kept_snapshots() -> [u64; 2] {
+    [KEPT_BYTES.load(Ordering::Relaxed), kept_most()]
 }
 
 /// The 64 KiB pieces, cut at multiples of 64 KiB of title memory, that
@@ -3221,6 +3494,423 @@ mod landing_tests {
 }
 
 #[cfg(test)]
+mod narrow_tests {
+    use super::{PAGE, Shadow};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    /// The tests ask ahead, which is the process's one.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Refreshing two spans apart, not the range between, loses no write: the
+    /// title's write outside them is told by the next refresh that refers to
+    /// it, one inside a span after its refresh by the next of that, and the
+    /// copy ends as the union's refresh would leave it.
+    #[test]
+    fn narrow_refreshes_lose_no_write_and_end_as_the_union_does() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let write = |page: usize, offset: usize, byte: u8| {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + offset) as *mut u8).write_volatile(byte) }
+        };
+        let mut side = vec![0u8; N * PAGE];
+        let mut union = vec![0u8; N * PAGE];
+        let copy = Shadow::unbacked(at as u64, side.as_mut_ptr(), (N * PAGE) as u64, false);
+        let whole = Shadow::unbacked(at as u64, union.as_mut_ptr(), (N * PAGE) as u64, false);
+        // Taken once, whole.
+        copy.update(at, N * PAGE);
+        whole.update(at, N * PAGE);
+        // The title writes inside the first span (page 1) and outside both (page 5).
+        write(1, 5, 1);
+        write(5, 9, 2);
+        copy.update(at, 2 * PAGE);
+        assert_eq!(side[PAGE + 5], 1);
+        assert_eq!(side[5 * PAGE + 9], 0, "nobody referred to it yet");
+        // A later submission refers to page 5: it is told, the journal kept it.
+        copy.update(at + 4 * PAGE, 3 * PAGE);
+        assert_eq!(side[5 * PAGE + 9], 2);
+        // A write inside a span after its refresh is seen by the next refresh of it.
+        write(1, 7, 3);
+        copy.update(at, 2 * PAGE);
+        assert_eq!(side[PAGE + 7], 3);
+        // The union's refresh, over all, ends the same.
+        whole.update(at, N * PAGE);
+        assert_eq!(side, union);
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Two spans of one copy, each of 1 MiB or more never taken, in one
+    /// `wide_each` (what `VICTORY_REFRESH_NARROW` makes of a copy), with the
+    /// kept threads busy: the refresh of the first holds the copy's lock
+    /// across the nested `wide` of its parts, and that call used to take the
+    /// second span's job from the queue and wait for the lock on the same
+    /// thread. It ends, and the copy holds the title's bytes.
+    #[test]
+    fn two_spans_of_one_copy_in_one_wide_each_do_not_lock_each_other() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        assert!(crate::watch::light());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const SPAN: usize = 24 * PAGE;
+        const N: usize = 2 * SPAN;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        for page in 0..N / PAGE {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + 3) as *mut u8).write_volatile(1 + page as u8) };
+        }
+        let side = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; N]));
+        let data = side.lock().unwrap().as_mut_ptr() as usize;
+        let copy = Shadow::unbacked(at as u64, data as *mut u8, N as u64, false);
+        // The kept threads are held (one job each, and one for the thread
+        // that makes the call), so the jobs of the `wide_each` are still in
+        // the queue when the first span's parts are made.
+        let (started, release) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicBool::new(false)));
+        let threads = super::wide_threads() + 1;
+        {
+            let (started, release) = (started.clone(), release.clone());
+            std::thread::spawn(move || {
+                let jobs = (0..threads)
+                    .map(|_| {
+                        let (started, release) = (started.clone(), release.clone());
+                        Box::new(move || {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            while !release.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }) as super::Job
+                    })
+                    .collect();
+                super::wide(jobs);
+            });
+        }
+        let began = std::time::Instant::now();
+        while started.load(Ordering::SeqCst) < threads && began.elapsed().as_secs() < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let held = started.load(Ordering::SeqCst) == threads;
+        let (done, wait) = std::sync::mpsc::channel();
+        {
+            let copy = copy.clone();
+            std::thread::spawn(move || {
+                super::wide_each(2, move |i| {
+                    copy.update(at + i * SPAN, SPAN);
+                });
+                let _ = done.send(());
+            });
+        }
+        let finished = held && wait.recv_timeout(std::time::Duration::from_secs(30)).is_ok();
+        release.store(true, Ordering::SeqCst);
+        assert!(held, "the kept threads did not all start");
+        assert!(finished, "the refresh of two spans of one copy did not end: its lock is taken twice by one thread");
+        let side = side.lock().unwrap();
+        for page in 0..N / PAGE {
+            assert_eq!(side[page * PAGE + 3], 1 + page as u8, "page {page}");
+        }
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The check counts the stale bytes of whole pages of a range that the
+    /// asking found written since the copy took them (what it cannot look at
+    /// without the kernel it leaves out: other tests ask ahead too, so that is
+    /// not asserted here).
+    #[test]
+    fn the_check_counts_what_a_refresh_left_stale() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let mut side = vec![0u8; N * PAGE];
+        let copy = Shadow::unbacked(at as u64, side.as_mut_ptr(), (N * PAGE) as u64, false);
+        copy.update(at, N * PAGE);
+        // SAFETY: inside the allocation.
+        unsafe {
+            ((at + PAGE + 1) as *mut u8).write_volatile(7);
+            ((at + 5 * PAGE + 1) as *mut u8).write_volatile(8);
+        }
+        crate::watch::ask_ahead(&[(at, at + 2 * PAGE), (at + 4 * PAGE, at + 6 * PAGE)]);
+        let (looked, stale) = copy.stale_in(at, at + 2 * PAGE).expect("asked");
+        assert_eq!(looked, 2 * PAGE);
+        assert!(stale >= PAGE, "page 1 was written since it was taken: {stale}");
+        copy.update(at, 2 * PAGE);
+        assert_eq!(copy.stale_in(at, at + 2 * PAGE), Some((2 * PAGE, 0)), "refreshed");
+        // What is outside the refreshed span is as stale as the title's write made it.
+        let (_, outside) = copy.stale_in(at + 4 * PAGE, at + 6 * PAGE).expect("asked");
+        assert!(outside >= PAGE, "page 5 was written, nobody refreshed it: {outside}");
+        copy.update(at + 4 * PAGE, 2 * PAGE);
+        assert_eq!(copy.stale_in(at + 4 * PAGE, at + 6 * PAGE), Some((2 * PAGE, 0)));
+        crate::watch::ask_ahead_done();
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+    /// One copy of the model's memory, refreshed in a mode of `VICTORY_PAGE_REFRESH` (the side is where its bytes are).
+    struct One {
+        side: Vec<u8>,
+        copy: std::sync::Arc<Shadow>,
+        mode: u8,
+        live: bool,
+    }
+
+    fn one(at: usize, n: usize, mode: u8) -> One {
+        let mut side = vec![0u8; n * PAGE];
+        let copy = Shadow::unbacked(at as u64, side.as_mut_ptr(), (n * PAGE) as u64, false);
+        One { side, copy, mode, live: true }
+    }
+
+    /// `update`, in the copy's mode.
+    fn refresh(c: &One, address: usize, len: usize) -> usize {
+        crate::pagedrive::force_mode(Some(c.mode));
+        let copied = c.copy.update(address, len);
+        crate::pagedrive::force_mode(None);
+        copied
+    }
+
+    /// Three copies of write-watched memory (the walk, the walk with the ledger beside it, the ledger) refreshed in
+    /// the same random ranges over many rounds, with the title writing between them, an asking that stands now and
+    /// then, and more copies made and retired on the way: each ends as title memory is wherever it was refreshed, the
+    /// three answer a look the same way, and the shadow check never finds a page stale by the journal that the ledger
+    /// lacks.
+    #[test]
+    fn a_refresh_driven_by_the_ledger_ends_as_the_walk_does_and_the_check_misses_nothing() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 24;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let write = |page: usize, offset: usize, byte: u8| {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + offset) as *mut u8).write_volatile(byte) }
+        };
+        let title = |from: usize, len: usize| -> Vec<u8> {
+            // SAFETY: inside the allocation.
+            unsafe { std::slice::from_raw_parts((at + from) as *const u8, len) }.to_vec()
+        };
+        let missed_before = crate::pagedrive::missed_total();
+        let compared_before = crate::pagedrive::compared_total();
+        let driven_before = crate::pagedrive::driven_total();
+        let mut copies = vec![one(at, N, 0), one(at, N, 1), one(at, N, 2)];
+        let mut seed = 0x5eed_1234_abcd_u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 8) as usize
+        };
+        let mut byte = 0u8;
+        for round in 0..400 {
+            // The title writes, in pages at random (some more than once between two refreshes).
+            for _ in 0..1 + random() % 5 {
+                byte = byte.wrapping_add(1).max(1);
+                write(random() % N, 5 + random() % 4000, byte);
+            }
+            let from = random() % N;
+            let to = (from + 1 + random() % 6).min(N);
+            let (a, len) = (at + from * PAGE, (to - from) * PAGE);
+            let asking = random() % 2 == 0;
+            if asking {
+                crate::watch::ask_once(&[(a, a + len)]);
+            }
+            for c in copies.iter().filter(|c| c.live) {
+                refresh(c, a, len);
+            }
+            if asking {
+                crate::watch::ask_once_end();
+            }
+            let wanted = title(from * PAGE, len);
+            for (i, c) in copies.iter().enumerate().filter(|(_, c)| c.live) {
+                assert!(c.side[from * PAGE..to * PAGE] == wanted[..], "round {round}: copy {i} (mode {}) does not hold what the title holds in pages {from}..{to}", c.mode);
+            }
+            // The looks, with the asking standing: the three copies of one history say the same.
+            if round % 3 == 0 {
+                let (la, ll) = (at + (random() % N) * PAGE, PAGE * (1 + random() % 3));
+                let ll = ll.min(at + N * PAGE - la);
+                crate::watch::ask_once(&[(la, la + ll)]);
+                let before = crate::watch::covered(la, la + ll);
+                let answers: Vec<bool> = copies[..3]
+                    .iter()
+                    .map(|c| {
+                        crate::pagedrive::force_mode(Some(c.mode));
+                        let same = c.copy.nothing_new(la, ll);
+                        crate::pagedrive::force_mode(None);
+                        same
+                    })
+                    .collect();
+                let gates: Vec<bool> = copies[..3]
+                    .iter()
+                    .map(|c| {
+                        crate::pagedrive::force_mode(Some(c.mode));
+                        let gate = c.copy.nothing_new_noted(la, ll);
+                        crate::pagedrive::force_mode(None);
+                        gate
+                    })
+                    .collect();
+                let after = crate::watch::covered(la, la + ll);
+                crate::watch::ask_once_end();
+                if before && after {
+                    assert!(answers[0] == answers[1] && answers[1] == answers[2], "round {round}: looks at {la:#x}+{ll:#x} say {answers:?} in the three modes");
+                    // What the gate leaves out the walk finds nothing new in.
+                    assert!(!gates[2] || answers[0], "round {round}: the gate leaves out {la:#x}+{ll:#x} where the walk finds something new");
+                }
+            }
+            // More copies made (of everything, never taken), and the older of those retired.
+            if round % 40 == 39 {
+                copies.push(one(at, N, 2));
+                copies.push(one(at, N, 1));
+                let old: Vec<usize> = (3..copies.len()).filter(|&i| copies[i].live).collect();
+                if old.len() > 4 {
+                    let i = old[random() % old.len()];
+                    crate::pagedrive::retire(copies[i].copy.ledger());
+                    copies[i].live = false;
+                }
+            }
+        }
+        // Everything, once more, and every copy is the title's memory.
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        for c in copies.iter().filter(|c| c.live) {
+            refresh(c, at, N * PAGE);
+        }
+        crate::watch::ask_once_end();
+        let wanted = title(0, N * PAGE);
+        for (i, c) in copies.iter().enumerate().filter(|(_, c)| c.live) {
+            assert!(c.side == wanted, "copy {i} (mode {}) does not end as the title's memory is", c.mode);
+        }
+        assert_eq!(crate::pagedrive::missed_total(), missed_before, "the journal says pages stale that the ledger does not hold");
+        assert!(crate::pagedrive::compared_total() > compared_before, "the shadow check compared nothing");
+        assert!(crate::pagedrive::driven_total() > driven_before, "the ledger decided nothing");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The gate says a range needs no look when the copy's ledger holds nothing and a range that holds it was taken whole;
+    /// a write to the range, once the asking has found it, shuts the gate until the next refresh of the range; a range
+    /// outside what was taken whole never passes; shadow mode counts what the journal says of each pass.
+    #[test]
+    fn the_gate_passes_what_the_ledger_holds_nothing_for_and_nothing_else() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let missed_before = crate::pagedrive::missed_total();
+        let c = one(at, N, 2);
+        let shadow = one(at, N, 1);
+        let look = |c: &One, from: usize, len: usize| {
+            crate::pagedrive::force_mode(Some(c.mode));
+            let said = c.copy.nothing_new_noted(from, len);
+            crate::pagedrive::force_mode(None);
+            said
+        };
+        // Taken whole in the first half only.
+        for c in [&c, &shadow] {
+            refresh(c, at, N / 2 * PAGE);
+        }
+        // (Fresh memory may be told written by the first asking: it is taken once more, and the bits are clear.)
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        for c in [&c, &shadow] {
+            refresh(c, at, N / 2 * PAGE);
+        }
+        crate::watch::ask_once_end();
+        // Other tests' askings may end the one that stands: try again until the gate is judged under one that stands.
+        let mut judged = false;
+        for _ in 0..200 {
+            crate::watch::ask_once(&[(at, at + N * PAGE)]);
+            let covered = crate::watch::covered(at, at + N * PAGE);
+            let (inside, outside) = (look(&c, at, N / 2 * PAGE), look(&c, at + N / 2 * PAGE, PAGE));
+            let still = crate::watch::covered(at, at + N * PAGE);
+            crate::watch::ask_once_end();
+            if covered && still {
+                assert!(
+                    inside,
+                    "nothing was written in the range taken whole (the ledger holds {} pages, {:?} in the range)",
+                    c.copy.ledger().len(),
+                    c.copy.ledger().dirty_in(at / PAGE, at / PAGE + N / 2)
+                );
+                assert!(!outside, "the second half was never taken");
+                judged = true;
+                break;
+            }
+        }
+        assert!(judged, "no asking stood long enough to judge the gate");
+        // A write in the first half, found by an asking: the gate is shut for the range until the copy takes it.
+        // SAFETY: inside the allocation.
+        unsafe { ((at + PAGE + 3) as *mut u8).write_volatile(9) };
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        crate::pagedrive::drain();
+        assert!(c.copy.ledger().len() > 0, "the ledger holds the page the asking found written");
+        assert!(!look(&c, at, N / 2 * PAGE));
+        // The shadow copy compared its gate with the journal's word on each pass.
+        look(&shadow, at, N / 2 * PAGE);
+        refresh(&c, at, N / 2 * PAGE);
+        refresh(&shadow, at, N / 2 * PAGE);
+        crate::watch::ask_once_end();
+        assert_eq!(crate::pagedrive::missed_total(), missed_before);
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Where shaders may write, a refresh leaves the copy alone, in every mode, and the pages the title wrote there
+    /// stay stale in the ledger as in the journal, until the flight is done: then the next refresh brings them.
+    #[test]
+    fn what_the_title_wrote_under_a_flights_range_waits_in_the_ledger_for_the_flight_to_land() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let write = |page: usize, offset: usize, byte: u8| {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + offset) as *mut u8).write_volatile(byte) }
+        };
+        let copies = vec![one(at, N, 0), one(at, N, 1), one(at, N, 2)];
+        let missed_before = crate::pagedrive::missed_total();
+        for c in &copies {
+            refresh(c, at, N * PAGE);
+            // Shaders may write the second half.
+            c.copy.pending.lock().unwrap().push((at + 4 * PAGE, at + 8 * PAGE));
+        }
+        write(2, 1, 11);
+        write(5, 2, 22);
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        for c in &copies {
+            crate::pagedrive::force_mode(Some(c.mode));
+            assert!(c.copy.stale_under_writes(at + 4 * PAGE, 4 * PAGE), "mode {}: the title wrote page 5 under the flight's range", c.mode);
+            crate::pagedrive::force_mode(None);
+            refresh(c, at, N * PAGE);
+            assert_eq!(c.side[2 * PAGE + 1], 11, "mode {}: the page outside the range", c.mode);
+            assert_eq!(c.side[5 * PAGE + 2], 0, "mode {}: the page under the flight's range is left alone", c.mode);
+        }
+        // The flight is done: the page the title wrote under it is taken.
+        for c in &copies {
+            c.copy.pending.lock().unwrap().clear();
+            refresh(c, at, N * PAGE);
+            assert_eq!(c.side[5 * PAGE + 2], 22, "mode {}: the page under the range is taken when it is free", c.mode);
+        }
+        crate::watch::ask_once_end();
+        assert_eq!(crate::pagedrive::missed_total(), missed_before);
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -3357,9 +4047,21 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
+        for key in &idle {
+            changed(key.0, key.0 + key.1);
+        }
+        if !idle.is_empty() {
+            // Before it looks at who holds them again: a thread that hands out what it remembers ([`LOOSE_FOUND`]) makes it
+            // held first, or finds this number moved.
+            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        }
+        let idle: Vec<(u64, u64)> = idle
+            .into_iter()
+            .filter(|key| map.get(key).is_some_and(|s| Arc::strong_count(s) == 1))
+            .collect();
         let gone: Vec<Arc<Shadow>> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
         if !gone.is_empty() {
-            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            moved(5);
         }
         gone
     };
@@ -3454,6 +4156,11 @@ impl Shadow {
         self.id
     }
 
+    /// The pages noted written since the copy took them (`crate::pagedrive`).
+    pub(crate) fn ledger(&self) -> &crate::pagedrive::Ledger {
+        &self.ledger
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -3478,6 +4185,8 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        // Nothing refreshes it.
+        crate::pagedrive::retire(&shadow.ledger);
         shadow
     }
 
@@ -3498,6 +4207,8 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
         Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
@@ -3513,9 +4224,12 @@ impl Shadow {
             settled: Settled::default(),
             quiet: Mutex::default(),
             gpu_only: Default::default(),
+            probed: AtomicU64::new(0),
             quiet_window: AtomicU64::new(0),
             quiet_landing: Default::default(),
             found_seq: AtomicU64::new(0),
+            refresh_us: std::sync::atomic::AtomicU32::new(0),
+            title_read: std::sync::atomic::AtomicBool::new(false),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -3525,16 +4239,28 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
-            id: {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            },
+            id,
+            ledger: crate::pagedrive::ledger_of(start, len, id),
             card: None,
             window: false,
             changes_only: Default::default(),
             mapped: false,
             place: None,
         }
+    }
+
+    /// A refresh of this copy took `us` microseconds: the moving mean (three parts of what it was, one of this)
+    /// follows. Not atomic as a whole (two refreshes of one copy at once may lose one): it only orders work.
+    pub(crate) fn note_refresh_cost(&self, us: u64) {
+        let us = us.min(u64::from(u32::MAX)) as u32;
+        let was = self.refresh_us.load(Ordering::Relaxed);
+        let now = if was == 0 { us.max(1) } else { ((u64::from(was) * 3 + u64::from(us)) / 4).max(1) as u32 };
+        self.refresh_us.store(now, Ordering::Relaxed);
+    }
+
+    /// What a refresh of this copy took lately, in microseconds (0: not known).
+    pub(crate) fn refresh_cost(&self) -> u32 {
+        self.refresh_us.load(Ordering::Relaxed)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -4032,9 +4758,10 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        let mode = crate::pagedrive::mode();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+        busy.into_iter().any(|(a, e)| match crate::watch::asked_with(a, e, mode != 2) {
+            Some((_, written)) => !self.stale_by_mode(mode, base, &copied, a, e, &written).is_empty(),
             None => true,
         })
     }
@@ -4056,10 +4783,18 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        self.merge_under_writes_with(address, len, runs_left, Locks::Wait) == Merged::Settle
+    }
+
+    /// [`Shadow::merge_under_writes`], with the copy's locks (`merging`, `before`) taken as `locks` says. With
+    /// [`Locks::Try`] a copy whose locks another thread holds (a landing of it, which holds `merging` shared) is
+    /// left as it is from that range on, [`Merged::Busy`]: what was done before stays done, and a call again, or one
+    /// that waits, does the rest (the pages it finds stale are the same, and those taken are noted).
+    pub(crate) fn merge_under_writes_with(&self, address: usize, len: usize, runs_left: &mut usize, locks: Locks) -> Merged {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return false;
+            return Merged::Done;
         }
         let busy: Vec<(usize, usize)> = self
             .pending
@@ -4070,11 +4805,11 @@ impl Shadow {
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
-            return false;
+            return Merged::Done;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             note_stale(0);
-            return true;
+            return Merged::Settle;
         }
         // The declared ranges overlap (views of the title's whole heap from
         // dozens of offsets): as one range each page is asked about and
@@ -4082,22 +4817,29 @@ impl Shadow {
         // copy in the PC's memory in the snapshot.
         let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
+        let mode = crate::pagedrive::mode();
         for (a, e) in busy {
+            // What is owed there is landed before the lock is taken alone.
+            crate::land::owed::land_range(a, e - a);
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
             // else the guards. The journal alone said nothing for copies
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let detecting = std::time::Instant::now();
+            let Some((now, written)) = crate::watch::writes_with(a, e, true, mode != 2) else {
                 note_stale(1);
-                return true;
+                return Merged::Settle;
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                self.stale_by_mode(mode, base, &copied, a, e, &written)
             };
+            UNDER[4].fetch_add(detecting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if stale.is_empty() {
+                UNDER[0].fetch_add(1, Ordering::Relaxed);
+                UNDER[1].fetch_add((e - a) as u64, Ordering::Relaxed);
                 continue;
             }
             // The lock of the copy's reference (the snapshot, or the
@@ -4108,8 +4850,22 @@ impl Shadow {
             // reference under the same lock, and a page read before
             // such a merge and compared after it would take the card's
             // bytes for the title's.
-            let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
-            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            let locking = std::time::Instant::now();
+            let Some((merging, mut before)) = self.merge_locks(locks) else {
+                // Not counted: the range is looked at again by the call that follows.
+                return Merged::Busy;
+            };
+            UNDER[0].fetch_add(1, Ordering::Relaxed);
+            UNDER[1].fetch_add((e - a) as u64, Ordering::Relaxed);
+            UNDER[2].fetch_add(stale.len() as u64, Ordering::Relaxed);
+            UNDER[3].fetch_add(1, Ordering::Relaxed);
+            let locked = locking.elapsed().as_nanos() as u64;
+            UNDER[5].fetch_add(locked, Ordering::Relaxed);
+            // (Under a microsecond is the locks taken at once.)
+            if locked > 1_000 {
+                crate::host::waits::note(crate::host::waits::Wait::CopyLocks, locked);
+            }
+            let merged = std::time::Instant::now();
             let held = if self.card.is_some() {
                 self.data as usize
             } else {
@@ -4117,7 +4873,7 @@ impl Shadow {
             };
             if held == 0 {
                 note_stale(3);
-                return true;
+                return Merged::Settle;
             }
             // A page's part in the range, compared and put in: the runs it
             // changed; none for a page that is not there (left as it is, and
@@ -4149,6 +4905,8 @@ impl Shadow {
                 (0..stale.len()).for_each(one);
             }
             *runs_left = left.into_inner().max(0) as usize;
+            UNDER[6].fetch_add(merged.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let putting = std::time::Instant::now();
             let mut taken = Vec::new();
             for (i, runs) in done.into_iter().enumerate() {
                 let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
@@ -4169,18 +4927,52 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut settles: Vec<(usize, u64)> = Vec::new();
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
                         *at = now;
+                        settles.push((page, now));
                     }
                 }
+                if mode > 0 {
+                    self.ledger.settle(&settles);
+                }
             }
+            UNDER[7].fetch_add(putting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if over.into_inner() {
                 note_stale(2);
-                return true;
+                return Merged::Settle;
             }
         }
-        false
+        Merged::Done
+    }
+
+    /// The locks [`Shadow::merge_under_writes_with`] puts title bytes in under: `merging` alone and then `before`
+    /// (in that order, as everything that takes both). With [`Locks::Try`], `None` if either is held by another thread:
+    /// nothing is kept then.
+    fn merge_locks(&self, locks: Locks) -> Option<(std::sync::RwLockWriteGuard<'_, ()>, std::sync::MutexGuard<'_, Option<Vec<u8>>>)> {
+        use std::sync::TryLockError::{Poisoned, WouldBlock};
+        match locks {
+            Locks::Wait => {
+                let merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
+                let before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                Some((merging, before))
+            }
+            Locks::Try => {
+                let merging = match self.merging.try_write() {
+                    Ok(guard) => guard,
+                    Err(Poisoned(e)) => e.into_inner(),
+                    Err(WouldBlock) => return None,
+                };
+                let before = match self.before.try_lock() {
+                    Ok(guard) => guard,
+                    Err(Poisoned(e)) => e.into_inner(),
+                    // (`merging` is let go as it goes out of scope.)
+                    Err(WouldBlock) => return None,
+                };
+                Some((merging, before))
+            }
+        }
     }
 
     /// Of [`Shadow::merge_under_writes`]: title memory `[lo, lo + n)`, in one
@@ -4241,6 +5033,21 @@ impl Shadow {
         })
     }
 
+    /// The pages of `[a, e)` that the copy took before and the title wrote since, as `copied` (from page `base`) and the
+    /// journal's `written` say (`mode` 0 and 1) or the ledger says (`mode` 2: `written` is not walked); in mode 1 the
+    /// ledger's answer is compared with the journal's (`crate::pagedrive`).
+    fn stale_by_mode(&self, mode: u8, base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+        if mode == 2 {
+            return stale_pages_in(base, copied, a, e, &crate::pagedrive::written(&self.ledger, a, e));
+        }
+        let stale = stale_pages_in(base, copied, a, e, written);
+        if mode == 1 {
+            let held = stale_pages_in(base, copied, a, e, &crate::pagedrive::written(&self.ledger, a, e));
+            crate::pagedrive::compare_under(&stale, &held, (a, e));
+        }
+        stale
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -4254,6 +5061,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        self.probe(from, to);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4338,7 +5146,17 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let ranged = self.ranged(from, to);
+        // (Read once: the switch may change while the title runs.)
+        let same = match crate::pagedrive::mode() {
+            2 => crate::pagedrive::nothing_new(&self.ledger, from, to, start / PAGE, &copied, ranged),
+            1 => {
+                let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, ranged);
+                crate::pagedrive::check_look(&self.ledger, from, to, start / PAGE, &copied, ranged);
+                same
+            }
+            _ => crate::watch::nothing_new(from, to, start / PAGE, &copied, ranged),
+        };
         drop(copied);
         if same && memo {
             if crate::watch::untouched_since(from, to, tick) {
@@ -4374,7 +5192,49 @@ impl Shadow {
         if held {
             crate::copystat::add(crate::copystat::C::NoteHits, 1);
         }
-        held
+        if held {
+            return true;
+        }
+        // The ledger knows it too (`VICTORY_PAGE_REFRESH`): a copy that holds no page noted since it took the range.
+        match crate::pagedrive::mode() {
+            0 => false,
+            mode => {
+                let gate = self.page_gate(from, to);
+                if mode == 1 {
+                    // (Shadow: the answer stays the memo's; the journal says whether the gate would have been wrong.)
+                    if gate {
+                        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        let stale = crate::watch::journal_stale(from, to, self.start as usize / PAGE, &copied, self.ranged(from, to));
+                        crate::pagedrive::gate_checked(stale);
+                    }
+                    false
+                } else {
+                    if gate {
+                        crate::pagedrive::gate_hit();
+                    }
+                    gate
+                }
+            }
+        }
+    }
+
+    /// Whether `[from, to)` (inside the copy) needs no look at all, from the copy's ledger alone: the memory is watched,
+    /// the copy holds no page of the range noted written after a range that holds it was taken whole, no flight's
+    /// declared range touches it, and the asking that stands covers it (one atomic and three short locks, none of the
+    /// copy's `copied`, and no walk of anything: `VICTORY_PAGE_REFRESH` stage 3).
+    fn page_gate(&self, from: usize, to: usize) -> bool {
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        crate::pagedrive::drain();
+        let ranged = self.ranged(from, to);
+        if ranged == 0 || self.ledger.any_after(from / PAGE, to.div_ceil(PAGE), ranged) {
+            return false;
+        }
+        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+            return false;
+        }
+        crate::watch::covered(from, to)
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
@@ -4387,12 +5247,21 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        // (`VICTORY_BUFFER_WHOLE`: a buffer the list names is taken whole from title memory
+        // at every refresh, whatever the watch and the notes say of it)
+        if buffer_listed(&BUFFER_WHOLE, self.start, self.len) {
+            return self.copy(from, to);
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // (Read once: the switch may change while the title runs.)
+            let mode = crate::pagedrive::mode();
+            if let Some((now, written)) = crate::watch::writes_with(from, to, true, mode != 2) {
+                // Driven: the pages are the ledger's, not a walk of the journal's entries in the range.
+                let written = if mode == 2 { crate::pagedrive::written(&self.ledger, from, to) } else { written };
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, mode);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4414,7 +5283,11 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let tick = crate::watch::tick();
-        self.copy(from, to);
+        if crate::echo::on() && self.quiet_able(from, to) && !crate::host::upcheck::on() {
+            self.copy_differing(from, to);
+        } else {
+            self.copy(from, to);
+        }
         if self.quiet_able(from, to) {
             *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) = Some((from, to, tick));
         }
@@ -4430,6 +5303,61 @@ impl Shadow {
     pub(crate) fn mark_gpu_only(&self) {
         crate::watch::quiet_mark(self.start as usize, (self.start + self.len) as usize);
         self.gpu_only.store(true, Ordering::Release);
+    }
+
+    /// Whether the title was seen to read this copy's buffer.
+    pub(crate) fn title_read(&self) -> bool {
+        self.title_read.load(Ordering::Relaxed) || {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            crate::readprobe::on() && crate::readprobe::touched_in(start, end).is_some() && {
+                self.title_read.store(true, Ordering::Relaxed);
+                true
+            }
+        }
+    }
+
+    /// The title touched the copy while a landing of it was owed.
+    pub(crate) fn note_title_read(&self) {
+        self.title_read.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a landing of this copy's pieces may be left owed
+    /// ([`crate::land::owed`]): a copy in the card's memory of a buffer in a
+    /// default heap that the title was not seen to read.
+    pub(crate) fn lazy_landing(&self) -> bool {
+        self.unwatched_landing() && !self.title_read()
+    }
+
+    /// For the tests of the owed set: the lock of landings, held alone.
+    #[cfg(test)]
+    pub(crate) fn hold_merging(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.merging.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// For the tests of the title's bytes put in under shader writes: the lock of the snapshot, held.
+    #[cfg(test)]
+    pub(crate) fn hold_before(&self) -> std::sync::MutexGuard<'_, Option<Vec<u8>>> {
+        self.before.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The shared lock of landings, taken by a thread that may be in the way
+    /// of one that holds it alone (the thread of a handler lands what a copy
+    /// owes while holding what it holds): for a little while, then not at all.
+    fn merging_patient(&self) -> Option<std::sync::RwLockReadGuard<'_, ()>> {
+        let began = std::time::Instant::now();
+        loop {
+            match self.merging.try_read() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if began.elapsed() > std::time::Duration::from_millis(250) {
+                        tracing::warn!(start = format_args!("{:#x}", self.start), "a landing owed went on without the copy's lock (its holder waits for it)");
+                        return None;
+                    }
+                    std::thread::yield_now();
+                }
+            }
+        }
     }
 
     /// Whether what a landing puts into this copy's title memory may be taken
@@ -4470,6 +5398,88 @@ impl Shadow {
         whole_pieces_of(self.start as usize, self.len as usize)
     }
 
+    /// Of the whole pages of `[from, to)` (pages of 64 KiB): how many bytes were looked at and how many of
+    /// them were written since the copy took them, by what the submission's asking
+    /// found (`None`: the kernel would have to be asked). For the check of
+    /// [`crate::host`]'s narrowed refreshes, after they are done and before the
+    /// asking stands no more.
+    pub(crate) fn stale_in(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to || self.place.is_some() {
+            return Some((0, 0));
+        }
+        let (_, written) = crate::watch::asked(from, to)?;
+        let base = start / PAGE;
+        let ranged = self.ranged(from, to);
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut looked, mut stale) = (0, 0);
+        let (first, last) = (from.div_ceil(PAGE), to / PAGE);
+        for page in first..last {
+            let taken = copied.get(page - base).copied().unwrap_or(0).max(ranged);
+            let write = written.binary_search_by_key(&page, |w| w.0).map_or(0, |i| written[i].1);
+            looked += PAGE;
+            if taken == 0 || write > taken {
+                stale += PAGE;
+            }
+        }
+        Some((looked, stale))
+    }
+
+    /// `VICTORY_BUFFER_PROBE=<hex address>,...`: for a buffer the list names, once in a while, what
+    /// title memory holds, what this copy's CPU side holds, and how the copy is kept, in a line:
+    /// the dwords that are not zero (the whole buffer and its first sixteen) on each side. The
+    /// copy is what the card's is made from; a title memory that holds a header the copy does
+    /// not is a copy that was not brought up to date.
+    fn probe(&self, from: usize, to: usize) {
+        if !buffer_listed(&BUFFER_PROBE, self.start, self.len) {
+            return;
+        }
+        let now = crate::host::now_ms();
+        let last = self.probed.load(Ordering::Relaxed);
+        if now < last.saturating_add(2000) || self.probed.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let n = (self.len as usize).min(8 << 20) & !3;
+        let mut title = vec![0u8; n];
+        let readable = crate::host::read_into(self.start as *const u8, &mut title);
+        // SAFETY: the copy's mapping is `len` bytes (rounded up).
+        let held = unsafe { std::slice::from_raw_parts(self.data.cast_const(), n) };
+        let look = ProbeLook::of(&title, held);
+        let pending: Vec<(usize, usize)> = self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let start = self.start as usize;
+        // Which of the pages that differ lie where shaders are writing (the refresh leaves those
+        // to the landing) and which not.
+        let in_flight = look.differ_at.iter().filter(|&&p| pending.iter().any(|&(a, e)| a < start + p + 4096 && e > start + p)).count();
+        let (tn, tf, cn, cf, differ) = (look.title_nonzero, look.title_first, look.copy_nonzero, look.copy_first, look.pages_differ);
+        tracing::info!(
+            start = format_args!("{:#x}", self.start),
+            len = self.len,
+            // (the list names an address: every buffer that holds it is probed, so one address can
+            // print the lines of several buffers that overlap)
+            starts_at_listed = buffer_starts_at(&BUFFER_PROBE, self.start),
+            readable,
+            title_nonzero = tn,
+            copy_nonzero = cn,
+            pages_differ = differ,
+            // (the range this refresh is asked for, as offsets: pages that differ outside it are
+            // pages no submission of this moment brings up to date)
+            asked = format_args!("{:#x}..{:#x}", from - start, to - start),
+            differ_at = ?look.differ_at.iter().map(|p| format!("{p:#x}")).collect::<Vec<_>>(),
+            differ_in_flight = in_flight,
+            title_at = ?look.title_at,
+            copy_at = ?look.copy_at,
+            gpu_only = self.gpu_only.load(Ordering::Relaxed),
+            watched = self.watched.load(Ordering::Relaxed),
+            on_card = self.card.is_some(),
+            in_place = self.place.is_some(),
+            pending = self.pending.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            title_first = ?tf,
+            copy_first = ?cf,
+            "buffer probe (VICTORY_BUFFER_PROBE)"
+        );
+    }
+
     /// Whether a refresh of `[from, to)` of memory that is not watched may
     /// take whole copies for noted ([`Shadow::quiet_skip`]).
     fn quiet_able(&self, from: usize, to: usize) -> bool {
@@ -4488,9 +5498,15 @@ impl Shadow {
             return false;
         }
         let Some((a, b, tick)) = *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) else {
+            crate::echo::skip_refused(0);
             return false;
         };
-        if a > from || to > b || !crate::watch::quiet_since(from, to, tick) {
+        if a > from || to > b {
+            crate::echo::skip_refused(1);
+            return false;
+        }
+        if !crate::watch::quiet_since(from, to, tick) {
+            crate::echo::skip_refused(2);
             return false;
         }
         const WINDOW: usize = 256 << 10;
@@ -4506,6 +5522,7 @@ impl Shadow {
             let held = unsafe { std::slice::from_raw_parts(self.data.add(at - self.start as usize).cast_const(), n) };
             crate::host::read_into(at as *const u8, title) && title[..] == *held
         });
+        crate::echo::skip_refused(if same { 4 } else { 3 });
         if !same {
             *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) = None;
             static SAID: AtomicU64 = AtomicU64::new(0);
@@ -4627,9 +5644,14 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], mode: u8) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        // The pages the ledger holds in the range (the shadow check, `VICTORY_PAGE_REFRESH=1`), and the entries a page
+        // taken removes (`settles`, with the copy's lock held).
+        let held = if mode == 1 { crate::pagedrive::written(&self.ledger, from, to) } else { Vec::new() };
+        let mut settles: Vec<(usize, u64)> = Vec::new();
+        let mut redundant = 0u64;
         let mut writes = written.iter().peekable();
         // Pages the range holds in part are never noted in `copied`, and
         // were copied again at every refresh of the range, written or not:
@@ -4659,6 +5681,9 @@ impl Shadow {
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                    if mode > 0 && write != 0 {
+                        settles.push((page, now));
+                    }
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
@@ -4679,9 +5704,26 @@ impl Shadow {
                     run = None;
                 }
                 run.get_or_insert((page, again));
-            } else if let Some((first, known)) = run.take() {
-                runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+            } else {
+                if mode > 0 && write != 0 {
+                    // Current: an entry of the ledger that is not newer than the copy goes.
+                    settles.push((page, taken));
+                    if held.binary_search_by_key(&page, |&(p, _)| p).is_ok_and(|i| held[i].1 <= taken) {
+                        redundant += 1;
+                    }
+                }
+                if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                }
             }
+        }
+        if mode > 0 {
+            if mode == 1 {
+                let journal: Vec<usize> = again_at.iter().map(|&(page, _)| page).collect();
+                crate::pagedrive::compare_refresh(&journal, &held, (from, to));
+                crate::pagedrive::extra(redundant);
+            }
+            self.ledger.settle(&settles);
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some((first, known)) = run {
@@ -4866,6 +5908,48 @@ impl Shadow {
         to - from
     }
 
+    /// [`Shadow::copy`] of a long range of a copy in a heap the title's CPU cannot write: only the 4 KiB blocks that
+    /// differ from the CPU side are stored and noted for the card (`VICTORY_QUIET_COMPARE`, [`crate::echo`]).
+    fn copy_differing(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let held = self.data as usize;
+        let parts = (to - from).div_ceil(crate::echo::PART);
+        let found = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let sink = found.clone();
+        wide_each(parts, move |i| {
+            let (lo, hi) = (from + i * crate::echo::PART, (from + (i + 1) * crate::echo::PART).min(to));
+            let mut runs = Vec::new();
+            // SAFETY: inside the copy's mapping, which nothing else reads or writes there (no shader's range holds it
+            // and the parts of a refresh lie apart).
+            unsafe {
+                crate::echo::take_differing(
+                    &|address, buffer| crate::host::read_into(address as *const u8, buffer),
+                    &|address, dst, n| crate::host::copy_mapped(dst, address as *const u8, n, false),
+                    (held + (lo - start)) as *mut u8,
+                    lo,
+                    hi,
+                    lo - start,
+                    &mut runs,
+                );
+            }
+            sink.lock().unwrap_or_else(|e| e.into_inner()).extend(runs);
+        });
+        let mut runs = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+        // (The parts finish in any order.)
+        runs.sort_unstable();
+        let runs = joined(runs);
+        for &(a, b) in &runs {
+            self.changed(a, b);
+        }
+        crate::echo::note(to - from, runs.iter().map(|r| r.1 - r.0).sum());
+        self.card_changed_runs(runs.into_iter());
+        to - from
+    }
+
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -4938,7 +6022,11 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        if !card.touched.swap(true, Ordering::AcqRel)
+            && let Some(me) = card.me.get()
+        {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4958,6 +6046,8 @@ impl Shadow {
             return;
         }
         let bytes = &bytes[self.start as usize + from - address..][..to - from];
+        // What is owed there is landed before the lock is taken alone.
+        crate::land::owed::land_range(address, bytes.len());
         CAUSES[4].fetch_add(bytes.len() as u64, Ordering::Relaxed);
         CAUSES[5].fetch_add(1, Ordering::Relaxed);
         let _merging = self.merging.write().unwrap_or_else(|e| e.into_inner());
@@ -4993,6 +6083,12 @@ impl Shadow {
     /// yet.
     pub(crate) fn card_dirty_now(&self) -> Vec<(usize, usize)> {
         self.card.as_ref().map_or_else(Vec::new, |c| c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    }
+
+    /// Whether a copy in the card's memory has its twin (the bytes from before), as
+    /// `card_sides` says, without a hold on it (a COM count shared with the threads that use it).
+    pub(crate) fn has_before(&self) -> bool {
+        self.card.as_ref().is_some_and(|c| c.before.lock().unwrap_or_else(|e| e.into_inner()).is_some())
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -5237,6 +6333,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -5284,11 +6381,27 @@ impl Shadow {
     /// The third of each piece is the address of its bytes, which stay as
     /// they are during the call.
     pub(crate) unsafe fn land_card(&self, pieces: &[(usize, usize, usize)], fetched_after: u64, notes: &mut crate::land::Notes) -> u64 {
+        // SAFETY: the caller's.
+        unsafe { self.land_card_with(pieces, fetched_after, notes, false) }
+    }
+
+    /// [`Shadow::land_card`]; `patient`: the lock is waited for only a while
+    /// ([`Shadow::merging_patient`]).
+    ///
+    /// # Safety
+    /// [`Shadow::land_card`]'s.
+    pub(crate) unsafe fn land_card_with(
+        &self,
+        pieces: &[(usize, usize, usize)],
+        fetched_after: u64,
+        notes: &mut crate::land::Notes,
+        patient: bool,
+    ) -> u64 {
         let Some(card) = &self.card else {
             return 0;
         };
         let waiting = std::time::Instant::now();
-        let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
+        let _merging = if patient { self.merging_patient() } else { Some(self.merging.read().unwrap_or_else(|e| e.into_inner())) };
         crate::land::spent(crate::land::stat::LOCK, waiting);
         let (from, to) = pieces.iter().fold((usize::MAX, 0), |(a, b), p| (a.min(p.0), b.max(p.1)));
         let skip: Vec<(usize, usize)> = {
@@ -5383,6 +6496,7 @@ impl Shadow {
         let held = *at != 0 && *at >= before && (clean || crate::watch::block_published(block));
         if held {
             *at = (*at).max(now);
+            self.ledger.settle(&[(block, *at)]);
         }
         held
     }
@@ -5407,6 +6521,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5598,6 +6713,43 @@ static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 /// under the map's lock, after the change.
 static WINDOWS_CHANGED: AtomicU64 = AtomicU64::new(0);
 
+/// What moved [`world`], per frame for the line: buffers registered, unregistered, taken out in place, copies made
+/// (two kinds of ask), windows let go of, taken out in place, made, copies of a view's own bytes.
+static WORLD_BY: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// A window or a copy of a view's own bytes came or went (`source` an index of [`WORLD_BY`]).
+fn moved(source: usize) {
+    WORLD_BY[source].fetch_add(1, Ordering::Relaxed);
+    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// [`buffers`], for the count of what moved [`world`].
+fn buffers_for(source: usize) -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entry>> {
+    WORLD_BY[source].fetch_add(1, Ordering::Relaxed);
+    buffers()
+}
+
+/// For the frame line: how often and by what [`world`] moved per frame over `frames`.
+pub(crate) fn world_line(frames: f64) {
+    let c: Vec<f64> = WORLD_BY.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if c.iter().sum::<f64>() == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "what moved the state of the copies of title memory per frame ({:.2} in all): buffers registered {:.2}, unregistered {:.2}, taken out in place {:.2}, copies of buffers made {:.2} ({:.2} on a second ask), windows let go of {:.2}, windows taken out in place {:.2}, windows made {:.2}, copies of views' own bytes made or let go {:.2}",
+        c.iter().sum::<f64>(),
+        c[0],
+        c[1],
+        c[2],
+        c[3],
+        c[4],
+        c[5],
+        c[6],
+        c[7],
+        c[8]
+    );
+}
+
 /// A number that grows whenever the copy a title address range is found on can be another one: a buffer came, went or
 /// got its copy ([`BUFFERS`]), a window or a copy of a view's own bytes came or went. What was made from the answer
 /// of [`find`] while it had a value is as good as then while it has it still
@@ -5608,6 +6760,51 @@ pub(crate) fn world() -> u64 {
         return pinned;
     }
     BUFFERS_CHANGED.load(Ordering::SeqCst) + WINDOWS_CHANGED.load(Ordering::SeqCst)
+}
+
+/// The changes of what asks about title memory are answered by, with the range of each (`crate::changes`).
+static CHANGES: crate::changes::ChangeLog = crate::changes::ChangeLog::new();
+
+/// Whether caches keep what they made while nothing changed in the address range it depends on, not while nothing changed
+/// at all (`VICTORY_RANGE_VALID=1`; off by default).
+fn range_valid() -> bool {
+    #[cfg(test)]
+    if TEST_RANGE_VALID.load(Ordering::Relaxed) {
+        return true;
+    }
+    crate::ab::live_flag!("VICTORY_RANGE_VALID")
+}
+
+#[cfg(test)]
+static TEST_RANGE_VALID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The top bit of a stamp: it was made by the log of changes (`VICTORY_RANGE_VALID=1`), not by the counts. The switch may
+/// change while the title runs (`VICTORY_AB`): what was stamped one way is never said to hold by the other (the numbers
+/// of the two are unrelated), it is made again.
+const RANGE_STAMP: u64 = 1 << 63;
+
+/// Whether `stamp` was made the way `range` says.
+fn stamped_so(stamp: u64, range: bool) -> bool {
+    (stamp & RANGE_STAMP != 0) == range
+}
+
+/// A change of what is answered for addresses `[lo, hi)` (buffers and windows that came or went, copies of a view's own
+/// bytes): logged under the lock that makes it.
+fn changed(lo: u64, hi: u64) {
+    CHANGES.log(lo, hi);
+}
+
+/// What a cache stamps what it makes from the answers of [`find`] with: read before the ask.
+pub(crate) fn stamp() -> u64 {
+    if range_valid() { CHANGES.stamp() | RANGE_STAMP } else { world() }
+}
+
+/// Whether what was made from answers found on addresses `[lo, hi)` when [`stamp`] was `stamp` holds still: nothing
+/// changed (with `VICTORY_RANGE_VALID=1`: nothing in that range).
+pub(crate) fn still(stamp: u64, lo: u64, hi: u64) -> bool {
+    let range = range_valid();
+    stamped_so(stamp, range)
+        && if range { !CHANGES.changed_since(stamp & !RANGE_STAMP, lo, hi) } else { world() == stamp }
 }
 
 #[cfg(test)]
@@ -5624,6 +6821,30 @@ pub(crate) fn pin_world_for_test(world: Option<u64>) {
 
 /// Answers a thread remembers.
 const FOUND_MOST: usize = 1024;
+
+/// Whether a thread remembers more answers, and those of windows outside buffers too (`VICTORY_ASK_CACHE=1`; off by
+/// default): the list threads ask 40,000 times a frame for the copies of a few thousand ranges, and the answer to most is
+/// one lock and a search of a map away (6 to 10 % of their time).
+fn ask_cache() -> bool {
+    #[cfg(test)]
+    if TEST_ASK_CACHE.load(Ordering::Relaxed) {
+        return true;
+    }
+    crate::ab::live_flag!("VICTORY_ASK_CACHE")
+}
+
+#[cfg(test)]
+static TEST_ASK_CACHE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many answers of [`BUFFERS`] a thread remembers.
+fn found_most() -> usize {
+    if ask_cache() { 8 * FOUND_MOST } else { FOUND_MOST }
+}
+
+thread_local! {
+    /// The answers of [`loose`] for the windows it names by the ask alone.
+    static LOOSE_FOUND: std::cell::RefCell<Option<crate::asked::Asked<Shadow>>> = const { std::cell::RefCell::new(None) };
+}
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -5644,29 +6865,49 @@ fn quick_find() -> bool {
 
 fn found_at(address: u64, len: u64) -> usize {
     let h = (address ^ len.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    (h >> 54) as usize % FOUND_MOST
+    (h >> 40) as usize % found_most()
 }
 
 /// What this thread remembers of an ask, if nothing changed since.
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
-    let shadow = FOUND.with(|f| {
+    let end = address.saturating_add(len.max(1));
+    let (shadow, stamp) = FOUND.with(|f| {
         let f = f.borrow();
         let (a, n, at, shadow) = f.get(found_at(address, len))?;
-        ((*a, *n, *at) == (address, len, changed)).then(|| shadow.upgrade()).flatten()
+        if (*a, *n) != (address, len) || !found_still(*at, address, end) {
+            return None;
+        }
+        shadow.upgrade().map(|s| (s, *at))
     })?;
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    found_still(stamp, address, end).then_some(shadow)
+}
+
+/// What [`FOUND`] stamps its answers with: the count of changes of [`BUFFERS`], or with `VICTORY_RANGE_VALID=1` of the log.
+fn found_stamp() -> u64 {
+    if range_valid() { CHANGES.stamp() | RANGE_STAMP } else { BUFFERS_CHANGED.load(Ordering::SeqCst) }
+}
+
+/// Whether an answer of [`FOUND`] for the ask `[lo, hi)` stamped with `stamp` holds still.
+fn found_still(stamp: u64, lo: u64, hi: u64) -> bool {
+    let range = range_valid();
+    stamped_so(stamp, range)
+        && if range {
+            !CHANGES.changed_since(stamp & !RANGE_STAMP, lo, hi)
+        } else {
+            BUFFERS_CHANGED.load(Ordering::SeqCst) == stamp
+        }
 }
 
 /// Remembers an answer given while `changed` was the count.
 fn remember(address: u64, len: u64, changed: u64, shadow: &Arc<Shadow>) {
     FOUND.with(|f| {
         let mut f = f.borrow_mut();
-        if f.is_empty() {
-            f.resize_with(FOUND_MOST, || (0, 0, 0, std::sync::Weak::new()));
+        if f.len() != found_most() {
+            f.clear();
+            f.resize_with(found_most(), || (0, 0, 0, std::sync::Weak::new()));
         }
         f[found_at(address, len)] = (address, len, changed, Arc::downgrade(shadow));
     });
@@ -5678,7 +6919,8 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
-    buffers().insert(
+    let mut map = buffers_for(0);
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -5686,11 +6928,15 @@ pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
             gpu_only,
         },
     );
+    changed(start, start + len);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers_for(1);
+    if let Some(entry) = map.remove(&(start, resource)) {
+        changed(start, entry.end);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5719,16 +6965,20 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
             .map(|(key, _)| *key)
             .collect();
+        for key in &keys {
+            changed(key.0, key.0 + key.1);
+        }
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
         if !gone.is_empty() {
-            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            moved(6);
         }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
-        let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        let mut map = buffers_for(2);
+        for (key, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+                changed(key.0, entry.end);
                 gone.extend(entry.shadow.take());
             }
         }
@@ -5782,6 +7032,20 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// What the copy of a title buffer is, in a few words (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn describe_copy(address: u64, len: u64) -> String {
+    match peek(address, len) {
+        None => "no copy".into(),
+        Some(shadow) => format!(
+            "copy card={} gpu_only={} quiet_landing_on={}",
+            shadow.card.is_some(),
+            shadow.gpu_only.load(Ordering::Acquire),
+            crate::land::quiet::on()
+        ),
+    }
+}
+
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
@@ -5801,7 +7065,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
                     // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, found_stamp(), shadow);
                 }
                 return Some(shadow.clone());
             }
@@ -5812,7 +7076,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             }
         }
     }
-    let mut map = buffers();
+    let mut map = buffers_for(3);
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -5856,7 +7120,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     };
     drop(held);
     let made = make_copy(key.0, blen, size, gpu_only);
-    let mut map = buffers();
+    let mut map = buffers_for(4);
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() && entry.end == end_of {
         entry.shadow = made;
@@ -5868,9 +7132,76 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 
 /// Whether a title buffer's copy is made with the buffer map free
 /// (`VICTORY_MAKE_ASIDE=0`: under its lock, as before).
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_MAKE_ASIDE=0`: read once for the buffer asked for. A
+/// thread that makes the copy under the lock while another is making one aside makes a second copy of the same
+/// bytes: the one that comes second finds the place taken and is let go of, as a copy that lost its place is.)
 fn made_aside() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MAKE_ASIDE").is_none_or(|v| v != "0"))
+    crate::ab::live_value!("VICTORY_MAKE_ASIDE", bool, crate::ab::unless_zero)
+}
+
+/// A list of title addresses in an environment variable (hex, comma apart): the buffers that hold
+/// one are the ones it names.
+struct BufferList {
+    name: &'static str,
+    at: std::sync::OnceLock<Vec<u64>>,
+}
+
+/// `VICTORY_BUFFER_PROBE` ([`Shadow::probe`]).
+static BUFFER_PROBE: BufferList = BufferList { name: "VICTORY_BUFFER_PROBE", at: std::sync::OnceLock::new() };
+/// `VICTORY_BUFFER_WHOLE`: the buffers that are taken whole from title memory at every refresh
+/// (an experiment: what a copy that the watch and the notes keep from being brought up to date
+/// would hold otherwise).
+static BUFFER_WHOLE: BufferList = BufferList { name: "VICTORY_BUFFER_WHOLE", at: std::sync::OnceLock::new() };
+
+fn buffer_listed(list: &BufferList, start: u64, len: u64) -> bool {
+    let at = list.at.get_or_init(|| {
+        std::env::var(list.name)
+            .map(|v| v.split(',').filter_map(|a| u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()).collect())
+            .unwrap_or_default()
+    });
+    at.iter().any(|&a| a >= start && a < start + len)
+}
+
+/// Whether the list names exactly this buffer's first address (the others it lists only hold one).
+fn buffer_starts_at(list: &BufferList, start: u64) -> bool {
+    list.at.get().is_some_and(|at| at.contains(&start))
+}
+
+/// What a buffer probe sees ([`Shadow::probe`]): title memory against the copy's CPU side.
+#[derive(Debug, PartialEq)]
+struct ProbeLook {
+    title_nonzero: usize,
+    copy_nonzero: usize,
+    /// The first dwords of each.
+    title_first: Vec<u32>,
+    copy_first: Vec<u32>,
+    /// The first dwords that are not zero (dword number, value), few of them.
+    title_at: Vec<(usize, u32)>,
+    copy_at: Vec<(usize, u32)>,
+    /// Pages of 4 KiB that differ, and where (offsets from the buffer's start) the first of them.
+    pages_differ: usize,
+    differ_at: Vec<usize>,
+}
+
+impl ProbeLook {
+    /// How many places each list names.
+    const SHOWN: usize = 8;
+
+    fn of(title: &[u8], held: &[u8]) -> ProbeLook {
+        let dwords = |b: &[u8]| {
+            let all = || b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            let first: Vec<u32> = all().take(16).collect();
+            let nonzero = all().filter(|&d| d != 0).count();
+            let at: Vec<(usize, u32)> = all().enumerate().filter(|&(_, d)| d != 0).take(Self::SHOWN).collect();
+            (nonzero, first, at)
+        };
+        let ((title_nonzero, title_first, title_at), (copy_nonzero, copy_first, copy_at)) = (dwords(title), dwords(held));
+        let mut differ = title.chunks(4096).zip(held.chunks(4096)).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i * 4096);
+        let differ_at: Vec<usize> = differ.by_ref().take(Self::SHOWN).collect();
+        let pages_differ = differ_at.len() + differ.count();
+        ProbeLook { title_nonzero, copy_nonzero, title_first, copy_first, title_at, copy_at, pages_differ, differ_at }
+    }
 }
 
 /// The buffers whose copies are being made ([`made_aside`]).
@@ -5947,6 +7278,7 @@ fn make_copy(start: u64, len: u64, size: u64, gpu_only: bool) -> Option<Arc<Shad
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
                 size,
             };
             (on_card, Some(card))
@@ -6002,7 +7334,8 @@ fn window() -> u64 {
     static GRID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GRID.get_or_init(|| {
         let kb = std::env::var("VICTORY_WINDOW_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        grid(kb)
+        // (`VICTORY_RAM_LEAN=2` asks for 1 MiB where nothing else is said.)
+        grid(kb.or_else(crate::lean::window_kb))
     })
 }
 
@@ -6040,7 +7373,10 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
 /// tail is that.
 fn tails() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOW_TAILS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WINDOW_TAILS") {
+        Some(v) => v == "1",
+        None => crate::lean::window_tails(),
+    })
 }
 
 /// Tails begin on multiples of this. A longer tail is a new host buffer,
@@ -6148,13 +7484,35 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         let mb = std::env::var("VICTORY_MEMORY_CARD_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         mb.unwrap_or(4096) << 20
     });
-    let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
+    // `VICTORY_MEMORY_CARD_OVER=1`: the card's budget is not asked (the
+    // layer keeps below it so that the system does not move its resources
+    // about; a card that is over it already, as the title's own copies can
+    // leave an 8 GiB one, then has every copy by address in the PC's memory,
+    // read over the bus with every step of every ray).
+    static OVER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let over = *OVER.get_or_init(|| std::env::var_os("VICTORY_MEMORY_CARD_OVER").is_some_and(|v| v == "1"));
+    let video = host.video_memory();
+    let room = over || video.is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
     let (staging, data) = host.shared_buffer(len)?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
         host.uav_buffer(len)
     } else {
         None
     };
+    if on_card.is_none() {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::warn!(
+                start = format_args!("{start:#x}"),
+                len,
+                room,
+                on_card_mb = USED.load(Ordering::Relaxed) >> 20,
+                most_mb = most >> 20,
+                budget_used_mb = ?video.map(|[budget, used, ..]| (budget >> 20, used >> 20)),
+                "title memory by address: a copy is in the PC's memory, not on the card: the shaders read it over the bus (`VICTORY_MEMORY_CARD_OVER=1` leaves out the card's budget, `VICTORY_MEMORY_CARD_MB` the most)"
+            );
+        }
+    }
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,
@@ -6174,6 +7532,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+                me: Default::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
@@ -6206,9 +7565,27 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     };
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+        // (The number is read before the lock: see `crate::asked`.)
+        let stamp = stamp();
+        let asked = ask_cache();
+        let (lo, hi) = (named.0, named.0.saturating_add(named.1));
+        if asked
+            && let Some(shadow) =
+                LOOSE_FOUND.with(|f| f.borrow().as_ref().and_then(|f| f.get(named.0, named.1, |st| still(st, lo, hi))))
+        {
+            note(&shadow);
+            return Some(shadow);
+        }
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         if let Some(shadow) = map.get(&named) {
             note(shadow);
+            if asked {
+                LOOSE_FOUND.with(|f| {
+                    f.borrow_mut()
+                        .get_or_insert_with(|| crate::asked::Asked::new(4096))
+                        .put(named.0, named.1, stamp, shadow)
+                });
+            }
             return Some(shadow.clone());
         }
     }
@@ -6235,7 +7612,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
-        WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        moved(7);
+        changed(start, start + len);
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -6249,7 +7627,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
-        WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        moved(7);
+        changed(start, start + len);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6265,6 +7644,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -6287,7 +7667,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
-    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    moved(7);
+    changed(start, start + len);
     Some(shadow)
 }
 
@@ -6343,7 +7724,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
         if map.len() != before {
-            WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+            moved(8);
+            // (Which went is not looked at: all views' own copies are of memory in no buffer or window.)
+            changed(0, u64::MAX);
         }
     }
     let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
@@ -6352,7 +7735,8 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
-    WINDOWS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    moved(8);
+    changed(address, address.saturating_add(len));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     OWN_MADE.fetch_add(1, Ordering::Relaxed);
     Some(shadow)
@@ -6714,7 +8098,7 @@ mod settled_tests {
 
 #[cfg(test)]
 mod quiet_tests {
-    use super::Shadow;
+    use super::{BufferList, Shadow, buffer_listed};
 
     const LEN: usize = 5 << 20;
     const WINDOW: usize = 256 << 10;
@@ -6759,6 +8143,54 @@ mod quiet_tests {
         assert_eq!(held, title);
     }
 
+    #[test]
+    fn a_buffer_list_names_the_buffers_that_hold_one_of_its_addresses() {
+        let list = BufferList { name: "VICTORY_NO_SUCH_LIST", at: std::sync::OnceLock::from(vec![0x1_0000, 0x9957a2f00]) };
+        assert!(buffer_listed(&list, 0x9957a2f00, 1_434_624));
+        assert!(buffer_listed(&list, 0x9957a0000, 0x10000 * 40));
+        assert!(!buffer_listed(&list, 0x9957a2f01, 1_434_624));
+        assert!(!buffer_listed(&list, 0x2_0000, 0x1000));
+        let none = BufferList { name: "VICTORY_NO_SUCH_LIST", at: std::sync::OnceLock::new() };
+        assert!(!buffer_listed(&none, 0x1_0000, 0x1000));
+    }
+
+    /// Two buffers that overlap each hold the listed address, and each prints its own line (the
+    /// probe of one address showed two "phases": a 1.4 MB table and the 4 MiB buffer around its
+    /// start); only one starts at it.
+    #[test]
+    fn a_listed_address_in_two_overlapping_buffers_is_told_apart_by_where_each_starts() {
+        let list = BufferList { name: "VICTORY_NO_SUCH_LIST", at: std::sync::OnceLock::from(vec![0x9957a2f00]) };
+        assert!(buffer_listed(&list, 0x9957a2f00, 1_434_624));
+        assert!(buffer_listed(&list, 0x995400000, 4 << 20));
+        assert!(!super::buffer_starts_at(&list, 0x995400000));
+        assert!(super::buffer_starts_at(&list, 0x9957a2f00));
+    }
+
+    /// The probe names the pages that differ and the dwords that are not zero, and counts the
+    /// pages it does not name.
+    #[test]
+    fn the_probe_names_where_title_memory_and_the_copy_differ() {
+        let mut title = vec![0u8; 20 * 4096];
+        title[..4].copy_from_slice(&89663u32.to_le_bytes());
+        let end = title.len();
+        title[end - 8..end - 4].copy_from_slice(&89663u32.to_le_bytes());
+        let mut held = title.clone();
+        let same = super::ProbeLook::of(&title, &held);
+        assert_eq!((same.title_nonzero, same.copy_nonzero, same.pages_differ), (2, 2, 0));
+        assert_eq!(same.title_at, vec![(0, 89663), (20 * 1024 - 2, 89663)]);
+        assert!(same.differ_at.is_empty());
+        // Pages 0, 3 and every even page from 10 on differ (named, up to eight; the rest are counted).
+        held[3 * 4096 + 12] = 1;
+        for page in (10..20).step_by(2) {
+            held[page * 4096] = 7;
+        }
+        held[1..4].fill(0);
+        let look = super::ProbeLook::of(&title, &held);
+        assert_eq!(look.pages_differ, 1 + 1 + 5, "pages 0, 3, 10, 12, 14, 16, 18");
+        assert_eq!(look.differ_at, vec![0, 3 * 4096, 10 * 4096, 12 * 4096, 14 * 4096, 16 * 4096, 18 * 4096]);
+        assert_eq!(look.copy_nonzero, 2 + 1 + 5);
+    }
+
     /// What `make_copy` does with a buffer `register` said is in a heap the
     /// title's CPU cannot write (kept apart from the making of the copy, which
     /// moved out of the map's lock): the copy skips its whole refreshes.
@@ -6785,6 +8217,28 @@ mod quiet_tests {
         assert_eq!(bare.update(start, LEN), LEN);
         title[1 << 20] ^= 1;
         assert_eq!(bare.update(start, LEN), LEN);
+    }
+
+    /// A whole copy that takes only what differs (`VICTORY_QUIET_COMPARE`): the copy ends up holding title memory,
+    /// and only the blocks that changed since the last are noted for the card.
+    #[test]
+    fn a_whole_copy_by_comparing_notes_only_the_blocks_that_differ() {
+        let mut title: Vec<u8> = (0..LEN).map(|i| (i % 241) as u8 | 1).collect();
+        let mut held = vec![0u8; LEN];
+        let start = title.as_ptr() as usize;
+        let copy = Shadow::unbacked(start as u64, held.as_mut_ptr(), LEN as u64, true);
+        assert_eq!(copy.copy_differing(start, start + LEN), LEN);
+        assert_eq!(held, title);
+        assert_eq!(copy.take_dirty(), vec![(0, LEN)], "the first time all of it differs");
+        // The same title memory: nothing goes up.
+        assert_eq!(copy.copy_differing(start, start + LEN), LEN);
+        assert!(copy.take_dirty().is_empty());
+        title[5 * 4096 + 7] ^= 1;
+        title[(3 << 20) + 100] ^= 1;
+        title[LEN - 1] ^= 1;
+        copy.copy_differing(start, start + LEN);
+        assert_eq!(held, title);
+        assert_eq!(copy.take_dirty(), vec![(5 * 4096, 6 * 4096), (3 << 20, (3 << 20) + 4096), (LEN - 4096, LEN)]);
     }
 }
 
@@ -6873,5 +8327,238 @@ mod making_tests {
             t.join().unwrap();
         }
         assert_eq!(made.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod ask_cache_tests {
+    use super::*;
+
+    /// Threads that ask for the copy of the same memory outside buffers with `VICTORY_ASK_CACHE` on get one copy, each
+    /// time, whatever is remembered.
+    #[test]
+    fn threads_asking_again_and_again_get_the_one_window() {
+        TEST_ASK_CACHE.store(true, Ordering::Relaxed);
+        let memory = vec![0u8; 64 << 10];
+        let at = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let Some(first) = find(at, 256) else {
+            return; // no host GPU
+        };
+        // What each ask gets with nothing remembered: held, so that no window goes.
+        let expected: Vec<Arc<Shadow>> = (0..8u64).map(|k| find(at + k * 256, 256).expect("a window")).collect();
+        assert!(Arc::ptr_eq(&first, &expected[0]));
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let expected = &expected;
+                s.spawn(move || {
+                    for i in 0..2000u64 {
+                        let k = ((i + t) % 8) as usize;
+                        let again = find(at + k as u64 * 256, 256).expect("the window is there");
+                        assert!(Arc::ptr_eq(&expected[k], &again));
+                    }
+                });
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod range_valid_tests {
+    use super::*;
+
+    /// The tests that turn range validity on take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// With `VICTORY_RANGE_VALID` a buffer that comes or goes changes what is stamped for its own addresses and for no others.
+    #[test]
+    fn a_buffer_changes_the_stamps_of_its_addresses_only() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        TEST_RANGE_VALID.store(true, Ordering::Relaxed);
+        // Addresses no title memory has (tests on other threads log changes of their own memory at any time, and a log that
+        // has seen too many since a stamp cannot tell: the part about the range outside is tried again then).
+        let (a, len) = (0x7f10_0000_0000u64, 4096u64);
+        let (inside, outside) = ((a + 100, a + 200), (a + (64 << 20), a + (64 << 20) + 100));
+        let mut told = false;
+        for _ in 0..16 {
+            let at_start = stamp();
+            register(0x5eed_0001, a, len, false);
+            // A change inside always shows.
+            assert!(!still(at_start, inside.0, inside.1), "a buffer registered over the range");
+            let registered = stamp();
+            unregister(0x5eed_0001, a);
+            assert!(!still(registered, inside.0, inside.1), "a buffer unregistered from it");
+            if still(at_start, outside.0, outside.1) {
+                told = true;
+                break;
+            }
+        }
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+        assert!(told, "a range nobody changed was said to be changed 16 times");
+    }
+
+    /// `VICTORY_RANGE_VALID` may change while the title runs (`VICTORY_AB`): what was stamped one way is never said to
+    /// hold by the other, even where the two numbers happen to be the same; by its own way it holds.
+    #[test]
+    fn a_stamp_made_the_other_way_never_holds() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        pin_world_for_test(Some(7));
+        let (lo, hi) = (0x7f20_0000_0000u64, 0x7f20_0000_1000u64);
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+        let counted = stamp();
+        assert!(still(counted, lo, hi), "the count is as it was");
+        TEST_RANGE_VALID.store(true, Ordering::Relaxed);
+        let ranged = stamp();
+        let by_log_number = still(counted, lo, hi);
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+        // (The count the log had, as a count: the same number, the other way.)
+        pin_world_for_test(Some(ranged & !RANGE_STAMP));
+        let by_count_number = still(ranged, lo, hi);
+        assert!(still(stamp(), lo, hi), "a stamp of the way that is on holds while nothing moved");
+        pin_world_for_test(None);
+        assert!(ranged & RANGE_STAMP != 0 && counted & RANGE_STAMP == 0);
+        assert!(!by_log_number, "a count taken for a log number");
+        assert!(!by_count_number, "a log number taken for a count");
+        assert!(stamped_so(ranged, true) && !stamped_so(ranged, false) && stamped_so(counted, false));
+    }
+    /// Threads that ask for windows again and again while another changes things all over (but not there): the one window each
+    /// time, with the asks remembered by range.
+    #[test]
+    fn asks_remembered_by_range_give_the_one_window_while_others_change() {
+        let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        TEST_RANGE_VALID.store(true, Ordering::Relaxed);
+        TEST_ASK_CACHE.store(true, Ordering::Relaxed);
+        let memory = vec![0u8; 64 << 10];
+        let at = (memory.as_ptr() as u64).next_multiple_of(4096);
+        let Some(first) = find(at, 256) else {
+            TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+            return; // no host GPU
+        };
+        let expected: Vec<Arc<Shadow>> = (0..8u64).map(|k| find(at + k * 256, 256).expect("a window")).collect();
+        assert!(Arc::ptr_eq(&first, &expected[0]));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut i = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    // Buffers that come and go far from the window.
+                    register(0x5eed_1000 + i as usize % 4, 0x7f30_0000_0000 + i % 4 * 0x10_0000, 4096, false);
+                    unregister(0x5eed_1000 + i as usize % 4, 0x7f30_0000_0000 + i % 4 * 0x10_0000);
+                    i += 1;
+                    std::thread::yield_now();
+                }
+            });
+            let workers: Vec<_> = (0..4u64)
+                .map(|t| {
+                    let expected = &expected;
+                    s.spawn(move || {
+                        for i in 0..2000u64 {
+                            let k = ((i + t) % 8) as usize;
+                            let again = find(at + k as u64 * 256, 256).expect("the window is there");
+                            assert!(Arc::ptr_eq(&expected[k], &again));
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+        TEST_RANGE_VALID.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod dirty_tests {
+    use super::*;
+
+    /// A copy in the card's memory with nothing behind it, known to the queue.
+    fn carded(start: u64, memory: &mut [u8]) -> Arc<Shadow> {
+        let shadow = Shadow::unbacked(start, memory.as_mut_ptr(), memory.len() as u64, true);
+        let card = shadow.card.as_ref().unwrap();
+        let _ = card.me.set(Arc::downgrade(&shadow));
+        shadow
+    }
+
+    /// What the queue holds for these, taken out of the global one (other tests' stay).
+    fn queued(of: &[Arc<Shadow>]) -> Vec<std::sync::Weak<Shadow>> {
+        let mut all = TOUCHED.lock().unwrap_or_else(|e| e.into_inner());
+        let (mine, others): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut *all).into_iter().partition(|w| of.iter().any(|s| std::ptr::eq(w.as_ptr(), Arc::as_ptr(s))));
+        *all = others;
+        mine
+    }
+
+    /// The copies found through the queue are those the look at all of them finds, with the same
+    /// ranges and in the same order, whatever was touched, however often, between the looks.
+    #[test]
+    fn the_queue_finds_the_copies_a_look_at_all_of_them_finds() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as usize % n
+        };
+        let mut memory = vec![0u8; 40 * 4096];
+        let (mut found, mut none) = (0, 0);
+        for round in 0..300 {
+            // Two sets alike: one looked at by the queue, one at all of them.
+            let (a, b): (Vec<_>, Vec<_>) = {
+                let mut halves = memory.chunks_mut(20 * 4096);
+                let (ha, hb) = (halves.next().unwrap(), halves.next().unwrap());
+                let make = |half: &mut [u8]| -> Vec<Arc<Shadow>> {
+                    half.chunks_mut(4096).enumerate().map(|(i, c)| carded(0x10_0000 * (i as u64 + 1), c)).collect()
+                };
+                (make(ha), make(hb))
+            };
+            let mut carded_b: Vec<_> = b.iter().map(|s| (Arc::downgrade(s), s.card.as_ref().unwrap().touched.clone())).collect();
+            let mut carded_a: Vec<_> = a.iter().map(|s| (Arc::downgrade(s), s.card.as_ref().unwrap().touched.clone())).collect();
+            for look in 0..4 {
+                for _ in 0..random(30) {
+                    let i = random(a.len());
+                    let from = random(3000);
+                    let to = from + random(400);
+                    for set in [&a, &b] {
+                        set[i].card_changed(from, to);
+                    }
+                }
+                let queue = queued(&a);
+                // Each copy is in the queue once, whatever the touches.
+                assert!(queue.iter().all(|w| queue.iter().filter(|x| x.ptr_eq(w)).count() == 1), "round {round} look {look}");
+                queued(&b);
+                let by_queue = dirty_of(&mut carded_a, queue, true, 7);
+                let by_all = dirty_of(&mut carded_b, Vec::new(), false, 7);
+                let names = |found: &[(Arc<Shadow>, Vec<(usize, usize)>)], set: &[Arc<Shadow>]| -> Vec<(usize, Vec<(usize, usize)>)> {
+                    found.iter().map(|(s, r)| (set.iter().position(|x| Arc::ptr_eq(x, s)).unwrap(), r.clone())).collect()
+                };
+                assert_eq!(names(&by_queue, &a), names(&by_all, &b), "round {round} look {look}");
+                found += by_all.len();
+                none += usize::from(by_all.is_empty());
+                // What was taken is taken: nothing is dirty, nothing touched.
+                assert!(a.iter().chain(&b).all(|s| s.card_dirty_now().is_empty() && !s.card.as_ref().unwrap().touched.load(Ordering::Relaxed)));
+            }
+        }
+        assert!(found > 1000 && none > 10, "{found} found, {none} looks of nothing");
+    }
+
+    /// A look at all of them, which empties the queue first, leaves none of what was touched behind for a look
+    /// by the queue after a flip.
+    #[test]
+    fn what_is_touched_after_a_look_at_all_of_them_is_in_the_queue() {
+        let mut memory = vec![0u8; 4096];
+        let copy = carded(0x40_0000, &mut memory);
+        copy.card_changed(10, 20);
+        let queue = queued(std::slice::from_ref(&copy));
+        assert_eq!(queue.len(), 1, "the touch put it in once");
+        // Touched again while it is touched: still once.
+        copy.card_changed(30, 40);
+        assert!(queued(std::slice::from_ref(&copy)).is_empty());
+        let mut all = vec![(Arc::downgrade(&copy), copy.card.as_ref().unwrap().touched.clone())];
+        let by_all = dirty_of(&mut all, Vec::new(), false, 1);
+        assert_eq!(by_all[0].1, [(10, 20), (30, 40)]);
+        // The next touch puts it in again.
+        copy.card_changed(50, 60);
+        assert_eq!(queued(std::slice::from_ref(&copy)).len(), 1);
     }
 }

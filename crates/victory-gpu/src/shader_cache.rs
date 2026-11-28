@@ -48,14 +48,25 @@ fn build() -> [u8; 32] {
     static FIXED: OnceLock<Vec<u8>> = OnceLock::new();
     let fixed = FIXED.get_or_init(|| {
         let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        if victory_shader::emit::loop_limit_is_named() {
             tracing::warn!(
                 limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
+                "VICTORY_SHADER_LOOP_LIMIT: every translated loop has this limit, whatever its stage"
+            );
+        }
+        if let Some(table) = std::env::var("VICTORY_LOOP_LIMITS")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            tracing::warn!(
+                table,
+                "VICTORY_LOOP_LIMITS: translated loops of these programs and stages stop later"
             );
         }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
         bytes.extend_from_slice(&limit.to_le_bytes());
+        // (naming the default number is not naming none)
+        bytes.push(u8::from(victory_shader::emit::loop_limit_is_named()));
         // Which group barriers wait is part of the translation too.
         bytes.push(victory_shader::emit::group_sync());
         // So are the switches that pick the form of a wave64 program:
@@ -68,6 +79,8 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_PAIR_SYNC",
             "VICTORY_PAIR_CLAMP",
+            "VICTORY_PAIR_LEAN",
+            "VICTORY_UNIFORM_LOADS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
@@ -77,6 +90,10 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_LOOP_NOTES",
             "VICTORY_LOOP_WHY",
+            "VICTORY_LOOP_LIMITS",
+            "VICTORY_LOCAL_EXIT",
+            "VICTORY_PEEK",
+            "VICTORY_MASK_NUMBERS",
             "VICTORY_BVH_BOUNDS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
@@ -84,6 +101,17 @@ fn build() -> [u8; 32] {
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
+            bytes.push(0);
+        }
+        // The ones that are on unless named `=0` go by the value in force (not by the text of the
+        // variable): a cache made before they were on, or with `=0`, is never served for the other.
+        for (name, on) in ["VICTORY_HALF_EXIT", "VICTORY_KEEP_LOOP_SKIPS"]
+            .into_iter()
+            .zip(victory_shader::emit::default_on_switches())
+        {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            bytes.push(u8::from(on));
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.

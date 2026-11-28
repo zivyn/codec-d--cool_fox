@@ -5,6 +5,13 @@
 //! takes to hand a submission to the card and to report it done is in it, 40
 //! times a frame. Here two lists made once, of nothing but a timestamp, stand
 //! around each submission.
+//!
+//! The stamps around our own passes (`pass_slot`) are in every build, not only
+//! the diagnostics one: the runs that measure the card's time are of the release
+//! exe too, and a line that only the other exe prints was never in their logs.
+
+// (Without diagnostics the stamps around submissions and the title's own timestamps are not used.)
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 
 use std::sync::Mutex;
 
@@ -145,6 +152,132 @@ impl Host {
     }
 }
 
+/// Slots of stamps for the passes of plans ([`Host::pass_slot`]) before one is used again.
+const PASS_SLOTS: usize = 4096;
+/// Stamps of a slot: the sync list's begin, after its sends, after its hash passes; the compare list's begin and end;
+/// and (with our own sends) after the copies of the sends, before their scatter and barriers.
+const PASS_STAMPS: usize = 6;
+
+/// The stamps of our own passes for copies in the card's memory
+/// (`VICTORY_CARD_SPANS=1`): what the card spends on the sends up (copies and
+/// the scatter of changed words), on the hash passes behind them, and on the
+/// compare passes after a submission's lists (`Host::card_before`).
+struct Passes {
+    _heap: ID3D12QueryHeap,
+    _back: ID3D12Resource,
+    /// The mapped results, `PASS_STAMPS` a slot.
+    data: usize,
+    ticks_per_ms: f64,
+    next: usize,
+    /// Ticks of sends, hashes, compares, the copies of the sends alone, and the lists counted for each.
+    ticks: [u64; 4],
+    count: [u64; 4],
+}
+
+// SAFETY: free-threaded objects and a mapping only read behind a lock.
+unsafe impl Send for Passes {}
+
+static PASSES_MADE: Mutex<Option<Option<Passes>>> = Mutex::new(None);
+
+/// Ticks between two stamps, if both were written.
+fn between(a: u64, b: u64) -> Option<u64> {
+    (a != 0 && b >= a).then(|| b - a)
+}
+
+impl Host {
+    /// A slot of stamps for the plan being recorded, if asked for.
+    pub(super) fn pass_slot(&self) -> Option<usize> {
+        if !on() {
+            return None;
+        }
+        let mut made = PASSES_MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let passes = made
+            .get_or_insert_with(|| {
+                self.make_passes()
+                    .inspect_err(|e| tracing::warn!(error = %e, "no stamps around our passes"))
+                    .ok()
+            })
+            .as_mut()?;
+        let slot = passes.next;
+        passes.next = (slot + 1) % PASS_SLOTS;
+        // SAFETY: inside the mapping; the slot's last plan was read long ago.
+        unsafe { std::ptr::write_bytes((passes.data as *mut u64).add(slot * PASS_STAMPS), 0, PASS_STAMPS) };
+        Some(slot)
+    }
+
+    /// Stamp number `k` of `slot`, at this point of `list`.
+    ///
+    /// # Safety
+    /// An open list of ours.
+    pub(super) unsafe fn pass_stamp(&self, list: &ID3D12GraphicsCommandList, slot: Option<usize>, k: usize) {
+        let Some(slot) = slot else {
+            return;
+        };
+        let made = PASSES_MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Some(passes)) = made.as_ref() else {
+            return;
+        };
+        let at = (slot * PASS_STAMPS + k) as u32;
+        // SAFETY: the caller's; the heap and the buffer live as long as the process.
+        unsafe {
+            list.EndQuery(&passes._heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
+            list.ResolveQueryData(&passes._heap, D3D12_QUERY_TYPE_TIMESTAMP, at, 1, &passes._back, u64::from(at) * 8);
+        }
+    }
+
+    /// The plan that had `slot` has run: its stamps are added up.
+    pub(super) fn pass_read(&self, slot: Option<usize>) {
+        let Some(slot) = slot else {
+            return;
+        };
+        let mut made = PASSES_MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Some(passes)) = made.as_mut() else {
+            return;
+        };
+        // SAFETY: inside the mapping; written by the card at whole words.
+        let s: [u64; PASS_STAMPS] = unsafe {
+            let at = (passes.data as *const u64).add(slot * PASS_STAMPS);
+            std::array::from_fn(|i| at.add(i).read_volatile())
+        };
+        for (i, ticks) in [between(s[0], s[1]), between(s[1], s[2]), between(s[3], s[4]), between(s[0], s[5])]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(ticks) = ticks {
+                passes.ticks[i] += ticks;
+                passes.count[i] += 1;
+            }
+        }
+    }
+
+    fn make_passes(&self) -> windows::core::Result<Passes> {
+        let device = &self.device;
+        // SAFETY: plain object creation.
+        unsafe {
+            let n = PASS_SLOTS * PASS_STAMPS;
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            device.CreateQueryHeap(
+                &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: n as u32, NodeMask: 0 },
+                &mut heap,
+            )?;
+            let heap = heap.ok_or_else(windows::core::Error::empty)?;
+            let back = self.read_back_buffer(8 * n as u64).ok_or_else(windows::core::Error::empty)?;
+            let mut data = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut data))?;
+            std::ptr::write_bytes(data.cast::<u8>(), 0, 8 * n);
+            Ok(Passes {
+                _heap: heap,
+                _back: back,
+                data: data as usize,
+                ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
+                next: 0,
+                ticks: [0; 4],
+                count: [0; 4],
+            })
+        }
+    }
+}
+
 /// The GPU timestamps the title was given since the last frame-rate line:
 /// how many, how often a later one was 1 ms or more after the one before
 /// (written with another submission), and where the first few lie.
@@ -194,6 +327,25 @@ pub(super) fn line(frames: f64) {
         }
         (s.0, s.1) = (0, 0);
     }
+    {
+        let mut made = PASSES_MADE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(Some(p)) = made.as_mut() {
+            let ms = |i: usize| p.ticks[i] as f64 / p.ticks_per_ms / frames;
+            let n = |i: usize| p.count[i] as f64 / frames;
+            tracing::info!(
+                "our passes on the card per frame (VICTORY_CARD_SPANS=1, by its stamps): sends up (copies and the scatter of changed words) {:.2} ms in {:.1} lists (the copies alone {:.2} ms in {:.1}), hash passes {:.2} ms in {:.1} lists, compare passes {:.2} ms in {:.1} lists",
+                ms(0),
+                n(0),
+                ms(3),
+                n(3),
+                ms(1),
+                n(1),
+                ms(2),
+                n(2)
+            );
+            (p.ticks, p.count) = ([0; 4], [0; 4]);
+        }
+    }
     let mut made = SPANS_MADE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Some(spans)) = made.as_mut() else {
         return;
@@ -212,7 +364,7 @@ pub(super) fn line(frames: f64) {
 
 #[cfg(test)]
 mod tests {
-    use super::Sums;
+    use super::{Sums, between};
 
     #[test]
     fn submissions_add_up_without_counting_anything_twice() {
@@ -228,5 +380,13 @@ mod tests {
         // Whole inside the last one.
         s.add(265, 268);
         assert_eq!((s.count, s.busy, s.between), (4, 110, 60));
+    }
+
+    #[test]
+    fn pass_stamps_count_only_when_both_were_written() {
+        assert_eq!(between(100, 150), Some(50));
+        assert_eq!(between(0, 150), None);
+        assert_eq!(between(150, 100), None);
+        assert_eq!(between(100, 100), Some(0));
     }
 }

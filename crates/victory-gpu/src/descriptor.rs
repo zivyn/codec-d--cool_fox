@@ -12,6 +12,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
 pub(crate) mod host;
+#[cfg(windows)]
+pub(crate) mod sparse;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -241,10 +243,18 @@ impl Rounds {
 /// still asks the kernel about the whole heap (and resets what it finds, with
 /// a flush of the other processors' translations), and the 4 ms ones went on
 /// for the whole of a 190 ms frame of which the title records in 64.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_HEAP_SYNC_BACKOFF=0` against the 2 of the unset
+/// variable: read for each wait, which is only a length of time; the count of quiet rounds is the thread's own.)
 #[cfg(windows)]
 fn sync_backoff() -> u32 {
-    static STEPS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *STEPS.get_or_init(|| std::env::var("VICTORY_HEAP_SYNC_BACKOFF").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2u32).min(6))
+    crate::ab::live_value!("VICTORY_HEAP_SYNC_BACKOFF", u32, backoff_steps)
+}
+
+/// The steps of [`sync_backoff`] as the text of the variable says (none: 2, at most 6).
+#[cfg(any(windows, test))]
+fn backoff_steps(text: Option<&str>) -> u32 {
+    text.and_then(|v| v.trim().parse().ok()).unwrap_or(2u32).min(6)
 }
 
 /// The wait before an early round after `quiet` rounds in a row that found
@@ -274,12 +284,9 @@ static SYNC_ROUND_COUNTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 #[cfg(windows)]
 pub(crate) struct SyncedHeaps(Option<u64>);
 
+/// Starts the thread that makes the rounds, once: whether there is one.
 #[cfg(windows)]
-pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
-    if !sync_aside() {
-        sync_heaps();
-        return SyncedHeaps(None);
-    }
+fn sync_thread() -> bool {
     static STARTED: std::sync::Once = std::sync::Once::new();
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
@@ -341,7 +348,45 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
     });
-    if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
+    THREAD.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A round asked for ahead of a submission's preparing (`VICTORY_HEAPS_EARLY`):
+/// the number to wait for ([`SyncedHeaps::asked`]), or 0 if the rounds are not
+/// made by a thread of ours. It is asked when the title's call is in the
+/// line: a round that begins after it sees all the title wrote before the
+/// call, which is all the submission needs, and is made while the thread
+/// prepares what is before it.
+#[cfg(windows)]
+pub(crate) fn ask_round() -> u64 {
+    if !sync_aside() || !sync_thread() {
+        return 0;
+    }
+    let mine = {
+        let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+        SYNC_ASKED.store(true, std::sync::atomic::Ordering::Release);
+        rounds.ask()
+    };
+    SYNC_ROUNDS.1.notify_all();
+    mine
+}
+
+#[cfg(windows)]
+impl SyncedHeaps {
+    /// What a round asked for ahead ([`ask_round`]) is waited for as one begun
+    /// now would be.
+    pub(crate) fn asked(mine: u64) -> Self {
+        SyncedHeaps(Some(mine))
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
+    if !sync_aside() {
+        sync_heaps();
+        return SyncedHeaps(None);
+    }
+    if !sync_thread() {
         sync_heaps();
         return SyncedHeaps(None);
     }
@@ -900,6 +945,37 @@ pub(crate) fn constant_slot(
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.constant_at(index, buffer, gpu, size);
+    }
+}
+
+/// [`constant_slot`] for several slots of one heap, `(index, gpu, size)` each,
+/// in order (`VICTORY_LEAN_STEPS`): the buffer is held once for all of them
+/// (a slot that already shows it takes no hold), and the heaps are looked at
+/// once for each sixty-four slots, with their lock held for those (as it is
+/// for each by [`constant_slot`]: a thread that wants the lock to change the
+/// heaps is not kept waiting for thousands of slots).
+#[cfg(windows)]
+pub(crate) fn constant_slots(
+    heap: usize,
+    buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    slots: impl Iterator<Item = (u32, u64, u32)>,
+) {
+    const CHUNK: usize = 64;
+    let held = Some(buffer.clone());
+    let mut slots = slots.peekable();
+    while slots.peek().is_some() {
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            for (index, gpu, size) in slots.by_ref().take(CHUNK) {
+                host.constant_at_held(index, buffer, &held, gpu, size);
+            }
+        } else {
+            // (A heap that is gone: nothing can read the slots.)
+            return;
+        }
     }
 }
 
@@ -1537,11 +1613,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1864,6 +1948,8 @@ mod tests {
         let waits: Vec<u128> = (0..6).map(|quiet| early_wait(every, quiet, 2).as_millis()).collect();
         assert_eq!(waits, [4, 8, 16, 16, 16, 16]);
         assert!((0..6).all(|quiet| early_wait(every, quiet, 0) == every), "no steps: the same wait always");
+        // The text of the variable, as `VICTORY_AB` gives it in its phases (unset against `=0`).
+        assert_eq!([None, Some("0"), Some(" 3 "), Some("9"), Some("x")].map(backoff_steps), [2, 0, 3, 6, 2]);
     }
 
     #[cfg(windows)]

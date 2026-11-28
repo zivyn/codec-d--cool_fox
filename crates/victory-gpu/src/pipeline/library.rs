@@ -570,6 +570,13 @@ pub(crate) fn save_shard(path: &std::path::Path) -> bool {
     true
 }
 
+/// How a pipeline came.
+#[derive(Clone, Copy)]
+enum Kind {
+    Loaded,
+    Made,
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -583,6 +590,22 @@ pub(crate) fn pipeline(
         return create();
     };
     let began = std::time::Instant::now();
+    // (For the pipelines line: what compiling and loading took.)
+    let timed = |kind: Kind| {
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let us = began.elapsed().as_micros() as u64;
+            let (count, micros) = match kind {
+                Kind::Loaded => (C::PipelineLoads, C::PipelineLoadUs),
+                Kind::Made => (C::PipelineMakes, C::PipelineMakeUs),
+            };
+            add(count, 1);
+            add(micros, us);
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = kind;
+    };
     let loaded = {
         let _all = one_call();
         let _one = same_name(name);
@@ -595,6 +618,7 @@ pub(crate) fn pipeline(
     let refused = match loaded {
         Ok(pso) => {
             LOADED.fetch_add(1, Ordering::Relaxed);
+            timed(Kind::Loaded);
             crate::host::trail(|| {
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
@@ -628,6 +652,7 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    timed(Kind::Made);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(

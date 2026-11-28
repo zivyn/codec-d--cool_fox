@@ -9,6 +9,8 @@ use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
 mod behind;
+#[cfg(windows)]
+mod timelines;
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(
@@ -460,6 +462,54 @@ pub(crate) fn no_drain_here() {
     behind::no_drain_here();
 }
 
+/// The round of the heaps' records that was asked for ahead for what our
+/// thread of [`behind`] prepares now, 0 if none (`VICTORY_HEAPS_EARLY`).
+#[cfg(windows)]
+pub(crate) fn heaps_round() -> u64 {
+    behind::round()
+}
+
+/// Whether the refreshes of the submission that comes next are begun while
+/// the one being prepared is sent (`VICTORY_PIPELINE_PREPARE=1`).
+#[cfg(windows)]
+pub(crate) fn pipeline_prepare() -> bool {
+    behind::pipeline_prepare() && behind::on()
+}
+
+/// Whether the next submission's refreshes are offered before the steps of the one being prepared
+/// (`VICTORY_STAGE_A=1`), for the copies it does nothing to.
+#[cfg(windows)]
+pub(crate) fn stage_a() -> bool {
+    behind::stage_a() && behind::on()
+}
+
+/// Whether the whole preparing of the next submission is done beside the sending of this one
+/// (`VICTORY_STAGE_A_STEPS=1` with `VICTORY_STAGE_A`).
+#[cfg(windows)]
+pub(crate) fn stage_front() -> bool {
+    behind::stage_a() && behind::stage_front() && behind::on()
+}
+
+/// The first submission of the line, if it is of the queue being done: its number, its host lists in the order they
+/// run and where its parts begin, after it took along what it can ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
+    behind::prefold()
+}
+
+/// The host lists (addresses) of the submission that comes next after the one
+/// our thread is preparing, asked once ([`behind`]).
+#[cfg(windows)]
+pub(crate) fn take_ahead() -> Option<Vec<usize>> {
+    behind::take_ahead()
+}
+
+/// Puts back what [`take_ahead`] took.
+#[cfg(windows)]
+pub(crate) fn restore_ahead(ahead: Option<Vec<usize>>) {
+    behind::restore_ahead(ahead);
+}
+
 /// Submissions the title made that the host has not begun ([`behind`]).
 #[cfg(windows)]
 pub(crate) fn queued() -> u64 {
@@ -576,6 +626,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        #[cfg(feature = "diagnostics")]
+        if !this.is_null() {
+            crate::list::tag_queue(lists, queue(this).kind);
+        }
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;
@@ -962,9 +1016,10 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
-        if crate::capture::listed(frame) {
+        if crate::capture::dump_due(frame) {
             before_sync();
-            crate::capture::dump_targets(frame);
+            crate::capture::dump_targets(crate::capture::dump_name(frame));
+            crate::capture::window_done(frame);
         }
     }
     #[cfg(windows)]

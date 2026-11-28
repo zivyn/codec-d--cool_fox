@@ -63,7 +63,7 @@ enum Mode {
 
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
+    *MODE.get_or_init(|| match crate::defaults::var("VICTORY_CARD_AWAKE").as_deref() {
         Ok("1") => Mode::On,
         Ok("turns") => Mode::ByTurns,
         _ => Mode::Off,

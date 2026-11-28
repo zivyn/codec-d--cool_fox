@@ -94,7 +94,7 @@ pub(super) fn native_of(body: &[u32], wave64: bool, threads: u32) -> NativeProgr
 }
 
 /// `program()` for a host of 32-lane waves, with the branches closing `wide` taken wave-wide.
-fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
+pub(super) fn lowered(native: &NativeProgram, p: &ir::Program, wide: &HashSet<usize>) -> Result<HostShader, ShaderError> {
     lowered_on(native, p, wide, 32)
 }
 
@@ -192,7 +192,7 @@ fn a_sum_of_halves_over_the_wave_is_the_consoles_tree_bit_for_bit() {
     assert_ne!(tree[0], in_a_row, "these terms tell the tree from another order");
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; not run");
+        eprintln!("SKIPPED (no wave32 hardware): no SM 6.6 hardware device; not run");
         return;
     };
     let (root, pso) = match host.compute_pipeline(&shader) {
@@ -480,7 +480,7 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
             return;
         };
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            eprintln!("the hardware device does not take this program; not run");
+            eprintln!("SKIPPED (no wave32 hardware): the hardware device does not take this program; not run");
             return;
         };
         let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
@@ -587,7 +587,7 @@ fn a_wave_or_inside(skip: u32, name: &str) {
 
 /// Runs `shader` on the hardware device with the root constants `s0`, `s1` and gives dword 0
 /// of the UAV; None (and a line) without a device that takes it.
-fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
+pub(super) fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     let Ok(host) = Host::new(false) else {
         eprintln!("no SM 6.6 hardware device; not run");
         return None;
@@ -647,6 +647,41 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
         assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
     }
     eprintln!("ran on the hardware device: the mask's bits, or the number");
+}
+
+/// The same stack register, and what the trace programs do with the entries that are numbers:
+/// `s_and` it with a literal. The structure takes the result for a mask (its source is one on
+/// one path), yet where the numbers it is made of all have values it is the number the hardware
+/// computes (`FullAdaptive` of the shadow rays stopped at it). The mask path gives its ballot's
+/// bits, the other 5, each `and`ed with 0xFF.
+#[test]
+fn a_number_made_of_a_joined_stack_entry_is_computed_where_its_sources_are_numbers() {
+    let words = [
+        0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+        0xBE94_036A, // s_mov_b32 s20, vcc_lo
+        0xBF06_8001, // s_cmp_eq_u32 s1, 0
+        0xBF85_0001, // s_cbranch_scc1 over the next
+        0xBE94_0385, // s_mov_b32 s20, 5
+        0x8715_FF14, // s_and_b32 s21, s20, lit(0xff)
+        0x0000_00FF,
+        0x7E00_0215, // v_mov_b32 v0, s21
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native_of(&words, false, 32);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    // (as `emit` makes it for a program the first translation refused for a mask read as data)
+    let shader = lower::with_mask_numbers(|| lowered(&native, &p, &HashSet::new())).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (below, other, expected) in [(32u32, 0u32, 0xFFu32), (10, 0, 0xFF), (4, 0, 0xF), (0, 0, 0), (10, 1, 5)] {
+        let Some(got) = on_the_card(&shader, [below, other]) else { return };
+        assert_eq!(got, expected, "{below} lanes in the mask, s1 = {other}");
+    }
+    eprintln!("ran on the hardware device: the number the stack entry's bits make");
 }
 
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after
@@ -992,4 +1027,290 @@ fn console_waves_branching(sizes: &[u32], lds_units: u32, host_lds: u32) {
         }
     }
     eprintln!("ran on the hardware device: console waves branching on their own");
+}
+
+/// A loop of `s1` rounds, each of which runs a lane branch with an LDS write and read and a lane
+/// read of a lane of the console wave (so the two host waves meet in it) in `threads` threads
+/// (one group): what a meeting of the host waves costs. Thread t gives out[t] = the sum over the
+/// rounds of lane 40 of its console wave's `lane + round`.
+fn meeting_loop(threads: u32) -> NativeProgram {
+    let words = [
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBE97_0380, // s_mov_b32 s23, 0
+        0xBE98_0380, // s_mov_b32 s24, 0
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+        // loop:
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz skip
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000, // ds_read_b32 v7, v3
+        0x0700_0003,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x4A0A_0014, // v_add_nc_u32 v5, s20, v0
+        0xD760_0016, // v_readlane_b32 s22, v5, 40
+        0x0001_5105,
+        0x8017_1617, // s_add_u32 s23, s23, s22
+        0xBEFE_040C, // skip: s_mov_b64 exec, s[12:13]
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_0114, // s_cmp_lt_u32 s20, s1
+        0xBF85_FFEF, // s_cbranch_scc1 loop
+        0x8018_8118, // s_add_u32 s24, s24, 1
+        0xBF0A_0218, // s_cmp_lt_u32 s24, s2
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBF85_FFEB, // s_cbranch_scc1 loop
+        0x7E10_0217, // v_mov_b32 v8, s23
+        0xE070_1000, // buffer_store_dword v8, v3, s[8:11], 0 offen
+        0x8002_0803,
+    ];
+    let mut native = native_of(&words, true, threads);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= (threads * 4).div_ceil(512) << 15;
+    }
+    native
+}
+
+/// What a meeting of the host waves costs, by the time of a loop of them on the card (printed,
+/// not asserted): a group of one console wave (group barriers) against a group of two (counters).
+#[test]
+fn a_meeting_of_the_host_waves_costs_this_much() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    for threads in [64u32, 128] {
+        let native = meeting_loop(threads);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let container = crate::dxbc::build(&[]);
+        let c = crate::dxbc::Container::parse(&container).unwrap();
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let lds = lower::TEST_HOST_LDS.replace(Some(49152));
+        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        lower::TEST_HOST_LDS.set(lds);
+        let shader = shader.unwrap_or_else(|e| panic!("{threads} threads: {e}"));
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else { return };
+        // (the results first, once; then the time of back-to-back dispatches)
+        let user = |rounds: u32| {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, d @ 0..=2) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = [threads, rounds, 1][d as usize];
+                }
+            }
+            ud
+        };
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(user(4000)))],
+                    views: &[View::RawUav(threads)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        for t in 0..threads {
+            let expected = 4000 * (t / 64 * 64 + 40) + 4000 * 3999 / 2;
+            assert_eq!(out[0][t as usize], expected, "{threads} threads, thread {t}");
+        }
+        let bench = [super::host::BenchView { index: 0, dwords: threads, uav: true, sysmem: false }];
+        let time = |rounds: u32| {
+            host.time_compute(&(root.clone(), pso.clone()), &user(rounds), &[], &bench, [1, 1, 1], 20)
+                .expect("time_compute")
+                .0
+        };
+        let (none, many) = (time(1), time(4000));
+        eprintln!(
+            "{threads} threads: {:.1} us a round of an LDS write, an LDS read and a lane read ({none:.2} ms for none, {many:.2} ms for 4000)",
+            (many - none) * 1e3 / 4000.0
+        );
+    }
+}
+
+/// 64 threads in one console wave walk a chain through a buffer: thread t first stores the offset
+/// of its successor, `(t + 5) & 63` dwords on, at its own dword; after a barrier every thread
+/// follows the chain from offset 0 for `s1` steps (a load at the scalar offset, then
+/// `v_readfirstlane` of what it found, the step the title's heap walks make), and gives the offset
+/// it ends at in out[64 + t]. The `v_readlane` makes the console wave need both its host waves.
+fn chain_walk() -> NativeProgram {
+    let words = [
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A08_0085, // v_add_nc_u32 v4, 5, v0
+        0x3608_08BF, // v_and_b32 v4, 63, v4
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xE070_1000, // buffer_store_dword v4, v3, s[8:11], 0 offen
+        0x8002_0403,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBBFD_0000, // s_waitcnt_vscnt null, 0
+        0xBF8A_0000, // s_barrier
+        0xBE93_0380, // s_mov_b32 s19, 0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        // loop:
+        0xE030_0000, // buffer_load_dword v6, v0, s[8:11], s19
+        0x1302_0600,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E26_0506, // v_readfirstlane_b32 s19, v6
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0xBF0A_0115, // s_cmp_lt_u32 s21, s1
+        0xBF85_FFF9, // s_cbranch_scc1 loop
+        0x7E0E_0213, // v_mov_b32 v7, s19
+        0xE070_1100, // buffer_store_dword v7, v3, s[8:11], 0 offen offset:256
+        0x8002_0703,
+        0xD760_0016, // v_readlane_b32 s22, v0, 63
+        0x0001_7F00,
+    ];
+    native(&words)
+}
+
+/// The walk is the same with the loads' values taken for alike in every lane (`VICTORY_UNIFORM_LOADS`
+/// 2) as without, and the first-lane reads of them make no exchange of the two host waves: less code.
+#[test]
+fn a_walk_down_a_chain_gives_the_same_ends_when_its_loads_are_taken_for_alike() {
+    let native = chain_walk();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let build = |level: u32| {
+        let was = lower::TEST_UNIFORM_LOADS.replace(Some(level));
+        let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+        lower::TEST_UNIFORM_LOADS.set(was);
+        shader.expect("lower")
+    };
+    let (plain, alike) = (build(0), build(2));
+    assert!(alike.dxil.len() < plain.dxil.len(), "{} and {} bytes", alike.dxil.len(), plain.dxil.len());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for shader in [&plain, &alike] {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    for shader in [&plain, &alike] {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else { return };
+        for steps in [1u32, 2, 7, 64, 100] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, 1) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = steps;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(128)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            for t in 0..64usize {
+                assert_eq!(out[0][64 + t], (5 * steps & 63) * 4, "{steps} steps, thread {t}");
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: the ends of the walk, as taken and as taken for alike");
+}
+
+/// The same walk by the lanes above `s0` only (a lane branch around it, so the loads and their
+/// first-lane reads are under a guard: the console's first lane may be in either host wave, or
+/// only in the upper one). Lane t above `s0` gives the offset the walk ends at in out[64 + t];
+/// the others give 0.
+fn chain_walk_above() -> NativeProgram {
+    let words = [
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A08_0085, // v_add_nc_u32 v4, 5, v0
+        0x3608_08BF, // v_and_b32 v4, 63, v4
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xE070_1000, // buffer_store_dword v4, v3, s[8:11], 0 offen
+        0x8002_0403,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBBFD_0000, // s_waitcnt_vscnt null, 0
+        0xBF8A_0000, // s_barrier
+        0xBE93_0380, // s_mov_b32 s19, 0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0x7D82_0000, // v_cmp_lt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_000A, // s_cbranch_execz past the walk
+        // loop:
+        0xE030_0000, // buffer_load_dword v6, v0, s[8:11], s19
+        0x1302_0600,
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E26_0506, // v_readfirstlane_b32 s19, v6
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0xBF0A_0115, // s_cmp_lt_u32 s21, s1
+        0xBF85_FFF9, // s_cbranch_scc1 loop
+        0x7E0E_0213, // v_mov_b32 v7, s19
+        0xE070_1100, // buffer_store_dword v7, v3, s[8:11], 0 offen offset:256
+        0x8002_0703,
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0xD760_0016, // v_readlane_b32 s22, v0, 63
+        0x0001_7F00,
+    ];
+    native(&words)
+}
+
+/// With the load's value taken as the one every lane read (`VICTORY_UNIFORM_LOADS=3`) the walk of
+/// the lanes above `s0` ends where it does without, whichever host wave has lanes there.
+#[test]
+fn a_walk_by_some_lanes_gives_the_same_ends_when_the_first_lane_reads_the_loads_own_value() {
+    let native = chain_walk_above();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let container = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&container).unwrap();
+    let build = |level: u32| {
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let (was, was_level) = (lower::TEST_HOST_WAVE.replace(Some(32)), lower::TEST_UNIFORM_LOADS.replace(Some(level)));
+        let shader = super::emit(&c, &native, &p, &st, &io, &res);
+        lower::TEST_HOST_WAVE.set(was);
+        lower::TEST_UNIFORM_LOADS.set(was_level);
+        shader.unwrap_or_else(|e| panic!("level {level}: {e}"))
+    };
+    let (plain, shadowed) = (build(0), build(3));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for shader in [&plain, &shadowed] {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    for shader in [&plain, &shadowed] {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else { return };
+        for (above, steps) in [(10u32, 7u32), (31, 7), (40, 7), (62, 3), (63, 3), (10, 64)] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                if let (RootType::Constants, 0, d @ 0..=1) = (u.root, u.slot, u.dword) {
+                    ud[u.index as usize] = if d == 0 { above } else { steps };
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(128)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            for t in 0..64u32 {
+                let expected = if t > above { (5 * steps & 63) * 4 } else { 0 };
+                assert_eq!(out[0][64 + t as usize], expected, "above {above}, {steps} steps, lane {t}");
+            }
+        }
+    }
+    eprintln!("ran on the hardware device: the ends of the walks by some lanes");
 }

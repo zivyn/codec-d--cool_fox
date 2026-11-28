@@ -102,16 +102,28 @@ fn passes_left_out(
     (hits, activation)
 }
 
-pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+/// `(hits, activation)` as [`passes_left_out`] says for this run's switches.
+fn left_out_passes() -> (bool, bool) {
     static LEFT_OUT: OnceLock<(bool, bool)> = OnceLock::new();
-    let (hits, activation) = *LEFT_OUT.get_or_init(|| {
+    *LEFT_OUT.get_or_init(|| {
         let var = |name| std::env::var(name).ok();
         passes_left_out(
             std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"),
             var("VICTORY_RT_RESOLVE").as_deref(),
             var("VICTORY_ACTIVATE_RAYS").as_deref(),
         )
-    });
+    })
+}
+
+/// Which programs this run leaves out, as text (what `victory warm --compute` keeps with the
+/// compute programs it has written down, to write them down again when it changes).
+pub(super) fn left_out_signature() -> String {
+    let (hits, activation) = left_out_passes();
+    format!("hit shading left out: {hits}, probe ray activation left out: {activation}")
+}
+
+pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let (hits, activation) = left_out_passes();
     if hits && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }

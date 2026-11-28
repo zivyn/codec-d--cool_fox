@@ -183,6 +183,9 @@ The cache key holds the value in force (`victory_shader::emit::default_on_switch
   and trim whatever the switch says, and only the planning of new retirements to follow it (and a test of a texture retired, flipped, given
   again and finished).
 - `VICTORY_TEXTURE_PRIORITY` (mode 0/1/2): the mode is the state of the cold and hot marks the texture pass keeps; not touched.
+- `VICTORY_TITLE_TAIL` (`=0`: off, on by default): a view the title makes by a call at a slot past the host's title
+  slots takes a dynamic slot of the same index for good (while the record holds a view), so a flip leaves slots
+  taken (or free) from before; it is read at the first such view and kept (`OnceLock`).
 - Anything that changes the translation or the cache key (the pipeline book, the translated programs) and
   anything that is read when an object is made (heaps, copies, pools).
 

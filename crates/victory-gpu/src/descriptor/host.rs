@@ -206,6 +206,16 @@ pub(crate) struct HostHeap {
     too_long: std::sync::atomic::AtomicU32,
     /// The most dynamic slots taken at once so far (logged as it climbs).
     peak: std::sync::atomic::AtomicU32,
+    /// Title slots past `count` that hold a view the title made by a call of
+    /// the API (`Create*View`, a copy of descriptors), and the record each was
+    /// made from: they are pinned in the dynamic slot of the same index
+    /// ([`HostHeap::pin_tail`]), which no table is given while the pin holds.
+    /// Taken after `next`'s lock, never before.
+    tail: Mutex<std::collections::BTreeMap<u32, u64>>,
+    /// Title slots past `count` that wait for a dynamic slot a table holds.
+    tail_want: Mutex<Vec<u32>>,
+    /// What the title does with its heap (see [`super::usage`]).
+    usage: super::usage::Usage,
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
@@ -1485,10 +1495,22 @@ pub(crate) fn probe_view_limit() {
         if raw != 0 {
             victory_shader::emit::set_raw_views(raw);
         }
+        // What the device says of its binding tier (tier 3 promises no limit
+        // on the views of a heap, but NVIDIA's driver has one) beside what a
+        // heap of each size does.
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        // SAFETY: a feature structure of its size.
+        let tier = unsafe {
+            host.device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut options).cast(), size_of_val(&options) as u32)
+        }
+        .map_or(-1, |()| options.ResourceBindingTier.0);
         tracing::info!(
             views,
             raw_twins = raw != 0,
-            "host view heaps hold {views} views; view indices are clamped to the null slot at the end from the first shader on"
+            binding_tier = tier,
+            plus_one_fits = view_heap_fits(&host.device, views + 1),
+            "host view heaps hold {views} views (resource binding tier {tier}; the title's heap has {TITLE_VIEWS}); view indices are clamped to the null slot at the end from the first shader on"
         );
         victory_shader::emit::set_view_heap_limit(views - 1);
     });
@@ -1508,6 +1530,30 @@ pub(crate) fn view_heap_fits(device: &ID3D12Device, count: u32) -> bool {
     made.is_ok()
 }
 
+/// The views in the title's own shader-visible heap in the retail game (a
+/// little over what NVIDIA's driver takes).
+const TITLE_VIEWS: u32 = 1_245_184;
+
+/// The most views a host takes in a heap, to within [`SEARCH_STEP`], that
+/// takes `low` and refuses `high` (`fits` says): a host that takes more than
+/// [`PORTABLE_VIEWS`] and fewer than [`MID_VIEWS`] gets all its heap, which
+/// is that many more of the title's slots shown.
+fn most_between(low: u32, high: u32, fits: &impl Fn(u32) -> bool) -> u32 {
+    let (mut low, mut high) = (low, high);
+    while high - low > SEARCH_STEP {
+        let at = low + (high - low) / 2;
+        if fits(at) {
+            low = at;
+        } else {
+            high = at;
+        }
+    }
+    low
+}
+
+/// How near [`most_between`] gets to the most a host takes.
+const SEARCH_STEP: u32 = 4096;
+
 /// The size of every host view heap, and where its raw twins start (0: it has
 /// none; they lie past the null slot), for a host where `fits` says what
 /// heaps can be made.
@@ -1520,7 +1566,7 @@ pub(crate) fn pick_views(fits: impl Fn(u32) -> bool) -> (u32, u32) {
     } else if fits(MID_VIEWS) {
         MID_VIEWS
     } else {
-        PORTABLE_VIEWS
+        most_between(PORTABLE_VIEWS, MID_VIEWS, &fits)
     };
     (views, if twins { RAW_TWINS } else { 0 })
 }
@@ -1547,6 +1593,34 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 /// of the opening, five records). 2.7 % fewer dynamic slots than 2^18; the
 /// peak taken is logged (`HostHeap::dynamic`). `VICTORY_DYNAMIC_SLOTS` sets it.
 const CAPPED_DYNAMIC: u32 = 254_976;
+
+/// The most title slots past a capped host heap's title slots that are pinned
+/// in dynamic slots ([`HostHeap::pin_tail`]). The title makes none there by a
+/// call in the opening (its records past the host's are the per-frame tables'
+/// ring, copied in as bytes and read through snapshots); this bounds what a
+/// title that did would take from the dynamic slots (0.4 % of them).
+const TAIL_MAX: usize = 1024;
+
+/// Whether a view the title makes by a call of the API at a slot past the
+/// host's title slots is pinned in the dynamic slot of the same index
+/// (`VICTORY_TITLE_TAIL=0`: not, the slot reads what a table put there).
+fn tail_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TITLE_TAIL").is_none_or(|v| v != "0"))
+}
+
+/// What [`HostHeap::pin_tail`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TailPin {
+    /// Pinned and made from the record.
+    Done,
+    /// The record holds no view (any more): the slot is free.
+    Gone,
+    /// A table holds the dynamic slot: try again later.
+    Busy,
+    /// No dynamic slot of that index, none to spare, or switched off.
+    Out,
+}
 
 /// How many dynamic slots a heap of `count` title slots whose null slot is
 /// `null` (0: none) has. On a capped host heap ([`CAPPED_DYNAMIC`]) the
@@ -1613,9 +1687,20 @@ impl HostHeap {
             let fitted = if count + extra <= null {
                 count
             } else {
-                // shortcut: descriptors past the host's limit are left out; a title that reaches
-                // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
+                // The title's slots from here on have no host slot of their own: what
+                // the title keeps there is its per-frame tables' ring (a draw's table past
+                // them is made afresh in dynamic slots from the title's records, which
+                // is what the draw reads), and a view it makes there by a call is
+                // pinned in the dynamic slot of its index ([`HostHeap::pin_tail`]).
+                // Only a view it makes at or past the null slot reads a null slot (one
+                // warning: `HostHeap::mirror`); `descriptor::usage` counts what it does.
+                tracing::info!(
+                    count,
+                    host = null - extra,
+                    size,
+                    "host view heap of {size} views, the most the device takes: the title's {count} slots are shown up to {};                      tables past that are read through snapshots in dynamic slots, views the title makes there by a call are pinned (VICTORY_TITLE_TAIL=0: not)",
+                    null - extra
+                );
                 null - extra
             };
             match make(size) {
@@ -1690,6 +1775,9 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             peak: std::sync::atomic::AtomicU32::new(0),
+            tail: Mutex::default(),
+            tail_want: Mutex::default(),
+            usage: super::usage::Usage::new(),
             strides,
             structures: Slots::new(count as usize),
             buffers: Slots::new(count as usize),
@@ -2958,12 +3046,101 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = (at + n).min(self.dynamic) as usize;
+        // Pinned title slots ([`HostHeap::pin_tail`]) stay taken.
+        let pinned: Vec<usize> = self
+            .tail
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(self.count + at..self.count + end as u32)
+            .map(|(&index, _)| (index - self.count) as usize)
+            .collect();
         if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+            let given = slots.iter().filter(|taken| **taken).count() as u32 - pinned.len() as u32;
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
             slots.fill(false);
+            for slot in pinned {
+                guard.1[slot] = true;
+            }
         }
+    }
+
+    /// Makes title slot `index`, at or past `count` (a view the title made by
+    /// a call of the API, which no host slot mirrors), a view of the dynamic
+    /// slot of that index, which no table is given while it holds: a shader
+    /// that picks the view by an index it computes reads it there, not a
+    /// table's entry or the null slot. Called again when the record changes;
+    /// [`TailPin::Gone`] when it holds no view any more (the slot is given
+    /// back), [`TailPin::Busy`] when a table holds the slot now (asked again
+    /// with the next [`HostHeap::tail_sync`]), and [`TailPin::Out`] when no
+    /// dynamic slot has that index (it lies at or past the null slot), too
+    /// many are pinned, or it is switched off.
+    pub(crate) fn pin_tail(&self, index: u32, handle: u64) -> TailPin {
+        let Some(at) = index.checked_sub(self.count).filter(|&at| !self.sampler && at < self.dynamic && tail_on()) else {
+            return TailPin::Out;
+        };
+        let key = record_key(handle);
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tail = self.tail.lock().unwrap_or_else(|e| e.into_inner());
+        if key == 0 {
+            if tail.remove(&index).is_some() {
+                guard.1[at as usize] = false;
+                self.free.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
+                drop((tail, guard));
+                self.make_null(index);
+            }
+            return TailPin::Gone;
+        }
+        match tail.get(&index) {
+            Some(&made) if made == key => return TailPin::Done,
+            Some(_) => {}
+            None if tail.len() >= TAIL_MAX => return TailPin::Out,
+            None if guard.1[at as usize] => return TailPin::Busy,
+            None => {
+                guard.1[at as usize] = true;
+                self.free.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        tail.insert(index, key);
+        drop((tail, guard));
+        match view_at(key as u32, (key >> 32) as u32) {
+            Some(view) => self.make_at(index, &view),
+            None => self.make_null(index),
+        }
+        TailPin::Done
+    }
+
+    /// Looks again at the slots pinned or waiting ([`HostHeap::pin_tail`]):
+    /// a record the title changed (as bytes too) is made again, one it
+    /// cleared lets go, one that waited for a table's slot is pinned if the
+    /// table is done. `start` is the title heap's first record, `step` the
+    /// bytes of one. Nothing to do (and nothing taken) while none is pinned
+    /// or waiting.
+    pub(crate) fn tail_sync(&self, start: u64, step: u64) {
+        if self.tail.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+            && self.tail_want.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        {
+            return;
+        }
+        let mut todo: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
+        todo.extend(self.tail.lock().unwrap_or_else(|e| e.into_inner()).keys());
+        todo.extend(std::mem::take(&mut *self.tail_want.lock().unwrap_or_else(|e| e.into_inner())));
+        for index in todo {
+            if self.pin_tail(index, start + u64::from(index) * step) == TailPin::Busy {
+                self.tail_want.lock().unwrap_or_else(|e| e.into_inner()).push(index);
+            }
+        }
+    }
+
+    /// How many title slots past `count` are pinned.
+    pub(crate) fn tail_pinned(&self) -> usize {
+        self.tail.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// What the title does with this heap, counted.
+    pub(crate) fn usage(&self) -> &super::usage::Usage {
+        &self.usage
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -3464,22 +3641,34 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         if index >= self.count {
+            // A view the title made past the host's title slots lives in the
+            // dynamic slot of its index, if there is one.
+            match self.pin_tail(index, handle) {
+                TailPin::Out => {}
+                TailPin::Busy => {
+                    self.tail_want.lock().unwrap_or_else(|e| e.into_inner()).push(index);
+                    return None;
+                }
+                TailPin::Done | TailPin::Gone => return None,
+            }
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
-            // host heap seen so far.
+            // host heap seen so far that no slot shows (it lies at or past
+            // the null slot, or the pins are full, or `VICTORY_TITLE_TAIL=0`):
+            // a view there reads a table's entry or the null slot.
             static HIGHEST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
+            if tag == VIEW_TAG && HIGHEST.fetch_max(index, std::sync::atomic::Ordering::Relaxed) < index {
                 tracing::warn!(
                     index,
                     count = self.count,
                     for_draw,
-                    "title slot past the host heap"
+                    "a view the title made at a slot past the host heap's title slots and its dynamic ones reads a null slot"
                 );
             }
             return None;
         }
-        // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record, and nothing has changed it: most of the
@@ -5206,7 +5395,7 @@ mod tests {
             assert_eq!(heap.count, title);
         } else {
             assert!(null < title + DYNAMIC);
-            assert!(!fits(PORTABLE_VIEWS + 1) || victory_shader::emit::view_heap_limit() > PORTABLE_VIEWS);
+            assert!(!fits(PORTABLE_VIEWS + SEARCH_STEP) || victory_shader::emit::view_heap_limit() > PORTABLE_VIEWS);
             assert_eq!(heap.count + heap.dynamic, null);
             assert!(heap.count < title);
             if null == PORTABLE_VIEWS - 1 && std::env::var_os("VICTORY_DYNAMIC_SLOTS").is_none() {
@@ -6148,6 +6337,163 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    /// A view the title makes by a call of the API at a slot past the title
+    /// slots the host has (a capped host view heap) is pinned in the dynamic
+    /// slot of its index: no table is given the slot, and giving back a range
+    /// around it keeps it; a record that goes unpins it; a slot a table holds
+    /// waits and is pinned by the next sync.
+    #[test]
+    fn title_views_past_the_host_slots_are_pinned_in_dynamic_slots() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let step = 32usize;
+        // Eight records of a title heap whose first four slots the host has.
+        let mut title = vec![0u32; 8 * step / 4];
+        let base = title.as_mut_ptr() as u64;
+        let at = |slot: usize| base + (slot * step) as u64;
+        let put = |slot: usize, on: bool| {
+            let at = at(slot) as *mut [u32; 3];
+            // SAFETY: inside `title`, whose records are 32 bytes.
+            unsafe {
+                if on {
+                    crate::descriptor::record(at as u64, View::Constant(0x1000 * (slot as u64 + 1), 256));
+                } else {
+                    at.write_unaligned([0; 3]);
+                }
+            }
+        };
+        let free = heap.free.load(std::sync::atomic::Ordering::Relaxed);
+        // Slots the host has, and slots past its dynamic ones, are not pinned.
+        put(2, true);
+        assert_eq!(heap.pin_tail(2, at(2)), TailPin::Out);
+        assert_eq!(heap.pin_tail(heap.count + heap.dynamic, at(2)), TailPin::Out);
+        // Slot 6 holds a view: pinned in dynamic slot 6 - 4 = 2.
+        put(6, true);
+        assert_eq!(heap.pin_tail(6, at(6)), TailPin::Done);
+        assert_eq!(heap.pin_tail(6, at(6)), TailPin::Done, "the same record: nothing to do again");
+        assert_eq!(heap.tail_pinned(), 1);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 1);
+        // A table asking for all the dynamic slots finds that run broken at 6,
+        // and one for the first two gets them.
+        assert_eq!(heap.dynamic(heap.dynamic), None);
+        assert_eq!(heap.dynamic(2), Some(4));
+        // Giving back the whole range leaves the pin taken, and the search
+        // (which goes on from where it was) steps over it.
+        heap.release(4, heap.dynamic);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 1);
+        assert_eq!(heap.dynamic(2), Some(7), "slot 6 is skipped");
+        heap.release(7, 2);
+        // A record that holds no view any more gives the slot back.
+        put(6, false);
+        assert_eq!(heap.pin_tail(6, at(6)), TailPin::Gone);
+        assert_eq!(heap.tail_pinned(), 0);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free);
+        // A slot a table holds waits ...
+        let table = heap.dynamic(heap.dynamic).unwrap();
+        assert_eq!(table, 4);
+        put(5, true);
+        assert_eq!(heap.pin_tail(5, at(5)), TailPin::Busy);
+        // ... and the sync pins it once the table is given back; a record
+        // changed by bytes is made again by the same sync.
+        heap.tail_want.lock().unwrap().push(5);
+        heap.tail_sync(at(0), step as u64);
+        assert_eq!(heap.tail_pinned(), 0, "still held by the table");
+        assert_eq!(*heap.tail_want.lock().unwrap(), [5u32], "and waiting");
+        heap.release(table, heap.dynamic);
+        heap.tail_sync(at(0), step as u64);
+        assert_eq!(heap.tail_pinned(), 1, "5 pinned");
+        assert!(heap.tail_want.lock().unwrap().is_empty());
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 1);
+        // Another record in a pinned slot is made again, not pinned twice.
+        put(5, true);
+        // SAFETY: the second word of the record of slot 5, in `title`.
+        unsafe { (at(5) as *mut u32).add(1).write(77) };
+        assert_eq!(heap.pin_tail(5, at(5)), TailPin::Done);
+        assert_eq!(heap.tail_pinned(), 1);
+        assert_eq!(heap.free.load(std::sync::atomic::Ordering::Relaxed), free - 1);
+        // No more than TAIL_MAX are pinned.
+        assert!(TAIL_MAX <= heap.dynamic as usize);
+        assert_eq!(title.len(), 8 * step / 4);
+    }
+
+    /// A view the title makes by a call of the API at a title slot far above
+    /// 1,000,000 (the title's heap has 1,245,184) is read where its slot is:
+    /// on a host that takes the whole heap, in the slot itself; on a capped
+    /// one, in the dynamic slot of its index when it has one, which holds the
+    /// buffer the record names; and at or past the null slot nowhere (a
+    /// shader that picks it reads the null slot: the one warning of a view
+    /// lost).
+    #[test]
+    fn a_view_at_a_title_slot_above_a_million_is_read_where_its_slot_is() {
+        let Some(heap) = HostHeap::new(false, TITLE_VIEWS) else {
+            return; // no host GPU
+        };
+        let step = 32usize;
+        // A title heap of eight records, of which the one at slot 1,100,000
+        // holds a view of memory of the title's.
+        let mut records = vec![0u32; 8 * step / 4];
+        let base = records.as_mut_ptr() as u64;
+        let handle = |s: u32| base + u64::from(s % 8) * step as u64;
+        let memory = vec![0u8; 2 << 20];
+        let at = (memory.as_ptr() as u64).next_multiple_of(64 << 10);
+        let null = victory_shader::emit::view_heap_limit();
+        for slot in [1_100_000u32, 1_000_001, TITLE_VIEWS - 1] {
+            // SAFETY: inside `records`, whose records are 32 bytes.
+            unsafe { crate::descriptor::record(handle(slot), View::Constant(at, 256)) };
+            heap.mirror(slot, handle(slot), true);
+            let shows = heap.kept_in(slot).is_some();
+            if slot < heap.count {
+                // A host that takes the whole title heap: a slot of its own.
+                assert!(shows, "slot {slot} of the host's own");
+                assert_eq!(heap.tail_pinned(), 0);
+            } else if slot < heap.count + heap.dynamic {
+                // Capped: the dynamic slot of the index, which no table is given.
+                assert!(shows, "slot {slot} pinned");
+                assert!(slot < null);
+                assert!(heap.tail.lock().unwrap().contains_key(&slot));
+                // A record that goes gives it back.
+                // SAFETY: as above.
+                unsafe { (handle(slot) as *mut [u32; 3]).write_unaligned([0; 3]) };
+                heap.mirror(slot, handle(slot), true);
+                assert!(!heap.tail.lock().unwrap().contains_key(&slot));
+                assert!(heap.kept_in(slot).is_none());
+            } else {
+                // At or past the null slot: not shown anywhere.
+                assert!(!shows, "slot {slot} lost");
+                assert_eq!(heap.tail_pinned(), 0);
+            }
+        }
+    }
+
+    /// A host that takes more than 1,000,000 views and fewer than the most
+    /// that is asked is given what it takes, to the step of the search.
+    #[test]
+    fn the_largest_heap_between_the_limits_is_found() {
+        // The limit of NVIDIA's driver: nothing past 1,000,000.
+        assert_eq!(most_between(PORTABLE_VIEWS, MID_VIEWS, &|n| n <= PORTABLE_VIEWS), PORTABLE_VIEWS);
+        // A host that takes 1,100,000: found within a step below it.
+        let found = most_between(PORTABLE_VIEWS, MID_VIEWS, &|n| n <= 1_100_000);
+        assert!(found <= 1_100_000 && found + SEARCH_STEP > 1_100_000, "{found}");
+        // One that takes the title's whole heap and its dynamic slots.
+        let found = most_between(PORTABLE_VIEWS, MID_VIEWS, &|n| n <= TITLE_VIEWS + 254_976);
+        assert!(found <= TITLE_VIEWS + 254_976 && found + SEARCH_STEP > TITLE_VIEWS + 254_976, "{found}");
+        // A host that takes all of it.
+        let found = most_between(PORTABLE_VIEWS, MID_VIEWS, &|_| true);
+        assert!(found + SEARCH_STEP >= MID_VIEWS, "{found}");
+        // A narrow range is not searched.
+        assert_eq!(most_between(10, 10 + SEARCH_STEP, &|_| panic!("not asked")), 10);
+        // The picks: the most the host takes, whatever it is, with no twins
+        // below 2^22 views.
+        let capped = |limit: u32| pick_views(move |n| n <= limit);
+        assert_eq!(capped(PORTABLE_VIEWS), (PORTABLE_VIEWS, 0));
+        let (views, raw) = capped(1_100_000);
+        assert_eq!(raw, 0);
+        assert!(views > PORTABLE_VIEWS && views <= 1_100_000, "{views}");
+        assert_eq!(capped(MID_VIEWS), (MID_VIEWS, 0));
+        assert_eq!(capped(UNCAPPED_VIEWS), (UNCAPPED_VIEWS, 0));
     }
 
     #[test]

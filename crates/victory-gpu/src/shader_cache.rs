@@ -92,7 +92,11 @@ fn build() -> [u8; 32] {
             "VICTORY_LOOP_WHY",
             "VICTORY_LOOP_LIMITS",
             "VICTORY_HALF_EXIT",
+<<<<<<< HEAD
             "VICTORY_LOCAL_EXIT",
+=======
+            "VICTORY_KEEP_LOOP_SKIPS",
+>>>>>>> 7e589744df0ac4427df31eae32406c2c79398bb4
             "VICTORY_PEEK",
             "VICTORY_MASK_NUMBERS",
             "VICTORY_BVH_BOUNDS",

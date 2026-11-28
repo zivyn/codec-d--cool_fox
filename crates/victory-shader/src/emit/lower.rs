@@ -1556,6 +1556,25 @@ fn half_exit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_EXIT").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_LOCAL_EXIT=1`: a console wave64 program that only translates as two host waves of
+/// 32 that each run as a wave of their own (`with_local_waves_any`) takes the branches that leave
+/// its loops, where the console takes them for the whole wave (`s_cbranch_scc0` on the lanes
+/// left in a loop's mask, `execz`), for the whole host wave too ([`Lower::wave_wide`]): the lanes
+/// of a host wave go through the loop and out of it together. Without it each lane leaves on its
+/// own bit: a lane outside the loop's mask never meets that branch and goes round until the
+/// loop's limit (then it leaves as killed, and what the code after the loop writes for it is
+/// lost), and the code after the loop, which reads other lanes (a quad's neighbours, a first
+/// lane), runs with the lanes that have left so far. Off unless set. Part of the translation:
+/// the shader cache keys on it.
+pub(super) fn local_exit() -> bool {
+    #[cfg(test)]
+    if TEST_LOCAL_EXIT.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_EXIT").is_some_and(|v| v == "1"))
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1570,6 +1589,8 @@ thread_local! {
     pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's `VICTORY_HALF_EXIT`, for its thread only.
     pub(super) static TEST_HALF_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's `VICTORY_LOCAL_EXIT`, for its thread only.
+    pub(super) static TEST_LOCAL_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's `VICTORY_LOOP_LIMITS`, for its thread only.
     pub(super) static TEST_LOOP_LIMITS: std::cell::RefCell<Option<super::LoopLimits>> = const { std::cell::RefCell::new(None) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -5200,6 +5221,20 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
+        if self.local && self.local_any {
+            // Each host wave is a wave of its own (`with_local_waves_any`, `VICTORY_LOCAL_EXIT`):
+            // its answer is the wave's, and its lanes must all be here to give it.
+            if !self.all_lanes(b) {
+                need(b);
+                return Err(WHY);
+            }
+            let c = self.cur;
+            let mine = self.boolean(when, c)?;
+            let i1t = self.s.t.i1;
+            self.s.flags |= flags::WAVE_OPS;
+            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
+            return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
+        }
         if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
             // The host's waves are the console's: the wave's own answer. The lanes that are
             // elsewhere have no bit set, as on the console, so "some lane" needs no one but

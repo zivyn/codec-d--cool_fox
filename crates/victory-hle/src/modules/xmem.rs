@@ -1319,7 +1319,10 @@ const WIDE: usize = 16;
 /// `VICTORY_MAP_THREADS` as a number; `None`: by how much there is to map.
 fn asked_threads() -> Option<usize> {
     static ASKED: LazyLock<Option<usize>> = LazyLock::new(|| {
-        match victory_gpu::defaults::var("VICTORY_MAP_THREADS") {
+        // This crate's own tests read the environment only (`victory_gpu::defaults`): they were written for the
+        // threads of an unset variable, and the page-by-page path some of them look at is taken only by several.
+        let asked = if cfg!(test) { std::env::var("VICTORY_MAP_THREADS") } else { victory_gpu::defaults::var("VICTORY_MAP_THREADS") };
+        match asked {
             Ok(v) if v.trim() == "auto" => None,
             v => Some(v.ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8).clamp(1, 32)),
         }

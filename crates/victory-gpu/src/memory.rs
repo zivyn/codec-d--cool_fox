@@ -956,6 +956,7 @@ impl Memory {
             self.faulted,
             fault_limit()
         );
+        crate::sizes::report();
         self.stats.from = Some((now, self.frame));
     }
 }
@@ -964,14 +965,17 @@ impl Memory {
 const SIZES: usize = usize::MAX - (9 << 33);
 
 /// Whether a submission that asks for the sizes of structures is waited for,
-/// and landed, before the title goes on (`VICTORY_BVH_SIZES_WAIT=1`; off).
+/// and landed, before the title goes on (`VICTORY_BVH_SIZES=wait` or
+/// `VICTORY_BVH_SIZES_WAIT=1`; off), and what else is done about the sizes:
+/// see [`crate::sizes`].
 ///
-/// Off: it does not help. In run light-15, with it, 33 of 154 copies had the
-/// slot's old size still (all of them recorded one frame after the size was
+/// Wait alone: it did not help. In run light-15, with it, 33 of 154 copies had
+/// the slot's old size still (all of them recorded one frame after the size was
 /// asked for) against 53 of 230 in light-11, 48 of 275 dynamic structures
 /// were good, and the title asks in every frame, so every frame waits (109 ms
 /// against 90). The title reads the slot before our submission of the asking
-/// list is through, or reads it for another purpose; not known.
+/// list is through, or reads it for another purpose; not known. The counts of
+/// [`crate::sizes::report`] (`wait_landed`, `wait_unchanged`) say which.
 ///
 /// The title asks for a new structure's compacted size (a program of one
 /// thread stores it into a small buffer), reads it a frame or two later
@@ -982,8 +986,7 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// asked for two frames earlier and landed in that frame, none of those with
 /// the right size.
 fn sizes_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
+    crate::sizes::mode().on()
 }
 
 /// Whether a dispatch of the builder is its program of a structure's size:
@@ -1082,6 +1085,7 @@ pub(crate) fn ready(
         m.take_faults();
         m.look_again();
         m.report();
+        crate::sizes::look(frame);
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
     }
@@ -1091,7 +1095,14 @@ pub(crate) fn ready(
     }
     let builds = use_ != Use::Reads;
     if builds && sizes_wait() && asks_size(written, constants, threads) {
-        list.first_use(SIZES);
+        // (`asks_size`: the structure's address in the first two constants, what to store in the third.)
+        let wait = match *constants {
+            [low, high, 1, ..] => crate::sizes::asked(frame, u64::from(low) | u64::from(high) << 32, written[0]),
+            _ => crate::sizes::mode() == crate::sizes::Mode::Wait,
+        };
+        if wait {
+            list.first_use(SIZES);
+        }
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;

@@ -858,39 +858,40 @@ fn emit_forms(
                 continue;
             }
             for (name, f) in &forms {
-                if let Some((p, st, io, res)) = f
-                    && idiom(p, st) == exact
+                if let Some((fp, fst, fio, fres)) = f
+                    && idiom(fp, fst) == exact
                 {
-                    // (`VICTORY_LOCAL_EXIT=2`: the lanes of a host wave leave the loops together)
-                    if !exact
-                        && lower::local_exit_all()
-                        && let Some(together) = local_exit_form::local_exit(c, native, p, why, false)
-                    {
-                        report(&format!("local waves (APPROXIMATE, loops left together), {name}"), &together);
-                        if done(&together) {
-                            return together.map(|(shader, _)| shader);
-                        }
-                    }
-                    let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                    let local = lower::with_local_waves(|| emit_program(c, native, fp, fst, fio, fres));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
+                        // (`VICTORY_LOCAL_EXIT=2`: where this form is the one taken, the lanes of a host wave
+                        // leave the loops together)
+                        if !exact && lower::local_exit_all() {
+                            for (label, q) in [("with its early-outs", p), (*name, fp)] {
+                                if let Some(together) = local_exit_form::local_exit(c, native, q, why, false) {
+                                    report(&format!("local waves (APPROXIMATE, loops left together), {label}"), &together);
+                                    if done(&together) {
+                                        return together.map(|(shader, _)| shader);
+                                    }
+                                }
+                            }
+                        }
                         return local.map(|(shader, _)| shader);
                     }
                 }
             }
             if idiom(p, st) == exact {
-                if !exact
-                    && lower::local_exit_all()
-                    && let Some(together) = local_exit_form::local_exit(c, native, p, why, false)
-                {
-                    report("local waves (APPROXIMATE, loops left together)", &together);
-                    if done(&together) {
-                        return together.map(|(shader, _)| shader);
-                    }
-                }
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
+                    if !exact && lower::local_exit_all() {
+                        if let Some(together) = local_exit_form::local_exit(c, native, p, why, false) {
+                            report("local waves (APPROXIMATE, loops left together)", &together);
+                            if done(&together) {
+                                return together.map(|(shader, _)| shader);
+                            }
+                        }
+                    }
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -898,45 +899,36 @@ fn emit_forms(
         if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
-                // (`VICTORY_LOCAL_EXIT=1`: the program itself first, with the early-out the console takes
-                // for a wave with no lane taken by the host wave)
-                if lower::local_exit()
-                    && let Some(together) = local_exit_form::local_exit(c, native, p, why, true)
-                {
-                    report("local waves (APPROXIMATE, any mask, loops left together), with its early-outs", &together);
-                    if done(&together) {
-                        return together.map(|(shader, _)| shader);
-                    }
-                }
+                // (`VICTORY_LOCAL_EXIT=1`: where a form of this is the one taken, the lanes of a host wave
+                // leave the loops together: the program itself first, with the early-out the console takes
+                // for a wave with no lane, then that form)
+                let together = |label: &str, q: &ir::Program| {
+                    let t = local_exit_form::local_exit(c, native, q, why, true)?;
+                    report(&format!("local waves (APPROXIMATE, any mask, loops left together), {label}"), &t);
+                    done(&t).then_some(t)
+                };
                 for (name, f) in &forms {
-                    if let Some((p, st, io, res)) = f {
-                        // (`VICTORY_LOCAL_EXIT=1`: the lanes of a host wave leave the loops together)
-                        if lower::local_exit()
-                            && let Some(together) = local_exit_form::local_exit(c, native, p, why, true)
-                        {
-                            report(&format!("local waves (APPROXIMATE, any mask, loops left together), {name}"), &together);
-                            if done(&together) {
-                                return together.map(|(shader, _)| shader);
-                            }
-                        }
-                        let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                    if let Some((fp, fst, fio, fres)) = f {
+                        let local = lower::with_local_waves_any(|| emit_program(c, native, fp, fst, fio, fres));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
+                            if lower::local_exit()
+                                && let Some(t) = together("with its early-outs", p).or_else(|| together(name, fp))
+                            {
+                                return t.map(|(shader, _)| shader);
+                            }
                             return local.map(|(shader, _)| shader);
                         }
-                    }
-                }
-                if lower::local_exit()
-                    && let Some(together) = local_exit_form::local_exit(c, native, p, why, true)
-                {
-                    report("local waves (APPROXIMATE, any mask, loops left together)", &together);
-                    if done(&together) {
-                        return together.map(|(shader, _)| shader);
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
+                    if lower::local_exit()
+                        && let Some(t) = together("with its early-outs", p)
+                    {
+                        return t.map(|(shader, _)| shader);
+                    }
                     return local.map(|(shader, _)| shader);
                 }
             }

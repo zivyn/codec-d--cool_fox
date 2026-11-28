@@ -56,6 +56,7 @@ pub(super) fn late_line(frames: f64) {
     }
     prefetch::line(frames);
     front::frame_line(frames);
+    plan::frame_line(frames);
     askaside::line(frames);
     waits::line(frames);
     onepass::line(frames);

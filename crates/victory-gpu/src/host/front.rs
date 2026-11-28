@@ -72,9 +72,16 @@
 //!    the refreshes of the entry after it (named by the lane when it offered the next: [`crate::queue::deeper_next`])
 //!    to the thread of the refreshes, for the copies the next submission does nothing to (`prefetch::offer_deep`).
 //!    The lane joins this thread first and the other second, before it takes anything of the next submission.
+//! 10. **The card's steps (`VICTORY_STAGE_A_PLAN`, [`plan`]).** A submission that reads what flights write is not declined
+//!     when the plan for the card can be made: the thread plans it ([`Host::plan_ahead`]) from the line with the
+//!     submission being sent in it, as the thread of submissions would after the send, asks, refreshes and does the steps
+//!     that are left (the fills of upload memory among them: the list's own memory), and hands the plan over with what it
+//!     did: the thread of submissions sends the plan's list in front of the submission's, as when it plans. The plan is
+//!     committed (the descriptor slots made) only at the point of no return, after the line's generation was looked at
+//!     again; before that, giving the submission back leaves no trace.
 //!
 //! What is not done on the thread: the snapshots, the declarations of picked ranges, the
-//! take (they are stage B), and the submissions that wait for flights unless a bit says wait.
+//! take (they are stage B), and the submissions that wait for flights unless a bit says wait or the plan is made.
 
 use super::*;
 
@@ -96,6 +103,10 @@ pub(super) struct Front {
     parts: Vec<usize>,
     number: u64,
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
+    /// The steps given to the card, planned and committed on the thread (`VICTORY_STAGE_A_PLAN`), and the generation of
+    /// the line they were planned against: the list that does them goes in front of the submission's.
+    taken: Option<card_steps::Taken>,
+    generation: u64,
 }
 
 /// What the thread is asked: the lists (addresses, in order) and where their parts begin, and with
@@ -339,6 +350,11 @@ impl Front {
     pub(super) fn into_placed(self) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)> {
         self.placed
     }
+
+    /// The plan for the card the thread made, once, and the generation of the line it is against.
+    pub(super) fn take_plan(&mut self) -> Option<(card_steps::Taken, u64)> {
+        self.taken.take().map(|taken| (taken, self.generation))
+    }
 }
 
 /// The submission lock for a submission that is waited for and takes its number under it: the threads of the title
@@ -455,14 +471,35 @@ impl Host {
         // Flights that write what it reads: the thread of submissions plans the reads for the card or waits for them.
         let mut need = seen.need;
         let mut waits: Option<&'static str> = None;
+        // With `VICTORY_STAGE_A_PLAN` the reads that flights stop are planned for the card here, as the thread of
+        // submissions would after the send, instead of the submission being declined for them; planned before anything
+        // else is done, and not committed until the point of no return below.
+        let mut ahead: Option<plan::Planned> = None;
+        let mut refused: Option<&'static str> = None;
         {
             let (written, copies) = {
                 let line = line();
                 (line.written.clone(), card_steps::copies(&line))
             };
-            if !written.is_empty() && (blocked_by(&written, &runs, false).is_some() || card_steps::copied_read(&copies, &runs)) {
-                waits = Some(relax::what_waits(&written, &copies, &runs));
-                need |= relax::WAIT_READS;
+            if !written.is_empty() {
+                let blocked = blocked_by(&written, &runs, false).is_some();
+                let copied = card_steps::copied_read(&copies, &runs);
+                let mut waiting = blocked || copied;
+                if blocked && !copied && seen.need & !bits == 0 && plan::on() {
+                    match self.plan_ahead(&runs) {
+                        plan::Tried::Planned(planned) => {
+                            ahead = Some(planned);
+                            waiting = false;
+                        }
+                        plan::Tried::NotBlocked => waiting = false,
+                        plan::Tried::NothingToTake => {}
+                        plan::Tried::Refused(why) => refused = Some(why),
+                    }
+                }
+                if waiting {
+                    waits = Some(relax::what_waits(&written, &copies, &runs));
+                    need |= relax::WAIT_READS;
+                }
             }
         }
         // (All its waits for flights together are bounded: the threads that wait for a number are held back for 200 ms.)
@@ -471,7 +508,10 @@ impl Host {
         let missing = need & !bits;
         if missing != 0 {
             let why = match waits {
-                Some(what) if missing == relax::WAIT_READS => format!("it waits for flights it reads from: {what}"),
+                Some(what) if missing == relax::WAIT_READS => match refused {
+                    Some(why) => format!("it waits for flights it reads from: {what} (the plan for the card was refused: {why})"),
+                    None => format!("it waits for flights it reads from: {what}"),
+                },
                 _ => {
                     let what = waits.map(|w| format!(" (flights: {w})")).unwrap_or_default();
                     format!("it needs these of VICTORY_STAGE_A_RELAX: {}{what}", relax::describe(missing))
@@ -500,8 +540,18 @@ impl Host {
                 return Err("nothing in the air after the wait: the thread of submissions sweeps".into());
             }
         }
+        // The lists as the thread of submissions runs them: the plan's own list in front of the submission's, the parts
+        // after it (the plan's list is in no part of its own).
+        let with: Vec<&HostList>;
+        let (lists, parts): (&[&HostList], Vec<usize>) = match &ahead {
+            Some(planned) => {
+                with = std::iter::once(planned.chosen.list()).chain(runs.iter().copied()).collect();
+                (&with[..], asked.parts.iter().map(|&n| n + 1).collect())
+            }
+            None => (&runs[..], asked.parts.clone()),
+        };
         let mut batch = Batch::new(lean_steps());
-        let ranges = ask_spans(&runs, batch.lean);
+        let ranges = ask_spans(lists, batch.lean);
         let mut asking: Option<crate::watch::Standing> = None;
         ask_for_submission(&ranges, &mut asking);
         let end = |asking: &mut Option<crate::watch::Standing>| match asking.take() {
@@ -511,11 +561,14 @@ impl Host {
         // What the title wrote under flights' writes that cannot be put in beside them waits for them: the thread of
         // submissions settles, or with bit 16 the thread waits for the flights that declared them, as `settle_stale`
         // does (three times at most: what is left after that waits as before).
-        let mut stale = stale_under_flights(&runs);
+        let mut stale = stale_under_flights(lists);
         if !stale.is_empty() {
             need |= relax::WAIT_STALE;
             if bits & relax::WAIT_STALE == 0 || card_steps::stage() == 0 {
                 end(&mut asking);
+                if ahead.is_some() {
+                    plan::dropped();
+                }
                 let why = if bits & relax::WAIT_STALE == 0 {
                     "title bytes under flights' writes wait for them (VICTORY_STAGE_A_RELAX bit 16)"
                 } else {
@@ -535,7 +588,7 @@ impl Host {
                 }
                 // What they landed is title memory written: asked and looked at again.
                 ask_for_submission(&ranges, &mut asking);
-                stale = stale_under_flights(&runs);
+                stale = stale_under_flights(lists);
                 if stale.is_empty() {
                     break;
                 }
@@ -543,9 +596,27 @@ impl Host {
             if !stale.is_empty() {
                 STATS[WAITS_GAVE_UP].fetch_add(1, Ordering::Relaxed);
                 end(&mut asking);
+                if ahead.is_some() {
+                    plan::dropped();
+                }
                 return Err(Declined { why: "title bytes under flights' writes were still there after waiting".into(), need, kinds: seen.kinds });
             }
             STATS[WAITS_OK].fetch_add(1, Ordering::Relaxed);
+        }
+        // The plan is committed (the descriptor slots made to show its buffer) only now, where nothing is given back after:
+        // if a submission was registered since it was made, it did not know what that one writes, and the submission is
+        // given back (the thread of submissions plans it).
+        if let Some(planned) = &ahead {
+            if !planned.holds() {
+                plan::redone();
+                end(&mut asking);
+                return Err(Declined {
+                    why: "the line of flights had a submission registered after the plan for the card was made".into(),
+                    need,
+                    kinds: seen.kinds,
+                });
+            }
+            planned.chosen.commit();
         }
         // Nothing is declined from here on: the submission has its number, and its steps are done.
         let number = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
@@ -554,17 +625,29 @@ impl Host {
         // this one's asking, refreshes and steps (`VICTORY_STAGE_A_DEEP`): the lane joins them before it asks, refreshes or
         // takes anything for this submission, and so no copy is in two stages' hands.
         if let Some(next) = &asked.deeper {
-            prefetch::offer_deep(&runs, next);
+            prefetch::offer_deep(lists, next);
         }
         let air = line().written.clone();
-        batch.refresh_front(&runs, &asked.parts);
-        for list in &runs {
-            list.run_deferred(&mut batch, &air, |_| false, None);
+        batch.refresh_front(lists, &parts);
+        for list in lists {
+            // (The steps the card does are left out, as the thread of submissions does with its own plan.)
+            list.run_deferred(&mut batch, &air, |i| ahead.as_ref().is_some_and(|planned| planned.chosen.takes(list, i)), None);
         }
         batch.fill();
         batch.flush();
         end(&mut asking);
-        Ok(Front { lists: asked.lists.clone(), parts: asked.parts.clone(), number, placed: std::mem::take(&mut batch.placed) })
+        let (generation, taken) = match ahead {
+            Some(planned) => (planned.generation(), Some(planned.chosen.into_taken())),
+            None => (0, None),
+        };
+        Ok(Front {
+            lists: asked.lists.clone(),
+            parts: asked.parts.clone(),
+            number,
+            placed: std::mem::take(&mut batch.placed),
+            taken,
+            generation,
+        })
     }
 }
 
@@ -636,7 +719,7 @@ mod tests {
     /// The lists the thread prepared must be those the thread of submissions runs, in the same order and parts.
     #[test]
     fn what_was_prepared_is_for_the_same_lists_in_the_same_parts() {
-        let front = Front { lists: vec![0x10, 0x20, 0x30], parts: vec![2], number: 5, placed: Vec::new() };
+        let front = Front { lists: vec![0x10, 0x20, 0x30], parts: vec![2], number: 5, placed: Vec::new(), taken: None, generation: 0 };
         let (a, b, c) = (0x10usize, 0x20usize, 0x30usize);
         assert!(same(&front, &[a, b, c], &[2]));
         assert!(!same(&front, &[a, c, b], &[2]), "another order");

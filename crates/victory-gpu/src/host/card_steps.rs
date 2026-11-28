@@ -134,6 +134,25 @@ pub(super) struct Writer {
     copy: bool,
 }
 
+impl Writer {
+    /// A writer of `[from, to)` through `shadow` (`None`: the bytes reach title memory when the flight lands); `copy`
+    /// whether it is the destination of a copy done on the card.
+    pub(super) fn new(shadow: Option<Arc<Shadow>>, from: usize, to: usize, copy: bool) -> Writer {
+        Writer { shadow, from, to, copy }
+    }
+
+    /// Another of the same.
+    pub(super) fn dup(&self) -> Writer {
+        Writer { shadow: self.shadow.clone(), ..*self }
+    }
+
+    /// From, to, whether it is a copy done on the card, and the address of its host copy (0: none), for comparing.
+    #[cfg(test)]
+    pub(super) fn parts(&self) -> (usize, usize, bool, usize) {
+        (self.from, self.to, self.copy, self.shadow.as_ref().map_or(0, |s| Arc::as_ptr(s) as usize))
+    }
+}
+
 /// What `items` of the line write.
 pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
     let mut out = Vec::new();
@@ -192,7 +211,7 @@ fn copies_in(line: &Line) -> Vec<Writer> {
     });
     // (And those of the submissions being sent, not yet flights in the line: the thread of stage A looks at the
     // next submission while the one before is sent.)
-    let sending = line.pending_copies.iter().flat_map(|p| p.1.iter()).map(|w| Writer {
+    let sending = line.pending_copies.iter().flat_map(|p| p.1.iter()).filter(|w| w.copy).map(|w| Writer {
         shadow: w.shadow.clone(),
         ..*w
     });
@@ -923,6 +942,122 @@ impl Taken {
     }
 }
 
+/// A plan for the card ([`Host::choose_steps`]): the list that does the steps, recorded and closed, and what is to be
+/// made of the descriptor slots, which [`Chosen::commit`] does. Until then nothing but the list's pool is touched, so
+/// dropping it (the thread of stage A found the submission could not be done after all) leaves no trace; after it,
+/// [`Chosen::into_taken`] is what the submission sends.
+pub(super) struct Chosen {
+    own: Option<Own>,
+    steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    copied: Vec<(Arc<Shadow>, usize, usize)>,
+    ops: Vec<Op>,
+    lean: bool,
+}
+
+impl Chosen {
+    fn own(&self) -> &Own {
+        // (Present until `into_taken` or the drop, which end its life.)
+        self.own.as_ref().expect("a plan holds its list until it is taken or dropped")
+    }
+
+    pub(super) fn list(&self) -> &HostList {
+        &self.own().list
+    }
+
+    /// Whether step `i` of `list` is done by this.
+    pub(super) fn takes(&self, list: &HostList, i: usize) -> bool {
+        self.steps.contains(&(std::ptr::from_ref(list) as usize, i))
+    }
+
+    /// Makes the descriptor slots of the fills it does show our buffer (the list that names them has not gone to the
+    /// card), and counts what it does. Not undone: a plan that is committed is the submission's.
+    pub(super) fn commit(&self) {
+        let spent = crate::timeline::span("steps on the card: the slots");
+        let (ops, lean, own) = (&self.ops, self.lean, self.own());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { own.between.GetGPUVirtualAddress() };
+        // (11,000 slots a frame in a street, two descriptors each: on
+        // several threads, a slot always on the same one, in the steps'
+        // order.)
+        let parts = if ops.len() < 256 { 1 } else { 8 };
+        crate::land::each_under(parts, &|part| {
+            if lean {
+                // The hold on the buffer is taken once, the look at the heaps once for each heap: not for each of
+                // thousands of slots, by threads that all do it on the same counter of the same buffer.
+                let mut mine: Vec<(usize, u32, u64, u32)> = Vec::with_capacity(ops.len() / parts + 1);
+                for op in ops {
+                    if let To::Slot(heap, index) = &op.to
+                        && *index as usize / 4 % parts == part
+                    {
+                        mine.push((*heap, *index, gpu + op.at, op.len as u32));
+                    }
+                }
+                // (In the steps' order, a heap at a time: the slots of one heap are made one after the other in
+                // that order, as before; those of two heaps have nothing in common.)
+                mine.sort_by_key(|slot| slot.0);
+                for heap in mine.chunk_by(|a, b| a.0 == b.0) {
+                    crate::descriptor::constant_slots(heap[0].0, &own.between, heap.iter().map(|&(_, index, at, len)| (index, at, len)));
+                }
+                return;
+            }
+            for op in ops {
+                if let To::Slot(heap, index) = &op.to
+                    && *index as usize / 4 % parts == part
+                {
+                    // (A heap that is gone: nothing can read the slot.)
+                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                }
+            }
+        });
+        let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
+        DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
+        DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
+        DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        noted(ops);
+        spent.end();
+    }
+
+    /// The plan as the submission carries it.
+    pub(super) fn into_taken(mut self) -> Taken {
+        Taken {
+            own: self.own.take().expect("a plan holds its list until it is taken or dropped"),
+            steps: std::mem::take(&mut self.steps),
+            copied: std::mem::take(&mut self.copied),
+        }
+    }
+}
+
+impl Drop for Chosen {
+    /// A plan that was not taken: its list and buffer are free, its commands stay until the next use resets it.
+    fn drop(&mut self) {
+        if let Some(own) = self.own.take() {
+            drop(std::mem::take(&mut *own.list.deferred()));
+            POOL.lock().unwrap_or_else(|e| e.into_inner()).push(own);
+        }
+    }
+}
+
+/// What a planning looks at in the line, taken in one hold of its lock: what flights write (`written`), the
+/// destinations of copies done on the card that have not landed, who writes what through which host copy (the flights
+/// in the line, those being landed, and the submissions registered and not yet flights: the one being sent, whose
+/// flight is not in the line yet), and how many submissions have been registered ([`Line::generation`]).
+pub(super) struct Snapshot {
+    pub(super) written: Vec<(usize, usize)>,
+    pub(super) copies: Vec<Writer>,
+    pub(super) writers: Vec<Writer>,
+    pub(super) generation: u64,
+}
+
+/// [`Snapshot`] of the line now.
+pub(super) fn snapshot() -> Snapshot {
+    let line = line();
+    let mut all = writers(&line.line);
+    all.extend(line.landing.iter().map(Writer::dup));
+    all.extend(line.pending_copies.iter().flat_map(|p| p.1.iter()).map(Writer::dup));
+    Snapshot { written: line.written.clone(), copies: copies(&line), writers: all, generation: line.generation }
+}
+
 impl Host {
     /// With flights in the air: if what keeps `runs` from being prepared
     /// now is reads of title memory that can all be done on the card
@@ -958,6 +1093,23 @@ impl Host {
     }
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList], compute: bool) -> Result<Option<Taken>, &'static str> {
+        Ok(self.choose_steps(written, runs, compute, None)?.map(|chosen| {
+            chosen.commit();
+            chosen.into_taken()
+        }))
+    }
+
+    /// The steps of `runs` to be done on the card, chosen and recorded in a list of ours, without anything outside
+    /// the plan being touched yet: [`Chosen::commit`] makes the descriptor slots show the buffer, and a plan dropped
+    /// before that leaves no trace (its list goes back to the pool). `writers`: what flights write, as the caller took
+    /// them in one hold of the line's lock together with `written` ([`snapshot`]); `None`: taken here.
+    pub(super) fn choose_steps(
+        &self,
+        written: &[(usize, usize)],
+        runs: &[&HostList],
+        compute: bool,
+        writers: Option<Vec<Writer>>,
+    ) -> Result<Option<Chosen>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         // (Read once: the way the steps of this submission are looked at and the slots made.)
         let lean = lean_steps();
@@ -973,14 +1125,17 @@ impl Host {
             return Ok(None);
         }
         spent.next("steps on the card: what holds their bytes");
-        let mut writers = {
-            let line = line();
-            let mut all = writers(&line.line);
-            all.extend(line.landing.iter().map(|w| Writer {
-                shadow: w.shadow.clone(),
-                ..*w
-            }));
-            all
+        let mut writers = match writers {
+            Some(writers) => writers,
+            None => {
+                let line = line();
+                let mut all = self::writers(&line.line);
+                all.extend(line.landing.iter().map(|w| Writer {
+                    shadow: w.shadow.clone(),
+                    ..*w
+                }));
+                all
+            }
         };
         // The writers that exist now, found by address (`VICTORY_HOLDER_INDEX`);
         // the copies' destinations pushed below are looked at one by one.
@@ -1130,54 +1285,13 @@ impl Host {
             record(level == 0, &own.list.list, &own.between, &reads, &writes);
         }
         own.list.close();
-        // SAFETY: a live buffer.
-        let gpu = unsafe { own.between.GetGPUVirtualAddress() };
-        spent.next("steps on the card: the slots");
-        // (11,000 slots a frame in a street, two descriptors each: on
-        // several threads, a slot always on the same one, in the steps'
-        // order.)
-        let parts = if ops.len() < 256 { 1 } else { 8 };
-        crate::land::each_under(parts, &|part| {
-            if lean {
-                // The hold on the buffer is taken once, the look at the heaps once for each heap: not for each of
-                // thousands of slots, by threads that all do it on the same counter of the same buffer.
-                let mut mine: Vec<(usize, u32, u64, u32)> =
-                    Vec::with_capacity(ops.len() / parts + 1);
-                for op in &ops {
-                    if let To::Slot(heap, index) = &op.to
-                        && *index as usize / 4 % parts == part
-                    {
-                        mine.push((*heap, *index, gpu + op.at, op.len as u32));
-                    }
-                }
-                // (In the steps' order, a heap at a time: the slots of one heap are made one after the other in
-                // that order, as before; those of two heaps have nothing in common.)
-                mine.sort_by_key(|slot| slot.0);
-                for heap in mine.chunk_by(|a, b| a.0 == b.0) {
-                    crate::descriptor::constant_slots(heap[0].0, &own.between, heap.iter().map(|&(_, index, at, len)| (index, at, len)));
-                }
-                return;
-            }
-            for op in &ops {
-                if let To::Slot(heap, index) = &op.to
-                    && *index as usize / 4 % parts == part
-                {
-                    // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
-                }
-            }
-        });
-        let copies = ops.iter().filter(|op| matches!(op.to, To::Copy(..))).count();
-        DONE[0].fetch_add((ops.len() - copies) as u64, Ordering::Relaxed);
-        DONE[1].fetch_add(copies as u64, Ordering::Relaxed);
-        DONE[2].fetch_add(ops.iter().map(|op| op.len as u64).sum(), Ordering::Relaxed);
-        #[cfg(feature = "diagnostics")]
-        noted(&ops);
         spent.end();
-        Ok(Some(Taken {
-            own,
+        Ok(Some(Chosen {
+            own: Some(own),
             steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
             copied,
+            ops,
+            lean,
         }))
     }
 
@@ -1892,5 +2006,185 @@ mod join_tests {
         // The same bytes: the sum of the lengths.
         let total = |v: &[(u32, u64, u64, u64)]| v.iter().map(|c| c.3).sum::<u64>();
         assert_eq!(total(&joined_copies(&planned, same)), total(&planned));
+    }
+}
+
+/// STAGE4: planning beside the send of the submission before (`VICTORY_STAGE_A_PLAN`).
+#[cfg(test)]
+mod beside_tests {
+    use super::*;
+    use crate::host::plan::pending_writers;
+
+    const BASE: usize = 0x10000;
+    const SIZE: usize = 0x4000;
+
+    /// The host copy a range is found in, by address, or why not.
+    fn found(writers: &[Writer], from: usize, to: usize) -> Result<usize, &'static str> {
+        holder(writers, from, to).map(|shadow| Arc::as_ptr(&shadow) as usize)
+    }
+
+    /// The steps of a submission as the plan sees them against `written`: what is asked is what a flight stops.
+    fn does_against(steps: &[(bool, usize, usize, usize)], written: &[(usize, usize)]) -> Vec<Does> {
+        steps
+            .iter()
+            .map(|&(is_copy, dst, src, len)| {
+                if is_copy {
+                    Does::Copy { dst, src, len, asked: touches(written, src, src + len) || touches(written, dst, dst + len) }
+                } else {
+                    Does::Fill { src, len, asked: touches(written, src, src + len), to: true }
+                }
+            })
+            .collect()
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+
+        /// A range of title memory, a multiple of 16 bytes at a multiple of 16, at most `max` of them.
+        fn range(&mut self, max: u64) -> (usize, usize) {
+            let from = BASE + 16 * self.below((SIZE / 16 - 40) as u64) as usize;
+            (from, from + 16 * (1 + self.below(max) as usize))
+        }
+    }
+
+    /// The title ranges a taken step reads and writes.
+    fn places(does: &Does) -> Vec<(usize, usize)> {
+        match *does {
+            Does::Copy { dst, src, len, .. } => vec![(src, src + len), (dst, dst + len)],
+            Does::Fill { src, len, .. } => vec![(src, src + len)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// 500 rounds of flights in the air, a submission being sent (registered with what its flight will say, not yet in
+    /// the line) and the steps of the next one. The plan the thread of stage A makes beside the send, from the line with
+    /// the registered submission in it, against the plan the thread of submissions makes after it, from the line with
+    /// the submission as a flight:
+    /// - with nothing landed in between they are the same plan, level by level, and find the same host copy for every
+    ///   range they read and write;
+    /// - with some flights landed in between (what is written only shrinks) every step the later plan takes, and every
+    ///   step asked at that look, is taken by the earlier one, and the host copy it found for a taken step is the one
+    ///   every writer that is left writes it through (the card reads it there, in order behind the flights);
+    /// - a plan made from a line that lacks the registered submission's writers finds another host copy for some
+    ///   ranges (why they are registered).
+    #[test]
+    fn a_plan_made_beside_the_send_is_the_plan_made_after_it_or_the_more_careful() {
+        let data: &'static mut [u8] = Box::leak(vec![0u8; SIZE].into_boxed_slice());
+        let shadows: Vec<Arc<Shadow>> = (0..3).map(|_| Shadow::unbacked(BASE as u64, data.as_mut_ptr(), SIZE as u64, false)).collect();
+        let mut rng = Rng(0x0004_51ab_7e57_0001);
+        let (mut same, mut shrunk, mut refused, mut taken, mut missed) = (0, 0, 0, 0, 0);
+        for round in 0..500 {
+            // Flights in the air: each writes a range through one of three host copies.
+            let flights: Vec<(usize, (usize, usize))> = (0..rng.below(6)).map(|_| (rng.below(3) as usize, rng.range(24))).collect();
+            // The submission being sent: what its shaders write through which host copy, and maybe a copy it does on the card.
+            let sending: Vec<(usize, (usize, usize))> = (0..rng.below(3)).map(|_| (rng.below(3) as usize, rng.range(24))).collect();
+            let copy = (rng.below(3) == 0).then(|| (rng.below(3) as usize, rng.range(24)));
+            let back: Vec<Declared> = sending.iter().map(|&(s, r)| (shadows[s].clone(), vec![r])).collect();
+            let copies: Vec<Writer> = copy.iter().map(|&(s, (a, b))| Writer::new(Some(shadows[s].clone()), a, b, true)).collect();
+            let registered = pending_writers(&back, [], [], copies.iter().map(Writer::dup));
+            // The steps of the next submission.
+            let steps: Vec<(bool, usize, usize, usize)> = (0..1 + rng.below(6))
+                .map(|_| {
+                    let (src, dst) = (rng.range(1).0, rng.range(1).0);
+                    (rng.below(2) == 0, dst, src, 16 * (1 + rng.below(8) as usize))
+                })
+                .collect();
+            let landed: Vec<bool> = flights.iter().map(|_| rng.below(3) == 0).collect();
+
+            let flight_writers = |kept: &[bool]| -> Vec<Writer> {
+                flights
+                    .iter()
+                    .zip(kept)
+                    .filter(|(_, kept)| **kept)
+                    .map(|(&(s, (a, b)), _)| Writer::new(Some(shadows[s].clone()), a, b, false))
+                    .collect()
+            };
+            let ranges_of = |kept: &[bool]| {
+                let mut written = Vec::new();
+                join_ranges(
+                    &mut written,
+                    flights.iter().zip(kept).filter(|(_, kept)| **kept).map(|(f, _)| f.1).chain(sending.iter().map(|s| s.1)),
+                );
+                written
+            };
+            // The thread's look: the flights in the line and the registered submission.
+            let all = vec![true; flights.len()];
+            let mut thread_writers = flight_writers(&all);
+            thread_writers.extend(registered.iter().map(Writer::dup));
+            let thread_does = does_against(&steps, &ranges_of(&all));
+            let thread_plan = plan(&thread_does, 2, true, &mut None);
+
+            // The lane's look after the send: the submission is a flight (its writers by the flight's own, its card copy as
+            // `Taken::copied` gives it), and the flights that landed in between are gone.
+            let kept: Vec<bool> = landed.iter().map(|&l| !l).collect();
+            let none_landed = kept.iter().all(|&k| k);
+            let flight = |back: Vec<Declared>| {
+                Late::Run(Flight { number: 1, fence: 1, lists: Vec::new(), order: Vec::new(), card: None, back, own: None, texture_back_ranges: Vec::new() })
+            };
+            let mut lane_items: Vec<Late> = vec![flight(back.clone())];
+            for (&(s, (a, b)), &keep) in flights.iter().zip(&kept) {
+                if keep {
+                    lane_items.push(flight(vec![(shadows[s].clone(), vec![(a, b)])]));
+                }
+            }
+            let mut lane_writers = writers(&lane_items);
+            lane_writers.extend(copies.iter().map(Writer::dup));
+            let lane_does = does_against(&steps, &ranges_of(&kept));
+            let lane_plan = plan(&lane_does, 2, true, &mut None);
+
+            // What the thread of stage A would have planned from the line as it was before the registration.
+            let old_writers = flight_writers(&all);
+            if let Ok(t) = &thread_plan {
+                let all_places: Vec<(usize, usize)> = t.iter().flat_map(|&(i, _)| places(&thread_does[i])).collect();
+                if all_places.iter().any(|&(a, b)| found(&old_writers, a, b) != found(&thread_writers, a, b)) {
+                    missed += 1;
+                }
+            }
+
+            match (&thread_plan, &lane_plan) {
+                (Err(_), _) => refused += 1,
+                (Ok(thread), Ok(lane)) if none_landed => {
+                    assert_eq!(thread, lane, "round {round}: the same plan, level by level");
+                    for &(i, _) in thread {
+                        for (a, b) in places(&thread_does[i]) {
+                            assert_eq!(found(&thread_writers, a, b), found(&lane_writers, a, b), "round {round}: the same host copy for {a:#x}..{b:#x}");
+                        }
+                    }
+                    same += 1;
+                    taken += usize::from(!thread.is_empty());
+                }
+                (Ok(thread), lane) => {
+                    let by_thread: Vec<usize> = thread.iter().map(|&(i, _)| i).collect();
+                    if let Ok(lane) = lane {
+                        for &(i, _) in lane {
+                            assert!(by_thread.contains(&i), "round {round}: step {i} is taken by the later plan and left to the CPU by the earlier");
+                        }
+                    }
+                    for (i, d) in lane_does.iter().enumerate() {
+                        let asked = matches!(d, Does::Copy { asked: true, .. } | Does::Fill { asked: true, .. });
+                        assert!(!asked || by_thread.contains(&i), "round {round}: step {i} is asked at the later look and left to the CPU");
+                    }
+                    for &i in &by_thread {
+                        for (a, b) in places(&thread_does[i]) {
+                            let Ok(was) = found(&thread_writers, a, b) else { continue };
+                            for w in lane_writers.iter().filter(|w| meet((w.from, w.to), (a, b))) {
+                                let through = w.shadow.as_ref().map(|s| Arc::as_ptr(s) as usize);
+                                assert_eq!(through, Some(was), "round {round}: what is left writes {a:#x}..{b:#x} through another host copy");
+                            }
+                        }
+                    }
+                    shrunk += 1;
+                }
+            }
+        }
+        assert!(same > 20 && shrunk > 20 && taken > 5, "the stress had its cases: {same} same, {shrunk} landed, {taken} with steps taken, {refused} refused");
+        assert!(missed > 0, "a plan made without the registered writers found another host copy now and then ({missed} rounds): that is why they are registered");
     }
 }

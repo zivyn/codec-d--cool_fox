@@ -1146,6 +1146,260 @@ mod copy_tests {
         }
     }
 
+    /// STAGE4: the steps given to the card, planned by the thread of stage A (`VICTORY_STAGE_A_PLAN`). Each round the lane's
+    /// submission K declares a range its shaders write (a flight) and takes what goes up to the card; the thread prepares
+    /// the next submission P beside K's send. A title buffer copy of P whose source is in K's range is done on the card
+    /// (the thread records the refreshes of the two host copies and declares the destination written, as the plan's list
+    /// does; the card runs the copy behind K's shaders), the other copies are done by the CPU, and a fill copies a page of
+    /// title memory into P's own upload memory (a region that no other submission writes or reads). The shaders write the
+    /// range, the card runs P's taken copies behind them, both land, with the title's other threads writing all through
+    /// until then. Every 7th round a submission is registered after the plan was made (forced, between the plan and the
+    /// commit): the thread gives P back before any step and the lane does the whole stage itself. Checked: what the card
+    /// reads for a copy taken from the flight's range is what K's shaders wrote there, and so is the destination at the
+    /// landing; each step ran once, by the CPU or by the card, never both, with none left out; K's upload region is
+    /// untouched by the thread; the lists the thread prepared are those the lane runs; and after the next preparing every
+    /// byte the card holds and every CPU side is the title's. 500 rounds.
+    #[test]
+    fn the_card_steps_planned_by_the_thread_leave_no_stale_byte_and_a_forced_mismatch_is_redone_by_the_lane() {
+        use crate::host::plan::agrees;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex, mpsc};
+        const COPIES: usize = 6;
+
+        type Log = Arc<Mutex<Vec<(usize, usize, &'static str)>>>;
+
+        /// A title buffer copy of one page onto another (copy and page of each).
+        #[derive(Clone, Copy)]
+        struct Page2 {
+            src: (usize, usize),
+            dst: (usize, usize),
+        }
+
+        /// Stage A of P, on whichever thread: the plan (the copies whose source is in K's range are the card's), its look
+        /// at the line's generation before the commit (`gate`: a registration forced between the plan and the commit),
+        /// the refreshes the plan's list holds and the declarations, the CPU's copies in order and the fill. `Err`: the
+        /// submission given back before any step. `Ok`: the copies taken.
+        #[allow(clippy::too_many_arguments)]
+        fn stage_a(
+            pts: Vec<(Arc<Shadow>, usize)>,
+            steps: Vec<Page2>,
+            flight: (usize, usize),
+            fill: ((usize, usize), usize),
+            upload: usize,
+            line_gen: Arc<AtomicU64>,
+            gate: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+            log: Log,
+            round: usize,
+        ) -> Result<Vec<usize>, ()> {
+            let taken: Vec<usize> = steps.iter().enumerate().filter(|(_, s)| s.src == flight).map(|(i, _)| i).collect();
+            let planned_at = line_gen.load(Ordering::SeqCst);
+            if let Some((told, go)) = gate {
+                told.send(()).unwrap();
+                go.recv().unwrap();
+            }
+            if !agrees(planned_at, line_gen.load(Ordering::SeqCst)) {
+                return Err(());
+            }
+            let ranges: Vec<(usize, usize)> = pts.iter().map(|p| (p.1, p.1 + N * PAGE)).collect();
+            let standing = crate::watch::ask_standing(&ranges, None);
+            // The plan's own list: what it reads and writes is refreshed, then what it writes is declared.
+            for &i in &taken {
+                for (c, _) in [steps[i].src, steps[i].dst] {
+                    refresh(&pts[c].0, pts[c].1, &[(0, N * PAGE)]);
+                }
+            }
+            for &i in &taken {
+                let (c, page) = steps[i].dst;
+                pts[c].0.writing(pts[c].1 + page * PAGE, PAGE);
+            }
+            // The submission's own steps that are left, in order.
+            for (i, s) in steps.iter().enumerate() {
+                if taken.contains(&i) {
+                    continue;
+                }
+                let (dst, src) = (pts[s.dst.0].1 + s.dst.1 * PAGE, pts[s.src.0].1 + s.src.1 * PAGE);
+                for k in (0..PAGE).step_by(64) {
+                    // SAFETY: inside the allocations, which live until the end of the test.
+                    let byte = unsafe { ((src + k) as *const u8).read_volatile() };
+                    write(dst, k, byte);
+                }
+                crate::watch::wrote(dst, PAGE);
+                log.lock().unwrap().push((round, i, "cpu"));
+            }
+            // The fill: a page of title memory into the upload memory of P alone.
+            let ((fc, fp), region) = fill;
+            let src = pts[fc].1 + fp * PAGE;
+            for k in (0..PAGE).step_by(64) {
+                // SAFETY: as above, and the region is this submission's alone.
+                unsafe { ((upload + region * PAGE + k) as *mut u8).write_volatile(((src + k) as *const u8).read_volatile()) };
+            }
+            crate::watch::end_standing(standing);
+            Ok(taken)
+        }
+
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copies: Vec<Held> = (0..COPIES).map(|_| Held::new()).collect();
+        let uploads: &'static mut [u8] = Box::leak(vec![0u8; 2 * PAGE].into_boxed_slice());
+        let upload = uploads.as_mut_ptr() as usize;
+        let mut seed = 0x5eed_0004_91a4_0001u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for c in copies.iter_mut() {
+            refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+            c.take();
+        }
+        let line_gen = Arc::new(AtomicU64::new(1));
+        let log: Log = Arc::default();
+        let (mut by_thread, mut redone, mut on_card, mut on_cpu) = (0usize, 0usize, 0usize, 0usize);
+        for round in 0..500 {
+            // The title writes for both submissions.
+            for _ in 0..(next() % 8) {
+                let c = (next() % COPIES as u64) as usize;
+                write(copies[c].at, (next() % (N * PAGE) as u64) as usize, (next() % 255) as u8 + 1);
+            }
+            // Distinct pages for the flight, the copies' sources and destinations and the fill's source.
+            fn pick(free: &mut Vec<(usize, usize)>, at: u64) -> (usize, usize) {
+                free.swap_remove((at % free.len() as u64) as usize)
+            }
+            let mut free: Vec<(usize, usize)> = (0..COPIES).flat_map(|c| (0..N).map(move |p| (c, p))).collect();
+            let flight = pick(&mut free, next());
+            let steps: Vec<Page2> = (0..1 + next() % 3)
+                .map(|i| {
+                    let src = if i == 0 && next() % 2 == 0 { flight } else { pick(&mut free, next()) };
+                    Page2 { src, dst: pick(&mut free, next()) }
+                })
+                .collect();
+            let fill = (pick(&mut free, next()), round % 2);
+            let pts: Vec<(Arc<Shadow>, usize)> = copies.iter().map(|c| (c.shadow.clone(), c.at)).collect();
+
+            // K: refreshes some copies, declares what its shaders write, takes what goes up to the card.
+            for c in copies.iter().take(2 + (next() % 3) as usize) {
+                refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+            }
+            let flight_at = copies[flight.0].at + flight.1 * PAGE;
+            copies[flight.0].shadow.writing(flight_at, PAGE);
+            for c in copies.iter_mut() {
+                c.take();
+            }
+            // K's own upload region, filled before; the thread does not touch it.
+            let others = ((round + 1) % 2) * PAGE;
+            let marked = vec![(round % 251) as u8 + 1; PAGE];
+            uploads[others..others + PAGE].copy_from_slice(&marked);
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let stop = stop.clone();
+                let targets: Vec<usize> = copies.iter().map(|c| c.at).collect();
+                let mut s = next() | 1;
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        write(targets[(s % COPIES as u64) as usize], ((s >> 8) % (N * PAGE) as u64) as usize, (s >> 40) as u8 | 1);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            // The offer: the thread prepares P beside K's send (the card runs K's shaders meanwhile).
+            let forced = round % 7 == 3;
+            let (told_tx, told_rx) = mpsc::channel();
+            let (go_tx, go_rx) = mpsc::channel();
+            let gate = forced.then_some((told_tx, go_rx));
+            let thread = {
+                let (pts, steps, line_gen, log) = (pts.clone(), steps.clone(), line_gen.clone(), log.clone());
+                std::thread::spawn(move || stage_a(pts, steps, flight, fill, upload, line_gen, gate, log, round))
+            };
+            // K's lists run on the card: the shaders write the range.
+            let shaded: Vec<u8> = (0..PAGE).map(|_| (next() % 255) as u8 + 1).collect();
+            copies[flight.0].card[flight.1 * PAGE..(flight.1 + 1) * PAGE].copy_from_slice(&shaded);
+            if forced {
+                // A submission is registered after the plan was made: the line is another generation.
+                told_rx.recv().unwrap();
+                line_gen.fetch_add(1, Ordering::SeqCst);
+                go_tx.send(()).unwrap();
+            }
+            // The lane's next submission: what the thread did, or all of it here.
+            let taken = match thread.join().unwrap() {
+                Ok(taken) => {
+                    assert!(!forced, "round {round}: the plan made before a registration was not given back");
+                    by_thread += 1;
+                    taken
+                }
+                Err(()) => {
+                    assert!(forced, "round {round}: a plan was given back without a registration");
+                    redone += 1;
+                    stage_a(pts.clone(), steps.clone(), flight, fill, upload, line_gen.clone(), None, log.clone(), round).unwrap()
+                }
+            };
+            assert_eq!(&uploads[others..others + PAGE], &marked[..], "round {round}: the other submission's upload memory was written");
+            // P's take, and its own list runs on the card behind K's shaders: each taken copy reads the card's host copy.
+            for c in copies.iter_mut() {
+                c.take();
+            }
+            for &i in &taken {
+                let (s, d) = (steps[i].src, steps[i].dst);
+                let page = copies[s.0].card[s.1 * PAGE..(s.1 + 1) * PAGE].to_vec();
+                if s == flight {
+                    assert!(page == shaded, "round {round}: the copy done on the card read something else than what the shaders wrote");
+                }
+                copies[d.0].card[d.1 * PAGE..(d.1 + 1) * PAGE].copy_from_slice(&page);
+                log.lock().unwrap().push((round, i, "card"));
+            }
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+            // Both land, K first: what the card holds is put into title memory and the journal is told.
+            let land = |copies: &mut Vec<Held>, (c, page): (usize, usize)| {
+                let at = copies[c].at + page * PAGE;
+                for k in 0..PAGE {
+                    write(at, k, copies[c].card[page * PAGE + k]);
+                }
+                crate::watch::wrote(at, PAGE);
+                copies[c].shadow.copy_back_done(&[(at, at + PAGE)]);
+            };
+            land(&mut copies, flight);
+            for &i in &taken {
+                land(&mut copies, steps[i].dst);
+                if steps[i].src == flight {
+                    let at = copies[steps[i].dst.0].at + steps[i].dst.1 * PAGE;
+                    // SAFETY: the allocation; nothing writes it now.
+                    let title = unsafe { std::slice::from_raw_parts(at as *const u8, PAGE) };
+                    assert!(title == &shaded[..], "round {round}: the destination of a copy from the flight's range is not what the shaders wrote");
+                }
+            }
+            // Each step ran once: by the card if it was taken, else by the CPU.
+            let mut ran = std::mem::take(&mut *log.lock().unwrap());
+            ran.sort_unstable();
+            let expected: Vec<(usize, usize, &str)> =
+                (0..steps.len()).map(|i| (round, i, if taken.contains(&i) { "card" } else { "cpu" })).collect();
+            assert_eq!(ran, expected, "round {round}: every step ran once, on the card or on the CPU");
+            on_card += taken.len();
+            on_cpu += steps.len() - taken.len();
+            // The lists prepared are the lists run.
+            let ids: Vec<usize> = (0..steps.len()).collect();
+            assert!(crate::host::front::same_lists(&ids, &[], &ids, &[]));
+            // The next preparing's own asking and refresh, and its take: nothing stale is left.
+            for c in copies.iter_mut() {
+                refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+                c.take();
+            }
+            for (i, c) in copies.iter().enumerate() {
+                assert!(c.card == c.title(), "round {round}: a byte of copy {i} that the card holds is not the title's");
+                assert!(c.side() == c.title(), "round {round}: a byte of copy {i}'s CPU side is not the title's");
+            }
+        }
+        assert_eq!(redone, (0..500).filter(|r| r % 7 == 3).count(), "every forced mismatch was redone by the lane");
+        assert!(by_thread > 400 && on_card > 100 && on_cpu > 100, "the stress had its cases: {by_thread} by the thread, {on_card} on the card, {on_cpu} on the CPU");
+        for c in &copies {
+            // SAFETY: ours.
+            unsafe { VirtualFree(c.at as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
     /// A range the submission declares written is left alone by the thread that is given the copy after the take,
     /// until the flight has landed, whichever of the two stages refreshes it.
     #[test]

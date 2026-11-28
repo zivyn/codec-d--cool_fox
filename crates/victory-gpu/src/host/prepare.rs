@@ -394,7 +394,7 @@ impl Host {
         // are over before anything is asked or refreshed here, and so is
         // everything stage A did of it (`VICTORY_STAGE_A_STEPS`): its asking, its
         // refreshes and its steps, which are not done again.
-        let staged = if late {
+        let mut staged = if late {
             // (The thread of stage A first: what it offered to the thread of the refreshes, beside its steps
             // [`relax::deep`], is offered while it works, and is there to be waited for after it is done.)
             front::join();
@@ -445,7 +445,18 @@ impl Host {
         // the others to the host's; with it on everything is joined to the host's fence by the sequencer ([`lanes`]).
         let mut route = lanes::Route::begin(self, runs, *submitted + 1);
         let on_compute = route.as_ref().is_some_and(|r| r.compute());
-        let own = if late && staged_number.is_none() { self.card_steps(runs, on_compute) } else { None };
+        // The steps given to the card: the thread of stage A planned them with the rest of the stage and the plan stands
+        // (`VICTORY_STAGE_A_PLAN`: checked against the line, which must not have had a submission registered since), or they
+        // are planned here.
+        let planned = staged.as_mut().and_then(front::Front::take_plan);
+        let own = match planned {
+            Some((taken, generation)) => {
+                plan::check(generation);
+                Some(taken)
+            }
+            None if late && staged_number.is_none() => self.card_steps(runs, on_compute),
+            None => None,
+        };
         if let (Some(route), Some(own)) = (route.as_mut(), own.as_ref()) {
             route.add_list(own.list());
         }
@@ -738,13 +749,16 @@ impl Host {
         // What it declares written is in the line before the card is given
         // anything of it (`VICTORY_PENDING_FLIGHT=1`).
         let pending = (late && pending_flights()).then(|| {
-            let mut ranges: Vec<(usize, usize)> =
-                crate::picked::with(declared.clone(), &picked.written).into_iter().flat_map(|(_, ranges)| ranges).collect();
+            let back = crate::picked::with(declared.clone(), &picked.written);
+            let mut ranges: Vec<(usize, usize)> = back.iter().flat_map(|(_, ranges)| ranges.iter().copied()).collect();
             for list in runs {
                 ranges.extend(list.deferred().texture_backs.iter().map(crate::texback::Back::range));
             }
-            // (With the card's copies of its own steps: stage A of the next submission looks at them too.)
-            PendingFlight::register_with(ranges, own.as_ref().map(|own| own.copied().collect::<Vec<_>>()).unwrap_or_default())
+            // (With what its flight will say of who writes what, and the card's copies of its own steps: stage A of the
+            // next submission looks at them too, and plans its reads for the card from them.)
+            let (reads_back, writes) = plan::backs_and_writes(runs);
+            let copies = own.as_ref().map(|own| own.copied().collect::<Vec<_>>()).unwrap_or_default();
+            PendingFlight::register_with(ranges, plan::pending_writers(&back, reads_back, writes, copies))
         });
         // The copies this submission still does something to after the card's
         // plan is made: its title buffer copies' places.

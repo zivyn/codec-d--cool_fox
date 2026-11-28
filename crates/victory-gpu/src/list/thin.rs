@@ -899,6 +899,44 @@ fn fold_on() -> bool {
 /// The most executions of a run made one.
 const FOLD_MOST: u32 = 64;
 
+/// Whether the dispatches of programs translated for runs (`VICTORY_FUSE_DISPATCH` at translation) that follow one
+/// another are made one dispatch (`VICTORY_FUSE_RUNS=1`; off by default; `crate::draw::fuse`). Read once per stream, as
+/// [`fold_on`]: a stream plans and makes its runs alone.
+fn fuse_runs_on() -> bool {
+    crate::ab::live_flag!("VICTORY_FUSE_RUNS")
+}
+
+/// The dispatches that may be one run, from the one just taken (`at` is the next op): how many there are (that one
+/// included), and where the stream goes on after the last. What may lie between them is what sets the roots the title
+/// sets for each dispatch (tables, constants, views), uploads and the pipeline, and, where the title's waits are held
+/// for what a command needs (`lazy_on`), those waits: nothing that records work.
+fn fuse_run(stream: &[u64], mut at: usize, lazy_on: bool) -> (u32, usize) {
+    let (mut n, mut end) = (1u32, at);
+    while at < stream.len() {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        if stream.get(at + 1..at + 1 + len).is_none() {
+            break;
+        }
+        at += 1 + len;
+        if op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64 {
+            n += 1;
+            end = at;
+            continue;
+        }
+        let between = op == UPLOAD
+            || op == COMPUTE_CONSTANTS
+            || op == Plain::COMPUTE_TABLE as u64
+            || op == Plain::COMPUTE_CONSTANT as u64
+            || op == Plain::COMPUTE_VIEW as u64
+            || op == Plain::SET_PIPELINE as u64
+            || (lazy_on && (op == Plain::SYNC as u64 || op == BARRIER_GROUPS));
+        if !between {
+            break;
+        }
+    }
+    (n, end)
+}
+
 /// The executions that may be one run, from the one with `signature` that was
 /// just taken (`at` is the next op): how many there are (that one included),
 /// and where the stream goes on after the last. What may lie between them is
@@ -966,7 +1004,10 @@ const NAMES: [&str; 48] = [
 /// The line of what the executions come to, per frame.
 pub(crate) fn runs_line(frames: f64) {
     #[cfg(windows)]
-    crate::draw::fold::line(frames);
+    {
+        crate::draw::fold::line(frames);
+        crate::draw::fuse::line(frames);
+    }
     let r: Vec<u64> = RUNS.iter().map(|r| r.swap(0, Relaxed)).collect();
     let between = held(&BETWEEN).take();
     let d: Vec<u64> = DROPS.iter().map(|d| d.swap(0, Relaxed)).collect();
@@ -1168,6 +1209,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
     let mut since = 0u32;
     // Where the run of executions made one ends (`crate::draw::fold`), 0: none.
     let mut fold_until = 0usize;
+    // Where the run of dispatches made one ends (`crate::draw::fuse`), 0: none.
+    let mut fuse_until = 0usize;
     let name_upload = |w: &[u64]| {
         // SAFETY: made by `allocate_upload`, named once.
         let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
@@ -1179,6 +1222,10 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if fold_until != 0 && i >= fold_until {
             super::fold_end(list);
             fold_until = 0;
+        }
+        if fuse_until != 0 && i >= fuse_until {
+            super::fuse_end(list);
+            fuse_until = 0;
         }
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
@@ -1289,6 +1336,19 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 between.push(op.min(255) as u8);
             }
         }
+        // The dispatches after this one that may be one run with it.
+        if fuse_until == 0
+            && !skip
+            && dead.is_empty()
+            && (op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64)
+            && fuse_runs_on()
+        {
+            let (n, end) = fuse_run(stream, i, lazy_on);
+            if n >= 2 {
+                super::fuse_begin(list);
+                fuse_until = end;
+            }
+        }
         if run_plain(op, list, w) {
             continue;
         }
@@ -1388,6 +1448,9 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
     }
     if fold_until != 0 {
         super::fold_end(list);
+    }
+    if fuse_until != 0 {
+        super::fuse_end(list);
     }
     (calls, closed)
 }

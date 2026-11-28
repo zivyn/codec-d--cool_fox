@@ -118,6 +118,18 @@ pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 /// past the host copy's end return zeros as before.
 pub const USER_ROOT_VIEW_INDEX: u32 = 0x107;
 
+/// The root CBV `b<SLOT_FUSE>` in [`ROOT_CBV_SPACE`] of a compute program translated for dispatches made one
+/// (`VICTORY_FUSE_DISPATCH=1`, `lower/fuse.rs`): the table of a run of dispatches of the program. The program reads its
+/// user data from the record of the member of the run its group belongs to, and its group id is the group's number in
+/// that member's dispatch; no other root view is read through a program with this slot.
+pub const SLOT_FUSE: u8 = 250;
+/// The most members of a run: the program finds its member by eight halvings of the table of starts.
+pub const FUSE_MEMBERS: usize = 255;
+/// The rows (16 bytes) a root CBV holds.
+pub const FUSE_ROWS: usize = 4096;
+/// The groups of a row of a run's dispatch: group `(x, y)` of the dispatch is number `y * FUSE_WIDTH + x` of the run.
+pub const FUSE_WIDTH: u32 = 65535;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;

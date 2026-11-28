@@ -101,6 +101,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_WIDE_FIRST",
             "VICTORY_VIEW_INDEX",
             "VICTORY_FOLD_VIEWS",
+            "VICTORY_FUSE_DISPATCH",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

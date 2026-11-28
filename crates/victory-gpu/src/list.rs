@@ -2190,6 +2190,24 @@ fn fold_end(this: This) {
     with_state(this, |list, s| s.fold_end(list));
 }
 
+/// The stream planned dispatches that may be one run (`crate::draw::fuse`).
+#[cfg(windows)]
+fn fuse_begin(this: This) {
+    with_state(this, |_, s| s.fuse_begin());
+}
+
+/// The run the stream planned is over: made, if one is open.
+#[cfg(windows)]
+fn fuse_end(this: This) {
+    with_state(this, |list, s| s.fuse_end(list));
+}
+
+#[cfg(not(windows))]
+fn fuse_begin(_: This) {}
+
+#[cfg(not(windows))]
+fn fuse_end(_: This) {}
+
 #[cfg(not(windows))]
 fn fold_begin(_: This, _: u32) {}
 

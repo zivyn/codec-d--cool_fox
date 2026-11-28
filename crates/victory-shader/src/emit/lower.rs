@@ -26,6 +26,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 pub(super) mod intersect;
 #[path = "view_index.rs"]
 pub(super) mod view_index;
+#[path = "fuse.rs"]
+pub(super) mod fuse;
 
 #[path = "exit_clear.rs"]
 pub(super) mod exit_clear;
@@ -105,6 +107,14 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    // A compute program in the form of a member of a run of dispatches (`VICTORY_FUSE_DISPATCH`): kept
+    // when it has no root view of the title, else lowered as it always was.
+    if fuse::wanted(parts)
+        && let Ok(l) = lower_counted_as(parts, false, true)
+        && fuse::kept(&l)
+    {
+        return Ok(l);
+    }
     lower_counted(parts, counted_in_threads(parts))
 }
 
@@ -129,17 +139,22 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    lower_counted_as(parts, counted, false)
+}
+
+/// [`lower_counted`]; `fused`: as a member of a run of dispatches (`fuse.rs`).
+fn lower_counted_as(parts: &Parts, counted: bool, fused: bool) -> Result<Lowered, ShaderError> {
     exit_clear::begin();
-    let lowered = lower_forced(parts, counted);
+    let lowered = lower_forced(parts, counted, fused);
     exit_clear::end();
     lowered
 }
 
-fn lower_forced(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+fn lower_forced(parts: &Parts, counted: bool, fused: bool) -> Result<Lowered, ShaderError> {
     let gs_outputs = gs_outputs_at_emit(parts)?;
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, gs_outputs.as_ref()).run(counted) {
+        match Lower::new(parts, &bad, gs_outputs.as_ref()).fused(fused).run(counted) {
             // (a loop that exchanges, passed at an exit before its first exchange: once more)
             Ok(_) if exit_clear::again() => {}
             Ok(l) => return Ok(l),
@@ -389,6 +404,8 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// As a member of a run of dispatches (`fuse.rs`).
+    fuse: fuse::Fused,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1913,6 +1930,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            fuse: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2647,6 +2665,9 @@ impl<'a> Lower<'a> {
             self.s.m.terminate(done, Term::Ret);
             self.s.entry = body;
         }
+        if self.fuse.on {
+            self.fuse_prologue();
+        }
         self.find_coherent();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -2878,7 +2899,12 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                return match self.fuse_group(c) {
+                    Some(local) => Val::I32(local),
+                    None => self.compute_id("groupId.i32", 94, c),
+                };
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -3230,6 +3256,9 @@ impl<'a> Lower<'a> {
 
     /// User-data dword `index`, loaded in the entry block.
     fn user_at(&mut self, index: u32) -> V {
+        if self.fuse.on {
+            return self.fuse_user(index);
+        }
         self.s.user_data = self.s.user_data.max(index + 1);
         let h = match self.user_data {
             Some(h) => h,

@@ -2380,6 +2380,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// What `copies` are to the submission's preparing ([`onepass`]), made when the list was closed (`VICTORY_ONE_PASS`):
+    /// of the number of steps it has, or it is made again.
+    summary: Option<std::sync::Arc<onepass::Summary>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -8473,6 +8476,31 @@ impl HostList {
         deferred.plane_uploads.push((chunk, size));
         deferred.copies.push(Step::Plane(read, Box::new(move || fill(destination))));
         Some(source)
+    }
+
+    /// What the list's steps are to a submission's pass ([`onepass::Summary`]): the one kept with the list if it is of
+    /// the steps it has, else made now (`lane`: by the thread that submits, counted) and kept.
+    fn kept_summary(&self, lane: bool) -> std::sync::Arc<onepass::Summary> {
+        let mut deferred = self.deferred();
+        if let Some(summary) = &deferred.summary
+            && summary.steps == deferred.copies.len()
+        {
+            return summary.clone();
+        }
+        if lane {
+            onepass::made_on_the_lane();
+        }
+        let summary = std::sync::Arc::new(onepass::Summary::of(&deferred.copies));
+        deferred.summary = Some(summary.clone());
+        summary
+    }
+
+    /// The list is closed and complete: with the pass over the steps on, what they are to the submission's pass is made
+    /// now, by the thread that closed it, not by the submitting thread.
+    pub(crate) fn summarize(&self) {
+        if onepass::on() && lean_steps() {
+            let _ = self.kept_summary(false);
+        }
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`

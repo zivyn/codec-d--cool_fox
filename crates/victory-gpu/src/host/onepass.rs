@@ -7,7 +7,8 @@
 //! (`Batch::refresh_front`), and the steps themselves (`HostList::run_deferred`, which asks `Batch::covered` of every
 //! refresh).
 //!
-//! Here the lists are looked through once, when the submission knows them: each distinct copy gets a number the first
+//! Here each list is summarized once, when it is closed (by the thread that translated it; by the submitting thread if it
+//! was not: `Summary`), and the lists of a submission are looked through once, when the submission knows them: each distinct copy gets a number the first
 //! time a step names it (one lookup by address for a copy that is not the one before, one hold on it), and the steps
 //! that matter to the four users are written down as records of that number and the range: a refresh, a range given
 //! to shaders (`GpuWrite`), a texture. Each user then goes over the records, which are in one flat table the thread
@@ -33,9 +34,10 @@ pub(super) fn on() -> bool {
 }
 
 /// Since the last frame-rate line: lists looked through, records made, copies met, microseconds spent making them, and
-/// lists whose steps did not agree with their records when they were followed (it should be none).
-static STATS: [std::sync::atomic::AtomicU64; 5] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// lists whose steps did not agree with their records when they were followed (it should be none), and lists whose summary
+/// the submitting thread had to make (the others were made by the thread that closed them).
+static STATS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// For the frame-rate line.
 pub(super) fn line(frames: f64) {
@@ -47,24 +49,38 @@ pub(super) fn line(frames: f64) {
         return;
     }
     tracing::info!(
-        "the steps of the lists looked through once, per frame (VICTORY_ONE_PASS): {:.0} lists, {:.0} records of {:.0} copies, {:.2} ms          looking through them; {:.0} lists whose steps did not agree with their records",
+        "the steps of the lists looked through once, per frame (VICTORY_ONE_PASS): {:.0} lists, {:.0} records of {:.0} copies, {:.2} ms taking them in ({:.0} of the lists summarized by the submitting thread, the others when they were closed); {:.0} lists whose steps did not agree with their records",
         s[0] / frames,
         s[1] / frames,
         s[2] / frames,
         s[3] / 1000.0 / frames,
+        s[5] / frames,
         s[4] / frames
     );
+}
+
+/// A list's summary was made by the submitting thread.
+pub(super) fn made_on_the_lane() {
+    STATS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// A list of steps that can be looked through: a host list (under its lock, as the walks always did) or, in tests,
 /// a vector.
 pub(super) trait StepList {
     fn steps<R>(&self, with: impl FnOnce(&[Step]) -> R) -> R;
+
+    /// What the steps are to the four users ([`Summary`]): the one the list keeps, made when the list is
+    /// closed by the thread that translated it, if it has one that is of the steps it has now.
+    fn summary(&self) -> Arc<Summary>;
 }
 
 impl StepList for &HostList {
     fn steps<R>(&self, with: impl FnOnce(&[Step]) -> R) -> R {
         with(&self.deferred().copies)
+    }
+
+    fn summary(&self) -> Arc<Summary> {
+        self.kept_summary(true)
     }
 }
 
@@ -72,6 +88,95 @@ impl StepList for &HostList {
 impl StepList for Vec<Step> {
     fn steps<R>(&self, with: impl FnOnce(&[Step]) -> R) -> R {
         with(self)
+    }
+
+    fn summary(&self) -> Arc<Summary> {
+        Arc::new(Summary::of(self))
+    }
+}
+
+/// What a list's steps are to the four users, by the number the copy has in the list: made once for a list, by the
+/// thread that closes it, and kept with it. A submission's pass takes the records of each of its lists, with the
+/// numbers of the copies changed to the submission's own, and never reads the steps of a refresh.
+pub(super) struct Summary {
+    /// How many steps the list had: the summary is of a list that has no other number.
+    pub(super) steps: usize,
+    /// The copies the refreshes and ranges given to shaders name, by their number in the list.
+    copies: Vec<Arc<Shadow>>,
+    textures: Vec<Arc<crate::texture::Staging>>,
+    /// One record for each step, in the order of the list.
+    recs: Vec<Rec>,
+}
+
+impl Summary {
+    /// The summary of `steps`.
+    pub(super) fn of(steps: &[Step]) -> Summary {
+        thread_local! {
+            static AT: std::cell::RefCell<ByCopy<u32>> = std::cell::RefCell::new(ByCopy::default());
+        }
+        let mut at = scratch::Lean::of(&AT, true);
+        let mut summary = Summary {
+            steps: steps.len(),
+            copies: Vec::new(),
+            textures: Vec::new(),
+            recs: Vec::with_capacity(steps.len()),
+        };
+        // The steps of a list name one copy several on end (the views of a draw).
+        let mut last = (0usize, 0u32);
+        for (index, step) in steps.iter().enumerate() {
+            let (shadow, rec) = match step {
+                Step::Refresh(shadow, from, len) => (
+                    Some(shadow),
+                    Rec {
+                        what: 0,
+                        from: *from,
+                        to: *from + *len,
+                    },
+                ),
+                Step::GpuWrite(shadow, ..) => (
+                    Some(shadow),
+                    Rec {
+                        what: WRITE,
+                        from: 0,
+                        to: index,
+                    },
+                ),
+                Step::Texture(staging) => {
+                    summary.textures.push(staging.clone());
+                    (
+                        None,
+                        Rec {
+                            what: TEXTURE,
+                            from: summary.textures.len() - 1,
+                            to: index,
+                        },
+                    )
+                }
+                _ => (
+                    None,
+                    Rec {
+                        what: EVENT,
+                        from: index,
+                        to: 0,
+                    },
+                ),
+            };
+            let mut rec = rec;
+            if let Some(shadow) = shadow {
+                let key = Arc::as_ptr(shadow) as usize;
+                if last.0 != key {
+                    let copies = &mut summary.copies;
+                    let number = *at.entry(key).or_insert_with(|| {
+                        copies.push(shadow.clone());
+                        (copies.len() - 1) as u32
+                    });
+                    last = (key, number);
+                }
+                rec.what |= last.1;
+            }
+            summary.recs.push(rec);
+        }
+        summary
     }
 }
 
@@ -108,6 +213,8 @@ pub(super) struct Pass {
     lists: Vec<(u32, u32)>,
     /// How many steps each of them had when it was looked through (by the same number as `lists`).
     steps: Vec<u32>,
+    /// The submission's number of each copy of the list being taken in.
+    map: Vec<u32>,
     textures: Vec<Arc<crate::texture::Staging>>,
     // What the users work in (each makes it of the size it needs: the thread keeps the room).
     slot: Vec<u32>,
@@ -131,6 +238,7 @@ impl Reset for Pass {
         self.recs.reset();
         self.lists.reset();
         self.steps.reset();
+        self.map.reset();
         self.textures.reset();
         self.slot.reset();
         self.found.reset();
@@ -177,45 +285,32 @@ impl Pass {
             self.copies.len(),
             std::time::Instant::now(),
         );
-        let mut count = 0u32;
-        list.steps(|steps| {
-            count = steps.len() as u32;
-            // The steps of a list name one copy several on end (the views of a draw).
-            let mut last = (0usize, 0u32);
-            for (index, step) in steps.iter().enumerate() {
-                match step {
-                    Step::Refresh(shadow, at, len) => {
-                        let number = self.number_of(shadow, &mut last);
-                        self.recs.push(Rec {
-                            what: number,
-                            from: *at,
-                            to: *at + *len,
-                        });
-                    }
-                    Step::GpuWrite(shadow, ..) => {
-                        let number = self.number_of(shadow, &mut last);
-                        self.recs.push(Rec {
-                            what: number | WRITE,
-                            from: 0,
-                            to: index,
-                        });
-                    }
-                    Step::Texture(staging) => {
-                        self.textures.push(staging.clone());
-                        self.recs.push(Rec {
-                            what: TEXTURE,
-                            from: self.textures.len() - 1,
-                            to: index,
-                        });
-                    }
-                    _ => self.recs.push(Rec {
-                        what: EVENT,
-                        from: index,
-                        to: 0,
-                    }),
+        let summary = list.summary();
+        // The copies of the list, each with the number it has in the submission (the next if it has none).
+        self.map.clear();
+        for copy in &summary.copies {
+            let key = Arc::as_ptr(copy) as usize;
+            let copies = &mut self.copies;
+            let number = *self.table.entry(key).or_insert_with(|| {
+                copies.push(copy.clone());
+                (copies.len() - 1) as u32
+            });
+            self.map.push(number);
+        }
+        let textures = self.textures.len();
+        self.textures.extend(summary.textures.iter().cloned());
+        let map = &self.map;
+        self.recs.extend(summary.recs.iter().map(|rec| {
+            let mut rec = *rec;
+            if rec.what & EVENT == 0 {
+                if rec.what & TEXTURE != 0 {
+                    rec.from += textures;
+                } else {
+                    rec.what = rec.what & WRITE | map[(rec.what & NUMBER) as usize];
                 }
             }
-        });
+            rec
+        }));
         let seen = (began, self.recs.len() as u32);
         let counts = [
             1,
@@ -228,26 +323,11 @@ impl Pass {
         }
         if first {
             self.lists.insert(0, seen);
-            self.steps.insert(0, count);
+            self.steps.insert(0, summary.steps as u32);
         } else {
             self.lists.push(seen);
-            self.steps.push(count);
+            self.steps.push(summary.steps as u32);
         }
-    }
-
-    /// The copy's number: the one it has, or the next.
-    fn number_of(&mut self, shadow: &Arc<Shadow>, last: &mut (usize, u32)) -> u32 {
-        let key = Arc::as_ptr(shadow) as usize;
-        if last.0 == key {
-            return last.1;
-        }
-        let copies = &mut self.copies;
-        let number = *self.table.entry(key).or_insert_with(|| {
-            copies.push(shadow.clone());
-            (copies.len() - 1) as u32
-        });
-        *last = (key, number);
-        number
     }
 
     /// Per copy that `keep` says yes to (asked once, at the copy's first refresh among the lists named), the span of

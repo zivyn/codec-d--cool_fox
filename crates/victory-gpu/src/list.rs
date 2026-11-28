@@ -179,6 +179,15 @@ pub(crate) fn tables_done(lists: &[This]) {
     }
 }
 
+/// The list is closed and complete: its host side makes what the submission's preparing will want of its steps
+/// ([`crate::host::HostList::summarize`]).
+#[cfg(windows)]
+pub(crate) fn summarize(this: This) {
+    if let Some(host) = host_list(this) {
+        host.summarize();
+    }
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {

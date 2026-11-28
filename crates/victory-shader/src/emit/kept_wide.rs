@@ -10,6 +10,17 @@ use super::form::{self, Mode};
 use super::wide_class;
 use super::*;
 
+/// Whether the program has skips or early-outs over loops that the switch keeps, and the wide form
+/// of them is asked for.
+pub(super) fn applicable(p: &ir::Program) -> bool {
+    form::kept_skips_mode() != Mode::Off
+        && ir::keep_loop_skips()
+        && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0")
+        && (!ir::drop_early_outs_as(p, true).1.is_empty()
+            || !ir::drop_skips_as(p, false, true).1.is_empty()
+            || !ir::drop_skips_as(p, true, true).1.is_empty())
+}
+
 /// The program's translation with its kept skips wave-wide, if it lowers that way and every
 /// branch is of class A or B; None for the forms the program has without the switch.
 pub(super) fn attempt(

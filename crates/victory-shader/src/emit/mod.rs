@@ -715,7 +715,7 @@ fn emit_forms(
     res: &resource::Resources,
 ) -> (Result<HostShader, ShaderError>, Form) {
     let mut form = Form::Original;
-    let result = emit_forms_in(c, native, p, st, io, res, &mut form);
+    let result = emit_forms_in(c, native, p, st, io, res, &mut form, false);
     if result.is_err() {
         form = Form::Refused;
     }
@@ -737,6 +737,7 @@ fn emit_forms_in(
     io: &io::Io,
     res: &resource::Resources,
     form_out: &mut Form,
+    without_kept: bool,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -823,10 +824,20 @@ fn emit_forms_in(
         };
         // The skips over loops that `VICTORY_KEEP_LOOP_SKIPS` keeps, taken by the whole wave, where
         // that is safe for the thread group ([`kept_wide`]): before the forms without the switch.
-        if let Some(again) = kept_wide::attempt(c, native, p, why) {
-            report("kept skips wave-wide", &again);
-            *form_out = Form::KeptSkipsWide;
-            return again.map(|(shader, _)| shader);
+        // Not for a program whose form without the switch is the exact local idiom (each host wave on
+        // its own, no barrier, never degraded by the kept skips): the wide form would only add barriers.
+        if !without_kept && kept_wide::applicable(p) {
+            let mut plain = Form::Original;
+            let result = emit_forms_in(c, native, p, st, io, res, &mut plain, true);
+            if !(result.is_ok() && plain == Form::LocalIdiom)
+                && let Some(again) = kept_wide::attempt(c, native, p, why)
+            {
+                report("kept skips wave-wide", &again);
+                *form_out = Form::KeptSkipsWide;
+                return again.map(|(shader, _)| shader);
+            }
+            *form_out = plain;
+            return result;
         }
         // (the forms without the skips over loops that the switch keeps: those are the wave-wide
         // form above, or not at all)

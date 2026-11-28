@@ -627,6 +627,7 @@ translation of shaders.
 | `VICTORY_SCREEN_WAIT_MS` | 10000 | number |  |  |  | Longest wait in ms for screen-size compute passes to compile before they are skipped. |
 | `VICTORY_SECTION_WINDOW` | on (=0 turns off) | flag |  |  |  | Writes through a long-lived mapped window of a section instead of a new view per write. |
 | `VICTORY_SEND_BAR` | off | flag |  |  |  | Keeps send memory in the card's memory, written by the CPU across the bus. |
+| `VICTORY_SECTION_MB` | off | number |  |  |  | Makes the physical pages the title asks for (one request of ~6.1 GiB) in sections of at most this many MiB each (2 is the tested value), so that a map or unmap of a page waits for the lock of a small section and not of one with hundreds of thousands of views. Read once; compared between processes, not live. Port of CLHelper's VIctory-NVIDIA #44. |
 | `VICTORY_SEND_CHANGED` | off | flag |  |  |  | Sends up only the dwords of a page that changed since the last send. |
 | `VICTORY_SEND_COPYQ` | off | flag |  | live |  | Sends submission bytes over the bus on a copy queue. |
 | `VICTORY_SEND_COPYQ_MB` | 64 | number |  |  |  | Most video memory in MB the copy-queue stages take together. |

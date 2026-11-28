@@ -444,6 +444,104 @@ mod tests {
         }
     }
 
+    /// A texture the title fills in each XOR mode (`_T`, `_X`) arrives on the card as its
+    /// layout says: the title's memory is made by tiling known rows with the layout (not by
+    /// the code under test), the copy queue's upload detiles it, and every level read back
+    /// from the host texture is those rows. Each mode, two sizes (one block, and several with
+    /// partial ones), all levels, tails included.
+    #[test]
+    fn placed_textures_in_the_xor_modes_arrive_as_their_layouts_say() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Some(host) = crate::host::host() else { return };
+        let wait = std::time::Duration::from_secs(20);
+        for mode in [17u32, 18, 21, 22, 24, 25, 26, 27] {
+            for (width, height, mips) in [(128u32, 128u32, 4u32), (300, 200, 5)] {
+                // R8G8B8A8_UNORM, one slice, layout `0x100 | mode`, no flags: the title fills it.
+                let words = [3u32, 0, 0, 0, width, 0, height, (mips << 16) | 1, 28, 1, 0, 0x100 | mode, 0, 0];
+                // SAFETY: fourteen words are a resource description (plain numbers).
+                let desc = unsafe { words.as_ptr().cast::<crate::resource::ResourceDesc>().read_unaligned() };
+                let layout = crate::resource::texture_layout(&desc).unwrap().planes[0].layout.clone();
+                assert!(layout.addressable() && layout.desc.swizzle.xor(), "mode {mode}");
+                let whole = (crate::resource::placed_bytes(&words).unwrap() as usize).max(layout.size as usize);
+                // SAFETY: memory of our own that stays.
+                let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+                // SAFETY: as above, written here only, before the texture is made.
+                let title = unsafe { std::slice::from_raw_parts_mut(at, whole) };
+                let rows: Vec<Vec<u8>> = (0..mips)
+                    .map(|mip| {
+                        let (w, h) = ((width >> mip).max(1) as usize, (height >> mip).max(1) as usize);
+                        (0..w * h * 4)
+                            .map(|i| (i * 7 + (i / (4 * w)) * 13 + mip as usize * 29 + mode as usize) as u8)
+                            .collect()
+                    })
+                    .collect();
+                for (mip, linear) in rows.iter().enumerate() {
+                    let w = (width >> mip).max(1) as usize;
+                    let h = (height >> mip).max(1) as usize;
+                    layout.tile(title, mip as u32, 0, linear, w * 4, w * 4 * h).unwrap();
+                }
+                let texture = crate::resource::texture_at(at as u64, &words).unwrap();
+                crate::resource::want_level(texture, 0);
+                let copy = crate::resource::host_copy(texture).unwrap();
+                if !crate::pool::fresh(&copy.texture) {
+                    return;
+                }
+                let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("mode {mode}: not taken") };
+                let (told, heard) = std::sync::mpsc::channel();
+                job.then(move || told.send(()).unwrap());
+                send(&job);
+                assert!(heard.recv_timeout(wait).is_ok(), "mode {mode}: not uploaded");
+                for (mip, linear) in rows.iter().enumerate() {
+                    let (w, h) = ((width >> mip).max(1) as usize, (height >> mip).max(1) as usize);
+                    let pitch = (w * 4).next_multiple_of(256);
+                    let back = host.read_back_buffer((pitch * h) as u64).unwrap();
+                    let list = host.new_list().unwrap();
+                    list.close();
+                    list.reset();
+                    let to = D3D12_TEXTURE_COPY_LOCATION {
+                        // SAFETY: a borrowed pointer the location never releases.
+                        pResource: unsafe { std::mem::transmute_copy(&back) },
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                                Offset: 0,
+                                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28),
+                                    Width: w as u32,
+                                    Height: h as u32,
+                                    Depth: 1,
+                                    RowPitch: pitch as u32,
+                                },
+                            },
+                        },
+                    };
+                    let from = D3D12_TEXTURE_COPY_LOCATION {
+                        // SAFETY: as above.
+                        pResource: unsafe { std::mem::transmute_copy(&copy.texture) },
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: mip as u32 },
+                    };
+                    // SAFETY: an open list, live resources; the mapping spans the buffer.
+                    unsafe {
+                        list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                        list.close();
+                        host.execute(&[&list]);
+                        let mut data = std::ptr::null_mut();
+                        back.Map(0, None, Some(&mut data)).unwrap();
+                        let seen = std::slice::from_raw_parts(data.cast::<u8>(), pitch * h);
+                        for y in 0..h {
+                            assert!(
+                                seen[y * pitch..][..w * 4] == linear[y * w * 4..][..w * 4],
+                                "mode {mode} {width}x{height} level {mip} row {y}"
+                            );
+                        }
+                        back.Unmap(0, None);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn drain_waits_until_then_callbacks_have_run() {
         use std::sync::atomic::AtomicBool;

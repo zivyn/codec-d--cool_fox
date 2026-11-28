@@ -45,6 +45,10 @@ on:
         description: Measure the audio DSP convolution in release (victory-hle, ignored test), in the job summary
         type: boolean
         default: false
+      bench_land:
+        description: Measure the landing merge's kernels in release (victory-gpu, ignored test), in the job summary
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -238,6 +242,33 @@ jobs:
             echo "## Audio DSP convolution (release, $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null || echo "runner CPU"))"
             echo '```'
             grep -h "convolution_bench" "$RUNNER_TEMP/bench.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # What landing the card's bytes costs on the runner's CPU, optimized: the merge's kernels (the plain loop and the
+  # ones that ask ahead for their bytes) on pieces made like a frame's, cold memory, one thread and three. The
+  # equivalence tests of the same kernels run with the rest (test-rest).
+  bench-land:
+    if: ${{ inputs.bench_land }}
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - name: Bench
+        run: |
+          set -o pipefail
+          cargo test --release -p victory-gpu --lib --locked -- --ignored --nocapture --test-threads=1 land_merge_bench 2>&1 | tee "$RUNNER_TEMP/bench.log"
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## Landing merge kernels (release, $(powershell -NoProfile -Command "(Get-CimInstance Win32_Processor).Name" 2>/dev/null || echo "runner CPU"), $(nproc) logical CPUs)"
+            echo '```'
+            grep -h "land_merge_bench" "$RUNNER_TEMP/bench.log" || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 

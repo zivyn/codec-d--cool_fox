@@ -211,7 +211,11 @@ pub(crate) mod stat {
     pub(crate) const TAIL_READ_BYTES: usize = 36;
     pub(crate) const TAIL_UNREAD_BYTES: usize = 37;
     pub(crate) const TAIL_UNREAD_US: usize = 38;
-    pub(crate) const COUNT: usize = 39;
+    /// In the jobs' pieces: microseconds in the pass that looks for the pages that differ (pieces put through the
+    /// title's own address) and in the loop over the pages that merges them.
+    pub(crate) const DIFFER_US: usize = 39;
+    pub(crate) const KERNEL_US: usize = 40;
+    pub(crate) const COUNT: usize = 41;
 }
 
 pub(crate) mod owed;
@@ -292,6 +296,17 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    if s[stat::KERNEL_US] > 0.0 || s[stat::DIFFER_US] > 0.0 {
+        tracing::info!(
+            "inside the merging jobs per frame, on all threads: {:.2} ms looking for the pages that differ (pieces through the title's \
+             address), {:.2} ms in the loop over the pages that merges them (VICTORY_LAND_AHEAD={}: the merge asks for its bytes ahead), \
+             of the {:.2} ms in all",
+            ms(stat::DIFFER_US),
+            ms(stat::KERNEL_US),
+            u8::from(crate::safecopy::ahead()),
+            ms(stat::CARD_ALL),
+        );
+    }
     if unwatch_on() {
         tracing::info!(
             "direct pieces per frame (VICTORY_LAND_UNWATCH=1): {:.0} put where the kernel's write watch of their block was clean and taken off it after, {:.0} where it held a write of the title's, {:.0} where the memory is not write-watched (views of pages, guarded)",
@@ -670,6 +685,53 @@ pub(crate) struct Notes {
     reset: Vec<usize>,
     /// The 64 KiB blocks of those pieces.
     clean: Vec<usize>,
+    /// What the job's pieces count, added to the totals at the flush: each total is a cache line the landing
+    /// threads would write by turns, a dozen times a piece.
+    tally: Tally,
+}
+
+/// The counts of the pieces a job lands ([`Notes::flush`] adds them to [`STATS`]).
+#[derive(Default)]
+struct Tally {
+    pieces: u64,
+    beside: u64,
+    direct: u64,
+    new_pieces: u64,
+    pages: u64,
+    new_pages: u64,
+    blocks: u64,
+    dwords: u64,
+    missing: u64,
+    put_pieces: u64,
+    differ_us: u64,
+    kernel_us: u64,
+}
+
+impl Tally {
+    fn flush(&mut self) {
+        let t = std::mem::take(self);
+        for (which, n) in [
+            (stat::PIECES, t.pieces),
+            (stat::BESIDE, t.beside),
+            (stat::DIRECT, t.direct),
+            (stat::NEW_PIECES, t.new_pieces),
+            (stat::PAGES, t.pages),
+            (stat::NEW_PAGES, t.new_pages),
+            (stat::NEW_BLOCKS, t.blocks),
+            (stat::DWORDS, t.dwords),
+            (stat::MISSING, t.missing),
+            (stat::DIFFER_US, t.differ_us),
+            (stat::KERNEL_US, t.kernel_us),
+        ] {
+            if n > 0 {
+                count(which, n);
+            }
+        }
+        if t.put_pieces > 0 {
+            crate::shadow::PUT[0].fetch_add(t.put_pieces, Ordering::Relaxed);
+            crate::shadow::PUT[2].fetch_add(t.dwords * 4, Ordering::Relaxed);
+        }
+    }
 }
 
 // SAFETY: the pointers are used by the job that has the notes, in `flush`.
@@ -703,6 +765,7 @@ static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 impl Notes {
     /// At the end of a job: what it wrote beside the guards is noted.
     pub(crate) fn flush(&mut self) {
+        self.tally.flush();
         if self.pages.is_empty() {
             return;
         }
@@ -788,8 +851,12 @@ unsafe fn piece_at(
     // ([`anytime`]), or the title's own address.
     let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
     let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
-    count(stat::PIECES, 1);
-    count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
+    notes.tally.pieces += 1;
+    if beside.is_some() {
+        notes.tally.beside += 1;
+    } else {
+        notes.tally.direct += 1;
+    }
     // The pages that differ, before any is written: none, and the guard
     // stays; else it is opened once for the piece.
     let mut differing = [true; BLOCK / PAGE + 1];
@@ -800,14 +867,16 @@ unsafe fn piece_at(
     if beside.is_none() {
         drop(reading);
         differing.fill(false);
+        let looking = std::time::Instant::now();
         for_pages(title, parts, |from, n| {
             // SAFETY: the caller's.
             if unsafe { crate::safecopy::differ(now.add(from), held.add(from), n) } {
                 differing[(title + from) / PAGE - base] = true;
             }
         });
+        notes.tally.differ_us += looking.elapsed().as_micros() as u64;
         let Some(first) = differing.iter().position(|&d| d) else {
-            for_pages(title, parts, |_, _| count(stat::PAGES, 1));
+            for_pages(title, parts, |_, _| notes.tally.pages += 1);
             return 0;
         };
         let last = differing.iter().rposition(|&d| d).unwrap_or(first);
@@ -832,6 +901,8 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    let kernel = crate::safecopy::kernel();
+    let looping = std::time::Instant::now();
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
@@ -839,7 +910,9 @@ unsafe fn piece_at(
         }
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
-        let merge = |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
+        let merge = |take| unsafe {
+            crate::safecopy::merge_with(kernel, into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take)
+        };
         let mut done = merge(take && beside.is_some());
         if !done.there && beside.is_none() {
             // Away only while the runtime changes a mapping beside it: the
@@ -878,6 +951,7 @@ unsafe fn piece_at(
             }
         }
     });
+    notes.tally.kernel_us += looping.elapsed().as_micros() as u64;
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the
@@ -888,16 +962,30 @@ unsafe fn piece_at(
             notes.clean.push(title / BLOCK);
         }
     }
-    count(stat::NEW_PIECES, u64::from(new_pages > 0));
-    count(stat::PAGES, pages);
-    count(stat::NEW_PAGES, new_pages);
-    count(stat::NEW_BLOCKS, blocks);
-    count(stat::DWORDS, dwords);
-    count(stat::MISSING, missing);
+    let tally = &mut notes.tally;
+    tally.new_pieces += u64::from(new_pages > 0);
+    tally.pages += pages;
+    tally.new_pages += new_pages;
+    tally.blocks += blocks;
+    tally.dwords += dwords;
+    tally.missing += missing;
+    tally.put_pieces += u64::from(dwords > 0);
     notes.missing += missing;
-    crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
-    crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     dwords * 4
+}
+
+/// Asks for the first `len` bytes (at most 1 KiB) at `at` to be brought toward the cache, a line at a time, for
+/// the piece that is landed next: its three streams begin cold, and the work before its first byte (the piece
+/// before it) is longer than the memory takes. Never faults, whatever `at` is.
+pub(crate) fn prefetch(at: *const u8, len: usize) {
+    let mut i = 0;
+    while i < len.min(1024) {
+        // SAFETY: a prefetch is a hint; it does not fault, and changes no register or memory.
+        unsafe {
+            std::arch::asm!("prefetcht1 byte ptr [{}]", in(reg) at.wrapping_add(i), options(nostack, preserves_flags, readonly));
+        }
+        i += 64;
+    }
 }
 
 /// `parts` of a piece that begins at `title`, cut where 4 KiB pages of title

@@ -6965,7 +6965,24 @@ impl Shadow {
             skip
         };
         let mut put = 0;
-        for &(lo, hi, now) in pieces {
+        let ahead = crate::safecopy::ahead();
+        for (k, &(lo, hi, now)) in pieces.iter().enumerate() {
+            // The piece after this one, and the first one of the run, begin with their bytes on the way: the
+            // merge is a stream of three (the card's bytes, the copy's, title memory), each cold at its start.
+            if ahead {
+                let head = |&(lo, hi, now): &(usize, usize, usize)| {
+                    let n = hi.saturating_sub(lo);
+                    crate::land::prefetch(now as *const u8, n);
+                    crate::land::prefetch(self.data.wrapping_add(lo), n);
+                    crate::land::prefetch((self.start as usize).wrapping_add(lo) as *const u8, n);
+                };
+                if k == 0 {
+                    head(&pieces[0]);
+                }
+                if let Some(next) = pieces.get(k + 1) {
+                    head(next);
+                }
+            }
             if lo >= hi || hi > self.len as usize {
                 continue;
             }

@@ -254,6 +254,15 @@ pub(super) fn front_line(frames: f64) {
 mod tests {
     use super::*;
 
+    /// The two askers (`LANE` and `FRONT`) are one pair of threads for the whole process, and the tests that offer
+    /// to them look at their state after the holders are dropped: tests that run side by side offer to the same
+    /// threads and see each other's work. The tests that do take this lock for as long as they run.
+    static ASKERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn askers() -> std::sync::MutexGuard<'static, ()> {
+        ASKERS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A submission that stage A prepared is never offered, whatever else says yes; one that is not follows the switches.
     #[test]
     fn a_submission_stage_a_prepared_does_not_offer_its_asking() {
@@ -269,6 +278,7 @@ mod tests {
     /// single one would refuse it), and each is over when its holder has waited.
     #[test]
     fn the_thread_of_stage_a_has_an_asking_thread_of_its_own() {
+        let _one = askers();
         let mut plain = vec![0u8; 4096];
         let at = plain.as_mut_ptr() as usize;
         let mut both = 0;
@@ -292,6 +302,7 @@ mod tests {
     /// What is offered is made before the holder's drop returns, and a second is refused while the first is not over.
     #[test]
     fn what_is_offered_is_asked_before_the_wait_is_over() {
+        let _one = askers();
         // Nothing of ours is in the memory: ranges that are not write-watched are left alone, the asking just ends.
         let mut plain = vec![0u8; 4096];
         let at = plain.as_mut_ptr() as usize;

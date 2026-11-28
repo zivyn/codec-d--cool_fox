@@ -498,7 +498,7 @@ float4 corner(uint id : SV_VertexID) : SV_Position {
         unsafe {
             list.list.OMSetRenderTargets(0, None, false, Some(&target));
             list.list
-                .ClearDepthStencilView(target, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, &[]);
+                .ClearDepthStencilView(target, D3D12_CLEAR_FLAG_DEPTH, 1.0, 0, Some(&[]));
             list.list.SetGraphicsRootSignature(&root);
             list.list.SetPipelineState(&pipeline);
             list.list.RSSetViewports(&[D3D12_VIEWPORT {

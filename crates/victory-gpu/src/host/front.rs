@@ -104,9 +104,37 @@ use super::*;
 /// (May change while the title runs, `VICTORY_AB`: [`offer`] reads it once; [`join`] and [`take`] look at what
 /// there is whatever it says.)
 pub(super) fn on() -> bool {
+    why_off().is_none()
+}
+
+/// What keeps [`on`] from being true now, if anything (the first of the conditions that does not hold).
+fn why_off() -> Option<&'static str> {
     // (Not with the compute lane on a queue of its own, `lanes`: the thread would prepare the card's steps before it is
     // known which queue they are for.)
-    !lanes::lists_compute() && prefetch::on() && crate::queue::stage_front() && pending_flights() && crate::watch::once()
+    if lanes::lists_compute() {
+        Some("the compute lane is on a queue of its own (VICTORY_ASYNC_COMPUTE=2)")
+    } else if !prefetch::on() {
+        Some("the refreshes begun early are off (VICTORY_PIPELINE_PREPARE, VICTORY_STAGE_A, the relay)")
+    } else if !crate::queue::stage_front() {
+        Some("the switch (VICTORY_STAGE_A, VICTORY_STAGE_A_STEPS) or the submit line (VICTORY_THIN) is off")
+    } else if !pending_flights() {
+        Some("VICTORY_PENDING_FLIGHT is not 1")
+    } else if !crate::watch::once() {
+        Some("VICTORY_ASK_ONCE=0")
+    } else {
+        None
+    }
+}
+
+/// Since the last frame-rate line: why [`offer`] asked for nothing, by reason.
+static NOT_OFFERED: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+fn not_offered(why: &'static str) {
+    let mut all = NOT_OFFERED.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|w| w.0 == why) {
+        Some(w) => w.1 += 1,
+        None => all.push((why, 1)),
+    }
 }
 
 /// What was done: the lists it was done for (addresses, in order), where their parts begin, the number the
@@ -309,13 +337,21 @@ pub(super) fn same_lists(prepared: &[usize], prepared_parts: &[usize], runs: &[u
 /// asks the thread to do stage A of the submission that comes next. Whether it was asked (the thread of submissions
 /// then takes it at its turn: [`take`]).
 pub(super) fn offer() -> bool {
-    if !on() || split_pending_here() {
+    if let Some(why) = why_off() {
+        not_offered(why);
+        return false;
+    }
+    if split_pending_here() {
+        not_offered("the first half of a cut submission is being sent");
         return false;
     }
     let Some((entry, lists, parts)) = crate::queue::prefold_next() else {
+        // (Why is counted by the line: `crate::queue::no_next_taken`.)
+        not_offered("no submission is next in the line");
         return false;
     };
     if lists.is_empty() {
+        not_offered("the next submission holds no lists");
         return false;
     }
     // (The entry after the next, named now: when the thread runs, the line may have moved on.)
@@ -335,6 +371,7 @@ pub(super) fn offer() -> bool {
             true
         }
         Err(_) => {
+            not_offered("the thread was still busy with the one before");
             HOLD.set(false);
             false
         }
@@ -751,9 +788,20 @@ pub(super) fn frame_line(frames: f64) {
     let why: Vec<(String, u64)> = std::mem::take(&mut *WHY.lock().unwrap_or_else(|e| e.into_inner()));
     let needs: Vec<(u32, u64)> = std::mem::take(&mut *NEEDS.lock().unwrap_or_else(|e| e.into_inner()));
     let kinds: Vec<(&'static str, u64)> = std::mem::take(&mut *KINDS.lock().unwrap_or_else(|e| e.into_inner()));
+    let unasked: Vec<(&'static str, u64)> = std::mem::take(&mut *NOT_OFFERED.lock().unwrap_or_else(|e| e.into_inner()));
+    let no_next = crate::queue::no_next_taken();
     if !crate::queue::stage_front() {
         return;
     }
+    let by_count = |mut all: Vec<(&'static str, u64)>| {
+        all.sort_by_key(|w| std::cmp::Reverse(w.1));
+        all.iter().map(|(text, n)| format!("{:.2} {text}", *n as f64 / frames)).collect::<Vec<_>>().join("; ")
+    };
+    tracing::info!(
+        "stage A of the next submission, the asks that were not made (VICTORY_STAGE_A_STEPS), per frame: [{}]; of them \"no submission is next\" is by what the line held [{}]",
+        by_count(unasked),
+        by_count(no_next)
+    );
     let mut why = why;
     why.sort_by_key(|w| std::cmp::Reverse(w.1));
     let why: Vec<String> = why.iter().map(|(text, n)| format!("{:.2} {text}", *n as f64 / frames)).collect();

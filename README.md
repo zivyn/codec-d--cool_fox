@@ -24,7 +24,7 @@ are kept as rolling prereleases (each is replaced by the next published build of
 
 Each release holds `victory.exe` (release build), `victory-diag.exe` (the same
 with the `diagnostics` switches), `dxil.dll` (the DXIL validator, only for
-`--validate` and `--pipelines`) and `Play-VIctory.cmd`. Put
+`--validate` and `--pipelines`), `Play-VIctory.cmd` and `get-nvidia-dlss.ps1` (the DLSS fetcher, below). Put
 them in one folder. The game itself is not included: you supply your own dump.
 
 ## Run
@@ -48,14 +48,40 @@ number; `VICTORY_AMBIENT=0` and `VICTORY_AMBIENT_AIR=0` leave the title's own li
 Other switches that won their comparison are on in the code without an entry in that file (the ray-tracing pair, the
 loop fixes, the seven switches of the submit thread's lane, `VICTORY_CLEAR_UAV` and more), and the rest of the
 `VICTORY_*` variables are for comparing and for diagnostics: [docs/switches.md](docs/switches.md) lists every one with its
-default. Without `VICTORY_CACHE_DIR` the cache goes to
-`%LOCALAPPDATA%\VIctory\cache-pareto`, and it grows large (the pipeline library alone is 0.5 to 1 GB): set it to a
-folder on a drive with room, as above. Requirements:
+default. Without `VICTORY_CACHE_DIR`, `Play-VIctory.cmd` puts the cache in `cache-pareto` beside the exe (on its drive; a
+`%LOCALAPPDATA%\VIctory\cache-pareto` an earlier version made stays in use), and it grows large (the pipeline library
+alone is 0.5 to 1 GB): set it to a folder on a drive with room, as above. Requirements:
 Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and
 mesh shader support. The first run builds shader pipelines and stutters (a first launch on an empty cache took about
 21 minutes to reach the world); `victory warm --used` makes them ahead. Since `integ/validation-28` every start also
 compiles, in the process, the pipelines whose root signature has static samplers (about 1,300 of 2,100; see the
 white-out below), which adds roughly 110 to 130 s to a start with a warm cache.
+
+### DLSS (NVIDIA RTX): on by default once NVIDIA's files are in place
+
+On a GeForce RTX, with the Series S profile that `Play-VIctory.cmd` selects, DLSS Super Resolution does the title's upscaling
+by itself (a 720p scene to 1080p, quality mode; on the test RTX 4060 it replaces the title's own FSR passes, the 21 MB
+arena copy-back goes away, and the picture is equal or slightly crisper). Two things must hold, and nothing else is asked:
+
+1. **NVIDIA's files are in place.** They are NVIDIA's, under NVIDIA's licences, and this project does not carry them and may
+   not: they come from NVIDIA's own release (github.com/NVIDIA-RTX/Streamline, about 70 MB). The first
+   `Play-VIctory.cmd` on an RTX PC where they are missing asks once, in the console, whether to download them
+   (`y` downloads, anything else is a no and is not asked again); `Play-VIctory.cmd get-dlss` downloads without asking.
+   Nothing is ever downloaded without one of the two. They go to `<home>\nvidia-sdk\Streamline\bin\x64`, where `<home>` is,
+   in order: `VICTORY_HOME`; else `victory-home` beside the folder of `VICTORY_CACHE_DIR` (the cache's drive); else
+   `victory-home` beside `victory.exe` (what `Play-VIctory.cmd` uses without a cache folder). Never the user profile: nothing
+   here is written to the system drive (the fetcher's temporary files go into `<home>\tmp`). `VICTORY_STREAMLINE_DIR` names
+   the folder of `sl.interposer.dll` itself if you have NVIDIA's SDK already (then nothing is fetched).
+2. **Streamline says this GPU has DLSS** (its own feature check, not the card's name). Otherwise, or on AMD or Intel,
+   or without the files, the title's own upscaler runs, with one line at the start saying why
+   (`upscaling      DLSS Super Resolution is off: ...`), and no warning.
+
+`VICTORY_DLSS=0` forces it off, `VICTORY_DLSS=1` forces it on (also on the Series X profile and with the files elsewhere; what
+is missing is then a warning). With DLSS on, the title renders through its FidelityFX path, which is another game image
+(cached in `images\upscaler-quality`): the first start with DLSS builds it, as a new build does. DLSS frame generation stays off
+(`VICTORY_FRAMEGEN=1` asks for it, with `VICTORY_DLSS=1` and `VICTORY_THIN=1`; it needs about 0.5 GB of video memory more,
+which an 8 GB card does not have to spare yet). Asking for frame generation without `VICTORY_DLSS=1` leaves Super Resolution
+off, as before.
 
 ## Where it stands (2026-11-28)
 
@@ -154,10 +180,11 @@ for comparing; the winner of a comparison becomes the default in the next integr
   difference with its interval; `VICTORY_AB_SHOTS=N` saves a picture of each arm. A census of the CPU time of every
   thread of the process is logged every 5 s; the diagnostics build also has a scan of buffers for NaN and infinities
   (`VICTORY_BUFFER_NAN`) and a file that skips passes while the title runs (`VICTORY_LIVE_FILE`).
-- **Audio and NVIDIA features, off.** The audio DSP's convolutions (TVs, telephones, reverb returns, silent before) are
-  computed from the title's own impulse responses with `VICTORY_DSP_CONVOLVE=1`. DLSS upscaling and frame generation
+- **Audio and NVIDIA features.** The audio DSP's convolutions (TVs, telephones, reverb returns, silent before) are
+  computed from the title's own impulse responses with `VICTORY_DSP_CONVOLVE=1` (off). DLSS upscaling and frame generation
   come from the VIctory-NVIDIA fork (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`, `VICTORY_HOTKEYS`); they need NVIDIA's own
-  files, which are not in the repository ([docs/switches.md](docs/switches.md)).
+  files, which are not in the repository ([docs/switches.md](docs/switches.md)). DLSS Super Resolution is on by default
+  on an RTX with the files in place (see "DLSS" above); frame generation is off.
 - **New and off, waiting for a measurement or a validation:** the video-memory pool compaction (`VICTORY_POOL_COMPACT`,
   `BETWEEN_FIT`), the look-ahead of stage A (`STAGE_A_LOOKAHEAD`), the audited form of the kept skips
   (`VICTORY_KEPT_SKIPS_WIDE=audited`), the automatic wave-wide form (`VICTORY_WAVE_WIDE_AUTO`), the guided page refresh (`VICTORY_PAGE_REFRESH`), one-pass

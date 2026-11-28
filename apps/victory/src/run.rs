@@ -100,9 +100,17 @@ pub fn run(
     // is loaded before anything of the title or the host GPU, and fails soft;
     // only if it offers one of them does the title render through its
     // FidelityFX path, which DLSS takes over (`native_1440p::prepare_upscaler`).
-    let mut asked = victory_hle::streamline::Asked::from_env().map_err(anyhow::Error::msg)?;
+    // `VICTORY_DLSS` unset: DLSS Super Resolution is on by default on the Series S profile where the
+    // adapter is NVIDIA's, its files are in `VICTORY_HOME` (else beside the named cache folder, else
+    // beside this program) and Streamline says the GPU has DLSS; else the title's own upscaler, with
+    // one line here saying why. `VICTORY_DLSS=0` turns it off, `=1` forces it.
+    let mut asked = victory_hle::streamline::Asked::from_env_with(cfg.cache_dir_named.then_some(cfg.cache_dir.as_path()))
+        .map_err(anyhow::Error::msg)?;
     asked.series_s = matches!(console, Console::SeriesS);
     let available = victory_hle::streamline::init(&asked);
+    if let Some(note) = victory_hle::streamline::upscaling_note() {
+        println!("upscaling      {note}");
+    }
     // `VICTORY_FSR_PATH=1`: the title's FidelityFX path at VICTORY_DLSS_MODE's
     // scale with its own FidelityFX upscaling (no Streamline): DLSS's
     // comparison, and on Series X what that path alone looks like.

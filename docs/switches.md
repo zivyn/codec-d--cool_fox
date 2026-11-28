@@ -263,12 +263,13 @@ switch is read.
 
 ## Added with the VIctory-NVIDIA port (2026-11-28, `feat/nv1-dlss-sr`)
 
-DLSS and frame generation come from the VIctory-NVIDIA fork (trustno1-coder, readmet3xt-lab, DexNom; `docs/dlss.md` there). All off unless asked; none changes the
+DLSS and frame generation come from the VIctory-NVIDIA fork (trustno1-coder, readmet3xt-lab, DexNom; `docs/dlss.md` there). Frame generation is off unless asked; Super Resolution is on by default only where `VICTORY_DLSS` says (below). None changes the
 translation of shaders.
 
 | Switch | Default | Kind | Translation | A/B | Cache | What it is for |
 |---|---|---|---|---|---|---|
-| `VICTORY_DLSS` | off | flag |  |  |  | `1`: DLSS Super Resolution does the title's FidelityFX upscaling (its `ffxDispatch`), from the same inputs into the same output. Needs NVIDIA's files (`VICTORY_STREAMLINE_DIR`); the title renders through its FidelityFX path (the image is patched, cached in `images\upscaler-<mode>`). |
+| `VICTORY_DLSS` | unset = automatic | text |  |  |  | `1`: DLSS Super Resolution does the title's FidelityFX upscaling (its `ffxDispatch`), from the same inputs into the same output (anything missing is a warning). `0`: off. Unset (the default): on only with the Series S profile, an NVIDIA adapter, NVIDIA's files in place (see `VICTORY_HOME`), no frame generation asked alone, and Streamline's own feature check saying the GPU has DLSS; else the title's own upscaler runs and the start prints one line saying why. The title renders through its FidelityFX path (the image is patched, cached in `images\upscaler-<mode>`). Decision: `crates/victory-gpu/src/streamline/choose.rs`. |
+| `VICTORY_HOME` | beside the cache folder, else beside the exe | path |  |  |  | The folder that holds `nvidia-sdk\Streamline\bin\x64` (NVIDIA's files, never in the repository; `Play-VIctory.cmd get-dlss` or `get-nvidia-dlss.ps1` fetch them from NVIDIA, with your yes). Not set: `victory-home` beside the folder of the cache (`VICTORY_CACHE_DIR` or `cache_dir`, so on the cache's drive), else `victory-home` beside `victory.exe`. Never `%LOCALAPPDATA%`. Set, only that folder is looked in. |
 | `VICTORY_DLSS_MODE` | quality (dlaa with frame generation alone) | text |  |  |  | dlaa, quality, balanced, performance, ultraperformance: the scene's size, 1, 2/3, 0.58, 1/2, 1/3 of the output. |
 | `VICTORY_DLSS_PRESET` | default | text |  |  |  | The DLSS model: default, j, k, l, m. |
 | `VICTORY_DLSS_JITTER`, `VICTORY_DLSS_MV` | `1,1` | text |  |  |  | Multipliers for the jitter and the motion-vector scale DLSS is given (sign and scale checks). |
@@ -282,7 +283,7 @@ translation of shaders.
 | `VICTORY_NATIVE_1440P`, `VICTORY_RENDER_1080P` | off | flag |  |  |  | Series X retail image at a 2560x1440 output (scene 2560x1440, or 1920x1080 scaled up by the title): the image is patched before it is mapped and cached apart (`native_1440p.rs`). The frontend's legacy 4K-projection triangle gets the 3840x2160 viewport on the 1440p target (`draw::State::native_frontend_viewport`; known by its shape, and by `VICTORY_INTERFACE_COMPOSITE` too when that is set). |
 | `VICTORY_HOTKEYS` | off | flag |  |  | diag | `1`: with one of our windows in front and Ctrl and Shift held, F5 frame generation off/on (at the start's amount, 2 if none), F6 the colour without the interface off/on, F7 the next DLSS model preset (default, j, k, l, m), F8 a mark in the log; each press is a line `hotkeys phase N: ...` with the seconds since it began and the clock's time. No key is taken from the title. F3 (the stats panel) says frame generation, frames shown a second, the HUD-less copy and the model while they are in the run. The DLSS mode is not live (the title's scene size is fixed by its mapped image). See `hotkeys.rs`. |
 | `VICTORY_MENU_CONSOLE` | unset | text |  |  |  | `series-s`: the title's Series S menu mode for the DLSS scene size. |
-| `VICTORY_STREAMLINE_DIR` | `C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64` (read only, normally absent) | path |  |  |  | The folder of `sl.interposer.dll`, its plugins and `nvngx_dlss.dll`, `nvngx_dlssg.dll` (NVIDIA's, never in the repository). Use a folder on G:. |
+| `VICTORY_STREAMLINE_DIR` | `VICTORY_HOME`'s `nvidia-sdk\Streamline\bin\x64` | path |  |  |  | The folder of `sl.interposer.dll`, its plugins and `nvngx_dlss.dll`, `nvngx_dlssg.dll` (NVIDIA's, never in the repository). Set, it is the only folder looked in. |
 | `VICTORY_STREAMLINE_LOG` | unset | path |  |  |  | A folder for Streamline's own verbose log files. |
 | `VICTORY_STREAMLINE_PRESENT` | off | flag |  |  |  | `1`: DLSS without frame generation with our swap chain as Streamline's proxy of it (no "presentCommon() was not observed"). |
 | `VICTORY_CHECK_TEARDOWN` | on (=0 turns off) | flag |  |  |  | `victory upscaler-check`: shut Streamline down at the end. |

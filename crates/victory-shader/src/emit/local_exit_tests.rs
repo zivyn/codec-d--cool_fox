@@ -57,7 +57,7 @@ fn translated(together: bool) -> Result<HostShader, ShaderError> {
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     lower::TEST_LOCAL_EXIT.set(together);
     let result = if together {
-        super::local_exit(&c, &native, &p, true).expect("a branch that leaves the loop")
+        super::local_exit(&c, &native, &p, true, true).expect("a branch that leaves the loop")
     } else {
         let st = structure::structure(&p).expect("structure");
         let res =

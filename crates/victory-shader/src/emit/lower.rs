@@ -1415,12 +1415,6 @@ thread_local! {
 }
 
 /// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
-/// The first 7 hex digits of the hash of the container being translated on this thread, as the
-/// logs name the program (`VICTORY_WAVE_WHY` lines say which program they are about).
-pub(super) fn program_digits() -> String {
-    format!("{:07x}", PROGRAM_TAG.get() & 0x0FFF_FFFF)
-}
-
 pub fn set_program_tag(container: &[u8]) {
     let hash = blake3::hash(container);
     let first = u32::from_be_bytes(hash.as_bytes()[..4].try_into().expect("4 bytes"));
@@ -1562,23 +1556,28 @@ fn half_exit() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_EXIT").is_some_and(|v| v == "1"))
 }
 
-/// `VICTORY_LOCAL_EXIT=1`: a console wave64 program that only translates as two host waves of
-/// 32 that each run as a wave of their own (`with_local_waves_any`) takes the branches that leave
-/// its loops, where the console takes them for the whole wave (`s_cbranch_scc0` on the lanes
-/// left in a loop's mask, `execz`), for the whole host wave too ([`Lower::wave_wide`]): the lanes
-/// of a host wave go through the loop and out of it together. Without it each lane leaves on its
-/// own bit: a lane outside the loop's mask never meets that branch and goes round until the
-/// loop's limit (then it leaves as killed, and what the code after the loop writes for it is
-/// lost), and the code after the loop, which reads other lanes (a quad's neighbours, a first
-/// lane), runs with the lanes that have left so far. Off unless set. Part of the translation:
-/// the shader cache keys on it.
+/// `VICTORY_LOCAL_EXIT=1`: in the local-waves "any mask" form (`with_local_waves_any`) the
+/// branches that leave a loop, which the console takes for its whole wave, are taken by the whole
+/// host wave ([`Lower::wave_wide`]). Otherwise each lane leaves on its own bit: a lane outside
+/// the loop's mask goes round to the loop's limit and leaves as killed, and the code after the
+/// loop runs with the lanes that have left so far. Off unless set; in the shader cache key.
 pub(super) fn local_exit() -> bool {
     #[cfg(test)]
     if TEST_LOCAL_EXIT.get() {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_EXIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_EXIT").is_some_and(|v| v == "1" || v == "2"))
+}
+
+/// `VICTORY_LOCAL_EXIT=2`: as `1`, for the other approximate local-waves forms too.
+pub(super) fn local_exit_all() -> bool {
+    #[cfg(test)]
+    if TEST_LOCAL_EXIT_ALL.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOCAL_EXIT").is_some_and(|v| v == "2"))
 }
 
 pub(super) fn host_max_wave() -> u32 {
@@ -1597,6 +1596,8 @@ thread_local! {
     pub(super) static TEST_HALF_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's `VICTORY_LOCAL_EXIT`, for its thread only.
     pub(super) static TEST_LOCAL_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A test's `VICTORY_LOCAL_EXIT=2`, for its thread only.
+    pub(super) static TEST_LOCAL_EXIT_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's `VICTORY_LOOP_LIMITS`, for its thread only.
     pub(super) static TEST_LOOP_LIMITS: std::cell::RefCell<Option<super::LoopLimits>> = const { std::cell::RefCell::new(None) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -5227,7 +5228,7 @@ impl<'a> Lower<'a> {
     fn wave_wide(&mut self, b: usize, when: Bool) -> Result<V, Why> {
         const WHY: Why = "a wave-wide branch where not every lane runs";
         let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
-        if self.local && self.local_any {
+        if self.local && (self.local_any || local_exit_all()) {
             // Each host wave is a wave of its own (`with_local_waves_any`, `VICTORY_LOCAL_EXIT`):
             // its answer is the wave's, and its lanes must all be here to give it.
             if !self.all_lanes(b) {

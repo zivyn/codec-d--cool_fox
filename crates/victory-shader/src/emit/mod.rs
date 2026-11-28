@@ -707,7 +707,7 @@ fn emit_forms(
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?} #{}", lower::program_digits()),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?} ~{}", code_digits(c)),
                     Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
                 }
             }
@@ -853,6 +853,16 @@ fn emit_forms(
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
                 {
+                    // (`VICTORY_LOCAL_EXIT=2`: the lanes of a host wave leave the loops together)
+                    if !exact
+                        && lower::local_exit_all()
+                        && let Some(together) = local_exit(c, native, p, why, false)
+                    {
+                        report(&format!("local waves (APPROXIMATE, loops left together), {name}"), &together);
+                        if done(&together) {
+                            return together.map(|(shader, _)| shader);
+                        }
+                    }
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
@@ -861,6 +871,15 @@ fn emit_forms(
                 }
             }
             if idiom(p, st) == exact {
+                if !exact
+                    && lower::local_exit_all()
+                    && let Some(together) = local_exit(c, native, p, why, false)
+                {
+                    report("local waves (APPROXIMATE, loops left together)", &together);
+                    if done(&together) {
+                        return together.map(|(shader, _)| shader);
+                    }
+                }
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
@@ -875,7 +894,7 @@ fn emit_forms(
                     if let Some((p, st, io, res)) = f {
                         // (`VICTORY_LOCAL_EXIT=1`: the lanes of a host wave leave the loops together)
                         if lower::local_exit()
-                            && let Some(together) = local_exit(c, native, p, why)
+                            && let Some(together) = local_exit(c, native, p, why, true)
                         {
                             report(&format!("local waves (APPROXIMATE, any mask, loops left together), {name}"), &together);
                             if done(&together) {
@@ -890,7 +909,7 @@ fn emit_forms(
                     }
                 }
                 if lower::local_exit()
-                    && let Some(together) = local_exit(c, native, p, why)
+                    && let Some(together) = local_exit(c, native, p, why, true)
                 {
                     report("local waves (APPROXIMATE, any mask, loops left together)", &together);
                     if done(&together) {
@@ -1104,6 +1123,13 @@ fn widen(
     }
 }
 
+/// The first 8 hex digits of the hash of the program's code, as `translate --list` names it after
+/// the `~` (`VICTORY_WAVE_WHY` lines say which program they are about).
+fn code_digits(c: &Container) -> String {
+    let code = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)).map_or(&[][..], |p| p.data);
+    blake3::hash(code).to_hex()[..8].to_owned()
+}
+
 /// The blocks closed by a branch that leaves a loop (one successor inside the loop of a back edge,
 /// one outside) and that the console takes for the whole wave ([`structure::Structured::wave_any`]:
 /// `execz`, `execnz`, `vccz`, `vccnz`, SCC of a mask operation), by block.
@@ -1155,6 +1181,7 @@ fn local_exit(
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    any: bool,
 ) -> Option<Result<(HostShader, Option<u32>), ShaderError>> {
     let first = structure::structure(p).ok()?;
     let mut wide: std::collections::HashSet<usize> = loop_exits(p, &first).into_iter().collect();
@@ -1166,7 +1193,11 @@ fn local_exit(
         let io = io::raise(p, native).ok()?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
         lower::take_needs();
-        let r = lower::with_local_waves_any(|| emit_program(c, native, p, &st, &io, &res));
+        let r = if any {
+            lower::with_local_waves_any(|| emit_program(c, native, p, &st, &io, &res))
+        } else {
+            lower::with_local_waves(|| emit_program(c, native, p, &st, &io, &res))
+        };
         let needs = lower::take_needs();
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what));
         let more: Vec<usize> = if stuck {
@@ -1183,8 +1214,8 @@ fn local_exit(
                 let mut sorted: Vec<usize> = wide.iter().copied().collect();
                 sorted.sort_unstable();
                 eprintln!(
-                    "WAVE64-LOCAL-EXIT #{} {} branches taken by the host wave together, {}: {sorted:?}",
-                    lower::program_digits(),
+                    "WAVE64-LOCAL-EXIT ~{} {} branches taken by the host wave together, {}: {sorted:?}",
+                    code_digits(c),
                     sorted.len(),
                     if r.is_ok() { "lowered" } else { "NOT lowered" }
                 );

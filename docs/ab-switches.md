@@ -178,7 +178,7 @@ the title's pipelines are made), `VICTORY_FUSE_DISPATCH` (translation), `VICTORY
 
 ## What integ/validation-27 adds to the A/B (2026-11-28)
 
-`VICTORY_STAGE_A_LOOKAHEAD=1` (needs `VICTORY_STAGE_A_STEPS`; row above) is the one new live switch. It is in `ab/registry.rs` (`LIVE`, 88 entries),
+`VICTORY_STAGE_A_LOOKAHEAD=1` (needs `VICTORY_STAGE_A_STEPS`; row above) is the one new live switch. It is in `ab/registry.rs` (`LIVE`, 90 entries with the two `VICTORY_DSP_CONVOLVE*` of feat/audio-conv, merged after),
 so `VICTORY_AB=10,VICTORY_STAGE_A_LOOKAHEAD` flips it; the isolating A/B holds the whole stage A stack constant on and flips only this.
 **Not live, so compared in pairs of processes:** `VICTORY_POOL_COMPACT` (and `VICTORY_POOL_FIT=best`, `VICTORY_POOL_SLACK_MB`,
 `VICTORY_POOL_COMPACT_MB`) and `VICTORY_BETWEEN_FIT` (read once, `OnceLock`; the pool and the card-steps buffers are sized when they are made).

@@ -84,38 +84,46 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 /// Which of the title's ray-tracing passes are left out, as `(the shading of
 /// hits, the activation of probe rays)`, by what the switches say.
 ///
-/// Without the structure builder every ray misses, and the ~1,000 programs
-/// that shade hits cost compile time for nothing, so they are left out unless
-/// `VICTORY_RT_RESOLVE` is set to something but 0; the activation of probe
-/// rays is one pipeline, left out unless `VICTORY_ACTIVATE_RAYS` is set to
-/// something but 0 (what it marks is then kept stale in blocks of the picture's
-/// tiles). With the builder (`VICTORY_BVH_BUILDER=1`) both run, and only
+/// Both run unless their switch says `0`: the ~1,000 programs that shade hits
+/// (`VICTORY_RT_RESOLVE=0` leaves them out, which saves their compile time:
+/// without the structure builder every ray misses), and the one that activates
+/// probe rays (`VICTORY_ACTIVATE_RAYS=0` leaves it out: the tiles of the screen
+/// probes are then never marked and keep what they held, in blocks of the
+/// picture's tiles, and runs with it left out showed the white-out). With the
+/// builder (`VICTORY_BVH_BUILDER=1`) the hits always run, and only
 /// `VICTORY_ACTIVATE_RAYS=0` takes the activation out.
 fn passes_left_out(
     builder: bool,
     rt_resolve: Option<&str>,
     activate_rays: Option<&str>,
 ) -> (bool, bool) {
-    let set = |v: Option<&str>| v.is_some_and(|v| v != "0");
-    let hits = !builder && !set(rt_resolve);
-    let activation = if builder {
-        activate_rays == Some("0")
-    } else {
-        !set(activate_rays)
-    };
+    let hits = !builder && rt_resolve == Some("0");
+    let activation = activate_rays == Some("0");
     (hits, activation)
 }
 
-pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+/// `(hits, activation)` as [`passes_left_out`] says for this run's switches.
+fn left_out_passes() -> (bool, bool) {
     static LEFT_OUT: OnceLock<(bool, bool)> = OnceLock::new();
-    let (hits, activation) = *LEFT_OUT.get_or_init(|| {
+    *LEFT_OUT.get_or_init(|| {
         let var = |name| std::env::var(name).ok();
         passes_left_out(
             std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"),
             var("VICTORY_RT_RESOLVE").as_deref(),
             var("VICTORY_ACTIVATE_RAYS").as_deref(),
         )
-    });
+    })
+}
+
+/// Which programs this run leaves out, as text (what `victory warm --compute` keeps with the
+/// compute programs it has written down, to write them down again when it changes).
+pub(super) fn left_out_signature() -> String {
+    let (hits, activation) = left_out_passes();
+    format!("hit shading left out: {hits}, probe ray activation left out: {activation}")
+}
+
+pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    let (hits, activation) = left_out_passes();
     if hits && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
@@ -965,17 +973,16 @@ mod tests {
     #[test]
     fn the_ray_tracing_passes_follow_the_builder_and_their_switches() {
         // (hits left out, activation left out)
-        // Default, without the builder: both out.
-        assert_eq!(passes_left_out(false, None, None), (true, true));
-        assert_eq!(passes_left_out(false, Some("0"), Some("0")), (true, true));
-        // Each has its own switch.
-        assert_eq!(passes_left_out(false, None, Some("1")), (true, false));
-        assert_eq!(passes_left_out(false, Some("1"), None), (false, true));
+        // Default, without the builder: both run.
+        assert_eq!(passes_left_out(false, None, None), (false, false));
         assert_eq!(passes_left_out(false, Some("1"), Some("1")), (false, false));
-        // The builder brings both back.
+        // Each has its own switch, `0` takes it out.
+        assert_eq!(passes_left_out(false, Some("0"), None), (true, false));
+        assert_eq!(passes_left_out(false, None, Some("0")), (false, true));
+        assert_eq!(passes_left_out(false, Some("0"), Some("0")), (true, true));
+        // The builder: the hits always run, and only the activation has a switch that takes it out.
         assert_eq!(passes_left_out(true, None, None), (false, false));
         assert_eq!(passes_left_out(true, Some("0"), Some("1")), (false, false));
-        // Only the activation has a switch that takes it out again.
         assert_eq!(passes_left_out(true, None, Some("0")), (false, true));
     }
 

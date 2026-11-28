@@ -195,6 +195,12 @@ pub fn seed_compute(dir: &Path, containers: impl IntoIterator<Item = Vec<u8>>) -
     append(&dir, &new).map_or(0, |()| added)
 }
 
+/// Which programs a run leaves out (see `make::left_out`), as text: `seed_compute` skips them, so
+/// a book seeded under other switches lacks the ones left out then.
+pub fn left_out_signature() -> String {
+    super::make::left_out_signature()
+}
+
 /// Calls `f` with each container's stage, hash, place and length; where the
 /// last whole one ends.
 fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
@@ -543,6 +549,26 @@ mod tests {
         assert_eq!(back.describe(), g.describe());
         assert!(GraphicsState::get(&bytes[..bytes.len() - 1]).is_none());
         assert!(GraphicsState::get(&bytes[..9]).is_none());
+    }
+
+    #[test]
+    fn the_ray_programs_are_seeded_by_default() {
+        let set = |name| std::env::var(name).ok();
+        if set("VICTORY_RT_RESOLVE").is_some() || set("VICTORY_ACTIVATE_RAYS").is_some() || set("VICTORY_BVH_BUILDER").is_some() {
+            return; // the switches of this process are not the defaults
+        }
+        let dir = std::env::temp_dir().join(format!("victory-seed-rays-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let all = vec![
+            b"a plain compute container".to_vec(),
+            b"x CS_RaytracingResolve_0123abcd x".to_vec(),
+            b"y CS_ScreenProbes_ActivateRays_0123abcd y".to_vec(),
+        ];
+        // The hit shading and the activation of probe rays are in the warm list without any run.
+        assert_eq!(seed_compute(&dir, all), 3);
+        assert_eq!(keys(&dir).len(), 3);
+        assert_eq!(left_out_signature(), "hit shading left out: false, probe ray activation left out: false");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

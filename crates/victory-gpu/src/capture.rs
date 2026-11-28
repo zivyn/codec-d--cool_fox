@@ -730,7 +730,7 @@ fn texel_bytes(format: u32) -> Option<usize> {
         1..=4 => 16,
         5..=8 => 12,
         9..=22 => 8,
-        23..=47 | 87..=93 => 4,
+        23..=47 | 67 | 87..=93 => 4,
         48..=59 => 2,
         60..=65 => 1,
         _ => return None,
@@ -859,7 +859,7 @@ struct Range {
 
 /// [`Range`] of the rows of a float format (`None` for any other).
 fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Range> {
-    // Channels, and how a channel is read: 32-bit, 16-bit, or R11G11B10.
+    // Channels, and how a channel is read: 32-bit, 16-bit, R11G11B10, or R9G9B9E5 (9).
     let (channels, kind) = match format {
         2 => (4, 32),
         6 => (3, 32),
@@ -869,6 +869,7 @@ fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Op
         34 => (2, 16),
         54 => (1, 16),
         26 => (3, 11),
+        67 => (3, 9),
         _ => return None,
     };
     let bytes = match kind {
@@ -887,6 +888,12 @@ fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Op
                     32 => {
                         let f = f32::from_le_bytes(t[4 * c..4 * c + 4].try_into().unwrap_or([0; 4]));
                         (f, f.is_nan(), f.is_infinite())
+                    }
+                    9 => {
+                        // Three 9-bit mantissas and one shared exponent: no NaN, no infinity.
+                        let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
+                        let m = (w >> (9 * c)) & 511;
+                        (m as f32 * 2f32.powi((w >> 27) as i32 - 24), false, false)
                     }
                     16 => {
                         let b = u16::from_le_bytes([t[2 * c], t[2 * c + 1]]);
@@ -955,9 +962,15 @@ fn target_stats(
     });
     // Float targets: the range of their values, the columns after the flatness ones
     // (`max`, `min` and `mean` over the color channels; `nan` and `inf` count channels).
-    let range = float_range(format, w, h, pitch, rows).map_or(String::new(), |r| {
-        format!("	max{:.4e}	min{:.4e}	mean{:.4e}	nan{}	inf{}", r.max, r.min, r.mean, r.nan, r.inf)
-    });
+    // (An R32_UINT target may be the title's diffuse light, which it packs as R9G9B9E5: its
+    // `e5max` and `e5mean` read the words that way, and mean nothing for any other counter.)
+    let range = if format == 42 {
+        float_range(67, w, h, pitch, rows).map_or(String::new(), |r| format!("	e5max{:.4e}	e5mean{:.4e}", r.max, r.mean))
+    } else {
+        float_range(format, w, h, pitch, rows).map_or(String::new(), |r| {
+            format!("	max{:.4e}	min{:.4e}	mean{:.4e}	nan{}	inf{}", r.max, r.min, r.mean, r.nan, r.inf)
+        })
+    };
     let line = format!(
         "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%{range}",
         d.Width,
@@ -1521,6 +1534,13 @@ mod stats_tests {
         let r = float_range(41, 4, 1, 16, &rows).unwrap();
         assert_eq!((r.nan, r.inf, r.max, r.min, r.mean), (1, 1, 4.0, -2.0, 1.0));
         assert!(float_range(28, 1, 1, 4, &[0; 4]).is_none());
+        // R9G9B9E5: red 511 x 2^(31-24) = 65408 (the largest), green 1 x 2^7, blue 0.
+        let w = 511u32 | 1 << 9 | 31 << 27;
+        let r = float_range(67, 1, 1, 4, &w.to_le_bytes()).unwrap();
+        assert_eq!((r.nan, r.inf, r.max, r.min), (0, 0, 65408.0, 0.0));
+        let one = 256u32 | 15 << 27; // red 256 x 2^(15-24) = 0.5; green and blue 0
+        let r = float_range(67, 1, 1, 4, &one.to_le_bytes()).unwrap();
+        assert_eq!((r.max, r.min), (0.5, 0.0));
     }
 
     #[test]

@@ -24,11 +24,21 @@ nothing. With `VICTORY_BVH_BUILDER=1`:
 | | off (default) | on |
 |---|---|---|
 | the builder's 53 stages (unpack, build, refit, copy) | dropped | run, all or none per frame |
-| the programs that shade ray hits (~1,000 pipelines, 540 to 800 dispatches a frame) | left out, no host pipeline: `VICTORY_RT_RESOLVE=1` makes them (hits all miss) | run |
-| the probe ray activation (1 dispatch a frame) | left out: tiles of the screen probes are never marked and keep what they held, which shows as blocks of the picture's tiles; `VICTORY_ACTIVATE_RAYS=1` runs it | runs; `VICTORY_ACTIVATE_RAYS=0` leaves it out |
+| the programs that shade ray hits (~1,000 pipelines, 540 to 800 dispatches a frame) | made and run (all miss); `VICTORY_RT_RESOLVE=0` leaves them out (no host pipeline) | run |
+| the probe ray activation (1 dispatch a frame) | runs; `VICTORY_ACTIVATE_RAYS=0` leaves it out: tiles of the screen probes are then never marked and keep what they held, which shows as blocks of the picture's tiles (and runs without it showed the white-out) | runs; `VICTORY_ACTIVATE_RAYS=0` leaves it out |
 | trace programs (probes, visibility buffer, irradiance cache, shadows, reflections) | run on empty structures | run on the built ones |
 | title memory by address (`memory.rs`) | only what a stray trace touches | the arenas: about 1 GB in 19 arenas in a run of the opening; by the code each page is twice in the PC's memory (reserved and staged) and once on the card, twice while shader writes are compared (`shadow::Card::before`) |
 | the indirect-light stand-in (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_AIR`) | applies | rests once the builder has run |
+
+Cost of the hit-shading programs being made by default: about 1,000 compute pipelines, ~10 minutes
+of compiling on a cache that has never made them (a cache warmed before this default has none of
+them: the book of pipelines records what a run makes, so the first run writes them down and every
+run after warms them; `known::seed_compute` could seed them without a run but nothing calls it).
+A compute dispatch waits for its pipeline (up to `VICTORY_COMPUTE_WAIT_MS`, 120 s, the frame's own
+requests made first), so on a cache that has never made them the first minutes of the world stall
+while they compile: warm the cache once (a warm-first run) before measuring or playing. Runs measured
+with both on (the builder off, warm): 96 to 109 ms a frame, the card 63.5 to 87.7 ms working, no
+slower than with both left out.
 
 The builder is the title's own, from its structure-builder library: bottom levels
 from vertex and index buffers (skinned and animated meshes from the output of the
@@ -124,8 +134,8 @@ after it was given them as an unordered access view.
 | variable | does |
 |---|---|
 | `VICTORY_BVH_BUILDER=1` | the builder's stages run; the hit shading and the probe activation are not left out; the stand-in rests |
-| `VICTORY_RT_RESOLVE=1` | without the builder: the programs that shade hits are made and run (all miss; ~10 minutes of compiling on a cold cache) |
-| `VICTORY_ACTIVATE_RAYS=1` | without the builder: the probe activation runs; with it, `=0` leaves it out |
+| `VICTORY_RT_RESOLVE=0` | without the builder: the programs that shade hits are left out again (on by default: all miss; about 1,000 pipelines, ~10 minutes of compiling on a cache that has never made them) |
+| `VICTORY_ACTIVATE_RAYS=0` | the probe activation is left out (on by default, with or without the builder) |
 | `VICTORY_MEMORY_FAULT_PAGES=<n>` | the most pages taken from faults in a run (8192; it was 2048 and was spent in seconds) |
 | `VICTORY_MEMORY_CARD_OVER=1` | a copy by address goes on the card even when the card is over its budget (else it is in the PC's memory, read over the bus: the log says so, `a copy is in the PC's memory`) |
 | `VICTORY_BVH_FENCES=0` | no fences around the builder's buffer atomics (beloooo's 72e748ea has them too) |

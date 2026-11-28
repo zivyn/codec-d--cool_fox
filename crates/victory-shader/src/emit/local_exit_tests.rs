@@ -78,7 +78,7 @@ fn translated(together: bool) -> Result<HostShader, ShaderError> {
     result.map(|(shader, _)| shader)
 }
 
-fn validated(shader: &HostShader) {
+pub(super) fn validated(shader: &HostShader) {
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");

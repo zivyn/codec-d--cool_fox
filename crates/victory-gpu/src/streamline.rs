@@ -1577,7 +1577,7 @@ fn status_line(live: bool, wanted: u32, per: u32, fps: f64, hudless: &str, prese
         (true, _, 0 | 1) => format!("FG {wanted}X"),
         (true, ..) => format!("FG {per}X SHOWN {:.0}", fps * f64::from(per)),
     };
-    let preset = if preset == "default" { "DEF" } else { preset };
+    let preset = if preset == "default" { "DEF".to_owned() } else { preset.to_ascii_uppercase() };
     format!("{fg}  HUDLESS {hudless}  MODEL {preset}")
 }
 

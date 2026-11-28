@@ -49,6 +49,7 @@ pub(super) fn classify(
     wide: &HashSet<usize>,
     barriers: &BTreeSet<usize>,
 ) -> Vec<(usize, Class)> {
+    WHY.with_borrow_mut(Vec::clear);
     let n = p.blocks.len();
     let succ: Vec<Vec<usize>> = p.blocks.iter().map(|b| b.exit.successors()).collect();
     // post-dominators (bitsets; a virtual exit after every block that ends)
@@ -107,7 +108,11 @@ pub(super) fn classify(
         let inside = barriers.iter().any(|&b| seen.get(b).copied().unwrap_or(false));
         let class = if !inside {
             Class::A
-        } else if threads <= 64 || condition_is_the_same_in_every_wave(st, d, &same) {
+        } else if threads <= 64 {
+            WHY.with_borrow_mut(|w| w.push((d, "one console wave")));
+            Class::B
+        } else if condition_is_the_same_in_every_wave(st, d, &same) {
+            WHY.with_borrow_mut(|w| w.push((d, "condition the same in every wave")));
             Class::B
         } else {
             Class::C
@@ -180,6 +185,8 @@ fn scalars_of_every_wave(p: &Program, native: &NativeProgram) -> HashSet<Value> 
 pub(super) type Summary = Vec<(usize, Class)>;
 
 thread_local! {
+    /// Why each class-B branch of the last classification is (for the corpus lines).
+    static WHY: std::cell::RefCell<Vec<(usize, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
     static LAST: std::cell::RefCell<Summary> = const { std::cell::RefCell::new(Vec::new()) };
     static BARRIERS: std::cell::RefCell<BTreeSet<usize>> = const { std::cell::RefCell::new(BTreeSet::new()) };
 }
@@ -212,6 +219,16 @@ pub(super) fn safe(classes: &[(usize, Class)]) -> bool {
 
 /// How a program's classes are told in a line of the corpus run.
 pub(super) fn describe(classes: &[(usize, Class)]) -> String {
-    let parts: Vec<String> = classes.iter().map(|(b, c)| format!("B{b}={}", c.letter())).collect();
+    let parts: Vec<String> = classes
+        .iter()
+        .map(|(b, c)| {
+            let why = WHY.with_borrow(|w| w.iter().find(|x| x.0 == *b).map(|x| x.1));
+            match why {
+                Some("one console wave") => format!("B{b}=b(one wave)"),
+                Some(_) => format!("B{b}=b(same condition)"),
+                None => format!("B{b}={}", c.letter()),
+            }
+        })
+        .collect();
     parts.join(",")
 }

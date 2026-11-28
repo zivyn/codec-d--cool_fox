@@ -44,8 +44,12 @@ pub(super) fn attempt(
         let safe = mode == Mode::All || wide_class::safe(&classes);
         if why {
             eprintln!(
-                "WAVE64-WIDE-CLASS ~{} {} {}",
+                "WAVE64-WIDE-CLASS ~{} threads={} {} {}",
                 code_digits(c),
+                match native.io {
+                    crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+                    _ => 0,
+                },
                 wide_class::describe(&classes),
                 if safe { "taken" } else { "refused" }
             );

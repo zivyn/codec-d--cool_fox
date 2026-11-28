@@ -2954,7 +2954,8 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
 /// looks at, a refresh that comes behind another of the same copy does not
 /// look the copy up again (`Batch::add`), what is refreshed ahead of the steps is
 /// made and kept without a list of ranges and its allocation for each of
-/// thousands of copies (`front_spans_flat`, `Batch::first`), and the slots the
+/// thousands of copies (`front_spans_flat`, `Batch::first`), the spans that copies have
+/// noted as holding nothing new are left out by threads (`retain_unnoted`), and the slots the
 /// card's steps make are made with one hold on their buffer and one look at the
 /// heap for each thread (`descriptor::constant_slots`), not for each slot.
 ///
@@ -9201,6 +9202,48 @@ fn ranges_cover(ranges: &[(usize, usize)], address: usize, end: usize, sorted: b
     at > 0 && end <= ranges[at - 1].1
 }
 
+/// `items` without those that `known` says of, in the order they stand in. With `wide` and many of them `known` is
+/// asked on the kept threads ([`crate::shadow::wide_each`]), a piece of them each.
+fn retain_where<T: Send + Sync + 'static>(items: &mut Vec<T>, known: impl Fn(&T) -> bool + Send + Sync + 'static, wide: bool) {
+    const PART: usize = 256;
+    if !wide || items.len() < 2 * PART {
+        items.retain(|item| !known(item));
+        return;
+    }
+    let all = std::sync::Arc::new(std::mem::take(items));
+    let said: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> =
+        std::sync::Arc::new((0..all.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
+    {
+        let (all, said) = (all.clone(), said.clone());
+        crate::shadow::wide_each(all.len().div_ceil(PART), move |part| {
+            for i in part * PART..((part + 1) * PART).min(all.len()) {
+                if known(&all[i]) {
+                    said[i].store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    // (The jobs are done, and have let go of what they held; if one has not yet, it is a moment.)
+    let mut held = all;
+    let all = loop {
+        match std::sync::Arc::try_unwrap(held) {
+            Ok(all) => break all,
+            Err(still) => {
+                held = still;
+                std::thread::yield_now();
+            }
+        }
+    };
+    *items = all.into_iter().zip(said.iter()).filter(|(_, said)| !said.load(Ordering::Relaxed)).map(|(item, _)| item).collect();
+}
+
+/// `spans` (a copy, from, to) without those a copy has noted as holding nothing new there
+/// ([`crate::shadow::Shadow::nothing_new_noted`]): for each a lock of the copy's notes and a few reads, a quarter of a
+/// microsecond, of some 9,000 spans a frame, on the submitting thread; with `VICTORY_LEAN_STEPS` on the kept threads.
+fn retain_unnoted(spans: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, wide: bool) {
+    retain_where(spans, |(shadow, from, to)| shadow.nothing_new_noted(*from, *to - *from), wide);
+}
+
 thread_local! {
     /// What a lean batch ([`Batch::new`]) keeps ahead of the steps, kept by the thread between submissions.
     static AHEAD_FIRST: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
@@ -9474,7 +9517,7 @@ impl Batch {
             // touched since, need no thread (nor asking ahead).
             #[cfg(feature = "diagnostics")]
             let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new_noted(*from, *to - *from));
+            retain_unnoted(&mut spans, self.lean);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
         }
@@ -9680,7 +9723,7 @@ impl Batch {
             // (As in `refresh_front`.)
             #[cfg(feature = "diagnostics")]
             let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new_noted(*from, *to - *from));
+            retain_unnoted(&mut self.refreshes, self.lean);
             #[cfg(feature = "diagnostics")]
             FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
         }
@@ -12266,6 +12309,24 @@ mod refresh_tests {
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
     use super::{Batch, ranges_cover};
     use std::sync::Arc;
+
+    /// What is left is what a look at each in turn leaves, in the order it was in, on the threads or not.
+    #[test]
+    fn what_is_known_is_left_out_whether_it_is_asked_on_the_threads_or_one() {
+        use super::retain_where;
+        let mut dice = Dice(0x0123_4567_89ab_cdef);
+        for n in [0usize, 1, 2, 255, 511, 512, 513, 1000, 4097, 9000] {
+            for threads in [false, true] {
+                let items: Vec<(usize, Arc<usize>)> = (0..n).map(|i| (i, Arc::new(dice.below(3)))).collect();
+                let want: Vec<usize> = items.iter().filter(|(_, k)| **k != 0).map(|(i, _)| *i).collect();
+                let mut got = items.clone();
+                retain_where(&mut got, |(_, k)| **k == 0, threads);
+                assert_eq!(got.iter().map(|(i, _)| *i).collect::<Vec<_>>(), want, "{n} items, threads {threads}");
+                // The holds the jobs took are let go of.
+                assert!(got.iter().all(|(_, k)| Arc::strong_count(k) == 2), "{n} items");
+            }
+        }
+    }
 
     /// A small generator of numbers (xorshift).
     struct Dice(u64);

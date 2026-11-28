@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Notes;
 use super::owed::{self, Land};
-use crate::shadow::{CLASSES, OwnClass, Shadow};
+use crate::shadow::{CLASSES, OverlapIndex, OwnClass, Shadow};
 
 /// A fetched piece: its copy, the offsets in it, and where its bytes are in the fetch buffer.
 pub(crate) type Fetched = (Arc<Shadow>, usize, usize, u64);
@@ -156,7 +156,23 @@ pub(crate) fn offer(pieces: Vec<Fetched>, data: usize, after: u64) -> Vec<Fetche
     if pieces.is_empty() {
         return pieces;
     }
-    let index = crate::shadow::overlap_index();
+    offer_in(
+        pieces,
+        data,
+        after,
+        &crate::shadow::overlap_index(),
+        &crate::shadow::overlap_index,
+    )
+}
+
+/// [`offer`] with the copies there are given (`index`), and how to ask again once the guards stand (`fresh`).
+pub(crate) fn offer_in(
+    pieces: Vec<Fetched>,
+    data: usize,
+    after: u64,
+    index: &OverlapIndex,
+    fresh: &dyn Fn() -> OverlapIndex,
+) -> Vec<Fetched> {
     let over_too = untaken_on();
     let mut rest = Vec::with_capacity(pieces.len());
     // The pieces newly kept, to be looked at again once their guards are armed.
@@ -208,7 +224,7 @@ pub(crate) fn offer(pieces: Vec<Fetched>, data: usize, after: u64) -> Vec<Fetche
             }
         }
     }
-    recheck(armed);
+    recheck(armed, fresh);
     rest
 }
 
@@ -216,12 +232,15 @@ pub(crate) fn offer(pieces: Vec<Fetched>, data: usize, after: u64) -> Vec<Fetche
 /// before its guard stood, read the title's bytes from before and would not read them again (nothing noted a write).
 /// If any copy over a piece has taken its bytes, the piece lands now, which notes the write for every copy and so
 /// has that copy take them again. A copy that has not taken them reads them later, through the guard.
-fn recheck(armed: Vec<((u64, usize), usize, usize, Arc<Shadow>)>) {
+fn recheck(
+    armed: Vec<((u64, usize), usize, usize, Arc<Shadow>)>,
+    fresh: &dyn Fn() -> OverlapIndex,
+) {
     if armed.is_empty() {
         return;
     }
     // (Made after the guards: a copy that is not in it was made after them, and reads through them.)
-    let index = crate::shadow::overlap_index();
+    let index = fresh();
     for (key, from, to, shadow) in armed {
         let taken = index
             .others_over(shadow.id(), from as u64, to as u64)

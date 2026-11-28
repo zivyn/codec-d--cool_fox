@@ -1249,13 +1249,19 @@ mod tests {
         let data = fetch.as_mut_ptr() as usize;
         let before = crate::land::own::held();
         let pieces = vec![(copy.clone(), 0, PAGE, 0u64), (copy.clone(), 2 * PAGE, 3 * PAGE, (2 * PAGE) as u64)];
-        let rest = crate::land::own::offer(pieces, data, 0);
+        // (The copies there are: this one. The process's other tests register copies at addresses of their own.)
+        let only = |copy: &Arc<crate::shadow::Shadow>| {
+            let copy = copy.clone();
+            move || crate::shadow::OverlapIndex::of_copies(&[copy.clone()])
+        };
+        let (index, fresh) = (only(&copy)(), only(&copy));
+        let rest = crate::land::own::offer_in(pieces, data, 0, &index, &fresh);
         assert!(rest.is_empty(), "both are ownable: {:?}", rest.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>());
         assert_eq!(kept_count(), 2);
         assert_eq!(crate::land::own::held() - before, 2 * PAGE as u64);
         // The next flight: the same piece, new bytes: replaced, the same unit, the same memory held.
         fetch.fill(0x88);
-        let rest = crate::land::own::offer(vec![(copy.clone(), 0, PAGE, 0u64)], data, 0);
+        let rest = crate::land::own::offer_in(vec![(copy.clone(), 0, PAGE, 0u64)], data, 0, &index, &fresh);
         assert!(rest.is_empty());
         assert_eq!(kept_count(), 2);
         assert_eq!(crate::land::own::held() - before, 2 * PAGE as u64);
@@ -1268,7 +1274,7 @@ mod tests {
         assert_eq!(buffer, [0x88; 4], "the second flight's bytes");
         // The title's thread was seen to read the copy: its pieces are handed back.
         copy.note_title_read();
-        let rest = crate::land::own::offer(vec![(copy.clone(), 3 * PAGE, 4 * PAGE, (3 * PAGE) as u64)], data, 0);
+        let rest = crate::land::own::offer_in(vec![(copy.clone(), 3 * PAGE, 4 * PAGE, (3 * PAGE) as u64)], data, 0, &index, &fresh);
         assert_eq!(rest.len(), 1);
         finish_kept();
         release(at);

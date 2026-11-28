@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
+pub mod together;
+#[cfg(test)]
+pub(crate) mod sim;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -49,6 +52,7 @@ pub(crate) enum V {
 }
 
 /// A global variable declaration (thread-group shared memory).
+#[derive(Clone)]
 struct Global {
     name: String,
     ty: Ty,
@@ -194,6 +198,7 @@ pub(crate) enum Attr {
     NoDuplicate = 4,
 }
 
+#[derive(Clone)]
 struct Func {
     name: String,
     ty: Ty,
@@ -205,13 +210,14 @@ struct Func {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Md(u32);
 
+#[derive(Clone)]
 enum MdDef {
     Str(String),
     Value(Ty, V),
     Node(Vec<Option<Md>>),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
     type_ids: HashMap<TypeDef, u32>,
@@ -226,6 +232,9 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Values the two host waves of a console wave agree on by an exchange
+    /// ([`Module::mark_together`]).
+    together: std::collections::HashSet<u32>,
 }
 
 impl Module {

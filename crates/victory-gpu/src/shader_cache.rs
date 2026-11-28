@@ -101,6 +101,9 @@ fn build() -> [u8; 32] {
             "VICTORY_VIEW_INDEX",
             "VICTORY_FOLD_VIEWS",
             "VICTORY_KEPT_SKIPS_WIDE",
+            "VICTORY_HANG_GUARD",
+            "VICTORY_HANG_BUDGET",
+            "VICTORY_HANG_LOOP",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -520,6 +523,7 @@ mod tests {
             "VICTORY_D3D12_DEBUG",
             "VICTORY_DESC_WHY",
             "VICTORY_DXIL",
+            "VICTORY_HANG_AUDIT",
             "VICTORY_MASK_WHY",
             "VICTORY_PC_DXC",
             "VICTORY_REF_PS",

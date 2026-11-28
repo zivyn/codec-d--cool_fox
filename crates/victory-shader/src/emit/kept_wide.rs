@@ -7,6 +7,7 @@
 //! `VICTORY_KEPT_SKIPS_WIDE=0` leaves the form out, `=all` takes it whatever the classes say.
 
 use super::form::{self, Mode};
+use super::hang;
 use super::wide_class;
 use super::*;
 
@@ -47,21 +48,34 @@ pub(super) fn attempt(
             continue;
         }
         let base = program.as_ref().unwrap_or(p);
+        hang::audit_from_now_on();
         let r = widen_seeded(c, native, base, why, false, &kept);
+        hang::stop_auditing();
         if !done(&r) {
             continue;
         }
         let classes = wide_class::last();
-        let safe = mode == Mode::All || wide_class::safe(&classes);
+        // (the classes are an argument about the branches; the audit looks at the control flow
+        // that was emitted: no group barrier may stand where some thread of the group can
+        // fail to come, `Mode::Classes` leaves the audit out)
+        let audit = hang::last_audit();
+        let audited = match mode {
+            Mode::Safe => audit.as_ref().is_none_or(|a| a.safe(true)),
+            Mode::Strict => audit.as_ref().is_none_or(|a| a.safe(false)),
+            _ => true,
+        };
+        let safe = mode == Mode::All || wide_class::safe(&classes) && audited;
         if why {
             eprintln!(
-                "WAVE64-WIDE-CLASS ~{} threads={} {} {}",
+                "WAVE64-WIDE-CLASS ~{} #{:07x} threads={} {} audit({}) {}",
                 code_digits(c),
+                super::lower::program_tag() & 0x0FFF_FFFF,
                 match native.io {
                     crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
                     _ => 0,
                 },
                 wide_class::describe(&classes),
+                audit.as_ref().map_or("no barriers".to_string(), |a| a.describe()),
                 if safe { "taken" } else { "refused" }
             );
         }

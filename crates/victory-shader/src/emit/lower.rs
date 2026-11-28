@@ -31,6 +31,8 @@ pub(super) mod view_index;
 pub(super) mod exit_clear;
 #[path = "wave_idiom.rs"]
 mod wave_idiom;
+#[path = "hang_guard.rs"]
+mod hang_guard;
 pub(super) use wave_idiom::wave_local;
 
 type Why = &'static str;
@@ -518,6 +520,13 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// `VICTORY_HANG_GUARD`: its settings and the shared memory it uses ([`hang_guard`]).
+    guard: Option<hang_guard::GuardState>,
+    /// With the guard: this host wave's number among the group's, made in the entry block.
+    guard_wave: Option<V>,
+    /// With the guard: the barriers made so far, and the IR blocks that hold one.
+    guard_sites: u32,
+    guard_waits: BTreeSet<usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1117,6 +1126,11 @@ pub const PEEK_PLACE: u32 = 4000;
 thread_local! {
     /// The code offsets to peek at in the program this thread translates ([`PEEK_NOTE`]).
     static PEEK: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The tag of the container this thread translates ([`set_program_tag`]).
+pub(super) fn program_tag() -> u32 {
+    PROGRAM_TAG.get()
 }
 
 /// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
@@ -1881,6 +1895,21 @@ impl<'a> Lower<'a> {
         } else {
             HashSet::new()
         };
+        // (the guard's counters, behind everything else the program has in shared memory)
+        let guard = match (x.native.stage, s.threads) {
+            (HwStage::Cs, Some(t)) if s.lds_dwords > 0 || insts().any(|i| i.name() == "s_barrier") => {
+                let group = t.iter().product::<u32>();
+                hang_guard::dwords(group)
+                    .filter(|n| s.lds_dwords + n <= host_lds_bytes() / 4)
+                    .zip(super::hang::guard())
+                    .map(|(n, cfg)| {
+                        let g = hang_guard::GuardState { cfg, base: s.lds_dwords, waves: group.div_ceil(32) };
+                        s.lds_dwords += n;
+                        g
+                    })
+            }
+            _ => None,
+        };
         Lower {
             s,
             x,
@@ -2024,6 +2053,10 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            guard,
+            guard_wave: None,
+            guard_sites: 0,
+            guard_waits: BTreeSet::new(),
         }
     }
 
@@ -4776,9 +4809,7 @@ impl<'a> Lower<'a> {
         if meeting_mode() & 1 != 0 {
             super::wide_class::note_barrier(self.cur_ir);
         }
-        let mode = self.s.m.i32(meeting_mode());
-        let void = self.s.t.void;
-        self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.barrier_op(block, meeting_mode());
     }
 
     /// The two host waves of a console wave meet at the end of block `at`: a group barrier
@@ -4851,7 +4882,8 @@ impl<'a> Lower<'a> {
         // A half whose other half is gone (it left where this one did not) does not hang the
         // card: the wait gives up after a while, with what is there, and says so.
         let next = self.s.m.bin(wait, Bin::Add, spins, k1);
-        let limit = self.s.m.i32(PAIR_SPINS);
+        // (with the guard the wait is as short as the guard's, which the card survives)
+        let limit = self.s.m.i32(super::hang::guard().map_or(PAIR_SPINS, |g| g.spins.min(PAIR_SPINS)));
         let early = self.s.m.cmp(wait, pred::IULT, next, limit);
         let again = self.s.m.bin(wait, Bin::And, behind, early);
         self.s.m.set_phi(spins, vec![(z, head), (next, wait)]);
@@ -4866,6 +4898,8 @@ impl<'a> Lower<'a> {
             let (mask, align, void) = (self.s.m.i8(1), self.s.m.i32(4), self.s.t.void);
             self.s.op(note, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, place, iu, value, iu, iu, iu, mask, align]);
         }
+        self.guard_pair_note(note);
+        self.guard_waits.insert(self.cur_ir);
         self.s.m.terminate(note, Term::Br(at));
         self.lds_fence(at);
     }
@@ -4922,6 +4956,12 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
+        // (what the two halves of a group that is one console wave read after the meeting is the
+        // same in every thread of it: the audit of the group barriers relies on that)
+        if self.s.threads.is_some_and(|t| t.iter().product::<u32>() <= 64) {
+            self.s.m.mark_together(lo);
+            self.s.m.mark_together(hi);
+        }
         if !self.lean {
             // the slots are written again only after every thread read them
             self.meet(at);
@@ -6191,10 +6231,7 @@ impl<'a> Lower<'a> {
                 if mode & 1 != 0 {
                     super::wide_class::note_barrier(self.cur_ir);
                 }
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.barrier_op(self.cur, mode);
                 Ok(())
             }
             Fields::Sopp { .. } if self.gs_ops.contains_key(&(b, i)) => self.gs_op(b, i),
@@ -6253,9 +6290,7 @@ impl<'a> Lower<'a> {
         if meeting_mode() & 1 != 0 {
             super::wide_class::note_barrier(self.cur_ir);
         }
-        let mode = self.s.m.i32(meeting_mode());
-        let void = self.s.t.void;
-        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        self.barrier_op(self.cur, meeting_mode());
     }
 
     /// Whether `v` is a register no program reads as a number: a descriptor dword without
@@ -13684,7 +13719,7 @@ impl<'a> Lower<'a> {
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
         // (`VICTORY_LOOP_LIMITS` raises the loops that are really that long, by program and loop)
-        let limit = self.loop_limit_of(to);
+        let limit = self.guard_loop_limit(to, self.loop_limit_of(to));
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
@@ -13693,6 +13728,7 @@ impl<'a> Lower<'a> {
             .push((next, c));
         let over = self.s.m.cmp(c, p, next, limit);
         self.s.m.tag(over, Tag::Counter);
+        self.guard_loop_note(to, next, limit);
         over
     }
 

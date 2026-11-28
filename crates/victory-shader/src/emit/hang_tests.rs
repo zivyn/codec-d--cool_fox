@@ -1,0 +1,355 @@
+//! The group barriers of the kept skips' wave-wide form, checked without a card: the audit of the
+//! emitted control flow ([`super::bitcode::together`]) and a model of the two host waves of a
+//! console wave running that control flow ([`super::bitcode::sim`]), which must pass the same
+//! barriers the same number of times, whatever the lanes hold and however the waves are
+//! interleaved.
+//!
+//! The programs are a lane branch around a region in which the two host waves meet (an LDS read of
+//! what the lane 16 above wrote), the region being straight code, a loop, a loop in a loop, or a
+//! loop whose lanes need different numbers of rounds, and the branch a skip or an early-out. The
+//! lanes below s0 take the branch (or, `reverse`, the lanes from s0 on): s0 of 0 or 64 puts no
+//! lane in, 32 leaves one half with none, 16 and 48 leave both with some.
+
+use super::bitcode::sim;
+use super::bitcode::{Attr, Bin, Module, Term, pred};
+use super::form::Mode;
+use super::hang;
+use super::shader::Shader;
+use super::{Form, HostShader, lower};
+use crate::dxbc::Container;
+use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+use crate::{ShaderError, io, ir, resource, structure};
+
+const S_ENDPGM: u32 = 0xBF81_0000;
+
+/// The program around `body` (a console wave64 compute program of `threads` threads).
+fn native_of(body: &[u32], threads: u32) -> NativeProgram {
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+        125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+    ];
+    words.extend_from_slice(body);
+    words.push(S_ENDPGM);
+    NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 16,
+        layout: vec![
+            RootParam { root: RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+            RootParam { root: RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [threads, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    }
+}
+
+/// What the branch goes around.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Over {
+    /// A skip: the region, then the join (the restore of EXEC and a store) and the end.
+    Skip,
+    /// An early-out: the region, then the end of the program.
+    EarlyOut,
+}
+
+/// The region.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Body {
+    Straight,
+    Looped,
+    /// A loop of two rounds in each round of a loop of two.
+    Nested,
+    /// A loop whose lanes need `lane / 16` more rounds (lanes drop out of EXEC, one branch for
+    /// the wave takes the next round).
+    Counted,
+}
+
+/// `v4 = v0 + 1; lds[t] = v4; out[t] = lds[(t + 16) & 63]`.
+fn exchange_words() -> Vec<u32> {
+    vec![
+        0x4A08_0081, // v_add_nc_u32 v4, 1, v0
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0x4A0C_0090, // v_add_nc_u32 v6, 16, v0
+        0x360C_0CBF, // v_and_b32 v6, 63, v6
+        0x340C_0C82, // v_lshlrev_b32 v6, 2, v6
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xD8D8_0000, // ds_read_b32 v7, v6
+        0x0700_0006,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xE070_1000, // buffer_store_dword v7, v3, s[8:11], 0 offen
+        0x8002_0703,
+    ]
+}
+
+fn region(body: Body) -> Vec<u32> {
+    let mut w = Vec::new();
+    match body {
+        Body::Straight => w.extend(exchange_words()),
+        Body::Looped => {
+            w.push(0xBE95_0380); // s_mov_b32 s21, 0
+            w.extend(exchange_words());
+            w.extend_from_slice(&[
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0xBF0A_8215, // s_cmp_lt_u32 s21, 2
+                0xBF85_FFF1, // s_cbranch_scc1 L
+            ]);
+        }
+        Body::Nested => {
+            w.push(0xBE96_0380); // s_mov_b32 s22, 0
+            let inner = region(Body::Looped);
+            let len = inner.len() + 3;
+            w.extend(inner);
+            w.extend_from_slice(&[
+                0x8016_8116, // s_add_u32 s22, s22, 1
+                0xBF0A_8216, // s_cmp_lt_u32 s22, 2
+                0xBF85_0000 | (-(len as i32) as u16 as u32), // s_cbranch_scc1 OL
+            ]);
+        }
+        Body::Counted => {
+            w.push(0xBE95_0380); // s_mov_b32 s21, 0
+            w.extend(exchange_words());
+            let len = w.len() as i32 - 1 + 4;
+            w.extend_from_slice(&[
+                0x8015_8115, // s_add_u32 s21, s21, 1
+                0x7D82_1015, // v_cmp_lt_u32 vcc, s21, v8
+                0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+                0xBF89_0000 | (-len as u16 as u32), // s_cbranch_execnz L
+            ]);
+        }
+    }
+    w
+}
+
+/// The program, in a group of `threads`.
+fn lane_branch(over: Over, body: Body, threads: u32, reverse: bool) -> NativeProgram {
+    let region = region(body);
+    let mut words = vec![
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x7E08_02C1, // v_mov_b32 v4, -1
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x2C10_0084, // v_lshrrev_b32 v8, 4, v0
+        0xD834_0000, // ds_write_b32 v3, v4
+        0x0000_0403,
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        if reverse { 0x7D86_0000 } else { 0x7D88_0000 }, // v_cmp_le_u32 / v_cmp_gt_u32 vcc, s0, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0000 | region.len() as u32, // s_cbranch_execz past the region
+    ];
+    words.extend(region);
+    if over == Over::Skip {
+        words.extend_from_slice(&[
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7E10_0214, // v_mov_b32 v8, s20
+            0xE070_1100, // buffer_store_dword v8, v3, s[8:11], 0 offen offset:256
+            0x8002_0803,
+        ]);
+    }
+    let mut native = native_of(&words, threads);
+    if let StageIo::Cs(cs) = &mut native.io {
+        cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
+    }
+    native
+}
+
+/// The program lowered as the title's are for a host of 32-lane waves, and the module that came
+/// out.
+fn lowered(native: &NativeProgram, mode: Mode, guard: Option<hang::Guard>) -> (Result<HostShader, ShaderError>, Form, Option<Module>) {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = Container::parse(&bytes).expect("container");
+    lower::set_program_tag(b"a hang test");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    ir::TEST_KEEP_LOOP_SKIPS.set(Some(true));
+    super::form::TEST_KEPT_SKIPS_WIDE.set(Some(mode));
+    hang::TEST_GUARD.set(Some(guard));
+    hang::TEST_MODULE.take();
+    let (result, form) = super::emit_as(&c, native, &p, &st, &io, &res);
+    hang::TEST_GUARD.set(None);
+    super::form::TEST_KEPT_SKIPS_WIDE.set(None);
+    ir::TEST_KEEP_LOOP_SKIPS.set(None);
+    lower::TEST_HOST_WAVE.set(was);
+    (result, form, hang::TEST_MODULE.take())
+}
+
+fn shapes() -> Vec<(Over, Body, bool)> {
+    let mut v = Vec::new();
+    for over in [Over::Skip, Over::EarlyOut] {
+        for body in [Body::Straight, Body::Looped, Body::Nested, Body::Counted] {
+            for reverse in [false, true] {
+                v.push((over, body, reverse));
+            }
+        }
+    }
+    v
+}
+
+const THRESHOLDS: [u32; 9] = [0, 1, 16, 31, 32, 33, 48, 63, 64];
+
+/// The shapes that were lowered into the kept skips' wave-wide form (the others are not the form
+/// the audit and the model are for; their forms are listed in the message of a failure).
+fn kept_wide_shapes() -> Vec<((Over, Body, bool), Module)> {
+    let mut found = Vec::new();
+    for shape in shapes() {
+        let native = lane_branch(shape.0, shape.1, 64, shape.2);
+        let (result, form, module) = lowered(&native, Mode::Classes, None);
+        if result.is_ok() && form == Form::KeptSkipsWide {
+            found.push((shape, module.expect("a module")));
+        }
+    }
+    found
+}
+
+#[test]
+fn some_shapes_take_the_kept_skips_wave_wide_form() {
+    let found = kept_wide_shapes();
+    let names: Vec<_> = found.iter().map(|f| f.0).collect();
+    assert!(
+        names.len() >= 4,
+        "the shapes in the kept skips' form: {names:?} (forms: {:?})",
+        shapes()
+            .into_iter()
+            .map(|s| lowered(&lane_branch(s.0, s.1, 64, s.2), Mode::Classes, None).1)
+            .collect::<Vec<_>>()
+    );
+}
+
+/// The audit of the emitted control flow finds no group barrier that a thread can fail to reach.
+#[test]
+fn the_group_barriers_of_the_kept_skips_form_are_reached_by_every_thread() {
+    for (shape, module) in kept_wide_shapes() {
+        let audit = module.audit_barriers();
+        assert!(audit.barriers > 0, "{shape:?}: no group barrier at all");
+        assert!(audit.safe(false), "{shape:?}: {}", audit.describe());
+    }
+}
+
+/// Both host waves pass every barrier the same number of times, whatever the lanes hold and
+/// however the waves are interleaved: exact counts for every thread, and nothing waits for a
+/// thread that is not there.
+#[test]
+fn the_two_halves_pass_the_same_barriers_in_the_kept_skips_form() {
+    let shapes = kept_wide_shapes();
+    for (shape, module) in &shapes {
+        for s0 in THRESHOLDS {
+            for seed in 1..=3 {
+                let report = sim::run(module, 64, &[s0, 0, 0, 0], seed).unwrap_or_else(|e| panic!("{shape:?} s0={s0}: {e}"));
+                assert!(report.problems.is_empty(), "{shape:?} s0={s0} seed={seed}: {:?}", report.problems);
+                assert!(report.alike(), "{shape:?} s0={s0} seed={seed}: the threads passed different barriers");
+                assert!(!report.barriers[0].is_empty(), "{shape:?}: no barrier passed");
+            }
+        }
+    }
+}
+
+/// Every form a shape ends in is checked, not only the kept skips': a barrier a thread cannot reach
+/// is a hang in whichever form it stands.
+#[test]
+fn no_form_of_the_shapes_has_a_barrier_that_threads_reach_differently() {
+    for shape in shapes() {
+        let native = lane_branch(shape.0, shape.1, 64, shape.2);
+        for mode in [Mode::Classes, Mode::Off] {
+            let (result, form, module) = lowered(&native, mode, None);
+            let (Ok(_), Some(module)) = (result, module) else { continue };
+            for s0 in [0, 16, 32, 48, 64] {
+                let report = sim::run(&module, 64, &[s0, 0, 0, 0], 7).unwrap_or_else(|e| panic!("{shape:?} {form:?} s0={s0}: {e}"));
+                assert!(report.problems.is_empty(), "{shape:?} {form:?} {mode:?} s0={s0}: {:?}", report.problems);
+                assert!(report.alike(), "{shape:?} {form:?} {mode:?} s0={s0}: different barriers");
+            }
+        }
+    }
+}
+
+/// A module by hand: a branch on the thread's own parity, a barrier on one side (and on the
+/// other, if `both`), and one after the join.
+fn parity_module(both: bool, together: bool) -> Module {
+    let mut s = Shader::new(false);
+    s.threads = Some([64, 1, 1]);
+    let (e, i32t, void) = (s.entry, s.t.i32, s.t.void);
+    let flat = s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+    let (one, zero) = (s.m.i32(1), s.m.i32(0));
+    let bit = s.m.bin(e, Bin::And, flat, one);
+    let c = s.m.cmp(e, pred::NE, bit, zero);
+    if together {
+        s.m.mark_together(c);
+    }
+    let (a, b, join) = (s.m.new_block(), s.m.new_block(), s.m.new_block());
+    s.m.terminate(e, Term::CondBr(c, a, b));
+    let mode = s.m.i32(9);
+    s.op(a, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    s.m.terminate(a, Term::Br(join));
+    if both {
+        s.op(b, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+    s.m.terminate(b, Term::Br(join));
+    s.op(join, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    s.m.terminate(join, Term::Ret);
+    s.m
+}
+
+/// The tools see what they are for: a barrier behind a branch on the thread's own parity is
+/// found by the audit and is a hang in the model; the same branch said to be the group's
+/// (an exchanged decision) is not.
+#[test]
+fn the_audit_and_the_model_see_a_barrier_behind_a_branch_on_the_threads_own_value() {
+    for both in [false, true] {
+        let module = parity_module(both, false);
+        let audit = module.audit_barriers();
+        assert!(!audit.differs.is_empty(), "both={both}: {}", audit.describe());
+        assert!(!audit.safe(true));
+        let report = sim::run(&module, 64, &[], 3).expect("run");
+        assert!(!report.problems.is_empty(), "both={both}: the model saw nothing wrong");
+    }
+    let module = parity_module(false, true);
+    assert!(module.audit_barriers().differs.is_empty(), "a decision the group exchanged was flagged");
+}
+
+/// With the guard on, a barrier is counters and a wait: the shapes still pass the same barriers
+/// (those of the entry) and make the same stores, and a half that goes away leaves the other
+/// ending with a note instead of waiting for ever.
+#[test]
+fn the_guard_keeps_the_stores_and_ends_a_wait_for_threads_that_are_gone() {
+    let guard = hang::Guard { spins: 64, budget: 1 << 16, loops: 1 << 10 };
+    let mut tried = 0;
+    for shape in shapes() {
+        let native = lane_branch(shape.0, shape.1, 64, shape.2);
+        let (plain, form, module) = lowered(&native, Mode::Classes, None);
+        let (guarded, gform, gmodule) = lowered(&native, Mode::Classes, Some(guard));
+        let (Ok(_), Some(module), Ok(_), Some(gmodule)) = (plain, module, guarded, gmodule) else { continue };
+        if form != Form::KeptSkipsWide || gform != Form::KeptSkipsWide {
+            continue;
+        }
+        tried += 1;
+        for s0 in [0, 16, 32, 64] {
+            let a = sim::run(&module, 64, &[s0, 0, 0, 0], 5).expect("run");
+            let b = sim::run(&gmodule, 64, &[s0, 0, 0, 0], 5).unwrap_or_else(|e| panic!("{shape:?} guarded: {e}"));
+            assert!(b.problems.is_empty(), "{shape:?} guarded s0={s0}: {:?}", b.problems);
+            assert_eq!(a.stores, b.stores, "{shape:?} s0={s0}: the guard changed what is stored");
+        }
+        // the upper half is gone after a while: the lower half's wait runs out
+        let b = sim::run_with(&gmodule, 64, &[64, 0, 0, 0], 5, Some((400, 32..64))).expect("run");
+        let notes: Vec<u64> = b.stores.values().copied().filter(|&v| v >= u64::from(hang::HANG_NOTE)).collect();
+        assert!(
+            notes.iter().any(|&n| hang::say(n as u32).0 == hang::kind::WAIT || hang::say(n as u32).0 == hang::kind::BUDGET),
+            "{shape:?}: no note of the guard (stores {:?}, problems {:?})",
+            b.stores,
+            b.problems
+        );
+        assert!(!b.problems.iter().any(|p| p.contains("hang")), "{shape:?}: the group hung: {:?}", b.problems);
+    }
+    assert!(tried >= 2, "only {tried} shapes were lowered in the kept skips' form with and without the guard");
+}

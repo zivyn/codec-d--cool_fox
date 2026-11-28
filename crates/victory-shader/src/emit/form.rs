@@ -47,8 +47,14 @@ pub(super) enum Mode {
     /// `=0`: none.
     Off,
     /// The default: where no branch of the form can hang the thread group (class A or B,
-    /// [`super::wide_class`]).
+    /// [`super::wide_class`]) and the audit of the emitted control flow finds no group barrier
+    /// that a branch on a value that differs between threads can keep a thread from.
     Safe,
+    /// `=strict`: as `Safe`, and no group barrier behind a branch on a value read from memory
+    /// either (the halves may read it at different times).
+    Strict,
+    /// `=classes`: the classes alone (what `Safe` was before the audit).
+    Classes,
     /// `=all`: whatever the classes say (to see the form the title lost the card in).
     All,
 }
@@ -65,6 +71,8 @@ pub(super) fn kept_skips_mode() -> Mode {
     match std::env::var("VICTORY_KEPT_SKIPS_WIDE").ok().as_deref().map(str::trim) {
         Some("0") => Mode::Off,
         Some("all") => Mode::All,
+        Some("strict") => Mode::Strict,
+        Some("classes") => Mode::Classes,
         _ => Mode::Safe,
     }
 }

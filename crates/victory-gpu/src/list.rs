@@ -1826,6 +1826,7 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 };
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
+    crate::pipeline::ahead(pipeline);
     crate::pipeline::bound(pipeline);
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));

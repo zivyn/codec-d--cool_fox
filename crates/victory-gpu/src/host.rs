@@ -1008,6 +1008,26 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
+        // `VICTORY_DRIVER_CACHE=off`: the driver's and the runtime's own shader caches are off for this
+        // device, so that a cold start measured here pays every compile and leaves the caches other
+        // programs share as they were (`ID3D12Device9::ShaderCacheControl`, which Windows allows in
+        // developer mode only; without it the call fails and the run goes on with the caches on, said
+        // in the log: `bin\cold-arm.ps1` then moves the cache folders aside instead).
+        if std::env::var("VICTORY_DRIVER_CACHE").is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+            let set = match device.cast::<ID3D12Device9>() {
+                Ok(device9) => device9
+                    .ShaderCacheControl(
+                        D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED,
+                        D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE,
+                    )
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("no ID3D12Device9: {e}")),
+            };
+            match set {
+                Ok(()) => tracing::info!("the driver's shader caches are off for this process (VICTORY_DRIVER_CACHE=off)"),
+                Err(why) => tracing::warn!(why, "VICTORY_DRIVER_CACHE=off did not take (ShaderCacheControl needs Windows developer mode): the caches stay on"),
+            }
+        }
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();

@@ -320,6 +320,35 @@ static BUSY: AtomicU64 = AtomicU64::new(0);
 fn note_made(took: Duration) {
     let old = AVERAGE_US.load(Ordering::Relaxed);
     AVERAGE_US.store(averaged(old, took.as_micros() as u64), Ordering::Relaxed);
+    let us = took.as_micros() as u64;
+    BATCH_WORK_US.fetch_add(us, Ordering::Relaxed);
+    BATCH_MADE.fetch_add(1, Ordering::Relaxed);
+    BATCH_LONGEST_US.fetch_max(us, Ordering::Relaxed);
+}
+
+/// What a batch of pipelines (from the queue's first one to its running dry) has
+/// cost, for the line that says how parallel it was: when it began (ms since
+/// [`epoch`] plus one), the time the workers spent in it, how many they made, the longest.
+static BATCH_AT_MS: AtomicU64 = AtomicU64::new(0);
+static BATCH_WORK_US: AtomicU64 = AtomicU64::new(0);
+static BATCH_MADE: AtomicU64 = AtomicU64::new(0);
+static BATCH_LONGEST_US: AtomicU64 = AtomicU64::new(0);
+
+/// A pipeline new to the queue: counted, and a batch begins if it is the first.
+fn queued_new() {
+    let before = WAITING.fetch_add(1, Ordering::Relaxed);
+    if before == 0 {
+        BATCH_WORK_US.store(0, Ordering::Relaxed);
+        BATCH_MADE.store(0, Ordering::Relaxed);
+        BATCH_LONGEST_US.store(0, Ordering::Relaxed);
+        BATCH_AT_MS.store(now_ms(), Ordering::Relaxed);
+    }
+    PEAK.fetch_max(before + 1, Ordering::Relaxed);
+}
+
+/// How parallel a batch was: the workers' time in it over the time it took.
+fn parallelism(work_us: u64, wall_ms: u64) -> f64 {
+    work_us as f64 / 1000.0 / wall_ms.max(1) as f64
 }
 
 fn averaged(old: u64, us: u64) -> u64 {
@@ -422,6 +451,51 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// Whether a pipeline is asked for when the title binds it, not when the
+/// thread that translates its list reaches the draw (`VICTORY_PIPELINE_AHEAD=1`;
+/// off until a cold start has been measured with it).
+///
+/// A cold cache cannot start anything early (nothing says what the title will
+/// draw with), and the title's first world frame binds hundreds of compute
+/// programs of 60 KB and more, 4 s of driver compile each. The threads that
+/// translate a list wait for each dispatch's pipeline (`wait_for_compute`)
+/// before they read the next call, so the next program was only asked for when
+/// the one before it was made: of the 8 workers one worked, 175 programs in 13
+/// minutes (run I18-cold: 16 of its 21 minutes were that single frame). The title
+/// writes the whole list down before any of it is translated, so what it binds is
+/// known long before the dispatch is reached: [`ahead`] queues it at the bind.
+fn ahead_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PIPELINE_AHEAD"))
+}
+
+/// Pipelines [`ahead`] queued.
+static AHEADS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a bind asks for `p`: the switch is on, and it is not queued yet, left out, or empty.
+fn asks_ahead(on: bool, p: &Pending) -> bool {
+    on && p.queue_state.load(Ordering::Relaxed) < REQUESTED && p.left_out.is_none() && !p.shaders.is_empty()
+}
+
+/// Asks for `p` without waiting for it, from the title's own thread at the
+/// bind (`VICTORY_PIPELINE_AHEAD`): it goes into the lane of the requested ones,
+/// behind what draws have asked for already and ahead of the early ones. Nothing
+/// happens when it is queued or made, when it is left out, or when there are no
+/// workers: the title's thread never makes one itself here.
+pub(crate) fn ahead(p: &Arc<Pending>) {
+    if !asks_ahead(ahead_on(), p) || !workers() {
+        return;
+    }
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(new) = queue.push(p, REQUESTED) {
+        if new {
+            queued_new();
+        }
+        AHEADS.fetch_add(1, Ordering::Relaxed);
+        AVAILABLE.notify_all();
+    }
+}
+
 /// Whether the frame's budget is one for all threads together: a thread
 /// that waits takes what is left of it and gives back what it did not
 /// use. Counted only when a wait had ended, the budget was one per thread:
@@ -441,6 +515,7 @@ fn shared_budget() -> bool {
 fn wait_for_compute(p: &Pending, limit: Duration) {
     let started = Instant::now();
     let _hold = victory_game::watchdog::hold("waiting for a compute pipeline");
+    let _waiting = Waiting::begin();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() {
@@ -633,6 +708,73 @@ fn wait(p: &Pending, frame: u64) {
     );
 }
 
+/// Threads that wait for a compute pipeline now: while one does, a title thread
+/// is stopped on it and the machine is the pipelines' ([`extra_workers`]).
+static COMPUTE_WAITERS: AtomicU64 = AtomicU64::new(0);
+
+/// A wait for a compute pipeline, as long as it lasts, counted in `counter`.
+struct Waiting(&'static AtomicU64);
+
+impl Waiting {
+    fn begin() -> Waiting {
+        let first = COMPUTE_WAITERS.fetch_add(1, Ordering::Relaxed) == 0;
+        if first {
+            // The workers that sleep until somebody waits are woken. (Under the
+            // queue's lock: one about to sleep has looked at the count already.)
+            drop(QUEUE.lock().unwrap_or_else(|e| e.into_inner()));
+            AVAILABLE.notify_all();
+        }
+        Waiting(&COMPUTE_WAITERS)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// What a worker is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    /// Takes whatever is next.
+    General,
+    /// One of the passes over the screen's two.
+    Screen,
+    /// One more than the general ones: it works only while a thread waits for a
+    /// compute pipeline ([`extra_may_take`]).
+    Extra,
+}
+
+/// Whether the title's threads leave the logical processors to the pipelines
+/// while one waits for its compute pipeline (`VICTORY_PIPELINE_WIDE=1`; off
+/// until measured): the general workers are two thirds of the processors so that
+/// the title's frames keep theirs (a worker on the sibling of a busy thread slows
+/// it even at the lowest priority), but a title that is stopped on a compile has
+/// no frame to keep them for, and the last third was idle for the whole of a cold
+/// start's first world frame.
+fn wide_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PIPELINE_WIDE"))
+}
+
+/// How many workers beyond the `general` ones the switch adds: as many as
+/// the processors have (at most 16, the most a default makes) beyond them,
+/// none with the number of workers asked for by name or in a machine short of
+/// memory (each compile holds hundreds of MB).
+fn extra_workers(wide: bool, asked: Option<usize>, processors: usize, general: usize, limited_ram: bool) -> usize {
+    if !wide || asked.is_some() || limited_ram {
+        return 0;
+    }
+    processors.min(16).saturating_sub(general)
+}
+
+/// Whether an extra worker takes the next pipeline: only while a thread waits
+/// for a compute pipeline.
+fn extra_may_take(waiters: u64) -> bool {
+    waiters > 0
+}
+
 const NOT_QUEUED: u8 = 0;
 const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
@@ -785,7 +927,7 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
-            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            queued_new();
         }
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
@@ -812,10 +954,12 @@ fn touch(p: &Arc<Pending>, frame: u64) {
 /// Workers that make passes over the screen alone, besides the others.
 const SCREEN_WORKERS: usize = 2;
 
-fn next(screens_only: bool) -> Arc<Pending> {
+fn next(role: Role) -> Arc<Pending> {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop(screens_only, slow_limit()) {
+        if (role != Role::Extra || extra_may_take(COMPUTE_WAITERS.load(Ordering::Relaxed)))
+            && let Some(p) = queue.pop(role == Role::Screen, slow_limit())
+        {
             return p;
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
@@ -842,18 +986,23 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let workers = worker_count_for(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
-            crate::residency::limited_host_ram(),
-        );
-        tracing::info!(workers, "pipeline workers");
+        let asked = std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse().ok());
+        let processors = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let limited_ram = crate::residency::limited_host_ram();
+        let workers = worker_count_for(asked, processors, limited_ram);
+        let extra = extra_workers(wide_on(), asked, processors, workers, limited_ram);
+        tracing::info!(workers, extra, "pipeline workers");
         WORKERS.store(workers as u64, Ordering::Relaxed);
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
-        for i in 0..workers + screens {
-            let screens_only = i >= workers;
+        for i in 0..workers + extra + screens {
+            let role = if i < workers {
+                Role::General
+            } else if i < workers + extra {
+                Role::Extra
+            } else {
+                Role::Screen
+            };
+            let screens_only = role == Role::Screen;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
@@ -864,7 +1013,7 @@ fn workers() -> bool {
                     let mut level = Level::Base;
                     set_priority(lowest, level);
                     loop {
-                        let p = next(screens_only);
+                        let p = next(role);
                         if !screens_only {
                             BUSY.fetch_add(1, Ordering::Relaxed);
                         }
@@ -955,12 +1104,25 @@ static PEAK: AtomicU64 = AtomicU64::new(0);
 /// the cache saved (at most every 20 s).
 fn drained() {
     use super::library::{EARLY, LOADED, MADE};
-    if PEAK.swap(0, Ordering::Relaxed) >= 10 {
+    let peak = PEAK.swap(0, Ordering::Relaxed);
+    if peak >= 10 {
+        let wall_ms = now_ms().saturating_sub(BATCH_AT_MS.load(Ordering::Relaxed));
+        let work_us = BATCH_WORK_US.load(Ordering::Relaxed);
         tracing::info!(
             made = MADE.load(Ordering::Relaxed),
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
+            asked_at_the_bind = AHEADS.load(Ordering::Relaxed),
             "host pipelines all made"
+        );
+        tracing::info!(
+            pipelines = BATCH_MADE.load(Ordering::Relaxed),
+            peak_queued = peak,
+            wall_ms,
+            work_ms = work_us / 1000,
+            longest_ms = BATCH_LONGEST_US.load(Ordering::Relaxed) / 1000,
+            workers_busy_on_average = (parallelism(work_us, wall_ms) * 10.0).round() / 10.0,
+            "the batch of host pipelines: how parallel it was"
         );
     }
     super::library::save(false);
@@ -1286,6 +1448,80 @@ mod tests {
         assert!(p.made.get().is_none());
         assert!(started.elapsed() >= Duration::from_millis(150));
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A pipeline asked for at the bind is queued as requested, once, without being made
+    /// by the caller, and goes behind what draws have asked for this frame.
+    #[test]
+    fn a_bind_asks_for_the_pipeline_once_and_behind_the_frames_requests() {
+        let new = || Arc::new(Pending::new(Vec::new(), None));
+        let (bound, asked) = (new(), new());
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&bound, REQUESTED), Some(true));
+        assert_eq!(queue.push(&asked, REQUESTED), Some(true));
+        // Nothing more happens for a second bind, or one of a pipeline a draw asked for.
+        assert_eq!(queue.push(&bound, REQUESTED), None);
+        queue.touch(&asked, 5);
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &asked));
+        assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &bound));
+        assert!(queue.pop(false, 1).is_none());
+        // One a bind has queued is not queued again when a draw asks for it later
+        // (it only moves up, `touch`), and is not made twice.
+        assert_eq!(queue.push(&bound, REQUESTED), None);
+    }
+
+    /// The bind asks for nothing when the switch is off (the default), for a pipeline left out, or one
+    /// with nothing to make; and never makes one on the title's thread.
+    #[test]
+    fn a_bind_asks_only_for_what_the_workers_can_make() {
+        let cs = of_stage("compute", b"cs asked at the bind");
+        assert!(asks_ahead(true, &cs));
+        assert!(!asks_ahead(false, &cs));
+        // Nothing is made on the title's thread, whatever the switch says: with it off the bind does nothing.
+        if !ahead_on() {
+            ahead(&cs);
+            assert_eq!(cs.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+            assert!(cs.made.get().is_none());
+        }
+        let mut out = Pending::new(vec![super::super::shader("compute", b"cs left out at the bind")], None);
+        out.left_out = Some("test");
+        assert!(!asks_ahead(true, &out));
+        assert!(!asks_ahead(true, &Pending::new(Vec::new(), None)));
+        cs.queue_state.store(REQUESTED, Ordering::Relaxed);
+        assert!(!asks_ahead(true, &cs));
+    }
+
+    /// The workers beyond the general ones are as many as there are processors, up to 16, only
+    /// with the switch, and none when the number of workers was named or memory is short.
+    #[test]
+    fn the_extra_workers_fill_the_processors_when_asked() {
+        assert_eq!(extra_workers(true, None, 12, 8, false), 4);
+        assert_eq!(extra_workers(true, None, 24, 16, false), 0);
+        assert_eq!(extra_workers(true, None, 32, 16, false), 0);
+        assert_eq!(extra_workers(true, None, 2, 2, false), 0);
+        assert_eq!(extra_workers(false, None, 12, 8, false), 0);
+        assert_eq!(extra_workers(true, Some(8), 12, 8, false), 0);
+        assert_eq!(extra_workers(true, None, 12, 8, true), 0);
+        // They are woken by a thread that waits for a compute pipeline and sleep without one.
+        assert!(!extra_may_take(0));
+        assert!(extra_may_take(1));
+        // (Other tests wait for compute pipelines meanwhile: only the guard's own count is exact.)
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        COUNT.fetch_add(1, Ordering::Relaxed);
+        let guard = Waiting(&COUNT);
+        assert_eq!(COUNT.load(Ordering::Relaxed), 1);
+        drop(guard);
+        assert_eq!(COUNT.load(Ordering::Relaxed), 0);
+        let held = Waiting::begin();
+        assert!(COMPUTE_WAITERS.load(Ordering::Relaxed) >= 1);
+        drop(held);
+    }
+
+    #[test]
+    fn the_parallelism_of_a_batch_is_the_work_over_the_wall() {
+        assert_eq!(parallelism(8_000_000, 1000), 8.0);
+        assert_eq!(parallelism(4_000_000, 0), 4000.0);
+        assert!(parallelism(0, 100) == 0.0);
     }
 
     #[cfg(feature = "diagnostics")]

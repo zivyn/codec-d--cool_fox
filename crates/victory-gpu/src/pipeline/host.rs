@@ -1173,6 +1173,59 @@ mod tests {
         );
     }
 
+    /// The cache of a build, copied for the next: its library, read by the next build's host, hands
+    /// back the pipelines whose DXIL did not change and has nothing for the one that did (a new
+    /// DXIL has another name, and a name's description must match too).
+    #[test]
+    fn a_library_copied_to_the_next_build_loads_all_but_the_program_that_changed() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        use windows::core::{HSTRING, Interface, PCWSTR};
+        let dir = tempfile::tempdir().unwrap();
+        let cs = |threads: u32| format!("[numthreads({threads}, 1, 1)] void main() {{}}");
+        // Build 1: programs of 1 to 4 threads; build 2: the third of them is a program of 9.
+        let build1: Vec<Vec<u8>> = [1, 2, 3, 4].map(|t| compile(&dxc, dir.path(), &cs(t), "cs_6_0")).into();
+        let build2: Vec<Vec<u8>> = [1, 2, 9, 4].map(|t| compile(&dxc, dir.path(), &cs(t), "cs_6_0")).into();
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let name_of = |bytes: &[u8]| super::super::library::name("compute", &root_blob, &[bytes], "");
+        let desc = |bytes: &[u8]| D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            // SAFETY: a borrowed pointer the description never releases.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            CS: code(bytes),
+            ..Default::default()
+        };
+        let device1 = host.device.cast::<ID3D12Device1>().expect("a device with libraries");
+        // SAFETY: the descriptions point at live bytes; the blob outlives the library made from it.
+        unsafe {
+            // Build 1 makes its pipelines and saves its library (what the cache's file holds).
+            let first = device1.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[]).expect("an empty library");
+            for bytes in &build1 {
+                let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc(bytes)).expect("made");
+                let wide = HSTRING::from(name_of(bytes));
+                first.StorePipeline(PCWSTR(wide.as_ptr()), &pso).expect("stored");
+            }
+            let mut saved = vec![0u8; first.GetSerializedSize()];
+            first.Serialize(&mut saved).expect("serialised");
+            // Build 2's host reads that file.
+            let second = device1.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&saved).expect("the copied library loads");
+            let loads = |bytes: &[u8]| {
+                let wide = HSTRING::from(name_of(bytes));
+                let loaded: windows::core::Result<ID3D12PipelineState> =
+                    second.LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc(bytes));
+                loaded.is_ok()
+            };
+            let found: Vec<bool> = build2.iter().map(|bytes| loads(bytes)).collect();
+            assert_eq!(found, [true, true, false, true]);
+            // (and the old third program still loads in the copy: nothing was lost)
+            assert!(loads(&build1[2]));
+        }
+    }
+
     fn targets(formats: &[DXGI_FORMAT]) -> D3D12_RT_FORMAT_ARRAY {
         let mut t = D3D12_RT_FORMAT_ARRAY {
             NumRenderTargets: formats.len() as u32,

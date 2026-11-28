@@ -1,5 +1,5 @@
 //! A feedback delay network standing in for the DSP's convolution reverb
-//! (`VICTORY_DSP_REVERB`): eight delay lines mixed by a Hadamard matrix,
+//! (`VICTORY_DSP_REVERB=1`, changed live by `VICTORY_AB`): eight delay lines mixed by a Hadamard matrix,
 //! each loop damped like air, two allpass diffusers in front. The title's
 //! impulse response is in the hardware's own layout and is not read, so the
 //! tail's length comes from `VICTORY_DSP_REVERB_RT60` (seconds, 2.0) and its
@@ -55,7 +55,9 @@ pub struct Reverb {
     damped: [f32; LINES],
     gain: [f32; LINES],
     diffusers: [Allpass; 2],
-    level: f32,
+    /// The return's level; the stream sets it at each block, since it may
+    /// change with the phase of an A/B.
+    pub level: f32,
     /// Where the last block's gains ended.
     last_gain: Option<f32>,
 }
@@ -76,7 +78,7 @@ impl Reverb {
     }
 
     /// Forgets everything the network holds.
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.lines.iter_mut().for_each(|l| l.fill(0.0));
         self.damped = [0.0; LINES];
         for d in &mut self.diffusers {
@@ -84,26 +86,12 @@ impl Reverb {
         }
     }
 
-    /// From the environment: `None` when `VICTORY_DSP_REVERB` is not set
-    /// (or is 0); the second is whether blocks are interleaved
-    /// (`VICTORY_DSP_REVERB=interleaved`) rather than one channel after the
-    /// other.
-    pub fn from_env() -> Option<(Self, bool)> {
-        let switch = std::env::var("VICTORY_DSP_REVERB").ok()?;
-        if switch.is_empty() || switch == "0" {
-            return None;
-        }
-        let number = |name: &str, default: f32| {
-            std::env::var(name)
-                .ok()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(default)
-        };
-        let reverb = Reverb::new(
-            number("VICTORY_DSP_REVERB_RT60", 2.0),
-            number("VICTORY_DSP_REVERB_LEVEL", 1.0),
-        );
-        Some((reverb, switch == "interleaved"))
+    /// The reverb time asked for with `VICTORY_DSP_REVERB_RT60` (seconds).
+    pub fn rt60_from_env() -> f32 {
+        std::env::var("VICTORY_DSP_REVERB_RT60")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2.0)
     }
 
     /// One sample in; the two outputs (decorrelated: the output signs

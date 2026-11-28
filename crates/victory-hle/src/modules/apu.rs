@@ -17,6 +17,7 @@ use opus_pure::OpusDecoder;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent};
 
+use super::audio::stats::COUNTERS;
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleModule, hle_export};
@@ -341,6 +342,15 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     with_pcm(MAX_FRAMES * channels, |pcm| {
         decode_packet(decoder, packet, options, command, result, pcm)
     });
+    // The pitch (the console's rate conversion) is not applied: counted, and
+    // the first few are logged, to see whether a title uses it.
+    let (ramp, target) = (command.pitch_ramp, command.target_pitch);
+    let pitched = ramp != 0.0 || target != 1.0;
+    COUNTERS.opus_packet(result.error != S_OK, pitched);
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if pitched && LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(ramp, target, "audio decoder: a pitch that is not applied");
+    }
 }
 
 thread_local! {

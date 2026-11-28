@@ -47,6 +47,9 @@ pub struct Counters {
     reverb_max_us: AtomicU64,
     reverb_gain_ramps: AtomicU64,
     reverb_gain_steps: AtomicU64,
+    opus_packets: AtomicU64,
+    opus_errors: AtomicU64,
+    opus_pitched: AtomicU64,
 }
 
 /// The counters of one window, plain.
@@ -78,6 +81,9 @@ pub struct Window {
     pub reverb_max_us: u64,
     pub reverb_gain_ramps: u64,
     pub reverb_gain_steps: u64,
+    pub opus_packets: u64,
+    pub opus_errors: u64,
+    pub opus_pitched: u64,
 }
 
 pub static COUNTERS: Counters = Counters::new();
@@ -113,7 +119,10 @@ impl Counters {
             reverb_us,
             reverb_max_us,
             reverb_gain_ramps,
-            reverb_gain_steps
+            reverb_gain_steps,
+            opus_packets,
+            opus_errors,
+            opus_pitched
         )
     }
 
@@ -140,6 +149,15 @@ impl Counters {
     pub fn reverb_gains(&self, ramp: bool, step: bool) {
         self.reverb_gain_ramps.fetch_add(u64::from(ramp), Relaxed);
         self.reverb_gain_steps.fetch_add(u64::from(step), Relaxed);
+    }
+
+    /// An Opus packet decoded for the title (`xapu`): whether it failed, and
+    /// whether the title asked for a pitch other than 1, which we do not
+    /// apply.
+    pub fn opus_packet(&self, failed: bool, pitched: bool) {
+        self.opus_packets.fetch_add(1, Relaxed);
+        self.opus_errors.fetch_add(u64::from(failed), Relaxed);
+        self.opus_pitched.fetch_add(u64::from(pitched), Relaxed);
     }
 
     /// A coprocessor command no unit of ours carries out.
@@ -226,6 +244,9 @@ impl Counters {
             reverb_max_us: t(&self.reverb_max_us),
             reverb_gain_ramps: t(&self.reverb_gain_ramps),
             reverb_gain_steps: t(&self.reverb_gain_steps),
+            opus_packets: t(&self.opus_packets),
+            opus_errors: t(&self.opus_errors),
+            opus_pitched: t(&self.opus_pitched),
         }
     }
 }
@@ -244,14 +265,21 @@ fn period() -> Option<Duration> {
 pub fn tick(since: &mut Instant, voices: usize) {
     let Some(period) = period() else { return };
     let elapsed = since.elapsed();
-    if elapsed < period {
+    // A window ends where an arm of `VICTORY_AB` changes, so that each one
+    // counts one arm: it is logged with the arm it counted.
+    static ARM: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let arm = ARM.load(Relaxed);
+    let now = super::live::arm();
+    if elapsed < period && now == arm {
         return;
     }
+    ARM.store(now, Relaxed);
     *since = Instant::now();
     let w = COUNTERS.take();
     let ms = |us: u64| us as f32 / 1000.0;
     tracing::info!(
         window_s = elapsed.as_secs_f32(),
+        arm,
         voices,
         enabled = w.enabled,
         disabled = w.disabled,
@@ -281,6 +309,9 @@ pub fn tick(since: &mut Instant, voices: usize) {
         reverb_max_block_ms = w.reverb_max_us as f32 / 1000.0,
         reverb_gain_ramps = w.reverb_gain_ramps,
         reverb_gain_steps = w.reverb_gain_steps,
+        opus_packets = w.opus_packets,
+        opus_errors = w.opus_errors,
+        opus_pitched = w.opus_pitched,
         "audio stats"
     );
 }

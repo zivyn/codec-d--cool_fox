@@ -99,7 +99,7 @@ mod tiles;
 pub mod signature;
 mod switch;
 #[cfg(windows)]
-mod ab;
+pub mod ab;
 #[cfg(windows)]
 mod echo;
 #[cfg(windows)]

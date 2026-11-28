@@ -28,6 +28,7 @@ use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
+pub mod live;
 pub mod stats;
 use stats::COUNTERS;
 

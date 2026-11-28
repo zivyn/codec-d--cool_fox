@@ -24,6 +24,8 @@
 use std::ffi::c_void;
 use std::sync::Mutex;
 
+use super::audio::live::{live_flag, live_value};
+
 mod reverb;
 
 use super::xasync::E_INVALIDARG;
@@ -67,10 +69,15 @@ pub struct Stream {
     dsp: *mut Dsp,
     frames: u32,
     channels: u32,
+    convolution: bool,
     status: Box<Status>,
-    /// The stand-in reverb of a convolution stream, and whether its blocks
-    /// are interleaved.
-    reverb: Option<(reverb::Reverb, bool)>,
+    /// The stand-in reverb of a convolution stream (made at its first block
+    /// with the switch on), whether its blocks are interleaved
+    /// (`VICTORY_DSP_REVERB_LAYOUT=interleaved`), and whether it runs whatever
+    /// the switch says (tests).
+    reverb: Option<reverb::Reverb>,
+    interleaved: bool,
+    always: bool,
 }
 
 /// One block of work.
@@ -178,17 +185,16 @@ pub extern "system" fn XDspActivate(
         dsp,
         frames: desc.frames,
         channels: desc.channels,
+        convolution: kind == CONVOLUTION,
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
             reserved: 0,
             result: S_OK,
         }),
-        reverb: if kind == CONVOLUTION {
-            reverb::Reverb::from_env()
-        } else {
-            None
-        },
+        reverb: None,
+        interleaved: std::env::var("VICTORY_DSP_REVERB_LAYOUT").is_ok_and(|v| v == "interleaved"),
+        always: false,
     });
     // SAFETY: checked non-null.
     unsafe {
@@ -272,7 +278,17 @@ pub extern "system" fn XDspSubmitCommand(
         // The block is computed here, on the title's own thread: it checks
         // the status one block later and takes a late command for an
         // overrun, and the network costs a few microseconds a block.
-        if let Some((reverb, interleaved)) = &mut stream.reverb {
+        // With the switch on (and for a convolution stream; `VICTORY_AB` may
+        // flip it between blocks) the block is the reverb's; off, silence,
+        // and the reverb is emptied so that a tail does not come back later.
+        let on = stream.convolution && (stream.always || live_flag!("VICTORY_DSP_REVERB"));
+        if on {
+            let reverb = stream
+                .reverb
+                .get_or_insert_with(|| reverb::Reverb::new(reverb::Reverb::rt60_from_env(), 1.0));
+            reverb.level = live_value!("VICTORY_DSP_REVERB_LEVEL", f32, |t| t
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(1.0));
             // SAFETY: the title's buffers hold one block of the stream each.
             unsafe {
                 reverb.block(
@@ -280,11 +296,14 @@ pub extern "system" fn XDspSubmitCommand(
                     command.output,
                     frames,
                     channels,
-                    *interleaved,
+                    stream.interleaved,
                     gains,
                 );
             }
         } else {
+            if let Some(reverb) = &mut stream.reverb {
+                reverb.reset();
+            }
             // SAFETY: the title's output buffer holds one block of the stream.
             unsafe { std::ptr::write_bytes(command.output, 0, frames * channels) };
         }
@@ -419,7 +438,7 @@ mod tests {
         let (mut status, mut stream) = (std::ptr::null(), std::ptr::null_mut());
         assert_eq!(XDspActivate(dsp, &desc, &mut status, &mut stream), S_OK);
         // SAFETY: just made; the test is its only user.
-        unsafe { (*stream).reverb = Some((reverb::Reverb::new(1.0, 1.0), false)) };
+        unsafe { (*stream).always = true };
         let mut input = vec![0f32; 0x400];
         input[0] = 1.0;
         let mut energies = Vec::new();

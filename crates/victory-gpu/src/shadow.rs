@@ -3829,7 +3829,12 @@ mod narrow_tests {
             let still = crate::watch::covered(at, at + N * PAGE);
             crate::watch::ask_once_end();
             if covered && still {
-                assert!(inside, "nothing was written in the range taken whole");
+                assert!(
+                    inside,
+                    "nothing was written in the range taken whole (the ledger holds {} pages, {:?} in the range)",
+                    c.copy.ledger().len(),
+                    c.copy.ledger().dirty_in(at / PAGE, at / PAGE + N / 2)
+                );
                 assert!(!outside, "the second half was never taken");
                 judged = true;
                 break;
@@ -5208,7 +5213,7 @@ impl Shadow {
     }
 
     /// Whether `[from, to)` (inside the copy) needs no look at all, from the copy's ledger alone: the memory is watched,
-    /// the copy holds no page noted written since it took it, a range that holds `[from, to)` was taken whole, no flight's
+    /// the copy holds no page of the range noted written after a range that holds it was taken whole, no flight's
     /// declared range touches it, and the asking that stands covers it (one atomic and three short locks, none of the
     /// copy's `copied`, and no walk of anything: `VICTORY_PAGE_REFRESH` stage 3).
     fn page_gate(&self, from: usize, to: usize) -> bool {
@@ -5216,7 +5221,8 @@ impl Shadow {
             return false;
         }
         crate::pagedrive::drain();
-        if self.ledger.len() != 0 || self.ranged(from, to) == 0 {
+        let ranged = self.ranged(from, to);
+        if ranged == 0 || self.ledger.any_after(from / PAGE, to.div_ceil(PAGE), ranged) {
             return false;
         }
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {

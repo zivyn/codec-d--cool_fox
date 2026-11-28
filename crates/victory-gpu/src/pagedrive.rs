@@ -172,6 +172,14 @@ impl Ledger {
             .any(|(&page, &w)| w > taken.get(page - first).copied().unwrap_or(0).max(ranged))
     }
 
+    /// Whether a page of `[first, last)` was noted by an asking after `bound`.
+    pub(crate) fn any_after(&self, first: usize, last: usize, bound: u64) -> bool {
+        if self.len() == 0 || first >= last {
+            return false;
+        }
+        self.dirty().range(first..last).any(|(_, &w)| w > bound)
+    }
+
     /// The pages the copy took just now: each page with the asking it took it under. A page noted by that asking or an
     /// earlier one is current and goes; one noted after it stays.
     pub(crate) fn settle(&self, taken: &[(usize, u64)]) {

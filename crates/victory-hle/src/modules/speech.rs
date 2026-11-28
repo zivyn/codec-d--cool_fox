@@ -48,7 +48,7 @@ const MAX_MS: usize = 30_000;
 /// Samples of silence for `words`: its characters, without SSML markup
 /// (`<...>`) and without leading, trailing or repeated white space.
 fn silence_samples(words: &str) -> usize {
-    let mut spoken = 0;
+    let mut spoken = 0usize;
     let (mut in_tag, mut space) = (false, true);
     for c in words.chars() {
         match c {

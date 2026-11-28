@@ -48,6 +48,9 @@ impl State {
             if footprint.by_address {
                 access.write_anywhere();
             }
+            if footprint.by_address_loads {
+                access.read_anywhere();
+            }
             let any = |t: &Footprint| {
                 t.stores
                     .iter()
@@ -90,11 +93,20 @@ impl State {
                     }
                 } else {
                     match view {
-                        crate::descriptor::View::Shader(resource, _) => access.read([(resource, 0, u64::MAX)]),
-                        // (A texture stored to by image instructions is not a buffer store: every unordered view of one counts.)
+                        // (A texture is counted whole, if the code names its descriptor among those it reads or writes
+                        // by image instructions, or if it names none it can be sure of.)
+                        crate::descriptor::View::Shader(resource, _) => {
+                            if images(footprint, |f| &f.image_reads, target) {
+                                access.read([(resource, 0, u64::MAX)]);
+                            }
+                        }
                         crate::descriptor::View::Unordered(resource, _, _) => {
-                            access.read([(resource, 0, u64::MAX)]);
-                            access.write([(resource, 0, u64::MAX)]);
+                            if images(footprint, |f| &f.image_reads, target) {
+                                access.read([(resource, 0, u64::MAX)]);
+                            }
+                            if images(footprint, |f| &f.image_writes, target) {
+                                access.write([(resource, 0, u64::MAX)]);
+                            }
                         }
                         crate::descriptor::View::Placed(..) => {
                             access.read_anywhere();
@@ -130,4 +142,18 @@ impl State {
             }
         }
     }
+}
+
+/// Whether the code reads (or writes) the texture of `target` by image instructions: yes where it was not gone through,
+/// where an image access could not be attributed, and where its list names the target (or one of its table, picked by
+/// a computed index).
+fn images(footprint: Option<(&Footprint, &Bind)>, list: fn(&Footprint) -> &Vec<Target>, target: Target) -> bool {
+    let Some((f, _)) = footprint else {
+        return true;
+    };
+    f.images_unknown
+        || list(f).iter().any(|t| {
+            *t == target
+                || matches!((t, target), (Target::TableAny { user_data: a }, Target::Table { user_data: b, .. }) if *a == b)
+        })
 }

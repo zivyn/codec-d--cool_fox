@@ -61,6 +61,14 @@ on:
         description: Runs of the whole victory-gpu lib test suite per runner, counting the tests that failed (0 skips it)
         type: string
         default: "0"
+      stress_suite_threads:
+        description: JSON list of the test thread counts of the suite stress
+        type: string
+        default: '[4]'
+      stress_suite_filters:
+        description: JSON list of test-name filters for the suite stress ("" is every test)
+        type: string
+        default: '[""]'
       stress_cases:
         description: JSON list of stress cases
         type: string
@@ -313,8 +321,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        threads: [4, 16]
+        threads: ${{ fromJSON(inputs.stress_suite_threads) }}
         runner: [a, b]
+        filter: ${{ fromJSON(inputs.stress_suite_filters) }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
@@ -332,15 +341,15 @@ jobs:
           for i in $(seq 1 ${{ inputs.stress_suite_n }}); do
             if [ $((SECONDS - started)) -gt 2400 ]; then echo "stopped by time after $((i - 1)) runs"; break; fi
             runs=$i
-            "$exe" --test-threads=${{ matrix.threads }} --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws > "$RUNNER_TEMP/suite.log" 2>&1 && continue
+            "$exe" ${{ matrix.filter }} --test-threads=${{ matrix.threads }} --skip pipeline::host::tests::depth_bounds_pipeline_loads_and_filters_draws > "$RUNNER_TEMP/suite.log" 2>&1 && continue
             fails=$((fails + 1))
             grep -h '^test .* FAILED' "$RUNNER_TEMP/suite.log" >> "$RUNNER_TEMP/failed.txt"
             grep -h 'is not after' "$RUNNER_TEMP/suite.log" | head -3 >> "$RUNNER_TEMP/failed.txt"
           done
           {
-            echo "## Suite threads=${{ matrix.threads }} ($GITHUB_REF_NAME $GITHUB_SHA)"
+            echo "## Suite filter='${{ matrix.filter }}' threads=${{ matrix.threads }} ($GITHUB_REF_NAME $GITHUB_SHA)"
             echo '```'
-            echo "SUITE-RESULT threads=${{ matrix.threads }} runs=${runs:-0} failed_runs=$fails"
+            echo "SUITE-RESULT filter='${{ matrix.filter }}' threads=${{ matrix.threads }} runs=${runs:-0} failed_runs=$fails"
             sort "$RUNNER_TEMP/failed.txt" | uniq -c
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"

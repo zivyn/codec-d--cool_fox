@@ -61,6 +61,10 @@ pub(super) trait Work: Send {
     fn shows(&self) -> bool;
     /// Whether it is a submission.
     fn runs(&self) -> bool;
+    /// What it is, for the counts of why stage A was not offered the first of the line ([`no_next`]).
+    fn kind(&self) -> &'static str {
+        "an entry"
+    }
     /// Whether it stands for other work, which takes its place in the line
     /// once it is free to go ([`Work::unfold`]).
     fn folded(&self) -> bool {
@@ -204,9 +208,26 @@ pub(super) fn stage_front() -> bool {
 /// Nothing more is taken into it after this ([`Lane::prefold`]).
 pub(super) fn prefold() -> Option<(u64, Vec<usize>, Vec<usize>)> {
     if !DOING.get() {
+        no_next("asked off the thread of the line");
         return None;
     }
     LANE.prefold()
+}
+
+/// Since the last frame-rate line: why [`prefold`] named no submission, by reason.
+static NO_NEXT: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+
+fn no_next(why: &'static str) {
+    let mut all = NO_NEXT.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|w| w.0 == why) {
+        Some(w) => w.1 += 1,
+        None => all.push((why, 1)),
+    }
+}
+
+/// The reasons [`prefold`] named no submission since the last call, and how many times each.
+pub(super) fn no_next_taken() -> Vec<(&'static str, u64)> {
+    std::mem::take(&mut *NO_NEXT.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// While our thread does an entry and [`prefold`] named the first of the line: the host lists of the entry after it of
@@ -457,14 +478,41 @@ impl<W: Work> Lane<W> {
     /// what it is is known: its number, the host lists it will run (as [`Work::peek`] says) and where its parts begin.
     /// It stays at its place.
     pub(super) fn prefold(&self) -> Option<(u64, Vec<usize>, Vec<usize>)> {
-        let (mut entry, limit) = {
+        let (mut entry, limit) = loop {
             let mut state = self.lock();
             let queue = state.running?;
-            let first = state.items.front()?;
-            if first.queue != queue || first.what.folded() || !first.what.runs() || first.what.peek().is_none() {
+            let Some(first) = state.items.front() else {
+                no_next("the line is empty");
+                return None;
+            };
+            if first.queue != queue {
+                no_next("the first of the line is of another queue");
                 return None;
             }
-            (state.items.pop_front()?, state.next)
+            if first.what.folded() {
+                // A submission whose lists were translated since it came in stands for its parts until someone unfolds it
+                // ([`Lane::gather`] does when an entry begins; the title's threads put in entries all the while this
+                // one is prepared): unfolded here, as it would be when its turn comes, or it would never be known.
+                let ask = first.what.ask();
+                drop(state);
+                if !ask.is_none_or(|ask| W::met(&ask)) {
+                    no_next("the first of the line is a submission whose lists are not translated yet");
+                    return None;
+                }
+                let mut state = self.lock();
+                let entry = state.items.pop_front()?;
+                Self::unfold(&mut state, 0, entry);
+                continue;
+            }
+            if !first.what.runs() {
+                no_next(first.what.kind());
+                return None;
+            }
+            if first.what.peek().is_none() {
+                no_next("the first of the line is a submission whose lists are not known");
+                return None;
+            }
+            break (state.items.pop_front()?, state.next);
         };
         // (The queue stays `running`: a thread that gives it something meanwhile puts it in the line.)
         if !entry.prepared {
@@ -687,6 +735,16 @@ impl Work for Job {
 
     fn runs(&self) -> bool {
         matches!(self, Job::Run(..) | Job::Joined(..) | Job::Lists(..))
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Job::Wait(..) => "the first of the line is a wait for a fence",
+            Job::Value(..) => "the first of the line is a wait for a memory value",
+            Job::Signal(..) => "the first of the line is a signal",
+            Job::Present(..) => "the first of the line is a present",
+            Job::Run(..) | Job::Joined(..) | Job::Lists(..) => "the first of the line is a submission",
+        }
     }
 
     fn round(&self) -> u64 {
@@ -1359,6 +1417,12 @@ mod tests {
         fn runs(&self) -> bool {
             matches!(self, T::Run(..) | T::Slow(..) | T::Group(..) | T::Round(..) | T::Peek(..))
         }
+        fn kind(&self) -> &'static str {
+            match self {
+                T::Wait(..) => "a test wait",
+                _ => "a test entry",
+            }
+        }
         fn peek(&self) -> Option<Vec<usize>> {
             match self {
                 T::Peek(name, _) => Some(vec![name.len(), name.as_bytes()[0] as usize]),
@@ -1561,6 +1625,20 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), ["a+b".to_string(), "c".to_string()]);
         let state = lane.lock();
         assert_eq!((state.runs, state.items.len()), (0, 0), "the counts come out even");
+    }
+
+    /// A first of the line that is not a submission names nothing, and the count says what it was.
+    #[test]
+    fn a_first_of_the_line_that_is_not_a_submission_is_counted_by_what_it_is() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        let f = fence();
+        lane.push(1, [T::Wait(f, 9), T::Peek("a", log.clone())]);
+        lane.lock().running = Some(1);
+        no_next_taken();
+        assert!(lane.prefold().is_none());
+        let counted = no_next_taken();
+        assert!(counted.iter().any(|(why, n)| *why == "a test wait" && *n >= 1), "{counted:?}");
     }
 
     /// While one entry is done and the first of the line is named, the entry after it of the same queue is named too if it

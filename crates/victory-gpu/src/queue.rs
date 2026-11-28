@@ -497,6 +497,12 @@ pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
     behind::prefold()
 }
 
+/// Why [`prefold_next`] named nothing since the last call, and how many times each reason came.
+#[cfg(windows)]
+pub(crate) fn no_next_taken() -> Vec<(&'static str, u64)> {
+    behind::no_next_taken()
+}
+
 /// While our thread does an entry and the first of the line has been named by [`prefold_next`]: the host lists
 /// (addresses, in order) of the entry after it of the same queue, if it is a submission whose lists are known
 /// (`VICTORY_STAGE_A_DEEP`). It stays in the line, at its place.

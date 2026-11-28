@@ -281,7 +281,7 @@ fn a_loop_that_ends_on_the_value_of_lane_63_is_through_in_its_first_round() {
 
 /// `LANE_63_EXIT` as the title's shaders are translated for a host of 32-lane waves, with the skip
 /// over its loop kept (the default) or left out (`VICTORY_KEEP_LOOP_SKIPS=0`).
-fn lane_63_exit_on_32_lanes(keep: bool, wide: bool) -> Result<HostShader, crate::ShaderError> {
+fn lane_63_exit_on_32_lanes(keep: bool, mode: super::form::Mode) -> Result<HostShader, crate::ShaderError> {
     let native = native_of(&LANE_63_EXIT, true, 128);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
@@ -292,7 +292,7 @@ fn lane_63_exit_on_32_lanes(keep: bool, wide: bool) -> Result<HostShader, crate:
     let c = Container::parse(&bytes).expect("container");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     ir::TEST_KEEP_LOOP_SKIPS.set(Some(keep));
-    super::form::TEST_KEPT_SKIPS_WIDE.set(Some(wide));
+    super::form::TEST_KEPT_SKIPS_WIDE.set(Some(mode));
     let shader = super::emit(&c, &native, &p, &st, &io, &res);
     super::form::TEST_KEPT_SKIPS_WIDE.set(None);
     ir::TEST_KEEP_LOOP_SKIPS.set(None);
@@ -300,18 +300,26 @@ fn lane_63_exit_on_32_lanes(keep: bool, wide: bool) -> Result<HostShader, crate:
     shader
 }
 
-/// The console wave that has no lane in a region does not run a loop in it: with the switch and
-/// `VICTORY_KEPT_SKIPS_WIDE=1` the early branch over the loop stays (the translation differs).
-/// By default the program keeps the form it had without the switch (the skip left out, which has no
-/// group barrier at a branch), and without the switch nothing changes.
+/// The console wave that has no lane in a region does not run a loop in it: with the switch the
+/// early branch over the loop stays, taken by the whole wave (the translation differs); with
+/// `VICTORY_KEPT_SKIPS_WIDE=0`, or without the switch, the program is as it was. This group is two
+/// console waves whose halves meet by counters of their own: no group barrier lies under the
+/// branch (class A), which is why it is taken.
 #[test]
 fn the_keep_loop_skips_switch_changes_the_translation_only_when_set() {
-    let (Ok(off), Ok(on)) = (lane_63_exit_on_32_lanes(false, false), lane_63_exit_on_32_lanes(true, false)) else {
+    use super::form::Mode;
+    let (Ok(off), Ok(none), Ok(on)) = (
+        lane_63_exit_on_32_lanes(false, Mode::Safe),
+        lane_63_exit_on_32_lanes(true, Mode::Off),
+        lane_63_exit_on_32_lanes(true, Mode::Safe),
+    ) else {
         eprintln!("not translated for waves of 32: the program of the test is refused");
         return;
     };
-    assert_eq!(off.dxil, lane_63_exit_on_32_lanes(false, false).expect("lowered").dxil);
-    assert_eq!(off.dxil, on.dxil, "by default the skip left out as before");
-    let wide = lane_63_exit_on_32_lanes(true, true).expect("lowered with the kept skip wave-wide");
-    assert_ne!(off.dxil, wide.dxil, "the skip over the loop is kept");
+    assert_eq!(off.dxil, lane_63_exit_on_32_lanes(false, Mode::Safe).expect("lowered").dxil);
+    assert_eq!(off.dxil, none.dxil, "the wide form is left out");
+    assert_ne!(off.dxil, on.dxil, "the skip over the loop is kept");
+    let classes = super::wide_class::last();
+    assert!(!classes.is_empty(), "the wave-wide form was taken");
+    assert!(classes.iter().all(|c| c.1 == super::wide_class::Class::A), "{classes:?}");
 }

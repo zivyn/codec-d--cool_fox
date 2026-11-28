@@ -8,8 +8,12 @@
 //! straight code, and the branch a skip (over the region to the join) or an early-out (to the end).
 //! The lanes below s0 take the branch.
 
+use std::collections::{BTreeSet, HashSet};
+
+use super::form::Mode;
 use super::host::{Dispatch, Host, Root, View};
 use super::wave64_tests::native_of;
+use super::wide_class::{self, Class};
 use super::{Form, HostShader, lower, validator};
 use crate::dxbc::Container;
 use crate::native::{NativeProgram, RootType, StageIo};
@@ -56,6 +60,11 @@ fn region(looped: bool) -> Vec<u32> {
 
 /// The program (64 threads, one console wave; 512 bytes of LDS).
 fn lane_branch(over: Over, looped: bool) -> NativeProgram {
+    lane_branch_of(over, looped, 64)
+}
+
+/// The same program in a group of `threads` threads.
+fn lane_branch_of(over: Over, looped: bool, threads: u32) -> NativeProgram {
     let region = region(looped);
     let mut words = vec![
         0xBE94_0380, // s_mov_b32 s20, 0
@@ -77,7 +86,7 @@ fn lane_branch(over: Over, looped: bool) -> NativeProgram {
             0x8002_0803,
         ]);
     }
-    let mut native = native_of(&words, true, 64);
+    let mut native = native_of(&words, true, threads);
     if let StageIo::Cs(cs) = &mut native.io {
         cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
     }
@@ -87,11 +96,11 @@ fn lane_branch(over: Over, looped: bool) -> NativeProgram {
 /// The program lowered as the title's are for a host of 32-lane waves, with the skips over loops
 /// kept (`VICTORY_KEEP_LOOP_SKIPS`, the default) or left out, and the form it ended in.
 fn lowered_as(native: &NativeProgram, keep: bool) -> (Result<HostShader, ShaderError>, Form) {
-    lowered_with(native, keep, false)
+    lowered_with(native, keep, Mode::Safe)
 }
 
-/// [`lowered_as`], with the kept skips taken wave-wide (`VICTORY_KEPT_SKIPS_WIDE`) or not.
-fn lowered_with(native: &NativeProgram, keep: bool, wide: bool) -> (Result<HostShader, ShaderError>, Form) {
+/// [`lowered_as`], with `VICTORY_KEPT_SKIPS_WIDE` as `mode` says.
+fn lowered_with(native: &NativeProgram, keep: bool, mode: Mode) -> (Result<HostShader, ShaderError>, Form) {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
@@ -101,7 +110,7 @@ fn lowered_with(native: &NativeProgram, keep: bool, wide: bool) -> (Result<HostS
     lower::set_program_tag(b"a form test");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     ir::TEST_KEEP_LOOP_SKIPS.set(Some(keep));
-    super::form::TEST_KEPT_SKIPS_WIDE.set(Some(wide));
+    super::form::TEST_KEPT_SKIPS_WIDE.set(Some(mode));
     let result = super::emit_as(&c, native, &p, &st, &io, &res);
     super::form::TEST_KEPT_SKIPS_WIDE.set(None);
     ir::TEST_KEEP_LOOP_SKIPS.set(None);
@@ -116,11 +125,11 @@ fn validated(shader: &HostShader) {
     }
 }
 
-/// The form of the program with the switch on (the kept skips taken wave-wide or not) and off,
+/// The form of the program with the switch on (`VICTORY_KEPT_SKIPS_WIDE` as `mode` says) and off,
 /// translated each way.
-fn forms(native: &NativeProgram, wide: bool) -> ((HostShader, Form), (HostShader, Form)) {
-    let (on, on_form) = lowered_with(native, true, wide);
-    let (off, off_form) = lowered_with(native, false, false);
+fn forms(native: &NativeProgram, mode: Mode) -> ((HostShader, Form), (HostShader, Form)) {
+    let (on, on_form) = lowered_with(native, true, mode);
+    let (off, off_form) = lowered_with(native, false, Mode::Off);
     let on = on.unwrap_or_else(|e| panic!("kept skips: {e} (form {on_form:?})"));
     let off = off.unwrap_or_else(|e| panic!("skips left out: {e} (form {off_form:?})"));
     validated(&on);
@@ -128,36 +137,97 @@ fn forms(native: &NativeProgram, wide: bool) -> ((HostShader, Form), (HostShader
     ((on, on_form), (off, off_form))
 }
 
-/// With the switch on (and not `VICTORY_KEPT_SKIPS_WIDE`) the form of the program is the exact one
-/// it had without it: the skip left out, every lane walks the loop, no group barrier at a branch.
-/// (Keeping the skip took the exact form from 32 programs of the title: an approximate form, each
-/// host wave a wave of its own, for 17, and the wave-wide branches for 15, which put group
-/// barriers where the card was lost.)
+/// A skip (or an early-out) over a loop is kept and taken by the whole wave, and the loop is code
+/// every lane runs: an exact form, with the skip in the translation, where no branch of it can
+/// hang the thread group. The group here is one console wave: both halves decide together.
 #[test]
-fn a_skip_over_a_loop_does_not_take_the_exact_form_from_the_program() {
+fn a_kept_skip_over_a_loop_is_taken_wave_wide_where_it_cannot_hang_the_group() {
     for over in [Over::Skip, Over::EarlyOut] {
         let native = lane_branch(over, true);
-        let ((on, on_form), (off, off_form)) = forms(&native, false);
+        let ((on, on_form), (off, off_form)) = forms(&native, Mode::Safe);
         let exact = if over == Over::Skip { Form::WithoutSkips } else { Form::WithoutEarlyOuts };
         assert_eq!(off_form, exact, "{over:?}: the skip left out");
-        assert_eq!(on_form, exact, "{over:?}: the switch on");
+        assert_eq!(on_form, Form::KeptSkipsWide, "{over:?}: the skip kept");
         assert!(on_form.exact());
-        assert_eq!(on.dxil, off.dxil, "{over:?}: the same program as without the switch");
+        assert_ne!(on.dxil, off.dxil, "{over:?}: the skip over the loop is in the translation");
+        let classes = wide_class::last();
+        assert!(!classes.is_empty() && wide_class::safe(&classes), "{over:?}: {classes:?}");
     }
 }
 
-/// With `VICTORY_KEPT_SKIPS_WIDE=1` the kept skip (and the early-out over a loop, which the switch
-/// kept as well) is taken by the whole wave, and the loop is code every lane runs: exact, with
-/// the skip in the translation.
+/// `VICTORY_KEPT_SKIPS_WIDE=0`, or the switch off: the form is the one the program has without
+/// the skips over loops kept: the skip left out, every lane walks the loop.
 #[test]
-fn a_kept_skip_over_a_loop_taken_wave_wide_is_an_exact_form() {
+fn without_the_wide_form_a_program_keeps_the_exact_form_it_had() {
     for over in [Over::Skip, Over::EarlyOut] {
         let native = lane_branch(over, true);
-        let ((on, on_form), (off, _)) = forms(&native, true);
-        assert_eq!(on_form, Form::KeptSkipsWide, "{over:?}");
-        assert!(on_form.exact());
-        assert_ne!(on.dxil, off.dxil, "{over:?}: the skip over the loop is in the translation");
+        let exact = if over == Over::Skip { Form::WithoutSkips } else { Form::WithoutEarlyOuts };
+        let ((on, on_form), (off, off_form)) = forms(&native, Mode::Off);
+        assert_eq!((on_form, off_form), (exact, exact), "{over:?}");
+        assert_eq!(on.dxil, off.dxil, "{over:?}");
+        let (switch_off, form) = lowered_with(&native, false, Mode::Safe);
+        assert_eq!(form, exact, "{over:?}: VICTORY_KEEP_LOOP_SKIPS=0");
+        assert_eq!(switch_off.expect("lowered").dxil, off.dxil, "{over:?}");
     }
+}
+
+fn branch_of(p: &ir::Program, name: &str) -> usize {
+    (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == name))
+        .expect("the branch")
+}
+
+/// The class of the only wide branch of `native`'s program (`name`), with a group barrier in the
+/// first block it guards (`barrier`) or none.
+fn class_of(native: &NativeProgram, name: &str, barrier: bool) -> Class {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let b = branch_of(&p, name);
+    let wide = HashSet::from([b]);
+    let st = structure::structure(&p).expect("structure");
+    let inside = match p.blocks[b].exit {
+        ir::Exit::Branch { taken, not_taken } => {
+            // (the block of the region: the way that is not the skip's target)
+            if name == "s_cbranch_scc1" || name == "s_cbranch_execz" { not_taken } else { taken }
+        }
+        _ => unreachable!(),
+    };
+    let barriers: BTreeSet<usize> = if barrier { BTreeSet::from([inside]) } else { BTreeSet::new() };
+    let classes = wide_class::classify(&p, &st, native, &wide, &barriers);
+    assert_eq!(classes.len(), 1);
+    assert_eq!(classes[0].0, b);
+    classes[0].1
+}
+
+/// Class A: no group barrier in the blocks the branch guards. Class B: one inside, and the group
+/// is one console wave (the halves decide together), or the condition is scalars every wave holds
+/// alike. Class C: one inside, in a group of several console waves that may decide differently.
+#[test]
+fn the_classes_of_a_wide_branch() {
+    let one = lane_branch_of(Over::Skip, true, 64);
+    let many = lane_branch_of(Over::Skip, true, 128);
+    assert_eq!(class_of(&one, "s_cbranch_execz", false), Class::A);
+    assert_eq!(class_of(&many, "s_cbranch_execz", false), Class::A);
+    assert_eq!(class_of(&one, "s_cbranch_execz", true), Class::B);
+    assert_eq!(class_of(&many, "s_cbranch_execz", true), Class::C);
+    // a branch on a scalar test of a root constant: every wave of the group takes it alike
+    let scalar = |first: &[u32], threads: u32| {
+        let mut words = first.to_vec();
+        words.extend_from_slice(&[
+            0xBF85_0002, // s_cbranch_scc1 past the region
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0A_0280, // v_mov_b32 v5, 0
+            0x7E0C_0280, // v_mov_b32 v6, 0
+        ]);
+        native_of(&words, true, threads)
+    };
+    let from_constant = scalar(&[0xBF06_8000], 128); // s_cmp_eq_u32 s0, 0
+    assert_eq!(class_of(&from_constant, "s_cbranch_scc1", false), Class::A);
+    assert_eq!(class_of(&from_constant, "s_cbranch_scc1", true), Class::B);
+    // ... and on a first lane: the waves may differ
+    let from_lane = scalar(&[0x7E28_0500, 0xBF06_8014], 128); // v_readfirstlane_b32 s20, v0; s_cmp_eq_u32 s20, 0
+    assert_eq!(class_of(&from_lane, "s_cbranch_scc1", true), Class::C);
+    assert!(wide_class::safe(&[(0, Class::A), (1, Class::B)]));
+    assert!(!wide_class::safe(&[(0, Class::A), (1, Class::C)]));
 }
 
 /// What has no loop in it is as it was: the switch changes nothing.
@@ -165,7 +235,7 @@ fn a_kept_skip_over_a_loop_taken_wave_wide_is_an_exact_form() {
 fn a_skip_or_an_early_out_without_a_loop_is_left_out_whatever_the_switch_says() {
     for (over, form) in [(Over::Skip, Form::WithoutSkips), (Over::EarlyOut, Form::WithoutEarlyOuts)] {
         let native = lane_branch(over, false);
-        let ((on, on_form), (off, off_form)) = forms(&native, false);
+        let ((on, on_form), (off, off_form)) = forms(&native, Mode::Safe);
         assert_eq!((on_form, off_form), (form, form), "{over:?}");
         assert_eq!(on.dxil, off.dxil, "{over:?}");
     }
@@ -176,7 +246,7 @@ fn a_skip_or_an_early_out_without_a_loop_is_left_out_whatever_the_switch_says() 
 #[test]
 fn a_skip_the_scalars_keep_is_the_last_resort_whatever_the_switch_says() {
     let native = super::wave64_tests::lds_read_after_write_in_a_lane_branch();
-    let ((on, on_form), (off, off_form)) = forms(&native, false);
+    let ((on, on_form), (off, off_form)) = forms(&native, Mode::Safe);
     assert_eq!((on_form, off_form), (Form::WaveWideLastResort, Form::WaveWideLastResort));
     assert_eq!(on.dxil, off.dxil);
 }
@@ -234,9 +304,9 @@ fn run(shader: &HostShader, host: &Host, below: u32) -> Option<Vec<u32>> {
 fn the_kept_skip_over_a_loop_gives_the_consoles_results_on_the_card() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     for over in [Over::Skip, Over::EarlyOut] {
-      for wide in [false, true] {
+      for mode in [Mode::Off, Mode::Safe] {
         let native = lane_branch(over, true);
-        let (on, form) = lowered_with(&native, true, wide);
+        let (on, form) = lowered_with(&native, true, mode);
         let Ok(on) = on else {
             eprintln!("not translated for waves of 32 ({over:?}): the program of the test is refused");
             return;

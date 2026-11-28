@@ -44,6 +44,12 @@ pub(super) fn on() -> bool {
     crate::queue::pipeline_prepare() && late() && relay_exact()
 }
 
+/// Whether the next submission's refreshes may begin (the test).
+#[cfg(test)]
+pub(super) fn may_offer(_own: bool, _nothing_sent: bool) -> bool {
+    true
+}
+
 /// Whether something was ever offered: from then on [`join`] looks at the gate whether the switch is on or not.
 static OFFERED_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -446,6 +452,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// Not offered while the card's list copies the CPU side of copies whose
+    /// bytes were not taken (`VICTORY_SEND_OWN=0`, or the taking failed).
+    #[test]
+    fn nothing_is_offered_while_the_card_is_to_read_the_cpu_side() {
+        assert!(super::may_offer(true, false), "taken into the send's own copies");
+        assert!(super::may_offer(true, true));
+        assert!(super::may_offer(false, true), "nothing goes up");
+        assert!(!super::may_offer(false, false), "the list reads the CPU side later");
+    }
 
     #[test]
     fn a_join_looks_at_the_gate_after_the_switch_went_off_once_anything_was_offered() {

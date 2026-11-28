@@ -3297,6 +3297,80 @@ mod narrow_tests {
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Two spans of one copy, each of 1 MiB or more never taken, in one
+    /// `wide_each` (what `VICTORY_REFRESH_NARROW` makes of a copy), with the
+    /// kept threads busy: the refresh of the first holds the copy's lock
+    /// across the nested `wide` of its parts, and that call used to take the
+    /// second span's job from the queue and wait for the lock on the same
+    /// thread. It ends, and the copy holds the title's bytes.
+    #[test]
+    fn two_spans_of_one_copy_in_one_wide_each_do_not_lock_each_other() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        assert!(crate::watch::light());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const SPAN: usize = 24 * PAGE;
+        const N: usize = 2 * SPAN;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        for page in 0..N / PAGE {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + 3) as *mut u8).write_volatile(1 + page as u8) };
+        }
+        let side = std::sync::Arc::new(std::sync::Mutex::new(vec![0u8; N]));
+        let data = side.lock().unwrap().as_mut_ptr() as usize;
+        let copy = Shadow::unbacked(at as u64, data as *mut u8, N as u64, false);
+        // The kept threads are held (one job each, and one for the thread
+        // that makes the call), so the jobs of the `wide_each` are still in
+        // the queue when the first span's parts are made.
+        let (started, release) = (std::sync::Arc::new(AtomicUsize::new(0)), std::sync::Arc::new(AtomicBool::new(false)));
+        let threads = super::wide_threads() + 1;
+        {
+            let (started, release) = (started.clone(), release.clone());
+            std::thread::spawn(move || {
+                let jobs = (0..threads)
+                    .map(|_| {
+                        let (started, release) = (started.clone(), release.clone());
+                        Box::new(move || {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            while !release.load(Ordering::SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                        }) as super::Job
+                    })
+                    .collect();
+                super::wide(jobs);
+            });
+        }
+        let began = std::time::Instant::now();
+        while started.load(Ordering::SeqCst) < threads && began.elapsed().as_secs() < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let held = started.load(Ordering::SeqCst) == threads;
+        let (done, wait) = std::sync::mpsc::channel();
+        {
+            let copy = copy.clone();
+            std::thread::spawn(move || {
+                super::wide_each(2, move |i| {
+                    copy.update(at + i * SPAN, SPAN);
+                });
+                let _ = done.send(());
+            });
+        }
+        let finished = held && wait.recv_timeout(std::time::Duration::from_secs(30)).is_ok();
+        release.store(true, Ordering::SeqCst);
+        assert!(held, "the kept threads did not all start");
+        assert!(finished, "the refresh of two spans of one copy did not end: its lock is taken twice by one thread");
+        let side = side.lock().unwrap();
+        for page in 0..N / PAGE {
+            assert_eq!(side[page * PAGE + 3], 1 + page as u8, "page {page}");
+        }
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// The check counts the stale bytes of whole pages of a range that the
     /// asking found written since the copy took them (what it cannot look at
     /// without the kernel it leaves out: other tests ask ahead too, so that is

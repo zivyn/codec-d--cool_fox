@@ -259,6 +259,16 @@ pub(crate) fn fault(at: usize) -> bool {
     true
 }
 
+/// (The test's: nothing is remembered.)
+#[cfg(test)]
+static FINISHED: Mutex<Vec<(usize, usize, std::time::Instant)>> = Mutex::new(Vec::new());
+#[cfg(test)]
+const GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+#[cfg(test)]
+pub(crate) fn finished_lately(_at: usize) -> bool {
+    false
+}
+
 /// Before our own read or the kernel's write of title memory `[at, at + len)`:
 /// what of it is owed is landed.
 pub(crate) fn land_range(at: usize, len: usize) {
@@ -559,6 +569,126 @@ mod tests {
         assert!(began.elapsed() < std::time::Duration::from_secs(10));
         finish_all();
         release(at);
+    }
+
+    /// A thread touches an owed page; the unit lands (another thread's
+    /// landing, in the test a handler placed before ours) after the guard
+    /// page violation was raised and before our handler looks at it. The
+    /// guard went with the touch and the landing is done: the handler takes
+    /// it and the access goes on, where it used to be passed on, unhandled,
+    /// and ended the process.
+    #[test]
+    fn a_unit_that_lands_between_the_touch_and_the_handler_is_handled() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
+            RemoveVectoredExceptionHandler,
+        };
+        static PAGE_OF: AtomicUsize = AtomicUsize::new(0);
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        /// Ahead of the handler of `crate::watch`: for the first violation on
+        /// the test's page, the unit lands before that one is looked at.
+        unsafe extern "system" fn lands_first(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: the system passes the exception being dispatched.
+            let r = unsafe { &*(*info).ExceptionRecord };
+            if r.ExceptionCode == 0x8000_0001u32 as i32
+                && r.NumberParameters >= 2
+                && r.ExceptionInformation[1] & !(PAGE - 1) == PAGE_OF.load(Ordering::SeqCst)
+                && !FIRED.swap(true, Ordering::SeqCst)
+            {
+                finish_all();
+            }
+            EXCEPTION_CONTINUE_SEARCH
+        }
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // (Memory of tests before, at the same addresses.)
+        FINISHED.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let at = memory(3);
+        let (from, to) = (at, at + 2 * PAGE);
+        register(vec![(
+            from,
+            to,
+            Box::new(move || {
+                // SAFETY: the pages, unguarded by `ensure` before this runs.
+                unsafe { std::ptr::write_bytes(from as *mut u8, 0x77, to - from) };
+            }),
+            quiet(),
+        )]);
+        PAGE_OF.store(at + PAGE, Ordering::SeqCst);
+        FIRED.store(false, Ordering::SeqCst);
+        // SAFETY: a handler that only lands the test's unit, removed below.
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(lands_first)) };
+        assert!(!handler.is_null());
+        let read = std::thread::spawn(move || {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + PAGE + 7) as *const u8).read_volatile() }
+        })
+        .join()
+        .unwrap();
+        // SAFETY: the one added above.
+        unsafe { RemoveVectoredExceptionHandler(handler) };
+        assert!(
+            FIRED.load(Ordering::SeqCst),
+            "the unit landed before the handler looked"
+        );
+        assert_eq!(read, 0x77, "the access went on over the landed bytes");
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        // A unit that is done is remembered for a while, and then it is not.
+        assert!(finished_lately(at + PAGE + 7));
+        assert!(
+            !finished_lately(at + 2 * PAGE),
+            "a page beside it was never owed"
+        );
+        std::thread::sleep(GRACE + std::time::Duration::from_millis(50));
+        finish_all();
+        assert!(!finished_lately(at + PAGE + 7));
+        release(at);
+    }
+
+    /// The title frees, unmaps or maps again memory that holds an owed unit:
+    /// the unit lands first, while it is the title's memory, not after, over
+    /// whatever is there next.
+    #[test]
+    fn memory_the_title_frees_or_unmaps_lands_what_is_owed_first() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let owed = |at: usize| {
+            let landed = Arc::new(AtomicBool::new(false));
+            let flag = landed.clone();
+            register(vec![(
+                at + PAGE,
+                at + 2 * PAGE,
+                Box::new(move || {
+                    // SAFETY: the unguarded page.
+                    unsafe { std::ptr::write_bytes((at + PAGE) as *mut u8, 0x66, PAGE) };
+                    flag.store(true, Ordering::SeqCst);
+                }),
+                quiet(),
+            )]);
+            assert!(!landed.load(Ordering::SeqCst));
+            landed
+        };
+        let at = memory(3);
+        let landed = owed(at);
+        crate::watch::title_memory_freed(at, 3 * PAGE);
+        assert!(landed.load(Ordering::SeqCst), "freed with its length");
+        release(at);
+        // No length: the whole allocation.
+        let at = memory(3);
+        let landed = owed(at);
+        crate::watch::title_memory_freed(at, 0);
+        assert!(landed.load(Ordering::SeqCst), "freed with no length");
+        release(at);
+        let at = memory(3);
+        let landed = owed(at);
+        crate::watch::title_memory_unmapping(at + PAGE, PAGE);
+        assert!(landed.load(Ordering::SeqCst), "unmapped");
+        release(at);
+        let at = memory(3);
+        let landed = owed(at);
+        crate::watch::title_memory_remapped(at, 2 * PAGE);
+        assert!(landed.load(Ordering::SeqCst), "mapped again");
+        release(at);
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        finish_all();
     }
 
     /// The verifier counts the dwords of a landed piece that differ from what

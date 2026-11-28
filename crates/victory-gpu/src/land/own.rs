@@ -244,6 +244,25 @@ pub(crate) fn line(frames: f64) {
         return;
     }
     let mb = |v: f64| v / (1 << 20) as f64;
+    // (What the tail's lazy landing prints with the same counters, when that is on.)
+    let o: Vec<f64> = if owed::on() {
+        vec![0.0; owed::STATS.len()]
+    } else {
+        owed::STATS
+            .iter()
+            .map(|o| o.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0))
+            .collect()
+    };
+    tracing::info!(
+        "kept pieces landed per frame: {:.1} units guarded ({:.1} MB), {:.2} touched by the title or another thread of the process ({:.2} ms landing them in the handler, {:.2} waits for another thread's landing), {:.2} landed by our own readers (a refresh of a copy over them, a copy of the title's; each counts against its copy's VICTORY_LAND_OWN_FORCED), {:.1} not armed",
+        o[owed::UNITS_N],
+        mb(o[owed::BYTES]),
+        o[owed::TOUCHES],
+        o[owed::TOUCH_US] / 1000.0,
+        o[owed::WAITS],
+        o[owed::FORCED],
+        o[owed::UNARMED],
+    );
     tracing::info!(
         "pieces left on the card per frame (VICTORY_LAND_OWN={}, VICTORY_LAND_OWN_UNTAKEN={}): {:.0} offered; kept new {:.1} (guards armed), replaced {:.1} (no guard, no merge), landed at once because they could not be kept {:.1}, landed at once because a copy over them had taken their bytes {:.1}; {:.1} MB copied out; by class of what was offered: ownable {:.1} MB, ownable under copies that never took it {:.1}, overlapped by a copy that took it {:.1}, seen read {:.1}, not private {:.1}, not default-heap {:.1}, forced often {:.1}, over the memory cap {:.1}; {} units and {:.1} MB held now (cap {} MB)",
         u8::from(on()),

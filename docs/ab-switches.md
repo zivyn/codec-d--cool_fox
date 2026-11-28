@@ -185,6 +185,16 @@ so `VICTORY_AB=10,VICTORY_STAGE_A_LOOKAHEAD` flips it; the isolating A/B holds t
 `VICTORY_POOL_COMPACT_MB`) and `VICTORY_BETWEEN_FIT` (read once, `OnceLock`; the pool and the card-steps buffers are sized when they are made).
 The `vram census` line (every 5 s, always on, no switch) names the card's bytes by who asked for them.
 
+## What integ/validation-28 adds to the A/B (2026-11-28)
+
+One new live entry in `ab/registry.rs` (`LIVE`, 91 entries): `VICTORY_RT_RESOLVE` (perf/rt-cost; on in the code, so name it `=0`: A is the
+resolves running, B the hit shading left out at the dispatch while no structures are built). Nothing else of the merged branches is live.
+**Not live, so compared in pairs of processes:** `VICTORY_RESOLVE_ASYNC`, `VICTORY_RESOLVE_WORKERS`, `VICTORY_PIPELINE_NOW_FIRST`,
+`VICTORY_PIPELINE_RAM_FREE_MB` (perf/cold2: the cold start, read when the pipelines are made), `VICTORY_LIBRARY_STATIC_SAMPLERS` (fix/white3-static-samplers: **the fix is on by
+default**: pipelines with static samplers are neither loaded from nor stored in the pipeline library; `=1` restores the old behaviour, read once when the
+library opens), and the translation switches `VICTORY_WAVE_WIDE_AUTO` (fix/hairw) and `VICTORY_BVH_MISS` (perf/rt-cost), both off and in the shader cache key by the text, so with
+them unset the emitted code is the one of integ/validation-27 (the corpus of integ/validation-28 says so). fix/water2 (`VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`) is not in this integration.
+
 ## Switches of the lane that are on by default
 
 Seven switches of the submitting thread's lane are **on** in the code since 2026-11-28 (integ/validation-19), by rule 14.

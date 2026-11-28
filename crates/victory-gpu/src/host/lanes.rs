@@ -764,8 +764,10 @@ mod model_tests {
         let ww = fp(&[], &[(10, 20)]);
         assert!(ww.conflicts(&fp(&[], &[(19, 30)])), "two writes");
         assert!(!ww.conflicts(&fp(&[], &[(20, 30)])));
-        let mut any = Footprint::default();
-        any.any = true;
+        let any = Footprint {
+            any: true,
+            ..Footprint::default()
+        };
         assert!(
             any.conflicts(&Footprint::default()),
             "a step that may write anywhere"
@@ -825,7 +827,7 @@ mod model_tests {
     #[test]
     fn overlap_agrees_with_a_brute_force_look() {
         let mut dice = Dice(0x2545_f491_4f6c_dd1d);
-        let mut made = |dice: &mut Dice| {
+        let made = |dice: &mut Dice| {
             let mut runs: Vec<Run> = Vec::new();
             for _ in 0..dice.next(6) {
                 let a = dice.next(100);

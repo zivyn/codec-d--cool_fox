@@ -310,12 +310,11 @@ pub(super) fn on() -> bool {
 }
 
 /// The submission the line's thread is sending now, among the title's lanes
-/// (stage 2): its lane, its number there and the submissions of the other lane
-/// it waits for, as the title's waits resolve.
+/// (stage 2): its lane and the submissions of the other lane it waits for, as
+/// the title's waits resolve.
 #[derive(Clone, Debug)]
 pub(crate) struct Current {
     pub(crate) lane: Lane,
-    pub(crate) number: u64,
     pub(crate) waits: Vec<Dep>,
 }
 
@@ -379,7 +378,6 @@ pub(super) fn begin(
         CURRENT.with(|c| {
             *c.borrow_mut() = Some(Current {
                 lane: plan.lane,
-                number: plan.number,
                 waits: plan.waits.clone(),
             });
         });
@@ -454,7 +452,6 @@ pub(super) fn line(frames: f64) {
     if !on() {
         return;
     }
-    crate::host::lanes::line(frames);
     let s = with(|m| std::mem::take(&mut m.stats));
     let f = |n: u64| n as f64 / frames;
     tracing::info!(

@@ -5613,8 +5613,7 @@ mod many_askers_tests {
             stop.store(true, Ordering::Relaxed);
             assert_eq!(failed, 0);
         });
-        // (A span of many blocks is seldom all clean at once.)
-        assert!(SPAN > 3 || by_bits.into_inner() > 0, "the bits answered none");
+        assert!(by_bits.into_inner() > 0, "the bits answered none");
         // All unmapped: known whole, and nothing but holes.
         writes(at, end, true).expect("a view");
         assert!(super::published(at, end));

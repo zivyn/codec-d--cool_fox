@@ -35,15 +35,21 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     // (A first preload on a PC no run has written pipelines down on yet: none known.)
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
-    // The driver keeps what is made here by program path: made by another copy of
-    // this program, a pipeline is not made for this one.
+    // The driver keeps what is made here by program path and card: made by
+    // another copy of this program, or on the other card of a PC with two, a
+    // pipeline is not made for this one (v2026.11.27.8 made them all on an RTX
+    // 5060 Ti while the runs played on the RTX 5070 beside it: black parts in
+    // the picture where the 5070 had not made a pipeline yet).
     let fingerprint = {
         let program = std::env::current_exe().map(|p| p.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let card = victory_shader::emit::host::hardware_adapter().map(|(_, name, _)| name).unwrap_or_default();
         let mut h = blake3::Hasher::new();
         h.update(known::fingerprint().as_bytes());
         h.update(program.as_bytes());
-        h.finalize().to_hex()[..16].to_owned()
+        h.update(card.as_bytes());
+        (h.finalize().to_hex()[..16].to_owned(), card)
     };
+    let (fingerprint, card) = fingerprint;
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
     let keys = known::keys(&dir);
@@ -72,7 +78,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
     println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
+        "{} pipelines known, {} made before ({fingerprint}, on {card}), {} bad; {} to make, {jobs} processes",
         keys.len(),
         done.len(),
         bad.len(),

@@ -249,6 +249,12 @@ pub fn run(
     victory_hle::modules::files::mount_at('G', title_dir);
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
+    // The F1 menu's save sharing, and an import it staged put in place before the title runs.
+    if let Some(data) = storage.parent()
+        && let Some(line) = victory_hle::save_share::start(data, title_dir)
+    {
+        println!("saves          {line}");
+    }
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
     victory_hle::console::set(match console {
         Console::SeriesX => victory_hle::console::Console::SeriesX,

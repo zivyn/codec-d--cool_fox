@@ -63,11 +63,17 @@ fn err(e: windows::core::Error) -> String {
 }
 
 /// The graphics card runs use: the first hardware adapter whose name holds
-/// `VICTORY_ADAPTER` (any case), else the hardware adapter with the most
-/// memory of its own. Windows' first adapter is often an integrated GPU (a
-/// monitor on the board's outputs, a laptop), and a device made with no
-/// adapter named runs there. The warm-up, the game's device and DLSS take the
-/// same card, so the driver's saved pipelines are the card's that plays.
+/// `VICTORY_ADAPTER` (any case); else, of the cards with memory of their own
+/// (2 GB or more), the first in Windows' order that a monitor is plugged into;
+/// else the hardware adapter with the most memory of its own. Windows' first
+/// adapter is often an integrated GPU (a monitor on the board's outputs, a
+/// laptop), and a device made with no adapter named runs there. A PC with two
+/// cards plays on the one its monitor is on (v2026.11.27.8 took the one with
+/// the most memory: an RTX 5060 Ti 16 GB beside the RTX 5070 the monitor was
+/// on, every frame then sent across to the 5070). A laptop's card without
+/// outputs of its own is still taken over the integrated GPU. The warm-up,
+/// the game's device and DLSS take the same card, so the driver's saved
+/// pipelines are the card's that plays.
 /// None: no hardware adapter (the default device is made then).
 pub fn hardware_adapter() -> Option<(IDXGIAdapter1, String, u64)> {
     // SAFETY: plain DXGI queries.
@@ -81,49 +87,84 @@ pub fn hardware_adapter() -> Option<(IDXGIAdapter1, String, u64)> {
                 continue;
             }
             let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-            all.push((adapter, String::from_utf16_lossy(&desc.Description[..len]), desc.DedicatedVideoMemory as u64));
+            let monitor = adapter.EnumOutputs(0).is_ok();
+            all.push((adapter, String::from_utf16_lossy(&desc.Description[..len]), desc.DedicatedVideoMemory as u64, monitor));
         }
         pick_adapter(all, std::env::var("VICTORY_ADAPTER").ok().as_deref())
     }
 }
 
-/// The adapter `hardware_adapter` takes from (adapter, name, own memory).
-fn pick_adapter<A>(all: Vec<(A, String, u64)>, named: Option<&str>) -> Option<(A, String, u64)> {
+/// Own memory from which a card counts as one of its own, not an integrated GPU.
+const CARD_MEMORY: u64 = 2 << 30;
+
+/// The adapter `hardware_adapter` takes from (adapter, name, own memory,
+/// whether a monitor is plugged into it).
+fn pick_adapter<A>(all: Vec<(A, String, u64, bool)>, named: Option<&str>) -> Option<(A, String, u64)> {
     let named = named.map(str::trim).filter(|n| !n.is_empty()).map(str::to_lowercase);
+    let mut shown: Option<(A, String, u64)> = None;
     let mut best: Option<(A, String, u64)> = None;
-    for a in all {
+    for (adapter, name, own, monitor) in all {
         if let Some(n) = &named
-            && a.1.to_lowercase().contains(n.as_str())
+            && name.to_lowercase().contains(n.as_str())
         {
-            return Some(a);
+            return Some((adapter, name, own));
         }
-        if best.as_ref().is_none_or(|b| a.2 > b.2) {
-            best = Some(a);
+        if monitor && own >= CARD_MEMORY && shown.is_none() {
+            shown = Some((adapter, name, own));
+        } else if best.as_ref().is_none_or(|b| own > b.2) {
+            best = Some((adapter, name, own));
         }
     }
-    best
+    shown.or(best)
 }
 
 #[cfg(test)]
 mod adapter_tests {
     use super::pick_adapter;
 
-    fn cards() -> Vec<((), String, u64)> {
+    type Card = ((), String, u64, bool);
+
+    fn cards() -> Vec<Card> {
         vec![
-            ((), "Intel(R) Graphics".to_owned(), 128 << 20),
-            ((), "NVIDIA GeForce RTX 4070 Ti".to_owned(), 12 << 30),
-            ((), "AMD Radeon(TM) Graphics".to_owned(), 512 << 20),
+            ((), "Intel(R) Graphics".to_owned(), 128 << 20, true),
+            ((), "NVIDIA GeForce RTX 4070 Ti".to_owned(), 12 << 30, false),
+            ((), "AMD Radeon(TM) Graphics".to_owned(), 512 << 20, false),
         ]
+    }
+
+    fn name(all: Vec<Card>, named: Option<&str>) -> String {
+        pick_adapter(all, named).unwrap().1
     }
 
     #[test]
     fn the_card_with_the_most_own_memory_unless_one_is_named() {
-        assert_eq!(pick_adapter(cards(), None).unwrap().1, "NVIDIA GeForce RTX 4070 Ti");
-        assert_eq!(pick_adapter(cards(), Some("  ")).unwrap().1, "NVIDIA GeForce RTX 4070 Ti");
-        assert_eq!(pick_adapter(cards(), Some("intel")).unwrap().1, "Intel(R) Graphics");
+        // A laptop: the monitor on the integrated GPU, the card without outputs.
+        assert_eq!(name(cards(), None), "NVIDIA GeForce RTX 4070 Ti");
+        assert_eq!(name(cards(), Some("  ")), "NVIDIA GeForce RTX 4070 Ti");
+        assert_eq!(name(cards(), Some("intel")), "Intel(R) Graphics");
         // A name no card has: the rule as without one.
-        assert_eq!(pick_adapter(cards(), Some("arc b580")).unwrap().1, "NVIDIA GeForce RTX 4070 Ti");
-        assert!(pick_adapter(Vec::<((), String, u64)>::new(), None).is_none());
+        assert_eq!(name(cards(), Some("arc b580")), "NVIDIA GeForce RTX 4070 Ti");
+        assert!(pick_adapter(Vec::<Card>::new(), None).is_none());
+    }
+
+    #[test]
+    fn of_two_cards_the_one_the_monitor_is_on() {
+        let two = || {
+            vec![
+                ((), "NVIDIA GeForce RTX 5070".to_owned(), 12 << 30, true),
+                ((), "NVIDIA GeForce RTX 5060 Ti".to_owned(), 16 << 30, false),
+            ]
+        };
+        assert_eq!(name(two(), None), "NVIDIA GeForce RTX 5070");
+        assert_eq!(name(two(), Some("5060")), "NVIDIA GeForce RTX 5060 Ti");
+        // Monitors on both: Windows' first.
+        let mut both = two();
+        both[1].3 = true;
+        assert_eq!(name(both, None), "NVIDIA GeForce RTX 5070");
+        // No monitor on either (a remote session): the most memory.
+        let mut none = two();
+        none[0].3 = false;
+        assert_eq!(name(none, None), "NVIDIA GeForce RTX 5060 Ti");
     }
 }
 

@@ -932,13 +932,13 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            // The card with the most memory of its own (or the one
+            // The card the monitor is on, else the one with the most memory (or the one
             // VICTORY_ADAPTER names), not Windows' first adapter, which is
             // often an integrated GPU.
             if let Some((adapter, name, own)) = victory_shader::emit::host::hardware_adapter()
                 && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
             {
-                tracing::info!(adapter = %name, own_memory_mb = own >> 20, "host device on the card with the most memory of its own (VICTORY_ADAPTER names another)");
+                tracing::info!(adapter = %name, own_memory_mb = own >> 20, "host device on the card the monitor is on, else the one with the most memory of its own (VICTORY_ADAPTER names another)");
             }
             if device.is_none() {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;

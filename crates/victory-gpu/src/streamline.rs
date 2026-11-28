@@ -307,6 +307,44 @@ static FG_ON: AtomicU64 = AtomicU64::new(0);
 static FG_OFF: AtomicU64 = AtomicU64::new(0);
 static FG_SHOWN: AtomicU64 = AtomicU64::new(0);
 static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+
+/// The driver's DLSS refused the evaluations Streamline gave it ("NGX
+/// evaluate feature failed", reported through [`log_message`]), and how
+/// many. Once nearly every one fails ([`dlss_failing`]), DLSS is left alone
+/// for the run and the title's own FidelityFX upscales again: a refused
+/// evaluation leaves the output as it was, so the screen stayed black with
+/// the sound and subtitles running (#449: an RTX 5060 Ti with the NVIDIA
+/// App's DLSS override, which loads its own Streamline plugins and asked
+/// every DLSS mode for a 2560x1440 render while the title rendered
+/// 1280x720; 599 of about 600 evaluations failed with 0xbad00005).
+static NGX_FAILED: AtomicU64 = AtomicU64::new(0);
+static DLSS_GIVEN_UP: AtomicBool = AtomicBool::new(false);
+
+/// Failed evaluations from which DLSS is given up, if they are nine in
+/// ten of the evaluations recorded.
+const NGX_FAILED_ENOUGH: u64 = 90;
+
+/// Whether DLSS is given up for the run (see [`NGX_FAILED`]).
+fn dlss_failing(failed: u64, evaluated: u64) -> bool {
+    failed >= NGX_FAILED_ENOUGH && failed * 10 >= evaluated * 9
+}
+
+fn ngx_evaluate_failed(text: &str) {
+    let failed = NGX_FAILED.fetch_add(1, Relaxed) + 1;
+    if !DLSS_GIVEN_UP.load(Relaxed)
+        && dlss_failing(failed, EVALUATED_ALL.load(Relaxed))
+        && !DLSS_GIVEN_UP.swap(true, Relaxed)
+    {
+        tracing::error!(
+            failed,
+            evaluated = EVALUATED_ALL.load(Relaxed),
+            last = text,
+            "DLSS: the driver refused nearly every upscaling, which leaves the picture black; DLSS and frame generation are off for this run and the game's own FSR upscales.              If the NVIDIA App has a DLSS override on for this game (Graphics > the program > DLSS Override), turn it off"
+        );
+        // Frame generation stops too (see `upscale`): with nothing noted it would show stale frames.
+        FG_WANTED.store(0, Relaxed);
+    }
+}
 static FG_STATUS: AtomicU32 = AtomicU32::new(0);
 /// Presents with frame generation on, and frames it showed, in all.
 static FG_ON_ALL: AtomicU64 = AtomicU64::new(0);
@@ -610,7 +648,12 @@ unsafe extern "C" fn log_message(kind: u32, message: *const c_char) {
     // (Every plugin in the folder that was not asked for says so.)
     let noise = text.contains("since it is was not requested by the host");
     match kind {
-        abi::LOG_ERROR => tracing::error!(target: "streamline", "{text}"),
+        abi::LOG_ERROR => {
+            tracing::error!(target: "streamline", "{text}");
+            if text.contains("NGX evaluate feature failed") {
+                ngx_evaluate_failed(text);
+            }
+        }
         abi::LOG_WARN if !noise => tracing::warn!(target: "streamline", "{text}"),
         _ => tracing::debug!(target: "streamline", "{text}"),
     }
@@ -628,9 +671,18 @@ pub fn adapter_name() -> Option<String> {
 }
 
 /// Whether a card of this name runs DLSS Frame Generation: a GeForce RTX of
-/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU").
+/// the 40 or 50 series ("NVIDIA GeForce RTX 4070 SUPER", "... RTX 5090 Laptop GPU"),
+/// or a workstation card of those generations ("NVIDIA RTX 2000 Ada Generation",
+/// "NVIDIA RTX PRO 4000 Blackwell SFF Edition", #312). Not the older Quadro RTX
+/// 4000 to 8000 (Turing) or RTX A2000 to A6000 (Ampere).
 pub fn dlss_framegen_card(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
+    if name.contains("QUADRO") {
+        return false;
+    }
+    if name.contains(" ADA") || name.contains("BLACKWELL") || name.contains("RTX PRO") {
+        return true;
+    }
     let Some(at) = name.find("RTX") else { return false };
     let model: String = name[at + 3..].trim_start().chars().take_while(char::is_ascii_digit).collect();
     model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
@@ -1031,6 +1083,12 @@ fn frame_token(sl: &Sl, index: u32) -> Option<*mut abi::FrameToken> {
 /// its inputs are noted there for the present); the title's own runs
 /// otherwise.
 pub fn upscale(up: &Upscale) -> Taken {
+    // DLSS given up: the title's own upscaling alone, as in a start without NVIDIA's files.
+    // Nothing is noted for frame generation (turned off with it, `ngx_evaluate_failed`): the
+    // title's FidelityFX beside our frame generation stops the title on a check (+0x2219650).
+    if DLSS_GIVEN_UP.load(Relaxed) {
+        return Taken::No("the driver refused DLSS's upscalings (DLSS and frame generation are off for the run)");
+    }
     let plan = PLAN.get();
     let dlss = plan.is_some_and(|p| p.dlss) && DLSS_READY.load(Acquire);
     // (FSR 3 frame generation reads the same inputs at the present.)
@@ -2271,5 +2329,21 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod failing_tests {
+    use super::dlss_failing;
+
+    #[test]
+    fn dlss_is_given_up_only_when_nearly_every_upscaling_fails() {
+        // #449: 599 failed of about 600.
+        assert!(dlss_failing(599, 600));
+        assert!(dlss_failing(90, 100));
+        // Too few to tell yet, or a few refusals among working upscalings.
+        assert!(!dlss_failing(89, 89));
+        assert!(!dlss_failing(120, 1000));
+        assert!(!dlss_failing(500, 600));
     }
 }

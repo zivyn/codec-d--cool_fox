@@ -50,12 +50,57 @@ const ABOUT_PRELOAD: [&str; 3] = [
     "TAKES A WHILE: MAYBE A LONG TIME, DEPENDING ON HARDWARE.",
     "A LATER UPDATE OF THIS BUILD MAY NEED A NEW PRELOAD.",
 ];
+/// The actions that export and import the game's save (`crate::save_share`), and what is said
+/// of them while they are picked.
+const EXPORT: usize = 4;
+const IMPORT: usize = 5;
+const ABOUT_EXPORT: [&str; 3] = [
+    "MAKES A ZIP OF YOUR SAVE IN SAVES, IN THE FOLDER OF",
+    "GAME_SCARLETT_MASTER.EXE. SEND THAT ZIP TO SHARE IT.",
+    "YOUR SAVE STAYS AS IT IS. GAME SETTINGS ARE LEFT OUT.",
+];
+const ABOUT_IMPORT: [&str; 3] = [
+    "PUT A SAVE ZIP INTO SAVES, IN THE FOLDER OF",
+    "GAME_SCARLETT_MASTER.EXE, THEN PRESS ENTER HERE AND",
+    "PICK IT FROM THE LIST. YOUR GAME SETTINGS ARE KEPT.",
+];
+/// The list IMPORT SAVE opens: the saves in `Saves`, then a line back to the settings.
+const PICK_TITLE: &str = "IMPORT SAVE                       ESC GOES BACK";
+const PICK_HELP: &str = "UP/DOWN PICK  ENTER TWICE IMPORTS IT";
+const PICK_NONE: &str = "  NONE YET: PUT A SAVE ZIP INTO SAVES IN THE GAME FOLDER";
+const PICK_BACK: &str = "BACK TO THE SETTINGS";
+const ABOUT_PICK: [&str; 3] = [
+    "THE SAVE ZIPS IN SAVES, IN THE GAME FOLDER, NEWEST FIRST.",
+    "ENTER TWICE: THE GAME RESTARTS WITH THE SAVE PICKED.",
+    "YOUR OLD SAVE IS ZIPPED INTO SAVES FIRST, SO IT IS KEPT.",
+];
+/// The note after the first Enter on a save in the list: the second one imports it.
+const CONFIRM_IMPORT: &str = "ENTER AGAIN: IMPORT IT AND RESTART THE GAME";
+/// The longest save name shown in the list.
+const IMPORT_NAME: usize = 56;
+
+/// A save's file name as the menu's letters can show it.
+fn shown_name(name: &str) -> String {
+    name.chars()
+        .map(|c| c.to_ascii_uppercase())
+        .map(|c| if c.is_ascii() && glyph(c as u8) != glyph(b'#') { c } else { '-' })
+        .take(IMPORT_NAME)
+        .collect()
+}
+
 /// The setting that turns MFG Unlocker on, and what is said of it while it is picked.
 const MFG: &str = "VICTORY_MFG_UNLOCKER";
 const ABOUT_MFG: [&str; 3] = [
     "A MOD, NOT OURS: DLSS FRAME GEN ON RTX 20 AND 30 CARDS.",
     "ON: DOWNLOADED FROM ITS GITHUB AT THE NEXT START, THEN RUN.",
     "NVIDIA DOES NOT SUPPORT IT. IF THE GAME FAILS, TURN IT OFF.",
+];
+/// The DLSS setting, and what is said while it is picked on in a start without NVIDIA's files.
+const DLSS: &str = "VICTORY_MENU_DLSS";
+const ABOUT_NO_DLSS: [&str; 3] = [
+    "THE NVIDIA DLSS FILES ARE NOT ON THIS PC YET: THEY ARE",
+    "DOWNLOADED FROM NVIDIA ON GITHUB AT THE NEXT START",
+    "(ABOUT 70 MB, ONCE). SAVE AND RESTART NOW DOES IT.",
 ];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
@@ -116,8 +161,15 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_PORT_CONSTANTS", label: "CONSTANTS HEAP IN PLACE", values: UNSET_ON, live: false },
 ];
 /// The lines after the settings.
-const ACTIONS: [&str; 5] =
-    ["SAVE AND RESTART NOW", "SAVE FOR NEXT START", "PRELOAD SHADERS (RESTARTS THE GAME)", "RESET ALL TO PLAY DEFAULTS", "CLOSE"];
+const ACTIONS: [&str; 7] = [
+    "SAVE AND RESTART NOW",
+    "SAVE FOR NEXT START",
+    "PRELOAD SHADERS (RESTARTS THE GAME)",
+    "RESET ALL TO PLAY DEFAULTS",
+    "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)",
+    "IMPORT SAVE (PICK FROM SAVES)",
+    "CLOSE",
+];
 
 fn get(var: &str) -> String {
     std::env::var(var).unwrap_or_default()
@@ -382,6 +434,11 @@ pub(super) struct Menu {
     painted: Option<String>,
     buffers: Option<Buffers>,
     failed: bool,
+    /// The saves in `Saves` that can be imported (read when the menu opens), and the line
+    /// picked in their list (`imports.len()`: the line back), shown while `picking`.
+    imports: Vec<String>,
+    import_at: usize,
+    picking: bool,
 }
 
 impl Menu {
@@ -393,7 +450,7 @@ impl Menu {
             crate::SETTINGS_MENU_OPEN.store(true, Ordering::Relaxed);
         }
         let values: Vec<String> = ITEMS.iter().map(|i| get(i.var)).collect();
-        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false }
+        Menu { started: values.clone(), values, at: 0, note: String::new(), changed: true, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false }
     }
 
     fn open() -> bool {
@@ -401,6 +458,9 @@ impl Menu {
     }
 
     fn lines(&self) -> Vec<String> {
+        if self.picking {
+            return self.pick_lines();
+        }
         let total = ITEMS.len() + ACTIONS.len();
         let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
@@ -426,13 +486,46 @@ impl Menu {
         out.push(String::new());
         let about = if self.at == ITEMS.len() + PRELOAD {
             ABOUT_PRELOAD
+        } else if self.at == ITEMS.len() + EXPORT {
+            ABOUT_EXPORT
+        } else if self.at == ITEMS.len() + IMPORT {
+            ABOUT_IMPORT
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == MFG) {
             ABOUT_MFG
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == DLSS)
+            && !matches!(self.values[self.at].as_str(), "" | "off")
+            && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none()
+        {
+            ABOUT_NO_DLSS
         } else {
             [""; 3]
         };
         out.extend(about.iter().map(|l| (*l).to_owned()));
         out.push(if self.note.is_empty() { "* = CHANGED: APPLIES AT THE NEXT START UNLESS LIVE".to_owned() } else { self.note.clone() });
+        out.push(REPO.to_owned());
+        out
+    }
+
+    /// The list IMPORT SAVE opens, in the box's lines.
+    fn pick_lines(&self) -> Vec<String> {
+        let mut out = vec![PICK_TITLE.to_owned(), PICK_HELP.to_owned(), String::new()];
+        if self.imports.is_empty() {
+            out.push(PICK_NONE.to_owned());
+        }
+        let rows = ROWS - (out.len() - 3);
+        let total = self.imports.len() + 1;
+        let first = self.import_at.saturating_sub(rows / 2).min(total.saturating_sub(rows));
+        for row in first..(first + rows).min(total) {
+            let cursor = if row == self.import_at { '>' } else { ' ' };
+            let name = self.imports.get(row).map_or_else(|| PICK_BACK.to_owned(), |n| shown_name(n));
+            out.push(format!("{cursor} {name}").chars().take(COLUMNS as usize).collect());
+        }
+        while out.len() < 3 + ROWS {
+            out.push(String::new());
+        }
+        out.push(String::new());
+        out.extend(ABOUT_PICK.iter().map(|l| (*l).to_owned()));
+        out.push(if self.note.is_empty() { format!("{} IN SAVES", self.imports.len()) } else { self.note.clone() });
         out.push(REPO.to_owned());
         out
     }
@@ -591,6 +684,66 @@ impl Menu {
         self.restart(false);
     }
 
+    /// Reads which saves `Saves` holds, keeping the one picked if it is still there.
+    fn read_imports(&mut self) {
+        let picked = self.imports.get(self.import_at).cloned();
+        self.imports = crate::save_share::share().map(|s| crate::save_share::exports(&s)).unwrap_or_default();
+        self.import_at = picked.and_then(|p| self.imports.iter().position(|n| *n == p)).unwrap_or(0);
+    }
+
+    /// Writes the game's save into a new zip in `Saves`.
+    fn export_save(&mut self) {
+        let (Some(data), Some(share)) = (crate::save_share::data(), crate::save_share::share()) else {
+            self.note = "SAVE FOLDERS NOT KNOWN IN THIS START".to_owned();
+            return;
+        };
+        let name = format!("save {}", crate::save_share::stamp());
+        match crate::save_share::export(&data, &share, &name) {
+            Ok(to) => {
+                tracing::info!(to = %to.display(), "settings menu: save exported");
+                self.note = format!("EXPORTED TO SAVES: {}.ZIP", shown_name(&name));
+                self.read_imports();
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, share = %share.display(), "settings menu: save not exported");
+                self.note = if e.kind() == std::io::ErrorKind::NotFound {
+                    "NOTHING TO EXPORT: THE GAME HAS NOT SAVED YET"
+                } else {
+                    "EXPORT FAILED: THE GAME FOLDER CANNOT BE WRITTEN"
+                }
+                .to_owned();
+            }
+        }
+    }
+
+    /// Stages the save picked to be put in place at the next start, and starts the game again.
+    fn import_save(&mut self) {
+        let (Some(data), Some(share)) = (crate::save_share::data(), crate::save_share::share()) else {
+            self.note = "SAVE FOLDERS NOT KNOWN IN THIS START".to_owned();
+            return;
+        };
+        let Some(name) = self.imports.get(self.import_at).cloned() else {
+            self.note = "NO SAVE TO IMPORT: PUT ONE IN SAVES FIRST".to_owned();
+            return;
+        };
+        if let Err(e) = crate::save_share::stage(&data, &share, &name) {
+            tracing::warn!(error = %e, name, "settings menu: save import not staged");
+            self.note = if e.kind() == std::io::ErrorKind::NotFound {
+                "IMPORT FAILED: NO SAVE IN THAT ZIP"
+            } else {
+                "IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE"
+            }
+            .to_owned();
+            return;
+        }
+        tracing::info!(name, "settings menu: save import staged; put in place at the next start");
+        if std::env::var_os("VICTORY_MENU_PLAY").is_some() {
+            self.restart(false);
+        } else {
+            self.note = "IMPORTED: CLOSE THE GAME AND START IT AGAIN".to_owned();
+        }
+    }
+
     /// Removes the settings file: the launcher's own settings at the next start.
     fn reset(&mut self) {
         if let Some(path) = settings_file() {
@@ -618,19 +771,43 @@ impl Menu {
         let total = ITEMS.len() + ACTIONS.len();
         for vk in pressed {
             let open = Self::open();
+            // Esc in the list of saves goes back to the settings.
+            if open && self.picking && vk == VK_ESCAPE {
+                self.picking = false;
+                self.note.clear();
+                self.changed = true;
+                continue;
+            }
             if vk == VK_F1 || (open && vk == VK_ESCAPE) {
                 crate::SETTINGS_MENU_OPEN.store(!open && vk == VK_F1, Ordering::Relaxed);
                 self.note.clear();
+                self.picking = false;
+                if !open {
+                    self.read_imports();
+                }
                 self.changed = true;
                 continue;
             }
             if !open {
                 continue;
             }
-            // Only an Enter right after the first one starts a preload.
-            let confirmed = self.note == CONFIRM_PRELOAD;
+            // Only an Enter right after the first one starts a preload or an import.
+            let confirmed = self.note == CONFIRM_PRELOAD || self.note == CONFIRM_IMPORT;
             if confirmed {
                 self.note.clear();
+            }
+            if self.picking {
+                let (n, back) = (self.imports.len() + 1, self.import_at >= self.imports.len());
+                match vk {
+                    VK_UP => self.import_at = (self.import_at + n - 1) % n,
+                    VK_DOWN => self.import_at = (self.import_at + 1) % n,
+                    VK_RETURN if back => self.picking = false,
+                    VK_RETURN if !confirmed => self.note = CONFIRM_IMPORT.to_owned(),
+                    VK_RETURN => self.import_save(),
+                    _ => {}
+                }
+                self.changed = true;
+                continue;
             }
             match vk {
                 VK_UP => self.at = (self.at + total - 1) % total,
@@ -654,6 +831,12 @@ impl Menu {
                         }
                     }
                     3 => self.reset(),
+                    EXPORT => self.export_save(),
+                    IMPORT => {
+                        self.read_imports();
+                        self.import_at = 0;
+                        self.picking = true;
+                    }
                     _ => crate::SETTINGS_MENU_OPEN.store(false, Ordering::Relaxed),
                 },
                 _ => {}
@@ -744,7 +927,7 @@ mod tests {
             std::env::remove_var("VICTORY_MENU_FILE");
             std::env::set_var("VICTORY_HOME", &home);
         }
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let dlss = ITEMS.iter().position(|i| i.var == "VICTORY_MENU_DLSS").expect("in the menu");
         menu.change_and_save(dlss, 1);
@@ -761,7 +944,7 @@ mod tests {
 
     #[test]
     fn every_line_fits_and_every_character_has_a_picture() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         for at in 0..ITEMS.len() + ACTIONS.len() {
             menu.at = at;
@@ -776,7 +959,7 @@ mod tests {
 
     #[test]
     fn the_link_is_always_right_under_the_note() {
-        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         for note in ["", "SAVED"] {
             menu.note = note.to_owned();
@@ -791,6 +974,10 @@ mod tests {
                 let about = &lines[n - 5..n - 2];
                 if at == ITEMS.len() + PRELOAD {
                     assert_eq!(about, ABOUT_PRELOAD);
+                } else if at == ITEMS.len() + EXPORT {
+                    assert_eq!(about, ABOUT_EXPORT);
+                } else if at == ITEMS.len() + IMPORT {
+                    assert_eq!(about, ABOUT_IMPORT);
                 } else if at < ITEMS.len() && ITEMS[at].var == MFG {
                     assert_eq!(about, ABOUT_MFG);
                 } else {
@@ -800,13 +987,32 @@ mod tests {
         }
         assert_eq!(ACTIONS[PRELOAD], "PRELOAD SHADERS (RESTARTS THE GAME)");
         assert!(CONFIRM_PRELOAD.len() <= COLUMNS as usize);
+        assert_eq!(ACTIONS[EXPORT], "EXPORT SAVE (TO SAVES IN THE GAME FOLDER)");
+        assert_eq!(ACTIONS[IMPORT], "IMPORT SAVE (PICK FROM SAVES)");
+        let pick = [PICK_TITLE, PICK_HELP, PICK_NONE, PICK_BACK, CONFIRM_IMPORT, "IMPORT FAILED: THAT ZIP IS DAMAGED OR NOT A SAVE"];
+        for line in ABOUT_EXPORT.iter().chain(&ABOUT_IMPORT).chain(&ABOUT_PICK).chain(&pick) {
+            assert!(line.len() <= COLUMNS as usize, "{line}");
+            assert!(line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
+        }
         assert!(ABOUT_MFG.iter().all(|l| l.len() <= COLUMNS as usize));
+        for line in ABOUT_NO_DLSS {
+            assert!(line.len() <= COLUMNS as usize && line.bytes().all(|c| glyph(c) != glyph(b'#')), "{line}");
+        }
+        // DLSS picked on where NVIDIA's files are missing (no VICTORY_STREAMLINE_DIR in tests): said so.
+        let dlss = ITEMS.iter().position(|i| i.var == DLSS).expect("in the menu");
+        menu.at = dlss;
+        menu.values[dlss] = "quality".to_owned();
+        let lines = menu.lines();
+        assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_NO_DLSS);
+        menu.values[dlss] = "off".to_owned();
+        let lines = menu.lines();
+        assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
         assert_eq!(ITEMS.iter().filter(|i| i.var == MFG).count(), 1);
     }
 
     #[test]
     fn values_cycle_both_ways() {
-        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false };
+        let mut menu = Menu { values: ITEMS.iter().map(|i| i.values[0].0.to_owned()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
         menu.started = menu.values.clone();
         let n = ITEMS[0].values.len();
         for _ in 0..n {
@@ -815,5 +1021,43 @@ mod tests {
         assert_eq!(menu.values[0], ITEMS[0].values[0].0);
         menu.change(0, -1);
         assert_eq!(menu.values[0], ITEMS[0].values[n - 1].0);
+    }
+
+    #[test]
+    fn a_shared_save_name_is_shown_in_letters_the_menu_has() {
+        let names = vec!["save 2026-11-27 23-45-10.zip".to_owned(), "Jason's boat ~ 100% [\u{e9}] and a very long name that goes on and on.zip".to_owned()];
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: ITEMS.len() + IMPORT, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: names, import_at: 0, picking: true };
+        menu.started = menu.values.clone();
+        let check = |menu: &Menu| {
+            let lines = menu.lines();
+            assert_eq!(lines.len(), LINES as usize);
+            assert_eq!(lines[lines.len() - 1], REPO);
+            assert_eq!(&lines[lines.len() - 5..lines.len() - 2], ABOUT_PICK);
+            for line in &lines {
+                assert!(line.len() <= COLUMNS as usize, "{line}");
+                assert!(line.bytes().all(|c| glyph(c.to_ascii_uppercase()) != glyph(b'#')), "{line}");
+            }
+            lines
+        };
+        let lines = check(&menu);
+        assert!(lines.iter().any(|l| l == "> SAVE 2026-11-27 23-45-10.ZIP"), "{lines:?}");
+        assert!(lines.iter().any(|l| l == &format!("  {PICK_BACK}")), "{lines:?}");
+        menu.import_at = 1;
+        check(&menu);
+        menu.import_at = 2;
+        assert!(check(&menu).iter().any(|l| l == &format!("> {PICK_BACK}")));
+        // Many saves: the list scrolls and the box keeps its size.
+        menu.imports = (0..50).map(|i| format!("save {i}.zip")).collect();
+        for at in [0, 25, 49, 50] {
+            menu.import_at = at;
+            let lines = check(&menu);
+            let picked = if at == 50 { format!("> {PICK_BACK}") } else { format!("> SAVE {at}.ZIP") };
+            assert!(lines.contains(&picked), "{at}: {lines:?}");
+        }
+        menu.imports.clear();
+        menu.import_at = 0;
+        let lines = check(&menu);
+        assert!(lines.iter().any(|l| l == PICK_NONE));
+        assert!(lines.iter().any(|l| l == &format!("> {PICK_BACK}")));
     }
 }

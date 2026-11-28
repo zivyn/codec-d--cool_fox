@@ -27,6 +27,7 @@ pub use victory_gpu::console;
 /// DLSS and frame generation (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`).
 #[cfg(windows)]
 pub use victory_gpu::streamline;
+pub use victory_gpu::save_share;
 #[cfg(windows)]
 pub use victory_gpu::reserve_upload_space;
 #[cfg(all(windows, feature = "diagnostics"))]

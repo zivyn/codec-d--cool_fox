@@ -82,6 +82,8 @@ pub(super) trait Work: Send {
     {
         Err(next)
     }
+    /// What it was taking along stops: nothing more of its queue is in the line.
+    fn none_left(&self) {}
     /// Asked as it comes into the line: the number of a round of the heaps'
     /// records that began after it will have seen what the title wrote
     /// before its call (0: none was asked).
@@ -411,6 +413,7 @@ impl<W: Work> Lane<W> {
                 at.and_then(|at| Some((at, state.items.remove(at)?)))
             };
             let Some((at, next)) = next else {
+                entry.what.none_left();
                 break;
             };
             // (Back where it was: parts of one submission share a number.)
@@ -556,6 +559,10 @@ impl Work for Job {
         if self.runs() && heaps_early() { crate::descriptor::ask_round() } else { 0 }
     }
 
+    fn none_left(&self) {
+        stopped(STOP_EMPTY);
+    }
+
     fn peek(&self) -> Option<Vec<usize>> {
         match self {
             Job::Run(_, lists, order) => Some(order.iter().map(|&i| std::ptr::from_ref(lists[i].host()) as usize).collect()),
@@ -567,6 +574,7 @@ impl Work for Job {
         let (most, most_lists) = crate::host::joins();
         let most = ramp_parts(most);
         if most < 2 {
+            stopped(STOP_PARTS);
             return Err(next);
         }
         // Nothing but waits and signals that a submission may follow.
@@ -582,22 +590,44 @@ impl Work for Job {
                     || crate::host::late_met_known(wait) == Some(true)
                     || hosts().any(|list| crate::host::will_meet(list, wait));
                 if !met {
+                    stopped(STOP_VALUE);
                     return Err(next);
                 }
             }
             &Job::Wait(fence, value) => {
                 if crate::fence::completed(fence as This) < value && !signals.iter().any(|&(f, v)| f == fence && v >= value) {
+                    stopped(STOP_FENCE);
                     return Err(next);
                 }
             }
             Job::Signal(..) => {}
             Job::Run(_, more, order) => {
                 let runs: Vec<&crate::host::HostList> = order.iter().map(|&i| more[i].host()).collect();
-                if count >= most || lists.1.len() + runs.len() > most_lists || !crate::host::joinable(hosts(), &runs) {
+                let why = if count >= most {
+                    Some(STOP_PARTS)
+                } else if lists.1.len() + runs.len() > most_lists {
+                    Some(STOP_LISTS)
+                } else {
+                    use crate::host::NoJoin;
+                    crate::host::join_refusal(hosts(), &runs).map(|no| match no {
+                        NoJoin::CopyOrRun => STOP_STEP,
+                        NoJoin::Written => STOP_WRITTEN,
+                        NoJoin::WideOnly => STOP_WIDE,
+                    })
+                };
+                if let Some(why) = why {
+                    stopped(why);
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Present(..) => {
+                stopped(STOP_PRESENT);
+                return Err(next);
+            }
+            Job::Joined(..) | Job::Lists(..) => {
+                stopped(STOP_OTHER);
+                return Err(next);
+            }
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -698,6 +728,35 @@ impl Work for Job {
 }
 
 static LANE: Lane<Job> = Lane::new();
+
+/// Since the last frame-rate line: what ended a submission's taking of the ones behind it along (each submission
+/// that was prepared with others in reach ends in one of these): see the constants.
+static STOPS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// A wait for a memory value that is not met, and not known to be met by the lists taken along or the flights.
+const STOP_VALUE: usize = 0;
+/// A wait for a fence that nothing taken along signals.
+const STOP_FENCE: usize = 1;
+/// The most parts (`VICTORY_JOIN_PARTS`, or the ramp's) were taken.
+const STOP_PARTS: usize = 2;
+/// The most lists (`VICTORY_JOIN_LISTS`) would be passed.
+const STOP_LISTS: usize = 3;
+/// The next part copies title memory or has a step of ours.
+const STOP_STEP: usize = 4;
+/// The next part reads memory that the lists taken along write.
+const STOP_WRITTEN: usize = 5;
+/// The next part reads memory only a range of 4 MiB or more, declared writable by the lists taken along, covers
+/// (what `VICTORY_JOIN_WIDE_MB` would join; counted in diagnostics builds).
+const STOP_WIDE: usize = 6;
+/// A present.
+const STOP_PRESENT: usize = 7;
+/// A call whose lists are not translated yet, or parts taken along already.
+const STOP_OTHER: usize = 8;
+/// Nothing more of the queue was in the line.
+const STOP_EMPTY: usize = 9;
+
+fn stopped(why: usize) {
+    STOPS[why].fetch_add(1, Relaxed);
+}
 
 /// Submissions and presents in the line that have not been given to the host
 /// yet.
@@ -1039,6 +1098,20 @@ pub(super) fn line(frames: f64) {
         s[FORCED] / frames,
         s[JOINED] / frames,
         s[RAMPED] / frames
+    );
+    let t: Vec<f64> = STOPS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "what ended the joining of parts, per frame (VICTORY_JOIN_PARTS, VICTORY_JOIN_WIDE_MB): a wait for a value not met {:.1}, a wait for a fence          nothing along signals {:.1}, the most parts {:.1}, the most lists {:.1}, a copy or a step of ours in the next part {:.1}, the next part reads          what the parts along write {:.1} (of them {:.1} only because of a range of 4 MiB or more declared writable), a present {:.1}, a call not          translated yet or parts along {:.1}, nothing more in the line {:.1}",
+        t[STOP_VALUE],
+        t[STOP_FENCE],
+        t[STOP_PARTS],
+        t[STOP_LISTS],
+        t[STOP_STEP],
+        t[STOP_WRITTEN] + t[STOP_WIDE],
+        t[STOP_WIDE],
+        t[STOP_PRESENT],
+        t[STOP_OTHER],
+        t[STOP_EMPTY]
     );
     if s[PRESENTS] > 0.0 {
         tracing::info!(

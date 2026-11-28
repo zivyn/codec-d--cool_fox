@@ -445,6 +445,7 @@ translation of shaders.
 | `VICTORY_FIRST_HALF` | on (=0 turns off) | flag | yes |  |  | Removes first-half interpolants only the second half reads before lowering. |
 | `VICTORY_FOLD_VIEWS` | off | flag | yes | live |  | Folds view heap indexing into raw user data in draws and shaders. |
 | `VICTORY_FOOTPRINT_STATS` | off | flag |  |  |  | Runs the store footprint analysis on every program and prints stats to stderr. |
+| `VICTORY_FRAME_STATS` | on (=0 turns off; a file name also writes every frame there) | text |  |  |  | Says the time of each presented frame every 5 s: p50, p95, p99, max, the frames over 100, 200 and 500 ms; given a file, also one line of time (ms since 1970) and frame time for every frame. |
 | `VICTORY_FULL_CARD_PASS` | on (=0 turns off) | flag |  |  |  | Texture pass puts back every slot needing a new host copy. |
 | `VICTORY_FUSE_DISPATCH` | off | flag | yes |  | key (text) | `1`: compute programs are translated in the form of a member of a run of dispatches (they read user data and group id from a record of a table, the root CBV `SLOT_FUSE`); a run of one when nothing joins. Off: the emitted code is the same as without the switch (checked on the corpus, integ/validation-26). |
 | `VICTORY_FUSE_RUNS` | off | flag |  | live |  | Needs the programs translated with `VICTORY_FUSE_DISPATCH=1`: the dispatches of one program that follow one another are one table and one dispatch of all their groups (`draw/fuse.rs`). |

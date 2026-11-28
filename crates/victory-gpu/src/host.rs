@@ -19,6 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 mod frame_line;
+mod frame_times;
 mod batches;
 mod landing;
 mod prepare;
@@ -6219,6 +6220,8 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
+    /// The time of each frame, for the line of frame times.
+    times: frame_times::Times,
     /// The caption the window had, once read.
     caption: Option<Vec<u16>>,
 }
@@ -6233,6 +6236,7 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
+            times: frame_times::Times::new(),
             caption: None,
         }
     }
@@ -6250,6 +6254,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        self.times.frame();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -6398,6 +6403,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            self.times.line();
             crate::threadcpu::line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",

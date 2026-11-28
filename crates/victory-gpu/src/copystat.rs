@@ -907,7 +907,7 @@ fn log_memory() {
     let census = crate::resource::census();
     let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
     let card = crate::host::host()
-        .and_then(|h| h.video_memory())
+        .and_then(|h| h.video_memory_os())
         .unwrap_or_default();
     // Everything the system says of the two memory groups, beside the
     // budget and use the lines below print.

@@ -31,6 +31,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub(crate) mod abi;
+mod budget;
 pub mod plan;
 
 pub use plan::Mode;
@@ -89,6 +90,10 @@ pub struct Asked {
     /// FidelityFX upscales, made for the Series S sizes only: FSR 3 frame
     /// generation, which needs that upscaling, runs on Series X with DLSS only.
     pub series_s: bool,
+    /// `VICTORY_FRAMEGEN_BUDGET` (`auto`, the default: on with frame generation; `0` off; `1` on, also with
+    /// DLSS alone): what DLSS and frame generation take of the card's memory is kept out of what our
+    /// textures may use, and an out-of-VRAM answer of frame generation is recovered from ([`budget`]).
+    pub budget: bool,
 }
 
 impl Asked {
@@ -126,11 +131,22 @@ impl Asked {
             fsr_framegen,
             fidelityfx_dir: fsr::dir_from_env(),
             series_s: var("VICTORY_MENU_CONSOLE").is_some_and(|c| c.trim() == "series-s"),
+            budget: budget_asked(var("VICTORY_FRAMEGEN_BUDGET").as_deref(), framegen),
         })
     }
 
     pub fn any(&self) -> bool {
         self.dlss || self.framegen
+    }
+}
+
+/// `VICTORY_FRAMEGEN_BUDGET`: `0`, `off`, `no` and `false` off; `1`, `on` and `yes` on; anything else
+/// (`auto`) or unset: on with frame generation.
+fn budget_asked(value: Option<&str>, framegen: bool) -> bool {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("0" | "off" | "no" | "false") => false,
+        Some("1" | "on" | "yes") => true,
+        _ => framegen,
     }
 }
 
@@ -595,6 +611,7 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         "Streamline loaded (manual hooking, no downloads)"
     );
     let _ = PLAN.set(Plan { asked: asked.clone(), dlss, framegen });
+    budget::set_on(asked.budget && (dlss || framegen));
     Ok(Available { dlss, framegen, fsr_framegen: false })
 }
 
@@ -1295,6 +1312,7 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
     crate::external::output_written(up.resources[OUTPUT].0);
     EVALUATED.fetch_add(1, Relaxed);
     let all = EVALUATED_ALL.fetch_add(1, Relaxed) + 1;
+    budget::sr_seen(all, camera.output);
     if all == 1 || recorded.changed {
         tracing::info!(
             render = ?camera.render,
@@ -1792,6 +1810,36 @@ pub(crate) struct Planes<'a> {
     pub size: [u32; 2],
 }
 
+/// The size of the depth and motion vectors of the last upscaling (the larger of the two, 0: none yet).
+static MVEC_DEPTH: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+
+/// Asks Streamline what frame generation takes of the card's memory for a colour of `planes.size` and
+/// `generated` frames for each one rendered, once for each size and amount (`budget::fg_estimated` keeps
+/// the answer, or a size-based figure when it gives none). Nothing is allocated by the question.
+fn framegen_estimate(get_state: abi::SlDlssgGetState, planes: &Planes<'_>, generated: u32) {
+    let key = budget::fg_key(planes.size, generated);
+    if !budget::fg_stale(key) {
+        return;
+    }
+    let (width, height) = (MVEC_DEPTH[0].load(Relaxed), MVEC_DEPTH[1].load(Relaxed));
+    let mut options = abi::DlssgOptions::new(abi::DLSSG_ON);
+    options.num_frames_to_generate = generated;
+    options.flags = abi::DLSSG_RETAIN_RESOURCES_WHEN_OFF | abi::DLSSG_REQUEST_VRAM_ESTIMATE;
+    options.num_back_buffers = crate::host::BUFFERS;
+    options.color_width = planes.size[0];
+    options.color_height = planes.size[1];
+    options.mvec_depth_width = if width == 0 { planes.size[0] } else { width };
+    options.mvec_depth_height = if height == 0 { planes.size[1] } else { height };
+    // SAFETY: the description of a live texture.
+    options.color_buffer_format = unsafe { planes.base.0.GetDesc() }.Format.0 as u32;
+    let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
+    let mut state = abi::DlssgState::default();
+    // SAFETY: a structure to fill and options that live through the call.
+    let code = unsafe { get_state(&viewport, &mut state, &options) };
+    let own = (code == 0 && state.estimated_vram_usage_in_bytes > 0).then_some(state.estimated_vram_usage_in_bytes);
+    budget::fg_estimated(key, own, planes.size, generated, code);
+}
+
 /// What [`present_begins`] began, for [`present_ends`].
 pub(crate) struct Presenting {
     token: *mut abi::FrameToken,
@@ -1852,6 +1900,9 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         // (Frame generation reads the camera's planes and matrices: the
         // nearer plane is the near one, whichever way the title names them.)
         let camera = camera.planes_in_order();
+        let (depth_size, motion_size) = (camera.render, camera.motion_size());
+        MVEC_DEPTH[0].store(depth_size[0].max(motion_size[0]), Relaxed);
+        MVEC_DEPTH[1].store(depth_size[1].max(motion_size[1]), Relaxed);
         let constants = camera.constants(plan.asked.jitter, plan.asked.mvec);
         // SAFETY: constants for this frame and viewport.
         let code = unsafe { (sl.set_constants)(&constants, token, &viewport) };
@@ -1936,7 +1987,15 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         Some(false) => 0,
         None => framegen_wanted(),
     };
-    let on = on && wanted != 0;
+    // (`VICTORY_FRAMEGEN_BUDGET`: what frame generation will take of the card's memory, as Streamline
+    // says it for this size and amount; and no switch-on right after an answer 39, see `budget`.)
+    if budget::on()
+        && let Some(get_state) = functions.dlssg_get_state
+    {
+        let amount = if wanted != 0 { wanted } else { framegen_on_amount() };
+        framegen_estimate(get_state, &planes, amount.max(2) - 1);
+    }
+    let on = on && wanted != 0 && !budget::held_back(crate::host::now_ms(), || crate::host::host().and_then(|h| h.video_memory_os()));
     let times = if on { wanted } else { 0 };
     if on != calls.framegen_on || times != calls.framegen_times {
         let mut options = abi::DlssgOptions::new(if on { abi::DLSSG_ON } else { abi::DLSSG_OFF });
@@ -1959,20 +2018,38 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         options.num_frames_to_generate = generated;
         FG_TIMES.store(generated + 1, Relaxed);
         options.flags = abi::DLSSG_RETAIN_RESOURCES_WHEN_OFF;
-        options.num_back_buffers = 2;
+        options.num_back_buffers = crate::host::BUFFERS;
         options.color_width = planes.size[0];
         options.color_height = planes.size[1];
         options.on_error_callback = Some(present_error);
+        let used_before = if on && budget::on() { crate::host::host().and_then(|h| h.video_memory_os()) } else { None };
         // SAFETY: filled options for viewport 0, on the presenting thread.
         let code = unsafe { set_options(&viewport, &options) };
         tracing::info!(frame, on, times = generated + 1, code, result = abi::result_name(code), "DLSS Frame Generation switched");
         // 39, "warning: out of VRAM": the options are set all the same, with the card's memory
         // past its budget. Taken as set: asked again at every present (1,828 times in one
         // run, after the menu's 3X on a full 12 GB card) it showed no generated frame at all.
-        if code == 39 {
-            tracing::warn!(times = generated + 1, "DLSS Frame Generation is on with the card's memory past its budget: frames may come unevenly (the launcher leaves it room when it is on from the start)");
+        if code == 39 && on && budget::on() {
+            // Taken as set, it showed no generated frame at all (above): off again at once, without
+            // keeping what it made, the room backed off, and asked again after a wait.
+            let mut off = abi::DlssgOptions::new(abi::DLSSG_OFF);
+            off.num_back_buffers = crate::host::BUFFERS;
+            off.color_width = planes.size[0];
+            off.color_height = planes.size[1];
+            off.on_error_callback = Some(present_error);
+            // SAFETY: filled options for viewport 0, on the presenting thread.
+            unsafe { set_options(&viewport, &off) };
+            budget::out_of_vram(crate::host::now_ms(), crate::host::host().and_then(|h| h.video_memory_os()), generated + 1);
+            calls.framegen_on = false;
+            calls.framegen_times = 0;
+            FG_PER.store(1, Relaxed);
+        } else if code == 39 {
+            tracing::warn!(times = generated + 1, "DLSS Frame Generation is on with the card's memory past its budget: frames may come unevenly (the launcher leaves it room when it is on from the start; VICTORY_FRAMEGEN_BUDGET does)");
         }
-        if code == 0 || code == 39 {
+        if code == 0 && on && budget::on() {
+            budget::switched_on(used_before.map_or(0, |m| m[1]));
+        }
+        if code == 0 || (code == 39 && !(on && budget::on())) {
             calls.framegen_on = on;
             // What was asked (the driver may give fewer): not set again until that changes.
             calls.framegen_times = times;
@@ -1995,6 +2072,12 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             } else {
                 "240 presents with frame generation on later"
             });
+            if presents == 240
+                && budget::on()
+                && let Some([_, used, ..]) = host.video_memory_os()
+            {
+                budget::measured(used);
+            }
         }
     } else {
         FG_OFF.fetch_add(1, Relaxed);
@@ -2152,6 +2235,8 @@ pub(crate) fn resizing() {
     }
     let Some(set_options) = FUNCTIONS.get().and_then(|f| f.dlssg_set_options) else { return };
     let mut calls = calls();
+    // (Off without keeping its resources: the buffers are made again at the new size.)
+    budget::fg_held(false);
     if calls.framegen_on {
         let options = abi::DlssgOptions::new(abi::DLSSG_OFF);
         let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
@@ -2160,6 +2245,31 @@ pub(crate) fn resizing() {
         calls.framegen_on = false;
         calls.framegen_times = 0;
         FG_PER.store(1, Relaxed);
+    }
+}
+
+/// `budget` (the system's, for this process) less what DLSS and frame generation will take and do not
+/// hold yet, and the back-off after an out-of-VRAM answer ([`budget`]); `budget` itself with the
+/// switch off. What the texture room and the rest of the layer count the card's memory against.
+pub(crate) fn effective_budget(os_budget: u64) -> u64 {
+    if !budget::on() {
+        return os_budget;
+    }
+    budget::effective(os_budget, reserved())
+}
+
+/// What is kept of the budget now ([`budget::reserved`]).
+fn reserved() -> u64 {
+    // (Frame generation's from the device hand-over on: its swap chain is made at the first present, and
+    // a failure of it clears FG_READY.)
+    budget::reserved(FG_READY.load(Acquire), DLSS_READY.load(Acquire))
+}
+
+/// The line of the memory kept for DLSS and frame generation, beside the vram line (nothing without
+/// `VICTORY_FRAMEGEN_BUDGET`).
+pub(crate) fn budget_line(os_budget: u64) {
+    if budget::on() {
+        budget::log(FG_READY.load(Acquire), DLSS_READY.load(Acquire), effective_budget(os_budget), os_budget);
     }
 }
 
@@ -2465,6 +2575,22 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_switch_tests {
+    use super::budget_asked;
+
+    #[test]
+    fn the_budget_is_on_with_frame_generation_unless_it_is_turned_off() {
+        assert!(budget_asked(None, true));
+        assert!(budget_asked(Some("auto"), true));
+        assert!(!budget_asked(None, false));
+        assert!(!budget_asked(Some("auto"), false));
+        assert!(!budget_asked(Some("0"), true));
+        assert!(!budget_asked(Some(" OFF "), true));
+        assert!(budget_asked(Some("1"), false), "also with DLSS alone");
     }
 }
 

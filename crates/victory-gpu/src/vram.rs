@@ -404,6 +404,7 @@ pub(crate) fn log() {
         TRIMMED[1].load(Ordering::Relaxed) / MB,
     );
     census::log(parts.used);
+    crate::streamline::budget_line(parts.budget);
     os::start(host);
     os::log(
         parts.used,

@@ -36,8 +36,6 @@
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
-use windows::Win32::Graphics::Direct3D12::*;
-
 use super::*;
 use crate::indirect::batch::{self, SLOT};
 
@@ -154,6 +152,7 @@ fn varying_into(layout: &[(u32, u32)], head: &[u32], vary: &[Option<(u32, u32)>]
 }
 
 /// [`varying_into`] in a new vector.
+#[cfg(test)]
 pub(crate) fn varying(layout: &[(u32, u32)], head: &[u32], vary: &[Option<(u32, u32)>], call: &[u32]) -> Vec<Option<(u32, u32)>> {
     let mut out = Vec::with_capacity(vary.len());
     varying_into(layout, head, vary, call, &mut out);
@@ -171,7 +170,7 @@ pub(crate) fn command_words(layout: &[(u32, u32)], call: &[u32], ranges: &[(u32,
     let mut words = Vec::with_capacity(width(ranges) as usize);
     let mut at = 0usize;
     for &(param, dwords) in layout {
-        for &(p, first, count) in ranges.iter().filter(|r| r.0 == param) {
+        for &(_, first, count) in ranges.iter().filter(|r| r.0 == param) {
             words.extend_from_slice(&call[at + first as usize..at + (first + count) as usize]);
         }
         at += dwords as usize;

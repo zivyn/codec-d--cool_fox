@@ -265,17 +265,31 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// shortcut: copies between such a target and a texture the title fills
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
+///
+/// `VICTORY_R11G11B10_AS_F16=1` (BAND2, off): the same for R11G11B10_FLOAT (26), which every
+/// host GPU renders to and writes, so the host is not refusing it. The indirect light keeps
+/// its volumes in that format and writes each one back over itself every frame through
+/// filters; how a GPU rounds a float to 11 and 10 bits (D3D leaves it open: truncation is
+/// allowed) decides whether such a loop holds its values or sheds a unit in the last place
+/// a frame. 16-bit float RGBA stands in: more mantissa than either, rounded to nearest.
 pub(crate) fn target_format(format: u32) -> u32 {
-    const STAND_INS: [(u32, u32); 3] = [(86, 28), (115, 28), (67, 10)];
+    const STAND_INS: [(u32, u32); 4] = [(86, 28), (115, 28), (67, 10), (26, 10)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;
     };
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::*;
-        static REFUSED: std::sync::OnceLock<[bool; 3]> = std::sync::OnceLock::new();
+        static REFUSED: std::sync::OnceLock<[bool; 4]> = std::sync::OnceLock::new();
         let refused = REFUSED.get_or_init(|| {
             STAND_INS.map(|(f, to)| {
+                if f == 26 {
+                    let asked = crate::switch::on("VICTORY_R11G11B10_AS_F16");
+                    if asked {
+                        tracing::info!(format = f, stand_in = to, "VICTORY_R11G11B10_AS_F16: R11G11B10 targets and volumes are made in 16-bit float RGBA");
+                    }
+                    return asked;
+                }
                 let Some(host) = crate::host::host() else {
                     return false;
                 };

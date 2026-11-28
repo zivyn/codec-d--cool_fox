@@ -385,7 +385,7 @@ mod tests {
     #[test]
     fn leaving_pitch_one_leaves_no_seam() {
         let (frames, mut p) = (960, Pitcher::new(1, 1.0));
-        let mut out = Vec::new();
+        let mut out: Vec<f32> = Vec::new();
         let mut edges = Vec::new();
         for b in 0..30 {
             let input = tone(700.0, b * frames, frames, 1);

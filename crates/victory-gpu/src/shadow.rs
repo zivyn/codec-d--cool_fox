@@ -4851,7 +4851,11 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let tick = crate::watch::tick();
-        self.copy(from, to);
+        if crate::echo::on() && self.quiet_able(from, to) && !crate::host::upcheck::on() {
+            self.copy_differing(from, to);
+        } else {
+            self.copy(from, to);
+        }
         if self.quiet_able(from, to) {
             *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) = Some((from, to, tick));
         }
@@ -5056,9 +5060,15 @@ impl Shadow {
             return false;
         }
         let Some((a, b, tick)) = *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) else {
+            crate::echo::skip_refused(0);
             return false;
         };
-        if a > from || to > b || !crate::watch::quiet_since(from, to, tick) {
+        if a > from || to > b {
+            crate::echo::skip_refused(1);
+            return false;
+        }
+        if !crate::watch::quiet_since(from, to, tick) {
+            crate::echo::skip_refused(2);
             return false;
         }
         const WINDOW: usize = 256 << 10;
@@ -5074,6 +5084,7 @@ impl Shadow {
             let held = unsafe { std::slice::from_raw_parts(self.data.add(at - self.start as usize).cast_const(), n) };
             crate::host::read_into(at as *const u8, title) && title[..] == *held
         });
+        crate::echo::skip_refused(if same { 4 } else { 3 });
         if !same {
             *self.quiet.lock().unwrap_or_else(|e| e.into_inner()) = None;
             static SAID: AtomicU64 = AtomicU64::new(0);
@@ -5431,6 +5442,48 @@ impl Shadow {
                 at += n;
             }
         });
+        to - from
+    }
+
+    /// [`Shadow::copy`] of a long range of a copy in a heap the title's CPU cannot write: only the 4 KiB blocks that
+    /// differ from the CPU side are stored and noted for the card (`VICTORY_QUIET_COMPARE`, [`crate::echo`]).
+    fn copy_differing(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let held = self.data as usize;
+        let parts = (to - from).div_ceil(crate::echo::PART);
+        let found = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let sink = found.clone();
+        wide_each(parts, move |i| {
+            let (lo, hi) = (from + i * crate::echo::PART, (from + (i + 1) * crate::echo::PART).min(to));
+            let mut runs = Vec::new();
+            // SAFETY: inside the copy's mapping, which nothing else reads or writes there (no shader's range holds it
+            // and the parts of a refresh lie apart).
+            unsafe {
+                crate::echo::take_differing(
+                    &|address, buffer| crate::host::read_into(address as *const u8, buffer),
+                    &|address, dst, n| crate::host::copy_mapped(dst, address as *const u8, n, false),
+                    (held + (lo - start)) as *mut u8,
+                    lo,
+                    hi,
+                    lo - start,
+                    &mut runs,
+                );
+            }
+            sink.lock().unwrap_or_else(|e| e.into_inner()).extend(runs);
+        });
+        let mut runs = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+        // (The parts finish in any order.)
+        runs.sort_unstable();
+        let runs = joined(runs);
+        for &(a, b) in &runs {
+            self.changed(a, b);
+        }
+        crate::echo::note(to - from, runs.iter().map(|r| r.1 - r.0).sum());
+        self.card_changed_runs(runs.into_iter());
         to - from
     }
 

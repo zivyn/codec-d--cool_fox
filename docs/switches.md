@@ -326,7 +326,7 @@ translation of shaders.
 | `VICTORY_BVH_TRACE` | off | flag |  |  | diag | Logs the sizes the structure builder is asked for and when title memory has them. |
 | `VICTORY_CACHE_DIR` | n/a | path |  |  |  | Folder for the shader and other caches; overrides the config file's cache_dir. |
 | `VICTORY_CAPTURE` | off | path |  |  | diag | Folder where frames are captured, the base for most VICTORY_CAPTURE_* settings. |
-| `VICTORY_CAPTURE_BUFFER_WORDS` | off (0) | number |  |  | diag | Lists non-zero dwords of raw title buffers up to this many bytes in the frame listing. |
+| `VICTORY_CAPTURE_BUFFER_WORDS` | off (0) | number |  |  | diag | Lists non-zero dwords of raw title buffers, and of buffer views (shader and unordered access) of that many bytes or fewer, in the frame listing. |
 | `VICTORY_CAPTURE_CBV` | off | list |  |  | diag | Program hashes whose constant buffers the frame listing prints whole. |
 | `VICTORY_CAPTURE_CBV_WORDS` | off (0) | number |  |  | diag | Also prints the first n words of constant buffers as hex in the frame listing. |
 | `VICTORY_CAPTURE_FRAMES` | off | list |  |  | diag | Comma-separated frame numbers to capture, besides the power-of-two frames. |

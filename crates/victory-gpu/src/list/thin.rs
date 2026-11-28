@@ -1495,6 +1495,52 @@ const MINE: [(usize, *const ()); 54] = [
 mod tests {
     use super::*;
 
+    /// Work of ours (`super::external`) is written down as one word of a
+    /// stream (a box), under an op no call of the title has, and is taken out
+    /// of it once: dropped unrun if nothing runs it.
+    #[test]
+    fn external_work_is_one_boxed_word_taken_out_once() {
+        use std::sync::atomic::AtomicUsize;
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Relaxed);
+            }
+        }
+        let (dropped, ran) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let make = || -> super::super::External {
+            let guard = Counted(dropped.clone());
+            let ran = ran.clone();
+            Box::new(move |_| {
+                let _kept = &guard;
+                ran.fetch_add(1, Relaxed);
+                true
+            })
+        };
+        let mut f = Front::default();
+        f.recording = Some(Arc::new(Recording::new(0)));
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
+        f.put(Plain::TOPOLOGY as u64, &[4]);
+        f.put(EXTERNAL, &[Box::into_raw(Box::new(make())) as u64]);
+        let w = std::mem::take(&mut f.words);
+        assert_eq!((w[0] & 0xffff, w[0] >> 16), (EXTERNAL, 1));
+        assert_eq!((w[2] & 0xffff, w[2] >> 16), (Plain::TOPOLOGY as u64, 1));
+        assert_eq!((w[4] & 0xffff, w[4] >> 16), (EXTERNAL, 1));
+        // The op is none of the others'.
+        for other in [RESET, CLOSE, UPLOAD, BARRIER, BARRIER_GROUPS, VIEWPORTS, SCISSORS, BLEND_FACTOR, HEAPS, COMPUTE_CONSTANTS, GRAPHICS_CONSTANTS, INDEX_BUFFER, VERTEX_BUFFERS, TARGETS, CLEAR_RTV, CLEAR_DSV, COPY_TEXTURE, CLEAR_UAV] {
+            assert_ne!(other, EXTERNAL);
+        }
+        assert_eq!(class(EXTERNAL), super::super::lazy::Class::Opaque);
+        // Taken out as `translate` does: each box once.
+        for at in [1, 5] {
+            // SAFETY: made above by `Box::into_raw`, named once.
+            let work = *unsafe { Box::from_raw(w[at] as *mut super::super::External) };
+            drop(work);
+        }
+        assert_eq!((ran.load(Relaxed), dropped.load(Relaxed)), (0, 2));
+        f.recording = None;
+    }
+
     /// The title's queue is noted on the list of ours a recording goes to, whichever comes first: the submission
     /// (the list is not given yet, it takes the kind when it is) or the translating (the list is there, the
     /// submission tells it). A list used before for another queue does not keep that queue's kind.

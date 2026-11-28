@@ -509,7 +509,8 @@ impl Sim<'_> {
             if let Some((after, who)) = &self.kill
                 && self.passed == *after
             {
-                for t in who.clone().filter(|&t| t < ts.len()) {
+                let n = ts.len();
+                for t in who.clone().filter(|&t| t < n) {
                     ts[t].state = State::Done;
                 }
             }

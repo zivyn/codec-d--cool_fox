@@ -396,3 +396,65 @@ fn the_guard_keeps_the_stores_and_ends_a_wait_for_threads_that_are_gone() {
     }
     assert!(tried >= 2, "only {tried} shapes were lowered in the kept skips' form with and without the guard");
 }
+
+/// On the card (they lose it if the hardware hangs on what they test: run them one at a time, and
+/// not on a machine whose picture matters).
+#[cfg(windows)]
+mod on_the_card {
+    use super::*;
+    use crate::emit::host::{Dispatch, Host, Root, View};
+
+    fn run(shader: &HostShader, host: &Host, below: u32, groups: u32) -> Result<Option<Vec<u32>>, String> {
+        let Ok((root, pso)) = host.compute_pipeline(shader) else {
+            return Ok(None);
+        };
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = below;
+            }
+        }
+        let out = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &[View::RawUav(128)], samplers: &[], groups: [groups, 1, 1] },
+        )?;
+        Ok(Some(out[0][..128].to_vec()))
+    }
+
+    /// Whether the hardware finishes a group whose halves do not pass the same barriers: the shapes
+    /// whose lanes need different rounds (a loop with group barriers in it that one half leaves
+    /// before the other) in each form they take, with every number of lanes in the branch, in one
+    /// group and in many. A dispatch that does not finish (device removed) fails the test and says
+    /// the shape, the form and the number of lanes.
+    #[test]
+    #[ignore = "can lose the card: the hardware's answer to a barrier the other half never reaches"]
+    fn the_shapes_whose_halves_pass_different_barriers_finish_on_the_card() {
+        let _one = super::super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        for shape in shapes() {
+            let native = lane_branch(shape.0, shape.1, 64, shape.2);
+            for mode in [Mode::Classes, Mode::Off] {
+                let (result, form, module) = lowered(&native, mode, None);
+                let (Ok(shader), Some(module)) = (result, module) else { continue };
+                let audit = module.audit_barriers();
+                for below in [64u32, 48, 33, 32, 31, 16, 1, 0] {
+                    for groups in [1u32, 4096] {
+                        match run(&shader, &host, below, groups) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => return,
+                            Err(e) => panic!(
+                                "{shape:?} {form:?} {mode:?}, {below} lanes, {groups} groups: {e} (audit: {})",
+                                audit.describe()
+                            ),
+                        }
+                    }
+                }
+                eprintln!("{shape:?} {form:?} {mode:?}: finished on the card (audit: {})", audit.describe());
+            }
+        }
+    }
+}

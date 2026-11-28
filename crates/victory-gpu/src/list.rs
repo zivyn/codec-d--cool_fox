@@ -213,10 +213,11 @@ impl Detached {
     }
 }
 
-/// A host list that has run and waits to be used again, and the bytes of
-/// upload memory it keeps.
+/// A host list that has run and waits to be used again, the bytes of
+/// upload memory it keeps, and whether it was closed when it was put away
+/// (`VICTORY_CLOSED_IDLE`; else it is open, as a reset leaves it).
 #[cfg(windows)]
-struct Idle(crate::host::HostList, u64);
+struct Idle(crate::host::HostList, u64, bool);
 
 // SAFETY: D3D12 objects are free-threaded, and an idle list is touched by
 // nobody until it is taken out again.
@@ -250,22 +251,58 @@ fn pools() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
 }
 
-/// A host list open for recording: one that has run, as a title's list is
-/// after its reset, or a new one.
+/// Whether a list that has run is closed after its reset when it is put away
+/// (`VICTORY_CLOSED_IDLE=1`; off by default).
+///
+/// A submission takes the host side of each of its lists (about 215 a frame)
+/// and gives the title's list a new one, closed, for the title's reset to
+/// open (`detach`): the close of a list, 12 us each, 2.7 ms a frame of the
+/// submitting thread's. The lists are reset and put away by the thread that
+/// lands the flights (`recycle`), nearly all of them (1,025 of 1,263 in a
+/// timeline): closed there, they are taken closed, and the thread that
+/// submits does not close them. A list taken to record (a part cut at a wait)
+/// that was put away closed is reset again, on the thread that cuts.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+fn closed_idle() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: each list says whether it is closed, and
+    // whoever takes one makes it as it wants it.)
+    crate::ab::live_flag!("VICTORY_CLOSED_IDLE")
+}
+
+/// Takes from `idle` the last that is closed (`want`) or open, else the last
+/// there is: whoever takes it makes it as it wants it.
+#[cfg(windows)]
+fn pick_idle<T>(idle: &mut Vec<T>, closed: impl Fn(&T) -> bool, want: bool) -> Option<T> {
+    match idle.iter().rposition(|i| closed(i) == want) {
+        Some(at) => Some(idle.remove(at)),
+        None => idle.pop(),
+    }
+}
+
+/// A host list for the title's list to take, or to record into: one that has
+/// run, as a title's list is after its reset, or a new one. `closed`: closed (a
+/// title's list that is not recording is, until its reset), else open.
+#[cfg(windows)]
+fn fresh_list(closed: bool) -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
-        if let Some(Idle(_, bytes)) = &taken {
+        let taken = pick_idle(&mut idle.0, |i| i.2, closed);
+        if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
         taken
     };
-    match idle {
-        Some(Idle(list, _)) => Some(list),
-        None => crate::host::host().and_then(|h| h.new_list().ok()),
+    let (list, is_closed) = match idle {
+        Some(Idle(list, _, is_closed)) => (list, is_closed),
+        None => (crate::host::host().and_then(|h| h.new_list().ok())?, false),
+    };
+    match (closed, is_closed) {
+        (true, false) => list.close(),
+        // (Open again as a title's reset leaves it: the list has run and is empty.)
+        (false, true) => list.reset(),
+        _ => {}
     }
+    Some(list)
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -287,10 +324,15 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
+        // (Closed here, by the thread that lands, and not by the one that submits when the list is taken.)
+        let closed = closed_idle();
+        if closed {
+            host.close();
+        }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
+            idle.0.push(Idle(host, bytes, closed));
             idle.1 += bytes;
         }
     }
@@ -328,7 +370,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list() else {
+    let Some(fresh) = fresh_list(false) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -405,12 +447,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it closed.
+        let Some(fresh) = fresh_list(true) else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -477,12 +517,10 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it closed.
+        let Some(fresh) = fresh_list(true) else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
@@ -2325,7 +2363,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list() else {
+        let Some(fresh) = fresh_list(false) else {
             return;
         };
         current.close();
@@ -2554,5 +2592,25 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::pick_idle;
+
+    /// A list is taken in the state it is wanted in if one is put away so, the
+    /// most recent of them; else the most recent, to be made as it is wanted.
+    #[test]
+    fn the_last_list_in_the_state_wanted_is_taken_else_the_last() {
+        // (A number, whether it is closed.)
+        let mut idle = vec![(1, true), (2, false), (3, true), (4, false)];
+        assert_eq!(pick_idle(&mut idle, |i| i.1, true), Some((3, true)));
+        assert_eq!(idle, [(1, true), (2, false), (4, false)]);
+        assert_eq!(pick_idle(&mut idle, |i| i.1, false), Some((4, false)));
+        assert_eq!(pick_idle(&mut idle, |i| i.1, false), Some((2, false)));
+        // None open is left: the last there is, closed.
+        assert_eq!(pick_idle(&mut idle, |i| i.1, false), Some((1, true)));
+        assert_eq!(pick_idle(&mut idle, |i| i.1, true), None);
     }
 }

@@ -96,6 +96,7 @@ impl Front {
         self.closed = false;
         self.submitted = false;
         self.priced.clear();
+        crate::pipeline::ahead(pipeline);
         self.put(RESET, &[pipeline as u64]);
     }
 
@@ -503,7 +504,7 @@ plain! {
     GRAPHICS_CONSTANT graphics_constant = state::graphics_constant, (slot: u32, value: u32, offset: u32);
     COMPUTE_VIEW compute_view = state::compute_view, (slot: u32, address: u64);
     GRAPHICS_VIEW graphics_view = state::graphics_view, (slot: u32, address: u64);
-    SET_PIPELINE set_pipeline = super::set_pipeline, (pipeline: This);
+    SET_PIPELINE set_pipeline_put = super::set_pipeline, (pipeline: This);
     DRAW draw = state::draw, (vertices: u32, instances: u32, first: u32, first_instance: u32);
     DRAW_INDEXED draw_indexed = state::draw_indexed, (indices: u32, instances: u32, first: u32, base: i32, first_instance: u32);
     DISPATCH dispatch = state::dispatch, (x: u32, y: u32, z: u32);
@@ -524,6 +525,16 @@ plain! {
     SYNC sync = super::sync, (flags: u32, control: u32, address: u64, size: u64);
     BEGIN_QUERY begin_query = super::query_begin, (heap: This, kind: u32, index: u32);
     END_QUERY end_query = super::query_end, (heap: This, kind: u32, index: u32);
+}
+
+/// A bind of a pipeline, on the title's thread: the host pipeline is asked for
+/// here, as the call is written down, and not when a thread of ours reaches it in
+/// the stream (`VICTORY_PIPELINE_AHEAD`): that thread waits for each program a
+/// dispatch needs before it reads the next call, so the programs a list binds were
+/// made one after another.
+extern "system" fn set_pipeline(this: This, pipeline: This) {
+    crate::pipeline::ahead(pipeline);
+    set_pipeline_put(this, pipeline);
 }
 
 const fn after(n: u64) -> u64 {

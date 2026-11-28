@@ -627,6 +627,27 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The title binds `this` (its thread, as the call is made: the list's words
+/// are translated later by threads of ours, which wait for each program before
+/// reading the next call): its host pipeline is asked for now, so that all that a
+/// list binds are made at once and not one when the call before it was
+/// (`VICTORY_PIPELINE_AHEAD`, see `make::ahead`).
+#[cfg(windows)]
+pub(crate) fn ahead(this: This) {
+    if this.is_null() {
+        return;
+    }
+    let p = pipeline(this);
+    // (The structure builder's programs are made when it runs, the skinning left out never.)
+    if p.builder || p.bvh_skin {
+        return;
+    }
+    make::ahead(&p.host);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn ahead(_: This) {}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {

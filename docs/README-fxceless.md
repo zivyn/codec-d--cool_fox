@@ -66,7 +66,7 @@ What did it, on top of the list below:
   the runs before made 1, and the processor no longer compares 550 to
   710 MB a frame looking for shader writes (25 MB now).
 - Levels on demand ran on the card for the first time
-  (`VICTORY_LEVELS_ON_DEMAND=1`, still off by default; with the fixes of
+  (`VICTORY_LEVELS_ON_DEMAND=1`, still off by default then, on by default since 2026-11-27 (`defaults.rs`); with the fixes of
   pull request #747 by AscilCH): 3.1 GB of the card not allocated for
   texture levels the title does not hold, no device loss.
 - Guarded blocks under storage writes are opened by default; 14 more
@@ -91,7 +91,7 @@ Memory sync between the title's memory and the copies on the card:
 - Writes of the storage layer into physical pages are counted where the title
   has those pages mapped (10,000 to 50,000 guarded blocks of copies lay under
   them in every run) and can open the guards there:
-  `VICTORY_PAGE_WRITES=guards` (off by default; `1`, `slots`, `all` do more).
+  `VICTORY_PAGE_WRITES=guards` (off by default then; today unset reads as `guards`, on, and `=0` only counts; `1`, `slots`, `all` do more).
 - Failed page-destination reads are retried (`VICTORY_DSTORAGE_RETRIES=0` = as before).
 
 Card memory (the test card is full from the first frame of the world: 85 to
@@ -105,7 +105,7 @@ use):
 - Refused texture slots are held back for a few seconds so that a pass
   reaches the slots behind them (`VICTORY_FULL_CARD_PASS=0` = as before);
   room can be kept for the card copies of title buffers
-  (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`, off).
+  (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`, off then; on today unless `=0`).
 
 Tools and diagnostics:
 - `victory translate <shader file> --warm all --jobs N` translates every
@@ -114,7 +114,7 @@ Tools and diagnostics:
   build that does not touch the translator starts warm.
 - Counters, all off or diagnostics-only: `VICTORY_MERGE_RACE=1` (title bytes
   a copy-back is about to put back to older values: none found in 138,000
-  copy-backs), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
+  copy-backs; the switch is gone from the code), `VICTORY_WALLS_TRACE`, `VICTORY_CARD_ACCOUNTING`, and a census
   of the copies the texture sweep never lets go.
 
 ### What this fork changed (summary)
@@ -304,7 +304,8 @@ A release build has no debugging aids. Build them in with
 cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
 ```
 
-The on/off switches below (`...=1`) are off when unset or set to `0`.
+The on/off switches below (`...=1`) are off when unset or set to `0`, except the ones written `...=0`, which are on by default.
+This table is a selection: every `VICTORY_*` variable, with its default, is in [switches.md](switches.md).
 
 | Variable | Effect |
 |----------|--------|
@@ -339,8 +340,9 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | diagnostics build only: translated shader loops of every stage stop after `n` iterations per lane instead of the stage's own limit (pixel 128, vertex and mesh 256, compute 4096; any `n`, 2^20 included, replaces them; own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_LOOP_LIMITS=<entry>,...` | the limit of the loops that are really that long (see `VICTORY_LOOP_NOTES=1`, which names the loops cut at their limit, and `VICTORY_LOOP_WHY=1`, which lists the loops of each program): `cs=<n>` / `ps=` / `vs=` / `ms=` for a stage, `<hash>=<n>` for every loop of a program, `<hash>:<loop>=<n>` for one loop (`<hash>` the first 4-7 hex digits of the program's hash, `<n>` decimal, `0x` hex or `<n>k`, at most 2^20); the most specific entry wins; off unless set (own shader cache entries) |
 | `VICTORY_HALF_EXIT=0` | (on by default since 2026-11-28: on the RTX, DefragHeap's loop cut went from 7.78 ms to under 0.5 ms with an identical picture; `=0` is the A/B) a console wave64 run as two host waves of 32 (NVIDIA) whose loop reads the first lane in every round (a waterfall, a scalarisation loop): the half that has no lane left clears its exchange dword on the way out, and a first-lane read in a loop asks both halves which has a lane instead of taking lane 0's; without it the half that finishes later reads the other's last words, matches nothing and runs to the loop's limit, its lanes leaving as killed (own shader cache entries; groups of more than 64 threads are not covered) |
-| `VICTORY_KEEP_LOOP_SKIPS=0` | (on by default since 2026-11-28: on the RTX the alias copy went from 19.1 to 1.9 ms under instrumentation and the GPU commands from 166.7 to 140.2 ms, no errors, an identical picture; `=0` is the A/B) keeps an `s_cbranch_execz` over a region that holds a loop: a wave with no lane left skips the loop, as the console does; without it its lanes walk the region with EXEC clear, and a loop whose exit reads a scalar from a lane that holds nothing (a table walk ending on `v_readlane` of lane 63, a waterfall) runs to its iteration limit in every such wave (own shader cache entries) |
-| `VICTORY_LOCAL_EXIT=1` | a console wave64 program that translates only as two host waves of 32 that each run as a wave of their own (the approximate "any mask" form) and has a loop over the lanes left in a mask (a decal list walked bit by bit, a waterfall): the branches that leave the loop are taken by the host wave together, as the console takes them for its wave; without it each lane leaves on its own bit, a lane outside the loop's mask never meets the branch and goes round until the loop's limit (then it leaves as killed and what the code after the loop writes for it is lost), and the code after the loop that reads other lanes runs with the lanes that have left so far (own shader cache entries) |
+| `VICTORY_KEEP_LOOP_SKIPS=0` | (on by default since 2026-11-28: on the RTX the alias copy went from 19.1 to 1.9 ms under instrumentation and the GPU commands from 166.7 to 140.2 ms, no errors, an identical picture; `=0` is the A/B) keeps an `s_cbranch_execz` over a region that holds a loop: a wave with no lane left skips the loop, as the console does; without it its lanes walk the region with EXEC clear, and a loop whose exit reads a scalar from a lane that holds nothing (a table walk ending on `v_readlane` of lane 63, a waterfall) runs to its iteration limit in every such wave (own shader cache entries; since the form fix of 2026-11-28 it moves no program out of the form it had without it unless `VICTORY_KEPT_SKIPS_WIDE` is on) |
+| `VICTORY_KEPT_SKIPS_WIDE=1` | (off by default in integ/validation-23; the code of integ/validation-22 had it on for the safe classes: `=0` off, `=all` every class) with `VICTORY_KEEP_LOOP_SKIPS`, the skips and early-outs over loops of a program that has to be retried are kept and taken wave-wide, where no group barrier can be met by half of a group (class a: no barrier in the guarded block; class b: a barrier whose condition is the same in every wave of the group). It is the form that gave the defragmentation pass's loop cut (7.78 -> under 0.5 ms), and the form the title lost the card in while loading (2 of about 4 starts with it on, 0 of about 7 with it off); 91 of its 116 programs have a group barrier behind a divergent branch. In the shader cache key |
+| `VICTORY_LOCAL_EXIT=1` | a console wave64 program that translates only as two host waves of 32 that each run as a wave of their own (the approximate "any mask" form) and has a loop over the lanes left in a mask (a decal list walked bit by bit, a waterfall): the branches that leave the loop are taken by the host wave together, as the console takes them for its wave; without it each lane leaves on its own bit, a lane outside the loop's mask never meets the branch and goes round until the loop's limit (then it leaves as killed and what the code after the loop writes for it is lost), and the code after the loop that reads other lanes runs with the lanes that have left so far (own shader cache entries; `=2` also takes the broader forms. The RTX test passes since the 2026-11-28 fix, 64 of 64 lanes store against 40 of 64 without it, but the blocky hair is no better with it: off) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

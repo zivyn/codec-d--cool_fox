@@ -224,6 +224,8 @@ fn a_skip_over_a_loop_that_never_ends_with_no_lane_left_stays_when_asked() {
 /// console no lane runs. Then every lane that is left stores `lds[0]` at its own place.
 fn first_thread_init_after_the_first_thread_left() -> crate::native::NativeProgram {
     let words = [
+        0xD760_0006, // v_readlane_b32 s6, v0, 5 (a lane read: the program is one that needs the console's lanes,
+        0x0001_0B00, // which is what makes a branch of it one the host wave can take wave-wide)
         0x7E0C_0280, // v_mov_b32 v6, 0
         0x7E12_02FF, // v_mov_b32 v9, lit
         0x0000_DEAD,

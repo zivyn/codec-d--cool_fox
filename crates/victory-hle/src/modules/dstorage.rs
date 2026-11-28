@@ -731,7 +731,7 @@ pub(crate) mod stream_log {
 
     pub(crate) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_LOG").is_some())
+        *ON.get_or_init(|| victory_gpu::env_on("VICTORY_DSTORAGE_LOG"))
     }
 
     /// Milliseconds since the Unix epoch.

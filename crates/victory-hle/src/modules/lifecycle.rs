@@ -312,7 +312,7 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
 
 /// Runs the constrained-change routines (constrained), then the suspend
 /// routines (quiesced), as the console does when it suspends a title.
-/// Grand Theft Auto VI's suspend routine waits for a state that only its
+/// The title's suspend routine waits for a state that only its
 /// constrained routine brings about; called alone it never returns.
 fn constrain_then_suspend(constrain: &[Registration], suspend: &[Registration]) {
     for &(_, routine, context) in constrain.iter().chain(suspend) {

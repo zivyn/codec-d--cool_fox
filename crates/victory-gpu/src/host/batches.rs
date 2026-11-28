@@ -3,8 +3,8 @@
 use super::*;
 
 /// Whether a title buffer copy that continues the one recorded before it
-/// in its list becomes one step with it (`VICTORY_JOIN_COPIES=1`; off by
-/// default).
+/// in its list becomes one step with it (`VICTORY_JOIN_COPIES=1`, on by
+/// default through `defaults.rs`; any other value turns it off).
 ///
 /// Each copy is done at submission through the kernel, which reports a
 /// page that is not there instead of faulting (`copy_mapped`), tells the
@@ -187,7 +187,7 @@ pub(super) fn ahead_of_writes() -> bool {
 
 /// Whether everything a submission refreshes is brought up to date in one go,
 /// on several threads, ahead of its steps (`VICTORY_REFRESH_FRONT=1`, and with
-/// `VICTORY_JOIN_PARTS`, which needs it; else in groups where the steps ask
+/// more than one joined part, `VICTORY_JOIN_PARTS`, 8 by default, which needs it; else in groups where the steps ask
 /// for it). Measured on its own at nothing (run submit-1: refreshes 17.1 ms a
 /// frame without, 18.3 with).
 ///

@@ -97,6 +97,8 @@
 
 #[cfg(all(test, windows))]
 mod bench_tests;
+#[cfg(test)]
+mod fingerprint_tests;
 mod bitcode;
 mod container;
 mod denorm;
@@ -213,10 +215,11 @@ pub fn loop_limit_is_named() -> bool {
 }
 
 /// The switches that are on unless named `=0` and change the translation (`VICTORY_HALF_EXIT`,
-/// `VICTORY_KEEP_LOOP_SKIPS`), as the values in force: the shader cache keys on these, not on
-/// the text of the variables, so a cache made with the other default is never served.
-pub fn default_on_switches() -> [bool; 2] {
-    [lower::half_exit(), crate::ir::keep_loop_skips()]
+/// `VICTORY_KEEP_LOOP_SKIPS`), with the values in force: the shader cache keys on these, not on
+/// the text of the variables, so a cache made with the other default is never served. Each name
+/// comes with its value, so that no list of names has to be paired with this one.
+pub fn default_on_switches() -> [(&'static str, bool); 2] {
+    [("VICTORY_HALF_EXIT", lower::half_exit()), ("VICTORY_KEEP_LOOP_SKIPS", crate::ir::keep_loop_skips())]
 }
 
 /// `VICTORY_KEPT_SKIPS_WIDE` as the value in force (0 off, the default; 1 the safe classes; 2 all),
@@ -546,33 +549,81 @@ fn parse_set(value: Option<&str>, unset: u32, all: u32) -> u32 {
     parsed.map_or(unset, |n| n & all)
 }
 
-/// Everything a translation depends on besides the container: the
-/// translator's own source (hashed at build time), the value of every
-/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
-pub fn translation_fingerprint() -> Vec<u8> {
+/// The `VICTORY_*` names the translator's code reads that never change a translation, so that
+/// the cache key leaves them out: switches that only print (`*_WHY`, the census), paths of tools
+/// and the host's test harness, and the build-time list of switches. `fingerprint_tests` checks
+/// that each of them is read only where it does nothing to the code written.
+pub const NOT_THE_TRANSLATION: &[&str] = &[
+    "VICTORY_D3D12_DEBUG",
+    "VICTORY_DESC_WHY",
+    "VICTORY_DXIL",
+    "VICTORY_MASK_WHY",
+    "VICTORY_PC_DXC",
+    "VICTORY_REF_PS",
+    "VICTORY_REF_VS",
+    "VICTORY_SHADER_CENSUS",
+    "VICTORY_SHADER_SWITCHES",
+    "VICTORY_WARP",
+    "VICTORY_WAVE_WHY",
+];
+
+/// The switches the key holds by the value in force and not by the text of the variable
+/// ([`translation_fingerprint`], and [`host_settings`] for `VICTORY_RDNA_FLOAT`): the ones that are on unless
+/// `=0` ([`default_on_switches`]), the ones a number or a mode is made of, and the one that
+/// depends on the host's hardware. `fingerprint_tests` checks that each is in the key.
+pub const KEYED_BY_VALUE: &[&str] = &[
+    "VICTORY_GROUP_SYNC",
+    "VICTORY_HALF_EXIT",
+    "VICTORY_KEEP_LOOP_SKIPS",
+    "VICTORY_KEPT_SKIPS_WIDE",
+    "VICTORY_RDNA_FLOAT",
+    "VICTORY_SHADER_LOOP_LIMIT",
+    "VICTORY_SHADER_OPT",
+];
+
+/// The text of every switch of [`translation_fingerprint`], `get` being the environment.
+fn switch_texts(get: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
-    out.push(u8::from(cfg!(feature = "diagnostics")));
-    out.push(u8::from(cfg!(debug_assertions)));
     for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+        if NOT_THE_TRANSLATION.contains(&name) || KEYED_BY_VALUE.contains(&name) {
+            continue;
+        }
         out.extend_from_slice(name.as_bytes());
         out.push(b'=');
-        if let Some(value) = std::env::var_os(name) {
+        if let Some(value) = get(name) {
             out.extend_from_slice(value.as_encoded_bytes());
         }
         out.push(0);
     }
-    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
-    out.extend_from_slice(&lower::host_rdna().to_le_bytes());
-    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
-    out.extend_from_slice(&shader::raw_views().to_le_bytes());
-    out.extend_from_slice(&loop_limit().to_le_bytes());
-    out.push(u8::from(loop_limit_is_named()));
-    out.push(group_sync());
-    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out
+}
+
+/// Everything the environment makes of a translation besides the container: the text of every
+/// `VICTORY_*` switch the translator's code names (`build.rs` lists them, so a switch added to
+/// the code is in the key without being named anywhere else), except [`NOT_THE_TRANSLATION`] and
+/// [`KEYED_BY_VALUE`]; and the value in force of the latter ([`default_on_switches`], the form of
+/// the kept skips, the loop limit, the group barriers, the clean-up passes; `VICTORY_RDNA_FLOAT`
+/// is in [`host_settings`]). The shader cache keys on this and on [`host_settings`], which the
+/// device decides and which are read after it is made, beside the translator's own source. The
+/// environment does not change while the title runs: read it once and keep the bytes.
+pub fn translation_fingerprint() -> Vec<u8> {
+    let mut out = switch_texts(|name| std::env::var_os(name));
+    let mut value = |name: &str, bytes: &[u8]| {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        out.extend_from_slice(bytes);
+        out.push(0);
+    };
+    for (name, on) in default_on_switches() {
+        value(name, &[u8::from(on)]);
+    }
+    value("VICTORY_KEPT_SKIPS_WIDE", &[kept_skips_wide_code()]);
+    // (naming the default number is not naming none)
+    let mut limit = loop_limit().to_le_bytes().to_vec();
+    limit.push(u8::from(loop_limit_is_named()));
+    value("VICTORY_SHADER_LOOP_LIMIT", &limit);
+    value("VICTORY_GROUP_SYNC", &[group_sync()]);
+    value("VICTORY_SHADER_OPT", &shader_opt().to_le_bytes());
     out
 }
 
@@ -772,7 +823,7 @@ fn emit_forms(
     if form != Form::Original
         && native.stage == HwStage::Cs
         && native.wave64
-        && std::env::var_os("VICTORY_WAVE_WHY").is_some()
+        && crate::env_on("VICTORY_WAVE_WHY")
     {
         eprintln!("WAVE64-FORM-FINAL ~{} {}", code_digits(c), form.label());
     }
@@ -806,7 +857,7 @@ fn emit_forms_in(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
-        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let why = crate::env_on("VICTORY_WAVE_WHY");
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
@@ -1079,7 +1130,7 @@ fn emit_forms_in(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
+            let again = widen(c, native, p, crate::env_on("VICTORY_WAVE_WHY"), false);
             match again {
                 Ok(_) => {
                     *form_out = Form::LaneMaskWide;

@@ -972,7 +972,7 @@ impl Player {
                 let at = self.at.clone();
                 self.copy_masters(&at, &before, false)?;
                 self.at = before.clone();
-                if kinds.len() > 1 || std::env::var_os("VICTORY_REPLAY_PEEK").is_some() {
+                if kinds.len() > 1 || crate::switch::on("VICTORY_REPLAY_PEEK") {
                     self.peek(cmds, c, i, say)?;
                 }
                 let mut counts: Vec<u32> = kinds.values().copied().collect();

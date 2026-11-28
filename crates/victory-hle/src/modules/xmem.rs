@@ -2900,7 +2900,7 @@ const FOUR_GIB: usize = 1 << 32;
 /// Guards over the space below 4 GiB. Windows places allocations bottom up,
 /// so the host's own memory (the driver's, heaps, the shader and pipeline
 /// caches read at startup) filled it first: with a large pipeline cache only
-/// 22 MB was left, in pieces, when Grand Theft Auto VI asked for a 185 MB
+/// 22 MB was left, in pieces, when the title asked for a 185 MB
 /// 32-bit placeholder at startup, the request was refused
 /// (`ERROR_NOT_ENOUGH_MEMORY`) and the title stopped at an assertion. The
 /// debug layer's memory did the same. So the free space below 4 GiB is

@@ -1,5 +1,5 @@
-//! Keeps the card's clocks up between submissions (`VICTORY_CARD_AWAKE=1`; off
-//! by default). The card stands idle half of every frame, some thirty times for
+//! Keeps the card's clocks up between submissions (`VICTORY_CARD_AWAKE=1`, on by
+//! default through `defaults.rs`; `=0` turns it off). The card stands idle half of every frame, some thirty times for
 //! a millisecond or two each, while the CPU prepares the next submission. The
 //! driver takes that for a light load and lowers the clocks, and what comes
 //! next starts slow: a captured frame whose lists take 30 ms sent in one go

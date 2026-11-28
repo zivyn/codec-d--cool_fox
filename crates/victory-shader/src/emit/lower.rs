@@ -1748,7 +1748,7 @@ impl<'a> Lower<'a> {
                     }
                 }
                 // `VICTORY_WAVE_WHY=1`: why a program keeps 64-lane waves (one line per reason)
-                if wave == 64 && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                if wave == 64 && crate::env_on("VICTORY_WAVE_WHY") {
                     let mut why: Vec<&str> = Vec::new();
                     for i in insts() {
                         let n = i.name();
@@ -1978,7 +1978,7 @@ impl<'a> Lower<'a> {
             },
             own_bits: match &exchange {
                 Some((_, false, _)) if !LOCAL_WAVES.get() && own_bits_on() => {
-                    super::own_bits::find(p, x.st, std::env::var_os("VICTORY_WAVE_WHY").is_some())
+                    super::own_bits::find(p, x.st, crate::env_on("VICTORY_WAVE_WHY"))
                 }
                 _ => Default::default(),
             },
@@ -2743,7 +2743,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
-        if self.pair_meet && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        if self.pair_meet && crate::env_on("VICTORY_WAVE_WHY") {
             eprintln!("WAVE64-MEETINGS {} in the code (lean {}, {} accesses without one)", self.meetings, self.lean, self.lds_skip.len());
         }
         let user_data = self.user_reads.values().copied().collect();
@@ -3049,7 +3049,7 @@ impl<'a> Lower<'a> {
         if let Some(&Val::Missing(why)) = self.vals.get(&v)
             && is_mask
             && self.mask_ok
-            && std::env::var_os("VICTORY_MASK_WHY").is_some()
+            && crate::env_on("VICTORY_MASK_WHY")
         {
             eprintln!("MASK-WHY {v:?} has no value of its own ({why}) and is a mask: read as data at {:#x}", self.at_offset);
         }
@@ -3906,7 +3906,7 @@ impl<'a> Lower<'a> {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
-            if std::env::var_os("VICTORY_MASK_WHY").is_some() {
+            if crate::env_on("VICTORY_MASK_WHY") {
                 // (which mask, written where, read where: the lines to read the refusal by)
                 let writer = made.and_then(|b| {
                     self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)).map(|i| (b, i.machine.offset, i.name()))
@@ -4762,7 +4762,7 @@ impl<'a> Lower<'a> {
         if small || self.local || self.pair_meet {
             return;
         }
-        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        if crate::env_on("VICTORY_WAVE_WHY") {
             eprintln!("HALF-EXIT: block {} leaves its loop by {leaving}, slot {slot}", self.cur_ir);
         }
         let c = self.cur;
@@ -4912,7 +4912,7 @@ impl<'a> Lower<'a> {
             let hi = self.s.m.select(at, upper, mine, z);
             return (lo, hi);
         }
-        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        if crate::env_on("VICTORY_WAVE_WHY") {
             eprintln!("WAVE64-EXCHANGE at {:#x} (IR block {})", self.at_offset, self.cur_ir);
         }
         self.exchanged += 1;
@@ -6241,7 +6241,7 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
-                if std::env::var_os("VICTORY_MASK_WHY").is_some() {
+                if crate::env_on("VICTORY_MASK_WHY") {
                     eprintln!("MASK-WHY no value from {name} at {offset:#x}: {why}");
                 }
                 for &(_, v) in &inst.writes {
@@ -7420,7 +7420,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+            if crate::env_on("VICTORY_DESC_WHY") {
                 eprintln!(
                     "DESC-WHY {:#x} {} scalar={:?} lane_copied={}",
                     inst.machine.offset,
@@ -9674,7 +9674,7 @@ impl<'a> Lower<'a> {
         // half of an interpolation", foliage mesh shaders); until those are
         // lowered they keep drawing with that zero.
         static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let strict = *STRICT.get_or_init(|| std::env::var_os("VICTORY_STRICT_JOINS").is_some());
+        let strict = *STRICT.get_or_init(|| crate::env_on("VICTORY_STRICT_JOINS"));
         let mut work: Vec<Value> = if strict {
             self.read_phis.iter().copied().collect()
         } else {

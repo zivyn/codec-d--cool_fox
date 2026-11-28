@@ -109,6 +109,7 @@ mod sites;
 mod tiles;
 pub mod signature;
 mod switch;
+pub use switch::on as env_on;
 #[cfg(windows)]
 pub mod ab;
 #[cfg(windows)]

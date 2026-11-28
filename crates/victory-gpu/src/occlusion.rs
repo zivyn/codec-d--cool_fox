@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn the_switch_is_off_unless_asked_for() {
         // (The test process does not set it.)
-        if std::env::var_os("VICTORY_REAL_OCCLUSION").is_none() {
+        if !crate::switch::on("VICTORY_REAL_OCCLUSION") {
             assert!(!real());
         }
     }

@@ -19,6 +19,7 @@
 //! sends only what changed makes many of, go as pairs of offset and value,
 //! stored by one dispatch per copy; the others as a copy each.
 
+use super::stage::{self, Staged};
 use super::*;
 use crate::shadow::Shadow;
 
@@ -110,6 +111,9 @@ pub(super) struct Memory {
     buffer: ID3D12Resource,
     data: usize,
     size: u64,
+    /// The stage the bytes crossed to on the copy queue ([`stage`]), until
+    /// the submission has run.
+    staged: Option<Staged>,
 }
 
 // SAFETY: a D3D12 object (free-threaded) and its mapping, with one owner.
@@ -157,6 +161,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         buffer,
         data: data as usize,
         size,
+        staged: None,
     })
 }
 
@@ -169,7 +174,10 @@ pub(super) fn spare_kept() -> [u64; 3] {
 }
 
 /// The submission has run.
-pub(super) fn give_back(memory: Memory) {
+pub(super) fn give_back(mut memory: Memory) {
+    if let Some(staged) = memory.staged.take() {
+        staged.give_back();
+    }
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
@@ -193,6 +201,9 @@ struct Copy {
 pub(super) struct Own {
     memory: Memory,
     copies: Vec<Copy>,
+    /// The bytes are on their way to this stage, which the copies and the
+    /// scatters read in place of the memory.
+    staged: Option<Staged>,
 }
 
 /// Runs whose pairs are one piece of work.
@@ -311,7 +322,11 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         crate::shadow::copy_all(moves);
     }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    // The bus leg on the copy queue, started now: the sync list is recorded
+    // while the bytes cross (read once, so that each submission decides
+    // alone: `VICTORY_AB`). Not for memory in the card's own (`on_card`).
+    let staged = if stage::on() && !on_card() { stage::stage(&host.device, &memory.buffer, at) } else { None };
+    Some(Own { memory, copies, staged })
 }
 
 impl Own {
@@ -331,11 +346,23 @@ impl Own {
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let write = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         let dest = D3D12_RESOURCE_STATE_COPY_DEST;
+        // Where the bytes are read from: the stage in video memory (it is in
+        // the common state when this list begins and when it ends, as the
+        // copy queue needs it), or the submission's upload memory.
+        let source = self.staged.as_ref().map_or(&self.memory.buffer, Staged::buffer);
+        let source_states = D3D12_RESOURCE_STATE_COPY_SOURCE | read;
         let (mut first, mut last) = (Vec::new(), Vec::new());
+        if let Some(staged) = &self.staged {
+            // SAFETY: the caller's; a live buffer.
+            unsafe {
+                list.ResourceBarrier(&[transition(staged.buffer(), D3D12_RESOURCE_STATE_COMMON, source_states)]);
+            }
+            last.push(transition(staged.buffer(), source_states, D3D12_RESOURCE_STATE_COMMON));
+        }
         for ((shadow, _), copy) in dirty.iter().zip(&self.copies) {
             for &(a, from, n) in &copy.runs {
                 // SAFETY: the caller's; live buffers, ranges inside them.
-                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, &self.memory.buffer, from, n as u64) };
+                unsafe { list.CopyBufferRegion(&shadow.buffer, a as u64, source, from, n as u64) };
             }
             let mut state = (looked(shadow) || !copy.runs.is_empty()).then_some(dest);
             if copy.pairs.1 > 0 {
@@ -362,7 +389,7 @@ impl Own {
             {
                 list.SetComputeRootSignature(&pass.root);
                 list.SetPipelineState(&pass.pso);
-                list.SetComputeRootShaderResourceView(1, self.memory.buffer.GetGPUVirtualAddress());
+                list.SetComputeRootShaderResourceView(1, source.GetGPUVirtualAddress());
                 for ((shadow, _), copy) in dirty.iter().zip(&self.copies).filter(|(_, c)| c.pairs.1 > 0) {
                     list.SetComputeRootUnorderedAccessView(2, shadow.buffer.GetGPUVirtualAddress());
                     const MOST: u32 = 64 * D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
@@ -383,8 +410,18 @@ impl Own {
         }
     }
 
-    /// The memory, to be kept until the submission has run.
-    pub(super) fn memory(self) -> Memory {
+    /// The drawing queue stands behind the copy of the bytes to their stage,
+    /// if they cross on the copy queue. Before the list that reads them.
+    pub(super) fn wait(&self, queue: &ID3D12CommandQueue) -> windows::core::Result<()> {
+        match &self.staged {
+            Some(staged) => staged.wait(queue),
+            None => Ok(()),
+        }
+    }
+
+    /// The memory (and the stage), to be kept until the submission has run.
+    pub(super) fn memory(mut self) -> Memory {
+        self.memory.staged = self.staged.take();
         self.memory
     }
 }

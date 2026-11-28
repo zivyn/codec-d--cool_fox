@@ -4089,6 +4089,17 @@ fn late_line(frames: f64) {
                 t[2],
                 t[3] / 1000.0,
             );
+            if stage::on() {
+                let q: Vec<f64> = stage::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+                tracing::info!(
+                    "sends crossing the bus on a copy queue per frame (VICTORY_SEND_COPYQ): {:.1} submissions, {:.1} MB; left on the drawing                      queue: {:.1} too small, {:.1} for want of room, {:.1} failed",
+                    q[0],
+                    q[1] / (1 << 20) as f64,
+                    q[2],
+                    q[3],
+                    q[4],
+                );
+            }
         }
         let t: Vec<f64> = torn::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         if t[0] > 0.0 {
@@ -4163,6 +4174,7 @@ mod place;
 mod prefetch;
 mod scratch;
 mod send;
+mod stage;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
@@ -5125,6 +5137,11 @@ impl Host {
                     list.Close()?;
                     #[cfg(feature = "diagnostics")]
                     sync_lap(2, &mut lap);
+                    // Behind the copy of the sends over the bus, if it is
+                    // on the copy queue (`VICTORY_SEND_COPYQ`).
+                    if let Some(own) = &own {
+                        own.wait(&self.queue)?;
+                    }
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     #[cfg(feature = "diagnostics")]
                     {

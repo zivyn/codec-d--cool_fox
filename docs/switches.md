@@ -746,6 +746,7 @@ translation of shaders.
 | `VICTORY_WATCH` | off | list |  |  | diag | Logs the 32-bit value at each listed RVA whenever it changes, polled every 5 ms. |
 | `VICTORY_WATCHDOG_HOLD` | on (=0 turns off) | flag |  |  |  | Holds the title's watchdog byte so the watchdog stays paused; =0 leaves it alone. |
 | `VICTORY_WATCHDOG_HOLD_MAX_S` | 900 | number |  |  |  | Seconds the watchdog pause is kept without a heartbeat. |
+| `VICTORY_WATCH_LARGE_XMEM` | off | flag |  |  |  | Gives the title's blocks of 1 MiB and more from `XMemAllocDefault` a write-watched reservation (between 4 GiB and 2^40, like its other 64-bit memory), so the GPU side asks the kernel which pages were written instead of copying the block whole (the 21 MB upscaler buffer: 6.5 ms and 41 MB a frame "copied whole" in the processes where `quiet_skip` fails). Read once; compared between processes. Port of shreezzz's VIctory-NVIDIA #1038, with the address bounds Exopus asked for. |
 | `VICTORY_WAVE_DEEP_SKIPS` | on (=0 turns off) | flag | yes |  |  | Wave-wide form that drops skips with scalars followed, so more code runs in every lane. |
 | `VICTORY_WAVE_LOCAL` | on (=0 turns off) | text | yes |  |  | Gives each host wave its own wave for programs not run by every lane; =idiom refuses approximate ones. |
 | `VICTORY_WAVE_OWN_BITS` | on (=0 turns off) | flag | yes |  |  | Allows a wave OR where not every lane runs, using each lane's own bits. |

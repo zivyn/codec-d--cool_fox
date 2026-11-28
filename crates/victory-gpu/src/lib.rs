@@ -59,6 +59,7 @@ pub mod object;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod occlusion;
 pub mod pipeline;
+mod precompiled;
 #[cfg(windows)]
 mod picked;
 #[cfg(windows)]

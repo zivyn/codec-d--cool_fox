@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-const PIPELINE_IIDS: [Iid; 4] = [
+pub(crate) const PIPELINE_IIDS: [Iid; 4] = [
     guid(
         0x765a30f3,
         0xf624,
@@ -817,6 +817,24 @@ pub(crate) extern "system" fn create_compute(
         iid,
         out,
     )
+}
+
+/// A compute pipeline made from a container the layer built itself (the
+/// precompiled programs of `crate::precompiled`), handed out like the title's.
+pub(crate) fn make_compute(container: &[u8], iid: *const Iid, out: *mut This) -> HRESULT {
+    hand_out(
+        vec![shader("compute", container)],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// The containers of a pipeline's shaders (tests).
+#[cfg(test)]
+pub(crate) fn containers_of(this: This) -> Vec<Vec<u8>> {
+    pipeline(this).shaders.iter().map(|s| s.container.clone()).collect()
 }
 
 /// Device method 0x1f0: the plain compute description plus console

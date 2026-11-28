@@ -753,6 +753,15 @@ const NAMES: [&str; 45] = [
 pub(crate) fn runs_line(frames: f64) {
     let r: Vec<u64> = RUNS.iter().map(|r| r.swap(0, Relaxed)).collect();
     let between = held(&BETWEEN).take();
+    let d: Vec<u64> = DROPS.iter().map(|d| d.swap(0, Relaxed)).collect();
+    if d.iter().sum::<u64>() > 0 && frames > 0.0 {
+        tracing::info!(
+            "calls that only feed dispatches the host drops, left out per frame (VICTORY_DROP_EARLY): {:.0} root parameters set, {:.0} dispatches; {:.0} streams planned",
+            d[0] as f64 / frames,
+            d[1] as f64 / frames,
+            d[2] as f64 / frames,
+        );
+    }
     if r[0] == 0 || frames <= 0.0 {
         return;
     }
@@ -824,11 +833,114 @@ fn run_of(
     (records, end)
 }
 
+/// Whether calls that only feed dispatches the host drops are left out
+/// (`VICTORY_DROP_EARLY=1`; off by default; with the structure builder off,
+/// which is what drops them). Read for each stream, so it may change while the
+/// title runs: what a stream leaves out is a stream's own, and the state it
+/// leaves is the same whichever way the switch stands (`dead_ops`).
+fn drop_early_on() -> bool {
+    if !crate::pipeline::builder_disabled() {
+        return false;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_DROP_EARLY") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DROP_EARLY").is_some_and(|v| v == "1"))
+}
+
+/// Since the last line: root parameters set and dispatches left out, and
+/// streams planned.
+static DROPS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Which calls of `stream` (by their order, uploads counted) need not be made,
+/// given the pipeline the list has at its start (`start`) and which pipelines
+/// drop their dispatches (`dropped`).
+///
+/// - A dispatch while a dropped pipeline is set does nothing: left out.
+/// - A compute root parameter set (table, view, or constants) is read only by
+///   a dispatch that runs, or an execution that is not dropped. Roots persist
+///   from one dispatch to the next, so one that is replaced whole (a table or
+///   a view; constants only replace the dwords they give) before any such
+///   consumer is read by nobody: left out. At the end of the stream every
+///   parameter counts as read (the next stream goes on from here), and a
+///   consumer reads them all.
+/// - The pipelines the title sets are all kept (they say which dispatch is
+///   dropped), and everything else.
+fn dead_ops(stream: &[u64], start: u64, dropped: &dyn Fn(u64) -> bool) -> Vec<bool> {
+    const SLOTS: u32 = 64;
+    let mut ops: Vec<(u64, &[u64])> = Vec::new();
+    let mut at = 0;
+    while at < stream.len() {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        let Some(w) = stream.get(at + 1..at + 1 + len) else {
+            break;
+        };
+        ops.push((op, w));
+        at += 1 + len;
+    }
+    let (dispatch, dispatch_x, indirect) = (Plain::DISPATCH as u64, Plain::DISPATCH_X as u64, Plain::EXECUTE_INDIRECT as u64);
+    // Forward: each dispatch is dropped or a consumer.
+    let mut cur = start;
+    let mut consumer = vec![false; ops.len()];
+    let mut dead = vec![false; ops.len()];
+    for (i, &(op, w)) in ops.iter().enumerate() {
+        if (op == RESET || op == Plain::SET_PIPELINE as u64) && !w.is_empty() {
+            cur = w[0];
+        } else if op == dispatch || op == dispatch_x {
+            if dropped(cur) {
+                dead[i] = true;
+            } else {
+                consumer[i] = true;
+            }
+        } else if op == indirect {
+            consumer[i] = !dropped(cur);
+        }
+    }
+    // Backward: the parameters something later reads.
+    let mut live = u64::MAX;
+    for (i, &(op, w)) in ops.iter().enumerate().rev() {
+        if consumer[i] {
+            live = u64::MAX;
+            continue;
+        }
+        let slot = match op {
+            o if o == Plain::COMPUTE_TABLE as u64 || o == Plain::COMPUTE_VIEW as u64 || o == Plain::COMPUTE_CONSTANT as u64 => {
+                w.first().map(|&s| s as u32)
+            }
+            o if o == COMPUTE_CONSTANTS => w.first().map(|&s| s as u32),
+            _ => None,
+        };
+        let Some(slot) = slot else { continue };
+        if slot >= SLOTS {
+            continue;
+        }
+        let whole = op == Plain::COMPUTE_TABLE as u64 || op == Plain::COMPUTE_VIEW as u64;
+        if live >> slot & 1 == 0 {
+            dead[i] = true;
+        } else if whole {
+            live &= !(1 << slot);
+        }
+    }
+    dead
+}
+
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
+    // The calls that need not be made (`VICTORY_DROP_EARLY`), by their order.
+    let dead = if drop_early_on() && !skip {
+        // SAFETY: a list of ours that no thread but this one records into.
+        let start = held(unsafe { &(*list.cast::<List>()).state }).pipeline_handle();
+        DROPS[2].fetch_add(1, Relaxed);
+        dead_ops(stream, start, &|p| crate::pipeline::is_builder(p as This))
+    } else {
+        Vec::new()
+    };
+    let mut ordinal = 0usize;
     // The execution before: its signature, arguments and where its next
     // record would be; what came since (op codes, the first few, and how many).
     let mut last: Option<(u64, u64, u64)> = None;
@@ -846,6 +958,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;
+        let this_op = ordinal;
+        ordinal += 1;
         if calls % 64 == 0 {
             skip = left();
         }
@@ -854,6 +968,10 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             continue;
         }
         if skip && op != CLOSE && op != RESET {
+            continue;
+        }
+        if dead.get(this_op).copied().unwrap_or(false) {
+            DROPS[usize::from(op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64)].fetch_add(1, Relaxed);
             continue;
         }
         if op == Plain::EXECUTE_INDIRECT as u64 {
@@ -1163,6 +1281,151 @@ mod tests {
             assert_eq!(single(&w), None);
         }
         assert_eq!(single(&[7, 1, 9]), None);
+    }
+
+    /// What the compute roots hold, as the state keeps them.
+    #[derive(Clone, Debug, PartialEq)]
+    enum Root {
+        Table(u64),
+        View(u64),
+        Constants(Vec<u32>),
+    }
+
+    type Roots = std::collections::BTreeMap<u32, Root>;
+
+    /// The state a stream leaves, and what each dispatch that runs sees (the
+    /// pipeline and every root), run without the calls in `skip`. Pipelines of
+    /// an even number are dropped.
+    fn model(stream: &[u64], start: u64, skip: &[bool]) -> (Vec<(u64, Roots)>, (u64, Roots)) {
+        let mut roots: Roots = Default::default();
+        let (mut cur, mut seen) = (start, Vec::new());
+        let (mut at, mut k) = (0, 0);
+        while at < stream.len() {
+            let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+            let w = &stream[at + 1..at + 1 + len];
+            at += 1 + len;
+            let this = k;
+            k += 1;
+            if skip.get(this).copied().unwrap_or(false) {
+                continue;
+            }
+            let slot = w.first().map_or(0, |&s| s as u32);
+            match op {
+                o if o == Plain::SET_PIPELINE as u64 || o == RESET => cur = w[0],
+                o if o == Plain::COMPUTE_TABLE as u64 => {
+                    roots.insert(slot, Root::Table(w[1]));
+                }
+                o if o == Plain::COMPUTE_VIEW as u64 => {
+                    roots.insert(slot, Root::View(w[1]));
+                }
+                o if o == Plain::COMPUTE_CONSTANT as u64 || o == COMPUTE_CONSTANTS => {
+                    let (offset, values): (usize, Vec<u32>) = if o == COMPUTE_CONSTANTS {
+                        let count = w[1] as usize;
+                        ((w[0] >> 32) as usize, (0..count).map(|i| (w[2 + i / 2] >> (32 * (i % 2))) as u32).collect())
+                    } else {
+                        (w[2] as usize, vec![w[1] as u32])
+                    };
+                    if !matches!(roots.get(&slot), Some(Root::Constants(_))) {
+                        roots.insert(slot, Root::Constants(Vec::new()));
+                    }
+                    if let Some(Root::Constants(c)) = roots.get_mut(&slot) {
+                        if c.len() < offset + values.len() {
+                            c.resize(offset + values.len(), 0);
+                        }
+                        c[offset..offset + values.len()].copy_from_slice(&values);
+                    }
+                }
+                o if (o == Plain::DISPATCH as u64 || o == Plain::DISPATCH_X as u64) && cur % 2 == 1 => {
+                    seen.push((cur, roots.clone()));
+                }
+                o if o == Plain::EXECUTE_INDIRECT as u64 && cur % 2 == 1 => seen.push((cur, roots.clone())),
+                _ => {}
+            }
+        }
+        (seen, (cur, roots))
+    }
+
+    /// Calls left out change nothing a dispatch that runs, or the next stream,
+    /// can see: the pipeline and every compute root are as without leaving any
+    /// out, at each dispatch and at the end, over many streams of sets and
+    /// dispatches of running and dropped pipelines.
+    #[test]
+    fn the_next_dispatch_that_runs_sees_what_it_saw_with_none_left_out() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |m: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        let (mut left_out, mut dispatches_out) = (0, 0);
+        for round in 0..400 {
+            let mut stream = Vec::new();
+            for _ in 0..(10 + next(70)) {
+                let slot = next(5);
+                match next(11) {
+                    0 | 1 => put(&mut stream, Plain::SET_PIPELINE as u64, &[1 + next(4)]),
+                    2 | 3 => put(&mut stream, Plain::COMPUTE_TABLE as u64, &[slot, 100 + next(50)]),
+                    4 => put(&mut stream, Plain::COMPUTE_VIEW as u64, &[slot, 200 + next(50)]),
+                    5 => put(&mut stream, Plain::COMPUTE_CONSTANT as u64, &[slot, next(1000), next(3)]),
+                    6 => {
+                        let count = 1 + next(3);
+                        let words: Vec<u64> = (0..count.div_ceil(2)).map(|_| next(1 << 40)).collect();
+                        let mut all = vec![slot | next(3) << 32, count];
+                        all.extend(words);
+                        put(&mut stream, COMPUTE_CONSTANTS, &all);
+                    }
+                    7 | 8 => put(&mut stream, Plain::DISPATCH_X as u64, &[1, 1, 1, 0]),
+                    9 => put(&mut stream, Plain::DISPATCH as u64, &[1, 1, 1]),
+                    _ => match next(3) {
+                        0 => put(&mut stream, UPLOAD, &[1]),
+                        1 => put(&mut stream, Plain::EXECUTE_INDIRECT as u64, &[5, 1, 9, 0, 0, 0]),
+                        _ => put(&mut stream, Plain::DRAW as u64, &[3, 1, 0, 0]),
+                    },
+                }
+            }
+            let start = 1 + next(4);
+            let dead = dead_ops(&stream, start, &|p| p % 2 == 0);
+            assert_eq!(model(&stream, start, &[]), model(&stream, start, &dead), "round {round}");
+            left_out += dead.iter().filter(|&&d| d).count();
+            let (mut at, mut k) = (0, 0);
+            while at < stream.len() {
+                let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+                dispatches_out += usize::from(dead[k] && (op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64));
+                at += 1 + len;
+                k += 1;
+            }
+        }
+        // It is not nothing that is left out: parameters, and dispatches.
+        assert!(left_out > 1000 && dispatches_out > 100, "{left_out} {dispatches_out}");
+    }
+
+    /// The case that matters: stages of the structure builder that are dropped
+    /// set the same parameters one after another, and the dispatch that runs
+    /// after them sets some of its own: only the last set of what it does not
+    /// set is made.
+    #[test]
+    fn stages_that_are_dropped_leave_the_last_set_of_each_parameter() {
+        let mut stream = Vec::new();
+        // The pipeline the list has is a real one (1); 2 is a stage that is dropped.
+        for stage in 0..3u64 {
+            put(&mut stream, Plain::SET_PIPELINE as u64, &[2]);
+            put(&mut stream, Plain::COMPUTE_TABLE as u64, &[0, 10 + stage]);
+            put(&mut stream, Plain::COMPUTE_VIEW as u64, &[1, 20 + stage]);
+            put(&mut stream, Plain::DISPATCH_X as u64, &[8, 1, 1, 0]);
+        }
+        put(&mut stream, Plain::SET_PIPELINE as u64, &[1]);
+        put(&mut stream, Plain::COMPUTE_TABLE as u64, &[0, 99]);
+        put(&mut stream, Plain::DISPATCH as u64, &[1, 1, 1]);
+        let dead = dead_ops(&stream, 1, &|p| p == 2);
+        // Per stage (pipeline, table, view, dispatch): the dispatch always, the
+        // table of slot 0 always (the dispatch that runs sets it), the view of
+        // slot 1 for the stages before the last (that dispatch reads the last).
+        assert_eq!(
+            dead,
+            [false, true, true, true, false, true, true, true, false, true, false, true, false, false, false]
+        );
+        assert_eq!(model(&stream, 1, &[]), model(&stream, 1, &dead));
     }
 
     /// Arguments come out of a stream as they went in.

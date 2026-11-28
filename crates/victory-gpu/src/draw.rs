@@ -1201,6 +1201,11 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// The pipeline the title set last (0: none).
+    pub(crate) fn pipeline_handle(&self) -> u64 {
+        self.pipeline as u64
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {

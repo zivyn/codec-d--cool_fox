@@ -100,6 +100,9 @@ pub(super) trait Work: Send {
     fn parts(&self) -> Vec<usize> {
         Vec::new()
     }
+    /// Called with the queue it is the line's entry of, just before it is done
+    /// (or, joined, just before the submission that took it along).
+    fn seen(&self, _queue: usize) {}
     /// Does it. `forced`: its wait was not met.
     fn go(self, forced: bool);
 }
@@ -537,6 +540,7 @@ impl<W: Work> Lane<W> {
         };
         AHEAD.with(|a| *a.borrow_mut() = ahead);
         DOING.set(true);
+        entry.what.seen(entry.queue);
         entry.what.go(forced);
         DOING.set(false);
         AHEAD.with(|a| a.borrow_mut().take());
@@ -668,6 +672,15 @@ impl Work for Job {
         }
     }
 
+    fn seen(&self, queue: usize) {
+        match self {
+            &Job::Wait(fence, value) => super::timelines::wait(queue, fence, value),
+            Job::Value(wait) => super::timelines::value_wait(queue, wait),
+            &Job::Signal(fence, value) => super::timelines::signal(queue, fence, value),
+            _ => {}
+        }
+    }
+
     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
         let (most, most_lists) = crate::host::joins();
         let most = ramp_parts(most);
@@ -779,30 +792,37 @@ impl Work for Job {
             // (A folded one is unfolded, never done.)
             Job::Wait(..) | Job::Value(..) | Job::Lists(..) => {}
             Job::Run(queue, lists, order) => {
-                let _ = queue;
                 ramp_grow();
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || format!("RUN submission of {} lists (its thread's)", order.len()));
                 match crate::host::host() {
-                    Some(host) => host.execute_late(lists, order),
+                    Some(host) => {
+                        let plan = super::timelines::begin(host, queue, &value_writes(&lists, &order));
+                        host.execute_late(lists, order);
+                        super::timelines::end(host, plan);
+                    }
                     None => drop(lists),
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
             Job::Joined(queue, lists, order, parts, signals) => {
-                let _ = queue;
                 ramp_grow();
                 #[cfg(feature = "diagnostics")]
                 crate::capture::op(queue, || {
                     format!("RUN {} parts of submissions in one, {} lists (its thread's)", 1 + parts.len(), order.len())
                 });
                 match crate::host::host() {
-                    Some(host) => host.execute_parts(lists, order, &parts),
+                    Some(host) => {
+                        let plan = super::timelines::begin(host, queue, &value_writes(&lists, &order));
+                        host.execute_parts(lists, order, &parts);
+                        super::timelines::end(host, plan);
+                    }
                     None => drop(lists),
                 }
                 // (A part that had no list is one all the same.)
                 QUEUED.fetch_sub(1 + parts.len() as u64, Relaxed);
                 for (fence, value) in signals {
+                    super::timelines::signal(queue, fence, value);
                     if !crate::host::late_signal(fence, value) {
                         crate::fence::set(fence as This, value);
                     }
@@ -1184,8 +1204,22 @@ pub(super) fn present(
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
 }
 
+/// The values the lists' bottom-of-pipe writes put in memory, as (address,
+/// value), for the title's value waits (`VICTORY_ASYNC_COMPUTE`).
+fn value_writes(lists: &[crate::list::Detached], order: &[usize]) -> Vec<(usize, u64)> {
+    if !super::timelines::on() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for &i in order {
+        out.extend(lists[i].host().value_writes());
+    }
+    out
+}
+
 /// For the frame-rate line.
 pub(super) fn line(frames: f64) {
+    super::timelines::line(frames);
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(

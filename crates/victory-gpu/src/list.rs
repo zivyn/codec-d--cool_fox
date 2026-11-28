@@ -198,6 +198,17 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// Notes the kind of the title's queue on the host sides of the lists it is
+/// given (the timing report sums the commands' time by it).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn tag_queue(lists: &[This], kind: u32) {
+    for &list in lists {
+        if let Some(host) = host_list(list) {
+            host.set_queue_kind(kind);
+        }
+    }
+}
+
 /// The host side of a submitted list, taken from it: a queue that waits
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its

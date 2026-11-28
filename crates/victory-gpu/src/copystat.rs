@@ -248,15 +248,71 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// their microseconds, and the longest one's.
 static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 
+/// The same commands by the kind of the title's queue their list was
+/// submitted to (`u32::MAX`: not known) as well: `(key, queue)` to how many,
+/// microseconds and the longest.
+static COMMANDS_BY_QUEUE: Mutex<Option<HashMap<(String, u32), (u64, u64, u64)>>> = Mutex::new(None);
+
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
-pub(crate) fn command_took(op: &str, ms: f64) {
+/// `queue` is the kind of the title's queue its list went to.
+pub(crate) fn command_took(op: &str, ms: f64, queue: u32) {
     let us = (ms * 1e3) as u64;
+    let key = command_key(op);
+    let add = |e: &mut (u64, u64, u64)| {
+        e.0 += 1;
+        e.1 += us;
+        e.2 = e.2.max(us);
+    };
+    {
+        let mut by = COMMANDS_BY_QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let by = by.get_or_insert_with(HashMap::new);
+        add(by.entry((key.clone(), queue)).or_insert((0, 0, 0)));
+    }
     let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
-    e.0 += 1;
-    e.1 += us;
-    e.2 = e.2.max(us);
+    let by = by.get_or_insert_with(HashMap::new);
+    add(by.entry(key).or_insert((0, 0, 0)));
+}
+
+/// The name of a title queue kind in the report.
+fn queue_name(kind: u32) -> &'static str {
+    match kind {
+        0 => "graphics",
+        1 => "copy",
+        2 => "compute",
+        _ => "unknown",
+    }
+}
+
+/// The commands' time by the title's queue, and every kind of command with
+/// its queue as lines of a table (`VICTORY_GPU_TIMING_FILE`): per frame, the
+/// milliseconds, the commands, the longest one's milliseconds, the queue and
+/// the key. Longest first; `frames` is what the sums cover.
+fn by_queue_report(by: HashMap<(String, u32), (u64, u64, u64)>, frames: f64) -> (String, String) {
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by(|a, b| b.1.1.cmp(&a.1.1).then_with(|| a.0.cmp(&b.0)));
+    let mut queues: Vec<(u32, u64, u64)> = Vec::new();
+    let mut table = String::from("ms_per_frame\tcommands_per_frame\tlongest_ms\tqueue\tkey\n");
+    for ((key, queue), (n, us, longest)) in &rows {
+        match queues.iter_mut().find(|q| q.0 == *queue) {
+            Some(q) => (q.1, q.2) = (q.1 + n, q.2 + us),
+            None => queues.push((*queue, *n, *us)),
+        }
+        table.push_str(&format!(
+            "{:.4}\t{:.2}\t{:.3}\t{}\t{key}\n",
+            *us as f64 / 1e3 / frames,
+            *n as f64 / frames,
+            *longest as f64 / 1e3,
+            queue_name(*queue)
+        ));
+    }
+    queues.sort_by_key(|q| std::cmp::Reverse(q.2));
+    let line = queues
+        .iter()
+        .map(|&(q, n, us)| format!("{} {:.1} ms in {:.0}", queue_name(q), us as f64 / 1e3 / frames, n as f64 / frames))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (line, table)
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -480,6 +536,29 @@ mod command_tests {
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
+    }
+
+    /// The report sums by the title's queue and lists every kind of command
+    /// with its queue, longest first; a kind on two queues is two rows.
+    #[test]
+    fn the_time_is_summed_by_the_titles_queue_and_listed_whole() {
+        use super::{by_queue_report, queue_name};
+        use std::collections::HashMap;
+        let mut by: HashMap<(String, u32), (u64, u64, u64)> = HashMap::new();
+        by.insert(("dispatch [compute aa]".into(), 0), (10, 4_000, 900));
+        by.insert(("dispatch [compute aa]".into(), 2), (6, 1_000, 300));
+        by.insert(("indirect [mesh bb]".into(), 0), (20, 6_000, 500));
+        by.insert(("dispatch [compute cc]".into(), u32::MAX), (2, 600, 500));
+        let (line, table) = by_queue_report(by, 2.0);
+        assert_eq!(line, "graphics 5.0 ms in 15, compute 0.5 ms in 3, unknown 0.3 ms in 1");
+        let rows: Vec<&str> = table.lines().collect();
+        assert_eq!(rows[0], "ms_per_frame\tcommands_per_frame\tlongest_ms\tqueue\tkey");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1], "3.0000\t10.00\t0.500\tgraphics\tindirect [mesh bb]");
+        assert_eq!(rows[2], "2.0000\t5.00\t0.900\tgraphics\tdispatch [compute aa]");
+        assert_eq!(rows[3], "0.5000\t3.00\t0.300\tcompute\tdispatch [compute aa]");
+        assert_eq!(rows[4], "0.3000\t1.00\t0.500\tunknown\tdispatch [compute cc]");
+        assert_eq!(queue_name(1), "copy");
     }
 }
 
@@ -1508,6 +1587,20 @@ pub(crate) fn log(frames: f64) {
             all as f64 / 1e3 / frames,
             text.join(", ")
         );
+    }
+    // By the title's queue (the compute queue's share is what a second host
+    // queue could overlap with the graphics queue's), and every kind of
+    // command in a file: the forty lines are the top of some 1,100 kinds,
+    // about half of the time.
+    let by_queue = COMMANDS_BY_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(by_queue) = by_queue {
+        let (line, table) = by_queue_report(by_queue, frames);
+        tracing::info!("  the card's time by the title's queue (timing run): {line}");
+        if let Some(path) = std::env::var_os("VICTORY_GPU_TIMING_FILE")
+            && let Err(e) = std::fs::write(&path, table)
+        {
+            tracing::warn!(error = %e, "the table of the card's time by command was not written");
+        }
     }
     for (what, (n, us, longest)) in by.into_iter().take(40) {
         tracing::info!(

@@ -1296,6 +1296,10 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// The kind of the title's queue the list was last submitted to (0
+    /// graphics, 2 compute; `u32::MAX` before any), for the timing report.
+    #[cfg(feature = "diagnostics")]
+    queue_kind: AtomicU32,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -5142,6 +5146,8 @@ impl Host {
                 notes,
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                queue_kind: AtomicU32::new(u32::MAX),
             })
         }
     }
@@ -6352,6 +6358,24 @@ impl Host {
         }
     }
 
+    /// The host queue waits for `fence` to reach `value` (the lanes' fences of
+    /// `VICTORY_ASYNC_COMPUTE`): a wait for a signal already queued ahead of
+    /// it on this queue is met at once.
+    pub(crate) fn queue_wait(&self, fence: &ID3D12Fence, value: u64) {
+        // SAFETY: our queue and a fence of ours.
+        if let Err(e) = unsafe { self.queue.Wait(fence, value) } {
+            tracing::warn!(error = %e, "the host queue was not told to wait for a lane");
+        }
+    }
+
+    /// The host queue signals `fence` with `value` behind what it was given.
+    pub(crate) fn queue_signal(&self, fence: &ID3D12Fence, value: u64) {
+        // SAFETY: our queue and a fence of ours.
+        if let Err(e) = unsafe { self.queue.Signal(fence, value) } {
+            tracing::warn!(error = %e, "the host queue did not signal a lane");
+        }
+    }
+
     /// Runs closed lists and waits for them, and with [`late`] for
     /// everything sent to the card before them, which is settled first.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
@@ -7263,7 +7287,7 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 for (ms, op) in runs[i].slowest(frequency, usize::MAX) {
-                    crate::copystat::command_took(&op, ms);
+                    crate::copystat::command_took(&op, ms, runs[i].queue_kind());
                 }
             }
             // A submission of one list was never named here (`groups.len()
@@ -7695,6 +7719,20 @@ impl HostList {
                 Some((heap?, back?))
             })
             .as_ref()
+    }
+
+    /// The title's queue (kind) this list is submitted to, noted for the
+    /// timing report (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn set_queue_kind(&self, kind: u32) {
+        self.queue_kind.store(kind, Ordering::Relaxed);
+    }
+
+    /// The kind of the title's queue the list was last submitted to
+    /// (`u32::MAX`: none noted).
+    #[cfg(feature = "diagnostics")]
+    fn queue_kind(&self) -> u32 {
+        self.queue_kind.load(Ordering::Relaxed)
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
@@ -8290,6 +8328,20 @@ impl HostList {
             deferred.kept.push(root.clone().into());
         }
         self.used_pipeline(name);
+    }
+
+    /// The values the list's bottom-of-pipe writes put in memory when it has
+    /// run, as (address, value).
+    pub(crate) fn value_writes(&self) -> Vec<(usize, u64)> {
+        let deferred = self.deferred();
+        deferred
+            .writes
+            .iter()
+            .filter_map(|&(at, what, _)| match what {
+                crate::queue::Written::Value(v) => Some((at, v)),
+                _ => None,
+            })
+            .collect()
     }
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {

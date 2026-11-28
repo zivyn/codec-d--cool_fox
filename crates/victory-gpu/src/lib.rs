@@ -67,6 +67,7 @@ mod popwatch;
 mod primitive;
 #[cfg(windows)]
 mod barrier;
+mod precise;
 #[cfg(windows)]
 mod priority;
 #[cfg(windows)]

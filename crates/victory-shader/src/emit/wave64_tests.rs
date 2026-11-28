@@ -779,7 +779,7 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
 /// the wave's lanes in step, so the read inside the branch sees the writes of both host
 /// waves' lanes. The count the branch changes and the join reads keeps the branch: it is
 /// not one that only skips code no lane is left for.
-fn lds_read_after_write_in_a_lane_branch() -> NativeProgram {
+pub(super) fn lds_read_after_write_in_a_lane_branch() -> NativeProgram {
     let words = [
         0xBE94_0380, // s_mov_b32 s20, 0
         0x7E08_02C1, // v_mov_b32 v4, -1

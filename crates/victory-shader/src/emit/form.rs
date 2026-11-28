@@ -1,0 +1,93 @@
+//! The form a console wave64 compute program was lowered in for a host of 32-lane waves
+//! ([`super::emit_forms`]): the choice `emit_forms` makes among the exact forms (every result is the
+//! console's), the approximate ones (each host half a wave of its own: counts, ballots, first
+//! lane and sums are per half) and the wave-wide branches (group barriers at the branches the
+//! console takes for the whole wave). Returned with the shader ([`super::emit_as`]) so that a
+//! test, and the corpus run (`VICTORY_WAVE_WHY`), can say which form a program ended in without
+//! reading stderr.
+
+/// How a program was lowered. Programs that needed no retry are [`Form::Original`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Form {
+    /// The program as it is (a wave of 32 lanes, or a console wave that meets itself).
+    Original,
+    /// Without its early-outs ([`crate::ir::without_early_outs`]). Exact.
+    WithoutEarlyOuts,
+    /// Without the skips no lane is left for ([`crate::ir::without_skips`]). Exact.
+    WithoutSkips,
+    /// As [`Form::WithoutSkips`], with scalars followed (`deep`). Exact.
+    WithoutSkipsDeep,
+    /// The skips and early-outs `VICTORY_KEEP_LOOP_SKIPS` keeps over a loop, taken by the whole
+    /// wave (the two host waves exchange the decision and go the same way), the rest as in the
+    /// form without skips: the barriers are at those branches, outside the loops. Exact.
+    KeptSkipsWide,
+    /// The skips and early-outs over loops left out as before `VICTORY_KEEP_LOOP_SKIPS`, where the
+    /// wave-wide form does not lower: every lane walks the loop, and a wave with no lane left runs
+    /// it to its limit where its exit reads a lane that is off. Exact, and slower there.
+    LoopSkipsLeftOut,
+    /// Each host wave a wave of its own, where the wave operations are the allocation idiom. Exact.
+    LocalIdiom,
+    /// Each host wave a wave of its own, the wave operations answering per half. APPROXIMATE.
+    LocalApproximate,
+    /// As [`Form::LocalApproximate`], with every mask and lane read per host wave. APPROXIMATE.
+    LocalApproximateAnyMask,
+    /// The per-lane branches around cross-lane code taken wave-wide, before the approximate forms
+    /// (the programs named by `VICTORY_WAVE_WIDE_FIRST`, `VICTORY_WAVE_WIDE=1`). Exact.
+    WaveWide,
+    /// The same, tried last of all. Exact.
+    WaveWideLastResort,
+    /// SCC of a mask operation behind a per-lane skip, the skips taken wave-wide. Exact.
+    LaneMaskWide,
+    /// The program with the edges whose value is constant threaded.
+    Threaded,
+    /// No form lowered.
+    Refused,
+}
+
+/// `VICTORY_KEPT_SKIPS_WIDE=1`: `VICTORY_KEEP_LOOP_SKIPS` applies to the forms of a program that
+/// has to be retried: the skips and early-outs over loops are kept and taken wave-wide
+/// ([`Form::KeptSkipsWide`]), with the forms with them left out after it. Off unless asked for:
+/// that form puts group barriers at branches (its wide set can reach into loops), the shape
+/// that lost the card, and kept skips took exact forms away from 32 programs of the title. Without
+/// it the forms are those of a program without the switch. Part of the translation: the shader
+/// cache keys on the variable.
+pub(super) fn kept_skips_wide() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_KEPT_SKIPS_WIDE.get() {
+        return on;
+    }
+    std::env::var_os("VICTORY_KEPT_SKIPS_WIDE").is_some_and(|v| v == "1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's `VICTORY_KEPT_SKIPS_WIDE`, for its thread only.
+    pub(super) static TEST_KEPT_SKIPS_WIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+impl Form {
+    /// Whether every result of the form is the console's (not per half-wave).
+    pub fn exact(self) -> bool {
+        !matches!(self, Form::LocalApproximate | Form::LocalApproximateAnyMask)
+    }
+
+    /// The name the logs and the tests use.
+    pub fn label(self) -> &'static str {
+        match self {
+            Form::Original => "original",
+            Form::WithoutEarlyOuts => "without early-outs",
+            Form::WithoutSkips => "without skips",
+            Form::WithoutSkipsDeep => "without skips, scalars followed",
+            Form::KeptSkipsWide => "kept skips wave-wide",
+            Form::LoopSkipsLeftOut => "loop skips left out",
+            Form::LocalIdiom => "local waves (idiom)",
+            Form::LocalApproximate => "local waves (APPROXIMATE)",
+            Form::LocalApproximateAnyMask => "local waves (APPROXIMATE, any mask)",
+            Form::WaveWide => "wave-wide branches",
+            Form::WaveWideLastResort => "wave-wide branches (last resort)",
+            Form::LaneMaskWide => "wave-wide lane-mask skips",
+            Form::Threaded => "threaded edges",
+            Form::Refused => "refused",
+        }
+    }
+}

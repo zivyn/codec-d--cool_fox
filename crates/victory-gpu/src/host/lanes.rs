@@ -549,7 +549,7 @@ fn steps_footprint(runs: &[&HostList]) -> Footprint {
                     fp.write(*address, *address + *len);
                     fp.card_write(shadow.id(), 0, u32::MAX);
                 }
-                &Step::Host(_, (from, to)) => fp.read(from, to),
+                &Step::Host(_, (from, to), _) => fp.read(from, to),
                 Step::Run(_) => fp.any = true,
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();

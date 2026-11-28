@@ -1459,7 +1459,9 @@ fn emit_program(
     });
     let why = crate::env_on("VICTORY_WAVE_WHY");
     match again {
-        Ok((shader, Some(w))) if w <= *wave => {
+        // (only a translation the host runs: one that still wants waves it has not is no better, and
+        // it would hide from the forms after it what the first one needed, [`lower::take_needs`])
+        Ok((shader, Some(w))) if w <= *wave && w <= lower::host_max_wave() => {
             if why {
                 eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
             }

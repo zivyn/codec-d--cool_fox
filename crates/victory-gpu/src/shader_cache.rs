@@ -95,6 +95,8 @@ fn build() -> [u8; 32] {
             "VICTORY_PEEK",
             "VICTORY_MASK_NUMBERS",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_LEGACY_ASSUME",
+            "VICTORY_WAVE_WIDE_FIRST",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

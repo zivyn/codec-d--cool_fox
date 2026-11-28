@@ -4912,6 +4912,16 @@ impl<'a> Lower<'a> {
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
+    /// What the two halves of a console wave read after a meeting is the same in both of them, and
+    /// in every thread of a group that is one console wave: the audit of the group barriers relies
+    /// on that ([`super::bitcode::together`]).
+    fn mark_exchanged(&mut self, v: V) {
+        if self.s.threads.is_some_and(|t| t.iter().product::<u32>() <= 64) {
+            self.s.m.mark_together(v);
+        }
+        self.s.m.mark_paired(v);
+    }
+
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
@@ -4957,15 +4967,8 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
-        // (what the two halves of a group that is one console wave read after the meeting is the
-        // same in every thread of it: the audit of the group barriers relies on that)
-        if self.s.threads.is_some_and(|t| t.iter().product::<u32>() <= 64) {
-            self.s.m.mark_together(lo);
-            self.s.m.mark_together(hi);
-        }
-        // (in a group of several console waves, the two halves of one agree)
-        self.s.m.mark_paired(lo);
-        self.s.m.mark_paired(hi);
+        self.mark_exchanged(lo);
+        self.mark_exchanged(hi);
         if !self.lean {
             // the slots are written again only after every thread read them
             self.meet(at);
@@ -9731,6 +9734,7 @@ impl<'a> Lower<'a> {
                     let c2 = self.cur;
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
+                    self.mark_exchanged(r);
                     if !self.lean {
                         self.meet(c2);
                     }

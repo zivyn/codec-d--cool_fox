@@ -278,7 +278,7 @@ mod tests {
         ] {
             let mut p = Pitcher::new(1, start);
             let frames = 960;
-            let (mut out, mut edges) = (Vec::new(), Vec::new());
+            let (mut out, mut edges): (Vec<f32>, Vec<usize>) = (Vec::new(), Vec::new());
             for b in 0..40 {
                 let input = tone(700.0, b * frames, frames, 1);
                 let got = p.process(&input, target, ramp, 10_000);

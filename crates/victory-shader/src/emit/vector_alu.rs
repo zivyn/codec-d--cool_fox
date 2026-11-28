@@ -1150,7 +1150,7 @@ impl<'a> Lower<'a> {
                     // (inside a loop the lanes still in it are the ones EXEC holds, and the lower half
                     // may have none of them: `VICTORY_HALF_EXIT` asks which half has one)
                     if guard.is_none()
-                        && super::shader_opt() & super::bitcode::opt::FIRST != 0
+                        && super::super::shader_opt() & super::super::bitcode::opt::FIRST != 0
                         && !(half_exit() && self.in_loop(self.cur_ir))
                     {
                         // Every lane is in EXEC: the console's first lane is
@@ -2582,7 +2582,7 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                if super::nan_safe() & super::nan_safe_bits::COMPARE != 0 && !matches!(op, "f" | "tru") {
+                if super::super::nan_safe() & super::super::nan_safe_bits::COMPARE != 0 && !matches!(op, "f" | "tru") {
                     self.nan_safe_compare(op, a, b)?
                 } else if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.

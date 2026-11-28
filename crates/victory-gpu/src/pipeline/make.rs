@@ -121,6 +121,13 @@ fn resolve_async_for(switch: bool, builder: bool) -> bool {
 /// Dispatches dropped because their resolve was still being made, since the start.
 static NOT_WAITED: AtomicU64 = AtomicU64::new(0);
 
+/// Whether a compute container is one of the ray-tracing resolves (`victory warm` tells them from
+/// the book's containers, without a pipeline).
+pub(super) fn is_resolve(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_RaytracingResolve";
+    container.windows(NAME.len()).any(|w| w == NAME)
+}
+
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
         .iter()

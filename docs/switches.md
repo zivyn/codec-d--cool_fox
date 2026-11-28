@@ -45,6 +45,7 @@ How to read it:
 | `VICTORY_LOCAL_EXIT` | off (`=1`, `=2`) | After its fix the RTX test passes (64 of 64 lanes store, 40 of 64 before), but the hair arms with it on were no different from those with it off: it does not fix the blocky hair. `=2` is too broad (it includes a particle program class that took the card down once). |
 | `VICTORY_F16_NEAREST` (`=2`), `VICTORY_F32_FTZ`, `VICTORY_NAN_SAFE` | **`F16_NEAREST` 2 and `F32_FTZ` on since integ/validation-24 (2026-11-28; `=0` turns each off)**, `NAN_SAFE` off | The RTX tests found the compare and min/max instructions of NaN and infinity exact on the card (0 of 144 differ); the one difference is `v_cvt_f16_f32`, which the card truncates where the console rounds to nearest (24 of 144 cases, one step). `=1` fixes the convert, `=2` also the mixed and packed 16-bit ops. Made the default at integ/validation-24 on the evidence of the pilot's alternating runs: with both on (arm D) the picture was clean in 2 of 2 processes (12 of 12 shots out to +300 s: no red spot, no white-out, smooth walls with no banding, smooth hair) while 2 of 2 controls without them whited out; on the card level 2 takes the f16 rounding from 4 of 11 cases wrong to 0, and FTZ alone changes nothing measurable (so the f16 half is the likely cause, and the tested pair ships). `F32_FTZ` alone showed no difference in the one unguarded normalisation tested. |
 | `VICTORY_PIPELINE_AHEAD`, `VICTORY_PIPELINE_WIDE` | off | Cold start: 61 % of it is one frame of about 175 compute programs made one at a time. These two queue them ahead and add workers; estimated 21 -> 7-9 minutes, not measured yet. |
+| `VICTORY_RESOLVE_ASYNC`, `VICTORY_PIPELINE_NOW_FIRST` | off | Cold start (COLD2): the ~175 big programs of that frame are the ray-tracing resolves; with the first switch a dispatch of one is dropped while it is made in a lane of its own (all but a quarter of the workers), as the title's own async-compile model drops a draw; the second makes what the frame on screen asked for go before older requests. Not measured yet. `victory warm --skip-resolves` leaves the resolves to the title. |
 | experiments | off | `ONE_PASS`, `PAGE_REFRESH`, `PRECISE_*`, `JOIN_WAITS`, `INDIRECT_FOLD`, `FOLD_VIEWS` with `VIEW_INDEX`, `STAGE_A*`, `SEND_COPYQ`, `QUIET_COMPARE`, `ASYNC_COMPUTE` (`=2` is a second compute queue), `LANE_CORE`, `LANE_HIGH`, `LIST_NICE`, `WAIT_NICE`, `OPUS_PITCH`, `BVH_BUILDER` with `BVH_SIZES`, `R11G11B10_AS_F16`, `PRECOMPILED`: new or not yet measured (rule 14). |
 
 ## What the older documents and comments said wrong (corrected in this change)
@@ -197,8 +198,10 @@ switch is read.
 | `VICTORY_OPUS_PITCH` | off | no | Resample audio packets to the pitch the title asks for. |
 | `VICTORY_PAGE_REFRESH` | off | yes | Refreshes driven by pages the title wrote: 1 shadow mode, 2 driven mode. |
 | `VICTORY_PIPELINE_BOOST` | off | yes | Raise the level of pipelines being made, per pipeline at its time. |
+| `VICTORY_PIPELINE_NOW_FIRST` | off | yes | Of the requested pipelines a worker takes first one a draw of this frame or the one before asked for (also in the resolves' lane); else the oldest. |
 | `VICTORY_PIPELINE_PREPARE` | off | yes | Begin the next submission refreshes on another thread while the current one is sent. |
 | `VICTORY_PIPELINE_PRIORITY` | on (=0 turns off) | yes | Pipelines the title waits on or touches go first in the queue. |
+| `VICTORY_PIPELINE_RAM_FREE_MB` | 1536 (0: no limit) | no | The free physical memory below which an extra pipeline worker or a ray-tracing resolve starts no new compile. |
 | `VICTORY_PIPELINE_WAIT_ADAPT` | off | yes | Let the per-frame pipeline wait budget follow how the waits end. |
 | `VICTORY_PLACED_CONSTANTS` (needs `VICTORY_COPIES_IN_PLACE`, on) | off | yes | A constant buffer that reads bytes the list's own placed copy wrote is snapshotted on the card (integ/validation-26). |
 | `VICTORY_PLACED_ORDER` | off | no | Order placed copies by where they stand in title memory. |
@@ -213,6 +216,8 @@ switch is read.
 | `VICTORY_REFRESH_NARROW` | off | yes | Splits each copy's refreshes into narrow spans separated by gaps (1 = 64 KiB, else that many KiB). |
 | `VICTORY_REFRESH_NOTES` | on (=0 turns off) | no | Skips re-looking at ranges whose write stamps stand and whose bits are set. |
 | `VICTORY_RESIDENT_BATCH` | on (=0 turns off) | yes | Makes residency calls for a batch of objects together instead of one call or round trip each. |
+| `VICTORY_RESOLVE_ASYNC` | off | no | The ray-tracing resolves (`CS_RaytracingResolve`) are made in a lane of their own and a dispatch of one is dropped, never waited for, while its pipeline is made. Not with the structure builder. |
+| `VICTORY_RESOLVE_WORKERS` | all but a quarter of the workers | no | How many workers make ray-tracing resolves at once with `VICTORY_RESOLVE_ASYNC` (`0`: every one). |
 | `VICTORY_SAME_RECORDS` | on (=0 turns off) | no | Skips writing records into title memory that already hold the same bytes. |
 | `VICTORY_SEND_COPYQ` | off | yes | Sends submission bytes over the bus on a copy queue. |
 | `VICTORY_SNAP_ASIDE` | on (=0 turns off) | yes | Gives snapshots to kept threads and waits for them before sending, saving about 3.5 ms. |
@@ -562,8 +567,10 @@ translation of shaders.
 | `VICTORY_PIPELINE_BOOK` | off | flag |  |  |  | Keep the pipelines the title creates, to make host pipelines ahead of later runs. |
 | `VICTORY_PIPELINE_BOOST` | off | flag |  | live |  | Raise the level of pipelines being made, per pipeline at its time. |
 | `VICTORY_PIPELINE_LOWEST` | on (=0 turns off) | flag |  |  |  | Run pipeline workers below the title own threads. |
+| `VICTORY_PIPELINE_NOW_FIRST` | off | flag |  |  |  | Of the requested pipelines a worker takes first one a draw of this frame or the one before asked for (also in the resolves' lane); else the oldest. |
 | `VICTORY_PIPELINE_PREPARE` | off | flag |  | live |  | Begin the next submission refreshes on another thread while the current one is sent. |
 | `VICTORY_PIPELINE_PRIORITY` | on (=0 turns off) | flag |  | live |  | Pipelines the title waits on or touches go first in the queue. |
+| `VICTORY_PIPELINE_RAM_FREE_MB` | 1536 (0: no limit) | number |  |  |  | The free physical memory below which an extra pipeline worker or a ray-tracing resolve starts no new compile. |
 | `VICTORY_PIPELINE_SLOW` | on (=0 turns off) | number |  |  |  | Limit how many slow programs are made at once, a quarter of the workers. |
 | `VICTORY_PIPELINE_WAIT_ADAPT` | off | flag |  | live |  | Let the per-frame pipeline wait budget follow how the waits end. |
 | `VICTORY_PIPELINE_WAIT_FLOOR_MS` | 100 | number |  |  |  | Lowest the adaptive pipeline wait budget may fall to, in ms. |
@@ -625,6 +632,8 @@ translation of shaders.
 | `VICTORY_REPLAY_TRACE_UPLOAD` | off | flag |  |  | diag | Replay tool: uploads textures one part at a time, waiting on each, to name a hanging part. |
 | `VICTORY_RESIDENCY_PRIORITY` | off | flag |  |  |  | Sets D3D residency priorities on allocations by class. |
 | `VICTORY_RESIDENT_BATCH` | on (=0 turns off) | flag |  | live |  | Makes residency calls for a batch of objects together instead of one call or round trip each. |
+| `VICTORY_RESOLVE_ASYNC` | off | flag |  |  |  | The ray-tracing resolves are made in a lane of their own and a dispatch of one is dropped, never waited for, while its pipeline is made (not with `VICTORY_BVH_BUILDER=1`). |
+| `VICTORY_RESOLVE_WORKERS` | all but a quarter of the workers | number |  |  |  | How many workers make ray-tracing resolves at once with `VICTORY_RESOLVE_ASYNC` (`0`: every one). |
 | `VICTORY_REUPLOAD_WHEN_FULL` | on (=0 turns off) | flag |  |  |  | Keeps bringing textures that have a host copy up to date while the card has no room. |
 | `VICTORY_RIPE_BLOCKS` | 12 | number |  |  |  | Number of blocks kept ready in the pool lists before pieces are cut from fresh ones. |
 | `VICTORY_ROOT_SRV_DIRECT` | off | flag |  |  |  | Goes back to root descriptors for buffer views instead of the bounded descriptor-table path. |

@@ -255,6 +255,52 @@ pub fn keys(dir: &Path) -> Vec<(String, bool)> {
     all
 }
 
+/// What `victory warm` weighs a pipeline of the book by.
+pub struct Weight {
+    /// The size of its shaders' containers: what the driver's compile costs follows it (a program
+    /// of 60 KB takes seconds, one of 4 KB a few hundred ms).
+    pub bytes: u64,
+    /// A ray-tracing resolve (`VICTORY_RESOLVE_ASYNC` makes these in the background, so a warm may
+    /// leave them to the title: `victory warm --skip-resolves`).
+    pub resolve: bool,
+}
+
+/// The [`Weight`] of each pipeline known in `dir`, in the book's order (as [`keys`]). Each
+/// compute container is read once and let go: memory stays at one container.
+pub fn weights(dir: &Path) -> Vec<Weight> {
+    let mut places = HashMap::new();
+    walk_shaders(dir, |_, hash, at, len| {
+        places.insert(hash, (at, len));
+    });
+    let mut file = std::fs::File::open(dir.join(SHADERS)).ok();
+    let mut container = Vec::new();
+    let mut all = Vec::new();
+    walk_pipelines(dir, |_, entry| {
+        let (mut bytes, mut resolve) = (0u64, false);
+        let count = entry.get(16).copied().unwrap_or(0);
+        let mut rest = entry.get(17..).unwrap_or_default();
+        for _ in 0..count {
+            let Some((head, after)) = rest.split_first_chunk::<33>() else { break };
+            rest = after;
+            let mut hash = [0; 32];
+            hash.copy_from_slice(&head[1..]);
+            let Some(&(at, len)) = places.get(&hash) else { continue };
+            bytes += u64::from(len);
+            // (One program alone is the pipeline of a compute shader.)
+            if count == 1
+                && STAGES.get(usize::from(head[0])) == Some(&"compute")
+                && let Some(file) = file.as_mut()
+            {
+                container.resize(len as usize, 0);
+                resolve = file.seek(SeekFrom::Start(at)).and_then(|_| file.read_exact(&mut container)).is_ok()
+                    && super::make::is_resolve(&container);
+            }
+        }
+        all.push(Weight { bytes, resolve });
+    });
+    all
+}
+
 /// What a driver's cached pipelines depend on besides the title's: the
 /// translator with its settings, and the driver.
 pub fn fingerprint() -> String {

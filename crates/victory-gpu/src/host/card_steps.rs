@@ -928,7 +928,7 @@ impl Host {
     /// now is reads of title memory that can all be done on the card
     /// ([`stage`]), the list that does them. `None` if nothing is in the
     /// way or the old wait is due. Under the submission lock.
-    pub(super) fn card_steps(&self, runs: &[&HostList]) -> Option<Taken> {
+    pub(super) fn card_steps(&self, runs: &[&HostList], compute: bool) -> Option<Taken> {
         if stage() == 0 || !relay_exact() {
             return None;
         }
@@ -943,7 +943,7 @@ impl Host {
         let taken = if copied_read(&copies, runs) {
             Err("a copy done on the card is read through another host copy")
         } else {
-            self.take_steps(&written, runs)
+            self.take_steps(&written, runs, compute)
         };
         match taken {
             Ok(taken) => taken,
@@ -957,7 +957,7 @@ impl Host {
         }
     }
 
-    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+    fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList], compute: bool) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
         // (Read once: the way the steps of this submission are looked at and the slots made.)
         let lean = lean_steps();
@@ -1080,7 +1080,7 @@ impl Host {
             });
         }
         spent.next("steps on the card: the list");
-        let Some(own) = self.own_list() else {
+        let Some(own) = self.own_list(compute) else {
             return Err("no host list or buffer for it");
         };
         // First every refresh, then the writes: the bytes compared with are
@@ -1182,15 +1182,20 @@ impl Host {
     }
 
     /// A list of ours open for recording, and its buffer.
-    fn own_list(&self) -> Option<Own> {
-        let pooled = POOL.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    fn own_list(&self, compute: bool) -> Option<Own> {
+        // (Of the type the queue it goes to runs: `VICTORY_ASYNC_COMPUTE=2`.)
+        let pooled = {
+            let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+            let at = pool.iter().rposition(|own| own.list.is_compute() == compute);
+            at.map(|at| pool.remove(at))
+        };
         if let Some(own) = pooled {
             own.list.reset();
             return Some(own);
         }
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
-        let list = self.new_list().ok()?;
+        let list = self.new_list_of(compute).ok()?;
         Some(Own { list, between })
     }
 }
@@ -1699,7 +1704,7 @@ mod tests {
             (*x, *y) = (i as u8 ^ (i >> 8) as u8, 0xee);
         }
         let was = a_bytes.to_vec();
-        let own = host.own_list().unwrap();
+        let own = host.own_list(false).unwrap();
         // Within `a` (there and back), from `a` to `b`, and a read alone.
         record(
             true,
@@ -1736,7 +1741,7 @@ mod tests {
         assert_eq!(a_bytes, &was[..]);
         // As the landing does: its next use records anew.
         POOL.lock().unwrap().push(own);
-        let own = host.own_list().unwrap();
+        let own = host.own_list(false).unwrap();
         own.list.close();
     }
 

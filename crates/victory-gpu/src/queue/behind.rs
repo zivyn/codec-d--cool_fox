@@ -1222,6 +1222,7 @@ fn value_writes(lists: &[crate::list::Detached], order: &[usize]) -> Vec<(usize,
 /// For the frame-rate line.
 pub(super) fn line(frames: f64) {
     super::timelines::line(frames);
+    crate::host::lanes::line(frames);
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
     let ms = |i: usize| s[i] / 1000.0 / frames;
     tracing::info!(

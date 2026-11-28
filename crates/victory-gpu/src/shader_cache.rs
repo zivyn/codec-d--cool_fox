@@ -494,4 +494,65 @@ mod tests {
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
     }
+
+    /// Every `VICTORY_*` name in the translator's sources (the way its build script lists the switches it
+    /// reads) that changes what it emits is part of the cache's key (`build`): by its text there, or by its value
+    /// through a function the key calls. A switch left out serves the translations made without it.
+    #[test]
+    fn every_switch_the_translator_reads_is_in_the_key() {
+        // Read but not a change of the translation (debug output, tools, the validator, build-time lists), or keyed
+        // through a function (`loop_limit`, `group_sync`, `shader_opt`, `host_settings`).
+        const NOT_TRANSLATION: &[&str] = &[
+            "VICTORY_PC_DXC",
+            "VICTORY_D3D12_DEBUG",
+            "VICTORY_DESC_WHY",
+            "VICTORY_MASK_WHY",
+            "VICTORY_WAVE_WHY",
+            "VICTORY_DXIL",
+            "VICTORY_SHADER_CENSUS",
+            "VICTORY_WARP",
+            "VICTORY_REF_PS",
+            "VICTORY_REF_VS",
+            "VICTORY_SHADER_SOURCE_HASH",
+            "VICTORY_SHADER_SWITCHES",
+            "VICTORY_SHADER_LOOP_LIMIT",
+            "VICTORY_SHADER_OPT",
+            "VICTORY_GROUP_SYNC",
+            "VICTORY_RDNA_FLOAT",
+        ];
+        let key = include_str!("shader_cache.rs");
+        let key = &key[..key.find("#[cfg(test)]").unwrap()];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../victory-shader/src");
+        let mut missing = std::collections::BTreeSet::new();
+        for file in walk(&root) {
+            let name = file.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".rs")
+                || name.ends_with("_tests.rs")
+                || name.ends_with("_test.rs")
+                || name == "tests.rs"
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find("\"VICTORY_") {
+                let tail = &rest[at + 1..];
+                let end = tail
+                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+                    .unwrap_or(tail.len());
+                let switch = &tail[..end];
+                if tail[end..].starts_with('"')
+                    && !NOT_TRANSLATION.contains(&switch)
+                    && !key.contains(&format!("\"{switch}\""))
+                {
+                    missing.insert(switch.to_owned());
+                }
+                rest = &tail[end..];
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "read by the translator, not in the shader cache key: {missing:?}"
+        );
+    }
 }

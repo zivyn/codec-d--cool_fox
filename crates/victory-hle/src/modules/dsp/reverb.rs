@@ -56,6 +56,8 @@ pub struct Reverb {
     gain: [f32; LINES],
     diffusers: [Allpass; 2],
     level: f32,
+    /// Where the last block's gains ended.
+    last_gain: Option<f32>,
 }
 
 impl Reverb {
@@ -69,6 +71,7 @@ impl Reverb {
             gain: DELAYS.map(|d| 10f32.powf(-3.0 * d as f32 / (rt60 * SAMPLE_RATE))),
             diffusers: DIFFUSERS.map(Allpass::new),
             level,
+            last_gain: None,
         }
     }
 
@@ -151,7 +154,10 @@ impl Reverb {
     /// `channels` of them, in the layout asked for) with the reverb of
     /// `input` (silence when null): the mean of the channels in, a channel
     /// of the network's output per channel out, scaled by the command's
-    /// `gains`.
+    /// `gains`: for a mono stream a ramp from the first to the second over
+    /// the block (what two gains can mean on one channel, and no step when
+    /// the next block starts where this one ended), for a stereo one a gain
+    /// for each channel.
     ///
     /// # Safety
     /// `output` holds `frames * channels` floats; `input`, if not null,
@@ -172,6 +178,11 @@ impl Reverb {
                 c * frames + n
             }
         };
+        let started = std::time::Instant::now();
+        let ramp = channels == 1 && gains[0] != gains[1];
+        let step = self.last_gain.is_some_and(|g| (g - gains[0]).abs() > 1e-4);
+        crate::modules::audio::stats::COUNTERS.reverb_gains(ramp, step);
+        self.last_gain = Some(if channels == 1 { gains[1] } else { gains[0] });
         // A sample that is not a number would stay in the network for good.
         let (mut input_peak, mut output_peak, mut repaired) = (0f32, 0f32, false);
         for n in 0..frames {
@@ -198,13 +209,23 @@ impl Reverb {
             output_peak = output_peak.max(left.abs()).max(right.abs());
             // SAFETY: as above; every input of this frame is read already.
             unsafe {
-                output.add(index(n, 0)).write(left * gains[0] * self.level);
+                let gain = if channels == 1 {
+                    gains[0] + (gains[1] - gains[0]) * (n as f32 / frames as f32)
+                } else {
+                    gains[0]
+                };
+                output.add(index(n, 0)).write(left * gain * self.level);
                 if channels > 1 {
                     output.add(index(n, 1)).write(right * gains[1] * self.level);
                 }
             }
         }
-        crate::modules::audio::stats::COUNTERS.reverb_block(input_peak, output_peak, repaired);
+        crate::modules::audio::stats::COUNTERS.reverb_block(
+            input_peak,
+            output_peak,
+            repaired,
+            started.elapsed(),
+        );
     }
 }
 
@@ -360,5 +381,89 @@ mod tests {
         let quiet = run(&mut reverb, &vec![0f32; 48_000 * 6]);
         assert!(quiet.iter().all(|v| v.is_finite()));
         assert!(rms(&quiet[48_000 * 5..]) < 1e-6);
+    }
+
+    /// One mono stream fed block after block of a steady tone, as the title
+    /// drives it (1024 frames a command): the output has no jump at the
+    /// edges of blocks beyond what it has inside them.
+    #[test]
+    fn a_steady_tone_through_consecutive_blocks_has_no_edge_discontinuity() {
+        let (frames, blocks) = (1024, 60);
+        let mut reverb = Reverb::new(2.0, 1.0);
+        let mut out = Vec::new();
+        for b in 0..blocks {
+            let tone: Vec<f32> = (0..frames)
+                .map(|n| {
+                    0.5 * ((b * frames + n) as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin()
+                })
+                .collect();
+            let mut block = vec![0f32; frames];
+            // SAFETY: one channel of `frames` floats each.
+            unsafe {
+                reverb.block(
+                    tone.as_ptr(),
+                    block.as_mut_ptr(),
+                    frames,
+                    1,
+                    false,
+                    [1.0, 1.0],
+                )
+            };
+            out.extend(block);
+        }
+        // Past the build-up; jumps between neighbours, inside and at edges.
+        let (mut inside, mut edge) = (0f32, 0f32);
+        for (n, w) in out.windows(2).enumerate().skip(frames * 8) {
+            let jump = (w[1] - w[0]).abs();
+            if (n + 1) % frames == 0 {
+                edge = edge.max(jump);
+            } else {
+                inside = inside.max(jump);
+            }
+        }
+        assert!(
+            inside > 0.0 && edge <= inside * 1.15,
+            "edge {edge}, inside {inside}"
+        );
+    }
+
+    /// Gains that change over the block (a ramp from the first to the
+    /// second) leave no step where the next block starts at the second.
+    #[test]
+    fn gains_ramped_over_a_block_leave_no_step_at_its_edge() {
+        let (frames, blocks) = (1024, 40);
+        let mut reverb = Reverb::new(2.0, 1.0);
+        let tone: Vec<f32> = (0..frames * blocks)
+            .map(|n| 0.5 * (n as f32 * 220.0 * std::f32::consts::TAU / 48_000.0).sin())
+            .collect();
+        let mut out = Vec::new();
+        for b in 0..blocks {
+            // Gain falls from 1 to 0 over ten blocks, then rises again.
+            let at = |k: usize| 1.0 - (k % 20) as f32 / 10.0;
+            let (g0, g1) = (at(b).abs(), at(b + 1).abs());
+            let mut block = vec![0f32; frames];
+            // SAFETY: one channel of `frames` floats each.
+            unsafe {
+                reverb.block(
+                    tone[b * frames..].as_ptr(),
+                    block.as_mut_ptr(),
+                    frames,
+                    1,
+                    false,
+                    [g0, g1],
+                )
+            };
+            out.extend(block);
+        }
+        let (mut inside, mut edge) = (0f32, 0f32);
+        for (n, w) in out.windows(2).enumerate().skip(frames * 8) {
+            let jump = (w[1] - w[0]).abs();
+            if (n + 1) % frames == 0 {
+                edge = edge.max(jump);
+            } else {
+                inside = inside.max(jump);
+            }
+        }
+        assert!(edge <= inside * 1.15, "edge {edge}, inside {inside}");
     }
 }

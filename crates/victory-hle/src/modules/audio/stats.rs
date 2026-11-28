@@ -18,17 +18,6 @@ pub const MIXER_BLOCK: Duration = Duration::from_micros(5_333);
 /// Decoding passes are asked for every 2 ms; this many apart is a stall.
 pub const PASS_STALL: Duration = Duration::from_millis(8);
 
-/// What happened to an overlap token: kept with a state, found and used,
-/// found but not usable (too old or another shape), or a voice's own state
-/// dropped because its refill came too late.
-#[derive(Clone, Copy)]
-pub enum Overlap {
-    Saved,
-    Restored,
-    Refused,
-    Reset,
-}
-
 #[derive(Default)]
 pub struct Counters {
     enabled: AtomicU64,
@@ -50,14 +39,14 @@ pub struct Counters {
     pass_max_us: AtomicU64,
     peak: AtomicU64,
     unknown_commands: AtomicU64,
-    overlap_saved: AtomicU64,
-    overlap_restored: AtomicU64,
-    overlap_refused: AtomicU64,
-    overlap_reset: AtomicU64,
     reverb_blocks: AtomicU64,
     reverb_bad_blocks: AtomicU64,
     reverb_in_peak_milli: AtomicU64,
     reverb_out_peak_milli: AtomicU64,
+    reverb_us: AtomicU64,
+    reverb_max_us: AtomicU64,
+    reverb_gain_ramps: AtomicU64,
+    reverb_gain_steps: AtomicU64,
 }
 
 /// The counters of one window, plain.
@@ -81,14 +70,14 @@ pub struct Window {
     pub pass_max_us: u64,
     pub peak: u64,
     pub unknown_commands: u64,
-    pub overlap_saved: u64,
-    pub overlap_restored: u64,
-    pub overlap_refused: u64,
-    pub overlap_reset: u64,
     pub reverb_blocks: u64,
     pub reverb_bad_blocks: u64,
     pub reverb_in_peak_milli: u64,
     pub reverb_out_peak_milli: u64,
+    pub reverb_us: u64,
+    pub reverb_max_us: u64,
+    pub reverb_gain_ramps: u64,
+    pub reverb_gain_steps: u64,
 }
 
 pub static COUNTERS: Counters = Counters::new();
@@ -117,33 +106,25 @@ impl Counters {
             pass_max_us,
             peak,
             unknown_commands,
-            overlap_saved,
-            overlap_restored,
-            overlap_refused,
-            overlap_reset,
             reverb_blocks,
             reverb_bad_blocks,
             reverb_in_peak_milli,
-            reverb_out_peak_milli
+            reverb_out_peak_milli,
+            reverb_us,
+            reverb_max_us,
+            reverb_gain_ramps,
+            reverb_gain_steps
         )
-    }
-
-    /// What the overlap buffers did (`VICTORY_XMA_OVERLAP`).
-    pub fn overlap(&self, kind: Overlap) {
-        let counter = match kind {
-            Overlap::Saved => &self.overlap_saved,
-            Overlap::Restored => &self.overlap_restored,
-            Overlap::Refused => &self.overlap_refused,
-            Overlap::Reset => &self.overlap_reset,
-        };
-        counter.fetch_add(1, Relaxed);
     }
 
     /// A block through the stand-in reverb (`VICTORY_DSP_REVERB`): the
     /// largest sample in and out, and whether it had to be repaired
     /// (a sample that was not a number, or a network that ran away).
-    pub fn reverb_block(&self, input_peak: f32, output_peak: f32, repaired: bool) {
+    pub fn reverb_block(&self, input_peak: f32, output_peak: f32, repaired: bool, took: Duration) {
         let milli = |v: f32| (v * 1000.0).min(1e12) as u64;
+        let us = took.as_micros() as u64;
+        self.reverb_us.fetch_add(us, Relaxed);
+        self.reverb_max_us.fetch_max(us, Relaxed);
         self.reverb_blocks.fetch_add(1, Relaxed);
         self.reverb_bad_blocks
             .fetch_add(u64::from(repaired), Relaxed);
@@ -151,6 +132,14 @@ impl Counters {
             .fetch_max(milli(input_peak), Relaxed);
         self.reverb_out_peak_milli
             .fetch_max(milli(output_peak), Relaxed);
+    }
+
+    /// The gains of a reverb block: whether they differ within it (a ramp),
+    /// and whether they start somewhere other than where the stream's last
+    /// block ended.
+    pub fn reverb_gains(&self, ramp: bool, step: bool) {
+        self.reverb_gain_ramps.fetch_add(u64::from(ramp), Relaxed);
+        self.reverb_gain_steps.fetch_add(u64::from(step), Relaxed);
     }
 
     /// A coprocessor command no unit of ours carries out.
@@ -229,14 +218,14 @@ impl Counters {
             pass_max_us: t(&self.pass_max_us),
             peak: t(&self.peak),
             unknown_commands: t(&self.unknown_commands),
-            overlap_saved: t(&self.overlap_saved),
-            overlap_restored: t(&self.overlap_restored),
-            overlap_refused: t(&self.overlap_refused),
-            overlap_reset: t(&self.overlap_reset),
             reverb_blocks: t(&self.reverb_blocks),
             reverb_bad_blocks: t(&self.reverb_bad_blocks),
             reverb_in_peak_milli: t(&self.reverb_in_peak_milli),
             reverb_out_peak_milli: t(&self.reverb_out_peak_milli),
+            reverb_us: t(&self.reverb_us),
+            reverb_max_us: t(&self.reverb_max_us),
+            reverb_gain_ramps: t(&self.reverb_gain_ramps),
+            reverb_gain_steps: t(&self.reverb_gain_steps),
         }
     }
 }
@@ -284,14 +273,14 @@ pub fn tick(since: &mut Instant, voices: usize) {
         pass_max_ms = ms(w.pass_max_us),
         peak = w.peak,
         unknown_commands = w.unknown_commands,
-        overlap_saved = w.overlap_saved,
-        overlap_restored = w.overlap_restored,
-        overlap_refused = w.overlap_refused,
-        overlap_reset = w.overlap_reset,
         reverb_blocks = w.reverb_blocks,
         reverb_bad_blocks = w.reverb_bad_blocks,
         reverb_in_peak = w.reverb_in_peak_milli as f32 / 1000.0,
         reverb_out_peak = w.reverb_out_peak_milli as f32 / 1000.0,
+        reverb_ms = w.reverb_us as f32 / 1000.0,
+        reverb_max_block_ms = w.reverb_max_us as f32 / 1000.0,
+        reverb_gain_ramps = w.reverb_gain_ramps,
+        reverb_gain_steps = w.reverb_gain_steps,
         "audio stats"
     );
 }

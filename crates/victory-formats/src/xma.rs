@@ -1824,37 +1824,4 @@ mod tests {
             assert!(errors == 0 && snr > 40.0);
         }
     }
-
-    /// What a decoder carries over from one frame goes into the next: the
-    /// tail of the frame before comes out first, joined to its samples, where
-    /// a decoder started cold gives silence (a seam). A copy of the warm
-    /// decoder (what the overlap buffer keeps for the next context) decodes
-    /// as the original does.
-    #[test]
-    fn the_overlap_a_decoder_carries_goes_into_the_next_frame() {
-        // A mono frame of one empty subframe: 31 bits.
-        let mut frame = vec![0xffu8; 8];
-        set_bits(&mut frame, 0, 15, 31);
-        set_bits(&mut frame, 15, 2, 0b10);
-        set_bits(&mut frame, 17, 14, 0);
-        let tail: Vec<f32> = (0..FRAME_SAMPLES / 2)
-            .map(|i| 0.01 + i as f32 * 1e-4)
-            .collect();
-        let mut warm = Decoder::new(1, 48_000);
-        warm.ch[0].out[..tail.len()].copy_from_slice(&tail);
-        let copy = warm.clone();
-        let (mut continued, mut copied, mut cold) = (Vec::new(), Vec::new(), Vec::new());
-        warm.decode(&frame, 31, &mut continued).unwrap();
-        copy.clone().decode(&frame, 31, &mut copied).unwrap();
-        Decoder::new(1, 48_000)
-            .decode(&frame, 31, &mut cold)
-            .unwrap();
-        assert_eq!(continued, copied);
-        // The tail comes out (shaped by the frame it joins), starting where
-        // it was and with no jump; cold, the same frame is silence.
-        assert_eq!(continued[0], to_i16(tail[0]));
-        assert!(continued[..tail.len()].iter().all(|&s| s > 0));
-        assert!(continued.windows(2).all(|w| (w[1] - w[0]).abs() < 8));
-        assert!(cold.iter().all(|&s| s == 0));
-    }
 }

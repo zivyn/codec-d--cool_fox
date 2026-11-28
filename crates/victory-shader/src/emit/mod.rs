@@ -155,6 +155,8 @@ mod sampler_table_tests;
 #[cfg(all(test, windows))]
 mod view_index_tests;
 #[cfg(all(test, windows))]
+mod bindless_tests;
+#[cfg(all(test, windows))]
 mod fuse_tests;
 #[cfg(all(test, windows))]
 mod loop_limit_tests;
@@ -186,7 +188,8 @@ pub use lower::fuse::{
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    FUSE_MEMBERS, FUSE_ROWS, FUSE_WIDTH, SLOT_FUSE, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_ROOT_VIEW_INDEX, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    FUSE_MEMBERS, FUSE_ROWS, FUSE_WIDTH, SLOT_FUSE, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES, SLOT_VIEW_WINDOWS,
+    SLOT_WINDOWS_COUNT, USER_WINDOW_BASE, WINDOW_COPIES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_ROOT_VIEW_INDEX, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
@@ -731,6 +734,9 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// The table entries (root parameter, offset in dwords) the shader reads through the host's windows
+    /// alone (`VICTORY_BINDLESS_BUFFERS`): their views need not be made for it.
+    pub bindless: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -1600,6 +1606,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        bindless: l.bindless,
     };
     Ok((shader, wave_size))
 }
@@ -2428,6 +2435,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            bindless: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -2440,6 +2448,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                bindless: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -3108,6 +3117,7 @@ mod tests {
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
             root_indexed_views: Vec::new(),
+            bindless: Vec::new(),
         };
         let (root, pso) = host.compute_pipeline(&cs).unwrap();
         // Twelve dwords: the loads below run across the view's end.
@@ -3262,6 +3272,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                bindless: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -3678,6 +3689,7 @@ mod barycentric_tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            bindless: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.

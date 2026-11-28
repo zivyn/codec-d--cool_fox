@@ -1289,6 +1289,22 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A raw read of a table's buffer through the host's window of the entry, when it has one
+        // (`VICTORY_BINDLESS_BUFFERS`): the dwords come out as integers.
+        if !typed
+            && !d16
+            && !uav
+            && index.is_none()
+            && let Some(xs) = self.window_dwords(site, src, off, count)?
+        {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");

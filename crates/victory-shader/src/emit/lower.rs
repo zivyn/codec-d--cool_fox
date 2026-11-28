@@ -26,6 +26,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 pub(super) mod intersect;
 #[path = "view_index.rs"]
 pub(super) mod view_index;
+#[path = "bindless.rs"]
+pub(super) mod bindless;
 #[path = "fuse.rs"]
 pub(super) mod fuse;
 
@@ -74,6 +76,8 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    /// The table entries only windows read ([`bindless`]).
+    pub bindless: Vec<(u8, u32)>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
     /// Heap handles made with a non-uniform index.
@@ -428,6 +432,9 @@ struct Lower<'a> {
     /// Element strides read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
+    /// The table entries read through the host's windows, and those through their views
+    /// ([`bindless`]).
+    bindless: bindless::Entries,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -2007,6 +2014,7 @@ impl<'a> Lower<'a> {
             merged_wave_mask,
             handles: HashMap::new(),
             strides: HashMap::new(),
+            bindless: Default::default(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -2810,7 +2818,9 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let bindless = self.bindless.only_windows();
         Ok(Lowered {
+            bindless,
             wave_size,
             cmp_samplers,
             root_cbvs,
@@ -7285,6 +7295,13 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+            // Through the host's window of the entry, when it has one (`VICTORY_BINDLESS_BUFFERS`).
+            if let Some(xs) = self.window_dwords(site, src, addr, count)? {
+                for (k, x) in xs.into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             // The size in a structure's header (its second dword), which a
             // copy of it loops over.
             let size = *offset == 4
@@ -8217,6 +8234,7 @@ impl<'a> Lower<'a> {
         sampler: bool,
         props: (u32, u32),
     ) -> Result<V, Why> {
+        self.note_view(src);
         match src {
             Source::Loaded { load, first } => {
                 let key = (self.cur, *load, *first, sampler, props);

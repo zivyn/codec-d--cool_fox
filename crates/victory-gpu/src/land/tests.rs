@@ -873,6 +873,17 @@ fn bench_landing(memory: Memory, every_kernel: bool) {
         }
         h
     };
+    if memory == Memory::Plain {
+        let mut brand = Vec::new();
+        for leaf in 0x8000_0002u32..=0x8000_0004 {
+            // SAFETY: the instruction is there on any processor that has AVX2.
+            let r = unsafe { std::arch::x86_64::__cpuid(leaf) };
+            for word in [r.eax, r.ebx, r.ecx, r.edx] {
+                brand.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        println!("land_merge_bench: processor {}", String::from_utf8_lossy(&brand).trim_matches(char::from(0)).trim());
+    }
     println!(
         "land_merge_bench: {memory:?} memory, {PIECES} pieces, {:.1} MB of {} MB, {} jobs",
         bytes as f64 / 1e6,
@@ -881,10 +892,17 @@ fn bench_landing(memory: Memory, every_kernel: bool) {
     );
     let mut expect = None;
     let all = crate::safecopy::kernels();
-    let chosen: Vec<(&str, crate::safecopy::Kernel)> =
+    let mut chosen: Vec<(&str, crate::safecopy::Kernel)> =
         if every_kernel { all.to_vec() } else { vec![all[0], all[3]] };
+    if every_kernel {
+        chosen.extend(crate::safecopy::diagnostic_kernels());
+    }
     for (name, kernel) in chosen {
+        let diagnostic = name == "whole stores" || name == "card and copy only";
         for heads in [false, true] {
+            if diagnostic && !heads {
+                continue;
+            }
             if !every_kernel && heads != (name != "plain") {
                 continue;
             }
@@ -907,7 +925,9 @@ fn bench_landing(memory: Memory, every_kernel: bool) {
                         );
                     }
                     let d = digest();
-                    assert_eq!(*expect.get_or_insert(d), d, "{name}: not what the plain loop left");
+                    if name != "card and copy only" {
+                        assert_eq!(*expect.get_or_insert(d), d, "{name}: not what the plain loop left");
+                    }
                 }
                 walls.sort_by(f64::total_cmp);
                 line += &format!(

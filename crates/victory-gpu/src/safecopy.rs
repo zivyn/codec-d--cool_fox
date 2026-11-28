@@ -144,7 +144,7 @@ std::arch::global_asm!(
 /// request here is over the end of the page into the next one of the piece, which is where the next call begins.
 /// (Title memory is asked for only where a block differs: a page the card left as it was is never touched.)
 macro_rules! merge_kernel {
-    ($name:literal, $at:literal, $after:literal, $failed:literal, $pf:literal) => {
+    ($name:literal, $at:literal, $after:literal, $failed:literal, $pf:literal, $partial:literal) => {
         std::arch::global_asm!(
             concat!(".globl ", $name),
             concat!(".globl ", $at),
@@ -175,7 +175,7 @@ macro_rules! merge_kernel {
             "cmp eax, 255",
             "je 3f",
             "vpxor ymm4, ymm4, ymm5",
-            "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3",
+            $partial,
             "jmp 7f",
             "3:",
             "vmovdqu ymmword ptr [rcx], ymm3",
@@ -204,12 +204,53 @@ macro_rules! merge_kernel {
     };
 }
 
-merge_kernel!("victory_safe_merge_p256", "victory_safe_merge_p256_at", "victory_safe_merge_p256_after", "victory_safe_merge_p256_failed", 256);
-merge_kernel!("victory_safe_merge_p512", "victory_safe_merge_p512_at", "victory_safe_merge_p512_after", "victory_safe_merge_p512_failed", 512);
-merge_kernel!("victory_safe_merge_p1024", "victory_safe_merge_p1024_at", "victory_safe_merge_p1024_after", "victory_safe_merge_p1024_failed", 1024);
-merge_kernel!("victory_safe_merge_p2048", "victory_safe_merge_p2048_at", "victory_safe_merge_p2048_after", "victory_safe_merge_p2048_failed", 2048);
+merge_kernel!("victory_safe_merge_p256", "victory_safe_merge_p256_at", "victory_safe_merge_p256_after", "victory_safe_merge_p256_failed", 256, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+merge_kernel!("victory_safe_merge_p512", "victory_safe_merge_p512_at", "victory_safe_merge_p512_after", "victory_safe_merge_p512_failed", 512, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+merge_kernel!("victory_safe_merge_p1024", "victory_safe_merge_p1024_at", "victory_safe_merge_p1024_after", "victory_safe_merge_p1024_failed", 1024, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+merge_kernel!("victory_safe_merge_p2048", "victory_safe_merge_p2048_at", "victory_safe_merge_p2048_after", "victory_safe_merge_p2048_failed", 2048, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+
+// What the merge's parts cost, for the benchmark (tests only; neither is the merge): the loop with a store of the
+// whole block where it stores some dwords (which the title's threads would see as a write of the dwords beside),
+// and the loop that only looks at what the card holds and what it held and brings the second up to the first.
+#[cfg(test)]
+merge_kernel!("victory_diag_whole", "victory_diag_whole_at", "victory_diag_whole_after", "victory_diag_whole_failed", 1024, "vmovdqu ymmword ptr [rcx], ymm3");
+#[cfg(test)]
+std::arch::global_asm!(
+    ".globl victory_diag_held",
+    "victory_diag_held:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "2:",
+    "prefetcht0 byte ptr [rdx + 1024]",
+    "prefetcht0 byte ptr [r8 + 1024]",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "vzeroupper",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], r10",
+    "mov qword ptr [rax + 8], r11",
+    "xor eax, eax",
+    "ret",
+);
 
 unsafe extern "system" {
+    #[cfg(test)]
+    fn victory_diag_whole(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    #[cfg(test)]
+    fn victory_diag_held(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
     fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
@@ -287,6 +328,13 @@ pub(crate) fn kernels() -> [(&'static str, Kernel); 5] {
         ("ahead 1024", victory_safe_merge_p1024),
         ("ahead 2048", victory_safe_merge_p2048),
     ]
+}
+
+/// The two loops that cost what parts of the merge do (see `victory_diag_whole`): not the merge, never to be used as
+/// one.
+#[cfg(test)]
+pub(crate) fn diagnostic_kernels() -> [(&'static str, Kernel); 2] {
+    [("whole stores", victory_diag_whole), ("card and copy only", victory_diag_held)]
 }
 
 /// The kernel that asks ahead, as used when [`ahead`] is on.

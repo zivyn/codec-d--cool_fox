@@ -18,6 +18,8 @@
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod lux;
+#[cfg(windows)]
 mod bufscan;
 mod asked;
 mod changes;

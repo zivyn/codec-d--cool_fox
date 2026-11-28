@@ -65,6 +65,9 @@ pub(crate) struct Shader {
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
+    /// Whether it is the program that moves the title's lux block (`crate::lux`).
+    #[cfg(windows)]
+    pub(crate) lux: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
     /// What its code stores to buffers, by descriptor ([`Shader::footprint`]), made when first asked.
@@ -123,6 +126,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                #[cfg(windows)]
+                lux: stage == "compute" && crate::lux::program(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
                 #[cfg(windows)]

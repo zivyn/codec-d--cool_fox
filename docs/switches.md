@@ -209,6 +209,7 @@ switch is read.
 | `VICTORY_LEVELS_RETRY` | on (=0 turns off) | yes | Lets a level-capped texture retry upload when room appears; =0 brings the old rule back. |
 | `VICTORY_LIST_NICE` | off | yes | Runs list-translating threads this many priority levels below the guest's; 0 is normal. |
 | `VICTORY_LIST_VIEWS` | on (=0 turns off) | no | Makes a view its tables hold once per list instead of once per table. |
+| `VICTORY_LUX` | unset (the title's own) | no | A value from 1 to 1024 forced as the target of the title's lux block (its luminance passes and its composite's bloom scale read it); unset leaves the title's own range. |
 | `VICTORY_MAKE_ASIDE` | on (=0 turns off) | yes | Makes a buffer's copy aside from its lock; =0 makes it under the lock. |
 | `VICTORY_ONE_CALL` | off | yes | A submission joined of several parts is given to the queue in one `ExecuteCommandLists` call (integ/validation-26). |
 | `VICTORY_ONE_PASS` | off | yes | Prepare a submission from one pass over the steps instead of four walks. |
@@ -570,6 +571,7 @@ translation of shaders.
 | `VICTORY_LOOP_LIMITS` | off | list | yes |  |  | Table of per-program, per-stage iteration limits for translated loops. |
 | `VICTORY_LOOP_NOTES` | off | flag | yes |  |  | Translated loops that hit their iteration limit leave a note in the faults buffer. |
 | `VICTORY_LOOP_WHY` | off | flag | yes |  |  | Prints one stderr line per translated loop, saying why it has its limit. |
+| `VICTORY_LUX` | unset | number |  | live |  | A value from 1 to 1024 forced as the target of the title's lux block; unset leaves the title's own range. |
 | `VICTORY_MAKE_ASIDE` | on (=0 turns off) | flag |  | live |  | Makes a buffer's copy aside from its lock; =0 makes it under the lock. |
 | `VICTORY_MAPPED_BY_PAGE` | off | flag |  |  |  | Reads which pages of a texture are mapped by page, without the walk. |
 | `VICTORY_MAPPED_BY_VIEWS` | on (=0 turns off) | flag |  |  |  | Finds which pages of a texture are mapped from the views, not by asking the host. |

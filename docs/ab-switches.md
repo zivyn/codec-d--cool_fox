@@ -319,3 +319,7 @@ system calls, faults and the handlers that run inside them; a thread of ours at 
   places (`module+rva`) that hold most of it. It is how to read what `VICTORY_WAIT_NICE` can save before and after.
 - `VICTORY_LIST_OPS=1` (diagnostics): per frame, calls and time of `view_at`, `shadow::lookup`, `hosted`, `keep`, `make_listed`, `make_twinned`,
   `readable`, `tables` and `bind` (inclusive of each other, wall time of the thread, 25-30 ns of clock in each), in the `VICTORY_THIN` line's place.
+
+## What fix/gi3-bounce adds to the A/B (2026-11-28)
+
+Two live entries in `ab/registry.rs` (`LIVE`, 107 entries with integ/validation-29's 105): `VICTORY_AMBIENT_AIR=<multiple>` (`ambient::air`, read at each dispatch of the air's program; A is the unset variable, the built-in 1.5; B is the value, `=0` leaves the title's own air: the next dispatch does what the value says, nothing is kept between dispatches, so a flip at any instant is safe) and `VICTORY_AMBIENT_DIRECTION=<weight>` (`ambient::direction`, a constant of the resolve pass read at each dispatch; A is 1.2, B the value; no state, safe at any instant). The estimate follows both within a few seconds (the previous frame's radiance, a slow mean), so give a phase 10 s or more and read the picture of its end (`VICTORY_AB_SHOTS`). `VICTORY_AMBIENT_RT=1` is not live (read once; it needs the builder, which is not flippable).

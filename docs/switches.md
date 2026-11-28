@@ -164,6 +164,8 @@ switch is read.
 | switch | default | row in ab-switches.md | purpose |
 |---|---|---|---|
 | `VICTORY_ALIAS_BATCH` | off | yes | The other views of a run of blocks the write guards make read-only are guarded by one change of protection for each run of them side by side. |
+| `VICTORY_AMBIENT_AIR` | 1.5 | no | The multiple of the air's scattering bound of the stand-in (A: 1.5, B: the value; `=0` leaves the title's own air). |
+| `VICTORY_AMBIENT_DIRECTION` | 1.2 | no | The weight of the directional term of the stand-in's estimate (0 leaves the mean alone). |
 | `VICTORY_AMBIENT_GAIN` | 1 | no | Scales the light the indirect-light stand-in puts in (share, floor and constant); 1 changes nothing. |
 | `VICTORY_ASK_ASIDE` | on (=0 turns off) | yes | Offers the write-watch asking to a side thread and joins it where it used to ask. |
 | `VICTORY_ASK_CACHE` | off | yes | Lets a thread remember more write-watch answers, including windows outside buffers. |
@@ -304,8 +306,10 @@ translation of shaders.
 | `VICTORY_ALIAS_COPY` | on (=0 turns off) | number |  |  |  | Finds the texture aliasing a title resource's memory; 0 none, 1 only single-level single-layer textures. |
 | `VICTORY_ALIAS_FAST` | off | flag |  |  |  | Lets page-by-page remapping skip pages that already show the wanted page and do small groups itself. |
 | `VICTORY_AMBIENT` | on, 0.8 (0/off turns off) | text |  |  |  | Stand-in for the title's missing indirect light: share of the estimate, optional floor or constant. |
-| `VICTORY_AMBIENT_AIR` | 1.5 | text |  |  |  | Multiple of the air's scattering for the stand-in light, with optional max:level cap. |
+| `VICTORY_AMBIENT_AIR` | 1.5 | text |  | live |  | Multiple of the air's scattering for the stand-in light, with optional max:level cap; the multiple is live in the A/B (`=0`: the title's own air, no bound). |
+| `VICTORY_AMBIENT_DIRECTION` | 1.2 | number |  | live |  | Weight of the directional (first-order) term of the stand-in's estimate; 0 leaves the mean alone. |
 | `VICTORY_AMBIENT_GAIN` | 1 | number |  | live |  | Scales the light the indirect-light stand-in puts in (share, floor and constant); 1 changes nothing. |
+| `VICTORY_AMBIENT_RT` | off | flag |  |  |  | Lets the stand-in run as a floor under the title's own traced light while the structure builder lights (needs `VICTORY_BVH_BUILDER=1`); what the program left is kept up to 64 times the estimate. |
 | `VICTORY_AMBIENT_SHADE` | 1.0,0.6 | list |  |  |  | Strength and radius in metres of the creases' shade in the stand-in light. |
 | `VICTORY_AMBIENT_TRUST` | 4 | number |  |  |  | Bounds what the title's own program left by this multiple of the estimate; 0 drops it. |
 | `VICTORY_ASK_ASIDE` | on (=0 turns off) | flag |  | live |  | Offers the write-watch asking to a side thread and joins it where it used to ask. |

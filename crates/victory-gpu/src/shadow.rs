@@ -4807,19 +4807,27 @@ impl Shadow {
         let readable = crate::host::read_into(self.start as *const u8, &mut title);
         // SAFETY: the copy's mapping is `len` bytes (rounded up).
         let held = unsafe { std::slice::from_raw_parts(self.data.cast_const(), n) };
-        let dwords = |b: &[u8]| -> (usize, Vec<u32>) {
-            let all = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
-            (all.clone().filter(|&d| d != 0).count(), all.take(16).collect())
-        };
-        let ((tn, tf), (cn, cf)) = (dwords(&title), dwords(held));
-        let differ = title.chunks(4096).zip(held.chunks(4096)).filter(|(a, b)| a != b).count();
+        let look = ProbeLook::of(&title, held);
+        let pending: Vec<(usize, usize)> = self.pending.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let start = self.start as usize;
+        // Which of the pages that differ lie where shaders are writing (the refresh leaves those
+        // to the landing) and which not.
+        let in_flight = look.differ_at.iter().filter(|&&p| pending.iter().any(|&(a, e)| a < start + p + 4096 && e > start + p)).count();
+        let (tn, tf, cn, cf, differ) = (look.title_nonzero, look.title_first, look.copy_nonzero, look.copy_first, look.pages_differ);
         tracing::info!(
             start = format_args!("{:#x}", self.start),
             len = self.len,
+            // (the list names an address: every buffer that holds it is probed, so one address can
+            // print the lines of several buffers that overlap)
+            starts_at_listed = buffer_starts_at(&BUFFER_PROBE, self.start),
             readable,
             title_nonzero = tn,
             copy_nonzero = cn,
             pages_differ = differ,
+            differ_at = ?look.differ_at.iter().map(|p| format!("{p:#x}")).collect::<Vec<_>>(),
+            differ_in_flight = in_flight,
+            title_at = ?look.title_at,
+            copy_at = ?look.copy_at,
             gpu_only = self.gpu_only.load(Ordering::Relaxed),
             watched = self.watched.load(Ordering::Relaxed),
             on_card = self.card.is_some(),
@@ -6427,6 +6435,47 @@ fn buffer_listed(list: &BufferList, start: u64, len: u64) -> bool {
     at.iter().any(|&a| a >= start && a < start + len)
 }
 
+/// Whether the list names exactly this buffer's first address (the others it lists only hold one).
+fn buffer_starts_at(list: &BufferList, start: u64) -> bool {
+    list.at.get().is_some_and(|at| at.contains(&start))
+}
+
+/// What a buffer probe sees ([`Shadow::probe`]): title memory against the copy's CPU side.
+#[derive(Debug, PartialEq)]
+struct ProbeLook {
+    title_nonzero: usize,
+    copy_nonzero: usize,
+    /// The first dwords of each.
+    title_first: Vec<u32>,
+    copy_first: Vec<u32>,
+    /// The first dwords that are not zero (dword number, value), few of them.
+    title_at: Vec<(usize, u32)>,
+    copy_at: Vec<(usize, u32)>,
+    /// Pages of 4 KiB that differ, and where (offsets from the buffer's start) the first of them.
+    pages_differ: usize,
+    differ_at: Vec<usize>,
+}
+
+impl ProbeLook {
+    /// How many places each list names.
+    const SHOWN: usize = 8;
+
+    fn of(title: &[u8], held: &[u8]) -> ProbeLook {
+        let dwords = |b: &[u8]| {
+            let all = || b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+            let first: Vec<u32> = all().take(16).collect();
+            let nonzero = all().filter(|&d| d != 0).count();
+            let at: Vec<(usize, u32)> = all().enumerate().filter(|&(_, d)| d != 0).take(Self::SHOWN).collect();
+            (nonzero, first, at)
+        };
+        let ((title_nonzero, title_first, title_at), (copy_nonzero, copy_first, copy_at)) = (dwords(title), dwords(held));
+        let mut differ = title.chunks(4096).zip(held.chunks(4096)).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i * 4096);
+        let differ_at: Vec<usize> = differ.by_ref().take(Self::SHOWN).collect();
+        let pages_differ = differ_at.len() + differ.count();
+        ProbeLook { title_nonzero, copy_nonzero, title_first, copy_first, title_at, copy_at, pages_differ, differ_at }
+    }
+}
+
 /// The buffers whose copies are being made ([`made_aside`]).
 static MAKING: Making = Making::new();
 
@@ -7372,6 +7421,43 @@ mod quiet_tests {
         assert!(!buffer_listed(&list, 0x2_0000, 0x1000));
         let none = BufferList { name: "VICTORY_NO_SUCH_LIST", at: std::sync::OnceLock::new() };
         assert!(!buffer_listed(&none, 0x1_0000, 0x1000));
+    }
+
+    /// Two buffers that overlap each hold the listed address, and each prints its own line (the
+    /// probe of one address showed two "phases": a 1.4 MB table and the 4 MiB buffer around its
+    /// start); only one starts at it.
+    #[test]
+    fn a_listed_address_in_two_overlapping_buffers_is_told_apart_by_where_each_starts() {
+        let list = BufferList { name: "VICTORY_NO_SUCH_LIST", at: std::sync::OnceLock::from(vec![0x9957a2f00]) };
+        assert!(buffer_listed(&list, 0x9957a2f00, 1_434_624));
+        assert!(buffer_listed(&list, 0x995400000, 4 << 20));
+        assert!(!super::buffer_starts_at(&list, 0x995400000));
+        assert!(super::buffer_starts_at(&list, 0x9957a2f00));
+    }
+
+    /// The probe names the pages that differ and the dwords that are not zero, and counts the
+    /// pages it does not name.
+    #[test]
+    fn the_probe_names_where_title_memory_and_the_copy_differ() {
+        let mut title = vec![0u8; 20 * 4096];
+        title[..4].copy_from_slice(&89663u32.to_le_bytes());
+        let end = title.len();
+        title[end - 8..end - 4].copy_from_slice(&89663u32.to_le_bytes());
+        let mut held = title.clone();
+        let same = super::ProbeLook::of(&title, &held);
+        assert_eq!((same.title_nonzero, same.copy_nonzero, same.pages_differ), (2, 2, 0));
+        assert_eq!(same.title_at, vec![(0, 89663), (20 * 1024 - 2, 89663)]);
+        assert!(same.differ_at.is_empty());
+        // Pages 0, 3 and every even page from 10 on differ (named, up to eight; the rest are counted).
+        held[3 * 4096 + 12] = 1;
+        for page in (10..20).step_by(2) {
+            held[page * 4096] = 7;
+        }
+        held[1..4].fill(0);
+        let look = super::ProbeLook::of(&title, &held);
+        assert_eq!(look.pages_differ, 1 + 1 + 5, "pages 0, 3, 10, 12, 14, 16, 18");
+        assert_eq!(look.differ_at, vec![0, 3 * 4096, 10 * 4096, 12 * 4096, 14 * 4096, 16 * 4096, 18 * 4096]);
+        assert_eq!(look.copy_nonzero, 2 + 1 + 5);
     }
 
     /// What `make_copy` does with a buffer `register` said is in a heap the

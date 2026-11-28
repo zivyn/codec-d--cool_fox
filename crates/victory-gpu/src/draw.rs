@@ -5034,6 +5034,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            #[cfg(feature = "diagnostics")]
+            crate::probe_watch::note(*resource as This);
             // Some compute-written textures are also read by the title CPU.
             list.texture_written(*resource as This);
             // Unordered access to a depth texture is its colour twin's.

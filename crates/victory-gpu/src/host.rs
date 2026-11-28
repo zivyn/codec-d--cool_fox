@@ -49,17 +49,22 @@ use self::frame_line::{card_clock_line, late_line};
 #[cfg(feature = "diagnostics")]
 use self::frame_line::{lines_aside, split_line};
 use self::batches::{
-    Batch, COPIES_JOINED, Held, Touch, ahead_of_writes, continues, front_spans, front_spans_flat,
-    front_spans_gap, join_copies, joined_with_gap, longest_first, narrow_on, ranges_cover,
-    referenced_bytes, refresh_check, refresh_front, refresh_narrow_gap, retain_unnoted,
-    retain_where, wide_fills, wide_refresh_enabled, wide_textures, written_spans, written_spans_gap,
+    Batch, COPIES_JOINED, Touch, ahead_of_writes, continues, front_spans_gap, join_copies,
+    narrow_on, ranges_cover, refresh_check, refresh_front, refresh_narrow_gap, wide_fills,
+    wide_textures,
+};
+#[cfg(test)]
+use self::batches::{
+    front_spans, front_spans_flat, joined_with_gap, longest_first, referenced_bytes, retain_where,
+    wide_refresh_enabled, written_spans, written_spans_gap,
 };
 pub(crate) use self::landing::{relay, walls_trace};
 use self::landing::{
-    HELPER_UP, QUEUE_ORDER, RELAY_MOVED, RELAY_STATS, declare_once, declared_writes,
-    declared_writes_steps, declared_writes_summarized, flagged_pieces, hand_back, land, late_helper,
-    late_threads, read_backs, relay_copy, relay_exact, relay_wait,
+    HELPER_UP, QUEUE_ORDER, RELAY_MOVED, RELAY_STATS, declare_once, declared_writes, hand_back,
+    land, late_threads, read_backs, relay_exact, relay_wait,
 };
+#[cfg(test)]
+use self::landing::flagged_pieces;
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.

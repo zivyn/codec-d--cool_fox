@@ -22,7 +22,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 /// (`s_ff1_i32_b64`, `buffer_atomic_add` with the old value returned), that old value read from
 /// the first lane (`v_readfirstlane_b32`) and added to each lane's rank. Each lane stores its
 /// slot at `1 + n` and the counter ends at 64: the slots are `n`, each given once.
-const TILE_SLOT_LOOP: [u32; 40] = [
+const TILE_SLOT_LOOP: [u32; 39] = [
     0x3602_0087, // v_and_b32 v1, 7, v0
     0x4A02_0281, // v_add_nc_u32 v1, 1, v1
     0x7E04_0280, // v_mov_b32 v2, 0
@@ -46,7 +46,7 @@ const TILE_SLOT_LOOP: [u32; 40] = [
     0x0002_0AC1,
     0x7E0A_0280, // v_mov_b32 v5, 0
     0x7D24_0C0E, // v_cmpx_eq_i32 exec, s14, v6
-    0xBF88_0005, // s_cbranch_execz SKIP
+    0xBF88_0004, // s_cbranch_execz SKIP
     0xBE82_1002, // s_bcnt1_i32_b64 s2, s[2:3]
     0x7E0A_0202, // v_mov_b32 v5, s2
     0xE0C8_4000, // buffer_atomic_add v5, v0, s[8:11], 0 glc

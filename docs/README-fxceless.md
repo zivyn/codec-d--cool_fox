@@ -315,6 +315,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCHDOG_HOLD=0` | (any build) our stalls (a frame recording, host pipelines made on a title thread) no longer pause the title's hang watchdog; on by default |
 | `VICTORY_WATCHDOG_HOLD_MAX_S=900` | (any build) how long the pause is kept while the title's heartbeat does not move |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS_FILE=<path>` | holds the keys named in that file (comma separated, `W,Enter`; rewritten live by a driver script, empty or missing = none), focus or not, so a script can press keys without taking the keyboard from the user |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |

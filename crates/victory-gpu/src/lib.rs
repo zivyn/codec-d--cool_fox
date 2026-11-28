@@ -169,7 +169,7 @@ pub fn frame_phase() -> u32 {
 #[cfg(windows)]
 pub mod addrset;
 #[cfg(windows)]
-pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view, title_memory_views};
 #[cfg(windows)]
 pub use shadow::{title_memory_gpu_readonly, title_memory_gpu_writable};
 #[cfg(windows)]

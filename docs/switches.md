@@ -679,6 +679,7 @@ translation of shaders.
 | `VICTORY_RELAUNCHED_FROM` | n/a | text |  |  |  | Internal hand-off: handle number of the old process, set in the environment of a relaunched copy. |
 | `VICTORY_RELAY` | on (stage 2; =1 stage 1; =0 off) | number |  |  |  | Lands what shaders wrote back to title memory on a thread of its own. |
 | `VICTORY_RELAY_COPY` | on (=0 turns off) | flag |  |  |  | Lands the relay's fetches over the card's copy queue instead of the drawing queue. |
+| `VICTORY_REMAP_BATCH` | off | flag |  |  |  | Does the title's page-mapping calls by groups of 64 pages (whatever `VICTORY_MAP_THREADS` is) and tells the GPU side of each group by runs of pages, its views at once, not page by page. |
 | `VICTORY_REPLAY_COUNT` | off | flag |  |  |  | Counts what reusing recorded lists could save, without reusing anything. |
 | `VICTORY_REPLAY_GBV` | off | flag |  |  | diag | Replay tool: also turns on GPU-based validation of every shader access under the debug layer. |
 | `VICTORY_REPLAY_PEEK` | off | flag |  |  | diag | Replay tool: peeks at the state at every diverging command, not only when several kinds differ. |

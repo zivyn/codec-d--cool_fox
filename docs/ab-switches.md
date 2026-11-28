@@ -281,6 +281,7 @@ Every other `VICTORY_*` name the translator's code holds is in the key by the te
 ## Not converted, and why
 
 - `VICTORY_ALIAS_FAST` (off): page-by-page remapping skips the pages that already show the wanted page; read once.
+- `VICTORY_REMAP_BATCH` (off): the title's page-mapping calls go by groups and what is told of their pages goes by runs; read once.
 - `VICTORY_TEXTURE_RECLAIM`: with it off the texture pass returns before it finishes the retirements it began (`tiles::finish_retired`)
   and before it trims the tile heaps, so a flip to off leaves levels retired (not shown) with their tiles still mapped for as long as
   it stays off, while a cold texture asked for again may be given new tiles for the same levels, and the later `finish_retired` unmaps by

@@ -329,18 +329,48 @@ pub fn title_memory_section_gone(section: usize) {
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     {
         let mut v = views_mut();
-        v.views.insert(at, (len, section, offset));
-        for k in 0..len.div_ceil(K64) {
-            let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
-            shown.push(at + k * K64);
-            let twice = shown.len() == 2;
-            v.pages_twice += usize::from(twice);
-        }
+        insert_view(&mut v, at, len, section, offset);
     }
     // This view is writable from now on: a guard over the same bytes at
     // another view must look at them again, and the pages are noted written
     // there (`crate::watch`).
     crate::watch::views_mapped(section, offset, len);
+}
+
+/// What [`title_memory_view`] notes of one view.
+fn insert_view(v: &mut Views, at: usize, len: usize, section: usize, offset: u64) {
+    v.views.insert(at, (len, section, offset));
+    for k in 0..len.div_ceil(K64) {
+        let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
+        shown.push(at + k * K64);
+        let twice = shown.len() == 2;
+        v.pages_twice += usize::from(twice);
+    }
+}
+
+/// [`title_memory_view`] of many views, `(address, bytes, section, offset)`
+/// each, in one go (`VICTORY_REMAP_BATCH`): the views are noted under one
+/// write lock of the views instead of one each, and the guards look once
+/// at the pages of each (section, offset, bytes) that the views show, after
+/// all of them are noted, where each view looked at its own page when it was
+/// told and the next found it again. What is noted when it returns is what
+/// the calls one after the other would have left.
+pub fn title_memory_views(views: &[(usize, usize, usize, u64)]) {
+    if views.is_empty() {
+        return;
+    }
+    {
+        let mut v = views_mut();
+        for &(at, len, section, offset) in views {
+            insert_view(&mut v, at, len, section, offset);
+        }
+    }
+    let mut looks: Vec<(usize, u64, usize)> = views.iter().map(|&(_, len, section, offset)| (section, offset, len)).collect();
+    looks.sort_unstable();
+    looks.dedup();
+    for (section, offset, len) in looks {
+        crate::watch::views_mapped(section, offset, len);
+    }
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
@@ -1345,6 +1375,41 @@ mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    /// Many views told at once leave what the same views told one by one
+    /// do: what shows where, and the pages shown more than once.
+    #[test]
+    fn views_told_together_are_those_told_one_by_one() {
+        let (one, many) = (0x7_c000_0000usize, 0x7_d000_0000usize);
+        // A run of pages of one page of a section (a heap set to one page),
+        // two that follow on in another, and a page shown twice.
+        let page = |at: usize, k: usize, section: usize, offset: usize| (at + k * K64, K64, section, (offset * K64) as u64);
+        let mut told: Vec<(usize, usize, usize, u64)> = (0..9).map(|k| page(one, k, 31, 3)).collect();
+        told.extend((9..11).map(|k| page(one, k, 32, k)));
+        told.push(page(one, 12, 31, 3));
+        let shifted: Vec<_> = told.iter().map(|&(at, len, section, offset)| (at - one + many, len, section + 10, offset)).collect();
+        for &(at, len, section, offset) in &told {
+            title_memory_view(at, len, section, offset);
+        }
+        title_memory_views(&shifted);
+        let same = |a: usize, b: usize| {
+            assert_eq!(shown_bytes(a, 13 * K64), shown_bytes(b, 13 * K64));
+            let runs = |base: usize| shown_runs(base, 13 * K64).into_iter().map(|(at, n)| (at - base, n)).collect::<Vec<_>>();
+            assert_eq!(runs(a), runs(b));
+            for k in 0..13 {
+                let (x, y) = (pages_of(a + k * K64), pages_of(b + k * K64));
+                assert_eq!(x.iter().map(|at| at - a).collect::<Vec<_>>(), y.iter().map(|at| at - b).collect::<Vec<_>>(), "page {k}");
+            }
+        };
+        same(one, many);
+        assert_eq!(pages_of(one).len(), 10, "the page shown at ten addresses");
+        assert_eq!(pages_of(many + 12 * K64).len(), 10);
+        title_memory_views(&[]);
+        views_gone(one, 13 * K64);
+        views_gone(many, 13 * K64);
+        assert_eq!(cover(many, 13 * K64), Cover::None);
+        assert!(pages_of(one).is_empty() && pages_of(many).is_empty());
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.

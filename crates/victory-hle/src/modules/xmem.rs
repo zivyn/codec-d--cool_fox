@@ -494,6 +494,10 @@ const PAGE: usize = 64 << 10;
 // `VICTORY_SECTION_MB` MiB (off unless set).
 mod section_mb;
 
+// A change of many pages of mapping done by groups, told by runs
+// (`VICTORY_REMAP_BATCH`).
+mod remap_batch;
+
 struct Section {
     handle: HANDLE,
     pages: usize,
@@ -1335,7 +1339,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _timed = calls::Timed::begin(calls::Kind::Alias, pages_in);
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
+    if side_by_side() <= 1 && !remap_batch::on() {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     // By the page: the address, and the one whose page it is to show.
@@ -1606,6 +1610,10 @@ impl Op {
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
     let began = std::time::Instant::now();
+    // With `VICTORY_REMAP_BATCH`: what is noted and told of the pages is
+    // kept to be done once for the group (see `remap_batch`).
+    let batch = remap_batch::on();
+    let (mut forgotten, mut gone): (Vec<(usize, usize, Slice)>, Vec<usize>) = (Vec::new(), Vec::new());
     for op in &mut ops {
         let there = physical
             .views
@@ -1616,9 +1624,17 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
         match there {
             Some((base, PAGE)) if base == op.at => {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
-                    shown_mut().forget(op.at, size, &slice);
+                    if batch {
+                        forgotten.push((op.at, size, slice));
+                    } else {
+                        shown_mut().forget(op.at, size, &slice);
+                    }
                 }
-                victory_gpu::title_memory_unmapping(op.at, PAGE);
+                if batch {
+                    gone.push(op.at);
+                } else {
+                    victory_gpu::title_memory_unmapping(op.at, PAGE);
+                }
                 physical.holes.remove(&op.at);
                 (op.had, op.own) = (true, lean());
             }
@@ -1640,23 +1656,65 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             op.own = true;
         }
     }
+    if batch {
+        if !forgotten.is_empty() {
+            let mut shown = shown_mut();
+            for (at, size, slice) in &forgotten {
+                shown.forget(*at, *size, slice);
+            }
+        }
+        for (at, len) in remap_batch::runs(gone) {
+            victory_gpu::title_memory_unmapping(at, len);
+        }
+    }
     let before = began.elapsed();
     let done = pool::all(ops);
     let hosted = began.elapsed();
     let mut ok = true;
-    for (op, done) in done {
-        match op.slice {
-            Some(slice) if done => {
-                // As in `map`.
-                shown_mut().note(op.at, PAGE, &slice);
-                victory_gpu::title_memory_remapped(op.at, PAGE);
-                victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
-                physical.views.insert(op.at, (PAGE, slice));
+    if batch {
+        let mut mapped: Vec<(usize, Slice)> = Vec::new();
+        for (op, done) in done {
+            match op.slice {
+                Some(slice) if done => mapped.push((op.at, slice)),
+                None if op.had && done => {
+                    physical.holes.insert(op.at, PAGE);
+                }
+                _ => ok &= done,
             }
-            None if op.had && done => {
-                physical.holes.insert(op.at, PAGE);
+        }
+        if !mapped.is_empty() {
+            {
+                // As in `map`: noted before the GPU side is told.
+                let mut shown = shown_mut();
+                for (at, slice) in &mapped {
+                    shown.note(*at, PAGE, slice);
+                }
             }
-            _ => ok &= done,
+            for (at, len) in remap_batch::runs(mapped.iter().map(|m| m.0).collect()) {
+                victory_gpu::title_memory_remapped(at, len);
+            }
+            let views: Vec<(usize, usize, usize, u64)> =
+                mapped.iter().map(|(at, slice)| (*at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64)).collect();
+            victory_gpu::title_memory_views(&views);
+            for (at, slice) in mapped {
+                physical.views.insert(at, (PAGE, slice));
+            }
+        }
+    } else {
+        for (op, done) in done {
+            match op.slice {
+                Some(slice) if done => {
+                    // As in `map`.
+                    shown_mut().note(op.at, PAGE, &slice);
+                    victory_gpu::title_memory_remapped(op.at, PAGE);
+                    victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+                    physical.views.insert(op.at, (PAGE, slice));
+                }
+                None if op.had && done => {
+                    physical.holes.insert(op.at, PAGE);
+                }
+                _ => ok &= done,
+            }
         }
     }
     let ns = |d: std::time::Duration| d.as_nanos() as u64;
@@ -1745,7 +1803,9 @@ mod pool {
         // Waking the others takes longer than a few quick calls (and the host
         // does them one at a time whoever calls: `VICTORY_ALIAS_FAST` takes
         // up to 8 so).
-        if ops.len() < if super::alias_fast() { 8 } else { 3 } {
+        // (Nor when nobody else maps: a batch queued then would be served by no one and kept.)
+        let few = if super::alias_fast() { 8 } else { 3 };
+        if ops.len() < few || side_by_side() <= 1 {
             return ops
                 .into_iter()
                 .map(|op| {
@@ -2123,11 +2183,17 @@ mod tests {
         fn set(&self, value: u8) {
             ALIAS.store(value, Ordering::Relaxed);
         }
+
+        /// `VICTORY_REMAP_BATCH`: 2 on, 0 as the environment says.
+        fn batch(&self, value: u8) {
+            remap_batch::BATCH.store(value, Ordering::Relaxed);
+        }
     }
 
     impl Drop for AliasSet<'_> {
         fn drop(&mut self) {
             ALIAS.store(0, Ordering::Relaxed);
+            remap_batch::BATCH.store(0, Ordering::Relaxed);
         }
     }
 
@@ -2797,8 +2863,9 @@ mod tests {
     fn one_page_at_many_addresses_and_back() {
         const N: usize = 150;
         let alias = AliasSet::take();
-        for fast in [0, 2] {
+        for (fast, batch) in [(0, 0), (2, 0), (0, 2), (2, 2)] {
             alias.set(fast);
+            alias.batch(batch);
             let pages = allocate(3);
             let heap = XMemVirtualAlloc(std::ptr::null_mut(), N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
             let pool = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
@@ -2845,6 +2912,92 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(pool as *mut c_void, 3, std::ptr::null()), pool as *mut c_void);
             assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         }
+    }
+
+    /// What a heap shows after a call that changes it every way at once
+    /// (a part of a larger view, a single view, a run of one page at many
+    /// addresses, an unmapped range, a page of a view unmapped): the state
+    /// of each page, the bytes, and the views, with the changes told by
+    /// runs (`VICTORY_REMAP_BATCH`) or page by page, and with the skipping
+    /// of pages that show what is asked or without.
+    fn a_heap_after_a_mixed_call(fast: u8, batch: u8) -> (Vec<(u32, i32)>, Vec<(usize, usize)>, Vec<usize>) {
+        const HEAP: usize = 40;
+        let alias = AliasSet::take();
+        alias.set(fast);
+        alias.batch(batch);
+        let pages = allocate(6);
+        let ptr = |at: usize| at as *mut c_void;
+        let reserve = |n: usize| XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+        let (pool, heap) = (reserve(6), reserve(HEAP));
+        assert!(pool != 0 && heap != 0);
+        assert_eq!(XMemMapPhysicalPages(ptr(pool), 6, pages.as_ptr()), ptr(pool));
+        for k in 0..6 {
+            // SAFETY: mapped read-write.
+            unsafe { ((pool + k * PAGE) as *mut u8).write(20 + k as u8) };
+        }
+        // A view of four pages at the start, a single page at 10, one page twice (2 and 12).
+        assert_eq!(XMemMapPhysicalPages(ptr(heap), 4, pages.as_ptr()), ptr(heap));
+        assert_eq!(XMemMapPhysicalPages(ptr(heap + 10 * PAGE), 1, pages[5..].as_ptr()), ptr(heap + 10 * PAGE));
+        let at = |k: usize| (heap + k * PAGE) as u64;
+        let from = |k: usize| (pool + k * PAGE) as u64;
+        let mut ranges = vec![
+            // Pages 2, 3 and 4 of the pool over pages 1 to 3 of the 4-page view.
+            (at(1), from(2), 3 * PAGE as u64),
+            // A single page replaced.
+            (at(10), from(0), PAGE as u64),
+            // A page of the 4-page view that is not touched by the first range: unmapped.
+            (at(0), 0, PAGE as u64),
+        ];
+        // One page of the pool at ten addresses one after the other, as a tiled heap set to zeros.
+        ranges.extend((12..22).map(|k| (at(k), from(1), PAGE as u64)));
+        // Some of those again as they are (what the skipping leaves alone), a range already unmapped, a part of a run unmapped.
+        ranges.extend((12..15).map(|k| (at(k), from(1), PAGE as u64)));
+        ranges.push((at(30), 0, 5 * PAGE as u64));
+        ranges.push((at(16), 0, 2 * PAGE as u64));
+        assert!(map_aliases(&ranges));
+        // The same call again changes nothing anyone sees.
+        assert!(map_aliases(&ranges));
+        let state: Vec<(u32, i32)> = (0..HEAP)
+            .map(|k| {
+                let info = query((heap + k * PAGE) as *const c_void);
+                // SAFETY: read only where committed (mapped).
+                let byte = if info.host.State == MEM_COMMIT { i32::from(unsafe { ((heap + k * PAGE) as *const u8).read() }) } else { -1 };
+                (info.host.State, byte)
+            })
+            .collect();
+        let physical = physical();
+        let views: Vec<(usize, usize)> = physical.views.range(heap..heap + HEAP * PAGE).map(|(at, v)| (at - heap, v.0)).collect();
+        let held: Vec<usize> = (0..HEAP).filter(|k| physical.holes.contains_key(&(heap + k * PAGE))).collect();
+        drop(physical);
+        for at in [heap, pool] {
+            assert_eq!(XMemMapPhysicalPages(ptr(at), if at == heap { HEAP } else { 6 }, std::ptr::null()), ptr(at));
+        }
+        assert_eq!(XMemFreePhysicalPages(6, pages.as_ptr()), 1);
+        // (The holes the unmapping left are the same either way, unless pages were left alone.)
+        (state, views, if fast == 0 { held } else { Vec::new() })
+    }
+
+    #[test]
+    fn a_change_told_by_runs_leaves_the_heap_as_one_told_page_by_page() {
+        let (state, views, _) = a_heap_after_a_mixed_call(0, 0);
+        // What the call is to leave.
+        let shows = |k: usize| state[k];
+        assert_eq!(shows(0).0, MEM_RESERVE, "unmapped");
+        assert_eq!(shows(1), (MEM_COMMIT, 22), "page 2 of the pool");
+        assert_eq!(shows(3), (MEM_COMMIT, 24));
+        assert_eq!(shows(10), (MEM_COMMIT, 20));
+        assert_eq!(shows(12), (MEM_COMMIT, 21));
+        assert_eq!(shows(21), (MEM_COMMIT, 21));
+        assert_eq!(shows(16).0, MEM_RESERVE);
+        assert_eq!(shows(17).0, MEM_RESERVE);
+        assert_eq!(shows(18), (MEM_COMMIT, 21));
+        assert!(views.iter().all(|v| v.1 == PAGE), "{views:?}");
+        for (fast, batch) in [(2, 0), (0, 2), (2, 2)] {
+            let (state_b, views_b, _) = a_heap_after_a_mixed_call(fast, batch);
+            assert_eq!((&state_b, &views_b), (&state, &views), "fast {fast}, batch {batch}");
+        }
+        // With the holes: the same set with the batch as without it.
+        assert_eq!(a_heap_after_a_mixed_call(0, 2).2, a_heap_after_a_mixed_call(0, 0).2);
     }
 
     /// What a title that maps and unmaps pages all the time costs the

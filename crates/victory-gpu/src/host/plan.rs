@@ -254,7 +254,7 @@ pub(super) fn frame_line(frames: f64) {
 mod tests {
     use super::*;
     use crate::shadow::Shadow;
-    use card_steps::Writer;
+    use crate::host::card_steps::Writer;
     use std::sync::Arc;
 
     fn shadow() -> Arc<Shadow> {

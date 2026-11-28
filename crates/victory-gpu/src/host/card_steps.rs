@@ -973,9 +973,10 @@ impl Chosen {
     /// card), and counts what it does. Not undone: a plan that is committed is the submission's.
     pub(super) fn commit(&self) {
         let spent = crate::timeline::span("steps on the card: the slots");
-        let (ops, lean, own) = (&self.ops, self.lean, self.own());
+        // (The buffer by itself: the closure below goes to other threads, and `Own` is not `Sync`, only its buffer is.)
+        let (ops, lean, between) = (&self.ops, self.lean, &self.own().between);
         // SAFETY: a live buffer.
-        let gpu = unsafe { own.between.GetGPUVirtualAddress() };
+        let gpu = unsafe { between.GetGPUVirtualAddress() };
         // (11,000 slots a frame in a street, two descriptors each: on
         // several threads, a slot always on the same one, in the steps'
         // order.)
@@ -996,7 +997,7 @@ impl Chosen {
                 // that order, as before; those of two heaps have nothing in common.)
                 mine.sort_by_key(|slot| slot.0);
                 for heap in mine.chunk_by(|a, b| a.0 == b.0) {
-                    crate::descriptor::constant_slots(heap[0].0, &own.between, heap.iter().map(|&(_, index, at, len)| (index, at, len)));
+                    crate::descriptor::constant_slots(heap[0].0, between, heap.iter().map(|&(_, index, at, len)| (index, at, len)));
                 }
                 return;
             }
@@ -1005,7 +1006,7 @@ impl Chosen {
                     && *index as usize / 4 % parts == part
                 {
                     // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    crate::descriptor::constant_slot(*heap, *index, between, gpu + op.at, op.len as u32);
                 }
             }
         });

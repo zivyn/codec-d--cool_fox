@@ -44,6 +44,10 @@ pub(crate) struct Finding {
 pub(crate) struct Audit {
     /// The barriers that wait for the group.
     pub barriers: usize,
+    /// The loops with such a barrier in them, and how deep they nest (a loop that runs to its
+    /// limit costs the limit's number of barriers; in a loop in a loop, its square).
+    pub loops: usize,
+    pub nest: usize,
     /// Barriers in the region of a branch whose condition [`Level::Differs`].
     pub differs: Vec<Finding>,
     /// Barriers in the region of a branch on a value read from memory ([`Level::Loaded`]).
@@ -66,8 +70,10 @@ impl Audit {
             parts.join(",")
         };
         format!(
-            "barriers={} differs={} [{}] loaded={} [{}]",
+            "barriers={} loops={} nest={} differs={} [{}] loaded={} [{}]",
             self.barriers,
+            self.loops,
+            self.nest,
             self.differs.len(),
             list(&self.differs),
             self.loaded.len(),
@@ -182,10 +188,12 @@ impl Module {
             }
         }
         let mut loops: Vec<Vec<bool>> = Vec::new();
+        let mut headers: Vec<usize> = Vec::new();
         for &b in &order {
             for &s in &succ[b] {
                 if rpo[s] <= rpo[b] {
-                    // back edge b -> s: the body is what reaches b without passing s
+                    // back edge b -> s: the body is what reaches b without passing s (the back
+                    // edges of one header make one loop)
                     let mut body = vec![false; n];
                     body[s] = true;
                     let mut work = vec![b];
@@ -195,10 +203,30 @@ impl Module {
                             work.extend(preds[x].iter().copied().filter(|&q| seen[q]));
                         }
                     }
-                    loops.push(body);
+                    match headers.iter().position(|&h| h == s) {
+                        Some(k) => {
+                            for x in 0..n {
+                                loops[k][x] |= body[x];
+                            }
+                        }
+                        None => {
+                            headers.push(s);
+                            loops.push(body);
+                        }
+                    }
                 }
             }
         }
+        let with_barrier: Vec<usize> =
+            (0..loops.len()).filter(|&k| sync.iter().any(|&b| loops[k][b])).collect();
+        audit.loops = with_barrier.len();
+        audit.nest = with_barrier
+            .iter()
+            .map(|&k| {
+                with_barrier.iter().filter(|&&j| (0..n).all(|b| !loops[k][b] || loops[j][b])).count()
+            })
+            .max()
+            .unwrap_or(0);
         let words = n.div_ceil(64);
         let in_set = |set: &[u64], b: usize| set[b / 64] >> (b % 64) & 1 == 1;
         // levels, to a fixpoint (they only go up)

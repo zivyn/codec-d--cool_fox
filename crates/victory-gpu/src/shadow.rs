@@ -3749,10 +3749,21 @@ mod narrow_tests {
                         same
                     })
                     .collect();
+                let gates: Vec<bool> = copies[..3]
+                    .iter()
+                    .map(|c| {
+                        crate::pagedrive::force_mode(Some(c.mode));
+                        let gate = c.copy.nothing_new_noted(la, ll);
+                        crate::pagedrive::force_mode(None);
+                        gate
+                    })
+                    .collect();
                 let after = crate::watch::covered(la, la + ll);
                 crate::watch::ask_once_end();
                 if before && after {
                     assert!(answers[0] == answers[1] && answers[1] == answers[2], "round {round}: looks at {la:#x}+{ll:#x} say {answers:?} in the three modes");
+                    // What the gate leaves out the walk finds nothing new in.
+                    assert!(!gates[2] || answers[0], "round {round}: the gate leaves out {la:#x}+{ll:#x} where the walk finds something new");
                 }
             }
             // More copies made (of everything, never taken), and the older of those retired.
@@ -3780,6 +3791,64 @@ mod narrow_tests {
         assert_eq!(crate::pagedrive::missed_total(), missed_before, "the journal says pages stale that the ledger does not hold");
         assert!(crate::pagedrive::compared_total() > compared_before, "the shadow check compared nothing");
         assert!(crate::pagedrive::driven_total() > driven_before, "the ledger decided nothing");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The gate says a range needs no look when the copy's ledger holds nothing and a range that holds it was taken whole;
+    /// a write to the range, once the asking has found it, shuts the gate until the next refresh of the range; a range
+    /// outside what was taken whole never passes; shadow mode counts what the journal says of each pass.
+    #[test]
+    fn the_gate_passes_what_the_ledger_holds_nothing_for_and_nothing_else() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let missed_before = crate::pagedrive::missed_total();
+        let c = one(at, N, 2);
+        let shadow = one(at, N, 1);
+        let look = |c: &One, from: usize, len: usize| {
+            crate::pagedrive::force_mode(Some(c.mode));
+            let said = c.copy.nothing_new_noted(from, len);
+            crate::pagedrive::force_mode(None);
+            said
+        };
+        // Taken whole in the first half only.
+        for c in [&c, &shadow] {
+            refresh(c, at, N / 2 * PAGE);
+        }
+        // Other tests' askings may end the one that stands: try again until the gate is judged under one that stands.
+        let mut judged = false;
+        for _ in 0..200 {
+            crate::watch::ask_once(&[(at, at + N * PAGE)]);
+            let covered = crate::watch::covered(at, at + N * PAGE);
+            let (inside, outside) = (look(&c, at, N / 2 * PAGE), look(&c, at + N / 2 * PAGE, PAGE));
+            let still = crate::watch::covered(at, at + N * PAGE);
+            crate::watch::ask_once_end();
+            if covered && still {
+                assert!(inside, "nothing was written in the range taken whole");
+                assert!(!outside, "the second half was never taken");
+                judged = true;
+                break;
+            }
+        }
+        assert!(judged, "no asking stood long enough to judge the gate");
+        // A write in the first half, found by an asking: the gate is shut for the range until the copy takes it.
+        // SAFETY: inside the allocation.
+        unsafe { ((at + PAGE + 3) as *mut u8).write_volatile(9) };
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        crate::pagedrive::drain();
+        assert!(c.copy.ledger().len() > 0, "the ledger holds the page the asking found written");
+        assert!(!look(&c, at, N / 2 * PAGE));
+        // The shadow copy compared its gate with the journal's word on each pass.
+        look(&shadow, at, N / 2 * PAGE);
+        refresh(&c, at, N / 2 * PAGE);
+        refresh(&shadow, at, N / 2 * PAGE);
+        crate::watch::ask_once_end();
+        assert_eq!(crate::pagedrive::missed_total(), missed_before);
         // SAFETY: ours.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
@@ -5112,7 +5181,48 @@ impl Shadow {
         if held {
             crate::copystat::add(crate::copystat::C::NoteHits, 1);
         }
-        held
+        if held {
+            return true;
+        }
+        // The ledger knows it too (`VICTORY_PAGE_REFRESH`): a copy that holds no page noted since it took the range.
+        match crate::pagedrive::mode() {
+            0 => false,
+            mode => {
+                let gate = self.page_gate(from, to);
+                if mode == 1 {
+                    // (Shadow: the answer stays the memo's; the journal says whether the gate would have been wrong.)
+                    if gate {
+                        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                        let stale = crate::watch::journal_stale(from, to, self.start as usize / PAGE, &copied, self.ranged(from, to));
+                        crate::pagedrive::gate_checked(stale);
+                    }
+                    false
+                } else {
+                    if gate {
+                        crate::pagedrive::gate_hit();
+                    }
+                    gate
+                }
+            }
+        }
+    }
+
+    /// Whether `[from, to)` (inside the copy) needs no look at all, from the copy's ledger alone: the memory is watched,
+    /// the copy holds no page noted written since it took it, a range that holds `[from, to)` was taken whole, no flight's
+    /// declared range touches it, and the asking that stands covers it (one atomic and three short locks, none of the
+    /// copy's `copied`, and no walk of anything: `VICTORY_PAGE_REFRESH` stage 3).
+    fn page_gate(&self, from: usize, to: usize) -> bool {
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
+            return false;
+        }
+        crate::pagedrive::drain();
+        if self.ledger.len() != 0 || self.ranged(from, to) == 0 {
+            return false;
+        }
+        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
+            return false;
+        }
+        crate::watch::covered(from, to)
     }
 
     /// The latest asking after which a range that holds `[from, to)` was

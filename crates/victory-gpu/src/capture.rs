@@ -1033,7 +1033,7 @@ fn bad_texels(
     firsts
 }
 
-/// `VICTORY_CAPTURE_CROP=x0,y0,x1,y1[;x0,y0,x1,y1...]`: boxes of the screen as fractions of a
+/// `VICTORY_CAPTURE_CROP=x0,y0,x1,y1[|x0,y0,x1,y1...]`: boxes of the screen as fractions of a
 /// target's width and height (0..1, x0 < x1, y0 < y1), whose mean color every target of the
 /// census reports in a `crop` column, so the same patch of the picture (the character's
 /// hair, say, and the jumpsuit next to it) can be followed through every target the frame
@@ -1044,7 +1044,7 @@ fn crop_boxes() -> &'static [[f32; 4]] {
 }
 
 fn parse_crops(text: &str) -> Vec<[f32; 4]> {
-    text.split(';')
+    text.split('|')
         .filter_map(|part| {
             let v: Vec<f32> = part.split(',').filter_map(|n| n.trim().parse().ok()).collect();
             let [x0, y0, x1, y1] = <[f32; 4]>::try_from(v).ok()?;
@@ -1826,9 +1826,9 @@ mod stats_tests {
 
     #[test]
     fn crop_boxes_parse_and_their_mean_color_is_read_per_format() {
-        // Boxes: fractions of the target, several separated by `;`, bad ones left out.
+        // Boxes: fractions of the target, several separated by `|` (`;` splits the pilot's -Extra), bad ones left out.
         assert_eq!(parse_crops("0.25,0.5,0.75,1"), [[0.25, 0.5, 0.75, 1.0]]);
-        assert_eq!(parse_crops("0,0,1,1; 0.5,0.5,0.4,0.9 ;0.1,0.1,0.2,0.2"), [[0.0, 0.0, 1.0, 1.0], [0.1, 0.1, 0.2, 0.2]]);
+        assert_eq!(parse_crops("0,0,1,1| 0.5,0.5,0.4,0.9 |0.1,0.1,0.2,0.2"), [[0.0, 0.0, 1.0, 1.0], [0.1, 0.1, 0.2, 0.2]]);
         assert!(parse_crops("").is_empty());
         assert!(parse_crops("0,0,1").is_empty());
         assert!(parse_crops("0,0,1.5,1").is_empty());

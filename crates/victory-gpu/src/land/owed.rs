@@ -746,6 +746,99 @@ mod tests {
         finish_all();
     }
 
+    /// A thread that lands a unit and touches a page of another unit that is
+    /// owed does not go on over unlanded memory: that unit is landed first
+    /// (nested), and what the thread reads is what it landed. The pass through
+    /// the guard is for the pages of the unit the thread is landing.
+    #[test]
+    fn a_landing_thread_touching_another_owed_unit_lands_that_one_first() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let at = memory(4);
+        let seen = Arc::new(std::sync::atomic::AtomicU8::new(0xFF));
+        let other_landed = Arc::new(AtomicBool::new(false));
+        let (b_from, b_flag) = (at + 2 * PAGE, other_landed.clone());
+        let (read, flag) = (seen.clone(), other_landed.clone());
+        register(vec![
+            (
+                at,
+                at + PAGE,
+                Box::new(move || {
+                    // A page of the other unit, read by the landing of this one.
+                    // SAFETY: inside the allocation.
+                    let byte = unsafe { ((b_from + 5) as *const u8).read_volatile() };
+                    read.store(byte, Ordering::SeqCst);
+                    assert!(
+                        flag.load(Ordering::SeqCst),
+                        "the other unit landed before the byte was read"
+                    );
+                    // SAFETY: the unit's own page.
+                    unsafe { std::ptr::write_bytes(at as *mut u8, 0x11, PAGE) };
+                }),
+                quiet(),
+            ),
+            (
+                b_from,
+                b_from + PAGE,
+                Box::new(move || {
+                    // SAFETY: the other unit's page.
+                    unsafe { std::ptr::write_bytes(b_from as *mut u8, 0x22, PAGE) };
+                    b_flag.store(true, Ordering::SeqCst);
+                }),
+                quiet(),
+            ),
+        ]);
+        land_range(at, PAGE);
+        assert_eq!(seen.load(Ordering::SeqCst), 0x22);
+        assert!(other_landed.load(Ordering::SeqCst));
+        // Nothing is left owed twice or not at all.
+        finish_all();
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { *(at as *const u8) }, 0x11);
+        release(at);
+    }
+
+    /// While a unit is landed page by page, a thread that touches a page the
+    /// lander has not reached waits for the landing (the page stays guarded
+    /// until the lander touches it) and reads what was landed.
+    #[test]
+    fn pages_the_lander_has_not_reached_stay_guarded_until_it_has() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let at = memory(3);
+        let (began, wait) = std::sync::mpsc::channel();
+        let began = Mutex::new(began);
+        register(vec![(
+            at,
+            at + 2 * PAGE,
+            Box::new(move || {
+                // SAFETY: the unit's pages.
+                unsafe { std::ptr::write_bytes(at as *mut u8, 0x44, PAGE) };
+                began.lock().unwrap().send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                // SAFETY: as above.
+                unsafe { std::ptr::write_bytes((at + PAGE) as *mut u8, 0x44, PAGE) };
+            }),
+            quiet(),
+        )]);
+        let lander = std::thread::spawn(run_pending);
+        wait.recv().unwrap();
+        let began = std::time::Instant::now();
+        let byte = std::thread::spawn(move || {
+            // SAFETY: inside the allocation: the second page, not yet reached.
+            unsafe { ((at + PAGE + 9) as *const u8).read_volatile() }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(byte, 0x44, "never the bytes from before the landing");
+        assert!(
+            began.elapsed() >= std::time::Duration::from_millis(50),
+            "it waited for the lander"
+        );
+        lander.join().unwrap();
+        finish_all();
+        release(at);
+    }
+
     /// The verifier counts the dwords of a landed piece that differ from what
     /// was fetched.
     #[test]

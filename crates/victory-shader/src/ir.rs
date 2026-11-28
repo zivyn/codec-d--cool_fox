@@ -947,9 +947,19 @@ fn contains(set: &RegSet, reg: Reg) -> bool {
 
 /// In [`Reg`] order, which is also index order.
 fn members(set: &RegSet) -> impl Iterator<Item = Reg> + '_ {
-    (0..REGS)
-        .filter(|&i| set[i / 64] >> (i % 64) & 1 != 0)
-        .map(reg_at)
+    let (mut word, mut bits) = (0, set[0]);
+    std::iter::from_fn(move || loop {
+        if bits != 0 {
+            let b = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            return Some(reg_at(word * 64 + b));
+        }
+        word += 1;
+        if word >= set.len() {
+            return None;
+        }
+        bits = set[word];
+    })
 }
 
 /// `outs` is sorted by register, and holds every register live out.

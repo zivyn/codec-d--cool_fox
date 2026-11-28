@@ -1492,6 +1492,8 @@ mod tests {
         held(&late.inner).back = 88;
         late.tagging(0, &mut note);
         assert_eq!(*log.borrow(), [(88, u32::MAX), (88, 0)]);
+        // (Not a list of ours: the recording must not close it when it is dropped.)
+        held(&late.inner).back = 0;
     }
 
     /// Every method of the tables that records is written down too: what is

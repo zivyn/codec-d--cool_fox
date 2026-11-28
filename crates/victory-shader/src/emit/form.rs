@@ -47,8 +47,21 @@ pub(super) enum Mode {
     /// The default (unset, or `=0`): none.
     Off,
     /// `=1`: where no branch of the form can hang the thread group (class A or B,
-    /// [`super::wide_class`]).
+    /// [`super::wide_class`]) and the audit of the emitted control flow finds no group barrier
+    /// that a branch on a value that differs between threads can keep a thread from.
     Safe,
+    /// `=strict`: as `Safe`, and no group barrier behind a branch on a value read from memory
+    /// either (the halves may read it at different times), and no loop with a group barrier in
+    /// another loop with one (a loop that runs to its limit costs the limit's number of barriers:
+    /// the square of it in two loops).
+    Strict,
+    /// `=classes`: the classes alone (what `Safe` was before the audit).
+    Classes,
+    /// `=audited`: only what the audit of the emitted control flow proves clean: as `Strict`
+    /// (no barrier behind a branch that differs or is read from memory), and every loop that
+    /// holds a group barrier ends by a condition all the threads of the group agree on, or is
+    /// bounded (`audit.bounded`), so that it cannot run to its limit with a barrier in each round.
+    Audited,
     /// `=all`: whatever the classes say (to see the form the title lost the card in).
     All,
 }
@@ -67,17 +80,24 @@ pub(super) fn kept_skips_mode() -> Mode {
     }
     match std::env::var("VICTORY_KEPT_SKIPS_WIDE").ok().as_deref().map(str::trim) {
         Some("all") => Mode::All,
+        Some("strict") => Mode::Strict,
+        Some("classes") => Mode::Classes,
+        Some("audited") => Mode::Audited,
         Some("1") => Mode::Safe,
         _ => Mode::Off,
     }
 }
 
-/// [`kept_skips_mode`] as a number for the shader cache key (0 off, 1 safe, 2 all).
+/// [`kept_skips_mode`] as a number for the shader cache key (0 off, 1 safe, 2 all, 3 strict,
+/// 4 classes, 5 audited).
 pub(super) fn kept_skips_code() -> u8 {
     match kept_skips_mode() {
         Mode::Off => 0,
         Mode::Safe => 1,
         Mode::All => 2,
+        Mode::Strict => 3,
+        Mode::Classes => 4,
+        Mode::Audited => 5,
     }
 }
 

@@ -255,6 +255,7 @@ fn say_notes(notes: &[u32], frame: u64) {
     static SAID_PAIR: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     static CUTS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
     static PEEKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    static SAID_HANG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
     let mut peeked: Vec<u32> = Vec::new();
     for &page in notes {
         if page >= victory_shader::emit::PAIR_NOTE {
@@ -284,6 +285,25 @@ fn say_notes(notes: &[u32], frame: u64) {
                     loop_id = page & 0xFF,
                     frames,
                     "a shader loop was cut at its limit (hash starts with `program`; `loop_id` is the loop's number in the program, `VICTORY_LOOP_WHY=1` lists them)"
+                );
+            }
+        } else if page >= victory_shader::emit::HANG_NOTE {
+            // (the guard, `VICTORY_HANG_GUARD`: a program that would have hung the card ended)
+            let mut said = SAID_HANG.lock().unwrap_or_else(|e| e.into_inner());
+            if !said.contains(&page) {
+                said.push(page);
+                let (kind, program, site) = victory_shader::emit::say_hang_note(page);
+                tracing::warn!(
+                    program = format!("{program:05x}"),
+                    site,
+                    "the hang guard ended threads of a shader (hash starts with `program`): {} (`site` is the barrier's or the loop's number modulo 16)",
+                    match kind {
+                        1 => "a group barrier waited for threads of the group that never came",
+                        2 => "a wave arrived at more group barriers than the budget (a loop with barriers that does not end)",
+                        3 => "a loop with a group barrier in it reached its bound",
+                        4 => "the two host waves of a console wave gave up waiting for each other",
+                        _ => "unknown note",
+                    }
                 );
             }
         } else {

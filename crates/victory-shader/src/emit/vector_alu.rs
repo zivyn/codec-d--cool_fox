@@ -1066,6 +1066,7 @@ impl<'a> Lower<'a> {
                     let c2 = self.cur;
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
+                    self.mark_exchanged(r);
                     if !self.lean {
                         self.meet(c2);
                     }

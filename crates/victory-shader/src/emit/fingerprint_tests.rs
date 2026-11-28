@@ -227,6 +227,7 @@ fn every_environment_read_names_its_switch_by_a_literal() {
         ("lib.rs", "name"),
         ("emit/mod.rs", "name"),
         ("emit/mod.rs", "var"),
+        ("emit/hang.rs", "n"),
         ("emit/view_index.rs", "name"),
     ];
     let mut bad = Vec::new();

@@ -28,7 +28,7 @@ mod current;
 use current::Current;
 mod overlap;
 mod own;
-mod zero;
+pub(crate) mod zero;
 pub(crate) use overlap::{OverlapIndex, overlap_index};
 pub(crate) use own::{CLASSES, OwnClass};
 

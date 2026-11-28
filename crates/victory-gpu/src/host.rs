@@ -8016,6 +8016,20 @@ impl HostList {
         self.used_pipeline(name);
     }
 
+    /// The values the list's bottom-of-pipe writes put in memory when it has
+    /// run, as (address, value).
+    pub(crate) fn value_writes(&self) -> Vec<(usize, u64)> {
+        let deferred = self.deferred();
+        deferred
+            .writes
+            .iter()
+            .filter_map(|&(at, what, _)| match what {
+                crate::queue::Written::Value(v) => Some((at, v)),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }

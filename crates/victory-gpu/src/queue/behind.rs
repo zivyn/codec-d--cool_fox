@@ -1105,11 +1105,7 @@ fn value_writes(lists: &[crate::list::Detached], order: &[usize]) -> Vec<(usize,
     }
     let mut out = Vec::new();
     for &i in order {
-        let deferred = lists[i].host().deferred();
-        out.extend(deferred.writes.iter().filter_map(|(at, what, _)| match what {
-            super::Written::Value(v) => Some((*at, *v)),
-            _ => None,
-        }));
+        out.extend(lists[i].host().value_writes());
     }
     out
 }

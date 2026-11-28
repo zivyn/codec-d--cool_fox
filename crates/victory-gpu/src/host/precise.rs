@@ -303,8 +303,12 @@ pub(crate) fn refused<'a>(why: super::NoJoin, ahead: impl Iterator<Item = &'a Ho
 /// Whether a signal of a fence that the flights in the air hold (behind the flights before it) meets a wait for
 /// `value`: a part sent behind them runs after the work the signal stands behind, on the host's one queue.
 pub(crate) fn signalled(fence: usize, value: u64) -> bool {
-    let line = super::line();
-    line.line.iter().any(|late| matches!(late, super::Late::Signal(f, v) if *f == fence && *v >= value))
+    signalled_in(&super::line().line, fence, value)
+}
+
+/// [`signalled`] for the flights' line `late`.
+fn signalled_in(late: &[super::Late], fence: usize, value: u64) -> bool {
+    late.iter().any(|late| matches!(late, super::Late::Signal(f, v) if *f == fence && *v >= value))
 }
 
 /// A wait for a fence that nothing along signals ends the joining: counted by whether the flights' signals meet it.
@@ -336,7 +340,8 @@ fn covering(list: &HostList, wait: &crate::list::ValueWait) -> Option<bool> {
 }
 
 /// Whether a write of `list` that covers the place of `wait` meets it ([`covering`]).
-pub(crate) fn covers(list: &HostList, wait: &crate::list::ValueWait) -> bool {
+#[cfg(test)]
+fn covers(list: &HostList, wait: &crate::list::ValueWait) -> bool {
     covering(list, wait) == Some(true)
 }
 
@@ -427,7 +432,7 @@ pub(crate) fn line(frames: f64) {
 #[cfg(test)]
 mod device_tests {
     use super::super::*;
-    use super::{ENTRIES, Found, Target, declare_as};
+    use super::{ENTRIES, Found, Target, covers, declare_as};
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
 
     const WRITE_WATCH: u32 = 0x20_0000;
@@ -613,6 +618,18 @@ mod tests {
         side.add(0x3000, 0x3040);
         assert!(side.on);
         assert_eq!(side.ranges, vec![(0x1000, 0x2000), (0x3000, 0x3040)]);
+    }
+
+    #[test]
+    fn a_signal_in_the_flights_line_meets_a_wait_for_the_same_fence_and_no_more_than_it_gives() {
+        use crate::host::Late;
+        let line = [Late::Write(0x1000, crate::queue::Written::Value(1), 4), Late::Signal(7, 5), Late::Signal(9, 2)];
+        assert!(signalled_in(&line, 7, 5));
+        assert!(signalled_in(&line, 7, 3), "a lower value than the signal gives");
+        assert!(!signalled_in(&line, 7, 6), "a higher one is not met");
+        assert!(!signalled_in(&line, 8, 1), "another fence");
+        assert!(signalled_in(&line, 9, 2));
+        assert!(!signalled_in(&[], 7, 1));
     }
 
     #[test]

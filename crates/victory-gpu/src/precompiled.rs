@@ -544,7 +544,8 @@ mod tests {
         let code: Vec<u8> = [0x00u8, 0x00, 0x81, 0xBF].repeat(dwords);
         let mut meta = vec![0u8; META_HEADER + 32];
         meta[0..4].copy_from_slice(&META_MAGIC.to_le_bytes());
-        meta[4..8].copy_from_slice(&((meta.len() - 0x14) as u32).to_le_bytes());
+        let listed = (meta.len() - 0x14) as u32;
+        meta[4..8].copy_from_slice(&listed.to_le_bytes());
         meta[8..12].copy_from_slice(&(dwords as u32).to_le_bytes());
         meta[0x14] = 0x40;
         meta[META_HEADER] = 0x43;

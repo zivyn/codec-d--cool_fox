@@ -122,6 +122,8 @@ mod footprint_gpu_tests;
 #[cfg(all(test, windows))]
 mod geometry_tests;
 #[cfg(all(test, windows))]
+mod guards_tests;
+#[cfg(all(test, windows))]
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
@@ -503,12 +505,25 @@ pub fn builder_bounds() -> bool {
 ///   which half has a lane (where every lane has one).
 ///   64 the dwords of one console load read by one call for every four
 ///   (not on unless asked: `127` is every pass with it).
+///   128 the selects that keep a register's old value in lanes nothing
+///   reads it in are their new value (`bitcode/opt/demand.rs`; not on
+///   unless asked: `191` is the usual passes with it, `255` every pass).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.get() {
+        return passes;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`shader_opt`], for its thread only.
+    pub(crate) static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -1818,7 +1833,9 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("127")), 127, "the wide loads, not the guards");
+        assert_eq!(parse_shader_opt(Some("191")), usual | 128, "the guards, not the wide loads");
+        assert_eq!(parse_shader_opt(Some("255")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }

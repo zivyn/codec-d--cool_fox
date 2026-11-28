@@ -32,6 +32,8 @@
 
 use std::collections::HashMap;
 
+mod demand;
+
 use super::{
     Attr, Bin, Cast, Const, Func, MdDef, Module, Op, Term, Ty, TypeDef, V, for_each_operand, pred,
     successors,
@@ -60,14 +62,19 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// A pass over the module, after the others: the selects that keep a
+/// register's old value in lanes nothing reads it in are their new value
+/// (`opt/demand.rs`). Not on unless asked (`VICTORY_SHADER_OPT=191`: the
+/// usual passes with it): no card has shown a gain for it yet.
+pub const GUARDS: u32 = 128;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
 /// Every pass.
-pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+pub const ALL: u32 = MODULE | FIRST | WIDE | GUARDS;
+/// The passes that run when nothing says which: every one but [`WIDE`] and
+/// [`GUARDS`], which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127`
+/// asks for the first, `191` for the second, `255` for both).
+pub const DEFAULT: u32 = ALL & !WIDE & !GUARDS;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -229,22 +236,31 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
-            // Values merged in one round can make two joins the same in
-            // the next (a loop's registers that only go round), and a
-            // branch that goes one way leaves blocks with one way in.
-            for _ in 0..4 {
-                let mut changed = self.merge(passes);
-                if passes & FOLD != 0 {
-                    changed |= self.prune();
-                }
-                if !changed {
-                    break;
-                }
-            }
+        let merging = passes & (FOLD | REUSE | FACTS | LOADS) != 0;
+        if merging {
+            self.merge_rounds(passes);
+        }
+        // (what the guards leave as one value can be one value with another)
+        if passes & GUARDS != 0 && self.drop_guards() && merging {
+            self.merge_rounds(passes);
         }
         if passes & DEAD != 0 {
             self.drop_dead();
+        }
+    }
+
+    /// Values merged in one round can make two joins the same in the next
+    /// (a loop's registers that only go round), and a branch that goes one
+    /// way leaves blocks with one way in.
+    fn merge_rounds(&mut self, passes: u32) {
+        for _ in 0..4 {
+            let mut changed = self.merge(passes);
+            if passes & FOLD != 0 {
+                changed |= self.prune();
+            }
+            if !changed {
+                break;
+            }
         }
     }
 
@@ -2263,6 +2279,9 @@ mod tests {
                 LOADS,
                 FOLD | FACTS,
                 FOLD | REUSE | DEAD,
+                GUARDS,
+                GUARDS | DEAD,
+                MODULE | GUARDS,
                 ALL,
             ] {
                 let mut m = random_program(seed);
@@ -2279,5 +2298,226 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    // ---- GUARDS: selects that keep an old value nothing reads ----
+
+    /// The taken operand of the select that makes `v`, if `v` is one.
+    fn taken(m: &Module, v: V) -> Option<V> {
+        let V::Inst(i) = v else { return None };
+        match m.insts[i as usize].op {
+            Op::Select(_, t, _) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn selects_in(m: &Module, b: usize) -> usize {
+        m.blocks[b]
+            .body
+            .iter()
+            .filter(|&&i| matches!(m.insts[i as usize].op, Op::Select(..)))
+            .count()
+    }
+
+    #[test]
+    fn a_chain_of_guarded_writes_keeps_only_the_last_old_value() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (one, two, three) = (m.i32(1), m.i32(2), m.i32(3));
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![two, two]);
+        let z = m.call(b, reads, vec![three, three]);
+        let c = m.cmp(b, pred::IULT, x, y);
+        // r1 = x + 1 where c (else y); r2 = r1 + 2 where c (else z); r3 = r2 ^ x where c (else x)
+        let n1 = m.bin(b, Bin::Add, x, one);
+        let r1 = m.select(b, c, n1, y);
+        let n2 = m.bin(b, Bin::Add, r1, two);
+        let r2 = m.select(b, c, n2, z);
+        let n3 = m.bin(b, Bin::Xor, r2, x);
+        let r3 = m.select(b, c, n3, x);
+        m.call(b, writes, vec![r3, one]);
+        m.terminate(b, Term::Ret);
+        m.optimise(GUARDS | DEAD);
+        // the store reads r3 in every lane that runs it: that select stays; the others were
+        // only read by selects on the same condition
+        let stored = stores(&m, b);
+        assert_eq!(stored.len(), 1);
+        let Some(V::Inst(xor)) = taken(&m, stored[0][0]) else {
+            panic!("the last select stays");
+        };
+        let Op::Bin(Bin::Xor, sum2, _) = m.insts[xor as usize].op else {
+            panic!("the xor");
+        };
+        let V::Inst(sum2) = sum2 else { panic!("a sum") };
+        let Op::Bin(Bin::Add, sum1, _) = m.insts[sum2 as usize].op else {
+            panic!("the second sum reads the second guard's new value");
+        };
+        assert_eq!(sum1, n1, "the first sum feeds the second one directly");
+        assert_eq!(selects_in(&m, b), 1, "one select left of three");
+        m.write();
+    }
+
+    #[test]
+    fn a_guard_stays_where_the_old_value_is_read_elsewhere() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (one, two, three) = (m.i32(1), m.i32(2), m.i32(3));
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![two, two]);
+        let c = m.cmp(b, pred::IULT, x, y);
+        let d = m.cmp(b, pred::NE, x, three);
+        let n1 = m.bin(b, Bin::Add, x, one);
+        let r1 = m.select(b, c, n1, y);
+        // read under another condition
+        let n2 = m.bin(b, Bin::Add, r1, two);
+        let r2 = m.select(b, d, n2, y);
+        m.call(b, writes, vec![r2, one]);
+        // and one that a store reads too
+        let n3 = m.bin(b, Bin::Sub, x, one);
+        let r3 = m.select(b, c, n3, y);
+        let n4 = m.bin(b, Bin::Add, r3, one);
+        let r4 = m.select(b, c, n4, y);
+        m.call(b, writes, vec![r4, r3]);
+        m.terminate(b, Term::Ret);
+        m.optimise(GUARDS);
+        assert_eq!(
+            selects_in(&m, b),
+            4,
+            "every select is read where its condition may not hold"
+        );
+        m.write();
+    }
+
+    #[test]
+    fn a_guard_goes_where_the_reader_holds_a_condition_that_implies_its_own() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (one, two, three) = (m.i32(1), m.i32(2), m.i32(3));
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![two, two]);
+        let c = m.cmp(b, pred::IULT, x, y);
+        let d = m.cmp(b, pred::NE, x, three);
+        let both = m.bin(b, Bin::And, c, d);
+        let n1 = m.bin(b, Bin::Add, x, one);
+        let r1 = m.select(b, c, n1, y);
+        let n2 = m.bin(b, Bin::Mul, r1, two);
+        let r2 = m.select(b, both, n2, y);
+        m.call(b, writes, vec![r2, one]);
+        m.terminate(b, Term::Ret);
+        m.optimise(GUARDS);
+        let stored = stores(&m, b);
+        let Some(V::Inst(product)) = taken(&m, stored[0][0]) else {
+            panic!("the select on both conditions stays");
+        };
+        let Op::Bin(Bin::Mul, a, _) = m.insts[product as usize].op else {
+            panic!("the product");
+        };
+        assert_eq!(a, n1, "where both hold, c holds: the product reads the sum");
+        m.write();
+    }
+
+    #[test]
+    fn a_guard_stays_where_other_lanes_or_descriptors_read_it() {
+        let mut k = kit();
+        let i32t = k.m.int(32);
+        let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+        let first = k.m.function(
+            "dx.op.waveReadLaneFirst.i32",
+            fty,
+            Some(Attr::NoUnwind),
+            false,
+        );
+        let heap = k.m.function(
+            "dx.op.createHandleFromHeap",
+            fty,
+            Some(Attr::ReadNone),
+            false,
+        );
+        let deriv =
+            k.m.function("dx.op.unary.i32", fty, Some(Attr::ReadNone), false);
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = k;
+        let (one, two, d83) = (m.i32(1), m.i32(2), m.i32(83));
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![two, two]);
+        let c = m.cmp(b, pred::IULT, x, y);
+        for f in [first, heap] {
+            let n = m.bin(b, Bin::Add, x, one);
+            let r = m.select(b, c, n, y);
+            let used = m.call(b, f, vec![r, one]);
+            let guarded = m.select(b, c, used, y);
+            m.call(b, writes, vec![guarded, one]);
+        }
+        // a derivative reads the neighbours' operand: the opcode is the first operand
+        let n = m.bin(b, Bin::Add, x, two);
+        let r = m.select(b, c, n, y);
+        let used = m.call(b, deriv, vec![d83, r]);
+        let guarded = m.select(b, c, used, y);
+        m.call(b, writes, vec![guarded, one]);
+        m.terminate(b, Term::Ret);
+        m.optimise(GUARDS);
+        assert_eq!(
+            selects_in(&m, b),
+            6,
+            "the operands of lane, handle and derivative calls are read as they are"
+        );
+        m.write();
+    }
+
+    #[test]
+    fn a_guard_is_not_dropped_across_a_loop() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let i32t = m.int(32);
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        let x = m.call(b, reads, vec![one, one]);
+        let y = m.call(b, reads, vec![two, two]);
+        let (head, exit) = (m.new_block(), m.new_block());
+        m.terminate(b, Term::Br(head));
+        let acc = m.phi(head, i32t);
+        let count = m.phi(head, i32t);
+        // the guard's condition is made again each round, from what the round read
+        let c = m.cmp(head, pred::IULT, acc, y);
+        let n = m.bin(head, Bin::Add, acc, one);
+        let kept = m.select(head, c, n, acc);
+        let next = m.bin(head, Bin::Add, count, one);
+        let more = m.cmp(head, pred::IULT, next, two);
+        m.terminate(head, Term::CondBr(more, head, exit));
+        m.set_phi(acc, vec![(x, b), (kept, head)]);
+        m.set_phi(count, vec![(zero, b), (next, head)]);
+        m.call(exit, writes, vec![acc, one]);
+        m.terminate(exit, Term::Ret);
+        m.optimise(GUARDS);
+        assert_eq!(
+            selects_in(&m, head),
+            1,
+            "the register that goes round a loop keeps its old value in the lanes that stopped"
+        );
+        m.write();
     }
 }

@@ -2967,6 +2967,18 @@ fn lean_steps() -> bool {
     crate::ab::live_flag!("VICTORY_LEAN_STEPS")
 }
 
+/// Whether the submitting thread leaves the landed lists (reset, their upload memory and descriptor slots given back)
+/// to the thread that settles flights, which does it when it is asked to ([`late_helper`]), and not at the end of each
+/// submission it sends (`VICTORY_LAND_ASIDE=1`; off by default): 1.4 ms a frame of the submitting thread's.
+///
+/// What the lists hold is let go a moment later, and what is let go goes to the next list that asks for it, which
+/// takes new memory when there is none: every call of `land` takes what is due when it is made (`bury_lag` behind).
+fn land_aside() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: each submission takes the answer once, and either way every
+    // list landed is given back by the next `land`, whoever makes it.)
+    crate::ab::live_flag!("VICTORY_LAND_ASIDE")
+}
+
 /// Whether anything is in the air.
 fn flying() -> bool {
     if !late() {
@@ -3614,6 +3626,9 @@ fn land() {
     }
 }
 
+/// Whether the thread of [`late_helper`] is running.
+static HELPER_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3621,6 +3636,7 @@ fn land() {
 /// see it.
 fn late_helper() {
     crate::cores::keep_on_fast_cores("victory-late-wait");
+    HELPER_UP.store(true, Ordering::Release);
     let Some(host) = host() else {
         return;
     };
@@ -6057,8 +6073,15 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        if land_aside() && HELPER_UP.load(Ordering::Acquire) {
+            // The thread that settles flights gives the landed lists back, as it does when it is asked to look
+            // at what is in the air: it resets nearly all of them already (1,025 of 1,263 in a timeline).
+            line().poke = true;
+            LINE_MOVED.notify_one();
+        } else {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a

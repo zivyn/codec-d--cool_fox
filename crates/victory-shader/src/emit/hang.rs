@@ -93,7 +93,18 @@ pub fn say(note: u32) -> (u32, u32, u32) {
     (note >> 24 & 7, note >> 4 & 0x000F_FFFF, note & 15)
 }
 
+/// How many times a loop that holds a group barrier and sits in another loop that holds one goes
+/// round in the audited kept skips' form (`VICTORY_KEPT_SKIPS_WIDE=audited`), at most. Such an
+/// inner loop is a retry (the lanes that failed a compare-and-swap go again, each round at least
+/// one lane succeeds, so a console wave needs 64 rounds at the very most); a loop that ran to its
+/// default limit in each round of another that does costs the square of the limit in barriers (a
+/// loop of 4096 in a loop of 4096 is 16.7 million of them: seconds, a reset of the device).
+pub const NESTED_LOOP_LIMIT: u32 = 64;
+
 thread_local! {
+    /// Whether the modules this thread lowers bound their nested loops that hold a group barrier
+    /// ([`NESTED_LOOP_LIMIT`]): set while the audited kept skips' form is made.
+    static NESTED_BOUND: Cell<bool> = const { Cell::new(false) };
     /// Whether the modules this thread finishes are audited (the kept skips' form is being tried).
     static WANT: Cell<bool> = const { Cell::new(false) };
     /// The audit of the last module this thread finished with barriers in it.
@@ -134,6 +145,17 @@ pub(super) fn audit_from_now_on() {
     LAST.take();
 }
 
+/// Bounds the nested loops with a group barrier of the programs this thread lowers from now on
+/// (or stops doing so).
+pub(super) fn bound_nested_loops(on: bool) {
+    NESTED_BOUND.set(on);
+}
+
+/// Whether [`bound_nested_loops`] is in force.
+pub(super) fn nested_loops_bounded() -> bool {
+    NESTED_BOUND.get()
+}
+
 pub(super) fn stop_auditing() {
     WANT.set(false);
 }
@@ -151,7 +173,9 @@ pub(super) fn finished(m: &super::bitcode::Module, tag: u32) {
         return;
     }
     let audit = m.audit_barriers();
-    if audit.barriers == 0 {
+    // (the waits of the two host waves of a console wave are audited too: a module with only those
+    // can still hang a half that waits for a half that went another way)
+    if audit.barriers == 0 && audit.waits == 0 {
         LAST.take();
         return;
     }

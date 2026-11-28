@@ -40,6 +40,9 @@ impl<'a> Lower<'a> {
             self.guarded_barrier(block, mode, wave);
             return;
         }
+        if mode & 1 != 0 {
+            self.guard_waits.insert(self.cur_ir);
+        }
         let mode = self.s.m.i32(mode);
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -168,13 +171,36 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Whether loop `h` sits in another loop (the rpo of `h` is inside the other's, whose back
+    /// edge comes from after `h`'s own).
+    fn loop_in_loop(&self, h: usize) -> bool {
+        let latch = |l: usize| {
+            self.x.p.blocks[l]
+                .preds
+                .iter()
+                .filter(|&&q| self.block[q].is_some() && self.rpo[q] >= self.rpo[l])
+                .map(|&q| self.rpo[q])
+                .max()
+        };
+        let Some(mine) = latch(h) else { return false };
+        self.counters
+            .keys()
+            .any(|&g| g != h && self.rpo[g] < self.rpo[h] && latch(g).is_some_and(|theirs| theirs >= mine))
+    }
+
     /// The limit of loop `h` with the guard: a loop with a barrier in it goes round at most the
-    /// guard's number of times.
+    /// guard's number of times. And, in the audited kept skips' form
+    /// ([`hang::NESTED_LOOP_LIMIT`]), a loop with a barrier in another loop goes round at most
+    /// that bound.
     pub(super) fn guard_loop_limit(&self, h: usize, limit: u32) -> u32 {
-        match self.guard {
+        let limit = match self.guard {
             Some(g) if self.loop_has_wait(h) => limit.min(g.cfg.loops),
             _ => limit,
+        };
+        if hang::nested_loops_bounded() && self.loop_has_wait(h) && self.loop_in_loop(h) {
+            return limit.min(hang::NESTED_LOOP_LIMIT);
         }
+        limit
     }
 
     /// With the guard: a note, from every lane, that loop `h` reached its bound (`next` iterations

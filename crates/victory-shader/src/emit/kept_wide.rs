@@ -4,7 +4,9 @@
 //! is code every lane runs, so the two host waves exchange in it. Taken only where no branch of
 //! the form can hang the thread group ([`super::wide_class`]): a group barrier under a branch that
 //! the waves of a group may decide differently is how the device was lost.
-//! The form is out unless `VICTORY_KEPT_SKIPS_WIDE=1` (the safe classes) or `=all` (whatever the classes say).
+//! The form is out unless `VICTORY_KEPT_SKIPS_WIDE=1` (the classes and the audit with memory reads
+//! taken as alike), `=audited` (what the audit proves clean, nested loops with a barrier bounded),
+//! `=strict`, `=classes` or `=all` (whatever the classes say).
 
 use super::form::{self, Mode};
 use super::hang;
@@ -49,7 +51,11 @@ pub(super) fn attempt(
         }
         let base = program.as_ref().unwrap_or(p);
         hang::audit_from_now_on();
+        // (the audited form bounds the loops that hold a barrier in a loop that holds one, so that
+        // the audit's "no barrier a thread can miss" is not paid for in seconds: `hang::NESTED_LOOP_LIMIT`)
+        hang::bound_nested_loops(mode == Mode::Audited);
         let r = widen_seeded(c, native, base, why, false, &kept);
+        hang::bound_nested_loops(false);
         hang::stop_auditing();
         if !done(&r) {
             continue;
@@ -62,6 +68,10 @@ pub(super) fn attempt(
         let audited = match mode {
             Mode::Safe => audit.as_ref().is_none_or(|a| a.safe(true)),
             Mode::Strict => audit.as_ref().is_none_or(|a| a.safe(false) && a.nest <= 1),
+            // (no barrier behind a branch that differs, or that reads memory: every thread of the
+            // group passes each barrier the same number of times; loops with a barrier nest two
+            // deep at most, the inner one bounded)
+            Mode::Audited => audit.as_ref().is_none_or(|a| a.safe(false) && a.nest <= 2),
             _ => true,
         };
         let safe = mode == Mode::All || wide_class::safe(&classes) && audited;

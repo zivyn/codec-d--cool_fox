@@ -3671,6 +3671,7 @@ mod narrow_tests {
         };
         let missed_before = crate::pagedrive::missed_total();
         let compared_before = crate::pagedrive::compared_total();
+        let driven_before = crate::pagedrive::driven_total();
         let mut copies = vec![one(at, N, 0), one(at, N, 1), one(at, N, 2)];
         let mut seed = 0x5eed_1234_abcd_u64;
         let mut random = move || {
@@ -3748,6 +3749,7 @@ mod narrow_tests {
         }
         assert_eq!(crate::pagedrive::missed_total(), missed_before, "the journal says pages stale that the ledger does not hold");
         assert!(crate::pagedrive::compared_total() > compared_before, "the shadow check compared nothing");
+        assert!(crate::pagedrive::driven_total() > driven_before, "the ledger decided nothing");
         // SAFETY: ours.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }

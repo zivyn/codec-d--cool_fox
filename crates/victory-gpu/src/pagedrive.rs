@@ -41,7 +41,10 @@
 //!   the range (what a look needs to be valid), never walked.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{
+    AtomicU64, AtomicUsize,
+    Ordering::{Acquire, Relaxed, Release},
+};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::host::AddressHash;
@@ -136,13 +139,13 @@ impl Ledger {
             // (Numbers only grow; an older note after a newer one keeps the newer.)
             dirty.insert(page, w);
         }
-        self.count.store(dirty.len(), Relaxed);
+        self.count.store(dirty.len(), Release);
         true
     }
 
     /// How many pages are held.
     pub(crate) fn len(&self) -> usize {
-        self.count.load(Relaxed)
+        self.count.load(Acquire)
     }
 
     /// The pages `[first, last)` that are held, with their numbers, in page order: the shape of the journal's list,
@@ -183,7 +186,7 @@ impl Ledger {
                 gone += 1;
             }
         }
-        self.count.store(dirty.len(), Relaxed);
+        self.count.store(dirty.len(), Release);
         drop(dirty);
         if gone > 0 {
             count(CLEARED, gone);
@@ -285,7 +288,7 @@ impl Plane {
         let queued = {
             let mut noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
             noted.push((page, now));
-            self.held.fetch_add(1, Relaxed);
+            self.held.fetch_add(1, Release);
             noted.len()
         };
         if queued >= HELD {
@@ -297,7 +300,7 @@ impl Plane {
     /// views of its physical page (`alias`: the pages the title shows the same physical page at). After it returns,
     /// every note the journal made before the call is in the ledgers.
     pub(crate) fn drain(&self, alias: &dyn Fn(usize) -> Vec<usize>) {
-        if self.held.load(Relaxed) == 0 {
+        if self.held.load(Acquire) == 0 {
             return;
         }
         let _one = self.draining.lock().unwrap_or_else(|e| e.into_inner());
@@ -320,7 +323,7 @@ impl Plane {
             }
         }
         // Applied: a look that sees none held may rely on the ledgers.
-        self.held.fetch_sub(notes.len(), Relaxed);
+        self.held.fetch_sub(notes.len(), Release);
         count(NOTES, notes.len() as u64);
         count(MARKS, marks);
         count(ALIASED, aliased);
@@ -555,6 +558,15 @@ pub(crate) fn missed_total() -> [u64; 3] {
 #[cfg(test)]
 pub(crate) fn compared_total() -> u64 {
     [LOOKS, LISTS, UNDERS]
+        .iter()
+        .map(|&i| STATS[i].load(Relaxed))
+        .sum()
+}
+
+/// What the ledger has decided since the start (looks answered, refreshes listed).
+#[cfg(test)]
+pub(crate) fn driven_total() -> u64 {
+    [ANSWERED, LISTED]
         .iter()
         .map(|&i| STATS[i].load(Relaxed))
         .sum()

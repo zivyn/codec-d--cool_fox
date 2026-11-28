@@ -445,6 +445,8 @@ pub(crate) struct State {
     batch: Option<Batch>,
     /// The run of executions being made one (`VICTORY_INDIRECT_FOLD`).
     fold: fold::Mode,
+    /// The dispatches being made one (`VICTORY_FUSE_RUNS`).
+    fuse: fuse::Fuse,
     /// The title's waits for shader writes held for what a command needs
     /// (`VICTORY_PRECISE_BARRIERS`, [`crate::lazy_wait`]).
     lazy: Option<crate::lazy_wait::Lazy>,
@@ -1061,6 +1063,7 @@ pub(crate) mod access;
 #[cfg(feature = "diagnostics")]
 pub(crate) mod bufnan;
 pub(crate) mod fold;
+pub(crate) mod fuse;
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
@@ -1995,6 +1998,12 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            // A program translated for runs of dispatches takes its user data from a table: what is bound for
+            // its stage goes into the dispatch's record, not onto the host list (`fuse`).
+            let shaped = fuse::shaped(stage);
+            if shaped {
+                self.fuse.cur.clear();
+            }
             STORES.set(t.stores);
             // What the shader stores, by its code and what this draw gives it (`crate::host::precise`).
             let _precise = crate::host::precise::enter(stage, compute, &|slot, dword| match self.roots_ref(compute).get(usize::from(slot)) {
@@ -2075,10 +2084,18 @@ impl State {
                 }
                 // (A call after the head of a run made one: its dwords are in
                 // the run's commands, and the host list is not told.)
-                self.set_user_data(l, compute, param, values);
+                if shaped {
+                    self.fuse.cur.extend_from_slice(values);
+                } else {
+                    self.set_user_data(l, compute, param, values);
+                }
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    // Ours: the table of a run, set when the run is made (`fuse`).
+                    if !srv && slot == victory_shader::emit::SLOT_FUSE {
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
@@ -3625,12 +3642,17 @@ impl State {
             return;
         }
         // The groups the dispatch runs (counted in threads: whole groups of them), for what its shaders can write.
-        let _extent = crate::host::precise::extent(
-            (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
-                .then(|| p.stages.first().and_then(|s| s.translated().threads))
-                .flatten()
-                .map_or([x, y, z], |size| dispatch_groups([x, y, z], size)),
-        );
+        let groups = (flags & THREAD_DIMENSIONS != 0 && thread_dimensions())
+            .then(|| p.stages.first().and_then(|s| s.translated().threads))
+            .flatten()
+            .map_or([x, y, z], |size| dispatch_groups([x, y, z], size));
+        let _extent = crate::host::precise::extent(groups);
+        // A program translated for runs of dispatches (`fuse`): this dispatch is a record of a table, and the run
+        // open takes it or is made first, before the host list is given anything of this one.
+        let shaped = p.stages.first().is_some_and(fuse::shaped);
+        if shaped || self.fuse_open() {
+            self.fuse_room(list, p, groups, shaped);
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3666,14 +3688,26 @@ impl State {
         }
         // The title's waits that are held (`VICTORY_PRECISE_BARRIERS`): one goes in front of this
         // dispatch if it reads or writes what something before the wait wrote.
+        let mut wait = false;
         if self.lazy.is_some() {
             let access = self.access(p, true);
-            if self.lazy_op(crate::list::lazy::Class::Dispatch, Some(&access)) {
+            wait = self.lazy_op(crate::list::lazy::Class::Dispatch, Some(&access));
+        }
+        if shaped {
+            // The wait goes after the dispatches of the run, which it is the title's wait for.
+            if wait {
+                self.fuse_flush(list, fuse::WAIT);
                 crate::list::emit_uav_wait(list);
             }
+            self.fuse_add(list, p, groups);
+        } else {
+            if wait {
+                crate::list::emit_uav_wait(list);
+            }
+            fuse::plain();
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(x, y, z) };
         }
-        // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
         // What it wrote, scanned for NaN and infinities (`VICTORY_BUFFER_NAN`); that replaces the
         // list's compute root signature and pipeline.
@@ -4981,6 +5015,12 @@ impl State {
         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
         if kind == MESH {
             self.mesh_scissor(list, true);
+        }
+        // A program translated for runs of dispatches reads its user data from a table; the card reads this
+        // execution's group counts, so the table is that of a dispatch as the title made it (`fuse`).
+        if kind == DISPATCH && p.stages.first().is_some_and(fuse::shaped) && !self.fuse_native(list, p) {
+            why("the table of a program translated for runs of dispatches could not be made");
+            return false;
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.

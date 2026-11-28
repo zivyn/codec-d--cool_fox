@@ -70,6 +70,9 @@ pub(crate) struct Shader {
     /// What its code stores to buffers, by descriptor ([`Shader::footprint`]), made when first asked.
     #[cfg(windows)]
     footprint: OnceLock<Option<Arc<victory_shader::footprint::Footprint>>>,
+    /// Whether its dispatches may share a run ([`Shader::joins_runs`]), made when first asked.
+    #[cfg(windows)]
+    joins: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -124,6 +127,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 footprint: OnceLock::new(),
+                #[cfg(windows)]
+                joins: OnceLock::new(),
             })
         })
         .clone()
@@ -208,6 +213,35 @@ impl Shader {
                     .map(Arc::new)
             })
             .as_ref()
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// Whether the dispatches of this program may be made one with others (`draw::fuse`): it is translated for runs
+    /// (it reads its user data from a run's table), reads no root view of the title, has no part in the stand-in for
+    /// the indirect light, and its code is known to read and write buffers only, through the descriptor tables of the
+    /// title. A texture a dispatch of a run needs in another state than the one before it would be moved before the
+    /// dispatches in front of it, which are made when the run ends.
+    pub(crate) fn joins_runs(&self) -> bool {
+        *self.joins.get_or_init(|| {
+            use victory_shader::footprint::Target;
+            let Some(t) = self.translated() else { return false };
+            let h = &t.host;
+            if h.root_cbvs != [victory_shader::emit::SLOT_FUSE] || !h.root_srvs.is_empty() || !h.root_uavs.is_empty() {
+                return false;
+            }
+            if self.ambient.is_some() || t.threads.is_none() || !h.root_indexed_views.is_empty() {
+                return false;
+            }
+            let Some(f) = self.footprint() else { return false };
+            !f.images_unknown
+                && f.image_reads.is_empty()
+                && f.image_writes.is_empty()
+                && !f.by_address
+                && !f.by_address_loads
+                && f.stores.iter().chain(&f.loads).all(|s| matches!(s.target, Target::Table { .. }))
+        })
     }
 }
 

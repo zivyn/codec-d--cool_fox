@@ -153,6 +153,8 @@ mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod view_index_tests;
 #[cfg(all(test, windows))]
+mod fuse_tests;
+#[cfg(all(test, windows))]
 mod loop_limit_tests;
 mod local_exit_form;
 #[cfg(all(test, windows))]
@@ -173,10 +175,14 @@ pub use lower::{
     LOOP_NOTE, PAIR_NOTE, PEEK_NOTE, host_mesh_output_bytes, host_settings, set_host_lds_bytes, set_host_max_wave,
     set_host_mesh_output_bytes, set_host_rdna, set_program_tag,
 };
+pub use lower::fuse::{
+    fuse_dims, fuse_fill, fuse_fill_native, fuse_fits, fuse_locate, fuse_native_rows, fuse_record_rows, fuse_rows,
+    fuse_user_dword,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_ROOT_VIEW_INDEX, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    FUSE_MEMBERS, FUSE_ROWS, FUSE_WIDTH, SLOT_FUSE, SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, SLOT_VIEW_ADDRESSES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_ROOT_VIEW_INDEX, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 

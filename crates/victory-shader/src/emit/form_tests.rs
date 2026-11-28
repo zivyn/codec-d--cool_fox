@@ -242,19 +242,18 @@ fn the_kept_skip_over_a_loop_gives_the_consoles_results_on_the_card() {
 }
 
 /// A loop of `s1` rounds that tests its exit at the top (a scalar test: both host waves leave in the
-/// same round) and reads lane 63 of v0 + 1 in its body, which the two host waves of the console wave
-/// exchange. The exit comes before the exchange in the order the blocks are lowered. After the
-/// loop, `out[0] = s22` (what the last round read: 64).
-const TOP_EXIT: [u32; 11] = [
+/// same round) and reads the first lane of v0 + 1 in its body, which the two host waves of the console wave
+/// exchange (each asks the other whether it has a lane). The exit comes before the exchange in the order the blocks are lowered. After the
+/// loop, `out[0] = s22` (what the last round read: 1).
+const TOP_EXIT: [u32; 10] = [
     0x4A04_0081, // v_add_nc_u32 v2, 1, v0
     0xBE94_0380, // s_mov_b32 s20, 0
     0xBE96_0380, // s_mov_b32 s22, 0
     0xBF09_0114, // L: s_cmp_ge_u32 s20, s1
-    0xBF85_0004, // s_cbranch_scc1 DONE
-    0xD760_0016, // v_readlane_b32 s22, v2, 63
-    0x0001_7F02,
+    0xBF85_0003, // s_cbranch_scc1 DONE
+    0x7E2C_0502, // v_readfirstlane_b32 s22, v2
     0x8114_8114, // s_add_i32 s20, s20, 1
-    0xBF82_FFFA, // s_branch L
+    0xBF82_FFFB, // s_branch L
     0x7E02_0216, // DONE: v_mov_b32 v1, s22
     0x38 << 26 | 0x1C << 18,
 ];
@@ -295,12 +294,12 @@ fn the_half_that_leaves_a_loop_at_its_top_clears_its_exchange_dword() {
     assert!(on.dxil.len() > off.dxil.len());
 }
 
-/// ... and the loop still runs on the card as it did: three rounds, each reading lane 63.
+/// ... and the loop still runs on the card as it did: three rounds, each reading the first lane.
 #[test]
 fn a_loop_with_its_exit_at_the_top_still_exchanges_on_the_card() {
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let on = top_exit_lowered(true).expect("lowered");
-    for (rounds, expected) in [(3u32, 64u32), (1, 64)] {
+    for (rounds, expected) in [(3u32, 1u32), (1, 1)] {
         let Some(got) = super::wave64_tests::on_the_card(&on, [0, rounds]) else {
             return;
         };

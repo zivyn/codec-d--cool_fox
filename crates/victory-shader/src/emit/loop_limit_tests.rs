@@ -238,7 +238,7 @@ const LANE_63_EXIT: [u32; 16] = [
     0x7E04_0285, // L: v_mov_b32 v2, 5
     0x7E06_02C1, // v_mov_b32 v3, -1
     0x7D84_00BF, // v_cmp_eq_u32 vcc, 63, v0
-    0x0004_0685, // v_cndmask_b32 v2, 5, v3, vcc
+    0x0204_0685, // v_cndmask_b32 v2, 5, v3, vcc
     0xD760_0003, // v_readlane_b32 s3, v2, 63
     0x0001_7F02,
     0x8104_8104, // s_add_i32 s4, s4, 1

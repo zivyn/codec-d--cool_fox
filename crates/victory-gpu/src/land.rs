@@ -461,8 +461,12 @@ impl Pool {
         let mut state = self.state();
         // (After a panic here: nothing more is begun.)
         state.work = None;
-        while state.running > 0 {
-            state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+        if state.running > 0 {
+            let waiting = std::time::Instant::now();
+            while state.running > 0 {
+                state = self.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
+            crate::host::waits::joined(waiting.elapsed().as_nanos() as u64);
         }
         let panicked = state.panicked;
         drop(state);
@@ -503,6 +507,7 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 /// (`VICTORY_UNDER_THREADS`, 6 with this one).
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
+    let _joining = crate::host::waits::joining(crate::host::waits::Wait::JoinUnder);
     POOL.get_or_init(|| {
         let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
         Pool::new("victory-under", threads.clamp(1, 16))

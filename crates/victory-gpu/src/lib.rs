@@ -88,6 +88,8 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod memory;
 #[cfg(windows)]
+mod pagedrive;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod sites;

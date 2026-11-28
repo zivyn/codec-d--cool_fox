@@ -2243,6 +2243,20 @@ fn rehash_runs() -> bool {
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Since the last frame-rate line, of the list that brings copies in the card's memory up to date (one a submission
+/// that has changed ranges): nanoseconds resetting its allocator and list, recording it, closing it and giving it to
+/// the queue, and how many there were. The per-submission cost that the number of submissions multiplies.
+#[cfg(feature = "diagnostics")]
+static SYNC_LIST: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Adds the time since `lap` to part `i` of [`SYNC_LIST`] and begins the next lap.
+#[cfg(feature = "diagnostics")]
+fn sync_lap(i: usize, lap: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    SYNC_LIST[i].fetch_add((now - *lap).as_nanos() as u64, Ordering::Relaxed);
+    *lap = now;
+}
+
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
 /// default). The pieces the card's compare found differing come down in
@@ -5019,8 +5033,12 @@ impl Host {
             // live buffers, and the ranges lie in them.
             let recorded = unsafe {
                 (|| -> windows::core::Result<()> {
+                    #[cfg(feature = "diagnostics")]
+                    let mut lap = std::time::Instant::now();
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    #[cfg(feature = "diagnostics")]
+                    sync_lap(0, &mut lap);
                     self.pass_stamp(list, stamps, 0);
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
@@ -5102,8 +5120,17 @@ impl Host {
                         }
                     }
                     self.pass_stamp(list, stamps, 2);
+                    #[cfg(feature = "diagnostics")]
+                    sync_lap(1, &mut lap);
                     list.Close()?;
+                    #[cfg(feature = "diagnostics")]
+                    sync_lap(2, &mut lap);
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        sync_lap(3, &mut lap);
+                        SYNC_LIST[4].fetch_add(1, Ordering::Relaxed);
+                    }
                     Ok(())
                 })()
             };
@@ -10472,6 +10499,20 @@ impl Meter {
         crate::shadow::back_line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
+        #[cfg(feature = "diagnostics")]
+        {
+            let [reset, record, close, execute, lists] = [0, 1, 2, 3, 4].map(|i| SYNC_LIST[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if lists > 0.0 {
+                tracing::info!(
+                    "the list that brings copies in the card's memory up to date, per frame: {lists:.1} lists, {:.2} ms resetting allocator and list,                      {:.2} recording, {:.2} closing, {:.2} giving it to the queue ({:.0} us a list in all)",
+                    reset / 1e6,
+                    record / 1e6,
+                    close / 1e6,
+                    execute / 1e6,
+                    (reset + record + close + execute) / 1e3 / lists
+                );
+            }
+        }
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {

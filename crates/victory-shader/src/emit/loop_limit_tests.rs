@@ -230,10 +230,10 @@ fn a_waterfall_loop_whose_halves_finish_in_different_rounds_serves_every_lane() 
 /// 63 holds says so: the other lanes hold 5, lane 63 holds -1, and every round reads lane 63 with
 /// `v_readlane_b32`, the way a walk over a table decides that it is through. The second console
 /// wave leaves at once. The loop is through in its first round; s4 counts the rounds.
-const LANE_63_EXIT: [u32; 16] = [
+const LANE_63_EXIT: [u32; 17] = [
     0xBE8C_047E, // s_mov_b64 s[12:13], exec
     0x7DA8_00C0, // v_cmpx_gt_u32 exec, 64, v0
-    0xBF88_000D, // s_cbranch_execz past the store
+    0xBF88_000D, // s_cbranch_execz past the store (to the last instruction)
     0xBE84_0380, // s_mov_b32 s4, 0
     0x7E04_0285, // L: v_mov_b32 v2, 5
     0x7E06_02C1, // v_mov_b32 v3, -1
@@ -247,6 +247,7 @@ const LANE_63_EXIT: [u32; 16] = [
     0x7E00_0204, // v_mov_b32 v0, s4
     0x38 << 26 | 0x1C << 18,
     0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    0x7E0A_0280, // (the branch over the loop goes here, not to the end) v_mov_b32 v5, 0
 ];
 
 /// What a lane 63 that is read to end a loop does in two host waves of 32: both have the value of

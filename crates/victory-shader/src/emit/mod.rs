@@ -102,6 +102,8 @@ mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 pub mod form;
+mod kept_wide;
+mod wide_class;
 pub use form::Form;
 #[cfg(all(test, windows))]
 mod form_tests;
@@ -824,17 +826,18 @@ fn emit_forms_in(
             };
             Some((p, st, io, res))
         };
-        // (and the branches each kept over a loop, `VICTORY_KEEP_LOOP_SKIPS`)
-        // (by default the forms are those without the switch: the skips over loops are kept only
-        // for the wave-wide form of them, `VICTORY_KEPT_SKIPS_WIDE=1`; a program that has to be
-        // retried was never in danger of the loop's iteration limit by it)
-        let keep = ir::keep_loop_skips() && form::kept_skips_wide();
-        let (early_outs, early_kept) = ir::drop_early_outs_as(p, keep);
-        let (skips, skips_kept) = ir::drop_skips_as(p, false, keep);
-        let (early_dropped, skips_dropped) = (early_outs.is_some(), skips.is_some());
+        // The skips over loops that `VICTORY_KEEP_LOOP_SKIPS` keeps, taken by the whole wave, where
+        // that is safe for the thread group ([`kept_wide`]): before the forms without the switch.
+        if let Some(again) = kept_wide::attempt(c, native, p, why) {
+            report("kept skips wave-wide", &again);
+            *form_out = Form::KeptSkipsWide;
+            return again.map(|(shader, _)| shader);
+        }
+        // (the forms without the skips over loops that the switch keeps: those are the wave-wide
+        // form above, or not at all)
         let forms = [
-            ("without early-outs", form("without early-outs", early_outs)),
-            ("without skips", form("without skips", skips)),
+            ("without early-outs", form("without early-outs", ir::drop_early_outs_as(p, false).0)),
+            ("without skips", form("without skips", ir::drop_skips_as(p, false, false).0)),
         ];
         for (i, (name, f)) in forms.iter().enumerate() {
             if let Some((p, st, io, res)) = f {
@@ -843,26 +846,6 @@ fn emit_forms_in(
                 if done(&again) {
                     *form_out = if i == 0 { Form::WithoutEarlyOuts } else { Form::WithoutSkips };
                     return again.map(|(shader, _)| shader);
-                }
-            }
-        }
-        // The same two forms as they were before `VICTORY_KEEP_LOOP_SKIPS`, for a program whose
-        // skips (or early-outs) over loops it kept: with those left out, the first that lowers
-        // exactly (the form the program had without the switch).
-        let mut left_out: Vec<(&str, Option<(ir::Program, structure::Structured, io::Io, resource::Resources)>)> = Vec::new();
-        let mut left_out_done = None;
-        if !early_kept.is_empty() {
-            left_out.push(("without early-outs, loop skips left out", form("without early-outs, loop skips left out", ir::drop_early_outs_as(p, false).0)));
-        }
-        if !skips_kept.is_empty() {
-            left_out.push(("without skips, loop skips left out", form("without skips, loop skips left out", ir::drop_skips_as(p, false, false).0)));
-        }
-        for (name, f) in &left_out {
-            if let Some((p, st, io, res)) = f {
-                let again = emit_program(c, native, p, st, io, res);
-                report(name, &again);
-                if left_out_done.is_none() && done(&again) {
-                    left_out_done = Some(again);
                 }
             }
         }
@@ -908,61 +891,12 @@ fn emit_forms_in(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let (deep_p, deep_kept) = if deep_on { ir::drop_skips_as(p, true, keep) } else { (None, Vec::new()) };
-                let deep_dropped = deep_p.is_some();
-                let deep = if deep_on { form("without skips, scalars followed", deep_p) } else { None };
+                let deep = if deep_on { form("without skips, scalars followed", ir::drop_skips_as(p, true, false).0) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
                         *form_out = Form::WithoutSkipsDeep;
-                        return again.map(|(shader, _)| shader);
-                    }
-                }
-                // Where `VICTORY_KEEP_LOOP_SKIPS` kept a skip over a loop, the forms above are
-                // refused (cross-lane code under a branch each host wave takes on its own): the
-                // same forms with those branches taken by the whole wave stay exact, at two
-                // group barriers per branch, outside the loops. Before any approximate form.
-                // (Only with `VICTORY_KEPT_SKIPS_WIDE=1`: by default the forms with the loop skips left
-                // out, which have no group barrier at a branch, come first, below.)
-                if wide_option.as_ref().is_none_or(|v| v != "0") {
-                    // (the program itself where nothing was left out: only the kept branches differ)
-                    let bases = [
-                        (forms[0].1.as_ref().map(|f| &f.0), early_dropped, &early_kept),
-                        (forms[1].1.as_ref().map(|f| &f.0), skips_dropped, &skips_kept),
-                        (deep.as_ref().map(|f| &f.0), deep_dropped, &deep_kept),
-                    ];
-                    for (base, dropped, kept) in bases {
-                        let Some(base) = base.or((!dropped).then_some(p)) else {
-                            continue;
-                        };
-                        if kept.is_empty() {
-                            continue;
-                        }
-                        let again = widen_seeded(c, native, base, why, false, kept);
-                        report("kept skips wave-wide", &again);
-                        if done(&again) {
-                            *form_out = Form::KeptSkipsWide;
-                            return again.map(|(shader, _)| shader);
-                        }
-                    }
-                }
-                // The forms as they were before the switch, with the skips over loops left out (exact,
-                // no barrier at a branch; a wave with no lane left walks the loop, which is what the
-                // switch avoids). Before the wave-wide form of the kept skips, which lost the card
-                // as a group-barrier-in-a-loop shape, and before any approximate form.
-                if let Some(again) = left_out_done.take() {
-                    *form_out = Form::LoopSkipsLeftOut;
-                    return again.map(|(shader, _)| shader);
-                }
-                if !deep_kept.is_empty()
-                    && deep_on
-                    && let Some((p, st, io, res)) = form("without skips, scalars followed, loop skips left out", ir::drop_skips_as(p, true, false).0)
-                {
-                    let again = emit_program(c, native, &p, &st, &io, &res);
-                    report("without skips, scalars followed, loop skips left out", &again);
-                    if done(&again) {
-                        *form_out = Form::LoopSkipsLeftOut;
                         return again.map(|(shader, _)| shader);
                     }
                 }
@@ -1026,23 +960,6 @@ fn emit_forms_in(
                     return local.map(|(shader, _)| shader);
                 }
             }
-            // Where the program had no exact form with barriers before the switch either: its exact
-            // local form (no barrier), as it was without the switch: each host wave on its own does
-            // not mind a wave with no lane walking a loop whose exit reads no other lane.
-            if exact && left_out_done.is_none() {
-                for (name, f) in &left_out {
-                    if let Some((p, st, io, res)) = f
-                        && idiom(p, st)
-                    {
-                        let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
-                        report(&format!("local waves (idiom), {name}"), &local);
-                        if done(&local) {
-                            *form_out = Form::LocalIdiom;
-                            return local.map(|(shader, _)| shader);
-                        }
-                    }
-                }
-            }
         }
         if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
@@ -1100,7 +1017,7 @@ fn emit_forms_in(
         // loops lost the card for programs the approximate forms ran).
         // (`VICTORY_WAVE_WIDE=0` leaves it out.)
         if wide_option.is_none() {
-            let deep = form("without skips, scalars followed", ir::without_skips(p, true));
+            let deep = form("without skips, scalars followed", ir::drop_skips_as(p, true, false).0);
             let again = widen_from(deep.as_ref().map(|f| &f.0), false);
             report("wave-wide branches (last resort)", &again);
             if done(&again) {
@@ -1245,14 +1162,19 @@ fn widen_seeded(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
+        wide_class::take_barriers();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
+        let barriers = wide_class::take_barriers();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
                 if lower::needs_every_lane(what) || *what == lower::LANE_MASK && !needs.is_empty())
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
+            if !seed.is_empty() {
+                wide_class::set_last(wide_class::classify(p, &st, native, &wide, &barriers));
+            }
             if why {
                 let order = ir::reverse_postorder(&p.blocks);
                 let mut rpo = vec![0usize; p.blocks.len()];

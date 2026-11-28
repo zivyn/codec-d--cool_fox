@@ -60,6 +60,9 @@ pub(crate) struct Policy {
     pub(crate) min_buffer: u64,
     /// The most such a buffer is.
     pub(crate) max_buffer: u64,
+    /// `VICTORY_ZEROCOPY_SIZES`: the exact sizes of title buffers (any heap) that are placed in place whatever else
+    /// is true of them, for buffers the log shows nothing was ever fetched from (a decision of the pilot, per run).
+    pub(crate) sizes: Vec<u64>,
 }
 
 impl Policy {
@@ -73,6 +76,16 @@ impl Policy {
                 cell: var("VICTORY_ZEROCOPY_CELL_MB", 64).max(1) << 20,
                 min_buffer: var("VICTORY_ZEROCOPY_MIN_KB", 64) << 10,
                 max_buffer: var("VICTORY_ZEROCOPY_BUFFER_MB", 64) << 20,
+                sizes: std::env::var("VICTORY_ZEROCOPY_SIZES")
+                    .map(|v| {
+                        v.split(',')
+                            .filter_map(|n| {
+                                let n = n.trim();
+                                n.strip_prefix("0x").map_or_else(|| n.parse().ok(), |h| u64::from_str_radix(h, 16).ok())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
             }
         })
     }
@@ -82,6 +95,11 @@ impl Policy {
 pub(super) fn wants_buffer(len: u64) -> bool {
     let p = Policy::get();
     crate::inplace::zero_level() >= 2 && len >= p.min_buffer && len <= p.max_buffer
+}
+
+/// Whether a title buffer of `len` bytes is named by `VICTORY_ZEROCOPY_SIZES`.
+pub(super) fn listed(len: u64) -> bool {
+    crate::inplace::zero_level() >= 1 && Policy::get().sizes.contains(&len)
 }
 
 /// What is known of a declared range, by its start.
@@ -323,8 +341,8 @@ pub(crate) fn observe(start: u64, ranges: &[(usize, usize)]) {
                     break;
                 }
                 let bytes = to.min(rb) - from.max(ra);
-                match seen[..n].iter_mut().find(|s| s.0 == ra) {
-                    Some(s) => s.1 += bytes,
+                match seen[..n].iter().position(|s| s.0 == ra) {
+                    Some(k) => seen[k].1 += bytes,
                     None if n < seen.len() => {
                         seen[n] = (ra, bytes, rb);
                         n += 1;

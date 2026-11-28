@@ -187,7 +187,7 @@ pub(crate) fn zero_most() -> u64 {
 /// What the zero-copy classes did, since the start: cells (ranges the title declares read-only to the GPU) placed and
 /// their bytes; title buffers placed and their bytes; asks answered by a cell; refused for the memory (not private
 /// memory committed whole, or a page of it guarded just then); refused by the host; refused over [`zero_most`].
-pub(crate) static ZERO: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+pub(crate) static ZERO: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 pub(crate) const Z_CELLS: usize = 0;
 pub(crate) const Z_BUFFERS: usize = 2;
 pub(crate) const Z_ASKS: usize = 4;
@@ -195,6 +195,15 @@ pub(crate) const Z_MEMORY: usize = 5;
 pub(crate) const Z_HOST: usize = 6;
 pub(crate) const Z_CAP: usize = 7;
 pub(crate) const Z_VIEW: usize = 8;
+pub(crate) const Z_WRITES: usize = 9;
+
+/// Shaders were declared to write the title buffer `[start, start + len)`, which is in place: nothing tracks what they
+/// write there. Told for the first eight; the count is on the ten-second line (any is a reason to stop the run).
+pub(crate) fn zero_wrote(start: u64, len: u64) {
+    if ZERO[Z_WRITES].fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::warn!(start = format_args!("{start:#x}"), len, "zero copy: shaders write a title buffer that is in place: their writes are not tracked");
+    }
+}
 
 /// [`place_for`] for the zero-copy classes: no level to ask, the memory must be private memory committed whole. `None`
 /// with the reason counted: the caller leaves the range to a copy.
@@ -378,7 +387,7 @@ fn say_zero() {
     }
     let z: Vec<u64> = ZERO.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
-        "zero copy (VICTORY_ZEROCOPY={}): {} cells of title memory the title declares read-only to the GPU in place, {} MB, answering {} asks (no copy, no send up, no guard);          {} title buffers of CPU-visible heaps in place, {} MB; kept as copies: {} not private memory committed whole or guarded just then, {} refused by the host,          {} over VICTORY_ZEROCOPY_MB, {} view memory; {}",
+        "zero copy (VICTORY_ZEROCOPY={}): {} cells of title memory the title declares read-only to the GPU in place, {} MB, answering {} asks (no copy, no send up, no guard);          {} title buffers of CPU-visible heaps in place, {} MB; kept as copies: {} not private memory committed whole or guarded just then, {} refused by the host,          {} over VICTORY_ZEROCOPY_MB, {} view memory; {} declared shader writes into buffers in place (must be 0); {}",
         zero_level(),
         z[Z_CELLS],
         z[Z_CELLS + 1] >> 20,
@@ -389,6 +398,7 @@ fn say_zero() {
         z[Z_HOST],
         z[Z_CAP],
         z[Z_VIEW],
+        z[Z_WRITES],
         crate::shadow::zero_report()
     );
 }
@@ -1660,7 +1670,7 @@ mod tests {
     use crate::shadow::zero::{self, Policy, Watch};
     use std::sync::Arc;
 
-    const NOW: Policy = Policy { observe: 0, min_up: 0, cell: 64 << 20, min_buffer: 64 << 10, max_buffer: 64 << 20 };
+    const NOW: Policy = Policy { observe: 0, min_up: 0, cell: 64 << 20, min_buffer: 64 << 10, max_buffer: 64 << 20, sizes: Vec::new() };
 
     /// A range the title declares read-only to the GPU, in private memory of the test's own: (base, at, bytes).
     unsafe fn declared(pages: usize, from: usize, count: usize) -> (*mut u8, usize, usize) {
@@ -1736,7 +1746,7 @@ mod tests {
         if device.cast::<ID3D12Device13>().is_err() {
             return;
         }
-        let watching = Policy { observe: 10, min_up: 1 << 10, cell: 64 << 20, min_buffer: 0, max_buffer: u64::MAX };
+        let watching = Policy { observe: 10, min_up: 1 << 10, cell: 64 << 20, min_buffer: 0, max_buffer: u64::MAX, sizes: Vec::new() };
         // SAFETY: allocations of the test's own.
         unsafe {
             let (base, at, bytes) = declared(6, 1, 3);

@@ -4614,6 +4614,15 @@ impl Shadow {
         &self.ledger
     }
 
+    /// Shaders were declared to write a title buffer that is in place: they write the title's own bytes, which no
+    /// flight's rules know of (`VICTORY_ZEROCOPY`: only for a buffer the log shows nothing was ever fetched from).
+    /// Counted, and told for the first few.
+    fn wrote_in_place(&self) {
+        if !self.window {
+            crate::inplace::zero_wrote(self.start, self.len);
+        }
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -4742,6 +4751,7 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            self.wrote_in_place();
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -4758,6 +4768,7 @@ impl Shadow {
     /// is found in them afterwards, and nothing waits on them.
     pub(crate) fn shader_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.place.is_some() {
+            self.wrote_in_place();
             return;
         }
         let len = len.min(self.left(address));
@@ -7762,7 +7773,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     }
     // A buffer in a heap the title's CPU writes and no shader can write (`VICTORY_ZEROCOPY=2`): its own bytes, in
     // place, whatever its size (bigger ones are the card's copies today, filled up over the bus at every change).
-    if cpu_written && zero::wants_buffer(blen) && let Some(placed) = crate::inplace::place_zero(key.0, blen, false) {
+    if (cpu_written && zero::wants_buffer(blen) || zero::listed(blen)) && let Some(placed) = crate::inplace::place_zero(key.0, blen, false) {
         entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, blen, false)));
         return entry.shadow.clone();
     }

@@ -128,10 +128,11 @@ fn forms(native: &NativeProgram, wide: bool) -> ((HostShader, Form), (HostShader
     ((on, on_form), (off, off_form))
 }
 
-/// A skip over a loop is kept by the switch, and the form of the program is still the exact one
+/// With the switch on (and not `VICTORY_KEPT_SKIPS_WIDE`) the form of the program is the exact one
 /// it had without it: the skip left out, every lane walks the loop, no group barrier at a branch.
-/// (It was an approximate form, each host wave a wave of its own, for 17 programs of the title,
-/// and the wave-wide branches for 15, which put group barriers where the card was lost.)
+/// (Keeping the skip took the exact form from 32 programs of the title: an approximate form, each
+/// host wave a wave of its own, for 17, and the wave-wide branches for 15, which put group
+/// barriers where the card was lost.)
 #[test]
 fn a_skip_over_a_loop_does_not_take_the_exact_form_from_the_program() {
     for over in [Over::Skip, Over::EarlyOut] {
@@ -139,7 +140,7 @@ fn a_skip_over_a_loop_does_not_take_the_exact_form_from_the_program() {
         let ((on, on_form), (off, off_form)) = forms(&native, false);
         let exact = if over == Over::Skip { Form::WithoutSkips } else { Form::WithoutEarlyOuts };
         assert_eq!(off_form, exact, "{over:?}: the skip left out");
-        assert_eq!(on_form, Form::LoopSkipsLeftOut, "{over:?}: the skip kept");
+        assert_eq!(on_form, exact, "{over:?}: the switch on");
         assert!(on_form.exact());
         assert_eq!(on.dxil, off.dxil, "{over:?}: the same program as without the switch");
     }

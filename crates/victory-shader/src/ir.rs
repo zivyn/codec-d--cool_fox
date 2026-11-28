@@ -732,12 +732,14 @@ pub(crate) fn thread_edges(
 /// An early-out over a loop is kept with `VICTORY_KEEP_LOOP_SKIPS` ([`keep_loop_skips`]):
 /// a wave with no lane left does not walk the loop, which may not end for it.
 /// `None` if the program has no such branch.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     drop_early_outs(p).0
 }
 
 /// [`without_early_outs`], and the blocks whose early-out was kept only because a loop
 /// follows it (`VICTORY_KEEP_LOOP_SKIPS`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn drop_early_outs(p: &Program) -> (Option<Program>, Vec<usize>) {
     drop_early_outs_as(p, keep_loop_skips())
 }
@@ -811,6 +813,7 @@ fn loop_after(p: &Program, b: usize, first: usize) -> bool {
 /// the join may have other ways in (an inner branch that ends together with an outer one).
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     drop_skips(p, deep).0
 }
@@ -819,6 +822,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
 /// in the region it leaves out (`VICTORY_KEEP_LOOP_SKIPS`): the program is not changed there,
 /// and the branch stays a branch on the lanes of the host wave. A form that has to run the code
 /// after it in every lane takes those branches wave-wide ([`crate::emit`]'s `kept_skips_wide`).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn drop_skips(p: &Program, deep: bool) -> (Option<Program>, Vec<usize>) {
     drop_skips_as(p, deep, keep_loop_skips())
 }

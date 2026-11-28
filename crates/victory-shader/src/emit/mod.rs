@@ -825,8 +825,12 @@ fn emit_forms_in(
             Some((p, st, io, res))
         };
         // (and the branches each kept over a loop, `VICTORY_KEEP_LOOP_SKIPS`)
-        let (early_outs, early_kept) = ir::drop_early_outs(p);
-        let (skips, skips_kept) = ir::drop_skips(p, false);
+        // (by default the forms are those without the switch: the skips over loops are kept only
+        // for the wave-wide form of them, `VICTORY_KEPT_SKIPS_WIDE=1`; a program that has to be
+        // retried was never in danger of the loop's iteration limit by it)
+        let keep = ir::keep_loop_skips() && form::kept_skips_wide();
+        let (early_outs, early_kept) = ir::drop_early_outs_as(p, keep);
+        let (skips, skips_kept) = ir::drop_skips_as(p, false, keep);
         let (early_dropped, skips_dropped) = (early_outs.is_some(), skips.is_some());
         let forms = [
             ("without early-outs", form("without early-outs", early_outs)),
@@ -904,7 +908,7 @@ fn emit_forms_in(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let (deep_p, deep_kept) = if deep_on { ir::drop_skips(p, true) } else { (None, Vec::new()) };
+                let (deep_p, deep_kept) = if deep_on { ir::drop_skips_as(p, true, keep) } else { (None, Vec::new()) };
                 let deep_dropped = deep_p.is_some();
                 let deep = if deep_on { form("without skips, scalars followed", deep_p) } else { None };
                 if let Some((p, st, io, res)) = &deep {
@@ -921,7 +925,7 @@ fn emit_forms_in(
                 // group barriers per branch, outside the loops. Before any approximate form.
                 // (Only with `VICTORY_KEPT_SKIPS_WIDE=1`: by default the forms with the loop skips left
                 // out, which have no group barrier at a branch, come first, below.)
-                if form::kept_skips_wide() && wide_option.as_ref().is_none_or(|v| v != "0") {
+                if wide_option.as_ref().is_none_or(|v| v != "0") {
                     // (the program itself where nothing was left out: only the kept branches differ)
                     let bases = [
                         (forms[0].1.as_ref().map(|f| &f.0), early_dropped, &early_kept),

@@ -395,7 +395,7 @@ pub fn init(asked: &Asked) -> Available {
             Ok(available) => available,
             Err(why) => {
                 if asked.dlss_auto && asked.dlss {
-                    note(format!("DLSS Super Resolution is off: Streamline did not start ({why}); the title's own upscaler runs"));
+                    set_note(format!("DLSS Super Resolution is off: Streamline did not start ({why}); the title's own upscaler runs"));
                 } else {
                     tracing::warn!(
                         folder = %asked.dir.display(),
@@ -409,13 +409,13 @@ pub fn init(asked: &Asked) -> Available {
     };
     if asked.dlss_auto && asked.dlss {
         if available.dlss {
-            note(format!(
+            set_note(format!(
                 "DLSS Super Resolution is on by default (NVIDIA adapter, NVIDIA's files in {}); VICTORY_DLSS=0 turns it off",
                 asked.dir.display()
             ));
         } else if NOTE.get().is_none() {
             let why = NOT_SUPPORTED.get().map_or("Streamline gave no reason", String::as_str);
-            note(format!("DLSS Super Resolution is off: this GPU does not support it ({why}); the title's own upscaler runs"));
+            set_note(format!("DLSS Super Resolution is off: this GPU does not support it ({why}); the title's own upscaler runs"));
         }
     }
     let no_dlss = if available.dlss {
@@ -454,7 +454,7 @@ pub fn init(asked: &Asked) -> Available {
 
 /// What [`init`] does with `VICTORY_DLSS` unset: [`choose::choose`] from what
 /// is found out here, and the copy of `asked` with `dlss` set if it is tried.
-/// The reason it is not, if the user should read one, goes to [`note`].
+/// The reason it is not, if the user should read one, goes to [`set_note`].
 fn resolve_default(asked: &Asked) -> Asked {
     let mut a = asked.clone();
     if !a.dlss_auto {
@@ -472,7 +472,7 @@ fn resolve_default(asked: &Asked) -> Asked {
         choose::Choice::Try | choose::Choice::Forced => a.dlss = true,
         choose::Choice::Off(reason) => {
             if let Some(line) = choose::off_line(reason, &a.dir, &missing) {
-                note(line);
+                set_note(line);
             }
         }
     }
@@ -484,7 +484,7 @@ static NOTE: OnceLock<String> = OnceLock::new();
 /// Why Streamline said DLSS is not supported on the default's try.
 static NOT_SUPPORTED: OnceLock<String> = OnceLock::new();
 
-fn note(line: String) {
+fn set_note(line: String) {
     let _ = NOTE.set(line);
 }
 

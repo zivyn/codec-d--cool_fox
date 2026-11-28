@@ -456,6 +456,14 @@ fn rays_find_structures(
     asked && (has_run() || runs_now())
 }
 
+/// Whether the builder cannot run in this process (`VICTORY_BVH_BUILDER` is
+/// not set to 1): every dispatch of its pipelines is dropped.
+#[cfg(windows)]
+pub(crate) fn builder_disabled() -> bool {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| !std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]

@@ -17,6 +17,10 @@ pub struct Config {
     pub game_dir: Option<PathBuf>,
     /// Root for all derived data. Always outside the repository.
     pub cache_dir: PathBuf,
+    /// The cache folder was named (`VICTORY_CACHE_DIR` or the config file),
+    /// not the default under `%LOCALAPPDATA%`: other files that belong on the
+    /// cache's drive (NVIDIA's DLSS files) are put beside it only then.
+    pub cache_dir_named: bool,
     /// What titles write and must keep (persistent local storage). Never
     /// inside the cache, which may be deleted at any time.
     pub data_dir: PathBuf,
@@ -85,15 +89,16 @@ impl Config {
                 .collect(),
             _ => file.test_titles,
         };
-        let cache_dir = env_path("VICTORY_CACHE_DIR")
-            .or(file.cache_dir)
-            .map_or_else(|| default_dir("cache"), Ok)?;
+        let named_cache = env_path("VICTORY_CACHE_DIR").or(file.cache_dir);
+        let cache_dir_named = named_cache.is_some();
+        let cache_dir = named_cache.map_or_else(|| default_dir("cache"), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
             .or(file.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
         Ok(Config {
             game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
             cache_dir,
+            cache_dir_named,
             data_dir,
             test_titles,
             source,
@@ -205,6 +210,20 @@ mod tests {
             explicit_config_path(set),
             Some(PathBuf::from("custom.toml"))
         );
+    }
+
+    #[test]
+    fn a_named_cache_folder_is_marked_and_the_default_is_not() {
+        let named = |k: &str| (k == "VICTORY_CACHE_DIR").then(|| OsString::from("elsewhere"));
+        let cfg = Config::resolve(FilePaths::default(), None, named).unwrap();
+        assert!(cfg.cache_dir_named);
+        let file = FilePaths {
+            cache_dir: Some("in-file".into()),
+            ..Default::default()
+        };
+        assert!(Config::resolve(file, None, |_| None).unwrap().cache_dir_named);
+        let cfg = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
+        assert!(!cfg.cache_dir_named);
     }
 
     #[test]

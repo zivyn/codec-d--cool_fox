@@ -1,8 +1,12 @@
 //! NVIDIA DLSS Super Resolution and DLSS Frame Generation through NVIDIA
-//! Streamline, loaded at run time from a folder of the user's; both off by
-//! default.
+//! Streamline, loaded at run time from a folder of the user's. Super
+//! Resolution is on by default where the Series S profile runs on an NVIDIA
+//! adapter with NVIDIA's files in place and Streamline reports DLSS as
+//! supported ([`choose`]); frame generation is off unless asked.
 //!
-//! - `VICTORY_DLSS=1`: the title's FidelityFX upscaling (its `ffxDispatch`,
+//! - `VICTORY_DLSS`: `0` off, `1` forced on (what is missing is a warning),
+//!   unset automatic (what is missing is one line, and the title's own
+//!   upscaler runs). With it on, the title's FidelityFX upscaling (its `ffxDispatch`,
 //!   served by `victory_hle::modules::fidelityfx`) is done by DLSS instead,
 //!   from the same colour, depth, motion vectors, exposure and reactive mask
 //!   into the same output, at the same place of the title's command list.
@@ -17,7 +21,9 @@
 //!   the latency markers Frame Generation needs (Reflex on). Needs the line
 //!   of submissions (`VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1`).
 //! - `VICTORY_STREAMLINE_DIR`: the folder of `sl.interposer.dll`, its plugins
-//!   and NGX's DLLs (default [`DEFAULT_DIR`]).
+//!   and NGX's DLLs. Without it, `VICTORY_HOME\nvidia-sdk\Streamline\bin\x64`,
+//!   else `victory-home` beside the cache folder, else beside the program
+//!   ([`choose::candidates`]): never under `%LOCALAPPDATA%`.
 //!
 //! Anything missing (the folder, a signature, a feature on this GPU, the
 //! device hand-over) leaves the title's own upscaling and our plain present
@@ -32,6 +38,7 @@
 
 pub(crate) mod abi;
 mod budget;
+pub mod choose;
 pub mod plan;
 
 pub use plan::Mode;
@@ -47,8 +54,6 @@ use windows::core::Interface;
 
 use crate::object::Object;
 
-/// Where `sl.interposer.dll` is looked for without `VICTORY_STREAMLINE_DIR`.
-pub const DEFAULT_DIR: &str = r"C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64";
 const INTERPOSER: &str = "sl.interposer.dll";
 /// The project id NGX is given (engine "custom", no NVIDIA application id).
 const PROJECT_ID: &CStr = c"6f0d7b2e-3a41-4c1e-9b57-2d8e4f1a9c30";
@@ -60,7 +65,10 @@ const VIEWPORT_FG: u32 = 0;
 /// What the user asked for, read from the environment once.
 #[derive(Clone, Debug)]
 pub struct Asked {
+    /// DLSS Super Resolution is asked for (`VICTORY_DLSS=1`).
     pub dlss: bool,
+    /// `VICTORY_DLSS` is unset: [`init`] decides ([`choose::choose`]).
+    pub dlss_auto: bool,
     pub framegen: bool,
     pub mode: Mode,
     pub preset: u32,
@@ -99,16 +107,25 @@ pub struct Asked {
 impl Asked {
     /// The switches; an unknown mode or preset name is an error.
     pub fn from_env() -> Result<Self, String> {
+        let cache = std::env::var_os("VICTORY_CACHE_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
+        Self::from_env_with(cache.as_deref())
+    }
+
+    /// [`from_env`](Self::from_env), where `cache_dir` is the cache folder
+    /// the user named (the environment's or the config file's), if they did.
+    pub fn from_env_with(cache_dir: Option<&Path>) -> Result<Self, String> {
         let var = |name: &str| std::env::var(name).ok();
         let on = |name: &str| var(name).is_some_and(|v| v.trim() == "1");
+        let path = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
         let framegen = on("VICTORY_FRAMEGEN");
         let fsr_framegen = fsr::asked_from_env();
+        let switch = choose::parse_switch(var("VICTORY_DLSS").as_deref())?;
         let mode = match var("VICTORY_DLSS_MODE") {
             Some(name) => Mode::from_name(&name).ok_or_else(|| {
                 format!("VICTORY_DLSS_MODE={name}: not one of dlaa, quality, balanced, performance, ultraperformance")
             })?,
             // Frame generation alone keeps the scene at the output's size.
-            None if (framegen || fsr_framegen) && !on("VICTORY_DLSS") => Mode::Dlaa,
+            None if (framegen || fsr_framegen) && switch != choose::Switch::On => Mode::Dlaa,
             None => Mode::Quality,
         };
         let preset = match var("VICTORY_DLSS_PRESET") {
@@ -116,12 +133,21 @@ impl Asked {
                 .ok_or_else(|| format!("VICTORY_DLSS_PRESET={name}: not one of default, e, f, j, k, l, m"))?,
             None => 0,
         };
+        let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+        let (streamline_dir, home) = (path("VICTORY_STREAMLINE_DIR"), path("VICTORY_HOME"));
+        let places = choose::candidates(&choose::Locations {
+            streamline_dir: streamline_dir.as_deref(),
+            home: home.as_deref(),
+            cache_dir,
+            exe_dir: exe_dir.as_deref(),
+        });
         Ok(Asked {
-            dlss: on("VICTORY_DLSS"),
+            dlss: switch == choose::Switch::On,
+            dlss_auto: switch == choose::Switch::Auto,
             framegen,
             mode,
             preset,
-            dir: var("VICTORY_STREAMLINE_DIR").map_or_else(|| PathBuf::from(DEFAULT_DIR), PathBuf::from),
+            dir: choose::pick(&places, |d| d.join(INTERPOSER).is_file()),
             jitter: plan::pair(var("VICTORY_DLSS_JITTER").as_deref()),
             mvec: plan::pair(var("VICTORY_DLSS_MV").as_deref()),
             reactive: var("VICTORY_DLSS_REACTIVE").is_none_or(|v| v.trim() != "0"),
@@ -375,6 +401,8 @@ static CHECKING: AtomicBool = AtomicBool::new(false);
 /// title's imports are bound. Fails soft: what is not there is logged and
 /// left off.
 pub fn init(asked: &Asked) -> Available {
+    let resolved = resolve_default(asked);
+    let asked = &resolved;
     let mut files_missing = false;
     let available = if !asked.any() {
         Available::default()
@@ -382,15 +410,30 @@ pub fn init(asked: &Asked) -> Available {
         match load_and_init(asked, true) {
             Ok(available) => available,
             Err(why) => {
-                tracing::warn!(
-                    folder = %asked.dir.display(),
-                    "Streamline: {why}; DLSS and frame generation stay off, the title's own upscaling and our present run"
-                );
+                if asked.dlss_auto && asked.dlss {
+                    set_note(format!("DLSS Super Resolution is off: Streamline did not start ({why}); the title's own upscaler runs"));
+                } else {
+                    tracing::warn!(
+                        folder = %asked.dir.display(),
+                        "Streamline: {why}; DLSS and frame generation stay off, the title's own upscaling and our present run"
+                    );
+                }
                 files_missing = true;
                 Available::default()
             }
         }
     };
+    if asked.dlss_auto && asked.dlss {
+        if available.dlss {
+            set_note(format!(
+                "DLSS Super Resolution is on by default (NVIDIA adapter, NVIDIA's files in {}); VICTORY_DLSS=0 turns it off",
+                asked.dir.display()
+            ));
+        } else if NOTE.get().is_none() {
+            let why = NOT_SUPPORTED.get().map_or("Streamline gave no reason", String::as_str);
+            set_note(format!("DLSS Super Resolution is off: this GPU does not support it ({why}); the title's own upscaler runs"));
+        }
+    }
     let no_dlss = if available.dlss {
         None
     } else if !asked.dlss {
@@ -423,6 +466,49 @@ pub fn init(asked: &Asked) -> Available {
         fsr_needs_dlss,
     });
     Available { fsr_framegen, ..available }
+}
+
+/// What [`init`] does with `VICTORY_DLSS` unset: [`choose::choose`] from what
+/// is found out here, and the copy of `asked` with `dlss` set if it is tried.
+/// The reason it is not, if the user should read one, goes to [`set_note`].
+fn resolve_default(asked: &Asked) -> Asked {
+    let mut a = asked.clone();
+    if !a.dlss_auto {
+        return a;
+    }
+    let missing = choose::missing(|f| a.dir.join(f).is_file());
+    let facts = choose::Facts {
+        switch: choose::Switch::Auto,
+        framegen_asked: a.framegen || a.fsr_framegen,
+        series_s: a.series_s,
+        vendor: default_adapter_full().map(|d| d.2),
+        files_present: missing.is_empty(),
+    };
+    match choose::choose(&facts) {
+        choose::Choice::Try | choose::Choice::Forced => a.dlss = true,
+        choose::Choice::Off(reason) => {
+            if let Some(line) = choose::off_line(reason, &a.dir, &missing) {
+                set_note(line);
+            }
+        }
+    }
+    a
+}
+
+/// The one line about the default's outcome ([`upscaling_note`]).
+static NOTE: OnceLock<String> = OnceLock::new();
+/// Why Streamline said DLSS is not supported on the default's try.
+static NOT_SUPPORTED: OnceLock<String> = OnceLock::new();
+
+fn set_note(line: String) {
+    let _ = NOTE.set(line);
+}
+
+/// The line that says whether DLSS Super Resolution was turned on by default
+/// (and why not, if it was not), for the start's output; `None` if
+/// `VICTORY_DLSS` was set, or nothing was to be said.
+pub fn upscaling_note() -> Option<&'static str> {
+    NOTE.get().map(String::as_str)
 }
 
 /// What the start found out about frame generation on this card ([`notice`]).
@@ -530,7 +616,10 @@ fn notice_of(f: &Facts, dlss_live: bool, fsr_live: bool) -> Vec<String> {
 fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String> {
     let path = std::path::absolute(asked.dir.join(INTERPOSER)).map_err(|e| e.to_string())?;
     if !path.is_file() {
-        return Err(format!("no {INTERPOSER} in that folder (VICTORY_STREAMLINE_DIR)"));
+        return Err(format!(
+            "no {INTERPOSER} in {} (the folder is VICTORY_STREAMLINE_DIR, else VICTORY_HOME's nvidia-sdk, else beside the cache or the program)",
+            asked.dir.display()
+        ));
     }
     verify_signature(&path)?;
     let sl = load(&path)?;
@@ -596,10 +685,12 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
         let code = unsafe { (sl.is_feature_supported)(feature, &info) };
         if code == 0 { Ok(()) } else { Err(format!("{} ({code})", abi::result_name(code))) }
     };
-    let dlss = asked.dlss && report("DLSS Super Resolution", abi::FEATURE_DLSS, supported(abi::FEATURE_DLSS), sl);
+    // By default (VICTORY_DLSS unset) a card without DLSS is not a problem: info, not a warning.
+    let quiet = asked.dlss_auto;
+    let dlss = asked.dlss && report("DLSS Super Resolution", abi::FEATURE_DLSS, supported(abi::FEATURE_DLSS), sl, quiet);
     let framegen = framegen_asked
-        && report("DLSS Frame Generation", abi::FEATURE_DLSS_G, supported(abi::FEATURE_DLSS_G), sl)
-        && report("Reflex", abi::FEATURE_REFLEX, supported(abi::FEATURE_REFLEX), sl);
+        && report("DLSS Frame Generation", abi::FEATURE_DLSS_G, supported(abi::FEATURE_DLSS_G), sl, false)
+        && report("Reflex", abi::FEATURE_REFLEX, supported(abi::FEATURE_REFLEX), sl, false);
     tracing::info!(
         library = %path.display(),
         sdk = "2.14.16",
@@ -616,7 +707,7 @@ fn load_and_init(asked: &Asked, require_line: bool) -> Result<Available, String>
 }
 
 /// Logs whether a feature is supported, with its requirements; whether it is.
-fn report(name: &str, feature: u32, supported: Result<(), String>, sl: &Sl) -> bool {
+fn report(name: &str, feature: u32, supported: Result<(), String>, sl: &Sl, quiet: bool) -> bool {
     let mut requirements: abi::FeatureRequirements = unsafe_zeroed_requirements();
     // SAFETY: a structure to fill.
     let asked = unsafe { (sl.get_feature_requirements)(feature, &mut requirements) };
@@ -637,7 +728,12 @@ fn report(name: &str, feature: u32, supported: Result<(), String>, sl: &Sl) -> b
             true
         }
         Err(why) => {
-            tracing::warn!(requirements = needs.as_deref().unwrap_or("?"), "Streamline: {name} is not supported here: {why}");
+            if quiet {
+                tracing::info!(requirements = needs.as_deref().unwrap_or("?"), "Streamline: {name} is not supported here: {why}");
+                let _ = NOT_SUPPORTED.set(why);
+            } else {
+                tracing::warn!(requirements = needs.as_deref().unwrap_or("?"), "Streamline: {name} is not supported here: {why}");
+            }
             false
         }
     }
@@ -710,13 +806,18 @@ pub fn dlss_framegen_card(name: &str) -> bool {
 /// The card the host device is made on (the first adapter, where a device
 /// made with no adapter named is), its name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
+    default_adapter_full().map(|(name, luid, _)| (name, luid))
+}
+
+/// [`default_adapter`] with the adapter's PCI vendor id too.
+fn default_adapter_full() -> Option<(String, windows::Win32::Foundation::LUID, u32)> {
     // SAFETY: plain DXGI queries.
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
         let adapter = factory.EnumAdapters1(0).ok()?;
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-        Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))
+        Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid, desc.VendorId))
     }
 }
 
@@ -2323,6 +2424,7 @@ fn check_run(output: [u32; 2], device: bool, present: bool) -> Vec<String> {
         Err(why) => return vec![why],
     };
     asked.dlss = true;
+    asked.dlss_auto = false;
     // (`VICTORY_STREAMLINE_PRESENT=1` is for DLSS without frame generation.)
     asked.framegen = !asked.present_hook;
     let available = match load_and_init(&asked, false) {

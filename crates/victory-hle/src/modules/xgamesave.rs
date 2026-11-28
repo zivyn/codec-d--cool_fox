@@ -1924,11 +1924,11 @@ mod tests {
     #[test]
     fn the_blocking_calls_are_in_the_table() {
         let at = |offset| method::<usize>(&OBJECT, offset);
-        assert_eq!(at(0x18), initialize as usize);
-        assert_eq!(at(0x38), quota as usize);
-        assert_eq!(at(0x50), delete_now as usize);
-        assert_eq!(at(0xd8), submit as usize);
-        assert_eq!(at(0xe0), submit_async as usize);
+        assert_eq!(at(0x18), initialize as *const () as usize);
+        assert_eq!(at(0x38), quota as *const () as usize);
+        assert_eq!(at(0x50), delete_now as *const () as usize);
+        assert_eq!(at(0xd8), submit as *const () as usize);
+        assert_eq!(at(0xe0), submit_async as *const () as usize);
     }
 
     /// With no storage folder there is no provider (and nothing is written

@@ -32,6 +32,8 @@ pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod spinsample;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]
 mod threads;
@@ -56,6 +58,10 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile_on_schedule;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use spinsample::spin_sample_on_schedule;
+#[cfg(windows)]
+pub use console_insn::wait_nice_from;
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]

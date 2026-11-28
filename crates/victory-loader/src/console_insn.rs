@@ -79,8 +79,63 @@ fn wait_patch(what: ConsoleOnly) -> Option<[u8; 3]> {
 /// set to 1 ms): a wait that lasts costs a few hundred microseconds of processor time and not the whole wait, at the
 /// price of up to a millisecond between the write it waits for and its noticing. `monitorx` stays replaced by a no-op.
 fn nice_waits() -> bool {
+    // Flipped by the A/B (`VICTORY_AB` names it): the phase decides, each pass, and until the host has said how (the
+    // title's first instructions) it is off.
+    if nice_flips() {
+        return NICE_LIVE.get().is_some_and(|read| read());
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_NICE").is_some_and(|v| v == "1"))
+}
+
+/// Whether the A/B flips `VICTORY_WAIT_NICE` while the title runs (`VICTORY_AB=10,VICTORY_WAIT_NICE,...`): then no
+/// `monitorx` or `mwaitx` is replaced (a replaced one stays so: the spin cannot be given back), each pass of every
+/// wait loop faults, and the arm decides what the pass does: `pause` (off: the loop spins as it does replaced, with a
+/// trip into Windows added to each pass) or [`eased`] (on). So the arms differ by the ease, and the one called off is a
+/// little dearer than the title as it runs without the A/B (its kernel time; its user time is the same spin).
+fn nice_flips() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_AB").is_ok_and(|v| names_wait_nice(&v)))
+}
+
+/// Whether a `VICTORY_AB` value names `VICTORY_WAIT_NICE` as a switch (and not a longer name that starts with it).
+fn names_wait_nice(ab: &str) -> bool {
+    ab.split([',', ';', ' ']).any(|part| part.split('=').next().is_some_and(|name| name.trim() == "VICTORY_WAIT_NICE"))
+}
+
+/// What the A/B says of `VICTORY_WAIT_NICE` now (set by the host, which has the A/B: this crate has not).
+static NICE_LIVE: std::sync::OnceLock<fn() -> bool> = std::sync::OnceLock::new();
+
+/// The host tells this crate where the A/B's phase for `VICTORY_WAIT_NICE` is read ([`nice_flips`]).
+pub fn wait_nice_from(read: fn() -> bool) {
+    let _ = NICE_LIVE.set(read);
+}
+
+/// The places of the title's code where a `monitorx` or `mwaitx` has faulted: the sampler of the title's wait loops
+/// (`crate::spinsample`) asks whether a thread is at one. Filled at the first fault of each, taken as is.
+static WAIT_SITES: [std::sync::atomic::AtomicUsize; 512] = [const { std::sync::atomic::AtomicUsize::new(0) }; 512];
+
+fn note_wait_site(at: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut i = (at ^ at >> 9) % WAIT_SITES.len();
+    for _ in 0..16 {
+        let there = WAIT_SITES[i].load(Relaxed);
+        if there == at {
+            return;
+        }
+        if there == 0 && WAIT_SITES[i].compare_exchange(0, at, Relaxed, Relaxed).map_or_else(|now| now == at, |_| true) {
+            return;
+        }
+        i = (i + 1) % WAIT_SITES.len();
+    }
+}
+
+/// The wait instruction `rip` is in the loop of, if one: a loop that spins on `mwaitx` (`pause` in its place) is some
+/// 40 bytes around it.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn wait_site_near(rip: usize) -> Option<usize> {
+    use std::sync::atomic::Ordering::Relaxed;
+    WAIT_SITES.iter().map(|s| s.load(Relaxed)).find(|&at| at != 0 && rip + 64 >= at && rip <= at + 16)
 }
 
 /// Passes of a wait loop that only `pause`, then that yield, before each sleeps ([`nice_waits`]).
@@ -494,10 +549,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
             // `VICTORY_WAIT_NICE`: a `mwaitx` is not replaced, so that each pass is answered by `eased`.
             let eases = what == ConsoleOnly::Mwaitx && nice_waits();
+            note_wait_site(rip);
             // Without a prefix, so 3 bytes: replaced, the next pass does not fault.
             if len == 3
                 && patches_waits()
                 && !eases
+                && !nice_flips()
                 && let Some(new) = wait_patch(what)
                 // SAFETY: the title's code, where the instruction just faulted; both
                 // replacements are waits that wait for nothing, as the emulation is.
@@ -674,6 +731,31 @@ mod tests {
         // A spinning loop makes millions of passes in 300 ms; this one slept from its 49th on, a pass a millisecond or two.
         assert!(passes < 2_000, "{passes} passes");
         assert!(passes > SPIN_PASSES + YIELD_PASSES, "{passes} passes");
+    }
+
+    /// The A/B's list names the switch whole: not a longer name that starts with it, and with or without a value.
+    #[test]
+    fn the_ab_list_is_read_for_the_wait_switch_by_whole_names() {
+        assert!(names_wait_nice("10,VICTORY_WAIT_NICE,VICTORY_ONE_PASS"));
+        assert!(names_wait_nice("10, VICTORY_ONE_PASS, VICTORY_WAIT_NICE=1"));
+        assert!(names_wait_nice("VICTORY_WAIT_NICE"));
+        assert!(!names_wait_nice("10,VICTORY_WAIT_NICE_MORE,VICTORY_ONE_PASS"));
+        assert!(!names_wait_nice("10,VICTORY_ONE_PASS"));
+        assert!(!names_wait_nice(""));
+    }
+
+    /// A place is remembered once, however often it faults, and a loop around it is found from any of its bytes.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_place_that_faulted_is_found_from_the_loop_around_it() {
+        note_wait_site(0x7ff6_1234_5000);
+        note_wait_site(0x7ff6_1234_5000);
+        note_wait_site(0x7ff6_1234_9000);
+        assert_eq!(WAIT_SITES.iter().filter(|s| s.load(Relaxed) == 0x7ff6_1234_5000).count(), 1);
+        assert_eq!(wait_site_near(0x7ff6_1234_5000 - 30), Some(0x7ff6_1234_5000));
+        assert_eq!(wait_site_near(0x7ff6_1234_5000 + 10), Some(0x7ff6_1234_5000));
+        assert_eq!(wait_site_near(0x7ff6_1234_9000), Some(0x7ff6_1234_9000));
+        assert_eq!(wait_site_near(0x7ff6_1234_7000), None);
     }
 
     #[test]

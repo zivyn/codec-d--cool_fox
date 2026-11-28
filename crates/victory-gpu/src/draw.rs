@@ -468,6 +468,9 @@ pub(crate) struct State {
     /// `(what, value)`, 0 for nothing known, and for its vertex and index buffers.
     root_shadow: [Vec<(u64, u64)>; 2],
     ia_shadow: IaShadow,
+    /// What [`state_filter`] said when this recording first asked: a recording keeps its mode to its end (the shadows
+    /// above say what the host list holds only if every call since the start was told to them).
+    filter: Option<u8>,
     /// Calls the filter looked at, issued and left out ([`CALLS`]), until the state is dropped.
     calls: [u64; 12],
     /// Tables made afresh in this list: (table, slot count, contents) → first
@@ -511,12 +514,16 @@ pub(crate) fn state_filter() -> u8 {
             return forced;
         }
     }
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_STATE_FILTER").as_deref() {
-        Ok("1") => 1,
-        Ok("2") => 2,
+    crate::ab::live_value!("VICTORY_STATE_FILTER", u8, filter_of)
+}
+
+/// What the text of `VICTORY_STATE_FILTER` (none when it is not set) comes to.
+fn filter_of(text: Option<&str>) -> u8 {
+    match text {
+        Some("1") => 1,
+        Some("2") => 2,
         _ => 0,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -571,11 +578,17 @@ impl Drop for State {
 }
 
 impl State {
+    /// The mode of the filter this recording runs by: [`state_filter`] as it was when it was first asked (the A/B may
+    /// flip it between recordings, never inside one).
+    fn filter_mode(&mut self) -> u8 {
+        *self.filter.get_or_insert_with(state_filter)
+    }
+
     /// Whether the host list is to be given `value` as `what` for root parameter `param`, because it has something else (or
     /// the filter is off): `what` is 1 for constants (`value` a hash of them), 2 a descriptor's address, 3 a table's
     /// handle; `kind` says which count it adds to.
     fn root_changed(&mut self, compute: bool, param: u32, what: u64, value: u64) -> bool {
-        let mode = state_filter();
+        let mode = self.filter_mode();
         if mode == 0 {
             return true;
         }
@@ -596,7 +609,7 @@ impl State {
 
     /// Whether the host list is to be given these vertex buffers (it has others, or the filter is off).
     fn vertex_changed(&mut self, views: &[D3D12_VERTEX_BUFFER_VIEW]) -> bool {
-        let mode = state_filter();
+        let mode = self.filter_mode();
         if mode == 0 {
             return true;
         }
@@ -613,7 +626,7 @@ impl State {
 
     /// As [`State::vertex_changed`], for the index buffer.
     fn index_changed(&mut self, view: &D3D12_INDEX_BUFFER_VIEW) -> bool {
-        let mode = state_filter();
+        let mode = self.filter_mode();
         if mode == 0 {
             return true;
         }
@@ -630,7 +643,7 @@ impl State {
     fn set_user_data(&mut self, l: &ID3D12GraphicsCommandList, compute: bool, param: u32, values: &[u32]) {
         let quiet = self.fold_note(compute, param, values);
         // (With the filter: a hash of the dwords and their number says whether the list has them.)
-        let set = !quiet && (state_filter() == 0 || self.root_changed(compute, param, 1, constants_hash(values)));
+        let set = !quiet && (self.filter_mode() == 0 || self.root_changed(compute, param, 1, constants_hash(values)));
         // SAFETY: an open list; `values` covers the parameter.
         if set {
             unsafe {
@@ -646,7 +659,7 @@ impl State {
     /// The host list was given `values` for root parameter `param` without [`State::root_changed`] having been asked
     /// (the user data of the call that ended a run, set after it): the filter's record is what the list holds.
     fn root_told(&mut self, compute: bool, param: u32, values: &[u32]) {
-        if state_filter() == 0 {
+        if self.filter_mode() == 0 {
             return;
         }
         let shadow = &mut self.root_shadow[usize::from(compute)];
@@ -1947,6 +1960,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let _time = crate::opcost::time(crate::opcost::Op::Bind);
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -4244,6 +4258,7 @@ impl State {
         plan: &TablePlan,
         compute: bool,
     ) -> Few<(u8, u32), 16> {
+        let _time = crate::opcost::time(crate::opcost::Op::Tables);
         let mut fresh = [0u64; 4];
         let selected_slot = |mask: &[u64; 4], slot: u8| mask[usize::from(slot / 64)] & (1u64 << (slot % 64)) != 0;
         for group in &plan.groups {
@@ -4415,7 +4430,8 @@ impl State {
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays). (With the filter the descriptors the views give are copied
             // together at the end.)
-            crate::descriptor::host::copies_hold(state_filter() == 1);
+            let filtering = self.filter_mode() == 1;
+            crate::descriptor::host::copies_hold(filtering);
             for k in 0..n {
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
@@ -5380,6 +5396,7 @@ impl RecordHash {
 
 fn readable(list: &HostList, kind: ResourceType, view: &View, entry: Option<&UsedResource>) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    let _time = crate::opcost::time(crate::opcost::Op::Readable);
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -6006,6 +6023,32 @@ mod state_filter_tests {
         // A new host list (a cut) has none.
         state.ia_shadow = IaShadow::default();
         assert!(state.index_changed(&index));
+        TEST_STATE_FILTER.store(u8::MAX, Ordering::Relaxed);
+    }
+
+    /// The A/B flips the filter between recordings and never inside one: a recording that began with the filter on goes
+    /// on by it when the switch goes off (the shadows say what the list holds only if all of its calls were told to
+    /// them), and one that began with it off goes on without it when the switch goes on.
+    #[test]
+    fn a_recording_keeps_the_mode_it_began_with() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        TEST_STATE_FILTER.store(1, Ordering::Relaxed);
+        let mut with = State::default();
+        let mut without = State::default();
+        TEST_STATE_FILTER.store(0, Ordering::Relaxed);
+        // `without` first asks now, with the switch off; `with` asks below, with it on.
+        assert_eq!(without.filter_mode(), 0);
+        TEST_STATE_FILTER.store(1, Ordering::Relaxed);
+        assert_eq!(without.filter_mode(), 0, "it keeps it");
+        assert_eq!(with.filter_mode(), 1);
+        assert!(with.root_changed(false, 3, 1, 77));
+        TEST_STATE_FILTER.store(0, Ordering::Relaxed);
+        assert!(!with.root_changed(false, 3, 1, 77), "still filtered: it began so");
+        assert_eq!(State::default().filter_mode(), 0, "the next recording reads it anew");
+        assert_eq!(filter_of(None), 0);
+        assert_eq!(filter_of(Some("1")), 1);
+        assert_eq!(filter_of(Some("2")), 2);
+        assert_eq!(filter_of(Some("3")), 0);
         TEST_STATE_FILTER.store(u8::MAX, Ordering::Relaxed);
     }
 

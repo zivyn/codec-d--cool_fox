@@ -868,9 +868,9 @@ mod tests {
     #[test]
     fn a_switch_that_is_not_live_is_dropped_and_says_so() {
         // Read once, in the loader: never through the A/B (docs/ab-switches.md).
-        let a = parse("10,VICTORY_WAIT_NICE,VICTORY_ONE_PASS", false).ok().unwrap();
+        let a = parse("10,VICTORY_PATCH_WAITS,VICTORY_ONE_PASS", false).ok().unwrap();
         assert_eq!(names(&a), vec!["VICTORY_ONE_PASS"]);
-        assert!(a.notes[0].starts_with("VICTORY_WAIT_NICE:") && a.notes[0].contains("not a switch the A/B can flip"), "{}", a.notes[0]);
+        assert!(a.notes[0].starts_with("VICTORY_PATCH_WAITS:") && a.notes[0].contains("not a switch the A/B can flip"), "{}", a.notes[0]);
         assert!(a.notes[0].contains("live switches"), "{}", a.notes[0]);
     }
 

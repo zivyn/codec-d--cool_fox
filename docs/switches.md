@@ -46,7 +46,7 @@ How to read it:
 | `VICTORY_F16_NEAREST` (`=2`), `VICTORY_F32_FTZ`, `VICTORY_NAN_SAFE` | **`F16_NEAREST` 2 and `F32_FTZ` on since integ/validation-24 (2026-11-28; `=0` turns each off)**, `NAN_SAFE` off | The RTX tests found the compare and min/max instructions of NaN and infinity exact on the card (0 of 144 differ); the one difference is `v_cvt_f16_f32`, which the card truncates where the console rounds to nearest (24 of 144 cases, one step). `=1` fixes the convert, `=2` also the mixed and packed 16-bit ops. Made the default at integ/validation-24 on the evidence of the pilot's alternating runs: with both on (arm D) the picture was clean in 2 of 2 processes (12 of 12 shots out to +300 s: no red spot, no white-out, smooth walls with no banding, smooth hair) while 2 of 2 controls without them whited out; on the card level 2 takes the f16 rounding from 4 of 11 cases wrong to 0, and FTZ alone changes nothing measurable (so the f16 half is the likely cause, and the tested pair ships). `F32_FTZ` alone showed no difference in the one unguarded normalisation tested. |
 | `VICTORY_PIPELINE_AHEAD`, `VICTORY_PIPELINE_WIDE` | off | Cold start: 61 % of it is one frame of about 175 compute programs made one at a time. These two queue them ahead and add workers; estimated 21 -> 7-9 minutes, not measured yet. |
 | `VICTORY_RESOLVE_ASYNC`, `VICTORY_PIPELINE_NOW_FIRST` | off | Cold start (COLD2): the ~175 big programs of that frame are the ray-tracing resolves; with the first switch a dispatch of one is dropped while it is made in a lane of its own (all but a quarter of the workers), as the title's own async-compile model drops a draw; the second makes what the frame on screen asked for go before older requests. Not measured yet. `victory warm --skip-resolves` leaves the resolves to the title. |
-| experiments | off | `ONE_PASS`, `PAGE_REFRESH`, `PRECISE_*`, `JOIN_WAITS`, `INDIRECT_FOLD`, `FOLD_VIEWS` with `VIEW_INDEX`, `STAGE_A*`, `SEND_COPYQ`, `QUIET_COMPARE`, `ASYNC_COMPUTE` (`=2` is a second compute queue), `LANE_CORE`, `LANE_HIGH`, `LIST_NICE`, `WAIT_NICE`, `OPUS_PITCH`, `BVH_BUILDER` with `BVH_SIZES`, `R11G11B10_AS_F16`, `PRECOMPILED`: new or not yet measured (rule 14). |
+| experiments | off | `ONE_PASS`, `PAGE_REFRESH`, `PRECISE_*`, `JOIN_WAITS`, `INDIRECT_FOLD`, `FOLD_VIEWS` with `VIEW_INDEX`, `STAGE_A*`, `SEND_COPYQ`, `QUIET_COMPARE`, `ASYNC_COMPUTE` (`=2` is a second compute queue), `LANE_CORE`, `LANE_HIGH`, `LIST_NICE`, `WAIT_NICE` (live in the A/B since cpu3), `VIEW_AT_CACHE`, `KEEP_FAST`, `STATE_FILTER` (live since cpu3), `OPUS_PITCH`, `BVH_BUILDER` with `BVH_SIZES`, `R11G11B10_AS_F16`, `PRECOMPILED`: new or not yet measured (rule 14). |
 
 ## What the older documents and comments said wrong (corrected in this change)
 
@@ -240,6 +240,7 @@ switch is read.
 | `VICTORY_UNWATCHED_FRAMES` | 1 | yes | Refreshes copies of memory that is not write-watched every N frames; 1 is every frame. |
 | `VICTORY_UPLOAD_AHEAD` | on (built-in default 1; =0 turns off) | no | Reads, detiles and copies texture uploads ahead on threads of ours. |
 | `VICTORY_UPLOAD_HELD_ONLY` | off | yes | Upload copies only the texture levels the title holds. |
+| `VICTORY_VIEW_AT_CACHE` | off | yes | A thread answers the view a record names from a table of its own (live in the A/B). |
 | `VICTORY_VIEW_CACHE` | 0 (off) | yes | Keeps buffer views from one recording to the next; 2 also compares each with one made again. |
 | `VICTORY_WAIT_ORDER` | off | yes | Gives a flush's copy refreshes to the threads costliest first. |
 | `VICTORY_WIDE_SPIN` | 0 | yes | Microseconds a wide wait spins awake before sleeping; 0 does not spin. |
@@ -479,7 +480,7 @@ translation of shaders.
 | `VICTORY_JOIN_WAITS` | off | flag |  | live |  | Takes along a part behind a wait met in a way not seen before. |
 | `VICTORY_JOIN_WIDE_MB` | off | number |  | live |  | Joins parts whose upload fills read up to this many MiB; 0 refuses such parts. |
 | `VICTORY_KEEP_CHECK` | off | flag |  |  |  | Verifies what the snapshot keeping does not take and counts the misses. |
-| `VICTORY_KEEP_FAST` | off | flag |  |  |  | Looks at a slot's kept resource without its lock when it is the same again. |
+| `VICTORY_KEEP_FAST` | off | flag |  | live |  | Looks at a slot's kept resource without its lock when it is the same again. |
 | `VICTORY_KEEP_FREED` | on (=0 turns off) | flag |  |  |  | Keeps freed scratch chunks instead of giving them back. |
 | `VICTORY_KEEP_LOOP_SKIPS` | on (=0 turns off) | flag | yes |  |  | Keeps the early-outs and skips over loops in the translated shader. |
 | `VICTORY_KEEP_REMARK` | on (=0 turns off) | flag |  |  |  | Re-marks snapshot copies as current again after they are used; =0 turns that off. |
@@ -530,6 +531,7 @@ translation of shaders.
 | `VICTORY_LIST_NICE` | off | number |  | live |  | Runs list-translating threads this many priority levels below the guest's; 0 is normal. |
 | `VICTORY_LIST_POOL` | on (=0 turns off) | flag |  |  |  | Reuses command lists from a pool instead of making and dropping each. |
 | `VICTORY_LIST_SLOTS` | off | list |  |  | diag | Hash prefixes of pixel shaders whose draws get their slots listed in the frame listing. |
+| `VICTORY_LIST_OPS` | off | flag |  |  |  | Diagnostics: per frame, how often and how long each operation of the list translators ran (view_at, shadow lookup, hosted, keep, make_listed, make_twinned, readable, tables, bind). |
 | `VICTORY_LIST_VIEWS` | on (=0 turns off) | flag |  | live |  | Makes a view its tables hold once per list instead of once per table. |
 | `VICTORY_LIVE_FILE` | off | path |  |  | diag | (integ/validation-23, diag) File read once a second; its `skip=<hash>,...` lines add programs to the skipped list while the title runs. |
 | `VICTORY_LOCAL_EXIT` | off | flag | yes |  |  | Translates console wave64 loops as two host waves of 32 that leave together (=1 screen programs, =2 broader). |
@@ -693,6 +695,7 @@ translation of shaders.
 | `VICTORY_SPLIT_LISTS` | off | flag |  |  |  | Lets a split cut also fall inside lists, with at least VICTORY_SPLIT_MIN of them. |
 | `VICTORY_SPLIT_MIN` | 2 | number |  |  |  | Least number of lists the second part must have for VICTORY_SPLIT_LISTS to cut. |
 | `VICTORY_SPLIT_WAITS` | on (=0 turns off) | flag |  |  |  | Splits a queue submission's waits so parts go on while others wait, instead of holding whole submissions. |
+| `VICTORY_SPIN_SAMPLE` | off | number |  |  |  | Diagnostics: every this many ms (1-1000) looks at where the title's busy threads are and says each 5 s how much of their processor time is in wait loops (monitorx/mwaitx). |
 | `VICTORY_STACKS` | off | list |  |  |  | Prints every thread's stack at each listed time, in seconds from start. |
 | `VICTORY_STAGE_A` | off | flag |  | live |  | Offers the next submission's refreshes before the steps of the one being prepared. |
 | `VICTORY_STAGE_A_DEEP` | off | flag |  | live |  | (integ/validation-23) Also refreshes the copies of the entry after the next while the next is prepared. |
@@ -702,7 +705,7 @@ translation of shaders.
 | `VICTORY_STAGING_HOLD_MS` | 0 (off) | number |  | live |  | Milliseconds an empty texture-staging block is held before being let go. |
 | `VICTORY_STAGING_SPARE` | 8; lean 2 | number |  |  |  | Number of empty texture-staging blocks kept. |
 | `VICTORY_STALE_TEXTURES` | on (start-of-block rule; =0 off) | text |  |  |  | Rule for when a view the title writes makes older views of other memory stale. |
-| `VICTORY_STATE_FILTER` | off | number |  |  |  | Skips telling the host list state it already has (1); 2 tells it always but counts. |
+| `VICTORY_STATE_FILTER` | off | number |  | live |  | Skips telling the host list state it already has (1); 2 tells it always but counts. |
 | `VICTORY_STEPS_MERGE_READS` | off | flag |  | live |  | Records each list's reads in one go, whole or joined. |
 | `VICTORY_STEP_MERGE` | off | flag |  |  |  | Merges neighbouring copies with nothing between into one copy. |
 | `VICTORY_STORE_BESIDE` | off | flag |  | live |  | Writes title stores to a second place beside the title memory. |
@@ -766,6 +769,7 @@ translation of shaders.
 | `VICTORY_UPLOAD_HELD_ONLY` | off | flag |  | live |  | Upload copies only the texture levels the title holds. |
 | `VICTORY_UPLOAD_LOW` | on (=0 turns off) | flag |  |  |  | Upload buffers come from low addresses; =0 uses the process heap. |
 | `VICTORY_VIEW_BYTES` | on (=0 turns off) | flag |  |  |  | Fills in byte sizes of descriptor views; =0 leaves them null. |
+| `VICTORY_VIEW_AT_CACHE` | off | flag |  | live |  | A thread answers the view a record names from a table of its own, which it drops entries from as the title frees or reuses them, instead of through the lock of the table of views. |
 | `VICTORY_VIEW_CACHE` | 0 (off) | number |  | live |  | Keeps buffer views from one recording to the next; 2 also compares each with one made again. |
 | `VICTORY_VIEW_COPY` | on (=0 turns off) | flag |  |  |  | Makes view copies in a staging descriptor heap instead of in place. |
 | `VICTORY_VIEW_EXTENT` | on (=0 turns off) | flag |  |  |  | Copies up the whole extent a view shows rather than only the view's range. |
@@ -779,7 +783,7 @@ translation of shaders.
 | `VICTORY_VRAM_OVER_MB` | off (400 with `VICTORY_VRAM_HOLD`) | number |  |  |  | How far past the system's budget the card's whole use may stand, in MB, before the texture room says no (free room inside blocks and heaps does not count against it). |
 | `VICTORY_WAIT_ASK` | off | flag |  |  |  | Asks whether memory is committed before waiting on it. |
 | `VICTORY_WAIT_FORCE` | on (=0 turns off) | flag |  |  |  | Forces the held wait to finish across frames; =0 keeps it held. |
-| `VICTORY_WAIT_NICE` | off | flag |  |  |  | Replaces the title's busy-wait loops with eased waits. |
+| `VICTORY_WAIT_NICE` | off | flag |  | live |  | Replaces the title's busy-wait loops with eased waits. |
 | `VICTORY_WAIT_ORDER` | off | flag |  | live |  | Gives a flush's copy refreshes to the threads costliest first. |
 | `VICTORY_WAIT_RESIDENT` | on (=0 turns off) | flag |  |  |  | Waits for named heaps or blocks to be resident on the card. |
 | `VICTORY_WALLS_TRACE` | off | number |  |  |  | Logs read requests that fail (1) or all requests (2). |

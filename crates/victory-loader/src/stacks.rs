@@ -179,6 +179,23 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     (frames, (info.priority, info.base_priority, info.affinity))
 }
 
+/// Where the thread is (its instruction pointer), or `None` if it could not be stopped for a moment to see.
+pub(crate) fn rip_of(thread: HANDLE) -> Option<usize> {
+    // SAFETY: a thread of this process that is not this one.
+    if unsafe { SuspendThread(thread) } == u32::MAX {
+        return None;
+    }
+    // SAFETY: zeroed is a valid CONTEXT.
+    let mut context = Aligned(unsafe { std::mem::zeroed() });
+    context.0.ContextFlags = CONTEXT_FULL_AMD64;
+    // SAFETY: reads and resumes the thread suspended above; nothing in between allocates or takes a lock.
+    unsafe {
+        let got = GetThreadContext(thread, &mut context.0) != 0;
+        ResumeThread(thread);
+        got.then_some(context.0.Rip as usize)
+    }
+}
+
 pub(crate) fn start_of(thread: HANDLE) -> usize {
     let mut start = 0usize;
     // SAFETY: writes one pointer-sized start address.

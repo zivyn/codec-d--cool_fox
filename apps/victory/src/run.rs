@@ -392,6 +392,8 @@ fn arm_watchdog_hold(image: &victory_loader::LoadedImage) {
 fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) {
     victory_loader::dump_stacks_on_schedule();
     victory_loader::profile_on_schedule(victory_hle::frame_phase);
+    victory_loader::wait_nice_from(victory_hle::wait_nice_now);
+    victory_loader::spin_sample_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
     poke(image.base(), image.info().size_of_image as usize);

@@ -509,6 +509,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -685,6 +686,52 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+/// The three words of a view's record as two of the stream's: the memory they lie in is
+/// the record again, which is what the view is looked up by.
+fn view_words(words: [u32; 3]) -> [u64; 2] {
+    [u64::from(words[0]) | u64::from(words[1]) << 32, u64::from(words[2])]
+}
+/// `ClearUnorderedAccessViewUint` and `...Float` (`float`): the view's record as
+/// it is now (the slot may be written again), the resource, the four values
+/// and the rectangles.
+fn clear_uav(this: This, handle: u64, float: bool, values: *const [u32; 4], count: u32, rects: *const Rect) {
+    if handle == 0 || values.is_null() || !super::clear_uav_on() {
+        return;
+    }
+    // Not a view: nothing to clear (the call would be left out then as well).
+    let Some(words) = crate::descriptor::record_at(handle) else {
+        return;
+    };
+    let count = if rects.is_null() { 0 } else { count };
+    let view = view_words(words);
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count) << 1 | u64::from(float)],
+        &[bytes_of(view.as_ptr(), 2), bytes_of(values, 1), bytes_of(rects, count as usize)],
+    );
+}
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, super::view_handle(gpu, cpu), false, values, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, super::view_handle(gpu, cpu), true, values, count, rects);
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -801,7 +848,7 @@ static RUNS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 static BETWEEN: Mutex<Option<std::collections::HashMap<Vec<u8>, u64>>> = Mutex::new(None);
 
 /// The names of the plain ops and the others, by code.
-const NAMES: [&str; 47] = [
+const NAMES: [&str; 48] = [
     "topology", "stencil_ref", "depth_bounds", "compute_table", "graphics_table", "compute_constant",
     "graphics_constant", "compute_view", "graphics_view", "set_pipeline", "draw", "draw_indexed", "dispatch",
     "dispatch_x", "dispatch_mesh", "dispatch_mesh_x", "copy_buffer", "copy_resource", "copy_resource_x",
@@ -809,7 +856,7 @@ const NAMES: [&str; 47] = [
     "wait_value64", "sync", "begin_query", "end_query", "reset", "close", "upload", "barrier",
     "barrier_groups", "viewports", "scissors",
     "blend_factor", "heaps", "compute_constants", "graphics_constants", "index_buffer", "vertex_buffers",
-    "targets", "clear_rtv", "clear_dsv", "copy_texture",
+    "targets", "clear_rtv", "clear_dsv", "copy_texture", "clear_uav",
 ];
 
 /// The line of what the executions come to, per frame.
@@ -1179,6 +1226,18 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            CLEAR_UAV => {
+                // The view's record (two words), the values (two), the rectangles.
+                let rects = (w[0] >> 1) as usize;
+                super::clear_uav(
+                    list,
+                    w[1..].as_ptr() as u64,
+                    w[0] & 1 != 0,
+                    at_or(w, 3),
+                    rects as u32,
+                    at(w, 5, rects),
+                );
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -1218,7 +1277,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 52] = [
+const MINE: [(usize, *const ()); 54] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -1256,6 +1315,8 @@ const MINE: [(usize, *const ()); 52] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),
@@ -1301,10 +1362,33 @@ mod tests {
 
     const EXECUTE: u64 = Plain::EXECUTE_INDIRECT as u64;
 
+    /// The clears of unordered access views are written down, by both slots of the console's list.
+    #[test]
+    fn the_clears_of_unordered_access_views_are_written_down() {
+        for newer in [false, true] {
+            let table = table(newer);
+            assert_eq!(table[53], clear_uav_uint as *const ());
+            assert_eq!(table[54], clear_uav_float as *const ());
+        }
+        assert!(CLEAR_UAV > COPY_TEXTURE && CLEAR_UAV >= Plain::END as u64);
+    }
+
+    /// The record of a view, kept in two words of a stream, is read back as the same record from the
+    /// words' own memory (what the replay hands the lookup).
+    #[test]
+    fn a_views_record_in_the_stream_reads_back_as_the_record() {
+        let tag = u32::from_le_bytes(*b"vVIE");
+        let record = [tag, 0xdead_beef, 0x1234_5678];
+        let stream = view_words(record);
+        assert_eq!(crate::descriptor::record_at(stream.as_ptr() as u64), Some(record));
+        // Another record, another words.
+        assert_ne!(view_words([tag, 1, 2]), view_words([tag, 1, 3]));
+    }
+
     /// The names go by the codes.
     #[test]
     fn the_names_of_the_ops_are_by_their_codes() {
-        assert_eq!(NAMES.len(), COPY_TEXTURE as usize + 1);
+        assert_eq!(NAMES.len(), CLEAR_UAV as usize + 1);
         for (op, name) in [
             (Plain::EXECUTE_INDIRECT as u64, "execute_indirect"),
             (Plain::DRAW as u64, "draw"),
@@ -1313,6 +1397,7 @@ mod tests {
             (UPLOAD, "upload"),
             (BARRIER_GROUPS, "barrier_groups"),
             (COPY_TEXTURE, "copy_texture"),
+            (CLEAR_UAV, "clear_uav"),
         ] {
             assert_eq!(NAMES[op as usize], name);
         }

@@ -52,6 +52,12 @@ in that order of size:
   never brought back to title memory. Fixed by Geckomacabre's read-back as merged in
   fxceless/victory-fork f5c03f3b; on by default here (`VICTORY_TEXTURE_BACK=0`: off).
   With it the boat stays up through a whole run; without it sank in every one.
+- **The upscaler's clears of its own surfaces were not done.** The console's list has
+  `ClearUnorderedAccessViewUint` and `...Float` at 0x1a8 and 0x1b0; the title's upscaler library calls
+  the first, and every run logged "method not implemented" for that slot with nothing done. They are
+  now made on the host through a slot of the bound view heap and a CPU-only copy of the view (textures
+  and raw or typed buffers; structured buffers and views that are not unordered access are left out, as
+  the host refuses them). `VICTORY_CLEAR_UAV=0`: off. Not yet compared in the game.
 - **A device loss about every 16 minutes**: a page fault inside a texture made in the same
   tenth of a second. A slot showed it before its upload had run.
   `VICTORY_SHOW_AFTER=1`; none in the sessions since (likely fixed, not proven).

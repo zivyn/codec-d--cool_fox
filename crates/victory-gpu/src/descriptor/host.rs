@@ -4399,6 +4399,63 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Whether `view` can be cleared with `ClearUnorderedAccessViewUint` or
+/// `ClearUnorderedAccessViewFloat`: it must be an unordered access view and
+/// not a structured buffer (`StructureByteStride == 0`). A descriptor of
+/// another kind is invalid for a clear (the debug layer refuses it, WARP
+/// fails on it), and so is a structured buffer view.
+pub(crate) fn is_clearable_uav(view: &View) -> bool {
+    const BUFFER: u32 = 1;
+    let buffer_desc = match view {
+        View::Unordered(resource, _, desc) => {
+            let resource = *resource as crate::object::This;
+            if crate::resource::buffer_bytes(resource).is_some() {
+                // A buffer's view says how its elements are laid out: none, no clear.
+                let Some(words) = desc else {
+                    return false;
+                };
+                Some(words)
+            } else if crate::resource::texture_memory(resource).is_some() {
+                if desc.is_some_and(|w| w[1] == D3D12_UAV_DIMENSION_BUFFER.0 as u32) {
+                    return false;
+                }
+                None
+            } else {
+                return false;
+            }
+        }
+        View::Placed(true, resource, desc) => {
+            if resource[0] == BUFFER {
+                let Ok(words) = <&[u32; 10]>::try_from(&desc[..10]) else {
+                    return false;
+                };
+                Some(words)
+            } else {
+                if desc[1] == D3D12_UAV_DIMENSION_BUFFER.0 as u32 {
+                    return false;
+                }
+                None
+            }
+        }
+        _ => return false,
+    };
+    let Some(words) = buffer_desc else {
+        return true;
+    };
+    let desc = uav_desc(words);
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        return false;
+    }
+    // SAFETY: `ViewDimension` is `D3D12_UAV_DIMENSION_BUFFER`.
+    unsafe { desc.Anonymous.Buffer }.StructureByteStride == 0
+}
+
+/// Makes the host descriptor for `view` at `at` (in any host view heap):
+/// the host resource it views, if it can.
+pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
+    make(view, at).flatten()
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -6920,5 +6977,58 @@ mod keep_fast_tests {
             assert!([0, a.as_raw() as usize, b.as_raw() as usize].contains(&held));
             assert!(heap.shows_already(slot, held), "slot {slot}");
         }
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+
+    /// A view the title clears must be unordered access and, of a buffer, not structured: the host's
+    /// clear of anything else is refused by the debug layer and fails on WARP.
+    #[test]
+    fn only_unordered_access_views_that_are_not_structured_buffers_are_cleared() {
+        const BUFFER: u32 = 1;
+        let mut buffer_resource = [0u32; 14];
+        buffer_resource[0] = BUFFER;
+        buffer_resource[4] = 256;
+        let texture_resource: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, 28, 1, 0, 0, 4, 0];
+        // Format, dimension (1 buffer, 4 2D texture), then the buffer's first element (two words),
+        // elements, stride and flags.
+        let raw = [39, 1, 0, 0, 16, 0, 0, 0, 1, 0];
+        let typed = [42, 1, 0, 0, 16, 0, 0, 0, 0, 0];
+        let structured = [0, 1, 0, 0, 16, 16, 0, 0, 0, 0];
+        let texture_view = [28, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let placed = |unordered: bool, resource: [u32; 14], words: [u32; 10]| {
+            let mut desc = [0u32; 16];
+            desc[..10].copy_from_slice(&words);
+            View::Placed(unordered, resource, desc)
+        };
+
+        // Not unordered access.
+        assert!(!is_clearable_uav(&View::Constant(0x1000, 256)));
+        assert!(!is_clearable_uav(&View::Shader(0, Some(raw))));
+        assert!(!is_clearable_uav(&View::Sampler([0; 13])));
+        assert!(!is_clearable_uav(&View::ConsoleSampler([0; 27])));
+        assert!(!is_clearable_uav(&placed(false, buffer_resource, raw)));
+        assert!(!is_clearable_uav(&placed(false, texture_resource, texture_view)));
+        assert!(!is_clearable_uav(&View::Unordered(0, 0, Some(raw))));
+        // Structured, or of a kind the resource is not.
+        assert!(!is_clearable_uav(&placed(true, buffer_resource, structured)));
+        assert!(!is_clearable_uav(&placed(true, buffer_resource, texture_view)));
+        assert!(!is_clearable_uav(&placed(true, texture_resource, raw)));
+        // The ones that can be: raw and typed buffers, textures.
+        assert!(is_clearable_uav(&placed(true, buffer_resource, raw)));
+        assert!(is_clearable_uav(&placed(true, buffer_resource, typed)));
+        assert!(is_clearable_uav(&placed(true, texture_resource, texture_view)));
+
+        let buffer = crate::resource::test_buffer(256);
+        assert!(!is_clearable_uav(&View::Unordered(buffer as usize, 0, None)));
+        assert!(!is_clearable_uav(&View::Unordered(buffer as usize, 0, Some(structured))));
+        assert!(!is_clearable_uav(&View::Unordered(buffer as usize, 0, Some(texture_view))));
+        assert!(is_clearable_uav(&View::Unordered(buffer as usize, 0, Some(raw))));
+        assert!(is_clearable_uav(&View::Unordered(buffer as usize, 0, Some(typed))));
+        let release = |o: crate::object::This| crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(buffer), 0);
     }
 }

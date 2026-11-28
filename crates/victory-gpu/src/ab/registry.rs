@@ -102,6 +102,7 @@ pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_STAGE_A_ASK_ASIDE", Kind::Flag),
     ("VICTORY_STAGE_A_DEEP", Kind::Flag),
     ("VICTORY_STAGE_A_FRONT2", Kind::Flag),
+    ("VICTORY_STAGE_A_LOOKAHEAD", Kind::Flag),
     ("VICTORY_STAGE_A_PLAN", Kind::Flag),
     ("VICTORY_STAGE_A_RELAX", Kind::Count),
     ("VICTORY_STAGE_A_STEPS", Kind::Flag),

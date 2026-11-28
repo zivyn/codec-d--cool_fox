@@ -218,6 +218,7 @@ switch is read.
 | `VICTORY_SNAP_ASIDE` | on (=0 turns off) | yes | Gives snapshots to kept threads and waits for them before sending, saving about 3.5 ms. |
 | `VICTORY_STAGE_A` | off | yes | Offers the next submission's refreshes before the steps of the one being prepared. |
 | `VICTORY_STAGE_A_DEEP` | off | yes | (integ/validation-23) Also refreshes the copies of the entry after the next while the next is prepared. |
+| `VICTORY_STAGE_A_LOOKAHEAD` (with `VICTORY_STAGE_A_STEPS`) | off | yes | (integ/validation-27) Stage A prepares the oldest submission of the line whatever its queue, past the signals and met waits that stand before it on its own queue (it used to look only at the first of the line). |
 | `VICTORY_STAGE_A_RELAX` | 0 (off) | yes | (integ/validation-23) Bits of what stage A's thread may also do: note-only host steps, reads, planes, bounded waits for flights. |
 | `VICTORY_STAGE_A_STEPS` | off | yes | Has a thread of ours prepare the next submission's whole front part while the previous one is sent. |
 | `VICTORY_STAGING_HOLD_MS` | 0 (off) | yes | Milliseconds an empty texture-staging block is held before being let go. |
@@ -292,6 +293,7 @@ translation of shaders.
 | `VICTORY_AUDIO_STATS` | off | number |  |  |  | Logs a line every n seconds with counts of what the XMA audio decoder did. |
 | `VICTORY_BAKE_EXACT` | on (=0 turns off) | flag |  |  |  | Makes the title's texture-bake draws see textures exactly as title memory holds them now. |
 | `VICTORY_BAKE_TEXTURES_MS` | 1500 | number |  |  |  | Milliseconds the texture-upload pass may take just before the title's decoration bake draw. |
+| `VICTORY_BETWEEN_FIT` | off | flag |  |  |  | (integ/validation-27, VRAM2) The buffer `between` of a list of the card-steps pool is the size its plans need (at least 256 KiB, a power of two, at most the 4 MiB cap) instead of always 4 MiB; the pool hands back the smallest buffer that is big enough. Est. 80 to 160 MB of the card. Read once. |
 | `VICTORY_BARRIER_LOOK` | off | flag |  |  |  | Reads the title's barrier groups and counts which need a wait for earlier shader writes. |
 | `VICTORY_BARRIER_TEST` | off | text |  |  | diag | Timing experiment: leaves out barrier waits for groups, indirect passes or both (values groups, indirect, both). |
 | `VICTORY_BIND_CACHE` | on (=0 turns off) | flag |  |  |  | Skips re-setting render targets and depth on the host list when they are unchanged. |
@@ -575,7 +577,7 @@ translation of shaders.
 | `VICTORY_PLACED_FILLER` | off | flag |  |  |  | Keep filler fields of a placed resource description in the lookup key. |
 | `VICTORY_PLACED_ORDER` | off | flag |  | live |  | Order placed copies by where they stand in title memory. |
 | `VICTORY_POKE` | off | list |  |  | diag | Debug aid: write bytes at given RVAs, form rva:byte,... in hex, into title data. |
-| `VICTORY_POOL_COMPACT` | off | flag |  |  |  | Keeps the blocks of textures dense (VRAM2): pieces are cut from the fullest block with room, and while the card is under pressure the blocks with the fewest bytes in use are emptied once a second (`VICTORY_POOL_COMPACT_MB` of textures each), their textures made again in the others and shown after their upload ran; a block that stays after a minute is left alone for two. Gives back the 1.2 to 1.9 GB the blocks hold free at the window spot. |
+| `VICTORY_POOL_COMPACT` | off | flag |  |  |  | (integ/validation-27) Keeps the blocks of textures dense (VRAM2): pieces are cut from the fullest block with room, and while the card is under pressure the blocks with the fewest bytes in use are emptied once a second (`VICTORY_POOL_COMPACT_MB` of textures each), their textures made again in the others and shown after their upload ran; a block that stays after a minute is left alone for two. Gives back the 1.2 to 1.9 GB the blocks hold free at the window spot. |
 | `VICTORY_POOL_COMPACT_MB` | 48 | number |  |  |  | MB of textures the compaction makes again each second (`VICTORY_POOL_COMPACT=1`). |
 | `VICTORY_POOL_FIT` | off (on with `VICTORY_POOL_COMPACT`) | text |  |  |  | `best`: a piece of a texture block is cut from the fullest block that has room, not from the first. |
 | `VICTORY_POOL_SLACK_MB` | 256 | number |  |  |  | MB the blocks of textures keep free (the empty spare blocks among them) before the compaction empties one more block. |
@@ -671,6 +673,7 @@ translation of shaders.
 | `VICTORY_STACKS` | off | list |  |  |  | Prints every thread's stack at each listed time, in seconds from start. |
 | `VICTORY_STAGE_A` | off | flag |  | live |  | Offers the next submission's refreshes before the steps of the one being prepared. |
 | `VICTORY_STAGE_A_DEEP` | off | flag |  | live |  | (integ/validation-23) Also refreshes the copies of the entry after the next while the next is prepared. |
+| `VICTORY_STAGE_A_LOOKAHEAD` | off | flag |  | live |  | (integ/validation-27) Stage A prepares the oldest submission of the line whatever its queue, past the signals and met waits that stand before it on its own queue. Needs `VICTORY_STAGE_A_STEPS`. |
 | `VICTORY_STAGE_A_RELAX` | 0 (off) | number |  | live |  | (integ/validation-23) Bits of what stage A's thread may also do: note-only host steps, reads, planes, bounded waits for flights. |
 | `VICTORY_STAGE_A_STEPS` | off | flag |  | live |  | Has a thread of ours prepare the next submission's whole front part while the previous one is sent. |
 | `VICTORY_STAGING_HOLD_MS` | 0 (off) | number |  | live |  | Milliseconds an empty texture-staging block is held before being let go. |

@@ -247,8 +247,8 @@ fn snapshot(known: &mut HashMap<u32, (String, Kind)>) -> Vec<Row> {
 pub(crate) fn text(groups: &[Group], process: (f64, f64), frames: u64, wall_ms: f64, logical: usize) -> String {
     let per = |ms: f64| ms / frames as f64;
     let total = process.0 + process.1;
-    let sum = |kind: Kind| groups.iter().filter(|g| g.kind == kind).map(Group::total).sum::<f64>();
-    let accounted: f64 = groups.iter().map(Group::total).sum();
+    let sum = |kind: Kind| groups.iter().filter(|g| g.kind == kind).fold(0.0, |a, g| a + g.total());
+    let accounted = groups.iter().fold(0.0, |a, g| a + g.total());
     let parts: Vec<String> = groups
         .iter()
         .filter(|g| per(g.total()) >= 0.5)

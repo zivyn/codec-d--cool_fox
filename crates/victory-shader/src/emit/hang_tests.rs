@@ -469,15 +469,17 @@ fn the_audited_form_takes_the_serial_walks_and_every_thread_passes_the_same_barr
 }
 
 /// The loop ends as soon as no lane has work and by its own count: with no lane in the branch (the
-/// data not there, all lanes empty) the group passes no barrier, whatever the count; with lanes it
+/// data not there, all lanes empty) the group passes no barrier of the walk, whatever the count; with lanes it
 /// passes the same number in each round and ends after the count's rounds (the exit is the scalar
 /// count's: the same in every thread, so the halves leave in the same round).
 #[test]
 fn the_serial_walk_ends_with_the_lanes_and_by_its_count() {
     for (over, body) in walks() {
         let (_, module) = walk_module(over, body, Mode::Audited);
+        // (what the program passes outside the walk, with no lane in it and no round)
+        let outside = walk_barriers(&module, 0, 0, 1, 3);
         for count in [0, 1, 5, 4000] {
-            assert_eq!(walk_barriers(&module, 0, count, 1, 3), 0, "{over:?} {body:?}: lanes empty, count {count}");
+            assert_eq!(walk_barriers(&module, 0, count, 1, 3), outside, "{over:?} {body:?}: lanes empty, count {count}");
         }
         for s0 in [1, 32, 33, 64] {
             let none = walk_barriers(&module, s0, 0, 1, 3);

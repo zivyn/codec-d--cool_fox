@@ -278,6 +278,7 @@ fn the_switches_left_out_of_the_key_are_read_only_where_they_change_nothing() {
         ("VICTORY_D3D12_DEBUG", Files(&["emit/host.rs"])),
         ("VICTORY_DESC_WHY", Prints),
         ("VICTORY_DXIL", Files(&["emit/validator.rs"])),
+        ("VICTORY_HANG_AUDIT", Files(&["emit/hang.rs"])),
         ("VICTORY_MASK_WHY", Prints),
         ("VICTORY_PC_DXC", TestsOfMod),
         ("VICTORY_REF_PS", TestsOfMod),

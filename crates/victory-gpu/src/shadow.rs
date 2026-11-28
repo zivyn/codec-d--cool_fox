@@ -4489,7 +4489,7 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        self.probe();
+        self.probe(from, to);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4793,7 +4793,7 @@ impl Shadow {
     /// the dwords that are not zero (the whole buffer and its first sixteen) on each side. The
     /// copy is what the card's is made from; a title memory that holds a header the copy does
     /// not is a copy that was not brought up to date.
-    fn probe(&self) {
+    fn probe(&self, from: usize, to: usize) {
         if !buffer_listed(&BUFFER_PROBE, self.start, self.len) {
             return;
         }
@@ -4824,6 +4824,9 @@ impl Shadow {
             title_nonzero = tn,
             copy_nonzero = cn,
             pages_differ = differ,
+            // (the range this refresh is asked for, as offsets: pages that differ outside it are
+            // pages no submission of this moment brings up to date)
+            asked = format_args!("{:#x}..{:#x}", from - start, to - start),
             differ_at = ?look.differ_at.iter().map(|p| format!("{p:#x}")).collect::<Vec<_>>(),
             differ_in_flight = in_flight,
             title_at = ?look.title_at,

@@ -770,6 +770,20 @@ fn emit_forms(
     {
         eprintln!("WAVE64-FORM-FINAL ~{} {}", code_digits(c), form.label());
     }
+    // (`VICTORY_HANG_AUDIT=1`: the audit of the module the program ended in, if it has a group barrier)
+    if native.stage == HwStage::Cs && hang::reporting() {
+        eprintln!(
+            "HANG-FINAL ~{} #{:07x} threads={} {} {}",
+            code_digits(c),
+            lower::program_tag() & 0x0FFF_FFFF,
+            match native.io {
+                crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+                _ => 0,
+            },
+            form.label(),
+            hang::last_audit().map_or("no barriers".to_string(), |a| a.describe())
+        );
+    }
     (result, form)
 }
 

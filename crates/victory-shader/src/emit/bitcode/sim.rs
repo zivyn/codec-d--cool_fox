@@ -82,15 +82,16 @@ pub(crate) fn run(m: &Module, threads: usize, user: &[u32], seed: u64) -> Result
     run_with(m, threads, user, seed, None)
 }
 
-/// [`run`], where the threads `gone.1` leave the program (as if killed) after `gone.0` steps.
+/// [`run`], where the threads `gone.1` leave the program (as if killed) once the group has passed
+/// `gone.0` barriers.
 pub(crate) fn run_with(
     m: &Module,
     threads: usize,
     user: &[u32],
     seed: u64,
-    gone: Option<(u64, std::ops::Range<usize>)>,
+    gone: Option<(usize, std::ops::Range<usize>)>,
 ) -> Result<Report, String> {
-    let mut sim = Sim { m, user, mem: HashMap::new(), report: Report::default(), seed: seed | 1 };
+    let mut sim = Sim { m, user, mem: HashMap::new(), report: Report::default(), seed: seed | 1, kill: gone, passed: 0 };
     let mut ts: Vec<Thread> = (0..threads)
         .map(|_| Thread {
             block: 0,
@@ -125,13 +126,6 @@ pub(crate) fn run_with(
             sim.step(&mut ts, t)?;
             steps += 1;
         }
-        if let Some((after, who)) = &gone
-            && steps >= *after
-        {
-            for t in who.clone().filter(|&t| t < threads) {
-                ts[t].state = State::Done;
-            }
-        }
         sim.resolve(&mut ts);
         if steps > 20_000_000 {
             sim.report.problems.push("the threads ran 20 million steps (a loop that does not end)".into());
@@ -148,6 +142,9 @@ struct Sim<'a> {
     mem: HashMap<u32, Vec<u64>>,
     report: Report,
     seed: u64,
+    /// Threads that leave after a number of barriers, and the barriers the group has passed.
+    kill: Option<(usize, std::ops::Range<usize>)>,
+    passed: usize,
 }
 
 impl Sim<'_> {
@@ -508,6 +505,14 @@ impl Sim<'_> {
                 ts[t].state = State::Run;
             }
             any = true;
+            self.passed += 1;
+            if let Some((after, who)) = &self.kill
+                && self.passed == *after
+            {
+                for t in who.clone().filter(|&t| t < ts.len()) {
+                    ts[t].state = State::Done;
+                }
+            }
         }
         any
     }

@@ -111,6 +111,11 @@ fn printing() -> u8 {
     })
 }
 
+/// Whether `VICTORY_HANG_AUDIT` asks for the lines of the corpus run.
+pub(super) fn reporting() -> bool {
+    printing() > 0
+}
+
 /// Audits the modules this thread finishes from now on (and forgets the last audit), until
 /// [`stop_auditing`].
 pub(super) fn audit_from_now_on() {

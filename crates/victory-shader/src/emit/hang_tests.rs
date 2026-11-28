@@ -382,13 +382,15 @@ fn the_guard_keeps_the_stores_and_ends_a_wait_for_threads_that_are_gone() {
             assert_eq!(a.stores, b.stores, "{shape:?} s0={s0}: the guard changed what is stored");
         }
         // the upper half is gone after a while: the lower half's wait runs out
-        let b = sim::run_with(&gmodule, 64, &[64, 0, 0, 0], 5, Some((400, 32..64))).expect("run");
+        let b = sim::run_with(&gmodule, 64, &[64, 0, 0, 0], 5, Some((1, 32..64))).expect("run");
         let notes: Vec<u64> = b.notes.iter().copied().filter(|&v| v >= u64::from(hang::HANG_NOTE) && v < 0xE000_0000).collect();
         assert!(
             notes.iter().any(|&n| hang::say(n as u32).0 == hang::kind::WAIT || hang::say(n as u32).0 == hang::kind::BUDGET),
-            "{shape:?}: no note of the guard (notes {:x?}, problems {:?})",
+            "{shape:?}: no note of the guard (notes {:x?}, problems {:?})
+{}",
             b.notes,
-            b.problems
+            b.problems,
+            gmodule.listing().chars().take(7000).collect::<String>()
         );
         assert!(!b.problems.iter().any(|p| p.contains("hang")), "{shape:?}: the group hung: {:?}", b.problems);
     }

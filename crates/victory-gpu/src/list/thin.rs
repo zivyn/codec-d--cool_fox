@@ -614,6 +614,22 @@ const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
 const CLEAR_UAV: u64 = after(17);
+/// Work of ours (`super::external`), boxed.
+const EXTERNAL: u64 = after(18);
+
+/// Writes down work of ours at this place of a title list's stream
+/// ([`super::external`]); gives it back if the list is not written down.
+pub(super) fn put_external(this: This, work: super::External) -> Result<(), super::External> {
+    if !wanted() || !on() {
+        return Err(work);
+    }
+    let front = front(this);
+    if front.closed || front.recording.is_none() {
+        return Err(work);
+    }
+    front.put(EXTERNAL, &[Box::into_raw(Box::new(work)) as u64]);
+    Ok(())
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -1191,6 +1207,15 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         }
         if op == UPLOAD {
             name_upload(w);
+            continue;
+        }
+        if op == EXTERNAL {
+            // SAFETY: made by `put_external`, named once.
+            let work = *unsafe { Box::from_raw(w[0] as *mut super::External) };
+            // (A recording let go of drops it unrun.)
+            if !skip {
+                super::run_external(list, work);
+            }
             continue;
         }
         if skip && op != CLOSE && op != RESET {

@@ -225,3 +225,55 @@ fn a_waterfall_loop_whose_halves_finish_in_different_rounds_serves_every_lane() 
     );
     eprintln!("ran on the hardware device: the waterfall of two rounds served the upper half");
 }
+
+/// A loop that the first console wave of a group of 128 threads leaves when a value that only lane
+/// 63 holds says so: the other lanes hold 5, lane 63 holds -1, and every round reads lane 63 with
+/// `v_readlane_b32`, the way a walk over a table decides that it is through. The second console
+/// wave leaves at once. The loop is through in its first round; s4 counts the rounds.
+const LANE_63_EXIT: [u32; 16] = [
+    0xBE8C_047E, // s_mov_b64 s[12:13], exec
+    0x7DA8_00C0, // v_cmpx_gt_u32 exec, 64, v0
+    0xBF88_000D, // s_cbranch_execz past the store
+    0xBE84_0380, // s_mov_b32 s4, 0
+    0x7E04_0285, // L: v_mov_b32 v2, 5
+    0x7E06_02C1, // v_mov_b32 v3, -1
+    0x7D84_00BF, // v_cmp_eq_u32 vcc, 63, v0
+    0x0004_0685, // v_cndmask_b32 v2, 5, v3, vcc
+    0xD760_0003, // v_readlane_b32 s3, v2, 63
+    0x0001_7F02,
+    0x8104_8104, // s_add_i32 s4, s4, 1
+    0xBF06_C103, // s_cmp_eq_u32 s3, -1
+    0xBF84_FFF7, // s_cbranch_scc0 L
+    0x7E00_0204, // v_mov_b32 v0, s4
+    0x38 << 26 | 0x1C << 18,
+    0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+];
+
+/// What a lane 63 that is read to end a loop does in two host waves of 32: both have the value of
+/// the lane in the upper half, so the loop is through in its first round (a stale value of the
+/// exchange would have it run to its limit, as DefragHeap's walk does).
+#[test]
+fn a_loop_that_ends_on_the_value_of_lane_63_is_through_in_its_first_round() {
+    let native = native_of(&LANE_63_EXIT, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower::set_program_tag(b"a lane 63 loop");
+    let shader = match lowered(&native, &p, &HashSet::new()) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("not translated for waves of 32 ({e}): the program of the test is refused");
+            return;
+        }
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(got) = on_the_card(&shader, [0, 0]) else {
+        return;
+    };
+    assert_eq!(got, 1, "the rounds of a loop that lane 63 ends in the first");
+    eprintln!("ran on the hardware device: the loop on lane 63 was through in one round");
+}

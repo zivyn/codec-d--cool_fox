@@ -41,10 +41,13 @@ struct TableGroup {
     indexed: Vec<RootIndexedView>,
     // Descriptor number -> first declaration, matching the bind-time search.
     by_descriptor: Vec<(u32, usize)>,
+    // The descriptors only the program's windows read (`HostShader::bindless`): their views are not made for it
+    // (`VICTORY_BINDLESS_HOST=2`).
+    skip: Vec<u32>,
 }
 
 impl TablePlan {
-    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView]) -> Self {
+    pub(crate) fn new(used: &[UsedResource], indexed: &[RootIndexedView], bindless: &[(u8, u32)]) -> Self {
         let mut slots: Vec<_> = used
             .iter()
             .filter(|u| u.root == RootType::Table)
@@ -61,6 +64,7 @@ impl TablePlan {
                 max_dword: 0,
                 entries: Vec::new(),
                 by_descriptor: Vec::new(),
+                skip: Vec::new(),
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
             })
             .collect();
@@ -82,6 +86,23 @@ impl TablePlan {
         for group in &mut groups {
             group.by_descriptor.sort_unstable();
             group.by_descriptor.dedup_by_key(|item| item.0);
+            // A descriptor is skipped when every declaration at it is an SRV that only windows read.
+            let mut skip: Vec<u32> = group
+                .entries
+                .iter()
+                .filter(|u| u.kind == ResourceType::Srv && bindless.contains(&(u.slot, u.table_offset_dwords)))
+                .map(|u| u.table_offset_dwords / 8)
+                .collect();
+            skip.sort_unstable();
+            skip.dedup();
+            skip.retain(|&d| {
+                group
+                    .entries
+                    .iter()
+                    .filter(|u| u.table_offset_dwords / 8 == d)
+                    .all(|u| u.kind == ResourceType::Srv && bindless.contains(&(u.slot, u.table_offset_dwords)))
+            });
+            group.skip = skip;
         }
         Self { groups, direct }
     }
@@ -1603,7 +1624,15 @@ impl State {
     ) -> u32 {
         use victory_shader::emit::{
             USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_ROOT_VIEW_INDEX, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+            USER_WINDOW_BASE,
         };
+        if kind == USER_WINDOW_BASE {
+            // The run of the copies' raw views in the view heap (`descriptor::window`).
+            return match self.heaps[0] {
+                0 => 0,
+                h => crate::descriptor::heap(h as This).host().map_or(0, |host| host.window_base()),
+            };
+        }
         if kind == USER_ROOT_VIEW_INDEX {
             // Made by `bind` (`root_srv_index`) before it reads the dwords of the stage.
             return self.view_index.get(usize::from(slot)).copied().unwrap_or(0);
@@ -2176,6 +2205,27 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_WINDOWS {
+                        // Ours: the window of the buffer view at each slot of the view heap, for a shader that
+                        // reads the buffers of its tables through them.
+                        match self.heap_windows(list) {
+                            // SAFETY: an open list; the table lives as long as the heap the list holds.
+                            Some(gpu) => {
+                                if self.root_changed(compute, param, 2, gpu) {
+                                    // SAFETY: as above.
+                                    unsafe {
+                                        if compute {
+                                            l.SetComputeRootShaderResourceView(param, gpu);
+                                        } else {
+                                            l.SetGraphicsRootShaderResourceView(param, gpu);
+                                        }
+                                    }
+                                }
+                            }
+                            None => once!("a shader reads windows of buffer views from a view heap that has none"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_VIEW_ADDRESSES {
                         // Ours: the title address of the view at each slot
                         // of the view heap, for a shader that takes a
@@ -2675,6 +2725,25 @@ impl State {
         // Tag bit 1 (distinct from `heap_buffers`'s `| 1` and aligned guest pointers).
         if list.first_use(gpu as usize | 2)
             && let Some(buffer) = host.strides_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
+    /// The GPU address of the bound view heap's table of windows by slot, which the list holds.
+    fn heap_windows(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.windows_gpu()?;
+        // Tag bit 3 (distinct from `heap_buffers`'s, `heap_strides`'s and `heap_view_addresses`'s).
+        if list.first_use(gpu as usize | 8)
+            && let Some(buffer) = host.windows_buffer()
         {
             list.keep(buffer);
         }
@@ -4332,6 +4401,9 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
+            // The descriptors whose views this program leaves unmade (it reads them through windows): a table
+            // made so is not the one a program that reads their views is given.
+            let skip: &[u32] = if crate::descriptor::window::level() >= 2 { &group.skip } else { &[] };
             // The table and what its entries hold (record words).
             let key = {
                 let mut h = RecordHash::default();
@@ -4340,7 +4412,11 @@ impl State {
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
                 }
-                (table, n, h.0)
+                let mut skipped = RecordHash::default();
+                for &d in skip {
+                    skipped.add([d, 0x5b1d_0001, 0]);
+                }
+                (table, n, h.0 ^ skipped.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
             let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
@@ -4438,7 +4514,7 @@ impl State {
                 // and nothing more if nothing changed in the list since.
                 if list_views
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
-                    && let Some(mut listed) = host.make_listed(recording, words, index)
+                    && let Some(mut listed) = host.make_listed(recording, words, index, skip.binary_search(&k).is_ok())
                 {
                     let kind = group
                         .entry(k)
@@ -5888,6 +5964,38 @@ mod tests {
         assert!(step(&mut kept, 18, (0, 200), 3));
         // Going from 3 to 2 at frame 19: the note says 17, two frames ago, so it is refreshed now.
         assert!(!step(&mut kept, 19, (0, 200), 2));
+    }
+
+    /// The descriptors of a table a program's windows read alone are the ones its plan leaves unmade: SRVs the
+    /// translator listed (`HostShader::bindless`), only where every declaration at the descriptor is one.
+    #[test]
+    fn a_table_plan_skips_the_srvs_only_windows_read() {
+        use victory_shader::native::{ResourceType, RootType, UsedResource};
+        let used = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 3,
+        };
+        let declared = [
+            used(ResourceType::Srv, 0),
+            used(ResourceType::Srv, 8),
+            used(ResourceType::Uav, 16),
+            used(ResourceType::Srv, 24),
+            // The same descriptor as the one before, declared as another kind.
+            used(ResourceType::Uav, 24),
+        ];
+        let plan = super::TablePlan::new(&declared, &[], &[(3, 0), (3, 16), (3, 24)]);
+        assert_eq!(plan.groups.len(), 1);
+        // Descriptor 0 is listed and an SRV; 1 is not listed; 2 is listed but a UAV; 3 has an SRV the window reads
+        // and a UAV that is not listed.
+        assert_eq!(plan.groups[0].skip, [0]);
+        let plan = super::TablePlan::new(&declared, &[], &[]);
+        assert!(plan.groups[0].skip.is_empty());
     }
 
     use super::staging_budget_per_frame;

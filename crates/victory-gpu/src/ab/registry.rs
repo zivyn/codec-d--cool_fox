@@ -41,6 +41,7 @@ pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_ASK_MERGE", Kind::OnByDefault),
     ("VICTORY_ASYNC_COMPUTE", Kind::Modes(&["1", "2"])),
     ("VICTORY_ASYNC_SUBMIT", Kind::Flag),
+    ("VICTORY_BINDLESS_HOST", Kind::Modes(&["1", "2"])),
     ("VICTORY_CARD_AWAKE", Kind::Flag),
     ("VICTORY_CARD_BIG_FIRST", Kind::Flag),
     ("VICTORY_CLOSED_IDLE", Kind::OnByDefault),

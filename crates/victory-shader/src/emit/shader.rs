@@ -38,6 +38,20 @@ pub const SLOT_TABLE_STRIDES: u8 = 252;
 /// the title address (low dword, then bits 32 up) the view at heap slot `i`
 /// starts at (0: none).
 pub const SLOT_VIEW_ADDRESSES: u8 = 251;
+/// The root SRV `t<SLOT_VIEW_WINDOWS>` in [`ROOT_CBV_SPACE`] of a shader that reads the buffers of its
+/// descriptor tables through the host's windows (`VICTORY_BINDLESS_BUFFERS`, `bindless.rs`): a raw buffer
+/// of [`SLOT_WINDOWS_COUNT`] entries of four dwords the host keeps, entry `i` for the view heap slot `i`:
+/// the number of the host copy the slot's buffer view lies in (0: no window, the view is read), the byte
+/// of the copy the view begins at, the view's length in bytes, and a dword that is 0.
+pub const SLOT_VIEW_WINDOWS: u8 = 249;
+/// Entries of the [`SLOT_VIEW_WINDOWS`] table: heap indices are clamped to it.
+pub const SLOT_WINDOWS_COUNT: u32 = 1 << 20;
+/// The most host copies that have a number ([`SLOT_VIEW_WINDOWS`]): copy `n` (1 to this) is the raw view
+/// at view heap slot `USER_WINDOW_BASE`'s dword plus `n`; a number past it is clamped to it.
+pub const WINDOW_COPIES: u32 = 8192;
+/// `RootType::Other` code of a user-data dword the host computes: the view heap slot that holds the raw
+/// view of window copy 0 (a null view); copy `n`'s is `n` slots further ([`SLOT_VIEW_WINDOWS`]).
+pub const USER_WINDOW_BASE: u32 = 0x108;
 /// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format

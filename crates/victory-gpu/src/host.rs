@@ -2967,6 +2967,19 @@ fn lean_steps() -> bool {
     crate::ab::live_flag!("VICTORY_LEAN_STEPS")
 }
 
+/// Whether what a submission does for the copies in the card's memory is made with the leaner bookkeeping
+/// (`VICTORY_LEAN_CARD=1`; off by default): the copies whose CPU side changed are found through a queue of the
+/// touched ones, not by a look at all 900 for each of the 28 submissions a frame (`shadow::card_dirty`); the bytes
+/// taken out of the CPU sides (44 MB a frame, in 15 submissions of under the 4 MB that went to threads, so
+/// copied by the submitting thread into memory the card reads) are copied by the threads that write the pairs,
+/// in one batch with them (`send::take`); and a copy's twin is asked for without a hold on it
+/// (`Shadow::has_before`). The same bytes go up, in the same places.
+pub(crate) fn lean_card() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: each use reads it once and what it makes does not outlive
+    // the submission; the queue of touched copies is kept whichever way they are found.)
+    crate::ab::live_flag!("VICTORY_LEAN_CARD")
+}
+
 /// Whether the submitting thread leaves the landed lists (reset, their upload memory and descriptor slots given back)
 /// to the thread that settles flights, which does it when it is asked to ([`late_helper`]), and not at the end of each
 /// submission it sends (`VICTORY_LAND_ASIDE=1`; off by default): 1.4 ms a frame of the submitting thread's.
@@ -4912,6 +4925,8 @@ impl Host {
             picked.looked.iter().filter(|l| !declared.iter().any(|(s, _)| Arc::ptr_eq(s, &l.0))).collect();
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
+        // (Read once: how this submission looks at the copies' twins.)
+        let lean = lean_card();
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
         let sent_as = match order.as_mut() {
             Some(order) => {
@@ -5083,7 +5098,7 @@ impl Host {
                     _ => spans.push((from, to)),
                 }
             }
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = if lean { shadow.has_before() } else { shadow.card_sides().is_some_and(|(_, before, _)| before.is_some()) };
             for (from, to) in spans {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
@@ -5103,7 +5118,7 @@ impl Host {
             }
         }
         for (shadow, from, len) in looked {
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            let twin = if lean { shadow.has_before() } else { shadow.card_sides().is_some_and(|(_, before, _)| before.is_some()) };
             if let Some(span) = shadow.card_span(*from, from + len)
                 && twin
                 && u64::from(at + span.pieces) * 4 <= work.differs.2

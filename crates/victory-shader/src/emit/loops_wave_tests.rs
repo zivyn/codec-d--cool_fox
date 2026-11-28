@@ -3,6 +3,8 @@
 //! and without the switches (and validated by `dxil.dll` when present), and run on the host GPU
 //! where there is one. Nothing of the game is in them.
 
+use std::collections::HashSet;
+
 use super::host::{Dispatch, Host, Root, View};
 use super::local_exit_tests::validated;
 use super::wave64_tests::native_of;
@@ -76,10 +78,22 @@ fn tile_count_expected() -> Vec<u32> {
 /// involved), with `VICTORY_LOOPS_WAVE` set to `loops` for this thread, and
 /// `VICTORY_LDS_FIRST_INIT` to `first`.
 fn emitted(native: &crate::native::NativeProgram, loops: Option<u8>, first: bool) -> Result<HostShader, ShaderError> {
+    emitted_wide(native, &HashSet::new(), loops, first)
+}
+
+/// [`emitted`] with the branches closing the blocks of `wide` taken wave-wide (the form the
+/// water's tiled light ends in: every lane runs the code behind such a branch, guarded by its
+/// EXEC bit).
+fn emitted_wide(
+    native: &crate::native::NativeProgram,
+    wide: &HashSet<usize>,
+    loops: Option<u8>,
+    first: bool,
+) -> Result<HostShader, ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let bytes = crate::dxbc::build(&[]);
     let c = Container::parse(&bytes).expect("container");
-    let st = structure::structure(&p).expect("structure");
+    let st = structure::structure_wide(&p, wide).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
@@ -244,12 +258,14 @@ fn first_thread_init_after_the_first_thread_left() -> crate::native::NativeProgr
 }
 
 /// The switch changes the translation (the first thread sets shared memory up whether its lane
-/// runs or not) and only when set.
+/// runs or not) and only when set; the branch around the set-up is taken wave-wide (block 0), so that
+/// the first thread's lane is where the set-up is.
 #[test]
 fn the_lds_first_init_switch_changes_the_translation_only_when_set() {
     let native = first_thread_init_after_the_first_thread_left();
-    let off = emitted(&native, None, false);
-    let on = emitted(&native, None, true);
+    let wide = HashSet::from([0]);
+    let off = emitted_wide(&native, &wide, None, false);
+    let on = emitted_wide(&native, &wide, None, true);
     eprintln!(
         "off: {:?}; on: {:?}",
         off.as_ref().map(|s| s.dxil.len()).map_err(ToString::to_string),
@@ -260,7 +276,7 @@ fn the_lds_first_init_switch_changes_the_translation_only_when_set() {
     validated(&off);
     validated(&on);
     assert_ne!(off.dxil, on.dxil);
-    assert_eq!(on.dxil, emitted(&native, None, true).expect("lowered").dxil);
+    assert_eq!(on.dxil, emitted_wide(&native, &wide, None, true).expect("lowered").dxil);
 }
 
 /// On the host GPU: without the switch the console's result (no lane runs the set-up, the
@@ -268,7 +284,8 @@ fn the_lds_first_init_switch_changes_the_translation_only_when_set() {
 #[test]
 fn the_first_thread_sets_shared_memory_up_when_asked() {
     let native = first_thread_init_after_the_first_thread_left();
-    let (Ok(off), Ok(on)) = (emitted(&native, None, false), emitted(&native, None, true)) else {
+    let wide = HashSet::from([0]);
+    let (Ok(off), Ok(on)) = (emitted_wide(&native, &wide, None, false), emitted_wide(&native, &wide, None, true)) else {
         return;
     };
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());

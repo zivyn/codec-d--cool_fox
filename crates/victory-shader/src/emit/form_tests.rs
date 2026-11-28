@@ -305,3 +305,23 @@ fn a_loop_with_its_exit_at_the_top_still_exchanges_on_the_card() {
     }
     eprintln!("ran on the hardware device: the loop with its exit at the top");
 }
+
+#[test]
+fn zz_probe_top_exit() {
+    let mut words = TOP_EXIT.to_vec();
+    words.push(0x80 << 24 | 2 << 16 | 1 << 8);
+    let native = native_of(&words, true, 64);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    eprintln!("PROBE blocks {}", p.blocks.len());
+    for (i, b) in p.blocks.iter().enumerate() {
+        eprintln!("PROBE B{i} {:?} insts {:?}", b.exit, b.insts.iter().map(|x| x.name()).collect::<Vec<_>>());
+        eprintln!("PROBE B{i} phis {:?}", b.phis.iter().map(|x| x.reg).collect::<Vec<_>>());
+    }
+    eprintln!("PROBE inputs {:?}", p.inputs.iter().map(|x| x.0).collect::<Vec<_>>());
+    let r = super::wave64_tests::lowered(&native, &p, &std::collections::HashSet::new());
+    eprintln!("PROBE original {:?}", r.as_ref().err());
+    for keep in [true, false] {
+        let (r, f) = lowered_as(&native, keep);
+        eprintln!("PROBE emit keep {keep}: {:?} {:?}", r.as_ref().err(), f);
+    }
+}

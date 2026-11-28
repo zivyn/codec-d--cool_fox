@@ -18,7 +18,7 @@
 //! card they print `SKIPPED` and pass.
 
 use super::nan_tests::{Want, f, f16_rne, judge, legacy, max_f};
-use super::valu_tests::{build_valu_cs, run_cases_on, sgpr, vgpr, vop1, vop3};
+use super::valu_tests::{build_valu_cs, run_cases_on, sgpr, tbuffer_body, vgpr, vop1, vop3};
 use super::{HostShader, denorm, f16_level};
 use std::time::Duration;
 
@@ -199,7 +199,7 @@ fn answer(
     devices: &'static [(&'static str, bool)],
     ftz_on: bool,
     level: u8,
-    want: fn([u32; 4]) -> Want,
+    want: impl Fn([u32; 4]) -> Want + Send + 'static,
 ) -> (Vec<String>, usize) {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -351,6 +351,54 @@ fn the_mixed_precision_result_rounds_to_nearest_with_level_2_on_the_card() {
         "NAN2 v_fma_mixlo_f16 level 0 (the host's conversion): {} of {seen} answers differ",
         plain.len()
     );
+}
+
+/// The 16-bit loads of float results (`tbuffer_load_format_d16_*`): level 2 rounds what the host
+/// converts, and what the cases of `tbuffer_d16_loads_pack_two_channels_per_dword` hold is exact
+/// either way, so the answers are the same on the card and on WARP.
+#[test]
+fn d16_loads_are_the_same_at_level_2_on_the_card() {
+    // (opcode, format, dword stored, dword loaded)
+    let cases: [(u8, u8, u32, u32); 4] = [
+        (9, 29, 0x4000_3C00, 0x4000_3C00),
+        (9, 27, 0xBEEF_1234, 0xBEEF_1234),
+        (9, 23, 0xFFFF_0000, 0x3C00_0000),
+        (8, 13, 0x4000_3C00, 0x0000_3C00),
+    ];
+    for (op, format, stored, loaded) in cases {
+        let (bad, seen) = answer(
+            "d16 load",
+            150,
+            tbuffer_body(op, format),
+            vec![([stored, 0, 0, 0], false)],
+            BOTH,
+            false,
+            2,
+            move |_| Want::Bits(loaded),
+        );
+        assert!(seen > 0, "no device answered");
+        assert!(
+            bad.is_empty(),
+            "format {format}: {}",
+            bad.join(
+                "
+"
+            )
+        );
+    }
+}
+
+/// Level 2 reaches the 16-bit loads of float results and nothing changes at level 1.
+#[test]
+fn level_2_reaches_the_d16_loads() {
+    let body = tbuffer_body(9, 23);
+    let (d0, d1, d2) = (
+        dxil_of(&body, false, 0),
+        dxil_of(&body, false, 1),
+        dxil_of(&body, false, 2),
+    );
+    assert_eq!(d0, d1, "level 1 leaves it");
+    assert_ne!(d1, d2, "level 2 rounds to nearest");
 }
 
 fn dxil_of(body: &[u32], ftz_on: bool, level: u8) -> Vec<u8> {

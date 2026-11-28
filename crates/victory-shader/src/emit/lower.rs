@@ -7604,7 +7604,15 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // A descriptor whose words nothing computes with asks no view of it: the query below is cleaned up.
+        let numbers = (0..count).any(|k| {
+            inst.write(Reg::S(code + k as u8))
+                .is_some_and(|v| self.read_as_number(v))
+        });
+        let before = std::mem::replace(&mut self.bindless.fallback, !numbers);
+        let h = self.handle(site, &src, false, props);
+        self.bindless.fallback = before;
+        let h = h?;
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);

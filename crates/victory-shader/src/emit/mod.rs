@@ -193,6 +193,12 @@ pub use shader::{
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
+/// Whether table buffers are read through windows (`VICTORY_BINDLESS_BUFFERS=1`): the host makes the table of
+/// windows for the shaders translated so.
+pub fn bindless_buffers() -> bool {
+    lower::bindless::on()
+}
+
 /// The loop limit without an override: 2^20 (the "no number given" value; the limits a
 /// program really gets are per stage, see [`loop_limit_for`]).
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

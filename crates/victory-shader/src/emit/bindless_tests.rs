@@ -5,8 +5,6 @@
 //! when present, and run on the hardware GPU and WARP: with a window the reads come from the copy at the
 //! window's bytes and stop at its length, without one they are what the view gives.
 
-use windows::Win32::Graphics::Direct3D12::*;
-
 use super::host::{Dispatch, Host, Root, Stride, View};
 use super::lower::bindless::TEST_BINDLESS;
 use super::{HostShader, lower, validator};

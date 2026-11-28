@@ -42,7 +42,7 @@ thread_local! {
 }
 
 /// Whether table buffers are read through windows (`VICTORY_BINDLESS_BUFFERS=1`).
-pub(super) fn on() -> bool {
+pub(in crate::emit) fn on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_BINDLESS.get() {
         return on;
@@ -61,7 +61,7 @@ pub(super) struct Entries {
     /// Entries some access reads through the view.
     viewed: HashSet<(u8, u32)>,
     /// The view branch of a window access is being made: its handle is no use of the view in itself.
-    fallback: bool,
+    pub(super) fallback: bool,
 }
 
 impl Entries {

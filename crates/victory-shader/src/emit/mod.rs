@@ -101,6 +101,10 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
+pub mod form;
+pub use form::Form;
+#[cfg(all(test, windows))]
+mod form_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -682,14 +686,29 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_as(c, native, p, st, io, res).0
+}
+
+/// [`emit`], and the form the program was lowered in ([`Form`]).
+pub fn emit_as(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> (Result<HostShader, ShaderError>, Form) {
     match emit_forms(c, native, p, st, io, res) {
-        Err(ShaderError::Unsupported { what, .. }) if what == lower::MASK_ELSEWHERE => {
+        (Err(ShaderError::Unsupported { what, .. }), _) if what == lower::MASK_ELSEWHERE => {
             lower::with_mask_numbers(|| emit_forms(c, native, p, st, io, res))
         }
         other => other,
     }
 }
 
+/// The program's translation and the form it ended in. With `VICTORY_WAVE_WHY`, a program that
+/// had to be retried says its form on stderr (`WAVE64-FORM-FINAL ~<hash> <label>`), which is
+/// what the corpus run counts.
 fn emit_forms(
     c: &Container,
     native: &NativeProgram,
@@ -697,6 +716,26 @@ fn emit_forms(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> (Result<HostShader, ShaderError>, Form) {
+    let mut form = Form::Original;
+    let result = emit_forms_in(c, native, p, st, io, res, &mut form);
+    if result.is_err() {
+        form = Form::Refused;
+    }
+    if form != Form::Original && std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+        eprintln!("WAVE64-FORM-FINAL ~{} {}", code_digits(c), form.label());
+    }
+    (result, form)
+}
+
+fn emit_forms_in(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    form_out: &mut Form,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -781,15 +820,20 @@ fn emit_forms(
             };
             Some((p, st, io, res))
         };
+        // (and the branches each kept over a loop, `VICTORY_KEEP_LOOP_SKIPS`)
+        let (early_outs, early_kept) = ir::drop_early_outs(p);
+        let (skips, skips_kept) = ir::drop_skips(p, false);
+        let (early_dropped, skips_dropped) = (early_outs.is_some(), skips.is_some());
         let forms = [
-            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
-            ("without skips", form("without skips", ir::without_skips(p, false))),
+            ("without early-outs", form("without early-outs", early_outs)),
+            ("without skips", form("without skips", skips)),
         ];
-        for (name, f) in &forms {
+        for (i, (name, f)) in forms.iter().enumerate() {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
+                    *form_out = if i == 0 { Form::WithoutEarlyOuts } else { Form::WithoutSkips };
                     return again.map(|(shader, _)| shader);
                 }
             }
@@ -836,12 +880,41 @@ fn emit_forms(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+                let (deep_p, deep_kept) = if deep_on { ir::drop_skips(p, true) } else { (None, Vec::new()) };
+                let deep_dropped = deep_p.is_some();
+                let deep = if deep_on { form("without skips, scalars followed", deep_p) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
+                        *form_out = Form::WithoutSkipsDeep;
                         return again.map(|(shader, _)| shader);
+                    }
+                }
+                // Where `VICTORY_KEEP_LOOP_SKIPS` kept a skip over a loop, the forms above are
+                // refused (cross-lane code under a branch each host wave takes on its own): the
+                // same forms with those branches taken by the whole wave stay exact, at two
+                // group barriers per branch, outside the loops. Before any approximate form.
+                if wide_option.as_ref().is_none_or(|v| v != "0") {
+                    // (the program itself where nothing was left out: only the kept branches differ)
+                    let bases = [
+                        (forms[0].1.as_ref().map(|f| &f.0), early_dropped, &early_kept),
+                        (forms[1].1.as_ref().map(|f| &f.0), skips_dropped, &skips_kept),
+                        (deep.as_ref().map(|f| &f.0), deep_dropped, &deep_kept),
+                    ];
+                    for (base, dropped, kept) in bases {
+                        let Some(base) = base.or((!dropped).then_some(p)) else {
+                            continue;
+                        };
+                        if kept.is_empty() {
+                            continue;
+                        }
+                        let again = widen_seeded(c, native, base, why, false, kept);
+                        report("kept skips wave-wide", &again);
+                        if done(&again) {
+                            *form_out = Form::KeptSkipsWide;
+                            return again.map(|(shader, _)| shader);
+                        }
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -851,6 +924,7 @@ fn emit_forms(
                     let again = widen_from(deep.as_ref().map(|f| &f.0), driver_loop);
                     report("wave-wide branches", &again);
                     if done(&again) {
+                        *form_out = Form::WaveWide;
                         return again.map(|(shader, _)| shader);
                     }
                 }
@@ -861,6 +935,7 @@ fn emit_forms(
             if !local_on || exact_only {
                 continue;
             }
+            let local_form = if exact { Form::LocalIdiom } else { Form::LocalApproximate };
             for (name, f) in &forms {
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
@@ -872,12 +947,14 @@ fn emit_forms(
                     {
                         report(&format!("local waves (APPROXIMATE, loops left together), {name}"), &together);
                         if done(&together) {
+                            *form_out = local_form;
                             return together.map(|(shader, _)| shader);
                         }
                     }
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
+                        *form_out = local_form;
                         return local.map(|(shader, _)| shader);
                     }
                 }
@@ -889,12 +966,14 @@ fn emit_forms(
                 {
                     report("local waves (APPROXIMATE, loops left together)", &together);
                     if done(&together) {
+                        *form_out = local_form;
                         return together.map(|(shader, _)| shader);
                     }
                 }
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
+                    *form_out = local_form;
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -920,12 +999,14 @@ fn emit_forms(
                         {
                             report(&format!("local waves (APPROXIMATE, any mask, loops left together), {name}"), &together);
                             if done(&together) {
+                                *form_out = Form::LocalApproximateAnyMask;
                                 return together.map(|(shader, _)| shader);
                             }
                         }
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
+                            *form_out = Form::LocalApproximateAnyMask;
                             return local.map(|(shader, _)| shader);
                         }
                     }
@@ -935,12 +1016,14 @@ fn emit_forms(
                 {
                     report("local waves (APPROXIMATE, any mask, loops left together)", &together);
                     if done(&together) {
+                        *form_out = Form::LocalApproximateAnyMask;
                         return together.map(|(shader, _)| shader);
                     }
                 }
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
+                    *form_out = Form::LocalApproximateAnyMask;
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -955,6 +1038,7 @@ fn emit_forms(
             let again = widen_from(deep.as_ref().map(|f| &f.0), false);
             report("wave-wide branches (last resort)", &again);
             if done(&again) {
+                *form_out = Form::WaveWideLastResort;
                 return again.map(|(shader, _)| shader);
             }
         }
@@ -970,7 +1054,10 @@ fn emit_forms(
         {
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), false);
             match again {
-                Ok(_) => again,
+                Ok(_) => {
+                    *form_out = Form::LaneMaskWide;
+                    again
+                }
                 Err(_) => emit_program(c, native, p, st, io, res),
             }
         }
@@ -1000,6 +1087,7 @@ fn emit_forms(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+    *form_out = Form::Threaded;
     emit_program(c, native, &p, &st, &io, &res).and_then(supported)
 }
 
@@ -1050,6 +1138,19 @@ fn widen(
     why: bool,
     active_loop_only: bool,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    widen_seeded(c, native, p, why, active_loop_only, &[])
+}
+
+/// [`widen`] starting from the branches `seed` (the skips `VICTORY_KEEP_LOOP_SKIPS` kept over
+/// a loop, [`ir::drop_skips`]) taken wave-wide.
+fn widen_seeded(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    why: bool,
+    active_loop_only: bool,
+    seed: &[usize],
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
         what: "wave-wide branches in a thread group of several console waves",
@@ -1072,7 +1173,7 @@ fn widen(
         }
         _ => return Err(NOT),
     }
-    let mut wide = std::collections::HashSet::new();
+    let mut wide: std::collections::HashSet<usize> = seed.iter().copied().collect();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;

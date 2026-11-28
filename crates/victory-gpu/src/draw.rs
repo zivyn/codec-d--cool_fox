@@ -1853,6 +1853,20 @@ impl State {
                 list.list.ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
             }
         }
+        // The first ones are said with what they clear (what the title clears is not known
+        // otherwise), then each power of two of them.
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let made = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        if made <= 8 || made.is_power_of_two() {
+            tracing::info!(
+                made,
+                float,
+                rects = rects.len(),
+                values = ?values,
+                ?view,
+                "an unordered access view cleared on the host (VICTORY_CLEAR_UAV=0: not)"
+            );
+        }
     }
 
     /// A descriptor a shader reads through a table: its host slot made if

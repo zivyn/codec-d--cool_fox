@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use anyhow::Context;
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -867,14 +868,14 @@ pub(crate) fn host() -> Option<&'static Host> {
     HOST.get_or_init(|| match create() {
         Ok(host) => Some(host),
         Err(e) => {
-            tracing::warn!(error = %e, "no host D3D12 device; command lists will not run");
+            tracing::warn!(error = %format_args!("{e:#}"), "no host D3D12 device; command lists will not run");
             None
         }
     })
     .as_ref()
 }
 
-fn create() -> windows::core::Result<Host> {
+fn create() -> anyhow::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -928,25 +929,31 @@ fn create() -> windows::core::Result<Host> {
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
         if cfg!(feature = "diagnostics") && crate::switch::on("VICTORY_D3D12_WARP") {
-            let adapter = warp_adapter()?;
-            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            let adapter = warp_adapter().context("selecting the WARP adapter")?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                .context("D3D12CreateDevice(WARP, FL 12_0, ID3D12Device)")?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
             // The card the monitor is on, else the one with the most memory (or the one
             // VICTORY_ADAPTER names), not Windows' first adapter, which is
             // often an integrated GPU.
             if let Some((adapter, name, own)) = victory_shader::emit::host::hardware_adapter()
-                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok()
+                && D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .inspect_err(|e| tracing::warn!(adapter = %name, error = %e, "D3D12CreateDevice(selected adapter, FL 12_0, ID3D12Device) failed"))
+                    .is_ok()
             {
                 tracing::info!(adapter = %name, own_memory_mb = own >> 20, "host device on the card the monitor is on, else the one with the most memory of its own (VICTORY_ADAPTER names another)");
             }
             if device.is_none() {
-                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+                D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)
+                    .context("D3D12CreateDevice(default adapter, FL 12_0, ID3D12Device)")?;
             }
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
-        let device = device.ok_or_else(windows::core::Error::empty)?;
+        let device = device
+            .ok_or_else(windows::core::Error::empty)
+            .context("D3D12CreateDevice returned an empty device")?;
         require_direct_heaps(&device);
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
@@ -1011,26 +1018,32 @@ fn create() -> windows::core::Result<Host> {
         // its device proxy.
         let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
             Some(queue) => queue,
-            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-                ..Default::default()
-            })?,
+            None => device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .context("CreateCommandQueue(DIRECT)")?,
         };
-        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
-        let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+        let fence: ID3D12Fence = device
+            .CreateFence(0, D3D12_FENCE_FLAG_NONE)
+            .context("CreateFence")?;
+        let event = CreateEventW(None, false, false, None).context("CreateEventW")?;
+        let rtvs: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                 NumDescriptors: RTV_RING,
                 ..Default::default()
-            })?;
+            })
+            .context("CreateDescriptorHeap(RTV)")?;
         let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+        let dsvs: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
                 NumDescriptors: RTV_RING,
                 ..Default::default()
-            })?;
+            })
+            .context("CreateDescriptorHeap(DSV)")?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))

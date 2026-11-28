@@ -119,7 +119,7 @@ The cache key holds the value in force (`victory_shader::emit::default_on_switch
 
 | switch | default | since | evidence |
 |---|---|---|---|
-| `VICTORY_KEEP_LOOP_SKIPS` | **on** (`=0` is off) | 2026-11-28 (integ/validation-18) | RTX 4060, LX-A (off) vs LX-B (on): alias copy 19.1 -> 1.9 ms under instrumentation, GPU commands 166.7 -> 140.2 ms in total, no errors, no device removal, identical picture |
+| `VICTORY_KEEP_LOOP_SKIPS` | **on** (`=0` is off); since integ/validation-18b it moves no program out of its exact form unless `VICTORY_KEPT_SKIPS_WIDE=1` (off), so the measured win below needs that | 2026-11-28 (integ/validation-18) | RTX 4060, LX-A (off) vs LX-B (on): alias copy 19.1 -> 1.9 ms under instrumentation, GPU commands 166.7 -> 140.2 ms in total, no errors, no device removal, identical picture |
 | `VICTORY_HALF_EXIT` | **on** (`=0` is off) | 2026-11-28 (integ/validation-18) | same pilot: DefragHeap's loop cut 7.78 ms -> under 0.5 ms |
 | `VICTORY_LOCAL_EXIT` | off (`=1`, `=2`) | not flipped | fails its RTX unit test; being fixed |
 

@@ -58,14 +58,24 @@ list below, in the order it matters:
 
 - **Ray tracing passes are on by default** (`VICTORY_ACTIVATE_RAYS`, `VICTORY_RT_RESOLVE`, `=0` turns each off). With
   them the poster in the cell is the console's pale score again in every run, where the default build showed it
-  purple. The ray programs that shade hits make the first warm-up longer (about 2,700 pipelines, 23 minutes on the
-  test PC with `victory warm`). The rare white screen was not settled by it: it did not show in the runs made, which
+  purple. It costs about 10 ms a frame on the RTX 4060 and is kept on for correctness: it prevents the white-outs
+  and fixes the poster. The ray programs that shade hits also make the first warm-up longer (about 2,700 pipelines,
+  23 minutes on the test PC with `victory warm`). The rare white screen was not seen with it in the runs made, which
   are too few to say it is gone.
-- **The loop fixes are on by default** (`VICTORY_KEEP_LOOP_SKIPS`, `VICTORY_HALF_EXIT`, `=0` turns each off): a wave with
-  no lane left skips its loop as the console does, and the two host waves of a console wave leave a loop of exchanges
-  together. On the RTX the defragmentation pass's loop cut went from 7.78 ms to under 0.5 ms, an alias copy from 19.1
-  to 1.9 ms and all GPU commands from 166.7 to 140.2 ms (instrumented), with no errors and the same picture. The
-  translated programs change, so the shader cache is made again on the first run. `VICTORY_LOCAL_EXIT` (aimed at the
+- **The loop fixes are on by default** (`VICTORY_HALF_EXIT`, `VICTORY_KEEP_LOOP_SKIPS`, `=0` turns each off): the two host
+  waves of a console wave leave a loop of exchanges together (the half that leaves clears its exchange dword at every way
+  out of the loop). A wave with no lane left skips its loop as the console does when `VICTORY_KEEP_LOOP_SKIPS` is on and
+  `VICTORY_KEPT_SKIPS_WIDE=1` takes that skip wave-wide. On the RTX the defragmentation pass's loop cut went from 7.78 ms
+  to under 0.5 ms, an alias copy from 19.1 to 1.9 ms and all GPU commands from 166.7 to 140.2 ms (instrumented), with no
+  errors and the same picture. That measured win is the kept skip taken wave-wide, and after a device removal seen on
+  `integ/validation-18` while loading the wave-wide branches are the suspect, so `integ/validation-18b` keeps the
+  forms a program had without the switch (all exact, no group barrier at a branch): under the defaults
+  `VICTORY_KEEP_LOOP_SKIPS` no longer moves any program out of an exact form or into the wave-wide-barrier form (36
+  programs did on 18), and the two defragmentation programs have to be asked for the cut with
+  `VICTORY_KEPT_SKIPS_WIDE=1` (off; it is in the shader cache key) until that form is cleared. The shader cache key
+  now holds every switch the translator reads (a test guards it), and the translated programs change, so the cache is
+  made again on the first run. Checked against the shader corpus: 0 regressions, and the forms of the defaults equal
+  those with both switches off for all 321 compute programs that are retried in another form. `VICTORY_LOCAL_EXIT` (aimed at the
   blocky hair) stays off until its fix is validated. Also: `FullAdaptive` now validates (2,680 of 2,682 compute programs).
 - **The launcher's settings are code defaults** (`crates/victory-gpu/src/defaults.rs`): `Play-VIctory.cmd` only sets
   the cache and the log. Rule of this fork: the best known setting is the default, a switch is for comparing, and

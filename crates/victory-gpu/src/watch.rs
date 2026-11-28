@@ -256,7 +256,24 @@ fn protect_chunked(mut g: Guards, from: usize, to: usize) -> Guards {
     let pieces = chunks_of(from, to, guard_chunk());
     let last = pieces.len() - 1;
     for (i, (a, b)) in pieces.into_iter().enumerate() {
-        protect(&mut g, a, b);
+        if i == 0 {
+            protect(&mut g, a, b);
+        } else {
+            // (The lock was let go: what the kernel began to write or the
+            // runtime to change meanwhile is left alone.)
+            let mut at = a;
+            for block in a..b {
+                if g.left_alone(block) {
+                    if at < block {
+                        protect(&mut g, at, block);
+                    }
+                    at = block + 1;
+                }
+            }
+            if at < b {
+                protect(&mut g, at, b);
+            }
+        }
         if i < last {
             g = g.again();
         }

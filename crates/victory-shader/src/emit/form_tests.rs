@@ -272,7 +272,9 @@ fn top_exit_lowered(half_exit: bool) -> Result<HostShader, ShaderError> {
     lower::set_program_tag(b"a top exit");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     lower::TEST_HALF_EXIT.set(Some(half_exit));
-    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    lower::exit_clear::CLEARS.set((0, 0));
+    let (shader, form) = super::emit_as(&c, &native, &p, &st, &io, &res);
+    eprintln!("top exit, half exit {half_exit}: form {form:?}, (clearings, exits passed first) {:?}", lower::exit_clear::CLEARS.get());
     lower::TEST_HALF_EXIT.set(None);
     lower::TEST_HOST_WAVE.set(was);
     shader

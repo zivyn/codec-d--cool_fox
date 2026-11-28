@@ -24,6 +24,12 @@ thread_local! {
     static LATE: RefCell<BTreeSet<usize>> = const { RefCell::new(BTreeSet::new()) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The clearings emitted by the lowerings on this thread, and the exits passed before an exchange.
+    pub(in crate::emit) static CLEARS: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// What the lowering of one program knows of its loops for the clearing.
 #[derive(Default)]
 pub(super) struct State {
@@ -141,9 +147,13 @@ impl Lower<'_> {
                 || self.exchanged > self.loop_exchanged.get(h).copied().unwrap_or(u32::MAX)
         });
         if !known {
+            #[cfg(test)]
+            CLEARS.set((CLEARS.get().0, CLEARS.get().1 + 1));
             self.exit_clear.passed.extend(headers);
             return;
         }
+        #[cfg(test)]
+        CLEARS.set((CLEARS.get().0 + 1, CLEARS.get().1));
         if stays {
             self.half_leaves(f, cond);
         } else {

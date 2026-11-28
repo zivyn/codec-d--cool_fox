@@ -26,7 +26,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 pub(super) mod intersect;
 
 #[path = "exit_clear.rs"]
-mod exit_clear;
+pub(super) mod exit_clear;
 #[path = "wave_idiom.rs"]
 mod wave_idiom;
 pub(super) use wave_idiom::wave_local;

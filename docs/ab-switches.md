@@ -217,7 +217,13 @@ fix/expo1-ambient-gain adds one more live entry (`LIVE`, 94 entries): `VICTORY_A
 `VICTORY_PIPELINE_RAM_FREE_MB` (perf/cold2: the cold start, read when the pipelines are made), `VICTORY_LIBRARY_STATIC_SAMPLERS` (fix/white3-static-samplers: **the fix is on by
 default**: pipelines with static samplers are neither loaded from nor stored in the pipeline library; `=1` restores the old behaviour, read once when the
 library opens), `VICTORY_SAMPLER_TABLE` (fix/sampler-table, off, read once: immediate samplers become tables of a 64-slot region at the end of each sampler heap, so the library can keep those pipelines again; the library names carry `sampler-table-v1`), and the translation switches `VICTORY_WAVE_WIDE_AUTO` (fix/hairw) and `VICTORY_BVH_MISS` (perf/rt-cost), both off and in the shader cache key by the text, so with
-them unset the emitted code is the one of integ/validation-27 (the corpus of integ/validation-28 says so). fix/water2 (`VICTORY_LOOPS_WAVE`, `VICTORY_LDS_FIRST_INIT`) is not in this integration.
+them unset the emitted code is the one of integ/validation-27 (the corpus of integ/validation-28 says so).
+
+## What integ/validation-29 adds to the A/B (2026-11-28)
+
+integ/validation-28 (88587ca00) plus perf/cpu3 (with perf/lane5), fix/expo1-ambient-gain, fix/expo2 and fix/water2, all `--no-ff`, everything off by default. `ab/registry.rs` (`LIVE`) has **98 entries**: integ/validation-28's 94 (the 93 plus `VICTORY_AMBIENT_GAIN`, which was already counted above) plus the four of perf/cpu3: `VICTORY_WAIT_NICE` (the title's wait loops; with `VICTORY_AB` naming it the loader replaces no `monitorx`/`mwaitx`, so the off arm spins through the exception path and is not a plain spin), `VICTORY_VIEW_AT_CACHE`, `VICTORY_KEEP_FAST` and `VICTORY_STATE_FILTER` (the last two were read once before and are live now). `VICTORY_AB_SCREEN=1` (perf/lane5) is a mode of the A/B itself, not a switch of the list: up to 31 named switches, one effect each from one run.
+Diagnostics added, no effect on the emitted code or the frame: `VICTORY_SPIN_SAMPLE=<ms>` (share of the title's processor time spent in wait loops), `VICTORY_LIST_OPS=1` (calls and wall time of each list-translator operation), `VICTORY_CAPTURE_BUFFER_WORDS` (fix/expo2).
+**Not live (translation, off, in the shader cache key by the text):** `VICTORY_LOOPS_WAVE` (`=1`, `=2`), `VICTORY_LOOPS_WAVE_ONLY=<names>`, `VICTORY_LDS_FIRST_INIT`, `VICTORY_KEEP_STALLING_SKIPS` (fix/water2); compare them by warming their own cache and pairs of processes, not inside one. With them unset the emitted code is integ/validation-28's (the corpus of integ/validation-29 says so). Not merged, follow-ups: perf/bindless-buffers (CPU2), perf/card-propagate (CPU4), perf/cpu5.
 
 ## Switches of the lane that are on by default
 

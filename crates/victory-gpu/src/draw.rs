@@ -519,6 +519,15 @@ pub(crate) fn state_filter() -> u8 {
 #[cfg(test)]
 static TEST_STATE_FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
 
+/// A hash of root constants and their number, for the filter (`root_changed`, what 1).
+fn constants_hash(values: &[u32]) -> u64 {
+    let mut h = values.len() as u64;
+    for &v in values {
+        h = (h.rotate_left(5) ^ u64::from(v)).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    h
+}
+
 /// Per frame, for the line: root constants, root descriptors, root tables, vertex buffers, index buffers: asked and
 /// left out as the host list had them already (filter 1) or would have (2).
 static CALLS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
@@ -611,6 +620,39 @@ impl State {
         self.calls[8] += 1;
         self.calls[9] += u64::from(same);
         !(same && mode == 1)
+    }
+
+    /// The user data of a stage, `values` for root parameter `param`: set on the host list, unless the filter knows it
+    /// has them, or the call is one after the head of a run, whose commands set what differs (`fold_note`).
+    fn set_user_data(&mut self, l: &ID3D12GraphicsCommandList, compute: bool, param: u32, values: &[u32]) {
+        let quiet = self.fold_note(compute, param, values);
+        // (With the filter: a hash of the dwords and their number says whether the list has them.)
+        let set = !quiet && (state_filter() == 0 || self.root_changed(compute, param, 1, constants_hash(values)));
+        // SAFETY: an open list; `values` covers the parameter.
+        if set {
+            unsafe {
+                if compute {
+                    l.SetComputeRoot32BitConstants(param, values.len() as u32, values.as_ptr().cast(), 0);
+                } else {
+                    l.SetGraphicsRoot32BitConstants(param, values.len() as u32, values.as_ptr().cast(), 0);
+                }
+            }
+        }
+    }
+
+    /// The host list was given `values` for root parameter `param` without [`State::root_changed`] having been asked
+    /// (the user data of the call that ended a run, set after it): the filter's record is what the list holds.
+    fn root_told(&mut self, compute: bool, param: u32, values: &[u32]) {
+        if state_filter() == 0 {
+            return;
+        }
+        let shadow = &mut self.root_shadow[usize::from(compute)];
+        if shadow.is_empty() {
+            shadow.resize(64, (0, 0));
+        }
+        if let Some(have) = shadow.get_mut(param as usize) {
+            *have = (1, constants_hash(values));
+        }
     }
 
     /// The host list has other root arguments than it was told: its root signature was set, or its heaps.
@@ -1921,26 +1963,7 @@ impl State {
                 }
                 // (A call after the head of a run made one: its dwords are in
                 // the run's commands, and the host list is not told.)
-                let quiet = self.fold_note(compute, param, values);
-                // (With the filter: a hash of the dwords and their number says whether the list has them.)
-                let set = !quiet
-                    && (state_filter() == 0 || {
-                        let mut h = u64::from(dwords);
-                        for &v in values.iter() {
-                            h = (h.rotate_left(5) ^ u64::from(v)).wrapping_mul(0x517c_c1b7_2722_0a95);
-                        }
-                        self.root_changed(compute, param, 1, h)
-                    });
-                // SAFETY: an open list; `values` covers the parameter.
-                if set {
-                    unsafe {
-                        if compute {
-                            l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                        } else {
-                            l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                        }
-                    }
-                }
+                self.set_user_data(l, compute, param, values);
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -3583,11 +3606,15 @@ impl State {
         };
         let (of, image) = entry(places.image)?;
         let (seen, depth) = if role == Role::Resolve { entry(places.depth)? } else { (of, image) };
-        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT, or the 16-bit float RGBA that stands in for it with
+        // `VICTORY_R11G11B10_AS_F16`: the pass reads and writes the image through a typed view, three channels of it.)
+        let format = if role == Role::Resolve { 42 } else { crate::resource::target_format(26) as i32 };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || volume != (role == Role::Air) {
             return Err("its image is of another format or dimension");
+        }
+        if role != Role::Resolve && format != 26 {
+            once!("the indirect light stand-in (VICTORY_AMBIENT) runs on 16-bit float images (VICTORY_R11G11B10_AS_F16)");
         }
         if (seen.Width, seen.Height) != (of.Width, of.Height) {
             return Err("its depth is of another size than its image");
@@ -5492,7 +5519,7 @@ mod state_filter_tests {
     use super::*;
 
     /// The tests set one switch for the whole process, so they run one at a time.
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// What the host list holds for each of 64 root parameters, as the calls that reach it leave it.
     type Model = [Option<(u64, u64)>; 64];

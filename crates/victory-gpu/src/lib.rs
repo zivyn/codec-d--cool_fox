@@ -95,6 +95,8 @@ mod pagedrive;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod standin;
+#[cfg(windows)]
 mod sites;
 #[cfg(windows)]
 mod tiles;

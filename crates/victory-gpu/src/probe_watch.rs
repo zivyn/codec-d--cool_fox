@@ -15,6 +15,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::object::This;
 use crate::resource::HostTexture;
+use crate::standin::Voxel;
 
 const WIDTH: u64 = 32;
 const HEIGHT: u32 = 16;
@@ -22,6 +23,7 @@ const DEPTH: u16 = 64;
 const R16_FLOAT: i32 = 54;
 const R11G11B10_FLOAT: i32 = 26;
 const R8G8B8A8_UNORM: i32 = 28;
+const R16G16B16A16_FLOAT: i32 = 10;
 
 /// Seconds between samples (`VICTORY_PROBE_WATCH`), 0: off.
 fn period() -> u64 {
@@ -37,7 +39,10 @@ fn period() -> u64 {
 struct Volume {
     resource: usize,
     copy: Arc<HostTexture>,
+    /// The title's format (R11G11B10_FLOAT for a volume the host holds in 16-bit float RGBA).
     format: i32,
+    /// The host holds it as the stand-in (`VICTORY_R11G11B10_AS_F16`): 8-byte texels of 4 half floats.
+    halves: bool,
 }
 
 #[derive(Default)]
@@ -70,21 +75,26 @@ pub(crate) fn note(resource: This) {
     };
     // SAFETY: a live texture.
     let d = unsafe { copy.texture.GetDesc() };
+    // (A title volume of R11G11B10_FLOAT the host holds as 16-bit float RGBA: what the title has it as is what is logged.)
+    let halves = d.Format.0 == R16G16B16A16_FLOAT && crate::resource::stands_in_r11g11b10(resource);
+    let format = if halves { R11G11B10_FLOAT } else { d.Format.0 };
     let volume = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
         && d.Width == WIDTH
         && d.Height == HEIGHT
         && d.DepthOrArraySize == DEPTH
-        && matches!(d.Format.0, R16_FLOAT | R11G11B10_FLOAT | R8G8B8A8_UNORM);
+        && matches!(format, R16_FLOAT | R11G11B10_FLOAT | R8G8B8A8_UNORM);
     if volume && book.volumes.len() < 16 {
         tracing::info!(
             resource = format_args!("{:#x}", resource as usize),
-            format = d.Format.0,
+            format,
+            host_format = d.Format.0,
             "probe watch: a volume the title writes"
         );
         book.volumes.push(Volume {
             resource: resource as usize,
             copy,
-            format: d.Format.0,
+            format,
+            halves,
         });
     }
 }
@@ -142,21 +152,18 @@ fn read(host: &crate::host::Host, volume: &Volume) -> Option<(Vec<u8>, usize)> {
     // SAFETY: the copy finished; the mapping spans the footprint's rows.
     unsafe {
         buffer.Map(0, None, Some(&mut data)).ok()?;
-        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), rows).to_vec();
+        // (The buffer holds the last row without its padding.)
+        let held = usize::try_from(buffer.GetDesc().Width).unwrap_or(usize::MAX);
+        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), rows.min(held)).to_vec();
         buffer.Unmap(0, None);
         Some((bytes, pitch))
     }
 }
 
-/// An unsigned small float (5 exponent bits, `man` mantissa bits) as a number.
-fn small(bits: u32, man: u32) -> f32 {
-    let e = bits >> man;
-    let m = bits & ((1 << man) - 1);
-    match e {
-        0 => m as f32 / (1 << man) as f32 * 2f32.powi(-14),
-        31 => f32::INFINITY,
-        _ => (1.0 + m as f32 / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
-    }
+/// The four 16-bit floats of a texel of the stand-in.
+fn halves_at(bytes: &[u8], pitch: usize, x: usize, y: usize, z: usize) -> [u16; 4] {
+    let at = (z * HEIGHT as usize + y) * pitch + x * 8;
+    [0, 2, 4, 6].map(|k| u16::from_le_bytes([bytes[at + k], bytes[at + k + 1]]))
 }
 
 fn texel(bytes: &[u8], pitch: usize, size: usize, x: usize, y: usize, z: usize) -> u32 {
@@ -172,13 +179,13 @@ pub(crate) fn sample(frame: u64) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let volumes: Vec<(usize, Arc<HostTexture>, i32)> = {
+    let volumes: Vec<(usize, Arc<HostTexture>, i32, bool)> = {
         let book = BOOK.lock().unwrap_or_else(|e| e.into_inner());
         book.as_ref()
             .map(|b| {
                 b.volumes
                     .iter()
-                    .map(|v| (v.resource, v.copy.clone(), v.format))
+                    .map(|v| (v.resource, v.copy.clone(), v.format, v.halves))
                     .collect()
             })
             .unwrap_or_default()
@@ -186,11 +193,12 @@ pub(crate) fn sample(frame: u64) {
     let mut state: Option<Vec<bool>> = None;
     let mut minus1 = [0u32; 3];
     // The state volume first: the others are looked at by what it says.
-    for (resource, copy, format) in volumes.iter().filter(|v| v.2 == R16_FLOAT) {
+    for (resource, copy, format, halves) in volumes.iter().filter(|v| v.2 == R16_FLOAT) {
         let v = Volume {
             resource: *resource,
             copy: copy.clone(),
             format: *format,
+            halves: *halves,
         };
         let Some((bytes, pitch)) = read(host, &v) else {
             continue;
@@ -225,29 +233,38 @@ pub(crate) fn sample(frame: u64) {
         break;
     }
     let Some(minus_one) = state else { return };
-    for (resource, copy, format) in volumes.iter().filter(|v| v.2 != R16_FLOAT) {
+    for (resource, copy, format, halves) in volumes.iter().filter(|v| v.2 != R16_FLOAT) {
         let v = Volume {
             resource: *resource,
             copy: copy.clone(),
             format: *format,
+            halves: *halves,
         };
         let Some((bytes, pitch)) = read(host, &v) else {
             continue;
         };
         // Zero voxels among those the state volume marks -1 and among the others; the
         // magnitudes (largest channel) of the -1 ones: zero, < 2^-12, < 2^-8, < 1, >= 1.
-        let (mut zero_m1, mut zero_other, mut flag5) = (0u32, 0u32, 0u32);
+        let (mut zero_m1, mut zero_other, mut flag5, mut negative) = (0u32, 0u32, 0u32, 0u32);
         let mut bins = [0u32; 5];
         for z in 0..usize::from(DEPTH) {
             for y in 0..HEIGHT as usize {
                 for x in 0..WIDTH as usize {
-                    let t = texel(&bytes, pitch, 4, x, y, z);
                     let m1 = minus_one[(z * HEIGHT as usize + y) * WIDTH as usize + x];
                     if *format == R8G8B8A8_UNORM {
-                        flag5 += u32::from(t >> 24 == 5);
+                        flag5 += u32::from(texel(&bytes, pitch, 4, x, y, z) >> 24 == 5);
                         continue;
                     }
-                    if t == 0 {
+                    // (The stand-in holds four 16-bit floats a texel: what R11G11B10 would hold of them is looked at.)
+                    let voxel = if *halves {
+                        Voxel::halves(halves_at(&bytes, pitch, x, y, z))
+                    } else {
+                        Voxel::packed(texel(&bytes, pitch, 4, x, y, z))
+                    };
+                    if m1 && voxel.negative {
+                        negative += 1;
+                    }
+                    if voxel.zero {
                         if m1 {
                             zero_m1 += 1;
                             bins[0] += 1;
@@ -259,9 +276,7 @@ pub(crate) fn sample(frame: u64) {
                     if !m1 {
                         continue;
                     }
-                    let big = small(t & 0x7ff, 6)
-                        .max(small(t >> 11 & 0x7ff, 6))
-                        .max(small(t >> 22, 5));
+                    let big = voxel.magnitude;
                     let bin = if big < 2f32.powi(-12) {
                         1
                     } else if big < 2f32.powi(-8) {
@@ -288,27 +303,13 @@ pub(crate) fn sample(frame: u64) {
                 frame,
                 seconds = clock(),
                 resource = format_args!("{resource:#x}"),
+                stand_in = *halves,
                 zero_in_minus_one = zero_m1,
                 zero_elsewhere = zero_other,
+                negative_in_minus_one = negative,
                 magnitudes = ?bins,
                 "probe watch: a light volume (zero, <2^-12, <2^-8, <1, >=1 among the -1 voxels)"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::small;
-
-    #[test]
-    fn the_small_floats_read_as_numbers() {
-        // 11-bit: 5 exponent bits (bias 15), 6 mantissa bits.
-        assert_eq!(small(15 << 6, 6), 1.0);
-        assert_eq!(small(16 << 6 | 32, 6), 3.0);
-        assert_eq!(small(1, 6), 2f32.powi(-20));
-        // 10-bit: 5 mantissa bits.
-        assert_eq!(small(15 << 5, 5), 1.0);
-        assert!(small(31 << 5, 5).is_infinite());
     }
 }

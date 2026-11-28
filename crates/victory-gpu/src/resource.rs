@@ -335,6 +335,23 @@ pub(crate) fn stands_in(this: This) -> bool {
             .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 as u32 == target_format(own))
 }
 
+/// Whether `this` is a title texture of R11G11B10_FLOAT whose host copy stands in for it in 16-bit float RGBA
+/// (`VICTORY_R11G11B10_AS_F16`): what the title copies into it in its own format is converted ([`crate::standin`]).
+#[cfg(windows)]
+pub(crate) fn stands_in_r11g11b10(this: This) -> bool {
+    !this.is_null() && pc_format(resource(this).desc.format) == 26 && stands_in(this)
+}
+
+/// Whether `this` is a title texture of R11G11B10_FLOAT whose host copy is of that format too (not a stand-in).
+#[cfg(windows)]
+pub(crate) fn holds_r11g11b10(this: This) -> bool {
+    !this.is_null()
+        && pc_format(resource(this).desc.format) == 26
+        && host_resource(this)
+            // SAFETY: a live resource.
+            .is_some_and(|host| unsafe { host.GetDesc() }.Format.0 == 26)
+}
+
 /// Depth textures the title also asks unordered access for (the console
 /// allows both; the host copy loses the unordered access): how many were
 /// made, and how often such a texture was bound as the depth target,
@@ -691,6 +708,27 @@ pub(crate) struct PlacedFootprint {
 }
 
 impl PlacedFootprint {
+    /// A footprint of `format` (a DXGI format number), `size` texels (width, height, depth), its rows `row_pitch` bytes
+    /// apart, at `offset` in its buffer.
+    pub(crate) fn new(offset: u64, format: u32, size: [u32; 3], row_pitch: u32) -> PlacedFootprint {
+        PlacedFootprint { offset, format, width: size[0], height: size[1], depth: size[2], row_pitch }
+    }
+
+    /// Its DXGI format number.
+    pub(crate) fn format(&self) -> u32 {
+        self.format
+    }
+
+    /// Its width, height and depth in texels.
+    pub(crate) fn size(&self) -> [u32; 3] {
+        [self.width, self.height, self.depth]
+    }
+
+    /// The bytes between its rows.
+    pub(crate) fn row_pitch(&self) -> u32 {
+        self.row_pitch
+    }
+
     /// The bytes it spans in a buffer: every row pitched but the last.
     pub(crate) fn bytes(&self) -> Option<u64> {
         let (element, block) = element(self.format)?;

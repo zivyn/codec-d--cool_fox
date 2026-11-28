@@ -3317,6 +3317,148 @@ void main(uint3 group : SV_GroupID) {
         }
     }
 
+    /// The title's R11G11B10_FLOAT texels, read from a buffer at an offset and a pitch of the title's (and a slice of
+    /// two rows' height, as a footprint of a volume has), become 16-bit float RGBA rows of 256-byte pitch: each
+    /// texel is `standin::texel` of its word, only what the region names is written, and the rest of the output
+    /// stays as it was.
+    #[test]
+    fn warp_r11g11b10_texels_are_converted_to_half_floats() {
+        use crate::standin::{Region, make, record, texel};
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make(&warp.device).expect("the conversion pass must compile on WARP");
+        // 5 x 3 x 2 texels, rows 44 bytes apart, a slice of 4 rows, from byte 20.
+        let region = Region { width: 5, height: 3, depth: 2, src_offset: 20, src_pitch: 44, src_slice: 44 * 4 };
+        let (_src, src_ptr, src_gpu) = warp.shared_buffer(4096);
+        let dst = warp.default_uav(region.dst_bytes());
+        let (back, back_ptr, _) = warp.shared_buffer(region.dst_bytes());
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 16) as u32
+        };
+        // Every word of the source is something; the ones the region names are the ones to find in the output.
+        let words: Vec<u32> = (0..1024).map(|i| if i % 7 == 0 { next() & 0x0000_ffff } else { next() }).collect();
+        for (i, &w) in words.iter().enumerate() {
+            // SAFETY: 4 KiB of mapped memory nothing reads yet.
+            unsafe { src_ptr.cast::<u32>().add(i).write_volatile(w) };
+        }
+        // SAFETY: mapped memory nothing reads yet.
+        unsafe { std::ptr::write_bytes(back_ptr, 0xcd, region.dst_bytes() as usize) };
+        record(&warp.list, &pass, src_gpu, &dst, &region);
+        // SAFETY: an open list; buffers we made, the first in the copy source state.
+        unsafe {
+            warp.list.CopyBufferRegion(&back, 0, &dst, 0, region.dst_bytes());
+        }
+        warp.submit_and_wait();
+        let pitch = region.dst_pitch() as usize;
+        for z in 0..region.depth as usize {
+            for y in 0..region.height as usize {
+                for xx in 0..region.width as usize {
+                    let word = words[(region.src_offset as usize + z * region.src_slice as usize + y * region.src_pitch as usize + xx * 4) / 4];
+                    let at = z * pitch * region.height as usize + y * pitch + xx * 8;
+                    let got: Vec<u16> = (0..4)
+                        // SAFETY: the list has run; mapped bytes inside the output.
+                        .map(|c| unsafe { back_ptr.add(at + c * 2).cast::<u16>().read_unaligned() })
+                        .collect();
+                    assert_eq!(got, texel(word), "texel {xx},{y},{z} of word {word:#x}");
+                }
+            }
+        }
+    }
+
+    /// Three executions of one pipeline, the user data of the third what the first had (a material that comes back
+    /// after another), with the second not able to join the first's run (it differs in more dwords than a command
+    /// holds): each execution sees its own constants, with the user data filter on, whether the third heads a run or
+    /// is no part of one. (The run of one the second ends was left with the filter's record of the first's dwords, so
+    /// the third's were taken to be on the list already.)
+    #[test]
+    fn warp_a_run_of_one_ended_by_the_next_call_leaves_the_roots_as_the_calls_do() {
+        use crate::draw::fold::seam::{Filter, Stream};
+        const CS: &str = r#"
+#define RS "RootConstants(num32BitConstants=16, b0), UAV(u0)"
+cbuffer Call : register(b0) {
+    uint4 v[4];
+};
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    uint at;
+    seen.InterlockedAdd(0, 1, at);
+    seen.Store(16 + at * 16, v[0].x);
+    seen.Store(16 + at * 16 + 4, v[1].y);
+    seen.Store(16 + at * 16 + 8, v[3].w);
+}
+"#;
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let worker = compile_cs(&warp.device, CS).expect("the worker must compile");
+        let _filter = Filter::on();
+        let a: Vec<u32> = (0..16).map(|d| 100 + d).collect();
+        let b: Vec<u32> = (0..16).map(|d| 200 + d).collect();
+        let ways = ["call by call", "the third after the run", "the third heads a run"];
+        let seen: Vec<ID3D12Resource> = ways.iter().map(|_| warp.default_uav(4096)).collect();
+        let (back, back_ptr, _) = warp.shared_buffer(4096 * ways.len() as u64);
+        let list = warp.list.clone();
+        let dispatch = || {
+            // SAFETY: an open list with our root signature, pipeline and log.
+            unsafe {
+                list.Dispatch(1, 1, 1);
+                list.ResourceBarrier(&[uav_barrier()]);
+            }
+        };
+        // SAFETY: an open list, our root signature and pipeline, live buffers.
+        unsafe {
+            list.SetComputeRootSignature(&worker.root);
+            list.SetPipelineState(&worker.pso);
+        }
+        for (way, log) in seen.iter().enumerate() {
+            // SAFETY: as above.
+            unsafe { list.SetComputeRootUnorderedAccessView(1, log.GetGPUVirtualAddress()) };
+            if way == 0 {
+                for values in [&a, &b, &a] {
+                    // SAFETY: an open list; 16 dwords.
+                    unsafe { list.SetComputeRoot32BitConstants(0, 16, values.as_ptr().cast(), 0) };
+                    dispatch();
+                }
+                continue;
+            }
+            let mut stream = Stream::new(&worker.root);
+            stream.plan(2);
+            stream.call(&list, &a, &mut || dispatch());
+            stream.call(&list, &b, &mut || dispatch());
+            stream.end(&mut || dispatch());
+            if way == 1 {
+                stream.plain(&list, &a);
+                dispatch();
+            } else {
+                stream.plan(2);
+                stream.call(&list, &a, &mut || dispatch());
+                stream.end(&mut || dispatch());
+            }
+        }
+        // SAFETY: an open list; buffers we made.
+        unsafe {
+            for (way, log) in seen.iter().enumerate() {
+                list.ResourceBarrier(&[transition(log, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyBufferRegion(&back, 4096 * way as u64, log, 0, 4096);
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run; mapped words.
+        let word = |at: usize| unsafe { back_ptr.cast::<u32>().add(at).read_volatile() };
+        for (way, name) in ways.iter().enumerate() {
+            assert_eq!(word(way * 1024), 3, "{name}: executions");
+            let got: Vec<[u32; 3]> = (0..3).map(|k| [0, 1, 2].map(|w| word(way * 1024 + 4 + k * 4 + w))).collect();
+            assert_eq!(got, [[100, 105, 115], [200, 205, 215], [100, 105, 115]], "{name}");
+        }
+    }
+
     /// A run of executions whose root SRVs are read through the view heap by an index in the user data
     /// (`VICTORY_FOLD_VIEWS`: `ResourceDescriptorHeap[index]`, here a table over the heap that an array of raw
     /// buffers is indexed in, which is the same read of the same slots) is one execution whose commands set the

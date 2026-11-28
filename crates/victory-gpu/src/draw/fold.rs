@@ -243,18 +243,17 @@ impl Run {
         self.layout.iter().map(|b| b.1 as usize).sum()
     }
 
-    /// A run of the same kind and pipeline whose head is the call being
-    /// prepared.
-    fn successor(&self, left: u32) -> Run {
+    /// A run with no call yet: `left` more calls come of what the stream planned.
+    fn new(left: u32, (kind, stride): (u32, u32), (compute, pso): (bool, usize), root: ID3D12RootSignature, key: Vec<u64>, views: bool) -> Run {
         Run {
             left,
-            kind: self.kind,
-            stride: self.stride,
-            compute: self.compute,
-            pso: self.pso,
-            root: self.root.clone(),
-            key: self.key.clone(),
-            views: self.views,
+            kind,
+            stride,
+            compute,
+            pso,
+            root,
+            key,
+            views,
             scratch: None,
             table: (0, 0),
             first: 0,
@@ -271,6 +270,19 @@ impl Run {
             depth: 0,
             late_depth: None,
         }
+    }
+
+    /// A run of the same kind and pipeline whose head is the call being
+    /// prepared.
+    fn successor(&self, left: u32) -> Run {
+        Run::new(
+            left,
+            (self.kind, self.stride),
+            (self.compute, self.pso),
+            self.root.clone(),
+            self.key.clone(),
+            self.views,
+        )
     }
 }
 
@@ -436,31 +448,14 @@ impl State {
         }
         // (Read once, here: the run keeps what it began with.)
         let views = views_on();
-        let mut run = Run {
-            left: left - 1,
-            kind,
-            stride,
-            compute: p.compute,
-            pso: p.pso.as_raw() as usize,
-            root: p.root.clone(),
-            key: self.fold_views(p, views).collect(),
+        let mut run = Run::new(
+            left - 1,
+            (kind, stride),
+            (p.compute, p.pso.as_raw() as usize),
+            p.root.clone(),
+            self.fold_views(p, views).collect(),
             views,
-            scratch: None,
-            table: (0, 0),
-            first: 0,
-            ats: Vec::new(),
-            layout: Vec::new(),
-            values: Vec::new(),
-            vary: Vec::new(),
-            calls: 0,
-            next_vary: Vec::new(),
-            capturing: true,
-            cur_layout: Vec::new(),
-            cur: Vec::new(),
-            cur_at: 0,
-            depth: 0,
-            late_depth: None,
-        };
+        );
         run.ats.reserve(8);
         self.fold = Mode::On(Box::new(run));
         true
@@ -530,12 +525,25 @@ impl State {
 
     /// The call was prepared (`ran`: it can run): it joins the run or ends it.
     pub(super) fn fold_after(&mut self, list: &HostList, ran: bool) {
-        let Mode::On(mut run) = std::mem::take(&mut self.fold) else { return };
+        let Some((run, late)) = self.fold_judge(ran) else { return };
+        // This call ends the run, and is the head of the next: what it
+        // needed that the host list did not get is told now.
+        self.fold_make(list, *run);
+        if let Some(state) = late {
+            crate::list::ensure_state(list, self.depth as This, state);
+        }
+        self.fold_tell(&list.list);
+    }
+
+    /// [`State::fold_after`] without the host list: the call joins the run (`None`), or ends it and begins the next, which
+    /// holds the call (the run that ended and the state the depth target is to be moved to after it).
+    fn fold_judge(&mut self, ran: bool) -> Option<(Box<Run>, Option<u32>)> {
+        let Mode::On(mut run) = std::mem::take(&mut self.fold) else { return None };
         run.capturing = false;
         if !ran {
             // A head that did not run is no run; a call after it that did not run is not in it.
             self.fold = if run.calls == 0 { Mode::Planned(run.left) } else { Mode::On(run) };
-            return;
+            return None;
         }
         if run.calls == 0 {
             run.layout = std::mem::take(&mut run.cur_layout);
@@ -544,7 +552,7 @@ impl State {
             run.ats.push(run.cur_at);
             run.calls = 1;
             self.fold = Mode::On(run);
-            return;
+            return None;
         }
         // (A root signature holds 64 dwords: the masks of what differs are 64 bits.)
         let shape = run.cur_layout == run.layout && run.layout.iter().all(|b| b.1 <= 64);
@@ -574,11 +582,9 @@ impl State {
             run.ats.push(run.cur_at);
             run.calls += 1;
             self.fold = Mode::On(run);
-            return;
+            return None;
         }
         COUNTS[why].fetch_add(1, Relaxed);
-        // This call ends the run, and is the head of the next: what it
-        // needed that the host list did not get is told now.
         let late = run.late_depth;
         let mut next = run.successor(run.left);
         next.layout = std::mem::take(&mut run.cur_layout);
@@ -591,25 +597,39 @@ impl State {
         next.calls = 1;
         next.capturing = false;
         next.depth = late.unwrap_or(run.depth);
-        self.fold_make(list, *run);
-        if let Some(state) = late {
-            crate::list::ensure_state(list, self.depth as This, state);
-        }
-        self.fold_set(list, &next.layout, &next.values, next.compute);
         self.fold = Mode::On(Box::new(next));
+        Some((run, late))
+    }
+
+    /// The call that ended a run (the head of the one now open) did not set its user data on the host list: sets it, after
+    /// the run that ended. The list then holds these dwords, and the filter is told (`root_changed`): the next call that
+    /// asks for the dwords of the call before (a material that comes back after another) must set them again.
+    fn fold_tell(&mut self, l: &ID3D12GraphicsCommandList) {
+        let Mode::On(run) = &mut self.fold else { return };
+        let (layout, values, compute) = (std::mem::take(&mut run.layout), std::mem::take(&mut run.values), run.compute);
+        self.fold_set(l, &layout, &values, compute);
+        let mut at = 0usize;
+        for &(param, dwords) in &layout {
+            self.root_told(compute, param, &values[at..at + dwords as usize]);
+            at += dwords as usize;
+        }
+        if let Mode::On(run) = &mut self.fold {
+            run.layout = layout;
+            run.values = values;
+        }
     }
 
     /// Sets the user data blocks `layout` of `values` on the host list.
-    fn fold_set(&self, list: &HostList, layout: &[(u32, u32)], values: &[u32], compute: bool) {
+    fn fold_set(&self, l: &ID3D12GraphicsCommandList, layout: &[(u32, u32)], values: &[u32], compute: bool) {
         let mut at = 0usize;
         for &(param, dwords) in layout {
             let block = &values[at..at + dwords as usize];
             // SAFETY: an open list; the block covers the parameter's dwords.
             unsafe {
                 if compute {
-                    list.list.SetComputeRoot32BitConstants(param, dwords, block.as_ptr().cast(), 0);
+                    l.SetComputeRoot32BitConstants(param, dwords, block.as_ptr().cast(), 0);
                 } else {
-                    list.list.SetGraphicsRoot32BitConstants(param, dwords, block.as_ptr().cast(), 0);
+                    l.SetGraphicsRoot32BitConstants(param, dwords, block.as_ptr().cast(), 0);
                 }
             }
             at += dwords as usize;
@@ -658,6 +678,99 @@ impl State {
         if !single {
             // What the commands set is no longer what the host list holds.
             self.forget_roots();
+        }
+    }
+}
+
+/// What a test needs to play a stream of executions through the state of a draw (the user data filter, the runs) on a
+/// list of its own: the host list is a plain command list, and the executions are recorded by the test.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    /// The user data filter on (`VICTORY_STATE_FILTER=1`) for one test: the tests that set it run one at a time.
+    pub(crate) struct Filter(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Filter {
+        pub(crate) fn on() -> Filter {
+            let one = super::super::state_filter_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            super::super::TEST_STATE_FILTER.store(1, Ordering::Relaxed);
+            Filter(one)
+        }
+    }
+
+    impl Drop for Filter {
+        fn drop(&mut self) {
+            super::super::TEST_STATE_FILTER.store(u8::MAX, Ordering::Relaxed);
+        }
+    }
+
+    /// The executions of one compute pipeline with one block of user data in root parameter 0 (a dispatch: the run
+    /// logic is that of the draws, whose records and places the test does not need).
+    pub(crate) struct Stream {
+        state: State,
+        root: ID3D12RootSignature,
+    }
+
+    impl Stream {
+        const PSO: usize = 1;
+
+        /// The host list has `root` and the pipeline set.
+        pub(crate) fn new(root: &ID3D12RootSignature) -> Stream {
+            let mut state = State::default();
+            state.host_pipeline = Self::PSO;
+            state.host_roots[1] = root.as_raw() as usize;
+            Stream { state, root: root.clone() }
+        }
+
+        /// The stream says `n` executions come that may be one run.
+        pub(crate) fn plan(&mut self, n: u32) {
+            self.state.fold_begin(n);
+        }
+
+        /// An execution of the plan arrives with the user data `values`: it is prepared as `State::dispatch` does, and
+        /// joins the run or ends it, in which case `execute` records the execution of the run that ended (the host
+        /// list then holds what the head of that run set), before the list is given the dwords of this call.
+        pub(crate) fn call(&mut self, l: &ID3D12GraphicsCommandList, values: &[u32], execute: &mut dyn FnMut()) {
+            match std::mem::take(&mut self.state.fold) {
+                Mode::Off => {}
+                Mode::Planned(n) => {
+                    let run = Run::new(n - 1, (2, 32), (true, Self::PSO), self.root.clone(), Vec::new(), false);
+                    self.state.fold = Mode::On(Box::new(run));
+                }
+                Mode::On(mut run) => {
+                    run.left -= 1;
+                    run.capturing = true;
+                    run.cur_layout.clear();
+                    run.cur.clear();
+                    self.state.fold = Mode::On(run);
+                }
+            }
+            self.state.set_user_data(l, true, 0, values);
+            if let Mode::On(run) = &mut self.state.fold {
+                run.cur_at = u64::from(run.calls) * u64::from(SLOT);
+            }
+            if let Some((run, late)) = self.state.fold_judge(true) {
+                assert_eq!((run.calls, late), (1, None), "the runs of this stream are of one");
+                execute();
+                self.state.fold_tell(l);
+            }
+        }
+
+        /// The stream's run is over (`State::fold_end`): `execute` records its execution.
+        pub(crate) fn end(&mut self, execute: &mut dyn FnMut()) {
+            if let Mode::On(run) = std::mem::take(&mut self.state.fold) {
+                assert_eq!(run.calls, 1, "the runs of this stream are of one");
+                execute();
+            }
+            self.state.fold = Mode::Off;
+        }
+
+        /// An execution that is not folded: its user data is set as `bind` sets it.
+        pub(crate) fn plain(&mut self, l: &ID3D12GraphicsCommandList, values: &[u32]) {
+            self.state.set_user_data(l, true, 0, values);
         }
     }
 }

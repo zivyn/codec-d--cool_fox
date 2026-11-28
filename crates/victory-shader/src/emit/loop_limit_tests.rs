@@ -277,3 +277,34 @@ fn a_loop_that_ends_on_the_value_of_lane_63_is_through_in_its_first_round() {
     assert_eq!(got, 1, "the rounds of a loop that lane 63 ends in the first");
     eprintln!("ran on the hardware device: the loop on lane 63 was through in one round");
 }
+
+/// `LANE_63_EXIT` as the title's shaders are translated for a host of 32-lane waves, with the skip
+/// over its loop left out (the default) or kept (`VICTORY_KEEP_LOOP_SKIPS=1`).
+fn lane_63_exit_on_32_lanes(keep: bool) -> Result<HostShader, crate::ShaderError> {
+    let native = native_of(&LANE_63_EXIT, true, 128);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    ir::TEST_KEEP_LOOP_SKIPS.set(Some(keep));
+    let shader = super::emit(&c, &native, &p, &st, &io, &res);
+    ir::TEST_KEEP_LOOP_SKIPS.set(None);
+    lower::TEST_HOST_WAVE.set(was);
+    shader
+}
+
+/// The console wave that has no lane in a region does not run a loop in it: with the switch the
+/// early branch over the loop stays (the translation differs), without it nothing changes.
+#[test]
+fn the_keep_loop_skips_switch_changes_the_translation_only_when_set() {
+    let (Ok(off), Ok(on)) = (lane_63_exit_on_32_lanes(false), lane_63_exit_on_32_lanes(true)) else {
+        eprintln!("not translated for waves of 32: the program of the test is refused");
+        return;
+    };
+    assert_eq!(off.dxil, lane_63_exit_on_32_lanes(false).expect("lowered").dxil);
+    assert_ne!(off.dxil, on.dxil, "the skip over the loop is kept");
+}

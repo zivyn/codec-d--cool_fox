@@ -9657,6 +9657,7 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
+        self.s.m.mark_abort(a);
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s

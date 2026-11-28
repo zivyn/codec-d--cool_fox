@@ -561,6 +561,39 @@ fn the_audit_and_the_model_see_a_barrier_behind_a_branch_on_the_threads_own_valu
     assert!(module.audit_barriers().differs.is_empty(), "a decision the group exchanged was flagged");
 }
 
+/// A module by hand: a branch on the thread's own parity to a block that ends the program (what a
+/// loop's limit does to a thread that reaches it), and a barrier after the join.
+fn cut_module(marked: bool) -> Module {
+    let mut s = Shader::new(false);
+    s.threads = Some([64, 1, 1]);
+    let (e, i32t, void) = (s.entry, s.t.i32, s.t.void);
+    let flat = s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+    let (one, zero) = (s.m.i32(1), s.m.i32(0));
+    let bit = s.m.bin(e, Bin::And, flat, one);
+    let c = s.m.cmp(e, pred::NE, bit, zero);
+    let (cut, join) = (s.m.new_block(), s.m.new_block());
+    if marked {
+        s.m.mark_abort(cut);
+    }
+    s.m.terminate(e, Term::CondBr(c, cut, join));
+    s.m.terminate(cut, Term::Ret);
+    let mode = s.m.i32(9);
+    s.op(join, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    s.m.terminate(join, Term::Ret);
+    s.m
+}
+
+/// A thread that a loop's limit cuts leaves the program: that is an error path, not a branch the
+/// audit follows (every loop of the program has one, and with them every barrier after a loop would
+/// be a finding). The same exit that is not the limit's is a finding.
+#[test]
+fn the_exit_of_a_thread_cut_by_a_loops_limit_is_no_flow_of_the_program() {
+    let cut = cut_module(true).audit_barriers();
+    assert!(cut.safe(false) && cut.cuts == 1, "{}", cut.describe());
+    let other = cut_module(false).audit_barriers();
+    assert!(!other.safe(true) && other.cuts == 0, "{}", other.describe());
+}
+
 /// With the guard on, a barrier is counters and a wait: the shapes still pass the same barriers
 /// (those of the entry) and make the same stores, and a half that goes away leaves the other
 /// ending with a note instead of waiting for ever.

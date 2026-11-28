@@ -194,8 +194,8 @@ speed, in the picture and in simply being able to play it:
 
 - **DLSS in place of the title's upscaler**, with its model and mode to choose.
 - **DLSS frame generation with up to six frames shown for each one rendered**,
-  switched and changed while playing, without a restart (foxhound's is 2x, set
-  at the start). By Streamline's own count it shows exactly 2, 4 and 6.
+  switched and changed while playing, without a restart, once it was on at the
+  start or made ready with `-FrameGenReady` (foxhound's is 2x, set at the start). By Streamline's own count it shows exactly 2, 4 and 6.
 - **Why frame generation showed nothing on a full 12 GB card**, found and
   fixed: the card's memory is now shared out so that it has room.
 - **The frame rate at the top left of the picture**: frames rendered a second
@@ -333,7 +333,7 @@ fork has always had; its options:
 | `-Fps 60` | a frame rate cap (30 is the title's own) |
 | `-SeriesS` | the Series S profile: 1280x720 inside, faster, softer |
 | `-Res 1080to1440` / `4k` | scene at 1080p upscaled by the title / the stock 3840x2160 output |
-| `-NoFrameGenReady` | frame generation only with `-FrameGen` (it is otherwise made ready at every start, so the menu can switch it) |
+| `-FrameGenReady` | frame generation made ready but off, so the F1 menu can switch it while playing (costs frame rate: ready, frames go through Streamline's swap chain; without it, a change in F1 takes effect at the next start) |
 | `-FgType auto` / `dlss` / `fsr` | which frame generation (see the top of this page); FSR 3's DLLs from `VICTORY_FIDELITYFX_DIR`, else `amd-sdk\FidelityFX\bin` here |
 | `-Build diag` | the diagnostics build (slower; captures, timelines, recording time in the F3 panel) |
 | `-More @{VICTORY_X='1'}` | add or override any switch |

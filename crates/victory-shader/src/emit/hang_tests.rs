@@ -200,13 +200,13 @@ fn shapes() -> Vec<(Over, Body, bool)> {
 
 const THRESHOLDS: [u32; 9] = [0, 1, 16, 31, 32, 33, 48, 63, 64];
 
-/// The shapes that were lowered into the kept skips' wave-wide form (the others are not the form
-/// the audit and the model are for; their forms are listed in the message of a failure).
-fn kept_wide_shapes() -> Vec<((Over, Body, bool), Module)> {
+/// The shapes that were lowered into the kept skips' wave-wide form with `mode` (the others are not
+/// the form the audit and the model are for).
+fn kept_wide_shapes(mode: Mode) -> Vec<((Over, Body, bool), Module)> {
     let mut found = Vec::new();
     for shape in shapes() {
         let native = lane_branch(shape.0, shape.1, 64, shape.2);
-        let (result, form, module) = lowered(&native, Mode::Classes, None);
+        let (result, form, module) = lowered(&native, mode, None);
         if result.is_ok() && form == Form::KeptSkipsWide {
             found.push((shape, module.expect("a module")));
         }
@@ -216,14 +216,14 @@ fn kept_wide_shapes() -> Vec<((Over, Body, bool), Module)> {
 
 #[test]
 fn some_shapes_take_the_kept_skips_wave_wide_form() {
-    let found = kept_wide_shapes();
+    let found = kept_wide_shapes(Mode::Safe);
     let names: Vec<_> = found.iter().map(|f| f.0).collect();
     assert!(
-        names.len() >= 4,
+        names.len() >= 12,
         "the shapes in the kept skips' form: {names:?} (forms: {:?})",
         shapes()
             .into_iter()
-            .map(|s| lowered(&lane_branch(s.0, s.1, 64, s.2), Mode::Classes, None).1)
+            .map(|s| lowered(&lane_branch(s.0, s.1, 64, s.2), Mode::Safe, None).1)
             .collect::<Vec<_>>()
     );
 }
@@ -252,11 +252,39 @@ impl Findings {
     }
 }
 
+/// What the model says of `module` with `s0` lanes in the branch: the problems it found, and
+/// whether every thread passed the same barriers.
+fn model(module: &Module, s0: u32, seed: u64) -> Result<(Vec<String>, bool), String> {
+    let report = sim::run(module, 64, &[s0, 0, 0, 0], seed)?;
+    let mut problems = report.problems.clone();
+    problems.dedup();
+    Ok((problems, report.alike()))
+}
+
+/// The classes alone (the argument about the wide branches) let a shape through whose barriers a
+/// half can miss: a loop whose lanes need different rounds, one half leaving it before the other,
+/// with a group barrier in each round. The audit of the emitted control flow sees it, and with
+/// it the form is not taken.
+#[test]
+fn the_classes_alone_let_through_a_loop_whose_halves_leave_in_different_rounds() {
+    let by_classes = kept_wide_shapes(Mode::Classes);
+    let audited = kept_wide_shapes(Mode::Safe);
+    let missed: Vec<_> = by_classes.iter().filter(|(_, m)| !m.audit_barriers().safe(true)).map(|f| f.0).collect();
+    assert!(!missed.is_empty(), "the classes found every shape with a barrier a half can miss");
+    assert!(missed.iter().all(|s| s.1 == Body::Counted), "{missed:?}");
+    for shape in &missed {
+        assert!(audited.iter().all(|a| a.0 != *shape), "{shape:?} is in the audited form");
+    }
+    // (the others are not touched: what the classes took and the audit accepts is the same)
+    let names = |v: &[((Over, Body, bool), Module)]| v.iter().map(|f| f.0).filter(|s| s.1 != Body::Counted).collect::<Vec<_>>();
+    assert_eq!(names(&by_classes), names(&audited));
+}
+
 /// The audit of the emitted control flow finds no group barrier that a thread can fail to reach.
 #[test]
-fn the_group_barriers_of_the_kept_skips_form_are_reached_by_every_thread() {
+fn the_group_barriers_of_the_audited_kept_skips_form_are_reached_by_every_thread() {
     let mut found = Findings::default();
-    for (shape, module) in kept_wide_shapes() {
+    for (shape, module) in kept_wide_shapes(Mode::Strict) {
         let audit = module.audit_barriers();
         if audit.barriers == 0 || !audit.safe(false) {
             found.add(format!("{shape:?}: {}", audit.describe()), &module);
@@ -269,17 +297,15 @@ fn the_group_barriers_of_the_kept_skips_form_are_reached_by_every_thread() {
 /// however the waves are interleaved: exact counts for every thread, and nothing waits for a
 /// thread that is not there.
 #[test]
-fn the_two_halves_pass_the_same_barriers_in_the_kept_skips_form() {
+fn the_two_halves_pass_the_same_barriers_in_the_audited_kept_skips_form() {
     let mut found = Findings::default();
-    for (shape, module) in &kept_wide_shapes() {
+    for (shape, module) in &kept_wide_shapes(Mode::Safe) {
         for s0 in THRESHOLDS {
             for seed in 1..=3 {
-                match sim::run(module, 64, &[s0, 0, 0, 0], seed) {
+                match model(module, s0, seed) {
                     Err(e) => found.add(format!("{shape:?} s0={s0}: {e}"), module),
-                    Ok(report) if !report.problems.is_empty() || !report.alike() => {
-                        let mut p = report.problems.clone();
-                        p.dedup();
-                        found.add(format!("{shape:?} s0={s0} seed={seed}: {p:?} alike={}", report.alike()), module);
+                    Ok((problems, alike)) if !problems.is_empty() || !alike => {
+                        found.add(format!("{shape:?} s0={s0} seed={seed}: {problems:?} alike={alike}"), module);
                     }
                     Ok(_) => {}
                 }
@@ -289,29 +315,33 @@ fn the_two_halves_pass_the_same_barriers_in_the_kept_skips_form() {
     found.done();
 }
 
-/// Every form a shape ends in is checked, not only the kept skips': a barrier a thread cannot reach
-/// is a hang in whichever form it stands.
+/// The audit sees every problem the model finds, in every form the shapes end in: a barrier that a
+/// thread can fail to reach is a hang in whichever form it stands.
 #[test]
-fn no_form_of_the_shapes_has_a_barrier_that_threads_reach_differently() {
+fn the_audit_sees_every_problem_the_model_finds_in_every_form() {
     let mut found = Findings::default();
+    let mut model_found = 0;
     for shape in shapes() {
         let native = lane_branch(shape.0, shape.1, 64, shape.2);
-        for mode in [Mode::Classes, Mode::Off] {
+        for mode in [Mode::Classes, Mode::Safe, Mode::Off] {
             let (result, form, module) = lowered(&native, mode, None);
             let (Ok(_), Some(module)) = (result, module) else { continue };
+            let audit = module.audit_barriers();
             for s0 in [0, 16, 32, 48, 64] {
-                match sim::run(&module, 64, &[s0, 0, 0, 0], 7) {
+                match model(&module, s0, 7) {
                     Err(e) => found.add(format!("{shape:?} {form:?} {mode:?} s0={s0}: {e}"), &module),
-                    Ok(report) if !report.problems.is_empty() || !report.alike() => {
-                        let mut p = report.problems.clone();
-                        p.dedup();
-                        found.add(format!("{shape:?} {form:?} {mode:?} s0={s0}: {p:?} alike={}", report.alike()), &module);
+                    Ok((problems, alike)) if !problems.is_empty() || !alike => {
+                        model_found += 1;
+                        if audit.safe(true) {
+                            found.add(format!("{shape:?} {form:?} {mode:?} s0={s0}: {problems:?}, the audit: {}", audit.describe()), &module);
+                        }
                     }
                     Ok(_) => {}
                 }
             }
         }
     }
+    assert!(model_found > 0, "the model found nothing in any form");
     found.done();
 }
 
@@ -368,8 +398,8 @@ fn the_guard_keeps_the_stores_and_ends_a_wait_for_threads_that_are_gone() {
     let mut tried = 0;
     for shape in shapes() {
         let native = lane_branch(shape.0, shape.1, 64, shape.2);
-        let (plain, form, module) = lowered(&native, Mode::Classes, None);
-        let (guarded, gform, gmodule) = lowered(&native, Mode::Classes, Some(guard));
+        let (plain, form, module) = lowered(&native, Mode::Safe, None);
+        let (guarded, gform, gmodule) = lowered(&native, Mode::Safe, Some(guard));
         let (Ok(_), Some(module), Ok(_), Some(gmodule)) = (plain, module, guarded, gmodule) else { continue };
         if form != Form::KeptSkipsWide || gform != Form::KeptSkipsWide {
             continue;

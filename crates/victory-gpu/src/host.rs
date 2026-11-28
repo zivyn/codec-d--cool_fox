@@ -4051,6 +4051,18 @@ mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
+
+/// Without diagnostics there are no stamps around our passes (`spans`).
+#[cfg(not(feature = "diagnostics"))]
+impl Host {
+    fn pass_slot(&self) -> Option<usize> {
+        None
+    }
+
+    unsafe fn pass_stamp(&self, _list: &ID3D12GraphicsCommandList, _slot: Option<usize>, _k: usize) {}
+
+    fn pass_read(&self, _slot: Option<usize>) {}
+}
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;

@@ -4314,6 +4314,7 @@ impl RelayBack {
             }
         }
         land::spent(land::stat::BACK, merging);
+        crate::sizes::landed();
         for ((_, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -4942,6 +4943,12 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    hand_back_ranges(back);
+    // What the card wrote is in title memory: the sizes the title will read ([`crate::sizes`]).
+    crate::sizes::landed();
+}
+
+fn hand_back_ranges(back: &[Declared]) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.

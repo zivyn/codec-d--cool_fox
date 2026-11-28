@@ -104,6 +104,8 @@ mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
+mod footprint_gpu_tests;
+#[cfg(all(test, windows))]
 mod geometry_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;

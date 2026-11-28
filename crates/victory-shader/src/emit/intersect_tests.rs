@@ -702,3 +702,131 @@ fn a_structure_that_returns_triangle_ids_is_refused_by_name() {
         other => panic!("{:?}", other.map(|_| ())),
     }
 }
+
+/// Whole walks over structures made by [`crate::bvh_build`]: the card (and
+/// WARP) tests the nodes the walk asks for, a dispatch for every 32 rays'
+/// next node, and the walk is the CPU's own state machine. Every ray must
+/// end with the hit, and the number of node tests, the CPU walk has: the
+/// emitted node test is right over a whole tree (child order, the extent
+/// shortened by each hit, 16-bit and 32-bit boxes, triangles) and not only
+/// per node.
+#[test]
+fn walks_over_a_built_structure_with_the_emitted_node_test_match_the_cpu_walk() {
+    use crate::bvh_build::{self, Options, Walker};
+    let mut g = Numbers(0xb7d);
+    let triangles: Vec<bvh_build::Triangle> = (0..150)
+        .map(|_| {
+            let c = g.vector(10.0);
+            std::array::from_fn(|_| {
+                let o = g.vector(1.5);
+                [c[0] + o[0], c[1] + o[1], c[2] + o[2]]
+            })
+        })
+        .collect();
+    let rays: Vec<Ray> = (0..96)
+        .map(|_| {
+            let o = g.vector(14.0);
+            let target = g.vector(8.0);
+            Ray::new(
+                o,
+                [target[0] - o[0], target[1] - o[1], target[2] - o[2]],
+                1.0e9,
+            )
+        })
+        .collect();
+    // The title's way with a 32-bit pointer: the structure's address in
+    // the descriptor, pointers from its start, boxes sorted.
+    let base = 0x312_3456_7800u64;
+    let structure = base + u64::from(NODES);
+    let _memory = Memory::at(base);
+    let descriptor = Descriptor::Numbers(
+        (structure >> 8) as u32,
+        (structure >> 40) as u32 | bvh::BOX_SORT,
+    );
+    let (shader, _) = build(false, descriptor).expect("the program lowers");
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for wide_boxes in [false, true] {
+            let built = bvh_build::build(&triangles, Options { wide_boxes });
+            let mut walkers: Vec<Walker> =
+                rays.iter().map(|r| Walker::new(built.root, *r)).collect();
+            let mut rounds = 0;
+            loop {
+                let asked: Vec<(usize, u32)> = walkers
+                    .iter_mut()
+                    .enumerate()
+                    .filter_map(|(n, w)| w.ask().map(|pointer| (n, pointer)))
+                    .collect();
+                if asked.is_empty() {
+                    break;
+                }
+                rounds += 1;
+                for chunk in asked.chunks(THREADS as usize) {
+                    let mut data = vec![0u32; (NODES / 4) as usize];
+                    for (t, &(n, pointer)) in chunk.iter().enumerate() {
+                        let ray = walkers[n].ray();
+                        let r = &mut data[t * (RECORD / 4) as usize..][..13];
+                        (r[0], r[1]) = (pointer, 0);
+                        r[2] = ray.extent.to_bits();
+                        for a in 0..3 {
+                            r[3 + a] = ray.origin[a].to_bits();
+                            r[6 + a] = ray.direction[a].to_bits();
+                            r[9 + a] = ray.inverse[a].to_bits();
+                        }
+                        r[12] = 1;
+                    }
+                    data.extend(&built.words);
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(vec![0; 5]))],
+                                views: &[
+                                    View::Buffer {
+                                        data: &data,
+                                        stride: Stride::Raw,
+                                    },
+                                    View::RawUav(4 * THREADS),
+                                ],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                    for (t, &(n, _)) in chunk.iter().enumerate() {
+                        let result: [u32; 4] = out[0][4 * t..4 * t + 4].try_into().unwrap();
+                        walkers[n].give(result);
+                    }
+                }
+            }
+            let mut hits = 0;
+            for (n, (walker, ray)) in walkers.iter().zip(&rays).enumerate() {
+                let (best, tests) = bvh_build::walk(&built, *ray, true);
+                assert_eq!(
+                    (walker.best, walker.tests),
+                    (best, tests),
+                    "{label}, wide {wide_boxes}, ray {n}: {ray:?}"
+                );
+                hits += usize::from(best.is_some());
+            }
+            assert!(hits > 15, "{label}: the rays must hit something: {hits}");
+            assert!(
+                rounds > 10,
+                "{label}: the walks are deeper than {rounds} rounds"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}

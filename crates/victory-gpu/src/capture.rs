@@ -1033,6 +1033,97 @@ fn bad_texels(
     firsts
 }
 
+/// `VICTORY_CAPTURE_CROP=x0,y0,x1,y1[|x0,y0,x1,y1...]`: boxes of the screen as fractions of a
+/// target's width and height (0..1, x0 < x1, y0 < y1), whose mean color every target of the
+/// census reports in a `crop` column, so the same patch of the picture (the character's
+/// hair, say, and the jumpsuit next to it) can be followed through every target the frame
+/// writes: the G-buffer's albedo, the light, the post chain, the final picture.
+fn crop_boxes() -> &'static [[f32; 4]] {
+    static BOXES: std::sync::OnceLock<Vec<[f32; 4]>> = std::sync::OnceLock::new();
+    BOXES.get_or_init(|| parse_crops(&std::env::var("VICTORY_CAPTURE_CROP").unwrap_or_default()))
+}
+
+fn parse_crops(text: &str) -> Vec<[f32; 4]> {
+    text.split('|')
+        .filter_map(|part| {
+            let v: Vec<f32> = part.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+            let [x0, y0, x1, y1] = <[f32; 4]>::try_from(v).ok()?;
+            (0.0 <= x0 && x0 < x1 && x1 <= 1.0 && 0.0 <= y0 && y0 < y1 && y1 <= 1.0).then_some([x0, y0, x1, y1])
+        })
+        .collect()
+}
+
+/// The mean of the four channels over the box `crop` (fractions of the target) of a target's
+/// rows, as the card holds them: float formats as numbers (the third and fourth channel of a
+/// format that has fewer read 0), 8-bit color as 0..1 (B8G8R8A8 swapped back, the 10-bit
+/// formats over 1023 and the alpha over 3). `None` for formats the census does not read as
+/// color (single channels of other kinds, depth, integer words) and for an empty box.
+fn crop_mean(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8], crop: [f32; 4]) -> Option<[f64; 4]> {
+    let (x0, x1) = ((crop[0] * w as f32) as usize, (((crop[2] * w as f32) as usize).max(1)).min(w));
+    let (y0, y1) = ((crop[1] * h as f32) as usize, (((crop[3] * h as f32) as usize).max(1)).min(h));
+    if x0 >= x1 || y0 >= y1 {
+        return None;
+    }
+    let float = float_layout(format);
+    let bytes = match (float, format) {
+        (Some((c, 32)), _) => 4 * c,
+        (Some((c, 16)), _) => 2 * c,
+        (Some(_), _) => 4,
+        (None, 27..=32 | 87 | 88 | 90..=93 | 23..=25) => 4,
+        _ => return None,
+    };
+    let mut sum = [0f64; 4];
+    let mut n = 0u64;
+    for y in y0..y1 {
+        let row = rows.get(y * pitch..y * pitch + w * bytes)?;
+        for t in row[x0 * bytes..x1 * bytes].chunks_exact(bytes) {
+            let v: [f64; 4] = if let Some((channels, kind)) = float {
+                let mut v = [0f64; 4];
+                for (c, slot) in v.iter_mut().enumerate().take(channels) {
+                    let (value, nan, inf) = channel(kind, c, t);
+                    if nan || inf {
+                        v = [f64::NAN; 4];
+                        break;
+                    }
+                    *slot = f64::from(value);
+                }
+                v
+            } else if matches!(format, 23..=25) {
+                let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
+                [
+                    f64::from(w & 0x3ff) / 1023.0,
+                    f64::from(w >> 10 & 0x3ff) / 1023.0,
+                    f64::from(w >> 20 & 0x3ff) / 1023.0,
+                    f64::from(w >> 30) / 3.0,
+                ]
+            } else if matches!(format, 87 | 88 | 90..=93) {
+                [t[2], t[1], t[0], t[3]].map(|b| f64::from(b) / 255.0)
+            } else {
+                [t[0], t[1], t[2], t[3]].map(|b| f64::from(b) / 255.0)
+            };
+            if v.iter().all(|c| c.is_finite()) {
+                for (s, c) in sum.iter_mut().zip(v) {
+                    *s += c;
+                }
+                n += 1;
+            }
+        }
+    }
+    (n > 0).then(|| sum.map(|s| s / n as f64))
+}
+
+/// The census line's crop columns: one `crop<r>,<g>,<b>,<a>` per box of
+/// `VICTORY_CAPTURE_CROP` (`crop-` where the target has no color to read).
+fn crop_columns(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> String {
+    crop_boxes()
+        .iter()
+        .map(|b| match crop_mean(format, w, h, pitch, rows, *b) {
+            Some(m) => format!("	crop{:.5e},{:.5e},{:.5e},{:.5e}", m[0], m[1], m[2], m[3]),
+            None => "	crop-".to_owned(),
+        })
+        .collect()
+}
+
 /// One line per target in `frame-<frame>-targets.tsv` (in the order the
 /// frame first used them, which the `-ops.txt` lines name by resource):
 /// how many different texel values the target holds as the card wrote them
@@ -1112,8 +1203,14 @@ fn target_stats(
             }
         }
     }
+    // The patch of the picture `VICTORY_CAPTURE_CROP` names, as this target holds it (not for volumes).
+    let crops = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        String::new()
+    } else {
+        crop_columns(format, w, h, pitch, rows)
+    };
     let line = format!(
-        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%{range}",
+        "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%{range}{crops}",
         d.Width,
         d.Height,
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { format!("x{}", d.DepthOrArraySize) } else { String::new() },
@@ -1725,6 +1822,44 @@ mod stats_tests {
         let packed = (30u32 << 6 | 63) | (15 << 6) << 11 | (15 << 5) << 22;
         let r = float_range(26, 1, 1, 4, &packed.to_le_bytes(), 60000.0).unwrap();
         assert_eq!((r.over, r.first, r.at_max), (1, Some((0, 0)), (0, 0)));
+    }
+
+    #[test]
+    fn crop_boxes_parse_and_their_mean_color_is_read_per_format() {
+        // Boxes: fractions of the target, several separated by `|` (`;` splits the pilot's -Extra), bad ones left out.
+        assert_eq!(parse_crops("0.25,0.5,0.75,1"), [[0.25, 0.5, 0.75, 1.0]]);
+        assert_eq!(parse_crops("0,0,1,1| 0.5,0.5,0.4,0.9 |0.1,0.1,0.2,0.2"), [[0.0, 0.0, 1.0, 1.0], [0.1, 0.1, 0.2, 0.2]]);
+        assert!(parse_crops("").is_empty());
+        assert!(parse_crops("0,0,1").is_empty());
+        assert!(parse_crops("0,0,1.5,1").is_empty());
+        // R8G8B8A8, 2 x 2, rows padded to 16 bytes: the right column (x from 0.5) is the box.
+        let mut rows = vec![0u8; 32];
+        rows[4..8].copy_from_slice(&[255, 0, 51, 255]);
+        rows[20..24].copy_from_slice(&[0, 255, 51, 255]);
+        let m = crop_mean(28, 2, 2, 16, &rows, [0.5, 0.0, 1.0, 1.0]).unwrap();
+        assert_eq!(m, [0.5, 0.5, 51.0 / 255.0, 1.0]);
+        // The whole target includes the two black texels; B8G8R8A8 reads the channels swapped back.
+        let m = crop_mean(28, 2, 2, 16, &rows, [0.0, 0.0, 1.0, 1.0]).unwrap();
+        assert_eq!(m[0], 0.25);
+        let m = crop_mean(87, 2, 2, 16, &rows, [0.5, 0.0, 1.0, 1.0]).unwrap();
+        assert_eq!((m[0], m[2]), (51.0 / 255.0, 0.5));
+        // R16G16B16A16_FLOAT: one texel (1.0, 0.5, 2.0, 1.0) and one with a NaN, which is left out.
+        let half = |v: f32| -> u16 {
+            match v {
+                1.0 => 0x3c00,
+                0.5 => 0x3800,
+                _ => 0x4000,
+            }
+        };
+        let words = [half(1.0), half(0.5), half(2.0), half(1.0), 0x7e00, half(1.0), half(1.0), half(1.0)];
+        let mut rows = vec![0u8; 16];
+        for (i, w) in words.iter().enumerate() {
+            rows[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(crop_mean(10, 2, 1, 16, &rows, [0.0, 0.0, 1.0, 1.0]), Some([1.0, 0.5, 2.0, 1.0]));
+        // Formats that are no color, and a box that holds no texel.
+        assert_eq!(crop_mean(42, 2, 1, 8, &[0; 8], [0.0, 0.0, 1.0, 1.0]), None);
+        assert_eq!(crop_mean(10, 2, 1, 16, &rows, [0.9, 0.0, 0.95, 1.0]), None);
     }
 
     #[test]

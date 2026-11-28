@@ -1205,26 +1205,24 @@ mod tests {
             // Build 1 makes its pipelines and saves its library (what the cache's file holds).
             let first = device1.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&[]).expect("an empty library");
             for bytes in &build1 {
-                let pso = host.device.CreateComputePipelineState::<ID3D12PipelineState>(&desc(bytes)).expect("made");
-                first.StorePipeline(PCWSTR(HSTRING::from(name_of(bytes)).as_ptr()), &pso).expect("stored");
+                let pso: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc(bytes)).expect("made");
+                let wide = HSTRING::from(name_of(bytes));
+                first.StorePipeline(PCWSTR(wide.as_ptr()), &pso).expect("stored");
             }
             let mut saved = vec![0u8; first.GetSerializedSize()];
             first.Serialize(&mut saved).expect("serialised");
             // Build 2's host reads that file.
             let second = device1.CreatePipelineLibrary::<ID3D12PipelineLibrary>(&saved).expect("the copied library loads");
-            let loads: Vec<bool> = build2
-                .iter()
-                .map(|bytes| {
-                    second
-                        .LoadComputePipeline::<ID3D12PipelineState>(PCWSTR(HSTRING::from(name_of(bytes)).as_ptr()), &desc(bytes))
-                        .is_ok()
-                })
-                .collect();
-            assert_eq!(loads, [true, true, false, true]);
-            // (and the name of the old third program still loads in the copy: nothing was lost)
-            assert!(second
-                .LoadComputePipeline::<ID3D12PipelineState>(PCWSTR(HSTRING::from(name_of(&build1[2])).as_ptr()), &desc(&build1[2]))
-                .is_ok());
+            let loads = |bytes: &[u8]| {
+                let wide = HSTRING::from(name_of(bytes));
+                let loaded: windows::core::Result<ID3D12PipelineState> =
+                    second.LoadComputePipeline(PCWSTR(wide.as_ptr()), &desc(bytes));
+                loaded.is_ok()
+            };
+            let found: Vec<bool> = build2.iter().map(|bytes| loads(bytes)).collect();
+            assert_eq!(found, [true, true, false, true]);
+            // (and the old third program still loads in the copy: nothing was lost)
+            assert!(loads(&build1[2]));
         }
     }
 

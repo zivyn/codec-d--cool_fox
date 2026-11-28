@@ -1467,6 +1467,9 @@ pub(crate) fn log(frames: f64) {
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
     );
+    for line in crate::watch::fault_lines(frames as f64) {
+        tracing::info!("{line}");
+    }
     let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
         [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(

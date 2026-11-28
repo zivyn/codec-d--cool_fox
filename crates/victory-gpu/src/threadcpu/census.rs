@@ -313,6 +313,15 @@ fn read(thread: HANDLE, tid: u32, known: &mut HashMap<u32, (String, Kind)>, rows
     }
 }
 
+/// The group thread `tid` was found in by the census, and whether it is the title's (none: not seen, or the census is
+/// walking the threads now).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn group_of_tid(tid: u32) -> Option<(String, bool)> {
+    let state = STATE.try_lock().ok()?;
+    let (group, kind) = state.as_ref()?.known.get(&tid)?;
+    Some((group.clone(), matches!(kind, Kind::Title)))
+}
+
 /// The text of the first line for `groups` over `frames` frames in `wall_ms`, `process` being the ms of user and
 /// kernel time of the whole process (what it ran that no thread present accounts for is of threads that ended).
 pub(crate) fn text(groups: &[Group], process: (f64, f64), frames: u64, wall_ms: f64, logical: usize) -> String {

@@ -25,6 +25,11 @@ pub const MIN_PITCH: f32 = 0.25;
 pub const MAX_PITCH: f32 = 4.0;
 /// Frames of input kept: enough for the widest kernel on both sides.
 const HIST: usize = 2 * HALF * MAX_PITCH as usize + 4;
+/// Frames of the widest kernel's reach each side of a centre that the kept frames hold before the next one to give out.
+const MARGIN: usize = HALF * MAX_PITCH as usize + 2;
+/// Frames of input a packet may leave unrendered (`limit` reached below pitch 1) to be given out with the next one:
+/// 100 ms at 48 kHz. More than that is skipped (a seam) so that the stream does not fall further and further behind.
+const BACKLOG: usize = 4800;
 
 fn bessel_i0(x: f64) -> f64 {
     let (mut sum, mut term) = (1.0, 1.0);
@@ -77,7 +82,8 @@ pub struct Pitcher {
     /// The next frame to give out, in input frames from the start of the
     /// next packet (negative: among the kept ones).
     pos: f64,
-    /// The last `HIST` frames of input, interleaved.
+    /// The last `HIST` frames of input, interleaved, and with them the frames a packet ran out of room for
+    /// (`limit`) and could not give out yet, up to `BACKLOG` more.
     hist: Vec<f32>,
 }
 
@@ -122,6 +128,10 @@ impl Pitcher {
     pub fn pass(&mut self, input: &[f32]) {
         let ch = self.channels;
         let keep = HIST * ch;
+        // (What a packet left unrendered is not given out: the stream is at pitch 1 as it is.)
+        if self.hist.len() > keep {
+            self.hist.drain(..self.hist.len() - keep);
+        }
         if input.len() >= keep {
             self.hist.copy_from_slice(&input[input.len() - keep..]);
         } else {
@@ -140,10 +150,11 @@ impl Pitcher {
         let n = input.len() / ch;
         let (p0, p1) = (self.pitch, self.next_pitch(target, ramp));
         self.engaged = true;
-        let mut work = Vec::with_capacity((HIST + n) * ch);
+        let kept = self.hist.len() / ch;
+        let mut work = Vec::with_capacity((kept + n) * ch);
         work.extend_from_slice(&self.hist);
         work.extend_from_slice(&input[..n * ch]);
-        let len = (HIST + n) as isize;
+        let len = (kept + n) as isize;
         let table = table();
         // How many frames the packet gives at its mean pitch: the ramp's length.
         let span = (n as f64 / f64::from((p0 + p1) / 2.0)).max(1.0);
@@ -156,7 +167,7 @@ impl Pitcher {
             // Above 1 the kernel is stretched, to keep what the new rate cannot hold out.
             let scale = (1.0 / p).min(1.0);
             let reach = (HALF as f32 / scale).ceil() as isize;
-            let at = HIST as f64 + pos;
+            let at = kept as f64 + pos;
             let base = at.floor() as isize;
             if base + reach >= len {
                 break;
@@ -195,12 +206,16 @@ impl Pitcher {
             pos += f64::from(p);
             i += 1;
         }
-        // The next packet starts n frames on; the frames kept are the last ones.
-        // At most as far back as the widest kernel can still be served from the kept frames.
-        let furthest = (HIST - HALF * MAX_PITCH as usize - 2) as f64;
-        self.pos = (pos - n as f64).max(-furthest);
-        let keep = work.len() - HIST * ch;
-        self.hist.copy_from_slice(&work[keep..]);
+        // The next packet starts n frames on. What is kept: the last `HIST` frames, and more if the packet ran out of
+        // room before it had given out what it was to (below pitch 1 with `limit` reached): from the widest kernel's
+        // reach before the next frame to give out, as far back as `BACKLOG` frames allow. Past that the next frame is
+        // moved up to what is kept.
+        let next = (kept as f64 + pos).max(0.0) as usize;
+        let want = (len as usize).saturating_sub(next.saturating_sub(MARGIN)).clamp(HIST, HIST + BACKLOG);
+        let keep = want.min(len as usize);
+        self.pos = (pos - n as f64).max(-((keep - MARGIN) as f64));
+        self.hist.clear();
+        self.hist.extend_from_slice(&work[(len as usize - keep) * ch..]);
         self.pitch = p1;
         out
     }
@@ -407,5 +422,33 @@ mod tests {
             }
         }
         assert!(edge <= inside * 1.1, "edge {edge}, inside {inside}");
+    }
+
+    /// A `limit` below what the packet gives (pitch 0.5, as many frames asked for as the packet has) leaves the
+    /// rest of the packet for the next one: the frames given are the ones a single run over the whole signal
+    /// gives, with no packet's tail skipped, and what is kept stays bounded however long it goes on.
+    #[test]
+    fn a_limit_below_the_packet_leaves_the_rest_for_the_next_one_and_no_seam() {
+        let frames = 960;
+        let signal = tone(700.0, 0, 3 * frames, 1);
+        let reference = Pitcher::new(1, 0.5).process(&signal, 0.5, 0.0, 6000);
+        let mut p = Pitcher::new(1, 0.5);
+        let mut out: Vec<f32> = Vec::new();
+        for packet in signal.chunks(frames) {
+            let got = p.process(packet, 0.5, 0.0, frames);
+            assert_eq!(got.len(), frames);
+            out.extend(got);
+        }
+        for (n, (a, b)) in out.iter().zip(&reference).enumerate() {
+            assert!((a - b).abs() < 1e-4, "frame {n}: {a} against {b}");
+        }
+        // The same all the time: the unrendered frames pile up to the most and no further.
+        let mut p = Pitcher::new(2, 0.5);
+        for b in 0..60 {
+            let got = p.process(&tone(500.0, b * frames, frames, 2), 0.5, 0.0, frames);
+            assert_eq!(got.len(), frames * 2);
+            assert!(got.iter().all(|v| v.is_finite()));
+            assert!(p.hist.len() <= (HIST + BACKLOG) * 2, "{} frames kept", p.hist.len() / 2);
+        }
     }
 }

@@ -371,6 +371,9 @@ A tree of other people's work with a little on top; the history is kept.
   and the others foxhound's README names.
 - Everyone who sent pull requests to this fork before the move; that work is
   in the history, on the branch that was `main` until then.
+- Testing save sharing (F1 > EXPORT SAVE / IMPORT SAVE) with their own saves, in
+  [discussion #520](https://github.com/trustno1-coder/VIctory-NVIDIA/discussions/520):
+  [DueTonight](https://github.com/DueTonight).
 - NVIDIA Streamline, DLSS and Reflex are NVIDIA's; they are loaded at run time
   from a folder you supply.
 - Much of this fork's code was written with

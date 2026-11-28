@@ -238,6 +238,9 @@ impl Host {
         }
         let mut used: Vec<(u8, Prelude)> = Vec::new();
         let mut looks = None;
+        // (`VICTORY_CARD_GAPS=1`: when the CPU was in the call that sends the sync list.)
+        #[cfg(feature = "diagnostics")]
+        let mut sync_call = (0u64, 0u64);
         // On the compute queue the lists we add are of the compute type, and what the plan touches is told to the route.
         let compute = route.as_ref().is_some_and(|r| r.compute());
         if let Some(route) = route.as_mut() {
@@ -363,6 +366,8 @@ impl Host {
                         route.waits(self);
                     }
                     let queue = route.as_ref().map_or(&self.queue, |r| r.queue(self));
+                    #[cfg(feature = "diagnostics")]
+                    let entered = if spans::gaps_on() { crate::timeline::ticks() } else { 0 };
                     if let Some(own) = &own {
                         own.wait(queue)?;
                     }
@@ -371,6 +376,9 @@ impl Host {
                     {
                         sync_lap(3, &mut lap);
                         SYNC_LIST[4].fetch_add(1, Ordering::Relaxed);
+                        if entered != 0 {
+                            sync_call = (entered, crate::timeline::ticks());
+                        }
                     }
                     Ok(())
                 })()
@@ -381,6 +389,8 @@ impl Host {
             used.push((if compute { 2 } else { 0 }, sync));
         }
         drop(order);
+        #[cfg(feature = "diagnostics")]
+        let crosses = own.as_ref().is_some_and(send::Own::crosses_on_copy_queue);
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
@@ -390,6 +400,8 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
             stamps,
+            #[cfg(feature = "diagnostics")]
+            sync_call: (sync_call.0, sync_call.1, crosses),
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.

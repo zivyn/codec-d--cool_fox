@@ -422,6 +422,12 @@ impl Own {
         }
     }
 
+    /// Whether the bytes cross on the copy queue (the drawing queue stands behind a wait for them).
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn crosses_on_copy_queue(&self) -> bool {
+        self.staged.is_some()
+    }
+
     /// The memory (and the stage), to be kept until the submission has run.
     pub(super) fn memory(mut self) -> Memory {
         self.memory.staged = self.staged.take();

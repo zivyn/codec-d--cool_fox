@@ -707,6 +707,7 @@ impl Route {
         self.fp = fp;
         let queue = self.queue(host);
         if want > 0 {
+            super::spans::wait_seen(super::spans::wait_site::LANES);
             // SAFETY: our queue and fence; the value was queued as a signal.
             if let Err(e) = unsafe { queue.Wait(&lanes.fences[other], want) } {
                 fail(format_args!(
@@ -732,6 +733,7 @@ impl Route {
                 b.fetches_for(&self.fp)
             });
             for (fence, value) in fetches {
+                super::spans::wait_seen(super::spans::wait_site::LANES);
                 // SAFETY: our queue; a fence of a fetch that signals it behind its list.
                 if let Err(e) = unsafe { queue.Wait(&fence, value) } {
                     fail(format_args!("the compute queue could not be told to wait for a fetch ({e})"));

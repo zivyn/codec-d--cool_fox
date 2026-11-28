@@ -1415,6 +1415,12 @@ thread_local! {
 }
 
 /// Tells the lowering of this thread which container it translates ([`PAIR_NOTE`]).
+/// The first 7 hex digits of the hash of the container being translated on this thread, as the
+/// logs name the program (`VICTORY_WAVE_WHY` lines say which program they are about).
+pub(super) fn program_digits() -> String {
+    format!("{:07x}", PROGRAM_TAG.get() & 0x0FFF_FFFF)
+}
+
 pub fn set_program_tag(container: &[u8]) {
     let hash = blake3::hash(container);
     let first = u32::from_be_bytes(hash.as_bytes()[..4].try_into().expect("4 bytes"));

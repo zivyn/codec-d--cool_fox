@@ -707,7 +707,7 @@ fn emit_forms(
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
-                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?}"),
+                    Ok((_, wave)) => eprintln!("WAVE64-RETRY {what}: wave {wave:?} #{}", lower::program_digits()),
                     Err(e) => eprintln!("WAVE64-RETRY {what}: {e}"),
                 }
             }
@@ -1182,7 +1182,12 @@ fn local_exit(
             if why {
                 let mut sorted: Vec<usize> = wide.iter().copied().collect();
                 sorted.sort_unstable();
-                eprintln!("WAVE64-LOCAL-EXIT {} branches taken by the host wave together: {sorted:?}", sorted.len());
+                eprintln!(
+                    "WAVE64-LOCAL-EXIT #{} {} branches taken by the host wave together, {}: {sorted:?}",
+                    lower::program_digits(),
+                    sorted.len(),
+                    if r.is_ok() { "lowered" } else { "NOT lowered" }
+                );
             }
             return Some(r);
         }

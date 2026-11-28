@@ -187,19 +187,33 @@ fn an_index_into_a_buffer_of_no_known_stride_is_not_known() {
 }
 
 #[test]
-fn a_descriptor_picked_by_a_computed_index_is_any_of_the_table() {
-    let (layout, used) = table_layout();
-    // s_lshl_b32 s6, s0, 5; s_load_dwordx4 s[8:11], s[4:5], s6 (a root constant picks the entry).
-    let mut words = vec![0x8F06_8500];
-    words.extend(load_descriptor(6));
+fn a_descriptor_picked_from_the_heap_by_a_computed_index_leaves_nothing_known() {
+    // Dynamic resources: the root constant is a heap index, shifted to a byte, and no used-resource
+    // entry says which view it is.
+    let (mut layout, used) = table_layout();
+    layout[1].root = RootType::ResourceHeap;
+    let mut words = vec![0x8F06_8500]; // s_lshl_b32 s6, s0, 5
+    words.extend(load_descriptor(6)); // s_load_dwordx4 s[8:11], s[4:5], s6
     words.extend(store(0, true, false, 0));
     words.push(S_ENDPGM);
     let f = footprint(&words, layout, used, RSRC2_TABLE);
-    assert_eq!(f.stores[0].target, Target::TableAny { user_data: 4 });
+    assert!(f.unbounded);
+    assert_eq!(f.ranges(table_target(), &bind([4, 1, 1], None, &none)), None);
+}
+
+#[test]
+fn a_store_to_any_entry_of_a_table_counts_for_each_of_its_entries() {
+    let at = |target| crate::footprint::Store { target, offset: Expr::Const(8), bytes: 4 };
+    let any = Footprint { stores: vec![at(Target::TableAny { user_data: 4 })], ..Footprint::default() };
     let b = bind([4, 1, 1], None, &none);
-    assert_eq!(f.ranges(table_target(), &b), Some(vec![(0, 16)]));
-    assert_eq!(f.ranges(Target::Table { user_data: 4, dword: 8 }, &b), Some(vec![(0, 16)]));
-    assert_eq!(f.ranges(Target::Table { user_data: 5, dword: 0 }, &b), Some(vec![]));
+    assert_eq!(any.ranges(table_target(), &b), Some(vec![(8, 12)]));
+    assert_eq!(any.ranges(Target::Table { user_data: 4, dword: 8 }, &b), Some(vec![(8, 12)]));
+    assert_eq!(any.ranges(Target::Table { user_data: 5, dword: 0 }, &b), Some(vec![]));
+    assert_eq!(any.ranges(Target::Root { slot: 4 }, &b), Some(vec![]));
+    // And a store to one entry counts for a query of any entry of the table.
+    let one = Footprint { stores: vec![at(table_target())], ..Footprint::default() };
+    assert_eq!(one.ranges(Target::TableAny { user_data: 4 }, &b), Some(vec![(8, 12)]));
+    assert_eq!(one.ranges(Target::Table { user_data: 4, dword: 8 }, &b), Some(vec![]));
 }
 
 /// A root descriptor in s4/s5, built into a buffer descriptor by the code

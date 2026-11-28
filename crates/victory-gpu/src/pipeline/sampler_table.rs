@@ -45,9 +45,12 @@ pub(crate) const MAX_HEAP: u32 = 2048;
 /// sampler tables.
 pub(crate) const TAG: &[u8] = b"sampler-table-v1";
 
-/// Whether the table form is the default: off until the pilot has confirmed
-/// that it keeps the white-out away with the library in use.
-const DEFAULT_ON: bool = false;
+/// Whether the table form is the default: on since integ/validation-30 (rule
+/// 14), after the pilot's ST-1 and ST-2 (two processes on a full library: clean
+/// pictures, brown hair, 0 refusals, about 100 s less to the world than the
+/// simple fix of the white-out). `VICTORY_SAMPLER_TABLE=0` restores the static
+/// samplers.
+const DEFAULT_ON: bool = true;
 
 /// `VICTORY_SAMPLER_TABLE=1` (`=0`): immediate samplers go through tables of
 /// the sampler heap, which lets pipelines that use them go in the pipeline

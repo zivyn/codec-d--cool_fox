@@ -119,8 +119,9 @@ for comparing; the winner of a comparison becomes the default in the next integr
   cache whited out in 3 of 3 runs of the build before, and runs with the library removed or empty were clean in 15 of
   15 pictures, with brown hair. **The fix is on
   by default:** pipelines with static samplers are neither loaded from nor stored in the library, so each start compiles
-  them (the cost is above). `VICTORY_SAMPLER_TABLE=1` (off until measured) makes the static samplers one-descriptor
-  tables of the sampler heap, so that those pipelines can go back in the library.
+  them (the cost is above). `VICTORY_SAMPLER_TABLE` (**on since integration 30**: two processes on a full library were clean, with brown hair, no
+  refusal, about 100 s less to the world; `=0` restores the static samplers) makes the static samplers one-descriptor
+  tables of the sampler heap, so that those pipelines go back in the library. The library needs one `victory warm` made with it.
 - **16-bit rounding and flushed denormals are on as console-matching precision, not as the white-out cure**
   (`VICTORY_F16_NEAREST=2`, `VICTORY_F32_FTZ=1`, on since `integ/validation-24`; `=0` turns each off). The card
   truncates the conversion from 32 to 16 bits where the console rounds to nearest (24 of 144 cases, one step), and the

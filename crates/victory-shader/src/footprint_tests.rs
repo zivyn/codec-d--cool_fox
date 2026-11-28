@@ -112,7 +112,13 @@ const V_ADD_NC_U32: u32 = 0x25;
 const RSRC2_TABLE: u32 = 5 << 1;
 
 fn footprint(words: &[u32], layout: Vec<RootParam>, used: Vec<UsedResource>, rsrc2: u32) -> Footprint {
-    analyze(&compute(words, layout, used, rsrc2, 64)).expect("the front half of the translation runs")
+    let native = compute(words, layout, used, rsrc2, 64);
+    analyze(&native).unwrap_or_else(|| {
+        let p = crate::spill::build(&native).expect("spill::build");
+        let st = crate::structure::structure(&p);
+        let why = crate::resource::track(&p, &native.layout, native.stage, st.as_ref().ok());
+        panic!("the front half of the translation fails: {:?}", why.err())
+    })
 }
 
 fn table_target() -> Target {

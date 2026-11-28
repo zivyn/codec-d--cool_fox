@@ -2952,9 +2952,11 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
 /// are the thread's kept ones ([`scratch`]), the list of what its steps do
 /// (`card_steps::does_of`) leaves out the 21,000 refreshes the plan never
 /// looks at, a refresh that comes behind another of the same copy does not
-/// look the copy up again (`Batch::add`), and the slots the card's steps
-/// make are made with one hold on their buffer and one look at the heap for
-/// each thread (`descriptor::constant_slots`), not for each slot.
+/// look the copy up again (`Batch::add`), what is refreshed ahead of the steps is
+/// made and kept without a list of ranges and its allocation for each of
+/// thousands of copies (`front_spans_flat`, `Batch::first`), and the slots the
+/// card's steps make are made with one hold on their buffer and one look at the
+/// heap for each thread (`descriptor::constant_slots`), not for each slot.
 ///
 /// The steps, the refreshes and the descriptors that come out are the same:
 /// only where the memory of the tables comes from, how often a table is
@@ -8647,12 +8649,20 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
-    /// With [`lean_steps`] (read once, when the submission begins): the copy
-    /// looked up last in `ahead` is remembered.
+    /// With [`lean_steps`] (read once, when the submission begins): what is
+    /// refreshed ahead is kept in `first` and `rest`, not `ahead`, and the copy
+    /// looked up last is remembered.
     lean: bool,
-    /// The copy `add` looked at last (0: none), and what `ahead` held for it:
-    /// `Some((from, to))` if one range, else `None` (no range, or several: the
-    /// table is looked at). Forgotten whenever `ahead` changes.
+    /// With `lean`: the first range put ahead for each copy (nearly always
+    /// the only one: a table of ranges, and its allocation, for each of
+    /// thousands of copies a submission is what this leaves out) ...
+    first: ByCopy<(usize, usize)>,
+    /// ... and the others of the copies that have more.
+    rest: ByCopy<Vec<(usize, usize)>>,
+    /// The copy `add` looked at last (0: none), and what is ahead for it:
+    /// `Some((from, to))` if one range (none at all: the empty range), else
+    /// `None` (several: the table is looked at). Forgotten whenever what is
+    /// ahead changes.
     memo: (usize, Option<(usize, usize)>),
     /// A range was put into `ahead` that does not begin past the end of the one
     /// before it in its copy's list: the lists are not looked through by
@@ -8746,6 +8756,96 @@ fn front_spans_gap(steps: impl Iterator<Item = Touch>, gap: usize) -> Vec<(usize
     let mut spans = Vec::new();
     for (copy, runs) in copies.into_iter().zip(ranges) {
         spans.extend(joined_with_gap(runs, gap).into_iter().filter(|r| r.0 < r.1).map(|(a, b)| (copy, a, b)));
+    }
+    spans
+}
+
+/// [`front_spans_gap`] without a list of ranges, and another of the joined
+/// ones, for each copy (`VICTORY_LEAN_STEPS`): a submission has some 700 copies
+/// in front of its steps (4,500 and more in the lists that make the heap's
+/// buffers ready), each of which cost three small blocks of memory made and
+/// let go again. The ranges are put in one list with the number of their copy,
+/// brought together by copy by counting, and each copy's looked through as a
+/// slice: the same spans in the same order.
+fn front_spans_flat(steps: impl Iterator<Item = Touch>, gap: usize) -> Vec<(usize, usize, usize)> {
+    thread_local! {
+        static AT: std::cell::RefCell<ByCopy<usize>> = std::cell::RefCell::new(ByCopy::default());
+    }
+    let mut at = scratch::Lean::of(&AT, true);
+    // The copies in the order they come, and the part that gave each to shaders last.
+    let mut copies: Vec<usize> = Vec::new();
+    let mut given: Vec<u32> = Vec::new();
+    // (The number of the copy, from, to) of what each refreshes before that.
+    let mut flat: Vec<(u32, usize, usize)> = Vec::new();
+    let (mut part, mut last) = (1, usize::MAX);
+    for step in steps {
+        match step {
+            Touch::Refresh(copy, from, to) => {
+                let i = if copies.get(last).is_some_and(|c| *c == copy) {
+                    last
+                } else {
+                    *at.entry(copy).or_insert_with(|| {
+                        copies.push(copy);
+                        given.push(0);
+                        copies.len() - 1
+                    })
+                };
+                last = i;
+                if given[i] != part {
+                    flat.push((i as u32, from, to));
+                }
+            }
+            Touch::Write(copy) => {
+                let i = *at.entry(copy).or_insert_with(|| {
+                    copies.push(copy);
+                    given.push(0);
+                    copies.len() - 1
+                });
+                given[i] = part;
+            }
+            Touch::Part => part += 1,
+            Touch::Title | Touch::Nothing => {}
+        }
+    }
+    drop(at);
+    // Each copy's ranges together, in the order they came: where each begins, then put there.
+    let mut begins = vec![0u32; copies.len() + 1];
+    for &(i, ..) in &flat {
+        begins[i as usize + 1] += 1;
+    }
+    for k in 0..copies.len() {
+        begins[k + 1] += begins[k];
+    }
+    let mut next = begins.clone();
+    let mut ranges = vec![(0usize, 0usize); flat.len()];
+    for &(i, from, to) in &flat {
+        ranges[next[i as usize] as usize] = (from, to);
+        next[i as usize] += 1;
+    }
+    let mut spans = Vec::new();
+    for (k, &copy) in copies.iter().enumerate() {
+        let runs = &mut ranges[begins[k] as usize..begins[k + 1] as usize];
+        runs.sort_unstable();
+        let mut open: Option<(usize, usize)> = None;
+        for &(from, to) in runs.iter() {
+            if let Some(last) = open.as_mut()
+                && from <= last.1.saturating_add(gap)
+            {
+                last.1 = last.1.max(to);
+                continue;
+            }
+            if let Some((a, b)) = open.take()
+                && a < b
+            {
+                spans.push((copy, a, b));
+            }
+            open = Some((from, to));
+        }
+        if let Some((a, b)) = open
+            && a < b
+        {
+            spans.push((copy, a, b));
+        }
     }
     spans
 }
@@ -8880,7 +8980,45 @@ fn written_spans_gap(steps: impl Iterator<Item = Touch>, gap: usize) -> Vec<(usi
 
 #[cfg(test)]
 mod written_spans_tests {
-    use super::{Touch, front_spans, longest_first, referenced_bytes, split, written_spans};
+    use super::{Touch, front_spans, front_spans_flat, front_spans_gap, longest_first, referenced_bytes, split, written_spans};
+
+    /// The spans made without a list for each copy are those that are made with
+    /// one, in the same order, whatever the steps: refreshes of many copies and
+    /// of one on end, copies given to shaders, parts, empty ranges, any gap.
+    #[test]
+    fn spans_made_flat_are_the_spans_made_by_copy() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut random = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as usize % n
+        };
+        let (mut spans_seen, mut empty) = (0, 0);
+        for trial in 0..3000 {
+            let copies = 1 + random(12);
+            let steps: Vec<(usize, usize, usize, usize)> = (0..random(60))
+                .map(|_| (random(10), 1 + random(copies), random(400), random(100)))
+                .collect();
+            let make = || {
+                steps.clone().into_iter().map(|(kind, copy, from, len)| match kind {
+                    0..6 => Touch::Refresh(copy * 0x1000, from, from + len),
+                    6 => Touch::Write(copy * 0x1000),
+                    7 => Touch::Part,
+                    8 => Touch::Title,
+                    _ => Touch::Nothing,
+                })
+            };
+            for gap in [0, 1, 50, 64 << 10, usize::MAX] {
+                let by_copy = front_spans_gap(make(), gap);
+                let flat = front_spans_flat(make(), gap);
+                assert_eq!(flat, by_copy, "trial {trial} gap {gap}: {steps:?}");
+                spans_seen += by_copy.len();
+                empty += usize::from(by_copy.is_empty());
+            }
+        }
+        assert!(spans_seen > 5000 && empty > 20, "{spans_seen} {empty}");
+    }
 
     /// What the steps refer to is the bytes of the joined ranges of each copy; the
     /// span per copy is from the lowest to the highest.
@@ -9063,13 +9201,35 @@ fn ranges_cover(ranges: &[(usize, usize)], address: usize, end: usize, sorted: b
     at > 0 && end <= ranges[at - 1].1
 }
 
+thread_local! {
+    /// What a lean batch ([`Batch::new`]) keeps ahead of the steps, kept by the thread between submissions.
+    static AHEAD_FIRST: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
+    static AHEAD_REST: std::cell::RefCell<ByCopy<Vec<(usize, usize)>>> = std::cell::RefCell::new(ByCopy::default());
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        if self.lean {
+            scratch::give(&AHEAD_FIRST, std::mem::take(&mut self.first));
+            scratch::give(&AHEAD_REST, std::mem::take(&mut self.rest));
+        }
+    }
+}
+
 impl Batch {
     /// A batch for a submission's steps (`lean`: [`lean_steps`], read once).
     fn new(lean: bool) -> Batch {
-        Batch { lean, ..Batch::default() }
+        let mut batch = Batch::default();
+        batch.lean = lean;
+        if lean {
+            // (The tables the thread kept from the submission before, emptied.)
+            batch.first = scratch::take(&AHEAD_FIRST);
+            batch.rest = scratch::take(&AHEAD_REST);
+        }
+        batch
     }
 
-    /// Whether what `ahead` holds for the copy `key` covers `[address, end)`
+    /// Whether what is ahead of the steps for the copy `key` covers `[address, end)`
     /// in one range: it is refreshed ahead of the steps already.
     fn covered(&mut self, key: usize, address: usize, end: usize) -> bool {
         if !self.lean {
@@ -9078,12 +9238,20 @@ impl Batch {
         // The steps of a list come several on end for one copy (the views of a draw), and what is refreshed ahead
         // of most copies is one range: the copy is looked up when it is not the one before.
         if self.memo.0 != key {
-            let one = self.ahead.get(&key).and_then(|ranges| if ranges.len() == 1 { Some(ranges[0]) } else { None });
+            let one = match (self.first.get(&key), self.rest.contains_key(&key)) {
+                (Some(&one), false) => Some(one),
+                // (None at all: a range that holds nothing.)
+                (None, _) => Some((usize::MAX, 0)),
+                _ => None,
+            };
             self.memo = (key, one);
         }
         match self.memo.1 {
             Some((from, to)) => from <= address && end <= to,
-            None => self.ahead.get(&key).is_some_and(|ranges| ranges_cover(ranges, address, end, !self.unsorted)),
+            None => {
+                self.first.get(&key).is_some_and(|&(from, to)| from <= address && end <= to)
+                    || self.rest.get(&key).is_some_and(|ranges| ranges_cover(ranges, address, end, !self.unsorted))
+            }
         }
     }
 
@@ -9092,19 +9260,41 @@ impl Batch {
         match copy {
             Some(copy) => {
                 self.ahead.remove(&copy);
+                self.first.remove(&copy);
+                self.rest.remove(&copy);
             }
-            None => self.ahead.clear(),
+            None => {
+                self.ahead.clear();
+                self.first.clear();
+                self.rest.clear();
+            }
         }
         self.memo = (0, None);
     }
 
     /// Puts `[from, to)` among what is refreshed ahead of the steps for `copy`.
     fn put_ahead(&mut self, copy: usize, from: usize, to: usize) {
-        let ranges = self.ahead.entry(copy).or_default();
-        if ranges.last().is_some_and(|last| from < last.1) {
-            self.unsorted = true;
+        if self.lean {
+            match self.first.entry(copy) {
+                std::collections::hash_map::Entry::Vacant(place) => {
+                    place.insert((from, to));
+                }
+                std::collections::hash_map::Entry::Occupied(first) => {
+                    let ranges = self.rest.entry(copy).or_default();
+                    let last = ranges.last().copied().unwrap_or(*first.get());
+                    if from < last.1 {
+                        self.unsorted = true;
+                    }
+                    ranges.push((from, to));
+                }
+            }
+        } else {
+            let ranges = self.ahead.entry(copy).or_default();
+            if ranges.last().is_some_and(|last| from < last.1) {
+                self.unsorted = true;
+            }
+            ranges.push((from, to));
         }
-        ranges.push((from, to));
         self.memo = (0, None);
     }
 
@@ -9248,10 +9438,12 @@ impl Batch {
         } else {
             Vec::new()
         };
-        let spans: Vec<_> = front_spans_gap(touches.drain(..), refresh_narrow_gap())
-            .into_iter()
-            .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
-            .collect();
+        let found = if self.lean {
+            front_spans_flat(touches.drain(..), refresh_narrow_gap())
+        } else {
+            front_spans_gap(touches.drain(..), refresh_narrow_gap())
+        };
+        let spans: Vec<_> = found.into_iter().filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to))).collect();
         self.front = true;
         for (shadow, from, to) in &spans {
             self.put_ahead(std::sync::Arc::as_ptr(shadow) as usize, *from, *to);

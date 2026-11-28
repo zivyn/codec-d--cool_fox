@@ -102,7 +102,8 @@ pub(crate) fn preset_name(preset: u32) -> &'static str {
 
 fn down(vk: u16) -> bool {
     // SAFETY: a plain query.
-    unsafe { GetAsyncKeyState(i32::from(vk)) } < 0
+    let state = unsafe { GetAsyncKeyState(i32::from(vk)) };
+    state < 0
 }
 
 /// One of our windows is in front.

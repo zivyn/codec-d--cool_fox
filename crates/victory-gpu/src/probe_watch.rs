@@ -77,7 +77,7 @@ pub(crate) fn note(resource: This) {
         && matches!(d.Format.0, R16_FLOAT | R11G11B10_FLOAT | R8G8B8A8_UNORM);
     if volume && book.volumes.len() < 16 {
         tracing::info!(
-            resource = format_args!("{resource:#x}"),
+            resource = format_args!("{:#x}", resource as usize),
             format = d.Format.0,
             "probe watch: a volume the title writes"
         );

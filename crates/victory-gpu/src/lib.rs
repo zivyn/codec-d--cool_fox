@@ -68,6 +68,8 @@ mod primitive;
 #[cfg(windows)]
 mod barrier;
 #[cfg(windows)]
+mod lazy_wait;
+#[cfg(windows)]
 mod priority;
 #[cfg(windows)]
 mod vram;

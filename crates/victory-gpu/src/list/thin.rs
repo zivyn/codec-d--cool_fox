@@ -188,6 +188,42 @@ fn is_draw(op: u64) -> bool {
         || op == Plain::EXECUTE_INDIRECT as u64
 }
 
+/// What a call does to the title's waits for shader writes that are held
+/// (`VICTORY_PRECISE_BARRIERS`, [`super::lazy`]). Only what is named here sets state
+/// without recording work that reads or writes memory; a call that is not named is
+/// opaque, and so is one added to the list of calls later and forgotten here.
+fn class(op: u64) -> super::lazy::Class {
+    use super::lazy::Class;
+    const QUIET: [u64; 12] = [
+        Plain::TOPOLOGY as u64,
+        Plain::STENCIL_REF as u64,
+        Plain::DEPTH_BOUNDS as u64,
+        Plain::COMPUTE_TABLE as u64,
+        Plain::GRAPHICS_TABLE as u64,
+        Plain::COMPUTE_CONSTANT as u64,
+        Plain::GRAPHICS_CONSTANT as u64,
+        Plain::COMPUTE_VIEW as u64,
+        Plain::GRAPHICS_VIEW as u64,
+        Plain::SET_PIPELINE as u64,
+        Plain::WRITE32 as u64,
+        Plain::WRITE64 as u64,
+    ];
+    if QUIET.contains(&op)
+        || [RESET, UPLOAD, VIEWPORTS, SCISSORS, BLEND_FACTOR, HEAPS, COMPUTE_CONSTANTS, GRAPHICS_CONSTANTS, INDEX_BUFFER, VERTEX_BUFFERS]
+            .contains(&op)
+    {
+        Class::Quiet
+    } else if op == Plain::SYNC as u64 || op == BARRIER_GROUPS {
+        Class::Wait
+    } else if op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64 {
+        Class::Dispatch
+    } else if op == CLOSE {
+        Class::Close
+    } else {
+        Class::Opaque
+    }
+}
+
 /// Streams' memory to use again.
 static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 /// Recordings with words to translate.
@@ -1006,6 +1042,10 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         Vec::new()
     };
     let mut ordinal = 0usize;
+    // The title's waits for shader writes held for what a command needs (a wait is made
+    // where the title put it with the switch off, and in lists that are not written down).
+    let lazy_on = !skip && super::lazy::on();
+    super::lazy::begin(list, lazy_on);
     // The execution before: its signature, arguments and where its next
     // record would be; what came since (op codes, the first few, and how many).
     let mut last: Option<(u64, u64, u64)> = None;
@@ -1044,6 +1084,25 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if dead.get(this_op).copied().unwrap_or(false) {
             DROPS[usize::from(op == Plain::DISPATCH as u64 || op == Plain::DISPATCH_X as u64)].fetch_add(1, Relaxed);
             continue;
+        }
+        if lazy_on {
+            use super::lazy::Class;
+            match class(op) {
+                Class::Quiet | Class::Dispatch | Class::Close => {}
+                Class::Wait => {
+                    // (A group of no barriers waits for nothing.)
+                    if op == Plain::SYNC as u64 || w.first().is_some_and(|&n| n > 0) {
+                        super::lazy::op(list, Class::Wait);
+                    }
+                    // (As the call it stands for would have counted.)
+                    since += 1;
+                    if look_on() && between.len() < 8 {
+                        between.push(op.min(255) as u8);
+                    }
+                    continue;
+                }
+                Class::Opaque => super::lazy::op(list, Class::Opaque),
+            }
         }
         if op == Plain::EXECUTE_INDIRECT as u64 {
             RUNS[0].fetch_add(1, Relaxed);
@@ -1124,8 +1183,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 // (Only whether there is an allocator is looked at.)
                 let allocator: This = std::ptr::NonNull::<u64>::dangling().as_ptr().cast_const().cast();
                 super::reset(list, allocator, w[0] as This);
+                // (Its state is new: nothing is held.)
+                super::lazy::begin(list, lazy_on);
             }
             CLOSE => {
+                if lazy_on {
+                    super::lazy::op(list, super::lazy::Class::Close);
+                }
                 super::close(list);
                 closed = true;
             }
@@ -1602,5 +1666,171 @@ mod tests {
         slot[1] = 99;
         assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
+    }
+
+    /// The calls that only set state are named; every other call, and one this
+    /// table has never heard of, is opaque (it puts out a wait that is held).
+    #[test]
+    fn the_calls_that_set_state_are_named_and_the_rest_are_opaque() {
+        use crate::list::lazy::Class;
+        for op in [
+            Plain::TOPOLOGY as u64,
+            Plain::COMPUTE_TABLE as u64,
+            Plain::COMPUTE_CONSTANT as u64,
+            Plain::SET_PIPELINE as u64,
+            Plain::WRITE32 as u64,
+            RESET,
+            UPLOAD,
+            VIEWPORTS,
+            HEAPS,
+            COMPUTE_CONSTANTS,
+            VERTEX_BUFFERS,
+        ] {
+            assert_eq!(class(op), Class::Quiet, "op {op}");
+        }
+        for op in [Plain::SYNC as u64, BARRIER_GROUPS] {
+            assert_eq!(class(op), Class::Wait);
+        }
+        for op in [Plain::DISPATCH as u64, Plain::DISPATCH_X as u64] {
+            assert_eq!(class(op), Class::Dispatch);
+        }
+        assert_eq!(class(CLOSE), Class::Close);
+        for op in [
+            Plain::DRAW as u64,
+            Plain::DRAW_INDEXED as u64,
+            Plain::DISPATCH_MESH as u64,
+            Plain::DISPATCH_MESH_X as u64,
+            Plain::COPY_BUFFER as u64,
+            Plain::COPY_RESOURCE as u64,
+            Plain::COPY_MEMORY as u64,
+            Plain::RESOLVE as u64,
+            Plain::RESOLVE_QUERIES as u64,
+            Plain::EXECUTE_INDIRECT as u64,
+            Plain::WAIT_VALUE as u64,
+            Plain::BEGIN_QUERY as u64,
+            BARRIER,
+            TARGETS,
+            CLEAR_RTV,
+            CLEAR_DSV,
+            COPY_TEXTURE,
+            Plain::END as u64 + 1000,
+            u64::MAX,
+        ] {
+            assert_eq!(class(op), Class::Opaque, "op {op}");
+        }
+        // Every code up to the last one the front knows is classified in one of the five ways, and the
+        // only ones that are not opaque are those named above.
+        let named = (0..=COPY_TEXTURE).filter(|&op| class(op) != Class::Opaque).count();
+        assert_eq!(named, 12 + 10 + 2 + 2 + 1, "the calls that are not opaque");
+    }
+
+    /// Streams of the title's calls, each through `class` and `feed` as `translate` and `State::dispatch` do, with the
+    /// accesses a dispatch has and "anywhere" for every other call that records work: whatever the stream, two
+    /// commands that conflict with a title wait between them have a wait made between them, and one is only made
+    /// for a title wait.
+    #[test]
+    fn no_hazard_is_left_unordered_over_streams_of_the_titles_calls() {
+        use crate::host::precise::{Access, Span};
+        use crate::lazy_wait::{Lazy, anywhere};
+        use crate::list::lazy::{Class, feed};
+        let mut seed = 0x1234_5678_9abc_def1_u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let codes = [
+            Plain::DISPATCH as u64,
+            Plain::DISPATCH as u64,
+            Plain::DISPATCH_X as u64,
+            Plain::DISPATCH as u64,
+            BARRIER_GROUPS,
+            BARRIER_GROUPS,
+            Plain::SYNC as u64,
+            Plain::COMPUTE_TABLE as u64,
+            Plain::COMPUTE_CONSTANT as u64,
+            Plain::SET_PIPELINE as u64,
+            Plain::WRITE32 as u64,
+            VIEWPORTS,
+            Plain::DRAW as u64,
+            Plain::COPY_BUFFER as u64,
+            Plain::EXECUTE_INDIRECT as u64,
+            Plain::WAIT_VALUE as u64,
+            BARRIER,
+            CLEAR_RTV,
+            Plain::END as u64 + 77,
+        ];
+        let meet = |a: &Option<Vec<Span>>, b: &Option<Vec<Span>>| match (a, b) {
+            (None, None) => true,
+            (None, Some(s)) | (Some(s), None) => !s.is_empty(),
+            (Some(a), Some(b)) => a.iter().any(|x| b.iter().any(|y| x.0 == y.0 && x.1 < y.2 && y.1 < x.2)),
+        };
+        let (mut pairs, mut kept, mut skipped) = (0u64, 0u64, 0u64);
+        for _ in 0..400 {
+            let mut lazy = Lazy::new();
+            // (access, title waits before it, a wait was made in front of it)
+            let mut commands: Vec<(Access, u64, bool)> = Vec::new();
+            let (mut waits, mut since_made) = (0u64, 0u64);
+            for _ in 0..60 {
+                let op = codes[next(codes.len() as u64) as usize];
+                let class = class(op);
+                let access = match class {
+                    Class::Dispatch => Some(Access {
+                        reads: Some(vec![(0, next(16) * 64, next(16) * 64 + 64 * (1 + next(3)))]),
+                        writes: if next(9) == 0 {
+                            None
+                        } else {
+                            let at = next(16) * 64;
+                            Some(vec![(0, at, at + 64 * (1 + next(3)))])
+                        },
+                    }),
+                    _ => None,
+                };
+                // (A read from a range made of two draws of `next` may be empty: make it a span.)
+                let access = access.map(|mut a| {
+                    if let Some(r) = a.reads.as_mut() {
+                        for s in r.iter_mut() {
+                            s.2 = s.2.max(s.1 + 64);
+                        }
+                    }
+                    a
+                });
+                let made = feed(&mut lazy, class, access.as_ref());
+                match class {
+                    Class::Wait => {
+                        waits += 1;
+                        since_made += 1;
+                        assert!(!made);
+                    }
+                    Class::Quiet => assert!(!made),
+                    Class::Close => {}
+                    Class::Dispatch | Class::Opaque => {
+                        if made {
+                            assert!(since_made > 0, "a wait is only made for a wait of the title");
+                            since_made = 0;
+                            kept += 1;
+                        }
+                        commands.push((access.unwrap_or_else(anywhere), waits, made));
+                    }
+                }
+            }
+            skipped += waits.saturating_sub(commands.iter().filter(|c| c.2).count() as u64);
+            for j in 1..commands.len() {
+                for i in 0..j {
+                    let ((a, wi, _), (b, wj, _)) = (&commands[i], &commands[j]);
+                    if wi == wj {
+                        continue;
+                    }
+                    if !(meet(&a.writes, &b.reads) || meet(&a.writes, &b.writes) || meet(&a.reads, &b.writes)) {
+                        continue;
+                    }
+                    pairs += 1;
+                    assert!(commands[i + 1..=j].iter().any(|c| c.2), "commands {i} and {j} conflict across a wait");
+                }
+            }
+        }
+        assert!(pairs > 2000 && kept > 500, "the streams have hazards and waits ({pairs}, {kept})");
+        assert!(skipped > 100, "and some waits are left out ({skipped})");
     }
 }

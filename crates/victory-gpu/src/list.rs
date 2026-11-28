@@ -19,6 +19,8 @@ use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
 #[cfg(windows)]
+pub(crate) mod lazy;
+#[cfg(windows)]
 pub(crate) mod replay;
 #[cfg(windows)]
 pub(crate) mod thin;
@@ -823,6 +825,18 @@ const UAV_BARRIER: Barrier = Barrier {
     second: 0,
     last: 0,
 };
+
+/// A wait for every earlier shader write, as the title's barrier groups and
+/// pipeline syncs are made (`VICTORY_PRECISE_BARRIERS` puts it where a command
+/// needs it).
+#[cfg(windows)]
+pub(crate) fn emit_uav_wait(list: &crate::host::HostList) {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    // SAFETY: the same layout; no resource named.
+    let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+    // SAFETY: an open list.
+    unsafe { list.list.ResourceBarrier(&[barrier]) };
+}
 
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {

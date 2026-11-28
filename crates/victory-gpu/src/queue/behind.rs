@@ -1227,6 +1227,7 @@ pub(super) fn line(frames: f64) {
         );
     }
     crate::host::precise::line(frames);
+    crate::lazy_wait::line(frames);
     if let Some([splits, before, lists]) = crate::host::take_blocked_splits() {
         tracing::info!(
             "joined submissions that waited for flights, per frame (VICTORY_SPLIT_BLOCKED): {:.2} with parts in front of the wait \

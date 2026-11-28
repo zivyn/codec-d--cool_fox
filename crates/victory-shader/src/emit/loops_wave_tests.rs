@@ -218,7 +218,7 @@ fn a_skip_over_a_loop_that_never_ends_with_no_lane_left_stays_when_asked() {
     assert!(on.0.is_none(), "with it the skip stays");
 }
 
-/// 32 threads of a console wave64: every lane writes `0xDEAD` to `lds[0]`; then the lanes but the
+/// 64 threads of a console wave64: every lane writes `0xDEAD` to `lds[0]`; then the lanes but the
 /// first (the first thread's pixel is not water, say: `v_cmpx_ne_u32 exec, 0, v0` leaves it out)
 /// reach the thread group's set-up, `v_cmpx_eq_u32 exec, 0, v0` and `lds[0] = 0x4D`, which on the
 /// console no lane runs. Then every lane that is left stores `lds[0]` at its own place.
@@ -252,7 +252,7 @@ fn first_thread_init_after_the_first_thread_left() -> crate::native::NativeProgr
         0x8002_0803,
         0xBEFE_040C, // END: s_mov_b64 exec, s[12:13]
     ];
-    let mut native = native_of(&words, true, 32);
+    let mut native = native_of(&words, true, 64);
     if let StageIo::Cs(cs) = &mut native.io {
         cs.rsrc2 |= 1 << 15; // 512 bytes of LDS
     }
@@ -296,8 +296,8 @@ fn the_first_thread_sets_shared_memory_up_when_asked() {
     eprintln!("without: {before:?}");
     eprintln!("with: {after:?}");
     // (lane 0 stores nothing)
-    assert!(before[1..32].iter().all(|&v| v == 0xDEAD), "as the console: the set-up is not run");
-    assert!(after[1..32].iter().all(|&v| v == 0x4D), "the first thread's set-up is run");
+    assert!(before[1..64].iter().all(|&v| v == 0xDEAD), "as the console: the set-up is not run");
+    assert!(after[1..64].iter().all(|&v| v == 0x4D), "the first thread's set-up is run");
 }
 
 /// The 64 words of a 32-thread program's output.

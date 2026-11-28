@@ -115,15 +115,41 @@ fn left_out_passes() -> (bool, bool) {
     })
 }
 
+/// Shader hashes whose pipelines are left out in every build
+/// (`VICTORY_LEAVE_OUT=<16 hex digits>[,..]`, off when unset). From the
+/// VIctory-NVIDIA fork (trustno1-coder), which leaves out the decal heap's
+/// relocation program (translatable for 32-lane hosts through host waves that
+/// meet by spinning: 11.85 ms of the card a frame in its first gameplay area)
+/// and the heat-haze pass. The hashes are not in the repository.
+fn leave_out_hashes() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        std::env::var("VICTORY_LEAVE_OUT")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect()
+    })
+}
+
 /// Which programs this run leaves out, as text (what `victory warm --compute` keeps with the
 /// compute programs it has written down, to write them down again when it changes).
 pub(super) fn left_out_signature() -> String {
     let (hits, activation) = left_out_passes();
-    format!("hit shading left out: {hits}, probe ray activation left out: {activation}")
+    let named = leave_out_hashes();
+    if named.is_empty() {
+        format!("hit shading left out: {hits}, probe ray activation left out: {activation}")
+    } else {
+        format!("hit shading left out: {hits}, probe ray activation left out: {activation}, named: {}", named.join(","))
+    }
 }
 
 pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     let (hits, activation) = left_out_passes();
+    if !leave_out_hashes().is_empty() && shaders.iter().any(|s| leave_out_hashes().contains(&s.hash)) {
+        return Some("named in VICTORY_LEAVE_OUT, left out");
+    }
     if hits && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }

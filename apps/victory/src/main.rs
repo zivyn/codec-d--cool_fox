@@ -135,6 +135,11 @@ enum Command {
         /// one per logical core.
         #[arg(long)]
         now: bool,
+        /// Leave the ray-tracing resolves to the title: they are the ~1,000 biggest programs
+        /// (nine tenths of a warm's compile time), and with `VICTORY_RESOLVE_ASYNC=1` the title
+        /// makes the ones a scene binds in the background, without waiting for them.
+        #[arg(long)]
+        skip_resolves: bool,
         /// Say what there is to make and stop.
         #[arg(long)]
         status: bool,
@@ -268,8 +273,34 @@ fn main() -> Result<()> {
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
-        Command::Warm { jobs, limit, again, used, compute, now, status, verify, paths, these, shard } => {
-            warm::run(warm::Ask { jobs, limit, again, used, compute, now, status, verify, paths, these, shard })
+        Command::Warm {
+            jobs,
+            limit,
+            again,
+            used,
+            compute,
+            now,
+            skip_resolves,
+            status,
+            verify,
+            paths,
+            these,
+            shard,
+        } => {
+            warm::run(warm::Ask {
+                jobs,
+                limit,
+                again,
+                used,
+                compute,
+                now,
+                skip_resolves,
+                status,
+                verify,
+                paths,
+                these,
+                shard,
+            })
         }
         Command::Run {
             exe,

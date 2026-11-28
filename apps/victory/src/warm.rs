@@ -15,6 +15,10 @@ use victory_hle::known_pipelines as known;
 /// Pipelines a process makes before another takes its place: the compiler's
 /// and the translations' memory goes with it.
 const AT_ONCE: usize = 40;
+/// What a process is given at most, by what its pipelines are thought to cost (ms): the biggest
+/// programs take seconds, so a process of forty of them would still be at work when the others
+/// had finished, and would hold the compiler's memory of all of them.
+const AT_MOST_MS: u64 = 60_000;
 /// A pipeline that takes longer is taken for one the compiler hangs on.
 const LONGEST: Duration = Duration::from_secs(300);
 
@@ -38,6 +42,7 @@ pub struct Ask {
     pub used: bool,
     pub compute: bool,
     pub now: bool,
+    pub skip_resolves: bool,
     pub status: bool,
     pub verify: bool,
     pub paths: Vec<PathBuf>,
@@ -126,7 +131,7 @@ fn corpus_stamp(paths: &[PathBuf]) -> String {
 }
 
 pub fn run(ask: Ask) -> Result<()> {
-    let Ask { jobs, limit, again, used, compute, now, status, verify, paths, these, shard } = ask;
+    let Ask { jobs, limit, again, used, compute, now, skip_resolves, status, verify, paths, these, shard } = ask;
     let dir = folder()?;
     if let Some(these) = these {
         return make(&dir, &these, shard);
@@ -194,8 +199,21 @@ pub fn run(ask: Ask) -> Result<()> {
             (again || !done.contains(key)) && !bad.contains(key) && wanted
         })
         .collect();
-    // Drawn with first, then compute (a run waits for those whole), then the rest.
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), !book[n].1, keys[n]));
+    let weights = known::weights(&dir);
+    let weight = |n: usize| weights.get(n);
+    let resolves = if skip_resolves {
+        let before = all.len();
+        all.retain(|&n| !weight(n).is_some_and(|w| w.resolve));
+        before - all.len()
+    } else {
+        0
+    };
+    // What each took in earlier runs, else a guess from its size: the longest go first, so that
+    // what is left for the end is short and the processes finish together.
+    let took = slow_times(&dir);
+    let cost = |n: usize| cost_ms(took.get(keys[n].as_str()).copied(), weight(n).map_or(0, |w| w.bytes));
+    // Drawn with first, then compute (a run waits for those whole), then the rest; the longest first.
+    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), !book[n].1, std::cmp::Reverse(cost(n)), keys[n]));
     all.truncate(limit.unwrap_or(usize::MAX));
     // A launch that waits for this takes the whole machine.
     let jobs = jobs.unwrap_or(if now { cores } else { cores * 2 / 3 }).max(1);
@@ -207,11 +225,15 @@ pub fn run(ask: Ask) -> Result<()> {
         bad.len(),
         all.len()
     );
+    if skip_resolves {
+        println!("{resolves} ray-tracing resolves left to the title (VICTORY_RESOLVE_ASYNC makes them in the background)");
+    }
     if status || all.is_empty() {
         return Ok(());
     }
     let priority = if now { 0x20 } else { IDLE_PRIORITY_CLASS };
-    let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
+    let costs: Vec<u64> = all.iter().map(|&n| cost(n)).collect();
+    let chunks: Vec<&[usize]> = chunks_by_cost(&all, &costs, AT_ONCE, AT_MOST_MS);
     let next = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
     let done_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&done_file)?);
@@ -271,6 +293,46 @@ pub fn run(ask: Ask) -> Result<()> {
         times.iter().sum::<f64>() / 1e3
     );
     Ok(())
+}
+
+/// What a pipeline is thought to cost (ms): what it took in an earlier run, else its shaders' size
+/// over 20 (the programs of 60 KB the driver takes 3 to 4 s for, alone).
+fn cost_ms(took: Option<u64>, bytes: u64) -> u64 {
+    took.unwrap_or(bytes / 20).max(1)
+}
+
+/// How long the pipelines that took a second or more took, from the runs' `slow-pipelines.txt`
+/// (the most of each).
+fn slow_times(dir: &Path) -> std::collections::HashMap<String, u64> {
+    let mut took = std::collections::HashMap::new();
+    let Ok(file) = std::fs::File::open(dir.join("slow-pipelines.txt")) else { return took };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if let Some((key, ms)) = line.split_once(' ')
+            && let Ok(ms) = ms.trim().parse::<u64>()
+        {
+            let most = took.entry(key.to_owned()).or_insert(0);
+            *most = (*most).max(ms);
+        }
+    }
+    took
+}
+
+/// `all` cut into runs of at most `count` pipelines and about `most_ms` of `costs` (one for each
+/// of `all`); one is never empty, however much its first costs.
+fn chunks_by_cost<'a>(all: &'a [usize], costs: &[u64], count: usize, most_ms: u64) -> Vec<&'a [usize]> {
+    let mut chunks = Vec::new();
+    let (mut from, mut sum) = (0, 0u64);
+    for (at, cost) in costs.iter().enumerate().take(all.len()) {
+        if at > from && (at - from >= count || sum + cost > most_ms) {
+            chunks.push(&all[from..at]);
+            (from, sum) = (at, 0);
+        }
+        sum += cost;
+    }
+    if from < all.len() {
+        chunks.push(&all[from..]);
+    }
+    chunks
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -414,4 +476,38 @@ fn make(dir: &Path, these: &str, shard: Option<PathBuf>) -> Result<()> {
     // Without what a run's end does (nothing to save, the host's threads).
     let _ = out.flush();
     std::process::exit(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pipeline_is_thought_to_cost_what_it_took_else_by_its_size() {
+        assert_eq!(cost_ms(Some(8_000), 1_000), 8_000);
+        // A program of 60 KB: three seconds.
+        assert_eq!(cost_ms(None, 60_000), 3_000);
+        assert_eq!(cost_ms(None, 0), 1);
+    }
+
+    #[test]
+    fn processes_are_given_runs_cut_by_count_and_by_cost() {
+        let all: Vec<usize> = (0..10).collect();
+        // Many cheap ones: by count.
+        let cheap = vec![1; 10];
+        let chunks = chunks_by_cost(&all, &cheap, 4, 60_000);
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [4, 4, 2]);
+        // The biggest first, cut by what they cost: four of 20 s do not fit in one of 60 s.
+        let big = [20_000, 20_000, 20_000, 20_000, 1, 1, 1, 1, 1, 1];
+        let chunks = chunks_by_cost(&all, &big, 40, 60_000);
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [3, 7]);
+        // One that costs more than the whole is still a run of its own.
+        let huge = [100_000, 1, 1];
+        let chunks = chunks_by_cost(&all[..3], &huge, 40, 60_000);
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [1, 2]);
+        // Every pipeline is in exactly one run, in order.
+        let joined: Vec<usize> = chunks_by_cost(&all, &big, 40, 60_000).concat();
+        assert_eq!(joined, all);
+        assert!(chunks_by_cost(&[], &[], 40, 60_000).is_empty());
+    }
 }

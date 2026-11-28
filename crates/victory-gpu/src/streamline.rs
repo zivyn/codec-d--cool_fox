@@ -1466,6 +1466,20 @@ fn interface_composite() -> &'static [String] {
     })
 }
 
+/// Whether `has` holds for every one of `hashes`, none being no match.
+fn is_pair(hashes: &[String], has: impl Fn(&str) -> bool) -> bool {
+    !hashes.is_empty() && hashes.iter().all(|hash| has(hash))
+}
+
+/// For the 1440p frontend's viewport (`draw::State::native_frontend_viewport`),
+/// which does not need the hashes: with `VICTORY_INTERFACE_COMPOSITE` set the
+/// pipeline must also be that pair (`has`: the pipeline has a stage with the
+/// hash), unset it is a match.
+pub(crate) fn composite_wanted(has: impl Fn(&str) -> bool) -> bool {
+    let hashes = interface_composite();
+    hashes.is_empty() || is_pair(hashes, has)
+}
+
 /// Whether draws are looked at for the colour without the interface: frame
 /// generation runs on our swap chain and `VICTORY_FRAMEGEN_HUDLESS` is not 0.
 #[inline]
@@ -1546,9 +1560,7 @@ pub(crate) fn before_target_draw(
     if !SHOWN.iter().any(|s| s.load(Relaxed) == shown) {
         return;
     }
-    let composite = triangle
-        && !interface_composite().is_empty()
-        && interface_composite().iter().all(|hash| pipeline.stages.iter().any(|s| s.shader.hash == *hash));
+    let composite = triangle && is_pair(interface_composite(), |hash| pipeline.stages.iter().any(|s| s.shader.hash == hash));
     if !composite {
         HUD_COUNTS[HUD_OTHERS].fetch_add(1, Relaxed);
         static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -2356,5 +2368,23 @@ mod failing_tests {
         assert!(!dlss_failing(89, 89));
         assert!(!dlss_failing(120, 1000));
         assert!(!dlss_failing(500, 600));
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::is_pair;
+
+    #[test]
+    fn the_composite_is_a_pipeline_with_both_stages_and_none_when_unset() {
+        let hashes = ["aa".to_owned(), "bb".to_owned()];
+        let pipeline = |stages: &'static [&'static str]| move |hash: &str| stages.contains(&hash);
+        assert!(is_pair(&hashes, pipeline(&["aa", "bb"])));
+        assert!(is_pair(&hashes, pipeline(&["cc", "bb", "aa"])));
+        // One stage of the pair is not the composite.
+        assert!(!is_pair(&hashes, pipeline(&["aa"])));
+        assert!(!is_pair(&hashes, pipeline(&["bb", "cc"])));
+        // No hashes, no match: nothing is copied (the empty `all` is true).
+        assert!(!is_pair(&[], pipeline(&["aa", "bb"])));
     }
 }

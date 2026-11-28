@@ -717,7 +717,7 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 }
 
 /// A translated shader and what the host binds for it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
     /// The DXIL container, hashed as D3D12 expects.
@@ -743,6 +743,28 @@ pub struct HostShader {
     /// The table entries (root parameter, offset in dwords) the shader reads through the host's windows
     /// alone (`VICTORY_BINDLESS_BUFFERS`): their views need not be made for it.
     pub bindless: Vec<(u8, u32)>,
+}
+
+/// As the derive wrote it, but for `bindless`, which is named only when it holds something: `translate --list`
+/// hashes this text to say which programs a change touches, and a translation that has no entry there (any made
+/// without `VICTORY_BINDLESS_BUFFERS`) is what it was.
+impl std::fmt::Debug for HostShader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("HostShader");
+        d.field("stage", &self.stage)
+            .field("dxil", &self.dxil)
+            .field("user_data", &self.user_data)
+            .field("samplers", &self.samplers)
+            .field("static_samplers", &self.static_samplers)
+            .field("root_cbvs", &self.root_cbvs)
+            .field("root_srvs", &self.root_srvs)
+            .field("root_uavs", &self.root_uavs)
+            .field("root_indexed_views", &self.root_indexed_views);
+        if !self.bindless.is_empty() {
+            d.field("bindless", &self.bindless);
+        }
+        d.finish()
+    }
 }
 
 impl HostShader {

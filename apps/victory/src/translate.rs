@@ -782,6 +782,15 @@ fn check(
     if let Some(keep) = &checks.keep {
         lock(keep).push((label(), shader.clone()));
     }
+    // `VICTORY_BINDLESS_CENSUS=<file>`: the programs that have table entries only windows read
+    // (`VICTORY_BINDLESS_BUFFERS`), a line each, and how many entries.
+    if !shader.bindless.is_empty()
+        && let Ok(path) = std::env::var("VICTORY_BINDLESS_CENSUS")
+        && let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(file, "{}  {}", label(), shader.bindless.len());
+    }
     // With `--list`: a hash of the module and of what the host binds for it,
     // to show which shaders a change to the translator touches.
     if t.list {

@@ -21,6 +21,10 @@ pub enum Form {
     /// wave (the two host waves exchange the decision and go the same way), the rest as in the
     /// form without skips: the barriers are at those branches, outside the loops. Exact.
     KeptSkipsWide,
+    /// The skips and early-outs over loops left out as before `VICTORY_KEEP_LOOP_SKIPS`, where the
+    /// wave-wide form does not lower: every lane walks the loop, and a wave with no lane left runs
+    /// it to its limit where its exit reads a lane that is off. Exact, and slower there.
+    LoopSkipsLeftOut,
     /// Each host wave a wave of its own, where the wave operations are the allocation idiom. Exact.
     LocalIdiom,
     /// Each host wave a wave of its own, the wave operations answering per half. APPROXIMATE.
@@ -54,6 +58,7 @@ impl Form {
             Form::WithoutSkips => "without skips",
             Form::WithoutSkipsDeep => "without skips, scalars followed",
             Form::KeptSkipsWide => "kept skips wave-wide",
+            Form::LoopSkipsLeftOut => "loop skips left out",
             Form::LocalIdiom => "local waves (idiom)",
             Form::LocalApproximate => "local waves (APPROXIMATE)",
             Form::LocalApproximateAnyMask => "local waves (APPROXIMATE, any mask)",

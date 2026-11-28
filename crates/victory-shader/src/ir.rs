@@ -739,6 +739,11 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 /// [`without_early_outs`], and the blocks whose early-out was kept only because a loop
 /// follows it (`VICTORY_KEEP_LOOP_SKIPS`).
 pub(crate) fn drop_early_outs(p: &Program) -> (Option<Program>, Vec<usize>) {
+    drop_early_outs_as(p, keep_loop_skips())
+}
+
+/// [`drop_early_outs`] with the early-outs over loops kept (`keep`) or left out.
+pub(crate) fn drop_early_outs_as(p: &Program, keep: bool) -> (Option<Program>, Vec<usize>) {
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
             && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
@@ -751,7 +756,7 @@ pub(crate) fn drop_early_outs(p: &Program) -> (Option<Program>, Vec<usize>) {
             continue;
         };
         if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
-            if keep_loop_skips() && loop_after(p, b, not_taken) {
+            if keep && loop_after(p, b, not_taken) {
                 kept.push(b);
                 continue;
             }
@@ -815,6 +820,11 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
 /// and the branch stays a branch on the lanes of the host wave. A form that has to run the code
 /// after it in every lane takes those branches wave-wide ([`crate::emit`]'s `kept_skips_wide`).
 pub(crate) fn drop_skips(p: &Program, deep: bool) -> (Option<Program>, Vec<usize>) {
+    drop_skips_as(p, deep, keep_loop_skips())
+}
+
+/// [`drop_skips`] with the skips over loops kept (`keep`) or left out.
+pub(crate) fn drop_skips_as(p: &Program, deep: bool, keep: bool) -> (Option<Program>, Vec<usize>) {
     let n = p.blocks.len();
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -925,7 +935,7 @@ pub(crate) fn drop_skips(p: &Program, deep: bool) -> (Option<Program>, Vec<usize
             return None;
         }
         // (`VICTORY_KEEP_LOOP_SKIPS`, on unless `=0`: a region with a loop in it keeps its skip, `loops_in`)
-        if keep_loop_skips() && loops_in(&p.blocks, &inside) {
+        if keep && loops_in(&p.blocks, &inside) {
             loop_kept.set(true);
             return None;
         }
@@ -943,7 +953,7 @@ pub(crate) fn drop_skips(p: &Program, deep: bool) -> (Option<Program>, Vec<usize
         }
         let leave_out = if ends(taken) {
             // (an early-out over a loop is kept too: a wave with no lane left does not walk it)
-            let over_loop = keep_loop_skips() && loop_after(p, b, not_taken);
+            let over_loop = keep && loop_after(p, b, not_taken);
             if over_loop {
                 kept.push(b);
             }

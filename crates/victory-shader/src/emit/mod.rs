@@ -912,6 +912,33 @@ fn emit_forms_in(
                         }
                     }
                 }
+                // Where that does not lower either: the forms as they were before the switch, with
+                // the skips over loops left out (exact; a wave with no lane left walks the loop,
+                // which is what the switch avoids). Still before any approximate form.
+                if early_kept.len() + skips_kept.len() + deep_kept.len() > 0 {
+                    let left_out = [
+                        ("without early-outs, loop skips left out", ir::drop_early_outs_as(p, false).0, !early_kept.is_empty()),
+                        ("without skips, loop skips left out", ir::drop_skips_as(p, false, false).0, !skips_kept.is_empty()),
+                        (
+                            "without skips, scalars followed, loop skips left out",
+                            if deep_on { ir::drop_skips_as(p, true, false).0 } else { None },
+                            !deep_kept.is_empty(),
+                        ),
+                    ];
+                    for (name, program, kept) in left_out {
+                        if !kept {
+                            continue;
+                        }
+                        if let Some((p, st, io, res)) = form(name, program) {
+                            let again = emit_program(c, native, &p, &st, &io, &res);
+                            report(name, &again);
+                            if done(&again) {
+                                *form_out = Form::LoopSkipsLeftOut;
+                                return again.map(|(shader, _)| shader);
+                            }
+                        }
+                    }
+                }
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.

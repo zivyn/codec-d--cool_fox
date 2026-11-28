@@ -169,7 +169,8 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
 
 /// `VICTORY_ZEROCOPY`: 0 (unset) off. 1: ranges of title memory that the title itself declares read-only to the
 /// GPU (its page protection; the constant rings and dynamic data the title's CPU writes and shaders only read) are
-/// not copied up to the card: the GPU reads the title's own bytes over the bus ([`crate::shadow`]'s `zero`). 2: also
+/// not copied up to the card: the GPU reads the title's own bytes over the bus ([`crate::shadow`]'s `zero`), in
+/// private memory and, with the physical pages made in committed sections (`xmem`), in view memory. 2: also
 /// title buffers in the title's CPU-visible heaps that shaders cannot write (no unordered access), whatever their
 /// size. Read once: a range given to the card and a range left to a copy cannot trade places while the title runs
 /// (the pages a heap stands on cannot be guarded, so a copy of them would not see the title's writes).
@@ -220,29 +221,152 @@ pub(crate) fn place_zero(start: u64, len: u64, window: bool) -> Option<Placed> {
     place_zero_on(&host.device, start, len, window)
 }
 
+/// What was placed counts, with the in-place tables (`STATS`) that `gone` takes it out of.
+fn account(window: bool, len: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+    let z = if window { Z_CELLS } else { Z_BUFFERS };
+    ZERO[z].fetch_add(1, Ordering::Relaxed);
+    ZERO[z + 1].fetch_add(len, Ordering::Relaxed);
+}
+
+/// What the host's refusal to open memory is counted as, and told for the first eight.
+fn refused(start: u64, len: u64, why: Option<windows::core::Error>) {
+    match why {
+        None => {
+            ZERO[Z_MEMORY].fetch_add(1, Ordering::Relaxed);
+        }
+        Some(e) => {
+            if ZERO[Z_HOST].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "zero copy: title memory not opened in place: a copy instead");
+            }
+        }
+    }
+}
+
 /// [`place_zero`] on a device (tests make their own).
 pub(crate) fn place_zero_on(device: &ID3D12Device, start: u64, len: u64, window: bool) -> Option<Placed> {
     match place_part(device, start, len) {
         Ok(placed) => {
-            let at = if window { 0 } else { 2 };
-            STATS[at].fetch_add(1, Ordering::Relaxed);
-            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
-            let z = if window { Z_CELLS } else { Z_BUFFERS };
-            ZERO[z].fetch_add(1, Ordering::Relaxed);
-            ZERO[z + 1].fetch_add(len, Ordering::Relaxed);
+            account(window, len);
             Some(placed)
         }
-        Err(None) => {
-            ZERO[Z_MEMORY].fetch_add(1, Ordering::Relaxed);
-            None
-        }
-        Err(Some(e)) => {
-            if ZERO[Z_HOST].fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "zero copy: title memory not opened in place: a copy instead");
-            }
+        Err(why) => {
+            refused(start, len, why);
             None
         }
     }
+}
+
+/// Why a cell was not placed: the memory is not one run of a section where the ask is (try the buffer's copy, and
+/// look again only if the views change), or the memory or the host refused (try again later).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Refusal {
+    Scattered,
+    Memory,
+}
+
+/// A cell for the ask `[address, end)` inside the declared range `[start, start + len)`: of private memory the
+/// range whole; of view memory (the title's pages, shown by views of sections made committed) the one run of one
+/// section that holds the ask, cut to the range. The placed buffer and its start and bytes.
+pub(crate) fn place_zero_cell(start: u64, len: u64, address: u64, end: u64) -> Result<(Placed, u64, u64), Refusal> {
+    let Some(host) = crate::host::host() else {
+        return Err(Refusal::Memory);
+    };
+    place_zero_cell_on(&host.device, start, len, address, end)
+}
+
+/// [`place_zero_cell`] on a device (tests make their own).
+pub(crate) fn place_zero_cell_on(device: &ID3D12Device, start: u64, len: u64, address: u64, end: u64) -> Result<(Placed, u64, u64), Refusal> {
+    if cover(address as usize, 1) == Cover::None {
+        // Private memory: the range, whole.
+        if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > zero_most() {
+            ZERO[Z_CAP].fetch_add(1, Ordering::Relaxed);
+            return Err(Refusal::Memory);
+        }
+        return place_zero_on(device, start, len, true).map(|p| (p, start, len)).ok_or(Refusal::Memory);
+    }
+    let Some((from, to, section, offset)) = run_around(address, start, start + len).filter(|r| r.1 >= end) else {
+        ZERO[Z_VIEW].fetch_add(1, Ordering::Relaxed);
+        return Err(Refusal::Scattered);
+    };
+    let bytes = to - from;
+    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + bytes > zero_most() {
+        ZERO[Z_CAP].fetch_add(1, Ordering::Relaxed);
+        return Err(Refusal::Memory);
+    }
+    match place_view(device, from, bytes, section, offset) {
+        Ok(placed) => {
+            account(true, bytes);
+            Ok((placed, from, bytes))
+        }
+        Err(why) => {
+            refused(from, bytes, why);
+            Err(Refusal::Memory)
+        }
+    }
+}
+
+/// Heaps opened on whole committed sections, by the section's handle: a section is one heap, whatever is placed in it.
+static SECTION_HEAPS: std::sync::Mutex<BTreeMap<usize, ID3D12Heap>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn section_heaps() -> std::sync::MutexGuard<'static, BTreeMap<usize, ID3D12Heap>> {
+    SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A buffer over `[start, start + bytes)` of the title's pages, which a run of views shows from byte `offset` of
+/// `section`: placed in the heap of the whole section (opening it locks nothing, and the title may unmap, remap or
+/// protect its views meanwhile: the buffer shows the pages). `Err(None)`: the section was not made committed.
+fn place_view(device: &ID3D12Device, start: u64, bytes: u64, section: usize, offset: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bias = start - at;
+    if offset < bias {
+        return Err(None);
+    }
+    let bytes = (bias + bytes).next_multiple_of(K64 as u64);
+    let heap = {
+        let known = section_heaps().get(&section).cloned();
+        match known {
+            Some(heap) => heap,
+            None => {
+                if !views().sections.get(&section).is_some_and(|s| s.1) {
+                    return Err(None);
+                }
+                let heap = open(device, From::Section(section)).map_err(Some)?;
+                section_heaps().insert(section, heap.clone());
+                heap
+            }
+        }
+    };
+    let buffer = place(device, &heap, offset - bias, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Ok(Placed { buffer, heap, gpu, bias })
+}
+
+/// The longest run of the title's views that holds `address` and goes on in the same section, page after page, cut
+/// to `[lo, hi)`: (start, end, section, the section's byte offset of start).
+pub(crate) fn run_around(address: u64, lo: u64, hi: u64) -> Option<(u64, u64, usize, u64)> {
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=address as usize).next_back().filter(|(base, view)| **base + view.0 > address as usize)?;
+    let (mut s, mut e, mut off) = (base, base + bytes, offset);
+    while s as u64 > lo {
+        let Some((&b, &(n, sec, o))) = v.views.range(..s).next_back() else { break };
+        if b + n == s && sec == section && o + n as u64 == off {
+            (s, off) = (b, o);
+        } else {
+            break;
+        }
+    }
+    while (e as u64) < hi {
+        match v.views.get(&e) {
+            Some(&(n, sec, o)) if sec == section && o == off + (e - s) as u64 => e += n,
+            _ => break,
+        }
+    }
+    let (start, end) = ((s as u64).max(lo), (e as u64).min(hi));
+    (start <= address && address < end).then_some((start, end, section, off + (start - s as u64)))
 }
 
 /// What [`place_for`] gave is gone.
@@ -495,6 +619,7 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    section_heaps().remove(&section);
     let mut v = views_mut();
     // A handle's number given out again: the view was of the section that
     // had it before (it stays mapped: someone may be writing through it).
@@ -505,6 +630,7 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// The runtime lets go of a section, and of its handle: no view the title
 /// sees is of it any more, and [`beside`]'s view goes.
 pub fn title_memory_section_gone(section: usize) {
+    section_heaps().remove(&section);
     let whole = {
         views_mut().whole.remove(&section)
     };
@@ -1713,7 +1839,7 @@ mod tests {
         unsafe {
             let (base, at, bytes) = declared(8, 2, 4);
             fill(at as *mut u8, bytes, 1);
-            let place = |s: u64, l: u64| place_zero_on(&device, s, l, true);
+            let place = |s: u64, l: u64, a: u64, e: u64| place_zero_cell_on(&device, s, l, a, e);
             // An ask in the middle of the range, and one without a length.
             let cell = zero::serve_with(at as u64 + 0x1230, at as u64 + 0x1230 + 64, 1, &NOW, &place).expect("a cell");
             assert!(cell.in_place());
@@ -1750,7 +1876,7 @@ mod tests {
         // SAFETY: allocations of the test's own.
         unsafe {
             let (base, at, bytes) = declared(6, 1, 3);
-            let place = |s: u64, l: u64| place_zero_on(&device, s, l, true);
+            let place = |s: u64, l: u64, a: u64, e: u64| place_zero_cell_on(&device, s, l, a, e);
             let ask = |frame: u64| zero::serve_with(at as u64, at as u64 + 16, frame, &watching, &place);
             // Nothing sent up into it yet: not given, however long.
             assert!(ask(1).is_none());
@@ -1813,5 +1939,127 @@ mod tests {
         // (Its count is that of `STATS`: nothing was placed, so the free path does not look.)
         PINNED.lock().unwrap().retain(|&(a, _)| a != 0x7_9000_0000);
         assert!(!pinned_in(0x7_9000_0000, 1));
+    }
+
+    /// The run of views that holds an ask: views that go on page after page in one section are one run; a view from
+    /// elsewhere in the section, or another section's, ends it.
+    #[test]
+    fn a_run_of_views_is_what_goes_on_in_the_same_section() {
+        let at = 0x7_a000_0000usize;
+        let p = K64 as u64;
+        // A (4 pages) and B (2 pages) continue each other in section 31; C is from elsewhere in it; D is another section's.
+        title_memory_view(at, 4 * K64, 31, 16 * p);
+        title_memory_view(at + 4 * K64, 2 * K64, 31, 20 * p);
+        title_memory_view(at + 6 * K64, K64, 31, 3 * p);
+        title_memory_view(at + 7 * K64, K64, 32, 4 * p);
+        let a = at as u64;
+        assert_eq!(run_around(a + 100, a, a + 8 * p), Some((a, a + 6 * p, 31, 16 * p)));
+        assert_eq!(run_around(a + 5 * p, a, a + 8 * p), Some((a, a + 6 * p, 31, 16 * p)), "an ask in B is the same run");
+        assert_eq!(run_around(a + 6 * p + 5, a, a + 8 * p), Some((a + 6 * p, a + 7 * p, 31, 3 * p)), "C alone");
+        assert_eq!(run_around(a + 7 * p, a, a + 8 * p), Some((a + 7 * p, a + 8 * p, 32, 4 * p)), "D alone");
+        // Cut to the declared range: the run starts where it does and the section's offset goes with it.
+        assert_eq!(run_around(a + 2 * p, a + p, a + 5 * p), Some((a + p, a + 5 * p, 31, 17 * p)));
+        assert_eq!(run_around(a + 8 * p, a, a + 9 * p), None, "nothing shown there");
+        views_gone(at, 8 * K64);
+    }
+
+    /// The title's pages are views of a section made committed: a cell over a run of them is a buffer in the heap of
+    /// the whole section, and the GPU reads what the title writes through its view or through any other view of the
+    /// same pages.
+    #[test]
+    fn warp_the_titles_pages_in_a_committed_section_are_read_by_the_gpu_through_one_heap() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: the section, placeholder and views are the test's own.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            const SIZE: usize = 12 * K64;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, SIZE as u32, std::ptr::null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), SIZE, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
+            if handle.is_null() || hole.is_null() {
+                return;
+            }
+            // Pages 3..7 of the section at the placeholder's first four pages.
+            mem::VirtualFree(hole.cast(), 4 * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            let view = mem::MapViewOfFile3(handle, process, hole.cast(), (3 * K64) as u64, 4 * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!view.Value.is_null());
+            let at = hole as usize;
+            title_memory_section(handle as usize, SIZE as u64, true);
+            title_memory_view(at, 4 * K64, handle as usize, 3 * K64 as u64);
+            crate::shadow::title_memory_gpu_readonly(at, 4 * K64);
+            fill(hole, 4 * K64, 5);
+            let place = |s: u64, l: u64, a: u64, e: u64| place_zero_cell_on(&device, s, l, a, e);
+            // An ask for the middle of the range: a cell over the whole run.
+            let cell = zero::serve_with(at as u64 + 0x2340, at as u64 + 0x2380, 1, &NOW, &place).expect("a cell over the section's pages");
+            assert!(cell.in_place());
+            let mut rig = Rig::new(&device).unwrap();
+            let first = rig.fetch(&cell.buffer, cell.offset(at as u64), 4 * K64).unwrap();
+            assert!(same(hole, &first), "the GPU reads the title's bytes through the section");
+            // The title writes again, nothing sends or copies.
+            fill(hole, 4 * K64, 6);
+            let second = rig.fetch(&cell.buffer, cell.offset(at as u64), 4 * K64).unwrap();
+            assert!(same(hole, &second), "the GPU reads what the title wrote after");
+            assert_ne!(first, second, "red check: a copy made before the write shows the first");
+            let other = mem::MapViewOfFile(handle, mem::FILE_MAP_WRITE, 0, (4 * K64) as u32, K64);
+            assert!(!other.Value.is_null());
+            fill(other.Value.cast(), K64, 7);
+            let third = rig.fetch(&cell.buffer, cell.offset(at as u64) + K64 as u64, K64).unwrap();
+            assert!(same(other.Value.cast(), &third), "a write through another view of the page is seen too");
+            mem::UnmapViewOfFile(other);
+            // The title unmaps its view: the cell goes with it, the heap of the section stays for the next.
+            views_gone(at, 4 * K64);
+            let gone = zero::let_go(at as u64, (at + 4 * K64) as u64);
+            assert_eq!(gone.len(), 1);
+            drop((cell, gone));
+            crate::shadow::title_memory_gpu_writable(at, 4 * K64);
+            mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER);
+            title_memory_section_gone(handle as usize);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            mem::VirtualFree(hole.add(4 * K64).cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A reserved section is refused, and the ask stays the buffer's copy's (retried later).
+    #[test]
+    fn warp_pages_of_a_reserved_section_stay_copies() {
+        let _turn = crate::indirect::tests::warp_turn();
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        // SAFETY: the section, placeholder and views are the test's own.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            const SIZE: usize = 8 * K64;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, SIZE as u32, std::ptr::null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), SIZE, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
+            if handle.is_null() || hole.is_null() {
+                return;
+            }
+            mem::VirtualFree(hole.cast(), 2 * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            let view = mem::MapViewOfFile3(handle, process, hole.cast(), 0, 2 * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert!(!view.Value.is_null());
+            assert!(mem::VirtualAlloc(view.Value, 2 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE) != std::ptr::null_mut());
+            let at = hole as usize;
+            title_memory_section(handle as usize, SIZE as u64, false);
+            title_memory_view(at, 2 * K64, handle as usize, 0);
+            crate::shadow::title_memory_gpu_readonly(at, 2 * K64);
+            let place = |s: u64, l: u64, a: u64, e: u64| place_zero_cell_on(&device, s, l, a, e);
+            assert!(zero::serve_with(at as u64, at as u64 + 16, 1, &NOW, &place).is_none(), "reserved: not opened");
+            assert!(zero::let_go(at as u64, (at + 2 * K64) as u64).is_empty());
+            views_gone(at, 2 * K64);
+            crate::shadow::title_memory_gpu_writable(at, 2 * K64);
+            mem::UnmapViewOfFile2(process, view, mem::MEM_PRESERVE_PLACEHOLDER);
+            title_memory_section_gone(handle as usize);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            mem::VirtualFree(hole.add(2 * K64).cast(), 0, mem::MEM_RELEASE);
+        }
     }
 }

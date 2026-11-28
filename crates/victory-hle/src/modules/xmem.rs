@@ -501,6 +501,9 @@ mod section_mb;
 struct Section {
     handle: HANDLE,
     pages: usize,
+    /// Made committed whole (`SEC_COMMIT`): its pages need no commit call, and the GPU side can open it as one heap
+    /// (`VICTORY_ZEROCOPY`, on Wine always).
+    whole: bool,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
@@ -545,7 +548,7 @@ impl Section {
             if run == 0 {
                 continue; // another worker committed it meanwhile
             }
-            if !commit(base + page * PAGE, run * PAGE) {
+            if !self.whole && !commit(base + page * PAGE, run * PAGE) {
                 return None;
             }
             for p in page..page + run {
@@ -573,7 +576,7 @@ impl Section {
         if lean() && done() {
             return true;
         }
-        if !counted(Call::Commit, || commit(base, len)) {
+        if !self.whole && !counted(Call::Commit, || commit(base, len)) {
             return false;
         }
         for p in pages {
@@ -829,7 +832,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        if !slice.section.whole && !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }

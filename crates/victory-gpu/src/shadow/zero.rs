@@ -22,9 +22,18 @@
 //! times a frame stays a copy in the card's memory, where the reads are fast. `VICTORY_ZEROCOPY_OBSERVE=0` gives
 //! every declared range at its first ask.
 //!
-//! Fallbacks: a range whose memory the host refuses (not private memory committed whole: a view of pages; a page of it
-//! guarded just then; the host's own refusal) stays a copy, and is tried again after 2, 4, 8.. times 120 frames, six
-//! times in all. What was a copy first and becomes a cell is told to everything that remembers the answer
+//! Which memory: private memory committed whole (opened as a part of its allocation: the pages are pinned until the
+//! cell goes) and, since the title's 32-bit heap and most of what it shows the GPU are view memory, the title's
+//! physical pages: views of sections. A section made `SEC_RESERVE` cannot be opened; with `VICTORY_ZEROCOPY` `xmem`
+//! makes them `SEC_COMMIT` (whole, so a host that cannot commit that much at once gets them reserved as before), and
+//! the host opens the whole section once, as one heap that locks nothing and does not mind its views being unmapped,
+//! remapped or protected. A cell over view memory is a buffer at the section's offset of the run of views that holds
+//! the ask (cut to the declared range): the GPU reads the title's pages, wherever they are mapped, and a write
+//! through any view of them is seen.
+//!
+//! Fallbacks: a range whose memory the host refuses (a page of private memory guarded just then, a section made
+//! reserved, the host's own refusal) stays a copy, and is tried again after 2, 4, 8.. times 120 frames, six times in
+//! all; view memory that is not one run of one section where the ask is, is the buffer's copy's for 120 frames. What was a copy first and becomes a cell is told to everything that remembers the answer
 //! ([`super::changed`]), so views made of the copy are made again of the cell. Cells go when the title frees or
 //! decommits the memory ([`crate::inplace::title_memory_freeing`]) and the free waits for the lists that hold them.
 //!
@@ -130,10 +139,11 @@ fn watches() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Watch>>> {
 
 /// Whether a range with this watch is given now (`frame`).
 pub(crate) fn due(p: &Policy, w: &Watch, frame: u64) -> bool {
-    if w.given || w.failed >= TRIES || frame < w.retry {
+    if w.failed >= TRIES || frame < w.retry {
         return false;
     }
-    if p.observe == 0 {
+    // Given already: the range was seen to be written, and the cells of its other runs follow.
+    if w.given || p.observe == 0 {
         return true;
     }
     let seen = w.last.saturating_sub(w.first) + 1;
@@ -239,8 +249,12 @@ pub(super) fn serve(address: u64, len: u64) -> Option<Arc<Shadow>> {
         Some((until, None)) if frame < until => return None,
         _ => {}
     }
-    serve_with(address, end, frame, Policy::get(), &|start, len| crate::inplace::place_zero(start, len, true))
+    serve_with(address, end, frame, Policy::get(), &|start, len, a, e| crate::inplace::place_zero_cell(start, len, a, e))
 }
+
+/// What opens a cell: the declared range `(start, bytes)` and the ask inside it; the placed buffer and the start and
+/// bytes it shows.
+pub(crate) type Place<'a> = &'a dyn Fn(u64, u64, u64, u64) -> Result<(crate::inplace::Placed, u64, u64), crate::inplace::Refusal>;
 
 /// [`serve`], slowly: the ask `[address, end)`, at `frame`, under `p`; `place` opens the memory `(start, bytes)`.
 pub(crate) fn serve_with(
@@ -248,7 +262,7 @@ pub(crate) fn serve_with(
     end: u64,
     frame: u64,
     p: &Policy,
-    place: &dyn Fn(u64, u64) -> Option<crate::inplace::Placed>,
+    place: Place,
 ) -> Option<Arc<Shadow>> {
     let epoch = EPOCH.load(Ordering::SeqCst);
     // The cell is there already.
@@ -284,18 +298,29 @@ pub(crate) fn serve_with(
             return None;
         }
     }
-    let placed = place(start, len);
+    let placed = place(start, len, address, end);
     let mut all = watches();
     let w = all.get_or_insert_with(Default::default).entry(range.0).or_default();
-    let Some(placed) = placed else {
-        w.failed += 1;
-        w.retry = frame + (120u64 << w.failed.min(8));
-        let until = w.retry;
-        drop(all);
-        remember(Hot { lo: start, hi: start + len, epoch, until, cell: None });
-        return None;
+    let (placed, start, len) = match placed {
+        Ok(cell) => cell,
+        // View memory that is not one run of one section here: the buffer's copy's, and looked at again later.
+        Err(crate::inplace::Refusal::Scattered) => {
+            drop(all);
+            remember(Hot { lo: address, hi: end, epoch, until: frame + 120, cell: None });
+            return None;
+        }
+        Err(crate::inplace::Refusal::Memory) => {
+            w.failed += 1;
+            w.retry = frame + (120u64 << w.failed.min(8));
+            let until = w.retry;
+            drop(all);
+            remember(Hot { lo: start, hi: start + len, epoch, until, cell: None });
+            return None;
+        }
     };
     w.given = true;
+    w.failed = 0;
+    w.retry = 0;
     drop(all);
     let shadow = Arc::new(Shadow::placed(placed, start, len, true));
     {
@@ -418,4 +443,10 @@ pub(super) fn report() -> String {
         ));
     }
     format!("declared read-only to the GPU: {} ranges{}{}", ranges.len(), if parts.is_empty() { "" } else { ": " }, parts.join("; "))
+}
+
+/// What is known of a declared range (tests).
+#[cfg(test)]
+pub(crate) fn watch_of(start: u64) -> Option<Watch> {
+    watches().as_ref().and_then(|w| w.get(&start)).cloned()
 }

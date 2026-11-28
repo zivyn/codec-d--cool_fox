@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::*;
 use crate::shadow::Shadow;
 
-/// The stage (`VICTORY_CARD_STEPS`; off by default): `1` constant buffers
+/// The stage (`VICTORY_CARD_STEPS`, `2` by default through `defaults.rs`; `0` is off): `1` constant buffers
 /// of descriptor tables (`Step::Fill` with a slot of its own), `2` the
 /// title's buffer copies (`Step::Copy`) too, with the steps of the same
 /// submission that depend on them. Only with the relay's second stage

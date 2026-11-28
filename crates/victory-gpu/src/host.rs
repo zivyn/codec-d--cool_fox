@@ -2,7 +2,7 @@
 //! window to present on.
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap
-//! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
+//! (unless the submissions are sent ahead, on by default: `VICTORY_LATE_WAIT`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2382,8 +2382,8 @@ impl Drop for Deferred {
 }
 
 /// Whether a queue's submissions go to the card without a wait for each
-/// (`VICTORY_LATE_WAIT=1`; off by default, and off in the timing run, which
-/// waits for every list on its own).
+/// (stage 3 by default, with the relay; `VICTORY_LATE_WAIT=0` turns it off, and it
+/// is off in the timing run, which waits for every list on its own).
 ///
 /// Every submission was prepared, sent, waited for and copied back before
 /// the next one was looked at, so the card stood idle while we prepared
@@ -2436,7 +2436,7 @@ pub(crate) fn late() -> bool {
 fn late_stage() -> u8 {
     static STAGE: OnceLock<u8> = OnceLock::new();
     *STAGE.get_or_init(|| {
-        if std::env::var_os("VICTORY_GPU_TIMING").is_some() {
+        if crate::switch::on("VICTORY_GPU_TIMING") {
             return 0;
         }
         match std::env::var("VICTORY_LATE_WAIT").as_deref() {

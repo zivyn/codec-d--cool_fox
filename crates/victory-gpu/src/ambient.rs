@@ -24,7 +24,7 @@
 //! at once). No occlusion but the creases'.
 //!
 //! `VICTORY_AMBIENT`:
-//! - unset or `0`/`off`: the title's own output.
+//! - unset: `0.8`, the built-in default (`defaults.rs`); `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
 //! - `<share>,floor:<level>`: the estimate, and nowhere less than the
 //!   constant `<level>` (the estimate follows the light of the visible

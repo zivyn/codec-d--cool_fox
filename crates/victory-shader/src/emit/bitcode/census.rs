@@ -60,7 +60,7 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// Whether modules are counted (`VICTORY_SHADER_CENSUS` set).
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHADER_CENSUS").is_some())
+    *ON.get_or_init(|| crate::env_on("VICTORY_SHADER_CENSUS"))
 }
 
 /// The counts of the module whose bitcode the container `dxil` holds, if

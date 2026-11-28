@@ -2,7 +2,8 @@
 
 use super::*;
 
-/// The relay's first stage (`VICTORY_RELAY=1`; off by default; it turns
+/// The relay's first stage (on by default, with stage 2 on top, see [`relay_exact`]; `VICTORY_RELAY=0` turns
+/// it off; it turns
 /// [`late`] on at stage 3 unless `VICTORY_LATE_WAIT` says another stage,
 /// and is off with it, in the timing run and with kept snapshots).
 ///

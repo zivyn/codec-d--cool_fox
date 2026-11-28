@@ -68,7 +68,7 @@ pub fn start() {
                 }
             });
     }
-    if std::env::var_os("VICTORY_AUDIO_CAPTURE").is_some()
+    if victory_gpu::env_on("VICTORY_AUDIO_CAPTURE")
         && let Err(e) = std::env::current_exe().and_then(|exe| {
             std::process::Command::new(exe)
                 .env(TARGET, std::process::id().to_string())

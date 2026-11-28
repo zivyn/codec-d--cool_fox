@@ -411,7 +411,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         SPLIT[11].fetch_add(called.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // The write watch asked about what the lists refresh, on a thread of ours, while this one plans the steps it gives
-        // to the card, waits and sweeps (`VICTORY_ASK_ASIDE=1`, only with flights in the air: with none there is nothing to
+        // to the card, waits and sweeps (`VICTORY_ASK_ASIDE`, on unless it is `0`, only with flights in the air: with none there is nothing to
         // go beside). What the planning adds to the lists is asked after; a wait for flights, which lands title memory,
         // makes the asking be made again after it (`flights_waited`).
         let mut aside: Option<askaside::Offered> = None;

@@ -352,7 +352,7 @@ const QUADS: i32 = 32;
 /// PR #493). `VICTORY_ROOT_SRV_DIRECT=1` goes back to root descriptors.
 pub(crate) fn bounded_root_srvs() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOT_SRV_DIRECT").is_none())
+    *ON.get_or_init(|| !crate::switch::on("VICTORY_ROOT_SRV_DIRECT"))
 }
 
 /// One stage of a host pipeline and where its bindings go.

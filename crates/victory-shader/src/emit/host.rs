@@ -70,7 +70,7 @@ impl Host {
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
             // refused pipeline's error then carries.
-            if std::env::var_os("VICTORY_D3D12_DEBUG").is_some() {
+            if crate::env_on("VICTORY_D3D12_DEBUG") {
                 let mut debug: Option<ID3D12Debug> = None;
                 if D3D12GetDebugInterface(&mut debug).is_ok()
                     && let Some(debug) = debug

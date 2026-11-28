@@ -656,8 +656,7 @@ pub(crate) fn ask_ahead_done() {
 }
 
 /// Whether a submission asks the kernel once, before its first refresh,
-/// about every range its lists refresh (`VICTORY_ASK_ONCE=1`; off by
-/// default).
+/// about every range its lists refresh (on unless `VICTORY_ASK_ONCE=0`).
 ///
 /// A submission's refreshes are done in groups, between the title's own
 /// buffer copies (each copy flushes the refreshes recorded before it), and

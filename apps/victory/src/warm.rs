@@ -52,11 +52,16 @@ fn archives(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     }
     let cfg = victory_core::Config::load()?;
     let game = cfg.game_dir.context("no game folder configured and no archive named")?;
-    let found: Vec<PathBuf> = ["shaders.rpf", "game_scarlett_master.exe"]
-        .iter()
-        .map(|f| game.join(f))
-        .filter(|p| p.is_file())
-        .collect();
+    let mut found: Vec<PathBuf> = Some(game.join("shaders.rpf")).into_iter().filter(|p| p.is_file()).collect();
+    // The title is the largest executable of the folder.
+    let title = std::fs::read_dir(&game)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("exe")))
+        .filter_map(|e| Some((e.metadata().ok()?.len(), e.path())))
+        .max();
+    found.extend(title.map(|(_, path)| path));
     anyhow::ensure!(!found.is_empty(), "no shaders.rpf or title executable in {}", game.display());
     Ok(found)
 }

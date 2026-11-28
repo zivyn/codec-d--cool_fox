@@ -1091,7 +1091,7 @@ mod tests {
             ["0123456789abcdef", "0011223344556677"]
         );
         // Off by default: nothing is listed and nothing is skipped.
-        if std::env::var_os("VICTORY_SKIP_BVH_SKINNING").is_none() {
+        if !crate::switch::on("VICTORY_SKIP_BVH_SKINNING") {
             assert!(super::bvh_skin_hashes().is_empty());
         }
     }

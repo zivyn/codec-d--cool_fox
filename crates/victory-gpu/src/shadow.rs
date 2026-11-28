@@ -439,7 +439,7 @@ pub(crate) fn card_bytes() -> u64 {
 
 /// Whether the texture queue leaves room on the card for the card copies
 /// of title buffers that are not made yet
-/// (`VICTORY_CARD_ROOM_FOR_BUFFERS=1`; off by default).
+/// (on unless `VICTORY_CARD_ROOM_FOR_BUFFERS=0`).
 ///
 /// The copies are made in one burst when the world loads (run 189: 94 of
 /// its 95 within two seconds, right before the first world frame), and
@@ -1873,7 +1873,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
 /// compare that finds what the shaders wrote, run on several threads
-/// across ranges (`VICTORY_WIDE_BACK=1`; off by default).
+/// across ranges (on unless `VICTORY_WIDE_BACK=0`).
 ///
 /// Both ran range by range on the submitting thread, a range on several
 /// threads only if it was 16 MiB or more. The ranges left on the CPU's side
@@ -2122,7 +2122,7 @@ pub(crate) fn take_snapshots() {
 /// The snapshots [`take_snapshots_aside`] gave to the kept threads and nobody has waited for yet.
 static SNAPS_ASIDE: Mutex<Option<Aside>> = Mutex::new(None);
 
-/// [`take_snapshots`] without the wait (`VICTORY_SNAP_ASIDE=1`): the copies are given to the kept threads and the
+/// [`take_snapshots`] without the wait (on unless `VICTORY_SNAP_ASIDE=0`): the copies are given to the kept threads and the
 /// submitting thread goes on with what comes next, to wait for them ([`snapshots_wait`]) before anything that may
 /// write the bytes of a declared range or give the lists to the card. The snapshots are the 3.5 ms a frame of the
 /// submitting thread's "snapshots" stage (K6: 7.7 times a frame, 16 MB, 0.46 ms each, mostly the wake-ups and the

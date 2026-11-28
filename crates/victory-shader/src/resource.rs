@@ -375,7 +375,7 @@ pub fn track(
             Err(why) => {
                 // (`VICTORY_WAVE_WHY=1`: a loop that reads a descriptor offset at the first
                 // lane and was not proven a waterfall is a loop the translation runs as is)
-                if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+                if crate::env_on("VICTORY_WAVE_WHY") {
                     eprintln!(
                         "WATERFALL-UNPROVEN at {:#x}: {why}",
                         t.inst((block, accesses[0])).machine.offset
@@ -2043,7 +2043,7 @@ impl<'a> Tracer<'a> {
         let access = accesses[0];
         // (`VICTORY_WAVE_WHY=1`: which check refused it)
         let fail = |n: u32, e: &'static str| {
-            if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            if crate::env_on("VICTORY_WAVE_WHY") {
                 eprintln!("  waterfall check {n} failed ({e})");
             }
             e

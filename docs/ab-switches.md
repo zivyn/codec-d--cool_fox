@@ -168,6 +168,10 @@ The others from the same branches (`VICTORY_ONE_PASS`, `VICTORY_UNDER_TRY`, `VIC
 Switches of the translation are in the shader cache key (`victory-gpu/src/shader_cache.rs`) and cannot flip inside a
 process, so they are A/B'd between processes (`VICTORY_X=0` against unset) and the winner becomes the default (rule 14).
 The cache key holds the value in force (`victory_shader::emit::default_on_switches`), not the text of the variable.
+Every other `VICTORY_*` name the translator's code holds is in the key by the text of its variable, without being listed anywhere:
+`victory_shader::emit::translation_fingerprint` lists them from the source (`crates/victory-shader/build.rs`), and
+`emit/fingerprint_tests.rs` fails when a switch is read in a way the list cannot see, or one that is left out
+(`NOT_THE_TRANSLATION`: it only prints, or names a tool) is read where it could change what is written.
 
 | switch | default | since | evidence |
 |---|---|---|---|

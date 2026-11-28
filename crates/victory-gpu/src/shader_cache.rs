@@ -64,78 +64,12 @@ fn build() -> [u8; 32] {
             );
         }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
-        bytes.extend_from_slice(&limit.to_le_bytes());
-        // (naming the default number is not naming none)
-        bytes.push(u8::from(victory_shader::emit::loop_limit_is_named()));
-        // Which group barriers wait is part of the translation too.
-        bytes.push(victory_shader::emit::group_sync());
-        // So are the switches that pick the form of a wave64 program:
-        // without them here a run with `VICTORY_WAVE_WIDE=0` was
-        // served the translations an earlier run of the same
-        // executable had cached with the switch unset.
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_PAIR_SYNC",
-            "VICTORY_PAIR_CLAMP",
-            "VICTORY_PAIR_LEAN",
-            "VICTORY_UNIFORM_LOADS",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_HELPER_OWN",
-            "VICTORY_FIRSTLANE_OWN",
-            "VICTORY_FIRST_HALF",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_BVH_FENCES",
-            "VICTORY_LOOP_NOTES",
-            "VICTORY_LOOP_WHY",
-            "VICTORY_LOOP_LIMITS",
-            "VICTORY_LOCAL_EXIT",
-            "VICTORY_PEEK",
-            "VICTORY_MASK_NUMBERS",
-            "VICTORY_BVH_BOUNDS",
-            "VICTORY_LEGACY_ASSUME",
-            "VICTORY_NAN_SAFE",
-            "VICTORY_WAVE_WIDE_FIRST",
-            "VICTORY_VIEW_INDEX",
-            "VICTORY_FOLD_VIEWS",
-        ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
-        }
-        // The ones that are on unless named `=0` go by the value in force (not by the text of the
-        // variable): a cache made before they were on, or with `=0`, is never served for the other.
-        for (name, on) in ["VICTORY_HALF_EXIT", "VICTORY_KEEP_LOOP_SKIPS"]
-            .into_iter()
-            .zip(victory_shader::emit::default_on_switches())
-        {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            bytes.push(u8::from(on));
-            bytes.push(0);
-        }
-        // The float modes that are on by default (16-bit results to nearest, 32-bit denormals
-        // flushed), by the value in force.
-        for (name, value) in [
-            ("VICTORY_F16_NEAREST", victory_shader::emit::f16_nearest_level()),
-            ("VICTORY_F32_FTZ", u8::from(victory_shader::emit::f32_ftz_on())),
-        ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            bytes.push(value);
-            bytes.push(0);
-        }
-        // The wave-wide form of the kept skips (off unless asked for): by the value in force.
-        bytes.extend_from_slice("VICTORY_KEPT_SKIPS_WIDE".as_bytes());
-        bytes.push(b'=');
-        bytes.push(victory_shader::emit::kept_skips_wide_code());
-        bytes.push(0);
-        // And which clean-up passes ran over the translated code.
-        bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
+        // Every switch the translator's code names, by the text of its variable or by the value in
+        // force (the ones that are on unless `=0`, the form of the kept skips, the loop limit, the
+        // group barriers, the clean-up passes): `emit::translation_fingerprint` lists them from the
+        // code itself, so a switch added to the translator is in the key without a line here.
+        // (`victory-shader`'s `fingerprint_tests` hold it to that.)
+        bytes.extend_from_slice(&victory_shader::emit::translation_fingerprint());
         bytes
     });
     let mut hash = blake3::Hasher::new();
@@ -524,77 +458,24 @@ mod tests {
         assert_eq!(decode(b"VSH0"), None);
     }
 
-    /// Every `VICTORY_*` switch the translator's code names is in the cache key (the list in
-    /// `build`), or says in `ELSEWHERE` how it gets there, or only prints / points at a tool
-    /// (`NOT_THE_TRANSLATION`). A switch that changes the translation and is in neither is served
-    /// from a cache made with the other value of it: an A/B with it shows the first arm twice.
+    /// The key is made of the translator's source, the fingerprint of every switch it reads
+    /// (`victory-shader`'s `fingerprint_tests` check that each switch is in it), and what the
+    /// host tells it (`host_settings`, after the device is made). A list of switches kept here
+    /// could fall behind the code: this holds the key to the calls that make it whole.
     #[test]
-    fn every_switch_the_translator_reads_is_in_the_cache_key() {
-        const NOT_THE_TRANSLATION: &[&str] = &[
-            "VICTORY_D3D12_DEBUG",
-            "VICTORY_DESC_WHY",
-            "VICTORY_DXIL",
-            "VICTORY_MASK_WHY",
-            "VICTORY_PC_DXC",
-            "VICTORY_REF_PS",
-            "VICTORY_REF_VS",
-            "VICTORY_SHADER_CENSUS",
-            "VICTORY_SHADER_SOURCE_HASH",
-            "VICTORY_SHADER_SWITCHES",
-            "VICTORY_WARP",
-            "VICTORY_WAVE_WHY",
-        ];
-        // (keyed by the value in force: `loop_limit`, `group_sync`, `shader_opt`, `host_settings`)
-        const ELSEWHERE: &[&str] = &[
-            "VICTORY_GROUP_SYNC",
-            "VICTORY_RDNA_FLOAT",
-            "VICTORY_SHADER_LOOP_LIMIT",
-            "VICTORY_SHADER_OPT",
-        ];
-        fn sources(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-            for e in std::fs::read_dir(dir).unwrap().flatten() {
-                let path = e.path();
-                if path.is_dir() {
-                    sources(&path, out);
-                    continue;
-                }
-                let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                if name.ends_with(".rs") && !name.contains("test") {
-                    out.push(path);
-                }
-            }
-        }
+    fn the_key_is_the_source_the_fingerprint_and_the_host_settings() {
         // (the part of this file that is not its tests)
-        let keyed = include_str!("shader_cache.rs").split("#[cfg(test)]").next().unwrap();
-        let mut files = Vec::new();
-        sources(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../victory-shader/src"),
-            &mut files,
-        );
-        assert!(!files.is_empty());
-        let mut missing = std::collections::BTreeSet::new();
-        for file in files {
-            let text = std::fs::read_to_string(&file).unwrap();
-            let mut rest = text.as_str();
-            while let Some(at) = rest.find("\"VICTORY_") {
-                let tail = &rest[at + 1..];
-                let end = tail
-                    .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
-                    .unwrap_or(tail.len());
-                let name = &tail[..end];
-                if tail[end..].starts_with('"')
-                    && !NOT_THE_TRANSLATION.contains(&name)
-                    && !ELSEWHERE.contains(&name)
-                    && !keyed.contains(&format!("\"{name}\""))
-                {
-                    missing.insert(name.to_owned());
-                }
-                rest = &tail[end..];
-            }
+        let key = include_str!("shader_cache.rs").split("#[cfg(test)]").next().unwrap();
+        for part in [
+            "env!(\"VICTORY_TRANSLATOR\")",
+            "victory_shader::emit::translation_fingerprint()",
+            "victory_shader::emit::host_settings()",
+            "crate::descriptor::host::probe_view_limit()",
+        ] {
+            assert!(key.contains(part), "the cache key does not hold {part}");
         }
-        assert!(
-            missing.is_empty(),
-            "switches the translator reads that the shader cache key does not hold: {missing:?}"
-        );
+        // No list of names of switches here again: it is what fell behind before.
+        assert!(!key.contains("\"VICTORY_WAVE_"), "a switch is named in the key by hand");
+        assert!(!key.contains(".zip("), "two lists are paired in the key");
     }
 }

@@ -5398,7 +5398,7 @@ mod tests {
             assert!(!fits(PORTABLE_VIEWS + SEARCH_STEP) || victory_shader::emit::view_heap_limit() > PORTABLE_VIEWS);
             assert_eq!(heap.count + heap.dynamic, null);
             assert!(heap.count < title);
-            if null == PORTABLE_VIEWS - 1 && std::env::var_os("VICTORY_DYNAMIC_SLOTS").is_none() {
+            if null == PORTABLE_VIEWS - 1 && !crate::switch::on("VICTORY_DYNAMIC_SLOTS") {
                 // Slot 741,277 is the highest the title wrote past 2^18 dynamic slots.
                 assert_eq!(heap.dynamic, CAPPED_DYNAMIC);
                 assert!(heap.count >= 745_000);

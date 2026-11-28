@@ -15,7 +15,7 @@
 //! `"fp32-denorm-mode"="ftz"` on the entry point, which asks the driver for the console's mode.
 //! On by default since integ/validation-24 (2026-11-28, with `VICTORY_F16_NEAREST=2`; `=0` is off).
 //! Part of the translation (the shader cache keys on the value in force,
-//! [`super::f32_ftz_on`]).
+//! [`super::default_on_switches`]).
 
 /// Whether the entry point asks for flushed 32-bit denormals (on unless `VICTORY_F32_FTZ=0`).
 pub(super) fn f32_ftz() -> bool {

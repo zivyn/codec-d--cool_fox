@@ -88,6 +88,8 @@ the card.
 | `VICTORY_KEPT_SKIPS_WIDE` | on, safe classes at integ/validation-22 (=0 off, =all every class); off unless =1 or =all in integ/validation-23 | cache key (text at integ/validation-22, value in force at integ/validation-23) | Takes the kept loop skips in their wave-wide form (with VICTORY_KEEP_LOOP_SKIPS); a hang suspect, off in integ/validation-23. |
 | `VICTORY_LEGACY_ASSUME` | off | cache key (text) | Writes legacy multiplies as the host product where no factor can be infinity or NaN. |
 | `VICTORY_LOCAL_EXIT` | off | cache key (text) | Translates console wave64 loops as two host waves of 32 that leave together (=1 screen programs, =2 broader). |
+| `VICTORY_LDS_FIRST_INIT` | off | cache key (text) | `=1`: a thread group's shared-memory set-up by its first thread (constants under a test of the thread's place) is done whether that thread's lane runs there or not (the water's tiled light on 32-lane hosts). |
+| `VICTORY_LOOPS_WAVE` | off | cache key (text) | `=1` (`=2` every compute program): a console wave64 program that needs the host's waves is translated again with the branches that close or leave its loops taken by each host wave together (the water's tile generation on 32-lane hosts). |
 | `VICTORY_LOOP_LIMITS` | off | cache key (text) | Table of per-program, per-stage iteration limits for translated loops. |
 | `VICTORY_LOOP_NOTES` | off | cache key (text) | Translated loops that hit their iteration limit leave a note in the faults buffer. |
 | `VICTORY_LOOP_WHY` | off | cache key (text) | Prints one stderr line per translated loop, saying why it has its limit. |
@@ -514,6 +516,8 @@ translation of shaders.
 | `VICTORY_LIVE_FILE` | off | path |  |  | diag | (integ/validation-23, diag) File read once a second; its `skip=<hash>,...` lines add programs to the skipped list while the title runs. |
 | `VICTORY_LOCAL_EXIT` | off | flag | yes |  |  | Translates console wave64 loops as two host waves of 32 that leave together (=1 screen programs, =2 broader). |
 | `VICTORY_LOG` | n/a | text |  |  |  | Log filter for the tracing output; falls back to RUST_LOG, for example crate=trace,info. |
+| `VICTORY_LDS_FIRST_INIT` | off | flag | yes |  |  | `=1`: a thread group's shared-memory set-up by its first thread is done whether that thread's lane runs there or not. |
+| `VICTORY_LOOPS_WAVE` | off | flag | yes |  |  | `=1` (`=2` every compute program): console wave64 loops are left by each host wave together (water tile generation and tiled light on 32-lane hosts). |
 | `VICTORY_LOOP_LIMITS` | off | list | yes |  |  | Table of per-program, per-stage iteration limits for translated loops. |
 | `VICTORY_LOOP_NOTES` | off | flag | yes |  |  | Translated loops that hit their iteration limit leave a note in the faults buffer. |
 | `VICTORY_LOOP_WHY` | off | flag | yes |  |  | Prints one stderr line per translated loop, saying why it has its limit. |

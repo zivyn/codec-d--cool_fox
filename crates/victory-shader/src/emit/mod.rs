@@ -160,6 +160,8 @@ mod local_exit_form;
 #[cfg(all(test, windows))]
 mod local_exit_tests;
 #[cfg(all(test, windows))]
+mod loops_wave_tests;
+#[cfg(all(test, windows))]
 mod loop_note_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
@@ -1455,7 +1457,7 @@ fn emit_program(
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         emit_program_plain(c, native, p, &st, io, &res)
     });
-    let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+    let why = crate::env_on("VICTORY_WAVE_WHY");
     match again {
         Ok((shader, Some(w))) if w <= *wave => {
             if why {

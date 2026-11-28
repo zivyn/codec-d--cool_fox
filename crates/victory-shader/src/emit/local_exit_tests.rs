@@ -11,7 +11,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 /// What lane 5 holds when the loop is through: lanes 5 and 37 (lane 5 of each half) go round
 /// `(5 & 7) + 1` times.
-const EXPECTED: u32 = 6;
+pub(super) const EXPECTED: u32 = 6;
 
 /// A console wave64 program of 64 threads. Lanes 0..39 are in the loop's mask (s[20:21]), lanes
 /// 40..63 are not (the upper half has 24 lanes outside it). Lane `n` goes round `(n & 7) + 1`
@@ -21,7 +21,7 @@ const EXPECTED: u32 = 6;
 /// EXEC is the whole wave again and every lane stores what lane 5 holds in v2 (the number of
 /// rounds of its own half's lane 5), at its own place: all 64 lanes store 6, with the lanes of
 /// the upper half outside the mask too.
-const MASK_LOOP: [u32; 23] = [
+pub(super) const MASK_LOOP: [u32; 23] = [
     0x3408_0082, // v_lshlrev_b32 v4, 2, v0
     0x3602_0087, // v_and_b32 v1, 7, v0
     0x4A02_0281, // v_add_nc_u32 v1, 1, v1
@@ -78,7 +78,7 @@ fn translated(together: bool) -> Result<HostShader, ShaderError> {
     result.map(|(shader, _)| shader)
 }
 
-fn validated(shader: &HostShader) {
+pub(super) fn validated(shader: &HostShader) {
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
@@ -86,7 +86,7 @@ fn validated(shader: &HostShader) {
 }
 
 /// What each of the 64 lanes stored, on the host GPU (None without one).
-fn lanes_on_the_card(shader: &HostShader) -> Option<Vec<u32>> {
+pub(super) fn lanes_on_the_card(shader: &HostShader) -> Option<Vec<u32>> {
     let Ok(host) = Host::new(false) else {
         eprintln!(
             "SKIPPED (no wave32 hardware): no SM 6.6 hardware device; the GPU part of this test did not run"

@@ -163,7 +163,7 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+    *SET.get_or_init(|| parse(&crate::defaults::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
 /// Whether the stand-in is asked for (it still rests where the title's rays
@@ -189,7 +189,7 @@ fn air_setting(set: &str) -> (f32, f32) {
 
 fn air_set() -> (f32, f32) {
     static SET: OnceLock<(f32, f32)> = OnceLock::new();
-    *SET.get_or_init(|| air_setting(&std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default()))
+    *SET.get_or_init(|| air_setting(&crate::defaults::var("VICTORY_AMBIENT_AIR").unwrap_or_default()))
 }
 
 fn air() -> f32 {
@@ -726,6 +726,13 @@ mod tests {
         assert_eq!(air_setting(" 0.5 , max: 0.25 "), (0.5, 0.25));
         assert_eq!(air_setting("off,max:3"), (0.0, 3.0));
         assert_eq!(air_setting("1,max:-2"), (1.0, f32::MAX));
+    }
+
+    /// What the executable alone is set to (`crate::defaults`) reads as the launcher's text did.
+    #[test]
+    fn the_built_in_settings_read_as_the_launchers_did() {
+        assert_eq!(air_setting(crate::defaults::default_of("VICTORY_AMBIENT_AIR").unwrap()), (1.5, f32::MAX));
+        assert_eq!(parse(crate::defaults::default_of("VICTORY_AMBIENT").unwrap()), Set::Estimate(0.8, 0.0));
     }
 
     #[test]

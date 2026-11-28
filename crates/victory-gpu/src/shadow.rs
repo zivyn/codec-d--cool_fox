@@ -390,7 +390,7 @@ fn card_limits() -> (u64, u64) {
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
         // in the PC's memory every load, store and atomic a shader does on
         // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
+        if let Some(kib) = crate::defaults::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
             && kib > 0
         {
             min_bytes = kib << 10;
@@ -1181,7 +1181,7 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2"))
+    *ON.get_or_init(|| crate::defaults::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2"))
 }
 
 /// The submission being prepared (its number among those started): what
@@ -1829,7 +1829,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default; `VICTORY_WIDE_BACK=0` turns it off.
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::defaults::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
 }
 
 type Job = Box<dyn FnOnce() + Send>;

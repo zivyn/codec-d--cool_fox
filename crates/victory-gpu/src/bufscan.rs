@@ -6,7 +6,7 @@
 //! structured and raw buffers. With `VICTORY_BUFFER_NAN=@<file>` (one 16-digit program hash a line,
 //! `# name` after it is only shown in the log; the list is the user's and not in the repository) or
 //! `=all`, after every dispatch of those programs the spans of buffers the program wrote (what its
-//! footprint says it stores, whole views only where small) are scanned by a compute shader of ours:
+//! footprint says it stores; the whole view where the program was not analysed) are scanned by a compute shader of ours:
 //! a reduction that counts, per (buffer, program) slot, the dwords that are NaN or infinite as 32-bit
 //! floats and, for the fields of a record that hold 16-bit floats, the halves that are, by the field
 //! of the record, and keeps the first one and the order in which slots first hit. Nothing is read
@@ -43,8 +43,6 @@ pub(crate) const SLOTS: usize = 1024;
 const BYTES: u64 = (SLOTS * WIDTH * 4) as u64;
 /// The most bytes of one span that is scanned.
 pub(crate) const MOST_SPAN: u64 = 8 << 20;
-/// A view whose writes are not bounded is scanned whole only up to this.
-pub(crate) const MOST_WHOLE: u64 = 2 << 20;
 
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=8, b0), UAV(u0), UAV(u1)"

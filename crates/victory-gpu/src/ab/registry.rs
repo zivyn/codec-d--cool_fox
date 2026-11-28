@@ -49,6 +49,8 @@ pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_DSP_REVERB", Kind::Flag),
     ("VICTORY_DSP_REVERB_LEVEL", Kind::Float),
     ("VICTORY_FOLD_VIEWS", Kind::Flag),
+    ("VICTORY_FRAMEGEN_HUDLESS", Kind::OnByDefault),
+    ("VICTORY_FRAMEGEN_LIVE", Kind::Flag),
     ("VICTORY_FRONT_HIGH", Kind::Flag),
     ("VICTORY_FUSE_RUNS", Kind::Flag),
     ("VICTORY_GPU_RO_SKIP", Kind::Flag),

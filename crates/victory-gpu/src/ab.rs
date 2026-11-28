@@ -509,6 +509,8 @@ struct Phase {
     means: Vec<(u32, f64, usize)>,
     /// This phase's picture was asked for.
     shot_armed: bool,
+    /// What `streamline::displayed_counts` said when it began: presents and frames shown for them.
+    shown: (u64, u64),
 }
 
 /// The seconds of presents: where the world is found.
@@ -649,7 +651,7 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     };
     let p = state.phase.get_or_insert_with(|| {
         tracing::info!("{}", begins(asked, config, &setup.raw));
-        Phase { started: now, number: 0, began: now, last: now, drawn, frames: Vec::new(), draws: 0, means: Vec::new(), shot_armed: false }
+        Phase { started: now, number: 0, began: now, last: now, drawn, frames: Vec::new(), draws: 0, means: Vec::new(), shot_armed: false, shown: crate::streamline::displayed_counts() }
     });
     let bits = |number: u64| {
         if config.bundle {
@@ -691,8 +693,13 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     let (was, will) = (bits(p.number), bits(number));
     let (mean, median, most) = summary(&mut p.frames);
     let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
+    // With frame generation planned: the frames shown for each one rendered in the phase, and so the rate the
+    // screen got (the milliseconds above are the title's, rendered).
+    let (presents, shown) = crate::streamline::displayed_counts();
+    let (presents, shown) = (presents.saturating_sub(p.shown.0), shown.saturating_sub(p.shown.1));
+    let displayed = displayed_text(mean, presents, shown);
     tracing::info!(
-        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame",
+        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame{displayed}",
         p.number,
         on.join(" "),
         p.frames.len(),
@@ -718,14 +725,39 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     }
     BITS.store(will, Relaxed);
     (p.number, p.began, p.draws) = (number, now, 0);
+    p.shown = crate::streamline::displayed_counts();
     p.frames.clear();
     p.shot_armed = false;
     clear_shot();
 }
 
+/// What a phase's line adds when frame generation was planned: the rate the screen got (`mean` is the rendered
+/// frames' mean in ms; `presents` of the phase showed `shown` frames); nothing without presents of that kind.
+fn displayed_text(mean: f32, presents: u64, shown: u64) -> String {
+    if presents == 0 || mean.is_nan() || mean <= 0.0 {
+        return String::new();
+    }
+    let per = shown as f64 / presents as f64;
+    format!(", displayed {:.1} fps of rendered {:.1} ({per:.2} frames shown for each one rendered, {presents} presents)", 1000.0 / f64::from(mean) * per, 1000.0 / f64::from(mean))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phase_with_frame_generation_says_what_the_screen_got() {
+        // 40 ms a rendered frame is 25 fps; two shown for each one is 50.
+        assert_eq!(
+            displayed_text(40.0, 100, 200),
+            ", displayed 50.0 fps of rendered 25.0 (2.00 frames shown for each one rendered, 100 presents)"
+        );
+        // Off in the phase: one for one.
+        assert!(displayed_text(40.0, 10, 10).contains("displayed 25.0 fps of rendered 25.0 (1.00 "));
+        // No present of its kind (the run has no frame generation), or no frame: nothing.
+        assert_eq!(displayed_text(40.0, 0, 0), "");
+        assert_eq!(displayed_text(f32::NAN, 10, 20), "");
+    }
 
     /// The list a pilot's run named: nine switches, one with a value, the A/B a bundle.
     const PILOT: &str = "10,VICTORY_UNDER_TRY,VICTORY_WAIT_ORDER,VICTORY_ONE_PASS,VICTORY_STAGE_A,VICTORY_STAGE_A_STEPS,\

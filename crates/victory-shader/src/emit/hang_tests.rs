@@ -568,7 +568,7 @@ fn the_audited_form_is_taken_with_the_guard_on_too() {
 /// digits named (in any case, spaces around the commas allowed), and none if it names nothing.
 #[test]
 fn the_audited_form_can_be_asked_for_by_program() {
-    let tag = 0xF000_0000 | 0x0238_4A6F;
+    let tag = 0xF000_0000 | 0x0238_4A6;
     assert!(super::kept_wide::named_in(tag, None));
     assert!(super::kept_wide::named_in(tag, Some("02384a6")));
     assert!(super::kept_wide::named_in(tag, Some("2233808, 0238")));

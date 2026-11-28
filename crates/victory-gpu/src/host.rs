@@ -8489,7 +8489,36 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
-        for (i, step) in self.deferred().copies.iter().enumerate() {
+        let deferred = self.deferred();
+        let steps = &deferred.copies;
+        // With the pass over the steps ([`onepass`]) the refreshes, which are nearly all of them, come from the records
+        // (the steps are not read), the others by their place; the records are of the list as it was when it was looked
+        // through.
+        if cursor.as_mut().is_some_and(|cursor| !cursor.fits(steps.len())) {
+            cursor = None;
+        }
+        let mut plain = 0..steps.len();
+        loop {
+            let i = match cursor.as_mut() {
+                Some(cursor) => match cursor.next() {
+                    onepass::Item::Refresh(number, shadow, from, to) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            refreshes += 1;
+                            refreshed += (to - from) as u64;
+                        }
+                        batch.add_at(number, shadow, from, to - from);
+                        continue;
+                    }
+                    onepass::Item::Step(i) => i,
+                    onepass::Item::End => break,
+                },
+                None => match plain.next() {
+                    Some(i) => i,
+                    None => break,
+                },
+            };
+            let step = &steps[i];
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
@@ -8544,11 +8573,7 @@ impl HostList {
                         refreshes += 1;
                         refreshed += *len as u64;
                     }
-                    // (With the pass over the steps: the copy's number comes from the record of the step.)
-                    match cursor.as_mut().and_then(|cursor| cursor.refresh(shadow, *address, *len)) {
-                        Some(number) => batch.add_at(number, shadow, *address, *len),
-                        None => batch.add(shadow, *address, *len),
-                    }
+                    batch.add(shadow, *address, *len);
                     continue;
                 }
                 Step::Run(work) | Step::Host(work, _) => {
@@ -8574,9 +8599,6 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    if let Some(cursor) = cursor.as_mut() {
-                        cursor.skip(true);
-                    }
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -8594,9 +8616,6 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if let Some(cursor) = cursor.as_mut() {
-                        cursor.skip(false);
-                    }
                     if batch.texture_due(staging) {
                         batch.due.push(staging.clone());
                         if !wide_textures() {

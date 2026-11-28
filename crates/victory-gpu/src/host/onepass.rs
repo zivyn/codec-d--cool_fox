@@ -20,7 +20,7 @@
 //! (the tests compare each with the walk it replaces). Nothing a pass holds outlives the submission: it is emptied
 //! when it is given back, and the holds on the copies go with it.
 
-use super::scratch::{self, Reset};
+use super::scratch::Reset;
 use super::*;
 use crate::shadow::Shadow;
 use std::sync::Arc;
@@ -75,17 +75,19 @@ impl StepList for Vec<Step> {
     }
 }
 
-/// The record of a range given to shaders; of a texture.
+/// The record of a range given to shaders; of a texture; of any other step (an event: a copy, a fill, a run ...).
 const WRITE: u32 = 1 << 31;
 const TEXTURE: u32 = 1 << 30;
+const EVENT: u32 = 1 << 29;
 /// The number of the copy.
-const NUMBER: u32 = TEXTURE - 1;
+const NUMBER: u32 = EVENT - 1;
 /// What a copy's place in a table says before it has one, and that it is left out.
 const UNSEEN: u32 = u32::MAX;
 const LEFT_OUT: u32 = u32::MAX - 1;
 
-/// What a step is to the four users. Of a refresh: the copy's number, `from` and `to`. Of a `GpuWrite`: the number
-/// with [`WRITE`]. Of a texture: [`TEXTURE`], and in `from` the place of the texture in the pass's list of them.
+/// What a step is to the four users. Of a refresh: the copy's number, `from` and `to`. Of every other step the place
+/// of the step in its list is in `to` (of an event, [`EVENT`], in `from`, as it has nothing else to say): a `GpuWrite`
+/// has the number with [`WRITE`], a texture [`TEXTURE`] and in `from` the place of the texture in the pass's list of them.
 #[derive(Clone, Copy)]
 pub(super) struct Rec {
     what: u32,
@@ -104,6 +106,8 @@ pub(super) struct Pass {
     recs: Vec<Rec>,
     /// Where the records of each list are (from, to), in the order the lists go.
     lists: Vec<(u32, u32)>,
+    /// How many steps each of them had when it was looked through (by the same number as `lists`).
+    steps: Vec<u32>,
     textures: Vec<Arc<crate::texture::Staging>>,
     // What the users work in (each makes it of the size it needs: the thread keeps the room).
     slot: Vec<u32>,
@@ -126,6 +130,7 @@ impl Reset for Pass {
         self.table.reset();
         self.recs.reset();
         self.lists.reset();
+        self.steps.reset();
         self.textures.reset();
         self.slot.reset();
         self.found.reset();
@@ -172,10 +177,12 @@ impl Pass {
             self.copies.len(),
             std::time::Instant::now(),
         );
+        let mut count = 0u32;
         list.steps(|steps| {
+            count = steps.len() as u32;
             // The steps of a list name one copy several on end (the views of a draw).
             let mut last = (0usize, 0u32);
-            for step in steps {
+            for (index, step) in steps.iter().enumerate() {
                 match step {
                     Step::Refresh(shadow, at, len) => {
                         let number = self.number_of(shadow, &mut last);
@@ -190,7 +197,7 @@ impl Pass {
                         self.recs.push(Rec {
                             what: number | WRITE,
                             from: 0,
-                            to: 0,
+                            to: index,
                         });
                     }
                     Step::Texture(staging) => {
@@ -198,10 +205,14 @@ impl Pass {
                         self.recs.push(Rec {
                             what: TEXTURE,
                             from: self.textures.len() - 1,
-                            to: 0,
+                            to: index,
                         });
                     }
-                    _ => {}
+                    _ => self.recs.push(Rec {
+                        what: EVENT,
+                        from: index,
+                        to: 0,
+                    }),
                 }
             }
         });
@@ -217,8 +228,10 @@ impl Pass {
         }
         if first {
             self.lists.insert(0, seen);
+            self.steps.insert(0, count);
         } else {
             self.lists.push(seen);
+            self.steps.push(count);
         }
     }
 
@@ -252,7 +265,7 @@ impl Pass {
         for list in lists {
             let (from, to) = self.lists[list];
             for rec in &self.recs[from as usize..to as usize] {
-                if rec.what & (WRITE | TEXTURE) != 0 {
+                if rec.what & (WRITE | TEXTURE | EVENT) != 0 {
                     continue;
                 }
                 let number = rec.what as usize;
@@ -328,6 +341,9 @@ impl Pass {
                     texture(&self.textures[rec.from]);
                     continue;
                 }
+                if rec.what & EVENT != 0 {
+                    continue;
+                }
                 let number = (rec.what & NUMBER) as usize;
                 let mut at = self.rank[number];
                 if at == UNSEEN {
@@ -389,26 +405,37 @@ impl Pass {
         }
     }
 
-    /// The records of list number `list` (in the order the lists go), to be followed step by step.
+    /// The records of list number `list` (in the order the lists go), to be followed one after the other.
     pub(super) fn cursor(&self, list: usize) -> Option<Cursor<'_>> {
         let &(from, to) = self.lists.get(list)?;
         Some(Cursor {
             pass: self,
             at: from as usize,
             end: to as usize,
+            steps: self.steps[list] as usize,
             lost: false,
         })
     }
 }
 
-/// A list's steps followed against its records: the `n`th refresh, range given to shaders or texture among the
-/// steps is the `n`th record. A step that does not agree with its record (it should not happen: the lists are not
-/// changed while a submission is prepared) ends the following: from there on the steps are done as they were
-/// without a pass.
+/// What comes next in a list, by its records.
+pub(super) enum Item<'a> {
+    /// A refresh: the copy's number, the copy, the range.
+    Refresh(usize, &'a Arc<Shadow>, usize, usize),
+    /// Any other step: its place in the list.
+    Step(usize),
+    End,
+}
+
+/// A list's steps in their order, by its records: the refreshes (which are nearly all of them, and have everything the
+/// batch needs in the record: the step itself is never read) and the places of the others. The list is taken as it was
+/// when it was looked through: if it has another number of steps now (it should not) the records are not used
+/// ([`Cursor::fits`]) and the steps are done as without a pass.
 pub(super) struct Cursor<'a> {
     pass: &'a Pass,
     at: usize,
     end: usize,
+    steps: usize,
     lost: bool,
 }
 
@@ -420,57 +447,28 @@ impl Drop for Cursor<'_> {
     }
 }
 
-impl Cursor<'_> {
-    /// The number of the copy of the refresh `[address, address + len)` of `shadow`, if the next record is it.
-    pub(super) fn refresh(
-        &mut self,
-        shadow: &Arc<Shadow>,
-        address: usize,
-        len: usize,
-    ) -> Option<usize> {
-        if self.lost {
-            return None;
-        }
-        let said = (self.at < self.end)
-            .then(|| self.pass.recs[self.at])
-            .filter(|rec| {
-                rec.what & (WRITE | TEXTURE) == 0
-                    && rec.from == address
-                    && rec.to == address + len
-                    && std::ptr::eq(
-                        Arc::as_ptr(&self.pass.copies[rec.what as usize]),
-                        Arc::as_ptr(shadow),
-                    )
-            });
-        match said {
-            Some(rec) => {
-                self.at += 1;
-                Some(rec.what as usize)
-            }
-            None => {
-                self.lost = true;
-                None
-            }
-        }
+impl<'a> Cursor<'a> {
+    /// Whether the list still has the steps the records are of (counted if not).
+    pub(super) fn fits(&mut self, steps: usize) -> bool {
+        self.lost = self.lost || steps != self.steps;
+        !self.lost
     }
 
-    /// Passes the record of a range given to shaders (`write`) or of a texture.
-    pub(super) fn skip(&mut self, write: bool) {
-        if self.lost {
-            return;
+    /// The next step, in the order of the list.
+    pub(super) fn next(&mut self) -> Item<'a> {
+        if self.at >= self.end {
+            return Item::End;
         }
-        let kind = if write { WRITE } else { TEXTURE };
-        if self.at < self.end && self.pass.recs[self.at].what & kind != 0 {
-            self.at += 1;
+        let rec = self.pass.recs[self.at];
+        self.at += 1;
+        if rec.what & EVENT != 0 {
+            Item::Step(rec.from)
+        } else if rec.what & (WRITE | TEXTURE) != 0 {
+            Item::Step(rec.to)
         } else {
-            self.lost = true;
+            let number = rec.what as usize;
+            Item::Refresh(number, &self.pass.copies[number], rec.from, rec.to)
         }
-    }
-
-    /// Whether every record was followed.
-    #[cfg(test)]
-    pub(super) fn done(&self) -> bool {
-        !self.lost && self.at == self.end
     }
 }
 
@@ -734,47 +732,51 @@ mod tests {
         }
     }
 
-    /// The cursor of each list follows its refreshes and the ranges given to shaders, and says the number of the copy of
-    /// each refresh; a step that is not the record's ends the following.
+    /// The cursor of each list gives the steps in their order: a refresh with its copy and range as the step has them,
+    /// every other step as its place; and it does not fit a list that has another number of steps.
     #[test]
-    fn the_cursor_follows_the_steps_of_each_list() {
+    fn the_cursor_gives_the_steps_of_each_list_in_order() {
         let mut dice = Dice(0x0123_4567_89ab_cdef);
         let memory = vec![0u8; 4096];
         let copies = some_copies(&memory, 9);
+        let (mut refreshes, mut others) = (0, 0);
         for trial in 0..300 {
             let lists = random_lists(&mut dice, &copies);
             let mut pass = Pass::default();
             pass.add(&lists);
             for (n, list) in lists.iter().enumerate() {
                 let mut cursor = pass.cursor(n).unwrap();
-                for step in list {
-                    match step {
-                        Step::Refresh(shadow, at, len) => {
-                            let number = cursor
-                                .refresh(shadow, *at, *len)
-                                .expect("the record of the step");
-                            assert!(Arc::ptr_eq(&pass.copies[number], shadow), "trial {trial}");
+                assert!(cursor.fits(list.len()));
+                for (i, step) in list.iter().enumerate() {
+                    match (step, cursor.next()) {
+                        (Step::Refresh(shadow, at, len), Item::Refresh(number, copy, from, to)) => {
+                            assert!(
+                                Arc::ptr_eq(copy, shadow)
+                                    && Arc::ptr_eq(&pass.copies[number], shadow)
+                            );
+                            assert_eq!((from, to), (*at, *at + *len), "trial {trial}");
+                            refreshes += 1;
                         }
-                        Step::GpuWrite(..) => cursor.skip(true),
-                        _ => {}
+                        (Step::Refresh(..), _) | (_, Item::Refresh(..)) => {
+                            panic!("trial {trial} list {n} step {i}: a refresh is not")
+                        }
+                        (_, Item::Step(at)) => {
+                            assert_eq!(at, i, "trial {trial} list {n}");
+                            others += 1;
+                        }
+                        (_, Item::End) => {
+                            panic!("trial {trial} list {n}: the records end at step {i}")
+                        }
                     }
                 }
-                assert!(cursor.done(), "trial {trial} list {n}");
-            }
-            // A refresh of another range than the record's ends it, and what comes after is left to the old way.
-            if let Some((n, Step::Refresh(shadow, at, len))) =
-                lists.iter().enumerate().find_map(|(n, l)| {
-                    l.iter()
-                        .find(|s| matches!(s, Step::Refresh(..)))
-                        .map(|s| (n, s))
-                })
-            {
-                let mut cursor = pass.cursor(n).unwrap();
-                assert!(cursor.refresh(shadow, *at + 1, *len).is_none());
-                assert!(cursor.refresh(shadow, *at, *len).is_none());
-                assert!(!cursor.done());
+                assert!(matches!(cursor.next(), Item::End));
+                assert!(!pass.cursor(n).unwrap().fits(list.len() + 1));
             }
         }
+        assert!(
+            refreshes > 1000 && others > 500,
+            "{refreshes} refreshes, {others} others"
+        );
     }
 
     /// A pass made twice from the same thread's kept one finds nothing of the first, and lets go of its holds.
@@ -783,16 +785,24 @@ mod tests {
         let mut dice = Dice(0x7f4a_7c15_9e37_79b9);
         let memory = vec![0u8; 4096];
         let copies = some_copies(&memory, 5);
+        // (A copy may be held by the table of copies too: what is counted is what the pass adds.)
+        let held: Vec<usize> = copies.iter().map(Arc::strong_count).collect();
         {
             let mut pass = scratch::Lean::of(&PASS, true);
             let mut lists = random_lists(&mut dice, &copies);
             lists.push(vec![Step::Refresh(copies[0].clone(), 1, 2)]);
             pass.add(&lists);
             drop(lists);
-            assert!(Arc::strong_count(&copies[0]) > 1, "the pass holds the copy");
+            assert!(
+                Arc::strong_count(&copies[0]) > held[0],
+                "the pass holds the copy"
+            );
         }
         assert!(
-            copies.iter().all(|c| Arc::strong_count(c) == 1),
+            copies
+                .iter()
+                .map(Arc::strong_count)
+                .eq(held.iter().copied()),
             "the copies are let go of"
         );
         let pass = scratch::Lean::of(&PASS, true);

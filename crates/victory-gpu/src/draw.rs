@@ -643,7 +643,7 @@ impl State {
     /// The host list was given `values` for root parameter `param` without [`State::root_changed`] having been asked
     /// (the user data of the call that ended a run, set after it): the filter's record is what the list holds.
     fn root_told(&mut self, compute: bool, param: u32, values: &[u32]) {
-        if state_filter() == 0 {
+        if state_filter() == 0 || compute || param < 1000 {
             return;
         }
         let shadow = &mut self.root_shadow[usize::from(compute)];

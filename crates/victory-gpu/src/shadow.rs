@@ -3820,6 +3820,12 @@ mod narrow_tests {
         for c in [&c, &shadow] {
             refresh(c, at, N / 2 * PAGE);
         }
+        // (Fresh memory may be told written by the first asking: it is taken once more, and the bits are clear.)
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        for c in [&c, &shadow] {
+            refresh(c, at, N / 2 * PAGE);
+        }
+        crate::watch::ask_once_end();
         // Other tests' askings may end the one that stands: try again until the gate is judged under one that stands.
         let mut judged = false;
         for _ in 0..200 {

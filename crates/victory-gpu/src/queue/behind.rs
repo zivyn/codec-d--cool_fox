@@ -138,6 +138,11 @@ thread_local! {
 }
 
 thread_local! {
+    /// On our thread, while it does an entry (a thread of the title that submits by itself is not the thread of the line).
+    static DOING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
     /// On our thread, while it does an entry: the host lists of the entry
     /// that comes next of its queue, as addresses, if it is a submission.
     static AHEAD: std::cell::RefCell<Option<Vec<usize>>> = const { std::cell::RefCell::new(None) };
@@ -193,6 +198,9 @@ pub(super) fn stage_front() -> bool {
 /// it can (as it would when its turn came) and is named: its number, its host lists and where its parts begin.
 /// Nothing more is taken into it after this ([`Lane::prefold`]).
 pub(super) fn prefold() -> Option<(u64, Vec<usize>, Vec<usize>)> {
+    if !DOING.get() {
+        return None;
+    }
     LANE.prefold()
 }
 
@@ -525,7 +533,9 @@ impl<W: Work> Lane<W> {
             None
         };
         AHEAD.with(|a| *a.borrow_mut() = ahead);
+        DOING.set(true);
         entry.what.go(forced);
+        DOING.set(false);
         AHEAD.with(|a| a.borrow_mut().take());
         ROUND.set(0);
         {

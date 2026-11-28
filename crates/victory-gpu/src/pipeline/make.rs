@@ -80,6 +80,9 @@ pub(crate) struct Pending {
     background: bool,
     /// Taken by a worker from the resolves' own lane ([`Queue::resolves`]).
     as_resolve: AtomicBool,
+    /// The last title frame (plus one) a draw or dispatch asked for it and found it not made
+    /// ([`newest_asked`]; 0: none yet).
+    asked_frame: AtomicU64,
 }
 
 /// Whether the ray-tracing resolves are made in the background
@@ -262,6 +265,7 @@ impl Pending {
             making_at: AtomicU64::new(0),
             taken_asked: AtomicBool::new(false),
             as_resolve: AtomicBool::new(false),
+            asked_frame: AtomicU64::new(0),
         }
     }
 
@@ -486,6 +490,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         let frame = crate::frame::current();
+        p.asked_frame.store(frame + 1, Ordering::Relaxed);
         if p.background {
             // Made in the background: this dispatch is dropped, whatever the frame has waited.
             // (It is not in the lane of the frame's own requests either: that one has no
@@ -927,6 +932,39 @@ fn has_ram() -> bool {
     floor == 0 || ram_room(crate::host::available_physical_ram(), floor)
 }
 
+/// Whether a worker takes, of the requested pipelines, one a draw of this frame or the one before
+/// asked for before the older requests (`VICTORY_PIPELINE_NOW_FIRST=1`; off).
+///
+/// In the order asked alone, a cold library had the world's requests waiting 10 to 175 s behind
+/// requests of scenes the title had already left, and the frame on screen got none of its own
+/// until those were made. Passes over the screen, early and slow ones are not touched. (The
+/// lane of the frame's own requests, `Queue::recent`, does it for the frame that asked last;
+/// this reaches the one before it and the lane of the resolves.)
+///
+/// Ported from `trustno1-coder/VIctory-NVIDIA` #1125 (101Leafy).
+fn now_first() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_PIPELINE_NOW_FIRST"))
+}
+
+/// The first of `list` still waiting that was asked for in a title frame from `since` on (as
+/// the frame plus one, like [`Pending::asked_frame`]), taken out of it; `None` when there is
+/// none, or `on` is not set.
+fn newest_asked_since(list: &mut VecDeque<Arc<Pending>>, on: bool, since: u64) -> Option<Arc<Pending>> {
+    if !on {
+        return None;
+    }
+    let at = list
+        .iter()
+        .position(|p| p.queue_state.load(Ordering::Relaxed) == REQUESTED && p.asked_frame.load(Ordering::Relaxed) >= since)?;
+    list.remove(at)
+}
+
+fn newest_asked(list: &mut VecDeque<Arc<Pending>>, on: bool) -> Option<Arc<Pending>> {
+    // (Frame plus one: the frame before this one is `current`, and 0 is nobody's.)
+    newest_asked_since(list, on, crate::frame::current().max(1))
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -1033,13 +1071,15 @@ impl Queue {
         if p.is_none() && !screens_only {
             p = unclaimed(&mut self.recent, REQUESTED);
             self.publish();
+            p = p.or_else(|| newest_asked(&mut self.requested, now_first()));
             p = p.or_else(|| unclaimed(&mut self.requested, REQUESTED));
             if p.is_none() {
                 // (Not asked for as a frame's draw is: nothing waits for it, so it keeps
                 // the lowest priority whatever `VICTORY_PIPELINE_BOOST` says.)
                 asked = false;
                 if self.resolves_now < resolve_limit {
-                    p = unclaimed(&mut self.resolves, REQUESTED);
+                    p = newest_asked(&mut self.resolves, now_first());
+                    p = p.or_else(|| unclaimed(&mut self.resolves, REQUESTED));
                     if let Some(p) = &p {
                         p.as_resolve.store(true, Ordering::Relaxed);
                         self.resolves_now += 1;
@@ -1346,6 +1386,33 @@ mod tests {
         // One resolve made frees a place for r3.
         queue.resolves_now -= 1;
         assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &r3));
+    }
+
+    #[test]
+    fn the_frames_own_requests_go_first_only_with_the_switch() {
+        let asked = |frame| {
+            let p = Pending::new(Vec::new(), None);
+            p.asked_frame.store(frame, Ordering::Relaxed);
+            Arc::new(p)
+        };
+        let (old, never, recent, newer) = (asked(3), asked(0), asked(9), asked(10));
+        let mut list = VecDeque::new();
+        for p in [&old, &never, &recent, &newer] {
+            p.queue_state.store(REQUESTED, Ordering::Relaxed);
+            list.push_back(p.clone());
+        }
+        // Off: nothing is chosen, the caller takes the oldest.
+        assert!(newest_asked_since(&mut list, false, 9).is_none());
+        assert_eq!(list.len(), 4);
+        // On, with `since` 9 (a request of that frame, plus one, or later): the first such, in turn.
+        assert!(Arc::ptr_eq(&newest_asked_since(&mut list, true, 9).unwrap(), &recent));
+        assert!(Arc::ptr_eq(&newest_asked_since(&mut list, true, 9).unwrap(), &newer));
+        // None asked lately: the oldest is left to the caller.
+        assert!(newest_asked_since(&mut list, true, 9).is_none());
+        assert_eq!(list.len(), 2);
+        // One taken by another lane already is not offered.
+        old.queue_state.store(MAKING, Ordering::Relaxed);
+        assert!(newest_asked_since(&mut list, true, 1).is_none());
     }
 
     #[test]

@@ -540,9 +540,12 @@ const LISTED_PAGES: usize = 13;
 const STEPS: usize = 14;
 const STEPS_CLEAN: usize = 15;
 const CLEARED: usize = 16;
+const GATES: usize = 17;
+const GATE_HITS: usize = 18;
+const GATE_MISSED: usize = 19;
 
 /// Counters; those of the shadow check are cumulative in the line, the others per frame.
-static STATS: [AtomicU64; 17] = [const { AtomicU64::new(0) }; 17];
+static STATS: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 
 fn count(what: usize, n: u64) {
     STATS[what].fetch_add(n, Relaxed);
@@ -550,8 +553,23 @@ fn count(what: usize, n: u64) {
 
 /// What the shadow check has found since the start: (looks missed, pages of refreshes missed, pages under flights
 /// missed). All 0 when the ledger holds what the journal calls stale.
-pub(crate) fn missed_total() -> [u64; 3] {
-    [LOOK_MISSED, LIST_MISSED, UNDER_MISSED].map(|i| STATS[i].load(Relaxed))
+pub(crate) fn missed_total() -> [u64; 4] {
+    [LOOK_MISSED, LIST_MISSED, UNDER_MISSED, GATE_MISSED].map(|i| STATS[i].load(Relaxed))
+}
+
+/// Mode 1: the ledger's gate said a span needs no look (`stale`: the journal says a page of it was written after the
+/// copy took it, which would be a stale byte left behind).
+pub(crate) fn gate_checked(stale: bool) {
+    count(GATES, 1);
+    if stale {
+        count(GATE_MISSED, 1);
+        missed("the gate", (0, 0));
+    }
+}
+
+/// Mode 2: a span left out by the gate.
+pub(crate) fn gate_hit() {
+    count(GATE_HITS, 1);
 }
 
 /// What the shadow check has compared since the start (looks, pages of refreshes, pages under flights).
@@ -579,7 +597,7 @@ pub(crate) fn line(frames: f64) {
     }
     let per = |i: usize| STATS[i].swap(0, Relaxed) as f64 / frames;
     let (copies, pages) = PLANE.gauge();
-    let [looks_missed, lists_missed, unders_missed] = missed_total();
+    let [looks_missed, lists_missed, unders_missed, gates_missed] = missed_total();
     let (looks, lists, unders, extras) = (
         per(LOOKS),
         per(LISTS),
@@ -589,7 +607,8 @@ pub(crate) fn line(frames: f64) {
     tracing::info!(
         "page-driven refresh (VICTORY_PAGE_REFRESH={}), per frame: {:.0} pages noted written, {:.0} marks in copies ({:.0} through other views of the page); \
          ledger answered {:.0} looks and listed {:.0} pages for {:.0} refreshes; shadow check: {looks:.0} looks, {lists:.0} pages of refreshes, {unders:.0} pages under flights compared, \
-         {extras:.1} extra; MISSED so far: {looks_missed} looks, {lists_missed} pages of refreshes, {unders_missed} pages under flights (all must be 0); \
+         {extras:.1} extra; MISSED so far: {looks_missed} looks, {lists_missed} pages of refreshes, {unders_missed} pages under flights, {gates_missed} spans the gate would have left out (all must be 0); \
+         the gate: {:.0} spans checked against the journal (shadow), {:.0} left out (driven); \
          {:.0} entries cleared; {:.0} of {:.0} refresh steps are of copies that hold nothing; now {copies} copies hold {pages} pages",
         mode(),
         per(NOTES),
@@ -598,6 +617,8 @@ pub(crate) fn line(frames: f64) {
         per(ANSWERED),
         per(LISTED_PAGES),
         per(LISTED),
+        per(GATES),
+        per(GATE_HITS),
         per(CLEARED),
         per(STEPS_CLEAN),
         per(STEPS),

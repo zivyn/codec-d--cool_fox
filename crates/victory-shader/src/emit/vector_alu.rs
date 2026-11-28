@@ -798,7 +798,7 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 // (to nearest as the console does, with `VICTORY_F16_NEAREST=2`)
-                let h = if super::f16_level::mix_and_packed() {
+                let h = if super::super::f16_level::mix_and_packed() {
                     self.f16_nearest(r)
                 } else {
                     self.s
@@ -2022,7 +2022,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                if super::f16_level::mix_and_packed() {
+                if super::super::f16_level::mix_and_packed() {
                     self.f16_nearest(f)
                 } else {
                     self.s

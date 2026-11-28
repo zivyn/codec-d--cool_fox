@@ -5825,6 +5825,96 @@ mod many_askers_tests {
     /// The mode of the guards that changes with the round (and goes through the gate).
     const MIXED: usize = usize::MAX;
 
+    /// One run of the harness with `VIEWS` views of 12 blocks, asked about in spans of up to 3, in `mode`; `lean_on`
+    /// has the switches of `super::lean` on (cpu5: faults opening runs, the spin, the alias batch).
+    fn one_case<const VIEWS: usize>(rest: u64, mode: usize, lean_on: bool) {
+        let lean = if lean_on {
+            super::lean::Lean { around: 8, spin_us: 40, batch: true }
+        } else {
+            super::lean::Lean::OFF
+        };
+        writes_to_views_are_not_lost_lean::<VIEWS, 12, 3>(rest, mode, lean);
+    }
+
+    /// CI only (the `stress_guards` input of build.yml): a case of the tests above run again and again with varied
+    /// counts of threads (and idle cores taken by spinners every third time), and the runs that lost a write
+    /// counted, so that a flake has a rate. `VICTORY_STRESS_CASE` (`mixed_r50_1v`, `mixed_r0_3v`, `mixed_r50_3v`,
+    /// `s64_r50_1v`, `s0_r50_1v`, `s2_r50_1v`), `VICTORY_STRESS_N` runs at most, `VICTORY_STRESS_SECS` at most,
+    /// `VICTORY_STRESS_LEAN=1` for the switches of cpu5. Fails if a run lost a write (or failed otherwise).
+    #[test]
+    #[ignore = "the stress of the CI job stress-guards"]
+    fn stress_guard_modes() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::sync::Mutex;
+        static MESSAGES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let var = |key: &str, default: &str| std::env::var(key).unwrap_or_else(|_| default.to_string());
+        let (n, secs): (usize, u64) = (var("VICTORY_STRESS_N", "100").parse().unwrap(), var("VICTORY_STRESS_SECS", "1500").parse().unwrap());
+        let (case, lean_on) = (var("VICTORY_STRESS_CASE", "mixed_r50_1v"), var("VICTORY_STRESS_LEAN", "0") == "1");
+        std::panic::set_hook(Box::new(|info| {
+            let text = info.to_string();
+            eprintln!("STRESS-PANIC {}", text.replace('\n', " | "));
+            MESSAGES.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+        }));
+        let counts = [8usize, 4, 12, 16, 2];
+        let started = std::time::Instant::now();
+        let (mut done, mut lost, mut other) = (0usize, 0usize, 0usize);
+        let mut by_threads = [[0usize; 2]; 5];
+        for i in 0..n {
+            if started.elapsed().as_secs() >= secs {
+                break;
+            }
+            let k = i % counts.len();
+            THREADS_IN_TEST.set(counts[k]);
+            let stop = AtomicBool::new(false);
+            MESSAGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let result = std::thread::scope(|s| {
+                for _ in 0..if i % 3 == 2 { 2 } else { 0 } {
+                    s.spawn(|| {
+                        while !stop.load(Relaxed) {
+                            std::hint::spin_loop();
+                        }
+                    });
+                }
+                let result = std::panic::catch_unwind(|| match case.as_str() {
+                    "mixed_r50_1v" => one_case::<1>(50, MIXED, lean_on),
+                    "mixed_r0_3v" => one_case::<3>(0, MIXED, lean_on),
+                    "mixed_r50_3v" => one_case::<3>(50, MIXED, lean_on),
+                    "s64_r50_1v" => one_case::<1>(50, 64, lean_on),
+                    "s0_r50_1v" => one_case::<1>(50, 0, lean_on),
+                    "s2_r50_1v" => one_case::<1>(50, 2, lean_on),
+                    unknown => panic!("no such case {unknown}"),
+                });
+                stop.store(true, Relaxed);
+                result
+            });
+            done += 1;
+            if result.is_err() {
+                let messages = MESSAGES.lock().unwrap_or_else(|e| e.into_inner());
+                if messages.iter().any(|m| m.contains("is not after")) {
+                    lost += 1;
+                    by_threads[k][0] += 1;
+                } else {
+                    other += 1;
+                    by_threads[k][1] += 1;
+                }
+            }
+        }
+        let _ = std::panic::take_hook();
+        println!(
+            "STRESS-RESULT case={case} lean={} runs={done} lost_a_write={lost} other_failures={other} seconds={} lost_by_threads(8,4,12,16,2)={:?} other_by_threads={:?}",
+            u8::from(lean_on),
+            started.elapsed().as_secs(),
+            by_threads.map(|b| b[0]),
+            by_threads.map(|b| b[1])
+        );
+        assert_eq!(lost + other, 0, "{lost} runs lost a write, {other} failed otherwise, of {done}");
+    }
+
+    thread_local! {
+        /// Threads that write and ask in the harness below, for what this thread runs (the stress only changes it).
+        static THREADS_IN_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(8) };
+    }
+
     /// This thread works in `mode` (`shards`, or [`MIXED`]) in round `round`.
     fn tune(mode: usize, round: usize) {
         if mode == MIXED {
@@ -5853,7 +5943,7 @@ mod many_askers_tests {
     ) {
         tune(mode, 0);
         let rest = std::time::Duration::from_micros(rest);
-        const THREADS: usize = 8;
+        let threads = THREADS_IN_TEST.get();
         // SAFETY: views of a section of our own.
         let (section, all): (usize, [usize; VIEWS]) = unsafe {
             let _map = super::title_memory_remapping();
@@ -5896,7 +5986,7 @@ mod many_askers_tests {
                         assert_ne!(one, 0);
                         super::title_memory_remapped(one, PAGE);
                         crate::title_memory_view(one, PAGE, section, (page * PAGE) as u64);
-                        unsafe { ((one + THREADS * 8) as *mut u64).write_volatile(round as u64) };
+                        unsafe { ((one + threads * 8) as *mut u64).write_volatile(round as u64) };
                         let (now, written) =
                             writes(all[asked] + page * PAGE, all[asked] + (page + 1) * PAGE, true).expect("a view");
                         let number = written.first().map_or(0, |w| w.1);
@@ -5911,7 +6001,7 @@ mod many_askers_tests {
                     }
                 });
             }
-            for t in 0..THREADS {
+            for t in 0..threads {
                 let (by_bits, past, title_beside) = (&by_bits, &past, &title_beside);
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);

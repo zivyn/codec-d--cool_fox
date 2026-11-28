@@ -25,6 +25,16 @@
 //! ([`land_range`] in `crate::watch::writing`), and a copy of ours that reads
 //! them for the kernel does not exist for buffers of default heaps.
 //!
+//! One hole is left, and cannot be closed in process on private memory: the
+//! guard of a page goes with the first access to it, the lander's own
+//! included, and protection is the process's, not the thread's (a second view
+//! of the pages, which would let the lander write them with the guard still
+//! on, exists only for memory that is a mapped view, which is not armed). A
+//! thread that reads that very page between the lander's first access to it
+//! and the end of its merge (a 4 KiB page, a microsecond or two) reads the
+//! bytes from before the landing. Every other page of the unit is waited
+//! for, and the copies the title was seen to read are landed at once.
+//!
 //! What it takes: the pages are private memory, committed, read-write; the
 //! copy is that of a buffer in a default heap; the landing is the tail's.
 
@@ -57,6 +67,14 @@ thread_local! {
     /// How many units this thread is landing: its own accesses to owed pages
     /// are the landing's, and go on.
     static LANDING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Which units this thread is landing (the innermost last): only its
+    /// accesses to the pages of these are the landing's.
+    static LANDING_UNITS: std::cell::RefCell<Vec<*const Unit>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether this thread is landing `unit` (further out or not).
+fn landing_here(unit: &Unit) -> bool {
+    LANDING_UNITS.with_borrow(|units| units.contains(&std::ptr::from_ref(unit)))
 }
 
 /// What lands a unit: run once, by whoever has the unit.
@@ -210,9 +228,11 @@ fn ensure(unit: &Unit) {
             // access to a page; the lander's own accesses go on, below).
             let land = unit.land.lock().unwrap_or_else(|e| e.into_inner()).take();
             LANDING_DEPTH.set(LANDING_DEPTH.get() + 1);
+            LANDING_UNITS.with_borrow_mut(|units| units.push(std::ptr::from_ref(unit)));
             if let Some(land) = land {
                 land();
             }
+            LANDING_UNITS.with_borrow_mut(|units| units.pop());
             LANDING_DEPTH.set(LANDING_DEPTH.get() - 1);
             // The guards of the pages it did not touch.
             guard(unit.from, unit.to - unit.from, false);
@@ -261,8 +281,10 @@ pub(crate) fn fault(at: usize) -> bool {
     let Some(unit) = units.first() else {
         return false;
     };
-    // The landing's own access to its pages.
-    if LANDING_DEPTH.get() > 0 {
+    // The landing's own access to the pages of the unit it is landing. A page
+    // of another unit that is owed is landed first (nested: the guard went
+    // with this access, and anyone's later one would find it unlanded).
+    if landing_here(unit) {
         return true;
     }
     let began = std::time::Instant::now();

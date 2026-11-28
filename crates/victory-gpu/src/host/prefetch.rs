@@ -270,7 +270,8 @@ fn run(mut spans: Spans) {
     STATS[DONE].fetch_add(1, Ordering::Relaxed);
     STATS[SPANS].fetch_add(spans.len() as u64, Ordering::Relaxed);
     STATS[BYTES].fetch_add(spans.iter().map(|s| (s.2 - s.1) as u64).sum(), Ordering::Relaxed);
-    crate::shadow::wide_each(spans.len(), move |i| {
+    let copies = spans.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize).collect::<Vec<_>>();
+    wide_each_by_copy(copies.into_iter(), move |i| {
         let (shadow, from, to) = &spans[i];
         if many && shadow.nothing_new(*from, *to - *from) {
             return;

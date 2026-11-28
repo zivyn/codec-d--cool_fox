@@ -8288,9 +8288,17 @@ pub(crate) fn spans_by_copy(copies: impl Iterator<Item = usize>) -> Vec<Vec<usiz
     groups
 }
 
-/// (For now a job to each span, as before.)
+/// [`crate::shadow::wide_each`] over the spans whose copies are `copies`, a job
+/// for each copy: the spans of one copy are done one after the other by the
+/// thread that has the copy (they would wait for each other's lock), those of
+/// other copies at the same time. `work` gets the number of a span.
 pub(crate) fn wide_each_by_copy(copies: impl Iterator<Item = usize>, work: impl Fn(usize) + Send + Sync + 'static) {
-    crate::shadow::wide_each(copies.count(), work);
+    let groups = spans_by_copy(copies);
+    crate::shadow::wide_each(groups.len(), move |g| {
+        for &i in &groups[g] {
+            work(i);
+        }
+    });
 }
 
 /// A table by a copy's address.
@@ -9110,19 +9118,23 @@ impl Batch {
             FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
             Self::lap(&mut lap, crate::copystat::C::FlushAskNs);
         }
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+        // A job for each copy: its spans one after the other.
+        let groups = spans_by_copy(spans.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize));
+        crate::shadow::wide_each(groups.len() + due.len(), move |g| {
             // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
+            let Some(g) = g.checked_sub(due.len()) else {
+                due[g].refresh();
                 return;
             };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
+            for &i in &groups[g] {
+                let (shadow, from, to) = &spans[i];
+                if many && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                Self::update(shadow, *from, *to);
             }
-            Self::update(shadow, *from, *to);
         });
         #[cfg(feature = "diagnostics")]
         Self::lap(&mut lap, crate::copystat::C::FlushEachNs);
@@ -9176,7 +9188,8 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
+        let copies = due.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize).collect::<Vec<_>>();
+        wide_each_by_copy(copies.into_iter(), move |i| {
             let (shadow, from, to) = &due[i];
             if !shadow.nothing_new(*from, *to - *from) {
                 Self::update(shadow, *from, *to);
@@ -9325,7 +9338,8 @@ impl Batch {
             if light {
                 // A number to a free thread, not a job to each copy.
                 let refreshes = std::mem::take(&mut self.refreshes);
-                crate::shadow::wide_each(refreshes.len(), move |i| {
+                let copies = refreshes.iter().map(|s| std::sync::Arc::as_ptr(&s.0) as usize).collect::<Vec<_>>();
+                wide_each_by_copy(copies.into_iter(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
                     if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]

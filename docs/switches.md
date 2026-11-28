@@ -91,6 +91,7 @@ the card.
 | `VICTORY_KEEP_STALLING_SKIPS` | off | cache key (text) | `=1`: in the forms without skips, a skip over a loop that never ends once no lane is left in it stays a branch (the water's tiled light on 32-lane hosts: tiles with no output). |
 | `VICTORY_LDS_FIRST_INIT` | off | cache key (text) | `=1`: a thread group's shared-memory set-up by its first thread (constants under a test of the thread's place) is done whether that thread's lane runs there or not (the water's tiled light on 32-lane hosts). |
 | `VICTORY_LOOPS_WAVE` | off | cache key (text) | `=1` (`=2` every compute program): a console wave64 program that needs the host's waves is translated again with the branches that close or leave its loops taken by each host wave together (the water's tile generation on 32-lane hosts). |
+| `VICTORY_LOOPS_WAVE_ONLY` | off | cache key (text) | With `VICTORY_LOOPS_WAVE`: only the programs a word of whose container is one of these comma-separated names (for example the water library's) take the loops together. |
 | `VICTORY_LOOP_LIMITS` | off | cache key (text) | Table of per-program, per-stage iteration limits for translated loops. |
 | `VICTORY_LOOP_NOTES` | off | cache key (text) | Translated loops that hit their iteration limit leave a note in the faults buffer. |
 | `VICTORY_LOOP_WHY` | off | cache key (text) | Prints one stderr line per translated loop, saying why it has its limit. |
@@ -520,6 +521,7 @@ translation of shaders.
 | `VICTORY_KEEP_STALLING_SKIPS` | off | flag | yes |  |  | `=1`: a skip over a loop that never ends with no lane left stays in the forms without skips. |
 | `VICTORY_LDS_FIRST_INIT` | off | flag | yes |  |  | `=1`: a thread group's shared-memory set-up by its first thread is done whether that thread's lane runs there or not. |
 | `VICTORY_LOOPS_WAVE` | off | flag | yes |  |  | `=1` (`=2` every compute program): console wave64 loops are left by each host wave together (water tile generation and tiled light on 32-lane hosts). |
+| `VICTORY_LOOPS_WAVE_ONLY` | off | list | yes |  |  | With `VICTORY_LOOPS_WAVE`: only the programs named by a word of their container (comma-separated). |
 | `VICTORY_LOOP_LIMITS` | off | list | yes |  |  | Table of per-program, per-stage iteration limits for translated loops. |
 | `VICTORY_LOOP_NOTES` | off | flag | yes |  |  | Translated loops that hit their iteration limit leave a note in the faults buffer. |
 | `VICTORY_LOOP_WHY` | off | flag | yes |  |  | Prints one stderr line per translated loop, saying why it has its limit. |

@@ -1396,8 +1396,10 @@ fn code_digits(c: &Container) -> String {
 /// together where cross-lane code depends on the wave ([`emit_program`]), `VICTORY_LOOPS_WAVE`:
 /// - `1`: console wave64 compute programs on a host of 32-lane waves;
 /// - `2`: every compute program;
-/// - unset or anything else: none (off).
-fn loops_wave(native: &NativeProgram) -> bool {
+/// - unset or anything else: none (off);
+/// - with `VICTORY_LOOPS_WAVE_ONLY=<names>`: only the programs those names (words of the container,
+///   comma-separated) name.
+fn loops_wave(c: &Container, native: &NativeProgram) -> bool {
     if native.stage != HwStage::Cs {
         return false;
     }
@@ -1405,11 +1407,14 @@ fn loops_wave(native: &NativeProgram) -> bool {
     if let Some(mode) = TEST_LOOPS_WAVE.get() {
         return mode == 2 || mode == 1 && native.wave64 && lower::host_max_wave() == 32;
     }
-    match std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) {
+    let on = match std::env::var("VICTORY_LOOPS_WAVE").ok().as_deref().map(str::trim) {
         Some("2") => true,
         Some("1") => native.wave64 && lower::host_max_wave() == 32,
         _ => false,
-    }
+    };
+    // `VICTORY_LOOPS_WAVE_ONLY=<names>`: only the programs a word of whose container is one of the
+    // comma-separated names (as `VICTORY_WAVE_WIDE_FIRST` names them), to try the water's alone.
+    on && std::env::var("VICTORY_LOOPS_WAVE_ONLY").ok().is_none_or(|names| wide_first(c, &names))
 }
 
 #[cfg(test)]
@@ -1445,7 +1450,7 @@ fn emit_program(
     let Ok((_, Some(wave))) = &first else {
         return first;
     };
-    if !loops_wave(native) || !st.host_wide.is_empty() {
+    if !loops_wave(c, native) || !st.host_wide.is_empty() {
         return first;
     }
     let loops = lower::loop_branches(p, st);

@@ -1352,6 +1352,7 @@ impl Views {
                 let i = match self.free.pop() {
                     Some(i) => {
                         self.list[i as usize].0 = view.clone();
+                        VIEWS_CHANGED.changed(i);
                         i
                     }
                     None => {
@@ -1595,16 +1596,49 @@ pub(crate) fn forget(resource: usize) {
         views.index.remove(&view);
         // (Below the bits that say a record is no table entry.)
         views.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        VIEWS_CHANGED.changed(i);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
     }
 }
 
+/// Entries of the table of views that were freed or made another view ([`crate::viewat`]).
+static VIEWS_CHANGED: crate::viewat::Log = crate::viewat::Log::new();
+
+thread_local! {
+    /// What this thread read from the table of views and has not been told changed.
+    static NEAR: std::cell::RefCell<crate::viewat::Near> = const { std::cell::RefCell::new(crate::viewat::Near::new()) };
+}
+
+/// Whether a thread answers `view_at` from a table of its own where it can (`VICTORY_VIEW_AT_CACHE=1`; off by default).
+fn view_at_near() -> bool {
+    crate::ab::live_flag!("VICTORY_VIEW_AT_CACHE")
+}
+
+/// [`view_at`] for a table entry, without the lock of the table when this thread read it before and nobody changed it.
+fn entry_near(i: u32, generation: u32) -> Option<View> {
+    if let Some(view) = NEAR.with(|n| n.borrow_mut().get(&VIEWS_CHANGED, i, generation)) {
+        return Some(view);
+    }
+    let view = {
+        let views = views_read();
+        let (view, current) = views.list.get(i as usize)?;
+        if *current != generation {
+            return None;
+        }
+        view.clone()
+    };
+    NEAR.with(|n| n.borrow_mut().put(i, generation, &view));
+    Some(view)
+}
+
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
+    let _time = crate::opcost::time(crate::opcost::Op::ViewAt);
     match generation >> KIND_SHIFT {
+        0 if view_at_near() => entry_near(i, generation),
         0 => {
             let views = views_read();
             let (view, current) = views.list.get(i as usize)?;

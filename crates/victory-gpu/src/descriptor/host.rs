@@ -1784,7 +1784,7 @@ impl HostHeap {
             copied: Mutex::new(Vec::new()),
             waiting: Mutex::default(),
             away: Mutex::default(),
-            kept_raw: (0..if keep_fast() { count + extra } else { 0 })
+            kept_raw: (0..if keep_fast_possible() { count + extra } else { 0 })
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
             kept: super::sparse::Pages::new((count + extra) as usize, sparse),
@@ -3179,6 +3179,7 @@ impl HostHeap {
     /// ([`ListViews`]). What is known of the record in this recording;
     /// `None` (the slot is not made): not a view kept so.
     pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+        let _time = crate::opcost::time(crate::opcost::Op::MakeListed);
         if self.sampler {
             return None;
         }
@@ -3281,6 +3282,7 @@ impl HostHeap {
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
         use windows::core::Interface;
+        let _time = crate::opcost::time(crate::opcost::Op::Keep);
         let slot = if resource.is_some() { self.kept.get(index as usize) } else { self.kept.peek(index as usize) };
         let Some(slot) = slot else {
             return;
@@ -3310,6 +3312,7 @@ impl HostHeap {
     /// of memory they fight over) only if the slot shows another.
     fn keep_ref(&self, index: u32, resource: &Kept) {
         use windows::core::Interface;
+        let _time = crate::opcost::time(crate::opcost::Op::Keep);
         let slot = if resource.is_some() { self.kept.get(index as usize) } else { self.kept.peek(index as usize) };
         let Some(slot) = slot else {
             return;
@@ -3336,7 +3339,7 @@ impl HostHeap {
     /// the lock. Always false without `VICTORY_KEEP_FAST=1`.
     #[inline]
     fn shows_already(&self, index: u32, raw: usize) -> bool {
-        self.kept_raw.get(index as usize).is_some_and(|r| r.load(std::sync::atomic::Ordering::Relaxed) == raw)
+        keep_fast() && self.kept_raw.get(index as usize).is_some_and(|r| r.load(std::sync::atomic::Ordering::Relaxed) == raw)
     }
 
     /// Slot `index` holds the resource at `raw` from now on (under its lock).
@@ -4697,6 +4700,7 @@ fn make_twinned(
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
     twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
 ) -> Option<Kept> {
+    let _time = crate::opcost::time(crate::opcost::Op::MakeTwinned);
     let host = host()?;
     let device = &host.device;
     match view {
@@ -6677,14 +6681,19 @@ pub(crate) fn copies_flush() {
 }
 
 /// Whether a slot's kept resource is looked at without its lock when it is the same again (`VICTORY_KEEP_FAST=1`;
-/// off by default).
+/// off by default; `VICTORY_AB` may flip it).
 fn keep_fast() -> bool {
     #[cfg(test)]
     if TEST_KEEP_FAST.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FAST").is_some_and(|v| v == "1"))
+    crate::ab::live_flag!("VICTORY_KEEP_FAST")
+}
+
+/// Whether a heap keeps the addresses [`keep_fast`] looks at: the switch is on, or the A/B may turn it on while the title
+/// runs (they are kept whether it is on or off, so that a phase that turns it on finds them right).
+fn keep_fast_possible() -> bool {
+    keep_fast() || crate::ab::bit("VICTORY_KEEP_FAST").is_some()
 }
 
 #[cfg(test)]

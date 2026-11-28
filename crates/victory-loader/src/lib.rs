@@ -31,7 +31,12 @@ pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
-#[cfg(all(windows, feature = "diagnostics"))]
+// (The code of these two is built, and its tests run, in every build; only the threads that use them are diagnostics.)
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+mod spinsample;
+#[cfg(windows)]
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 mod stacks;
 #[cfg(windows)]
 mod threads;
@@ -56,6 +61,10 @@ pub use resolve::{ImportResolver, Provenance, Resolution};
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile_on_schedule;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use spinsample::spin_sample_on_schedule;
+#[cfg(windows)]
+pub use console_insn::wait_nice_from;
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]

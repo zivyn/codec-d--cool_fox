@@ -118,6 +118,8 @@ mod switch;
 pub use switch::on as env_on;
 #[cfg(windows)]
 pub mod ab;
+mod opcost;
+mod viewat;
 #[cfg(windows)]
 mod echo;
 #[cfg(windows)]
@@ -148,6 +150,13 @@ pub use host::on_failure;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub fn switched(switch: &str) -> Option<bool> {
     ab::pick(switch)
+}
+
+/// Whether `VICTORY_WAIT_NICE` is on now (`VICTORY_AB` may flip it while the title runs): the loader asks, at each pass of
+/// a wait loop of the title's (`victory_loader::wait_nice_from`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn wait_nice_now() -> bool {
+    ab::live_flag!("VICTORY_WAIT_NICE")
 }
 
 /// What the frame is at (`copystat::phase`), for the sampling profiler.

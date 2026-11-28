@@ -1610,6 +1610,7 @@ pub(crate) fn host_waits(this: This) -> bool {
 #[cfg(windows)]
 fn hosted(this: This, make: bool) -> Option<Made> {
     use std::sync::atomic::Ordering::Relaxed;
+    let _time = crate::opcost::time(crate::opcost::Op::Hosted);
     let r = resource(this);
     if r.desc.dimension == BUFFER {
         return None;

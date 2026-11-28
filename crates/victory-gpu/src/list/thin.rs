@@ -473,6 +473,7 @@ pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
 
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
+    crate::opcost::line(frames);
     if !wanted() || !on() {
         return;
     }

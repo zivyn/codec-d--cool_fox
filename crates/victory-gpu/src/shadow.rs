@@ -7606,6 +7606,7 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    let _time = crate::opcost::time(crate::opcost::Op::Lookup);
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);

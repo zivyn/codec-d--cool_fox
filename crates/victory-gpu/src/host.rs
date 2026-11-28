@@ -4456,20 +4456,7 @@ mod scratch;
 mod send;
 mod stage;
 pub(crate) use send::{goes_as_words, words_under};
-#[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
-
-/// Without diagnostics there are no stamps around our passes (`spans`).
-#[cfg(not(feature = "diagnostics"))]
-impl Host {
-    fn pass_slot(&self) -> Option<usize> {
-        None
-    }
-
-    unsafe fn pass_stamp(&self, _list: &ID3D12GraphicsCommandList, _slot: Option<usize>, _k: usize) {}
-
-    fn pass_read(&self, _slot: Option<usize>) {}
-}
 mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
@@ -5372,7 +5359,7 @@ impl Host {
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
                     if let Some(own) = &own {
-                        own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
+                        own.record(self, list, &dirty, stamps, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, _)) = shadow.card_sides() else {
@@ -5528,6 +5515,7 @@ impl Host {
             }
         }
         work.taken = at;
+        crate::echo::pieces(plan.ranges.iter().filter(|r| r.compared).map(|r| (r.shadow.id(), r.span.first, r.span.pieces)));
         if plan.ranges.iter().any(|r| r.compared) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
@@ -11202,8 +11190,8 @@ impl Meter {
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);
-        #[cfg(feature = "diagnostics")]
         spans::line(frames);
+        crate::echo::line(frames);
         crate::shadow::back_line(frames);
         crate::pagedrive::line(frames);
         #[cfg(feature = "diagnostics")]

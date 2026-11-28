@@ -101,6 +101,8 @@ mod switch;
 #[cfg(windows)]
 mod ab;
 #[cfg(windows)]
+mod echo;
+#[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
 mod texture;

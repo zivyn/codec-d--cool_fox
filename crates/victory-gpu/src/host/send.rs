@@ -341,6 +341,7 @@ impl Own {
         host: &Host,
         list: &ID3D12GraphicsCommandList,
         dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)],
+        stamps: Option<usize>,
         looked: impl Fn(&Shadow) -> bool,
     ) {
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -381,6 +382,8 @@ impl Own {
         }
         // SAFETY: the caller's; live objects.
         unsafe {
+            // (`VICTORY_CARD_SPANS=1`: the copies are over, the scatter and the barriers follow.)
+            host.pass_stamp(list, stamps, 5);
             if !first.is_empty() {
                 list.ResourceBarrier(&first);
             }

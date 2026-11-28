@@ -5,6 +5,13 @@
 //! takes to hand a submission to the card and to report it done is in it, 40
 //! times a frame. Here two lists made once, of nothing but a timestamp, stand
 //! around each submission.
+//!
+//! The stamps around our own passes (`pass_slot`) are in every build, not only
+//! the diagnostics one: the runs that measure the card's time are of the release
+//! exe too, and a line that only the other exe prints was never in their logs.
+
+// (Without diagnostics the stamps around submissions and the title's own timestamps are not used.)
+#![cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 
 use std::sync::Mutex;
 
@@ -147,8 +154,9 @@ impl Host {
 
 /// Slots of stamps for the passes of plans ([`Host::pass_slot`]) before one is used again.
 const PASS_SLOTS: usize = 4096;
-/// Stamps of a slot: the sync list's begin, after its sends, its end; the compare list's begin and end.
-const PASS_STAMPS: usize = 5;
+/// Stamps of a slot: the sync list's begin, after its sends, after its hash passes; the compare list's begin and end;
+/// and (with our own sends) after the copies of the sends, before their scatter and barriers.
+const PASS_STAMPS: usize = 6;
 
 /// The stamps of our own passes for copies in the card's memory
 /// (`VICTORY_CARD_SPANS=1`): what the card spends on the sends up (copies and
@@ -161,9 +169,9 @@ struct Passes {
     data: usize,
     ticks_per_ms: f64,
     next: usize,
-    /// Ticks of sends, hashes, compares, and the lists counted for each.
-    ticks: [u64; 3],
-    count: [u64; 3],
+    /// Ticks of sends, hashes, compares, the copies of the sends alone, and the lists counted for each.
+    ticks: [u64; 4],
+    count: [u64; 4],
 }
 
 // SAFETY: free-threaded objects and a mapping only read behind a lock.
@@ -231,7 +239,10 @@ impl Host {
             let at = (passes.data as *const u64).add(slot * PASS_STAMPS);
             std::array::from_fn(|i| at.add(i).read_volatile())
         };
-        for (i, ticks) in [between(s[0], s[1]), between(s[1], s[2]), between(s[3], s[4])].into_iter().enumerate() {
+        for (i, ticks) in [between(s[0], s[1]), between(s[1], s[2]), between(s[3], s[4]), between(s[0], s[5])]
+            .into_iter()
+            .enumerate()
+        {
             if let Some(ticks) = ticks {
                 passes.ticks[i] += ticks;
                 passes.count[i] += 1;
@@ -260,8 +271,8 @@ impl Host {
                 data: data as usize,
                 ticks_per_ms: self.queue.GetTimestampFrequency()? as f64 / 1000.0,
                 next: 0,
-                ticks: [0; 3],
-                count: [0; 3],
+                ticks: [0; 4],
+                count: [0; 4],
             })
         }
     }
@@ -322,15 +333,17 @@ pub(super) fn line(frames: f64) {
             let ms = |i: usize| p.ticks[i] as f64 / p.ticks_per_ms / frames;
             let n = |i: usize| p.count[i] as f64 / frames;
             tracing::info!(
-                "our passes on the card per frame (VICTORY_CARD_SPANS=1, by its stamps): sends up (copies and the scatter of changed words) {:.2} ms in {:.1} lists, hash passes {:.2} ms in {:.1} lists, compare passes {:.2} ms in {:.1} lists",
+                "our passes on the card per frame (VICTORY_CARD_SPANS=1, by its stamps): sends up (copies and the scatter of changed words) {:.2} ms in {:.1} lists (the copies alone {:.2} ms in {:.1}), hash passes {:.2} ms in {:.1} lists, compare passes {:.2} ms in {:.1} lists",
                 ms(0),
                 n(0),
+                ms(3),
+                n(3),
                 ms(1),
                 n(1),
                 ms(2),
                 n(2)
             );
-            (p.ticks, p.count) = ([0; 3], [0; 3]);
+            (p.ticks, p.count) = ([0; 4], [0; 4]);
         }
     }
     let mut made = SPANS_MADE.lock().unwrap_or_else(|e| e.into_inner());

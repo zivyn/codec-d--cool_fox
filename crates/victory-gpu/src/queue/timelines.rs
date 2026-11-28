@@ -458,9 +458,10 @@ pub(super) fn line(frames: f64) {
     let s = with(|m| std::mem::take(&mut m.stats));
     let f = |n: u64| n as f64 / frames;
     tracing::info!(
-        "the title's queues as two timelines per frame (VICTORY_ASYNC_COMPUTE, one host queue): {:.1} submissions on the graphics lane, {:.1} on the compute lane; \
+        "the title's queues as two timelines per frame (VICTORY_ASYNC_COMPUTE, {}): {:.1} submissions on the graphics lane, {:.1} on the compute lane; \
          compute waits for graphics {:.1} times, graphics waits for compute {:.1} times, {:.1} waits met by the lane's own order, {:.1} for a signal given before \
          anything ran, {:.1} not resolved; host waits made {:.1}, left out {:.1}",
+        if crate::host::lanes::lists_compute() { "two host queues" } else { "one host queue" },
         f(s.runs[0]),
         f(s.runs[1]),
         f(s.cross[1]),

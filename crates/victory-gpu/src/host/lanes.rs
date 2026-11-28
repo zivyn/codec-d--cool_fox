@@ -981,7 +981,11 @@ mod model_tests {
     fn host_sends(
         dice: &mut Dice,
         submissions: usize,
-    ) -> ([Vec<Cmd>; 3], Vec<(usize, Footprint, Vec<usize>, usize)>) {
+        flip: bool,
+    ) -> (
+        [Vec<Cmd>; 3],
+        Vec<(usize, Footprint, Vec<usize>, usize, bool)>,
+    ) {
         let mut queues: [Vec<Cmd>; 3] = [Vec::new(), Vec::new(), Vec::new()];
         let mut book = Book::default();
         let mut sent = Vec::new();
@@ -1012,14 +1016,16 @@ mod model_tests {
                 // Which submission was number n of that lane?
                 if let Some(at) =
                     sent.iter()
-                        .position(|s: &(usize, Footprint, Vec<usize>, usize)| {
+                        .position(|s: &(usize, Footprint, Vec<usize>, usize, bool)| {
                             s.3 == (1 - title) * 1_000_000 + n as usize
                         })
                 {
                     must.push(at);
                 }
             }
-            let want = book.waits_for(target, title, &deps, &f, [0, 0], false);
+            // The switch flips now and then: this submission keeps to one order, or does not.
+            let serial = flip && dice.next(3) == 0;
+            let want = book.waits_for(target, title, &deps, &f, [0, 0], serial);
             assert!(
                 want <= book.signalled[1 - target],
                 "a wait for what was never queued"
@@ -1034,7 +1040,13 @@ mod model_tests {
             queues[2].push(Cmd::Signal(2, value));
             book.sent(target, title, value, f.clone());
             book.planned(title, numbers[title]);
-            sent.push((target, f, must, title * 1_000_000 + numbers[title] as usize));
+            sent.push((
+                target,
+                f,
+                must,
+                title * 1_000_000 + numbers[title] as usize,
+                serial,
+            ));
         }
         (queues, sent)
     }
@@ -1043,7 +1055,7 @@ mod model_tests {
     fn whatever_the_title_waits_for_the_queues_never_stand_for_each_other() {
         let mut dice = Dice(0x1234_5678_9abc_def1);
         for round in 0..400 {
-            let (queues, _) = host_sends(&mut dice, 5 + (round % 40));
+            let (queues, _) = host_sends(&mut dice, 5 + (round % 40), round % 2 == 1);
             for _ in 0..3 {
                 assert!(
                     matches!(run(&queues, &mut dice), Ended::Done(_)),
@@ -1076,9 +1088,10 @@ mod model_tests {
     #[test]
     fn conflicting_work_runs_in_order_and_the_hosts_fence_goes_up_by_one_thing() {
         let mut dice = Dice(0x0dd_ba11_f00d);
-        for round in 0..400 {
+        for round in 0..600 {
             let n = 5 + (round % 50);
-            let (queues, sent) = host_sends(&mut dice, n);
+            // (Every other round the switch flips between the overlap and one order along the way.)
+            let (queues, sent) = host_sends(&mut dice, n, round % 2 == 1);
             for _ in 0..4 {
                 let Ended::Done(log) = run(&queues, &mut dice) else {
                     panic!("round {round} stalled");
@@ -1104,8 +1117,8 @@ mod model_tests {
                             (&sent[i].0, &sent[i].1, &sent[i].2, sent[i].3 / 1_000_000);
                         let (qj, fj, _, tj) =
                             (&sent[j].0, &sent[j].1, &sent[j].2, sent[j].3 / 1_000_000);
-                        // The same queue is in order by itself.
-                        if qi != qj && (fi.conflicts(fj) || (ti == tj)) {
+                        // The same queue is in order by itself; in one order, everything before is.
+                        if qi != qj && (fi.conflicts(fj) || (ti == tj) || sent[j].4) {
                             assert!(place(i) < place(j), "round {round}: {i} before {j}");
                         }
                     }

@@ -3,7 +3,7 @@
 The census of 2026-11-28: every `VICTORY_*` variable the code reads (547 names, 40 of them only in tests or comments), with the default the code gives it
 when it is unset, whether it changes the translation of shaders (and so is in the shader cache key), whether
 `VICTORY_AB` can flip it inside one running process, and what it is for. It was made by reading the place where each is
-read, on `integ/validation-22` (`b181327a4`), and the few differences of `integ/validation-23` are marked. The defaults in the "What is on" table below are those of `integ/validation-28`, the main candidate, and are unchanged in `integ/validation-29` (the fix for the white-out is the one default that changed after `integ/validation-24`; every switch added from `integ/validation-25` to `-29` is off, and `VICTORY_AMBIENT_GAIN` defaults to 1, which changes nothing). The other
+read, on `integ/validation-22` (`b181327a4`), and the few differences of `integ/validation-23` are marked. The defaults in the "What is on" table below are those of `integ/validation-28`, the main candidate, and are unchanged in `integ/validation-29` (the fix for the white-out is the one default that changed after `integ/validation-24`; every switch added from `integ/validation-25` to `-29` is off, except `VICTORY_LAND_AHEAD` of `integ/validation-29`, which is on and bit-exact with the old loop (`=0` restores it); `VICTORY_AMBIENT_GAIN` defaults to 1, which changes nothing). The other
 documents say more about some of them: [README-fxceless.md](README-fxceless.md) (commands and the debugging table),
 [ab-switches.md](ab-switches.md) (the A/B inside one process, and why each live switch may change at any instant).
 
@@ -196,6 +196,7 @@ switch is read.
 | `VICTORY_JOIN_WAITS` | off | yes | Takes along a part behind a wait met in a way not seen before. |
 | `VICTORY_JOIN_WIDE_MB` | off | yes | Joins parts whose upload fills read up to this many MiB; 0 refuses such parts. |
 | `VICTORY_KEEP_SHOWN` | 1 | no | When a slot gets a view of another texture: 0 show nothing, 1 keep a similar one, 2 any same-dimension one. |
+| `VICTORY_LAND_AHEAD` | on (=0 turns off) | yes | The landing merge asks for its bytes ahead (the card's, the copy's, title memory: 1 KiB in front, and the head of the next piece); same bytes, fewer stalls. |
 | `VICTORY_LAND_ASIDE` | on (=0 turns off) | yes | Lands a submission's lists aside, on another thread, saving time on the submitting thread. |
 | `VICTORY_LAND_ECHO` | on (=0 turns off) | no | Compares pages 4 KiB at a time and sends up only those that differ from what landed. |
 | `VICTORY_LAND_OWN` | off | yes | Leaves the pieces of shader-written copies that nothing but the title's CPU can read on the card: guarded, landed only when something reads or writes them (integ card propagation, perf/card-propagate). |
@@ -516,6 +517,7 @@ translation of shaders.
 | `VICTORY_KNOWN_HOLES` | on (=0 turns off) | flag |  |  |  | Treats placeholder views as known for what they are, to cut lock waits. |
 | `VICTORY_LAND` | on (=0 turns off) | flag |  |  |  | Lands writes from card back to guest memory in bulk instead of piece by piece. |
 | `VICTORY_LAND_ANYTIME` | on (=0 turns off) | flag |  |  |  | Lands writes through a mapping at any time instead of through the guest address. |
+| `VICTORY_LAND_AHEAD` | on (=0 turns off) | flag |  | live |  | The landing merge asks for its bytes ahead (the card's, the copy's, title memory: 1 KiB in front, and the head of the next piece); same bytes, fewer stalls. |
 | `VICTORY_LAND_ASIDE` | on (=0 turns off) | flag |  | live |  | Lands a submission's lists aside, on another thread, saving time on the submitting thread. |
 | `VICTORY_LAND_BESIDE` | on (=0 turns off) | flag |  |  |  | Writes views of guest pages through one of our own mappings. |
 | `VICTORY_LAND_ECHO` | on (=0 turns off) | flag |  | live |  | Compares pages 4 KiB at a time and sends up only those that differ from what landed. |

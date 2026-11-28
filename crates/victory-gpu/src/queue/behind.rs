@@ -364,6 +364,7 @@ impl<W: Work> Lane<W> {
                 }
                 (state.asked, state.next)
             };
+            crate::sched::lane_sync();
             self.look(limit);
             let mut state = self.lock();
             state.served = state.served.max(asked);
@@ -1046,6 +1047,7 @@ fn started() -> bool {
             crate::cores::keep_on_fast_cores("victory-submit");
             crate::threadcpu::register("submit");
             crate::host::waits::this_is_the_lane();
+            crate::sched::this_is_the_lane();
             OURS.set(true);
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LANE.serve()));
             if ended.is_err() {

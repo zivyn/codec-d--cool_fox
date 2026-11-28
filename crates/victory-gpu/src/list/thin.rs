@@ -349,6 +349,7 @@ fn start() {
                         }
                     }
                 };
+                crate::sched::list_sync();
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recording.run())).is_err() {
                     crate::host::fail(format_args!("a thread that translates lists panicked"));
                 }

@@ -66,6 +66,88 @@ fn wait_patch(what: ConsoleOnly) -> Option<[u8; 3]> {
     }
 }
 
+/// Whether `mwaitx` is left to fault each time it is run and is answered by a wait that gets longer the longer the
+/// loop has been at it (`VICTORY_WAIT_NICE=1`; off by default, and read once: the places already replaced stay so).
+///
+/// Replaced by `pause`, a wait loop of the title's (one thread of it spent 11 s of 30 at the window spot in one
+/// such, 0.4 of a core, 20 % of all the title's processor time, with the other thread of its core slowed down by it)
+/// reads its value as fast as the processor goes. On the console `mwaitx` stops the core until the line is written or
+/// the time given is up; here the loop runs the whole of a wait that may be milliseconds, and takes a processor from the
+/// thread that prepares the frame. Each pass that faults is a few microseconds of ours: the first [`SPIN_PASSES`] only
+/// `pause` (a wait that is soon over costs what it did), the next [`YIELD_PASSES`] give the processor to any thread that
+/// is waiting for one (`SwitchToThread`), after that each pass sleeps a millisecond (`Sleep(1)`: the system's timer is
+/// set to 1 ms): a wait that lasts costs a few hundred microseconds of processor time and not the whole wait, at the
+/// price of up to a millisecond between the write it waits for and its noticing. `monitorx` stays replaced by a no-op.
+fn nice_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_NICE").is_some_and(|v| v == "1"))
+}
+
+/// Passes of a wait loop that only `pause`, then that yield, before each sleeps ([`nice_waits`]).
+const SPIN_PASSES: u32 = 24;
+const YIELD_PASSES: u32 = 24;
+/// A loop that has not come back within this long is a new wait.
+const SAME_WAIT_MS: u64 = 4;
+
+/// What a pass of a wait loop does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Ease {
+    Spin,
+    Yield,
+    Sleep,
+}
+
+/// What pass number `pass` (1 for the first of a wait) does.
+fn ease(pass: u32) -> Ease {
+    if pass <= SPIN_PASSES {
+        Ease::Spin
+    } else if pass <= SPIN_PASSES + YIELD_PASSES {
+        Ease::Yield
+    } else {
+        Ease::Sleep
+    }
+}
+
+/// The pass number of a wait loop that comes back to `rip`, after `before` (the place and pass of the thread's last
+/// one) and `since` ms since it: the next of the same wait, or the first of a new one.
+fn next_pass(before: Option<(usize, u32)>, rip: usize, since_ms: u64) -> u32 {
+    match before {
+        Some((at, pass)) if at == rip && since_ms <= SAME_WAIT_MS => pass.saturating_add(1),
+        _ => 1,
+    }
+}
+
+thread_local! {
+    /// The place, pass and time of this thread's last `mwaitx` that was eased.
+    static WAITING: Cell<Option<(usize, u32, std::time::Instant)>> = const { Cell::new(None) };
+}
+
+/// Passes eased by a yield and by a sleep, since the start.
+static YIELDED: AtomicU64 = AtomicU64::new(0);
+static SLEPT: AtomicU64 = AtomicU64::new(0);
+
+/// One pass of the wait loop at `rip`: as long as it has lasted, so the wait it stands for costs.
+fn eased(rip: usize) {
+    use windows_sys::Win32::System::Threading::{Sleep, SwitchToThread};
+    let now = std::time::Instant::now();
+    let before = WAITING.with(Cell::get);
+    let pass = next_pass(before.map(|b| (b.0, b.1)), rip, before.map_or(u64::MAX, |b| now.duration_since(b.2).as_millis() as u64));
+    WAITING.with(|w| w.set(Some((rip, pass, now))));
+    match ease(pass) {
+        Ease::Spin => std::hint::spin_loop(),
+        Ease::Yield => {
+            YIELDED.fetch_add(1, Relaxed);
+            // SAFETY: a plain call.
+            unsafe { SwitchToThread() };
+        }
+        Ease::Sleep => {
+            SLEPT.fetch_add(1, Relaxed);
+            // SAFETY: a plain call.
+            unsafe { Sleep(1) };
+        }
+    }
+}
+
 /// Whether a `clzero` loop ([`ConsoleOnly::ClzeroLoop`]) is replaced the first time it faults
 /// by a jump to the same loop with plain stores ([`clzero_stub`]). Run cpu-5 (the dorm): 25,000
 /// exceptions a second, 2,100 a frame, at five such loops of one function of the title, for
@@ -291,9 +373,11 @@ mod sites {
         let top: Vec<String> =
             all.iter().take(8).map(|s| format!("{:#x} {} {:.0}", s.1, NAMES[s.2], s.0 as f64 / seconds)).collect();
         tracing::info!(
-            "console CPU instructions that fault, a second: {}; places replaced so far: {}; the busiest places: {}",
+            "console CPU instructions that fault, a second: {}; places replaced so far: {}; passes of waits eased (VICTORY_WAIT_NICE) by a yield {}, by a sleep {}; the busiest places: {}",
             kinds.join(", "),
             PATCHED.load(Relaxed),
+            super::YIELDED.load(Relaxed),
+            super::SLEPT.load(Relaxed),
             top.join(", ")
         );
     }
@@ -408,9 +492,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             }
         }
         ConsoleOnly::Monitorx | ConsoleOnly::Mwaitx => {
+            // `VICTORY_WAIT_NICE`: a `mwaitx` is not replaced, so that each pass is answered by `eased`.
+            let eases = what == ConsoleOnly::Mwaitx && nice_waits();
             // Without a prefix, so 3 bytes: replaced, the next pass does not fault.
             if len == 3
                 && patches_waits()
+                && !eases
                 && let Some(new) = wait_patch(what)
                 // SAFETY: the title's code, where the instruction just faulted; both
                 // replacements are waits that wait for nothing, as the emulation is.
@@ -419,7 +506,11 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 #[cfg(feature = "diagnostics")]
                 sites::patched();
             }
-            std::hint::spin_loop();
+            if eases {
+                eased(rip);
+            } else {
+                std::hint::spin_loop();
+            }
         }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
@@ -538,6 +629,52 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wait loop spins first, then yields, then sleeps; a pass at another place or after a pause is a new wait.
+    #[test]
+    fn a_wait_that_goes_on_is_eased_in_steps_and_a_new_wait_starts_again() {
+        assert_eq!(ease(1), Ease::Spin);
+        assert_eq!(ease(SPIN_PASSES), Ease::Spin);
+        assert_eq!(ease(SPIN_PASSES + 1), Ease::Yield);
+        assert_eq!(ease(SPIN_PASSES + YIELD_PASSES), Ease::Yield);
+        assert_eq!(ease(SPIN_PASSES + YIELD_PASSES + 1), Ease::Sleep);
+        assert_eq!(ease(u32::MAX), Ease::Sleep);
+        // The first pass of a thread, the next of the same place, a sleep's worth of time between them.
+        assert_eq!(next_pass(None, 0x1000, 0), 1);
+        assert_eq!(next_pass(Some((0x1000, 1)), 0x1000, 0), 2);
+        assert_eq!(next_pass(Some((0x1000, 60)), 0x1000, SAME_WAIT_MS), 61);
+        // Another place, or longer than a sleep and a bit since: a new wait.
+        assert_eq!(next_pass(Some((0x1000, 60)), 0x2000, 0), 1);
+        assert_eq!(next_pass(Some((0x1000, 60)), 0x1000, SAME_WAIT_MS + 1), 1);
+        // The count does not wrap.
+        assert_eq!(next_pass(Some((7, u32::MAX)), 7, 0), u32::MAX);
+    }
+
+    /// A thread that runs a wait loop through `eased` spends little processor time once the loop has gone on for a while,
+    /// and the wait it stands for still ends (the loop looks again after each pass).
+    #[test]
+    fn a_long_wait_costs_a_few_passes_of_processor_time_and_not_the_whole_wait() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                let begun = std::time::Instant::now();
+                let mut passes = 0u32;
+                while !flag.load(std::sync::atomic::Ordering::Acquire) {
+                    eased(0x4242);
+                    passes += 1;
+                }
+                (begun.elapsed(), passes)
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        let (took, passes) = waiter.join().unwrap();
+        assert!(took >= std::time::Duration::from_millis(300), "{took:?}");
+        // A spinning loop makes millions of passes in 300 ms; this one slept from its 49th on, a pass a millisecond or two.
+        assert!(passes < 2_000, "{passes} passes");
+        assert!(passes > SPIN_PASSES + YIELD_PASSES, "{passes} passes");
+    }
 
     #[test]
     fn wait_instructions_are_replaced_inside_sixteen_aligned_bytes() {

@@ -51,7 +51,45 @@ Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and
 mesh shader support. The first run builds shader pipelines and stutters;
 `victory warm --used` makes them ahead.
 
-## Where it stands (2026-11-27)
+## Since the last `main` (integrations #14 to #18, 2026-11-27 and 28)
+
+This is `integ/validation-18` (`build-integ-validation-18`), checked on the same PC. What it adds to the
+list below, in the order it matters:
+
+- **Ray tracing passes are on by default** (`VICTORY_ACTIVATE_RAYS`, `VICTORY_RT_RESOLVE`, `=0` turns each off). With
+  them the poster in the cell is the console's pale score again in every run, where the default build showed it
+  purple. The ray programs that shade hits make the first warm-up longer (about 2,700 pipelines, 23 minutes on the
+  test PC with `victory warm`). The rare white screen was not settled by it: it did not show in the runs made, which
+  are too few to say it is gone.
+- **The loop fixes are on by default** (`VICTORY_KEEP_LOOP_SKIPS`, `VICTORY_HALF_EXIT`, `=0` turns each off): a wave with
+  no lane left skips its loop as the console does, and the two host waves of a console wave leave a loop of exchanges
+  together. On the RTX the defragmentation pass's loop cut went from 7.78 ms to under 0.5 ms, an alias copy from 19.1
+  to 1.9 ms and all GPU commands from 166.7 to 140.2 ms (instrumented), with no errors and the same picture. The
+  translated programs change, so the shader cache is made again on the first run. `VICTORY_LOCAL_EXIT` (aimed at the
+  blocky hair) stays off until its fix is validated. Also: `FullAdaptive` now validates (2,680 of 2,682 compute programs).
+- **The launcher's settings are code defaults** (`crates/victory-gpu/src/defaults.rs`): `Play-VIctory.cmd` only sets
+  the cache and the log. Rule of this fork: the best known setting is the default, a switch is for comparing, and
+  the winner of a comparison becomes the default in the next integration.
+- **A/B inside one process** (`VICTORY_AB=<seconds>,<switch>[=<value>]`, `docs/ab-switches.md`): the run alternates a
+  switch between phases and reports the difference with its interval (`bin/bench1-ab.py`, `VICTORY_AB_SHOTS=N` saves
+  a picture of both arms). Many switches can be flipped live; the ones that change the translation cannot, and are
+  compared between processes (the table at the end of that file lists the ones now on).
+- **New switches, all off** (each described in `docs/ab-switches.md` and `docs/README-fxceless.md`): the lean and
+  one-pass looks at a submission's steps, closed idle lists, asides for the write watch and the snapshots
+  (`VICTORY_LEAN_STEPS`, `ONE_PASS`, `CLOSED_IDLE`, `LAND_ASIDE`, `ASK_ASIDE`, `ASK_MERGE`, `SNAP_ASIDE`), the copy
+  queue for sends (`SEND_COPYQ`), folded indirect draws (`INDIRECT_FOLD`), the card's touched-copies queue
+  (`LEAN_CARD`), guard stripes (`GUARD_SHARDS`), early drop of discarded dispatches (`DROP_EARLY`), pipeline boost
+  (`PIPELINE_BOOST`, `PIPELINE_WAIT_ADAPT`), real occlusion (`REAL_OCCLUSION`), the frame-rate target
+  (`TARGET_FPS`, rewrites the title's settings file with a backup), key files for navigation runs, RAM switches
+  (`HEAP_SPARSE`, `RAM_LEAN`) and the counters that go with them.
+- **The upstream sync of 2026-11-27** is in. Every change to the translator is checked against the whole shader
+  corpus (on the Linux build) for regressions before it is merged.
+
+Not in `main` yet, because they are waiting for a run in the game (`integ/validation-19`, all off): the guided page
+refresh, the precise write footprints, view indexing for folded draws, the first stage of asynchronous compute and
+the fix for `VICTORY_LOCAL_EXIT`.
+
+## Where it stands (2026-11-27, before these)
 
 Measured on `integ/validation-3` to `-10`, in the prologue cell, one PC with an 8 GB
 RTX 4060. A frame took about 410 ms at the start of the day; it now takes
@@ -114,7 +152,7 @@ download have all of this):
 
 ## Known wrong
 
-- Hair is blocky in some frames, intermittently.
+- Hair is blocky in some frames, intermittently (`VICTORY_LOCAL_EXIT` is the fix in progress; off by default).
 - Colours band on some machines, and glass is grainy in some runs with a warm cache;
   being investigated.
 - Bright rooms show an orange fog.

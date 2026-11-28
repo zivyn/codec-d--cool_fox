@@ -196,7 +196,7 @@ pub(crate) fn declare(
 ) {
     let (look, narrow) = (look(), narrow());
     if !look && !narrow {
-        shadow.gpu_writes(list, address, len);
+        shadow.shader_writes(list, address, len);
         return;
     }
     declare_as(list, shadow, address, len, target, (look, narrow));
@@ -238,16 +238,16 @@ fn declare_as(
         match ranges {
             Some(ranges) => {
                 for (from, to) in ranges {
-                    shadow.gpu_writes(list, address + from, to - from);
+                    shadow.shader_writes(list, address + from, to - from);
                 }
             }
-            None => shadow.gpu_writes(list, address, len),
+            None => shadow.shader_writes(list, address, len),
         }
         return;
     }
     // Looking: the list declares what it always did, and keeps the precise ranges beside it.
     SKIP.set(true);
-    shadow.gpu_writes(list, address, len);
+    shadow.shader_writes(list, address, len);
     SKIP.set(false);
     let mut deferred = list.deferred();
     deferred.precise.on = true;

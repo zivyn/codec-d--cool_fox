@@ -3602,6 +3602,11 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // Pages noted as GPU-read-only in it are the title's no more (the whole allocation when `len` is 0).
+    if crate::shadow::gpu_readonly_after(at) {
+        let len = if len != 0 { len } else { allocation_end(at, at).saturating_sub(at) };
+        crate::shadow::title_memory_gpu_writable(at, len);
+    }
     // What shaders wrote there and is owed lands now, while it is the title's
     // memory: after the free it may be another allocation's.
     if crate::land::owed::active() {

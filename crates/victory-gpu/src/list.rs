@@ -1990,6 +1990,25 @@ fn count_draws(n: u64) {
     DRAWS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The stream of `this` says `n` executions come that may be made one
+/// ([`thin`], `crate::draw::fold`).
+#[cfg(windows)]
+fn fold_begin(this: This, n: u32) {
+    with_state(this, |_, s| s.fold_begin(n));
+}
+
+/// The run the stream planned is over: made, if one is open.
+#[cfg(windows)]
+fn fold_end(this: This) {
+    with_state(this, |list, s| s.fold_end(list));
+}
+
+#[cfg(not(windows))]
+fn fold_begin(_: This, _: u32) {}
+
+#[cfg(not(windows))]
+fn fold_end(_: This) {}
+
 /// The line of the executions with one record ([`thin::runs_line`]).
 pub(crate) fn runs_line(frames: f64) {
     thin::runs_line(frames);

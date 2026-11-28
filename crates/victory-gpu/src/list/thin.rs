@@ -731,6 +731,62 @@ fn look_on() -> bool {
     *ON.get_or_init(|| runs_on() || std::env::var_os("VICTORY_INDIRECT_LOOK").is_some_and(|v| v == "1"))
 }
 
+/// Whether runs of executions that differ in the root arguments of their
+/// stages are made one execution (`VICTORY_INDIRECT_FOLD=1`; off by
+/// default; `crate::draw::fold`). Read once per stream: a stream plans and
+/// makes its runs alone, and leaves the host list as the executions one by
+/// one would, so streams translated with the switch on and off can follow
+/// each other on one list.
+fn fold_on() -> bool {
+    crate::ab::live_flag!("VICTORY_INDIRECT_FOLD")
+}
+
+/// The most executions of a run made one.
+const FOLD_MOST: u32 = 64;
+
+/// The executions that may be one run, from the one with `signature` that was
+/// just taken (`at` is the next op): how many there are (that one included),
+/// and where the stream goes on after the last. What may lie between them is
+/// only what sets roots the title sets for each object (tables, constants,
+/// views), uploads, and the pipeline the list already has (`pipeline`, asked
+/// if one is set): nothing that the host list is told of on its own. The
+/// executions are the ones of one record without a count of one signature.
+fn fold_run(stream: &[u64], mut at: usize, signature: u64, pipeline: &dyn Fn() -> u64) -> (u32, usize) {
+    let (mut n, mut end) = (1u32, at);
+    while at < stream.len() && n < FOLD_MOST {
+        let (op, len) = (stream[at] & 0xffff, (stream[at] >> 16) as usize);
+        let Some(w) = stream.get(at + 1..at + 1 + len) else {
+            break;
+        };
+        at += 1 + len;
+        if op == Plain::EXECUTE_INDIRECT as u64 {
+            if single(w).is_some_and(|(s, ..)| s == signature) {
+                n += 1;
+                end = at;
+                continue;
+            }
+            break;
+        }
+        let roots = [
+            Plain::COMPUTE_TABLE as u64,
+            Plain::GRAPHICS_TABLE as u64,
+            Plain::COMPUTE_CONSTANT as u64,
+            Plain::GRAPHICS_CONSTANT as u64,
+            Plain::COMPUTE_VIEW as u64,
+            Plain::GRAPHICS_VIEW as u64,
+        ];
+        let between = op == UPLOAD
+            || op == COMPUTE_CONSTANTS
+            || op == GRAPHICS_CONSTANTS
+            || roots.contains(&op)
+            || (op == Plain::SET_PIPELINE as u64 && w.first().is_some_and(|&p| p == pipeline()));
+        if !between {
+            break;
+        }
+    }
+    (n, end)
+}
+
 /// Since the last line: executions with one record and no count; each that
 /// is the next record of the one before (same signature and arguments); of
 /// those, with nothing between; runs made one and the executions that saved.
@@ -754,6 +810,8 @@ const NAMES: [&str; 47] = [
 
 /// The line of what the executions come to, per frame.
 pub(crate) fn runs_line(frames: f64) {
+    #[cfg(windows)]
+    crate::draw::fold::line(frames);
     let r: Vec<u64> = RUNS.iter().map(|r| r.swap(0, Relaxed)).collect();
     let between = held(&BETWEEN).take();
     let d: Vec<u64> = DROPS.iter().map(|d| d.swap(0, Relaxed)).collect();
@@ -949,6 +1007,8 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
     let mut last: Option<(u64, u64, u64)> = None;
     let mut between: Vec<u8> = Vec::new();
     let mut since = 0u32;
+    // Where the run of executions made one ends (`crate::draw::fold`), 0: none.
+    let mut fold_until = 0usize;
     let name_upload = |w: &[u64]| {
         // SAFETY: made by `allocate_upload`, named once.
         let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
@@ -957,6 +1017,10 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         held(uploads).push(block);
     };
     while i < stream.len() {
+        if fold_until != 0 && i >= fold_until {
+            super::fold_end(list);
+            fold_until = 0;
+        }
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
@@ -1025,6 +1089,22 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             }
             between.clear();
             since = 0;
+            // The executions after this one that may be one with it.
+            if fold_until == 0
+                && !skip
+                && dead.is_empty()
+                && !runs_on()
+                && let Some((signature, ..)) = first
+                && fold_on()
+            {
+                // SAFETY: a list of ours that no thread but this one records into.
+                let pipeline = || held(unsafe { &(*list.cast::<List>()).state }).pipeline_handle();
+                let (n, end) = fold_run(stream, i, signature, &pipeline);
+                if n >= 2 {
+                    super::fold_begin(list, n);
+                    fold_until = end;
+                }
+            }
         } else {
             since += 1;
             if look_on() && between.len() < 8 {
@@ -1110,6 +1190,9 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             }
             _ => {}
         }
+    }
+    if fold_until != 0 {
+        super::fold_end(list);
     }
     (calls, closed)
 }
@@ -1276,6 +1359,56 @@ mod tests {
         // Nothing after it, and an op cut short.
         assert_eq!(run_of(&[], 0, (7, 9, 0x100), 16, |_| ()), (1, 0));
         assert_eq!(run_of(&[EXECUTE | 6 << 16, 7], 0, (7, 9, 0x100), 16, |_| ()), (1, 0));
+    }
+
+    /// A fold is the executions of one signature with only what the title sets for each object between them (roots, uploads, the
+    /// pipeline the list has): anything else, another signature, a count or more records ends it, and it is never longer than the
+    /// most a run holds.
+    #[test]
+    fn a_fold_is_the_executions_with_only_roots_between() {
+        let call = |signature: u64, max: u64, count: u64| [signature, max, 9, 0x40, count, 0];
+        let pipeline = || 5u64;
+        let mut stream = Vec::new();
+        put(&mut stream, Plain::GRAPHICS_CONSTANT as u64, &[3, 7, 0]);
+        put(&mut stream, GRAPHICS_CONSTANTS, &[3, 2, 1]);
+        put(&mut stream, UPLOAD, &[1]);
+        put(&mut stream, EXECUTE, &call(7, 1, 0));
+        put(&mut stream, Plain::GRAPHICS_TABLE as u64, &[1, 0x100]);
+        put(&mut stream, Plain::COMPUTE_VIEW as u64, &[2, 0x200]);
+        put(&mut stream, Plain::SET_PIPELINE as u64, &[5]);
+        put(&mut stream, EXECUTE, &call(7, 1, 0));
+        let upto = stream.len();
+        put(&mut stream, Plain::GRAPHICS_VIEW as u64, &[2, 0x200]);
+        put(&mut stream, Plain::COMPUTE_CONSTANT as u64, &[1, 2, 0]);
+        // (What follows the last execution is not part of the run.)
+        assert_eq!(fold_run(&stream, 0, 7, &pipeline), (3, upto));
+        // Each thing that ends it, right after the execution that was taken.
+        for (what, op, words) in [
+            ("a draw", Plain::DRAW as u64, vec![3, 1, 0, 0]),
+            ("another pipeline", Plain::SET_PIPELINE as u64, vec![6]),
+            ("a barrier", BARRIER, vec![1, 0]),
+            ("targets", TARGETS, vec![1, 1, 0, 0]),
+            ("another signature", EXECUTE, call(8, 1, 0).to_vec()),
+            ("a count", EXECUTE, call(7, 1, 3).to_vec()),
+            ("more records", EXECUTE, call(7, 2, 0).to_vec()),
+        ] {
+            let mut stream = Vec::new();
+            put(&mut stream, op, &words);
+            put(&mut stream, EXECUTE, &call(7, 1, 0));
+            assert_eq!(fold_run(&stream, 0, 7, &pipeline), (1, 0), "{what}");
+        }
+        // Nothing after it, an op cut short, and the most.
+        assert_eq!(fold_run(&[], 0, 7, &pipeline), (1, 0));
+        assert_eq!(fold_run(&[EXECUTE | 6 << 16, 7], 0, 7, &pipeline), (1, 0));
+        let mut long = Vec::new();
+        for _ in 0..FOLD_MOST + 10 {
+            put(&mut long, EXECUTE, &call(7, 1, 0));
+        }
+        let (n, end) = fold_run(&long, 0, 7, &pipeline);
+        assert_eq!(n, FOLD_MOST);
+        assert_eq!(end, (FOLD_MOST as usize - 1) * 7);
+        #[cfg(windows)]
+        assert_eq!(FOLD_MOST, crate::draw::fold::MOST);
     }
 
     /// Which calls are executions of one record without a count.

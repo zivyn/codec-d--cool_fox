@@ -23,6 +23,12 @@ pub(crate) const JOBS: u32 = 256;
 pub(crate) const TABLE: u64 = 16 + 16 * JOBS as u64;
 /// The bytes of a clamped record's place in the scratch buffer.
 pub(crate) const SLOT: u32 = 32;
+/// Where the root arguments of folded executions are in the table's memory
+/// (`VICTORY_INDIRECT_FOLD`): after the jobs, [`SLOT`] bytes per job, the
+/// words the job puts in front of its record in its place.
+pub(crate) const PREFIXES: u64 = TABLE;
+/// The bytes of the table with those: what is asked of upload memory.
+pub(crate) const MEMORY: u64 = TABLE + JOBS as u64 * SLOT as u64;
 /// The source buffers a pass can read.
 pub(crate) const SOURCES: usize = 4;
 /// The most executions charged by one job: the most a record costs (2^26)
@@ -37,11 +43,14 @@ ByteAddressBuffer src2 : register(t2);
 ByteAddressBuffer src3 : register(t3);
 // The count, 12 bytes of nothing, then per job: source (bits 0-1), kind
 // (4-7), words (8-11) and the executions that read it (16-31); the
-// record's offset in the source; its place in the scratch buffer; nothing.
+// record's offset in the source; its place in the scratch buffer; the
+// words (0-15) put in front of the record there, from `PREFIXES`.
 ByteAddressBuffer jobs : register(t4);
 RWByteAddressBuffer dst_args : register(u0);
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// Where a folded job's words are (`PREFIXES`), 32 bytes a job.
+static const uint PREFIXES = 4112;
 static const uint GROUPS = 1u << 20;
 groupshared uint costs[64];
 groupshared uint fits[64];
@@ -173,8 +182,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             record[2] = 0;
         }
     }
+    // A folded execution's command: the root arguments it sets, then the record.
+    uint prefix = job.w & 15u;
+    for (uint p = 0; p < prefix; p++) {
+        dst_args.Store(job.z + p * 4, jobs.Load(PREFIXES + id.x * 32 + p * 4));
+    }
     for (uint s = 0; s < words; s++) {
-        dst_args.Store(job.z + s * 4, record[s]);
+        dst_args.Store(job.z + prefix * 4 + s * 4, record[s]);
     }
 }
 "#;
@@ -254,6 +268,70 @@ impl Table {
             table.write_volatile(i + 1);
         }
         Some(place(i))
+    }
+
+    /// As [`Table::place`], for a record that executions folded into one
+    /// read (`VICTORY_INDIRECT_FOLD`): always a job of its own, charged for
+    /// that one execution, which no other execution shares: the place holds
+    /// root arguments in front of the record once the run is made
+    /// ([`fold_words`]), so only the run's own command reads it. The places
+    /// of a run lie one [`SLOT`] after the other when nothing else added a
+    /// job between them.
+    pub(crate) fn place_unique(&mut self, id: u64, offset: u64, kind: u32) -> Option<u64> {
+        let source = self.sources.iter().position(|&s| s == id)? as u32;
+        let offset = u32::try_from(offset).ok().filter(|o| o.is_multiple_of(4))?;
+        offset.checked_add(words(kind)? * 4)?;
+        let i = self.times.len() as u32;
+        if i == JOBS {
+            return None;
+        }
+        self.times.push(1);
+        let table = self.at as *mut u32;
+        // SAFETY: inside the table: fewer than [`JOBS`] jobs before it.
+        unsafe {
+            let to = table.add(4 + 4 * i as usize);
+            to.write_volatile(job(source, kind, 1));
+            to.add(1).write_volatile(offset);
+            to.add(2).write_volatile(self.base + i * SLOT);
+            to.add(3).write_volatile(0);
+            table.write_volatile(i + 1);
+        }
+        Some(u64::from(self.base + i * SLOT))
+    }
+
+    /// How many more jobs fit.
+    pub(crate) fn room(&self) -> u32 {
+        JOBS - self.times.len() as u32
+    }
+
+    /// Where the table is in upload memory and the place of its first
+    /// record, for [`fold_words`].
+    pub(crate) fn memory(&self) -> (usize, u32) {
+        (self.at, self.base)
+    }
+}
+
+/// Puts `words` in front of the record of the job whose place is `at` in the
+/// scratch buffer of the table at `memory` whose first place is `base`: the
+/// pass stores them there before the record, which follows them
+/// ([`SOURCE`]), as the root arguments of the command a run of executions
+/// became. `memory` is [`Table::memory`].
+///
+/// # Safety
+/// The table is live and the pass has not run: it is mapped upload memory
+/// of [`MEMORY`] bytes, and `at` is the place of a job it holds
+/// ([`Table::place_unique`]); `words` are at most `SLOT / 4` less the
+/// words of the record.
+pub(crate) unsafe fn fold_words(memory: usize, base: u32, at: u64, words: &[u32]) {
+    let i = ((at - u64::from(base)) / u64::from(SLOT)) as usize;
+    let table = memory as *mut u32;
+    // SAFETY: the caller's: the job and its 32 bytes of words are in the memory.
+    unsafe {
+        table.add(4 + 4 * i + 3).write_volatile(words.len() as u32);
+        let to = table.add(PREFIXES as usize / 4 + i * (SLOT as usize / 4));
+        for (w, &word) in words.iter().enumerate() {
+            to.add(w).write_volatile(word);
+        }
     }
 }
 

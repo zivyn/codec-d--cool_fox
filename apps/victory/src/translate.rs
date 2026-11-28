@@ -1111,6 +1111,50 @@ fn foot_tally(p: &NativeProgram) {
         foot_flush(local);
         return;
     };
+    // Review check: every store-like instruction of the decoded code must show in the footprint
+    // (an entry, or the unbounded / by-address / images-unknown flag).
+    {
+        use victory_shader::gfx10::{Encoding, decode};
+        let (mut buf, mut img, mut flat) = (0usize, 0usize, 0usize);
+        if let Ok(code) = decode(&p.code) {
+            for i in &code {
+                let n = i.name().unwrap_or("");
+                let st = n.contains("store") || n.contains("atomic");
+                match i.encoding {
+                    Encoding::Mubuf | Encoding::Mtbuf if st => buf += 1,
+                    Encoding::Mimg if st => img += 1,
+                    Encoding::Flat | Encoding::Global if st && !n.contains("scratch") => flat += 1,
+                    _ => {}
+                }
+            }
+        }
+        let fnv = p.code.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+        let mut bad = |what: &str| {
+            add(&format!("VIOLATION {what}"), 1);
+            eprintln!("FOOT-VIOLATION {what} code={fnv:016x} len={} stage={:?}", p.code.len(), p.stage);
+        };
+        if buf > 0 && f.stores.is_empty() && !f.unbounded {
+            bad("buffer store sites but no entry and not unbounded");
+        }
+        if buf > 0 && !f.unbounded && f.stores.len() < buf {
+            bad("fewer store entries than store sites");
+        }
+        if img > 0 && f.image_writes.is_empty() && !f.images_unknown {
+            bad("image store sites but no image write and not unknown");
+        }
+        if flat > 0 && !f.by_address && !f.unbounded {
+            bad("flat/global store sites but not by_address");
+        }
+        if buf > 0 {
+            add("programs with buffer store sites", 1);
+        }
+        if img > 0 {
+            add("programs with image store sites", 1);
+        }
+        if flat > 0 {
+            add("programs with flat/global store sites", 1);
+        }
+    }
     for (flag, name) in [
         (f.unbounded, "programs with an unbounded store"),
         (f.by_address, "programs with stores by address"),

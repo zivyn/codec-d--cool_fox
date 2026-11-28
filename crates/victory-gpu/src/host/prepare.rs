@@ -395,8 +395,10 @@ impl Host {
         // everything stage A did of it (`VICTORY_STAGE_A_STEPS`): its asking, its
         // refreshes and its steps, which are not done again.
         let staged = if late {
-            prefetch::join();
+            // (The thread of stage A first: what it offered to the thread of the refreshes, beside its steps
+            // [`relax::deep`], is offered while it works, and is there to be waited for after it is done.)
             front::join();
+            prefetch::join();
             front::take(runs, parts)
         } else {
             None

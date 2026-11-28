@@ -209,6 +209,16 @@ pub(super) fn prefold() -> Option<(u64, Vec<usize>, Vec<usize>)> {
     LANE.prefold()
 }
 
+/// While our thread does an entry and [`prefold`] named the first of the line: the host lists of the entry after it of
+/// the same queue, if that is a submission whose lists are known (`VICTORY_STAGE_A_DEEP`), for the refreshes of its
+/// copies to begin while the first of the line is prepared. It is not taken along or marked: it stays as it is.
+pub(super) fn deeper() -> Option<Vec<usize>> {
+    if !DOING.get() {
+        return None;
+    }
+    LANE.deeper()
+}
+
 /// Tests: stage A's question answers yes.
 #[cfg(test)]
 static FORCE_STAGE_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -456,6 +466,23 @@ impl<W: Work> Lane<W> {
         let found = entry.what.peek().map(|lists| (entry.number, lists, entry.what.parts()));
         self.lock().items.push_front(entry);
         found
+    }
+
+    /// While the entry being done is, and the first of the line is the one [`Lane::prefold`] named (a submission of the
+    /// same queue, marked `prepared`): what the next entry of that queue after it is, as the addresses of its host lists
+    /// in the order they run, if it is a submission whose lists are known. Nothing is taken or marked.
+    pub(super) fn deeper(&self) -> Option<Vec<usize>> {
+        let state = self.lock();
+        let queue = state.running?;
+        let first = state.items.front()?;
+        if first.queue != queue || !first.prepared {
+            return None;
+        }
+        let next = state.items.iter().skip(1).find(|e| e.queue == queue)?;
+        if next.what.folded() || !next.what.runs() {
+            return None;
+        }
+        next.what.peek()
     }
 
     /// Does one entry: the oldest that is the first of its queue and free to
@@ -1521,6 +1548,42 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), ["a+b".to_string(), "c".to_string()]);
         let state = lane.lock();
         assert_eq!((state.runs, state.items.len()), (0, 0), "the counts come out even");
+    }
+
+    /// While one entry is done and the first of the line is named, the entry after it of the same queue is named too if it
+    /// is a submission whose lists are known: from another queue, a wait or a present it is not; nothing is taken or marked.
+    #[test]
+    fn the_entry_after_the_first_of_the_line_is_named_and_nothing_is_taken() {
+        let lane = Lane::new();
+        let log: Log = Default::default();
+        lane.push(1, [T::Peek("a", log.clone()), T::Peek("bb", log.clone()), T::Run("plain", log.clone())]);
+        lane.push(2, [T::Peek("cc", log.clone())]);
+        // Nothing is being done: nothing is named.
+        assert!(lane.deeper().is_none());
+        lane.lock().running = Some(1);
+        // The first of the line is not the one named yet (not prefolded).
+        assert!(lane.deeper().is_none());
+        let (_, lists, _) = lane.prefold().expect("a submission of the queue being done is first");
+        assert_eq!(lists, vec![1, b'a' as usize]);
+        // `bb` is the next of queue 1 (queue 2's `cc` does not count), and asking again changes nothing.
+        let bb = Some(vec![2usize, b'b' as usize]);
+        assert_eq!(lane.deeper(), bb);
+        assert_eq!(lane.deeper(), bb);
+        {
+            let state = lane.lock();
+            assert_eq!(state.items.len(), 4, "nothing was taken");
+            assert!(state.items[0].prepared && !state.items[1].prepared, "only the first of the line is marked");
+        }
+        // The entry after the first is a wait: not a submission, nothing is named.
+        let other = Lane::new();
+        let f = fence();
+        other.push(1, [T::Peek("a", log.clone()), T::Wait(f, 9), T::Peek("c", log.clone())]);
+        other.lock().running = Some(1);
+        other.prefold().expect("first");
+        assert!(other.deeper().is_none());
+        // Another queue running: the first of the line is not its entry.
+        other.lock().running = Some(2);
+        assert!(other.deeper().is_none());
     }
 
     /// A submission takes what follows it in its queue along, up to what it

@@ -292,7 +292,7 @@ impl Summary {
                             },
                         ),
                         &Step::Plane((at, len), _) => summary.note(index, Op::Plane { at, len }),
-                        &Step::Host(_, (from, to)) if from < to => {
+                        &Step::Host(_, (from, to), _) if from < to => {
                             summary.note(index, Op::Host { from, to })
                         }
                         Step::Placed(p) => summary.note(
@@ -831,7 +831,7 @@ mod tests {
                         3 => Step::Fill(base, base + 8, 4, None),
                         4 => Step::Run(Box::new(|| {})),
                         5 => Step::Plane((base + 8, 1 + dice.below(64)), Box::new(|| {})),
-                        6 => Step::Host(Box::new(|| {}), (base + 16, base + 16 + dice.below(40))),
+                        6 => Step::Host(Box::new(|| {}), (base + 16, base + 16 + dice.below(40)), relax::Kind::RectVertices),
                         _ => Step::Refresh(copies[at].clone(), from, len),
                     });
                 }

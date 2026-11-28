@@ -1157,7 +1157,7 @@ pub(crate) fn ready(
                 }
                 m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
             }
-            list.defer_host(move || {
+            list.defer_host(crate::host::relax::Kind::MemoryLanded, move || {
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
                     m.land(at);
                 }

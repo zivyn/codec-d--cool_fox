@@ -549,6 +549,8 @@ struct Lower<'a> {
     /// With the guard: the barriers made so far, and the IR blocks that hold one.
     guard_sites: u32,
     guard_waits: BTreeSet<usize>,
+    /// The IR blocks that hold a barrier that waits for the group (with or without the guard).
+    group_barriers: BTreeSet<usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -2079,6 +2081,7 @@ impl<'a> Lower<'a> {
             guard_wave: None,
             guard_sites: 0,
             guard_waits: BTreeSet::new(),
+            group_barriers: BTreeSet::new(),
         }
     }
 
@@ -9686,6 +9689,7 @@ impl<'a> Lower<'a> {
             return a;
         }
         let a = self.s.m.new_block();
+        self.s.m.mark_abort(a);
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s

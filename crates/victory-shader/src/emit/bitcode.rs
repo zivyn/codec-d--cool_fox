@@ -242,6 +242,9 @@ pub(crate) struct Module {
     /// ([`Module::mark_wait`]).
     paired: std::collections::HashSet<u32>,
     waits: Vec<usize>,
+    /// The blocks a thread stopped by a loop's iteration limit leaves the program through
+    /// ([`Module::mark_abort`]): an error path, not the program's control flow.
+    aborts: Vec<usize>,
 }
 
 impl Module {

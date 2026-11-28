@@ -32,6 +32,9 @@ impl<'a> Lower<'a> {
     /// The group barrier `mode` in `block`: the hardware's, or with the guard on a barrier of
     /// counters that gives up. Fences stay fences.
     pub(super) fn barrier_op(&mut self, block: usize, mode: u32) {
+        if mode & 1 != 0 {
+            self.group_barriers.insert(self.cur_ir);
+        }
         if mode & 1 != 0
             && self.guard.is_some()
             && block != self.s.entry
@@ -168,13 +171,45 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Whether loop `h` sits in another loop (the rpo of `h` is inside the other's, whose back
+    /// edge comes from after `h`'s own).
+    fn loop_in_loop(&self, h: usize) -> bool {
+        let latch = |l: usize| {
+            self.x.p.blocks[l]
+                .preds
+                .iter()
+                .filter(|&&q| self.block[q].is_some() && self.rpo[q] >= self.rpo[l])
+                .map(|&q| self.rpo[q])
+                .max()
+        };
+        let Some(mine) = latch(h) else { return false };
+        self.counters
+            .keys()
+            .any(|&g| g != h && self.rpo[g] < self.rpo[h] && latch(g).is_some_and(|theirs| theirs >= mine))
+    }
+
+    /// Whether a barrier that waits for the group was made in loop `h` (so far).
+    fn loop_has_group_barrier(&self, h: usize) -> bool {
+        self.group_barriers.iter().any(|&b| {
+            self.rpo[h] <= self.rpo[b]
+                && self.x.p.blocks[h].preds.iter().any(|&q| self.block[q].is_some() && self.rpo[q] >= self.rpo[b])
+        })
+    }
+
     /// The limit of loop `h` with the guard: a loop with a barrier in it goes round at most the
-    /// guard's number of times.
+    /// guard's number of times. And, in the audited kept skips' form, a loop with a barrier that
+    /// waits for the group in another loop goes round at most [`hang::nested_loop_limit`] times
+    /// (the threads of the group: a retry loop needs a round for each thread at the very most).
     pub(super) fn guard_loop_limit(&self, h: usize, limit: u32) -> u32 {
-        match self.guard {
+        let limit = match self.guard {
             Some(g) if self.loop_has_wait(h) => limit.min(g.cfg.loops),
             _ => limit,
+        };
+        if hang::nested_loops_bounded() && self.loop_has_group_barrier(h) && self.loop_in_loop(h) {
+            let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
+            return limit.min(hang::nested_loop_limit(group));
         }
+        limit
     }
 
     /// With the guard: a note, from every lane, that loop `h` reached its bound (`next` iterations

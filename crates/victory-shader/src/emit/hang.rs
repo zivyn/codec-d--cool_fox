@@ -62,6 +62,9 @@ impl Guard {
 
 /// The guard in force (`None`: the translation is what it was).
 pub(super) fn guard() -> Option<Guard> {
+    if GUARD_OFF.get() {
+        return None;
+    }
     #[cfg(test)]
     if let Some(g) = TEST_GUARD.get() {
         return g;
@@ -93,7 +96,27 @@ pub fn say(note: u32) -> (u32, u32, u32) {
     (note >> 24 & 7, note >> 4 & 0x000F_FFFF, note & 15)
 }
 
+/// How many times a loop that holds a group barrier and sits in another loop that holds one goes
+/// round in the audited kept skips' form (`VICTORY_KEPT_SKIPS_WIDE=audited`), at most. Such an
+/// inner loop is a retry (the lanes that failed a compare-and-swap go again, each round at least
+/// one lane succeeds, so a console wave needs 64 rounds at the very most); a loop that ran to its
+/// default limit in each round of another that does costs the square of the limit in barriers (a
+/// loop of 4096 in a loop of 4096 is 16.7 million of them: seconds, a reset of the device).
+pub const NESTED_LOOP_LIMIT: u32 = 64;
+
+/// [`NESTED_LOOP_LIMIT`] for a group of `threads`: a retry loop needs a round for each thread of
+/// the group at the very most, so a bigger group gets a bigger bound.
+pub fn nested_loop_limit(threads: u32) -> u32 {
+    threads.max(NESTED_LOOP_LIMIT)
+}
+
 thread_local! {
+    /// Whether this thread lowers as if the guard were off: the audit looks at the program's own
+    /// barriers, not at the counters the guard makes of them ([`audit_without_the_guard`]).
+    static GUARD_OFF: Cell<bool> = const { Cell::new(false) };
+    /// Whether the modules this thread lowers bound their nested loops that hold a group barrier
+    /// ([`NESTED_LOOP_LIMIT`]): set while the audited kept skips' form is made.
+    static NESTED_BOUND: Cell<bool> = const { Cell::new(false) };
     /// Whether the modules this thread finishes are audited (the kept skips' form is being tried).
     static WANT: Cell<bool> = const { Cell::new(false) };
     /// The audit of the last module this thread finished with barriers in it.
@@ -134,6 +157,23 @@ pub(super) fn audit_from_now_on() {
     LAST.take();
 }
 
+/// Lowers as if the guard were off (or as it is) from now on: the audit of a form that has the
+/// guard's counters in place of its barriers would be of the counters' waits.
+pub(super) fn audit_without_the_guard(off: bool) {
+    GUARD_OFF.set(off);
+}
+
+/// Bounds the nested loops with a group barrier of the programs this thread lowers from now on
+/// (or stops doing so).
+pub(super) fn bound_nested_loops(on: bool) {
+    NESTED_BOUND.set(on);
+}
+
+/// Whether [`bound_nested_loops`] is in force.
+pub(super) fn nested_loops_bounded() -> bool {
+    NESTED_BOUND.get()
+}
+
 pub(super) fn stop_auditing() {
     WANT.set(false);
 }
@@ -151,7 +191,9 @@ pub(super) fn finished(m: &super::bitcode::Module, tag: u32) {
         return;
     }
     let audit = m.audit_barriers();
-    if audit.barriers == 0 {
+    // (the waits of the two host waves of a console wave are audited too: a module with only those
+    // can still hang a half that waits for a half that went another way)
+    if audit.barriers == 0 && audit.waits == 0 {
         LAST.take();
         return;
     }

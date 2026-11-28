@@ -1807,31 +1807,11 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
-    /// What draws and dispatches share: heaps, our root signature, the
-    /// pipeline, and per stage the user data, root views and the
-    /// descriptors its tables hold.
-    /// False if the draw or dispatch must not run: a root SRV it reads
-    /// could not be given a view.
-    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+    /// The title's heaps, as the host's, are the list's: bound if the list
+    /// has others (or none yet), with the root arguments forgotten then (a
+    /// root signature with directly indexed heaps must be set after them).
+    fn bind_heaps(&mut self, list: &HostList) {
         let l = &list.list;
-        // Textures picked by index, before anything asks for them.
-        self.early_textures(list, p, compute);
-        if crate::host::walls_trace() {
-            self.walls_census(p, compute);
-        }
-        // A list without a view heap: one of the title's for the views the
-        // host itself puts into heap slots.
-        if self.heaps[0] == 0
-            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty() || fold::indexes_views(s))
-            && let Some(heap) = crate::descriptor::lent_heap()
-        {
-            once!("a dispatch without a view heap that needs one gets the title's");
-            self.heaps[0] = heap;
-        }
-        // Heaps first: a root signature with directly indexed heaps must be
-        // set after them, with both a view heap and a sampler heap bound.
         if !self.host_heaps_set || self.host_heaps != self.heaps {
             let mut view_heap: Option<ID3D12DescriptorHeap> = None;
             let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
@@ -1872,6 +1852,113 @@ impl State {
             self.host_roots = [0; 2];
             self.forget_roots();
         }
+    }
+
+    /// `ClearUnorderedAccessViewUint` or `...Float` (`float`): the view the
+    /// title made at `handle` (a descriptor of its own memory: the CPU
+    /// handle it gave, whose slot the GPU handle's descriptor is a copy of)
+    /// cleared to `values` on the host, through a dynamic slot of the bound
+    /// view heap that the list holds until it is reset, and a CPU-only copy
+    /// of the same view ([`crate::host::Host::cpu_view`]).
+    ///
+    /// A texture or a buffer is made readable and written as a dispatch's
+    /// unordered access makes it ([`readable`]): a buffer is cleared in its
+    /// host copy and goes back to title memory with what shaders wrote.
+    /// shortcut: a view that is not an unordered access view, or is of a
+    /// structured buffer, is left out (the host refuses such a clear); the
+    /// title clears those with its own words on the console.
+    pub(crate) fn clear_unordered(
+        &mut self,
+        list: &HostList,
+        handle: u64,
+        values: [u32; 4],
+        float: bool,
+        rects: &[windows::Win32::Foundation::RECT],
+    ) {
+        let Some(view) = crate::descriptor::view(handle) else {
+            once!("an unordered access clear of a slot without a view");
+            return;
+        };
+        if !crate::descriptor::host::is_clearable_uav(&view) {
+            once!("an unordered access clear of a non-UAV or structured buffer view");
+            return;
+        }
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This));
+        let (Some(heap), Some(host)) = (heap, crate::host::host()) else {
+            once!("an unordered access clear without a bound view heap");
+            return;
+        };
+        let Some(visible) = heap.host() else { return };
+        let Some(slot) = visible.dynamic(1).or_else(|| {
+            crate::host::settle_for_fence();
+            visible.dynamic(1)
+        }) else {
+            once!("an unordered access clear without a free dynamic slot");
+            return;
+        };
+        self.dynamic.push((std::ptr::from_ref(heap) as usize, slot, 1));
+        visible.make_at(slot, &view);
+        let at = host.cpu_view();
+        let Some(resource) = crate::descriptor::host::make_view(&view, at) else {
+            once!("an unordered access clear of a view the host cannot make");
+            return;
+        };
+        readable(list, ResourceType::Uav, &view, None);
+        self.bind_heaps(list);
+        list.keep(&resource);
+        let gpu = visible.gpu_handle(slot);
+        // SAFETY: an open list; both slots view the live resource, one in
+        // the bound heap and one CPU-only.
+        unsafe {
+            if float {
+                let values = values.map(f32::from_bits);
+                list.list.ClearUnorderedAccessViewFloat(gpu, at, &resource, &values, rects);
+            } else {
+                list.list.ClearUnorderedAccessViewUint(gpu, at, &resource, &values, rects);
+            }
+        }
+        // The first ones are said with what they clear (what the title clears is not known
+        // otherwise), then each power of two of them.
+        static MADE: AtomicU64 = AtomicU64::new(0);
+        let made = MADE.fetch_add(1, Ordering::Relaxed) + 1;
+        if made <= 8 || made.is_power_of_two() {
+            tracing::info!(
+                made,
+                float,
+                rects = rects.len(),
+                values = ?values,
+                ?view,
+                "an unordered access view cleared on the host (VICTORY_CLEAR_UAV=0: not)"
+            );
+        }
+    }
+
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
+    /// What draws and dispatches share: heaps, our root signature, the
+    /// pipeline, and per stage the user data, root views and the
+    /// descriptors its tables hold.
+    /// False if the draw or dispatch must not run: a root SRV it reads
+    /// could not be given a view.
+    pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let l = &list.list;
+        // Textures picked by index, before anything asks for them.
+        self.early_textures(list, p, compute);
+        if crate::host::walls_trace() {
+            self.walls_census(p, compute);
+        }
+        // A list without a view heap: one of the title's for the views the
+        // host itself puts into heap slots.
+        if self.heaps[0] == 0
+            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty() || fold::indexes_views(s))
+            && let Some(heap) = crate::descriptor::lent_heap()
+        {
+            once!("a dispatch without a view heap that needs one gets the title's");
+            self.heaps[0] = heap;
+        }
+        // Heaps first: a root signature with directly indexed heaps must be
+        // set after them, with both a view heap and a sampler heap bound.
+        self.bind_heaps(list);
         // The depth target a draw only tests, for the views of it that the
         // draw's shaders read (`readable`).
         let tested = if !compute && self.depth_state == DEPTH_READ {
@@ -5640,5 +5727,149 @@ mod state_filter_tests {
         state.ia_shadow = IaShadow::default();
         assert!(state.index_changed(&index));
         TEST_STATE_FILTER.store(u8::MAX, Ordering::Relaxed);
+    }
+
+    /// A 4x4 title texture of `format` with unordered access, in title memory at `address`.
+    fn uav_texture_at(address: u64, format: u32) -> This {
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 4, 1 | 1 << 16, format, 1, 0, 0, 4, 0];
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let mut out = std::ptr::null();
+        let made = crate::resource::create_at_address(
+            std::ptr::null(),
+            address,
+            words.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(made, crate::object::S_OK);
+        out
+    }
+
+    /// A shader-visible view heap of `count` descriptors of the title's.
+    fn view_heap(count: u32) -> (This, &'static crate::descriptor::Heap) {
+        let desc: [u32; 8] = [0, count, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let mut heap = std::ptr::null();
+        let made = crate::descriptor::create_heap(std::ptr::null(), desc.as_ptr().cast(), &iid, &mut heap);
+        assert_eq!(made, crate::object::S_OK);
+        (heap, crate::descriptor::heap(heap))
+    }
+
+    /// Title memory for a texture, leaked as title memory outlives a test.
+    fn title_memory() -> u64 {
+        let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
+        // SAFETY: a non-zero size.
+        unsafe { std::alloc::alloc_zeroed(layout) as u64 }
+    }
+
+    /// What the title's clears of unordered access views come to on the host: the texels of a texture
+    /// are the values (as integers or as floats), a rectangle leaves the rest, and the views that
+    /// cannot be cleared (not unordered access, no view at all) record nothing and take no slot.
+    #[test]
+    fn a_clear_of_an_unordered_access_view_clears_the_texture_on_the_host() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_UINT};
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let null = std::ptr::null();
+        let (heap_object, heap) = view_heap(8);
+        let handle = |i: u32| heap.handle(i).expect("a slot of the heap");
+        let uint = uav_texture_at(title_memory(), DXGI_FORMAT_R32_UINT.0 as u32);
+        let float = uav_texture_at(title_memory(), DXGI_FORMAT_R32_FLOAT.0 as u32);
+        crate::descriptor::create_uav(null, uint, null, std::ptr::null(), handle(0));
+        crate::descriptor::create_uav(null, float, null, std::ptr::null(), handle(1));
+        // Slot 2 is a shader view, slot 3 nothing.
+        crate::descriptor::create_srv(null, uint, std::ptr::null(), handle(2));
+
+        // What cannot be cleared: no view recorded, no slot taken.
+        {
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap_object]);
+            state.clear_unordered(&list, handle(3), [1, 2, 3, 4], false, &[]);
+            state.clear_unordered(&list, handle(2), [1, 2, 3, 4], true, &[]);
+            assert!(state.dynamic.is_empty(), "a clear that cannot be made takes no dynamic slot");
+            // SAFETY: an open list with nothing recorded in it.
+            assert!(unsafe { list.list.Close() }.is_ok());
+        }
+
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap_object]);
+        // The whole texture: 42, and one slot kept until the list is reset.
+        state.clear_unordered(&list, handle(0), [42, 7, 7, 7], false, &[]);
+        assert_eq!(state.dynamic.len(), 1);
+        // A float texture: 1.5, only in the left half (two columns of the four).
+        let left = windows::Win32::Foundation::RECT { left: 0, top: 0, right: 2, bottom: 4 };
+        state.clear_unordered(&list, handle(1), [1.5f32.to_bits(), 0, 0, 0], true, &[left]);
+        assert_eq!(state.dynamic.len(), 2);
+        let (uint_texture, float_texture) = (
+            crate::resource::host_resource(uint).expect("a host texture"),
+            crate::resource::host_resource(float).expect("a host texture"),
+        );
+        let back = host.read_back_buffer(2048).expect("a read-back buffer");
+        // SAFETY: an open list; the clears left both textures in the unordered access state; a read-back buffer
+        // of 2048 bytes holds two 4x4 footprints of 256-byte rows at 0 and 1024.
+        unsafe {
+            for (i, (texture, format)) in
+                [(uint_texture, DXGI_FORMAT_R32_UINT), (float_texture, DXGI_FORMAT_R32_FLOAT)].into_iter().enumerate()
+            {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 1024 * i as u64,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: format,
+                                Width: 4,
+                                Height: 4,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+        let mut data = std::ptr::null_mut();
+        // SAFETY: a mapped read-back buffer the list that has run wrote; 2048 bytes.
+        let words = unsafe {
+            back.Map(0, None, Some(&mut data)).expect("a mapping");
+            let words = std::slice::from_raw_parts(data.cast::<u32>(), 512).to_vec();
+            back.Unmap(0, None);
+            words
+        };
+        let texel = |texture: usize, x: usize, y: usize| words[texture * 256 + y * 64 + x];
+        for (x, y) in [(0, 0), (3, 0), (0, 3), (3, 3), (2, 1)] {
+            assert_eq!(texel(0, x, y), 42, "the whole integer texture at ({x}, {y})");
+        }
+        for y in 0..4 {
+            for x in 0..4 {
+                if x < 2 {
+                    assert_eq!(texel(1, x, y), 1.5f32.to_bits(), "the float texture inside the rectangle, at ({x}, {y})");
+                } else {
+                    assert_ne!(texel(1, x, y), 1.5f32.to_bits(), "the float texture outside it, at ({x}, {y})");
+                }
+            }
+        }
     }
 }

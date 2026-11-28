@@ -1519,6 +1519,86 @@ extern "system" fn clear_rtv(
     let _ = (this, handle, color, count, rects);
 }
 
+/// `ClearUnorderedAccessViewUint(GPU handle, CPU handle, resource, values,
+/// rectangle count, rectangles)`: slot 0x1a8 of the console's list (the title's
+/// upscaler clears its own surfaces with it, as the PC's index 49 of the
+/// interface, four slots on).
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, view_handle(gpu, cpu), false, values, count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat`, slot 0x1b0: the same with four floats.
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, view_handle(gpu, cpu), true, values, count, rects);
+}
+
+/// Which of the two handles of a clear names the view: the CPU one, where the
+/// title made it, else the GPU one (the slot of the bound heap it was copied
+/// to); the CPU one if neither does.
+pub(super) fn view_handle(gpu: u64, cpu: u64) -> u64 {
+    if crate::descriptor::record_at(cpu).is_none() && crate::descriptor::record_at(gpu).is_some() {
+        gpu
+    } else {
+        cpu
+    }
+}
+
+/// Whether the clears of unordered access views are done
+/// (`VICTORY_CLEAR_UAV=0`: not, as before: the host's views were then left
+/// as the host made them).
+#[cfg(windows)]
+pub(super) fn clear_uav_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLEAR_UAV").is_none_or(|v| v != "0"))
+}
+
+/// The clear of the view at `handle` to `values` (floats as their bits when
+/// `float`), on the list, with its rectangles.
+pub(super) fn clear_uav(
+    this: This,
+    handle: u64,
+    float: bool,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    #[cfg(windows)]
+    {
+        if !clear_uav_on() {
+            return;
+        }
+        // SAFETY: the title passes four values (null is tolerated).
+        let Some(&values) = (unsafe { values.as_ref() }) else {
+            return;
+        };
+        let rects: &[windows::Win32::Foundation::RECT] = if count > 0 && !rects.is_null() {
+            // SAFETY: the title passes `count` rectangles, laid out as the host's.
+            unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+        } else {
+            &[]
+        };
+        with_state(this, |list, state| state.clear_unordered(list, handle, values, float, rects));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, handle, float, values, count, rects);
+}
+
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
 /// flags: 1 depth, 2 stencil.
 extern "system" fn clear_dsv(
@@ -2569,10 +2649,12 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 11] = [
     (28, query_begin as *const ()),            // 0xe0 BeginQuery
     (29, query_end as *const ()),              // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
+    (53, clear_uav_uint as *const ()),         // 0x1a8
+    (54, clear_uav_float as *const ()),        // 0x1b0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310
     (99, driver_hint as *const ()),            // 0x318
@@ -2680,6 +2762,28 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// The console's clears of unordered access views (0x1a8, 0x1b0) are in the table of every layout of list.
+    #[test]
+    fn the_clears_of_unordered_access_views_are_in_the_tables() {
+        for table in [&LIST_FUNCTIONS, &NEWER_LIST_FUNCTIONS] {
+            assert_eq!(table.0[53], clear_uav_uint as *const ());
+            assert_eq!(table.0[54], clear_uav_float as *const ());
+        }
+    }
+
+    /// A clear names its view by the CPU handle (where the title made it), else by the GPU handle
+    /// (a copy in the bound heap), and by the CPU handle if neither does.
+    #[test]
+    fn a_clear_finds_its_view_by_either_handle() {
+        let tag = u32::from_le_bytes(*b"vVIE");
+        let (view, empty) = ([tag, 1, 1], [0u32; 3]);
+        let (view_at, empty_at) = (view.as_ptr() as u64, empty.as_ptr() as u64);
+        assert_eq!(view_handle(empty_at, view_at), view_at);
+        assert_eq!(view_handle(view_at, empty_at), view_at);
+        assert_eq!(view_handle(0, empty_at), empty_at);
+        assert_eq!(view_handle(0, 0), 0);
     }
 
     /// An offset near `u64::MAX` must not overflow and write outside the

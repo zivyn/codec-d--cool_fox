@@ -45,23 +45,106 @@ executable, so `victory.exe run <game> --console series-s --execute` with no
 `crates/victory-gpu/src/defaults.rs`. A variable you set wins over them and `=0` turns
 one off (`VICTORY_THIN=0`; `VICTORY_JOIN_PARTS=1` and `VICTORY_MAP_THREADS=1` take a
 number; `VICTORY_AMBIENT=0` and `VICTORY_AMBIENT_AIR=0` leave the title's own light).
-Other `VICTORY_*` variables are for comparing and for diagnostics. Without `VICTORY_CACHE_DIR` the cache goes to
+Other switches that won their comparison are on in the code without an entry in that file (the ray-tracing pair, the
+loop fixes, the seven switches of the submit thread's lane, `VICTORY_CLEAR_UAV` and more), and the rest of the
+`VICTORY_*` variables are for comparing and for diagnostics: [docs/switches.md](docs/switches.md) lists every one with its
+default. Without `VICTORY_CACHE_DIR` the cache goes to
 `%LOCALAPPDATA%\VIctory\cache-pareto`, and it grows large. Requirements:
 Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6 and
-mesh shader support. The first run builds shader pipelines and stutters;
-`victory warm --used` makes them ahead.
+mesh shader support. The first run builds shader pipelines and stutters (a first launch on an empty cache took about
+21 minutes to reach the world); `victory warm --used` makes them ahead.
 
-## Where it stands (2026-11-27)
+## Where it stands (2026-11-28)
 
-Measured on `integ/validation-3` to `-10`, in the prologue cell, one PC with an 8 GB
-RTX 4060. A frame took about 410 ms at the start of the day; it now takes
-88-91 ms looking at the window (about 11 frames a second), with the card
+This describes `integ/validation-23`, which is what the next `main` takes. Its parts were checked in the game in builds
+of integrations #16 to #21, on one PC with an 8 GB RTX 4060, in the prologue cell; #22 and #23 add the cold-start and
+asynchronous-compute switches (off), the fixes that came out of the review of the parts nobody had read (some of them
+only with the asynchronous queue on), the NaN tools and the split of `host.rs` and `lower.rs` into submodules (moves
+of code; the shader-corpus check of the split had not reported when this was written). They had not been run in the
+game as a whole either.
+
+A frame takes about 100 ms looking at the window (10 frames a second): 101 to 118 ms in the runs of builds #17 to #21,
+against 88 to 94 ms on the last `main`. That difference is the session, not the builds: the older `integ/validation-16`,
+run again in the same session as `integ/validation-18`, took 109 ms like it. The state of a process alone moves a
+frame by about 4 ms (standard deviation, between processes), and the state of a session by 15 to 20 ms, so the
+changes below are compared as arms inside one process (`VICTORY_AB`, [docs/ab-switches.md](docs/ab-switches.md)),
+where a few milliseconds show. The card works about 62 ms of a frame and waits for the CPU the rest (7.7 ms of its
+work are our own passes: sending bytes up, hashing, comparing); the CPU thread that prepares the frame (the lane) is
+the limit, and the whole process keeps about 8.8 of 12 logical processors busy (820 to 850 ms of CPU a frame).
+
+### Since the last `main` (integrations #14 to #23)
+
+Every switch, with its default, whether it changes the shader cache key and whether `VICTORY_AB` can flip it, is in
+[docs/switches.md](docs/switches.md). The rule of this fork: the best measured option is the default and a switch is
+for comparing; the winner of a comparison becomes the default in the next integration.
+
+- **The ray-tracing pair is on** (`VICTORY_ACTIVATE_RAYS`, `VICTORY_RT_RESOLVE`; `=0` turns each off). With it the
+  poster in the cell is the console's pale score in every run; with it off the poster is purple, on the PC and on a
+  cloud GPU. It costs about 10 ms a frame on the RTX 4060 (101.7 ms with it off and 111.7 ms with it on in two and
+  three processes of one session) and makes the first warm-up longer (about 2,700 pipelines). It is kept on because
+  the picture is wrong without it, not because it fixes the white-out: that was seen with it on (below).
+- **The loop fixes are on** (`VICTORY_KEEP_LOOP_SKIPS`, `VICTORY_HALF_EXIT`): the two host waves of a console wave leave
+  a loop of exchanges together, and a wave with no lane left skips its loop as the console does. With the wave-wide
+  form of the kept skips the defragmentation pass's loop cut went from 7.78 ms to under 0.5 ms, an alias copy from
+  19.1 to 1.9 ms and all GPU commands from 166.7 to 140.2 ms (instrumented), with no error and the same picture.
+  That form (`VICTORY_KEPT_SKIPS_WIDE`) is **off** because of the load-time hangs below, so with the defaults no program
+  leaves the exact form it had without the two switches (checked against the whole shader corpus: 0 regressions), and
+  the 7.8 ms stay until a subset proven safe is found. `VICTORY_LOCAL_EXIT`, the fix aimed at the blocky hair, now
+  passes its test on the RTX (64 of 64 lanes store, 40 of 64 without it); it stays off because the hair is no better
+  with it. The shader cache key now holds every switch the translator reads (a test guards it), so the cache is made
+  again on the first run. `FullAdaptive` now validates (2,680 of 2,682 compute programs).
+- **The seven switches of the submit thread's lane are on** (`VICTORY_LEAN_STEPS`, `CLOSED_IDLE`, `LAND_ASIDE`,
+  `LEAN_CARD`, `SNAP_ASIDE`, `ASK_ASIDE`, `ASK_MERGE`): all seven against none in one process gave -4.1 +-0.9 and
+  -3.8 +-0.9 ms a frame in two processes (95 % interval), with no stale byte in 211 checked lines. Less than their
+  estimates added up: the CPU is saturated, so moving work to other threads costs CPU.
+- **Correctness fixes, on:** the upscaler's `ClearUnorderedAccessView` calls are implemented (they were "not
+  implemented" in 186 of 212 runs; it did not stop the white-out); textures in the XOR tile modes are uploaded and
+  read back (the water; the console's pipe and packer counts are an estimate, `VICTORY_XOR_UPLOAD=0` and
+  `VICTORY_XOR_READBACK=0` turn them off); views past the host's title slots live in dynamic slots
+  (`VICTORY_TITLE_TAIL`; the 1,000,000-view limit is the driver's, and no view was created past it); the page-write
+  guards, merges, landings and the feeding of copies of the new parts were reviewed in three rounds, and the cases
+  found (a lost write, a stale byte, forms that moved from exact to approximate) are fixed; the last round found
+  nothing that blocks this build.
+- **Services and saves.** Saves already worked (a profile, settings and the autosave of the start of the prologue are
+  written under the data folder); the save calls (initialize, quota, delete, submit) that answered `E_NOTIMPL` are served;
+  text entry, the pad's trigger rumble and speech (silent, with the right duration) have stand-ins. A later save and
+  `Continue`/`Load` have not been tried.
+- **Audio.** The Opus decoder ignores the pitch of the process command (a wrong note, not a crackle):
+  `VICTORY_OPUS_PITCH=1` applies it (off until compared with a capture); the reverb stand-in has A/B switches.
+- **The upscaler's `DeserializeComputePipelineStateX` is implemented**; the 29 programs translate to the same DXIL by
+  both paths, so nothing is expected to change (`VICTORY_PRECOMPILED`, off).
+- **Cold start.** A first launch with an empty cache took 21 minutes from the launch to the world (the warm of an
+  integration took 29 minutes on the PC and 23 minutes on a cloud GPU). 61 % of a cold start is one frame of about 175
+  large compute programs made one at a time; `VICTORY_PIPELINE_AHEAD` and `VICTORY_PIPELINE_WIDE` (off) queue them ahead
+  and add workers, with an estimate of 7 to 9 minutes that has not been measured. The children of `victory warm` now read
+  the pipeline library, which should bring a warm to a few minutes (not measured). Copying the cache folder of one
+  integration into the next and running `victory warm` is safe (pipelines are keyed by DXIL, root signature and state;
+  translations by the translator's sources and settings).
+- **In-process A/B.** `VICTORY_AB=<seconds>,<switch>` flips a switch between phases of one run and reports the
+  difference with its interval; `VICTORY_AB_SHOTS=N` saves a picture of each arm. A census of the CPU time of every
+  thread of the process is logged every 5 s; the diagnostics build also has a scan of buffers for NaN and infinities
+  (`VICTORY_BUFFER_NAN`) and a file that skips passes while the title runs (`VICTORY_LIVE_FILE`).
+- **New and off, waiting for a measurement or a validation:** the guided page refresh (`VICTORY_PAGE_REFRESH`), one-pass
+  looks at a submission's steps (`ONE_PASS`), the precise write footprints and barriers (`PRECISE_*`, `JOIN_WAITS`),
+  folded indirect draws and views (`INDIRECT_FOLD`, `FOLD_VIEWS` with `VIEW_INDEX`), stage A of the pipeline and its
+  relaxed and deeper forms (`STAGE_A*`), copy-queue sends (`SEND_COPYQ`), a second compute queue
+  (`VICTORY_ASYNC_COMPUTE=2`), thread core and priority switches (`LANE_CORE`, `LANE_HIGH`, `LIST_NICE`, `WAIT_NICE`), the
+  frame-rate target (`TARGET_FPS`), the builder of the ray-tracing structures (`BVH_BUILDER`, `BVH_SIZES`), and the
+  float-mode experiments below.
+
+Every change to the translator is checked against the whole shader corpus (on the Linux build) for regressions before
+it is merged, and an integration is published only after the CI (builds, tests, policy) passes.
+
+### On `main` since 2026-11-27 (integrations #2 to #13)
+
+The list as of 2026-11-27, measured on `integ/validation-3` to `-13`, in the prologue cell, one PC with an 8 GB
+RTX 4060. A frame took about 410 ms at the start of 2026-11-26 and 88-94 ms on `main` then
+(about 11 frames a second, looking at the window), with the card
 working about 55 ms of it (95-113 ms before the card-copy changes, 67 ms before the
 lean pair meetings) and the CPU
 about 770 ms of thread time a frame (940-990 before).
 
-On `main` (integrations #2, #3, #6, #8 and #10 are merged, so `main` and the `build-main`
-download have all of this):
+On `main` before the integrations above (integrations #2, #3, #6, #8, #10 and #13 are merged):
 
 - FSR4's shared working buffer lives in video memory: its passes went from
   about 215 ms to about 24 ms in a microbenchmark, close to free on the card.
@@ -114,15 +197,52 @@ download have all of this):
 
 ## Known wrong
 
-- Hair is blocky in some frames, intermittently.
-- Colours band on some machines, and glass is grainy in some runs with a warm cache;
-  being investigated.
-- Bright rooms show an orange fog.
-- A full-screen white-out was seen about once in a few first runs on a fresh cache;
-  it recovers by itself. A rare defect that predates the multi-wave work; being tracked.
-- The CPU thread that submits the frame is still a large share of the frame.
-- The title caps itself at 30 frames a second; lifting that without breaking
-  physics, animation and cutscenes is the second half of the goal.
+(Fixed since the last list: the grainy glass no longer reproduces: about 100 clean pictures of the window in 123 runs
+since `integ/validation-3`, warm caches included.)
+
+- **Blocky hair, intermittent.** Posterised patches on the top of the hair in some processes; in others the hair is
+  smooth in every picture. The loop fix thought to cause it (`VICTORY_LOCAL_EXIT=1`) was run in two arms on the RTX
+  and did not change it. The cause is not found.
+- **White-out and red bloom.** In some runs a red dot appears on the character's hair, grows to a red glow and then
+  the whole picture goes white about a minute later (5 of 10 runs of the integration 18 family; builds before it
+  showed it now and then too). What is known: the title's temporal anti-aliasing pass ends each output with
+  `v_med3_f32 x,0,65280`, which turns a NaN into black and an infinity into 65280, and the black pixels in the
+  pictures cover exactly the character, so a NaN reaches that pass from the character's own passes (the hair
+  simulation alone is about 700 dispatches a frame; those are the suspects). It happens with the ray-tracing pair on
+  and off, and with `ClearUnorderedAccessView` implemented and not. The tests on the RTX find the comparisons of NaN
+  and infinity exact; the one difference found is the conversion from 32 to 16 bits, which the card truncates where
+  the console rounds to nearest (24 of 144 cases, one step). `VICTORY_F16_NEAREST=2` (also the mixed and packed 16-bit
+  operations) and `VICTORY_F32_FTZ` (the console flushes 32-bit denormals) are being compared in alternating runs; no
+  result yet. Not fixed.
+- **Orange fog in bright rooms** is most likely the empty ray-tracing structure: the title's builder stages are
+  dropped, so every ray misses and the sun and sky are visible from inside the buildings. That is a hypothesis; the
+  indirect-light stand-in (`VICTORY_AMBIENT`) was ruled out as the cause. `VICTORY_BVH_BUILDER=1` runs the real
+  builder, but the picture is still not right with it (the suspect is overlapping dynamic structures whose compacted
+  size the title reads a frame or two before the card writes it; `VICTORY_BVH_SIZES` is the experiment) and it costs
+  about 16 ms of card, 18 ms of lane and 3 GB, so it is off.
+- **Load-time GPU hangs.** Five times in builds of integrations #18 to #21 the card hung (`0x887A0006`) while the
+  title was loading, before the world appeared. All five were in builds that took the kept loop skips in a wave-wide
+  form (the first form on #18 and #19, the safe-classes form on #21); none in about seven starts with that form off.
+  An audit found a group barrier behind a divergent branch in 91 of the 116 programs that take the form; that this
+  hangs NVIDIA is not proven. The form is off by default (`VICTORY_KEPT_SKIPS_WIDE`). A detector that limits barriers
+  and writes a marker instead of hanging is on the branch `fix/hang1` and not in this build.
+- **Colours band on some processes.** The bands are the state of a process: the volume that holds the lighting probes
+  (a grid of 32x16x64 cells) has blocks of zero values past the depth range, which grow with depth in some processes
+  and not in others. The cause is not found; the candidate is the rounding of the 11-bit-float store inside a loop
+  that filters the volume in place (arms with `VICTORY_R11G11B10_AS_F16` and `VICTORY_F16_NEAREST` are queued, with no
+  result yet).
+- **Cold start of about 21 minutes** on an empty cache (above); the measurement of the two switches meant to shorten
+  it is pending.
+- **The ray-tracing pair costs about 10 ms a frame** and is kept for the picture.
+- **Slow and capped.** About 100 ms a frame on this PC, and the CPU thread that submits the frame is still the limit.
+  The estimates for the cuts in progress (not measurements) bring that thread from about 85 ms to 35 to 40 ms, while
+  the card works about 55 to 62 ms, so the card would be next; 60 frames a second needs less work per frame, not only
+  moving it to other threads. The title caps itself at 30 frames a second; lifting that without breaking physics,
+  animation and cutscenes is the second half of the goal.
+- **Not checked or not done:** `Continue`/`Load` after the first autosave; audio (the reverb returns are dry, the Opus
+  pitch is ignored unless asked, 290 to 540 dropouts a file on the cloud runs); the console's tiling for the water
+  read-back uses estimated pipe and packer counts; the title's HDR, speech and screenshot services are stand-ins; 6
+  programs still have a loop cut at its iteration limit; two compute programs still fail validation.
 
 ## Build from source
 
@@ -135,7 +255,7 @@ cargo build --release --locked -p victory
 # with the diag build, to have the pipelines made ahead:
 target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
 target\diag\victory.exe warm --used --compute --now       # the pipelines earlier runs drew with (VICTORY_PIPELINE_BOOK=1 writes
-                                                          # them down) and every compute pipeline of shaders.rpf, into the
+                                                          # them down) and every compute pipeline of the shader archives, into the
                                                           # pipeline library; `warm --verify` asks the library for them
 ```
 
@@ -143,7 +263,7 @@ target\diag\victory.exe warm --used --compute --now       # the pipelines earlie
 `cargo build --profile diag --locked -p victory --features diagnostics`. CI
 builds both and runs the tests on demand
 ([workflow](.github/workflows/build.yml)). Commands and debugging switches:
-[docs/README-fxceless.md](docs/README-fxceless.md). The history of the AMD
+[docs/README-fxceless.md](docs/README-fxceless.md); every switch with its default: [docs/switches.md](docs/switches.md). The history of the AMD
 RX 7900 XTX work is in avatarmanz's README.
 
 ## Credits and license

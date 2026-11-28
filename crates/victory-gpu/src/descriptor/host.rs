@@ -149,6 +149,11 @@ pub(crate) struct HostHeap {
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     sampler: bool,
+    /// A sampler heap's region of the descriptions of the immediate samplers
+    /// (`pipeline::sampler_table`): its first slot and its size (0: none),
+    /// and how many of the registry's descriptions it holds.
+    region: (u32, u32),
+    region_written: Mutex<u32>,
     /// Where the raw twins of the title's slots start
     /// (`victory_shader::emit::raw_views`; 0: there are none), and which of
     /// them are not null.
@@ -1674,9 +1679,19 @@ impl HostHeap {
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        // A sampler heap may end in the region of the immediate samplers' descriptions
+        // (`pipeline::sampler_table`); the title slots it shows are `count` from here on.
+        let (count, region) = if sampler {
+            crate::pipeline::sampler_table::heap_layout(count)
+        } else {
+            (count, 0)
+        };
+        if region != 0 {
+            tracing::info!(count, region, "host sampler heap with the region of the immediate samplers' tables");
+        }
         let (heap, count, size) = if null == 0 {
-            match make(count + extra) {
-                Ok(heap) => (heap, count, count + extra),
+            match make(count + extra + region) {
+                Ok(heap) => (heap, count, count + extra + region),
                 Err(e) => {
                     tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
                     return None;
@@ -1756,6 +1771,8 @@ impl HostHeap {
             count,
             dynamic: extra,
             sampler,
+            region: (count, region),
+            region_written: Mutex::new(0),
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             #[cfg(feature = "diagnostics")]
@@ -3449,6 +3466,27 @@ impl HostHeap {
         D3D12_GPU_DESCRIPTOR_HANDLE {
             ptr: start + u64::from(index) * u64::from(self.step),
         }
+    }
+
+    /// The region of the immediate samplers' descriptions of a sampler heap
+    /// (`pipeline::sampler_table`) with the first `len` descriptions of the
+    /// registry written: the GPU handle of its first slot and the size of a
+    /// slot. None for a heap without the region (or a view heap).
+    pub(crate) fn sampler_table(&self, len: u32) -> Option<(u64, u64)> {
+        let (base, room) = self.region;
+        if !self.sampler || room == 0 || len > room {
+            return None;
+        }
+        let mut written = self.region_written.lock().unwrap_or_else(|e| e.into_inner());
+        if *written < len {
+            let host = host()?;
+            let start = self.cpu + base as usize * self.step as usize;
+            if !crate::pipeline::sampler_table::write(&host.device, start, self.step as usize, *written, len) {
+                return None;
+            }
+            *written = len;
+        }
+        Some((self.gpu_handle(base).ptr, u64::from(self.step)))
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host

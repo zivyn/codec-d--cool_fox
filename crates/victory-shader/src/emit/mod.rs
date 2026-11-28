@@ -151,6 +151,8 @@ mod nan2_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
+mod sampler_table_tests;
+#[cfg(all(test, windows))]
 mod view_index_tests;
 #[cfg(all(test, windows))]
 mod fuse_tests;

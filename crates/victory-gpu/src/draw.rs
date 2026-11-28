@@ -1996,6 +1996,10 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        // The tables of the immediate samplers (`pipeline::sampler_table`), after the root signature.
+        if p.stages.iter().any(|s| !s.sampler_tables.is_empty()) && !self.bind_sampler_tables(list, p, compute) {
+            return false;
+        }
         for stage in &p.stages {
             let t = stage.translated();
             // A program translated for runs of dispatches takes its user data from a table: what is bound for
@@ -2428,6 +2432,48 @@ impl State {
                     list.list.SetComputeRootDescriptorTable(param, handle);
                 } else {
                     list.list.SetGraphicsRootDescriptorTable(param, handle);
+                }
+            }
+        }
+        true
+    }
+
+    /// Binds the tables of the immediate samplers of pipeline `p`
+    /// (`pipeline::sampler_table`): each root parameter of them points at the slot of its sampler's description in the
+    /// region at the end of the sampler heap the list has bound (the title's, else our own). False if that heap has no
+    /// such region: the draw is dropped.
+    fn bind_sampler_tables(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        let len = crate::pipeline::sampler_table::len();
+        let title = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| h.samplers())
+            .and_then(|h| h.host());
+        let region = match title {
+            Some(host) => host.sampler_table(len),
+            None => crate::pipeline::sampler_table::fallback(len),
+        };
+        let Some((start, step)) = region else {
+            once!(
+                "a pipeline with sampler tables is drawn with a sampler heap that has no room for them: the draw is dropped (VICTORY_SAMPLER_TABLE=0: static samplers)"
+            );
+            return false;
+        };
+        for stage in &p.stages {
+            for &(param, slot) in &stage.sampler_tables {
+                let handle = start + u64::from(slot) * step;
+                if self.root_changed(compute, param, 3, handle) {
+                    let at = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle };
+                    // SAFETY: an open list; the slot is in the bound sampler heap.
+                    unsafe {
+                        if compute {
+                            list.list.SetComputeRootDescriptorTable(param, at);
+                        } else {
+                            list.list.SetGraphicsRootDescriptorTable(param, at);
+                        }
+                    }
                 }
             }
         }

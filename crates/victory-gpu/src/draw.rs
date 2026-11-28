@@ -478,6 +478,10 @@ pub(crate) struct State {
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// The view heap slot the last bind put in the user data of each root
+    /// parameter whose SRV is read through the heap
+    /// (`victory_shader::emit::USER_ROOT_VIEW_INDEX`), by root parameter.
+    view_index: Vec<u32>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
@@ -1513,7 +1517,13 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_ROOT_VIEW_INDEX, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
+        if kind == USER_ROOT_VIEW_INDEX {
+            // Made by `bind` (`root_srv_index`) before it reads the dwords of the stage.
+            return self.view_index.get(usize::from(slot)).copied().unwrap_or(0);
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -1749,7 +1759,7 @@ impl State {
         // A list without a view heap: one of the title's for the views the
         // host itself puts into heap slots.
         if self.heaps[0] == 0
-            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty())
+            && p.stages.iter().any(|s| !s.root_uavs.is_empty() || !s.root_srvs.is_empty() || fold::indexes_views(s))
             && let Some(heap) = crate::descriptor::lent_heap()
         {
             once!("a dispatch without a view heap that needs one gets the title's");
@@ -1878,6 +1888,14 @@ impl State {
                 };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
+                        if kind == victory_shader::emit::USER_ROOT_VIEW_INDEX {
+                            // A root SRV read through the view heap: its slot is a dword of the user data.
+                            let Some(index) = self.root_srv_index(list, t, u.slot, compute) else {
+                                return false;
+                            };
+                            values[u.index as usize] = index;
+                            continue;
+                        }
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
                         continue;
@@ -2234,13 +2252,72 @@ impl State {
         compute: bool,
         biased: bool,
     ) -> bool {
+        let Some(index) = self.root_srv_slot(list, address, biased) else {
+            return false;
+        };
+        let heap = match self.heaps[0] {
+            0 => None,
+            h => Some(crate::descriptor::heap(h as This)),
+        };
+        let Some(host) = heap.and_then(|h| h.host()) else {
+            return false;
+        };
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        if self.root_changed(compute, param, 3, handle.ptr) {
+            unsafe {
+                if compute {
+                    list.list.SetComputeRootDescriptorTable(param, handle);
+                } else {
+                    list.list.SetGraphicsRootDescriptorTable(param, handle);
+                }
+            }
+        }
+        true
+    }
+
+    /// For a shader that reads the title's root SRV of root parameter `slot`
+    /// through the view heap (`victory_shader::emit::USER_ROOT_VIEW_INDEX`):
+    /// the heap slot of the one-view slot [`State::root_srv_slot`] makes of
+    /// what the title set there, the number its user data holds. None if no
+    /// slot could be had: the draw is dropped.
+    fn root_srv_index(&mut self, list: &HostList, t: &crate::pipeline::Translated, slot: u8, compute: bool) -> Option<u32> {
+        let address = match self.roots_ref(compute).get(usize::from(slot)) {
+            Some(&Root::View(address)) => Some(address),
+            _ => {
+                // A slot left unset is a null view, as the table was.
+                once!(slot, "a shader reads a root view the title did not set");
+                None
+            }
+        };
+        // The shader adds the bytes a raw view begins early by.
+        let biased = t
+            .host
+            .user_data
+            .iter()
+            .any(|u| u.slot == slot && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS));
+        let index = self.root_srv_slot(list, address, biased)?;
+        if self.view_index.len() <= usize::from(slot) {
+            self.view_index.resize(usize::from(slot) + 1, 0);
+        }
+        self.view_index[usize::from(slot)] = index;
+        Some(index)
+    }
+
+    /// The one-view slot of the view heap that holds the raw view of what
+    /// the title set as a root SRV (`address`): the host copy of its buffer
+    /// from the address to the copy's end, or a null view (no address, no
+    /// host copy, or an address not on 16 bytes); its copy is brought up to
+    /// date. One slot per address per list, given back with the list's
+    /// others. None if no slot could be had or no view heap is bound.
+    fn root_srv_slot(&mut self, list: &HostList, address: Option<u64>, biased: bool) -> Option<u32> {
         let heap = match self.heaps[0] {
             0 => None,
             h => Some(crate::descriptor::heap(h as This)),
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return None;
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -2256,7 +2333,7 @@ impl State {
                     crate::host::settle_for_fence();
                     host.dynamic(1)
                 }) else {
-                    return false;
+                    return None;
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
@@ -2294,18 +2371,7 @@ impl State {
         if let Some((a, s)) = &shadow {
             s.refresh(list, *a, s.left(*a));
         }
-        let handle = host.gpu_handle(index);
-        // SAFETY: an open list; the slot is in the bound view heap.
-        if self.root_changed(compute, param, 3, handle.ptr) {
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootDescriptorTable(param, handle);
-                } else {
-                    list.list.SetGraphicsRootDescriptorTable(param, handle);
-                }
-            }
-        }
-        true
+        Some(index)
     }
 
     /// For a shader that picks buffers from the view heap by an index it
@@ -3575,7 +3641,8 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs) {
+            let slots = stage.root_cbvs.iter().chain(&stage.root_srvs).chain(&stage.root_uavs).map(|v| v.0);
+            for slot in slots.chain(fold::indexed_slots(t)) {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));

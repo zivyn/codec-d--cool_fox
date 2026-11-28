@@ -24,6 +24,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 /// it shares the emitter's state.
 #[path = "intersect.rs"]
 pub(super) mod intersect;
+#[path = "view_index.rs"]
+pub(super) mod view_index;
 
 type Why = &'static str;
 
@@ -8265,28 +8267,6 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// For a root view the host binds as a raw view that may begin before
-    /// the title's address (`shader.rs` `USER_VIEW_BIAS`): the bytes to add
-    /// to offsets through it. Every root UAV (root SRVs keep the views they
-    /// have).
-    fn root_bias(&mut self, param: usize) -> Option<V> {
-        use super::shader::USER_VIEW_BIAS;
-        let rp = *self.x.native.layout.get(param)?;
-        // (Title memory by address where the user-data table is spilled:
-        // [`Lower::root_memory`].)
-        if rp.root != RootType::Descriptor || crate::spill::is_spilled(self.x.native) {
-            return None;
-        }
-        let kind = self
-            .x
-            .native
-            .used
-            .iter()
-            .find(|u| u.user_data == rp.user_data)
-            .map(|u| u.kind);
-        (kind == Some(ResourceType::Uav)).then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
-    }
-
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -8376,9 +8356,7 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
-                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
-                        Ok(self.s.root_srv_handle(rp.slot))
-                    }
+                    (RootType::Descriptor, Some(ResourceType::Srv), 11) => Ok(self.root_srv(rp.slot)),
                     // A root UAV: a raw buffer whether the access reads
                     // (11) or writes (11 with the UAV bit). Indexed
                     // accesses reach here as raw ones at index times the

@@ -178,7 +178,23 @@ pub(super) fn wide_branches(p: &ir::Program) -> Option<Vec<usize>> {
         wide.extend(lp.exits.iter().copied());
         wide.extend(branches_around_exits(p, &first, &index, lp)?);
     }
-    (!wide.is_empty()).then(|| wide.into_iter().collect())
+    if wide.is_empty() {
+        return None;
+    }
+    // A host wave with no lane at all must not go round its loops: the branches around them that
+    // the console takes for its wave (the early-out after `s_and_saveexec`) go to the host wave too
+    // (they are in the program unless a form left them out).
+    let headers: Vec<usize> = loops
+        .iter()
+        .filter(|lp| !lp.exits.is_empty())
+        .flat_map(|lp| {
+            (0..lp.body.len())
+                .filter(|&b| lp.body[b] && p.blocks[b].preds.iter().any(|&q| !lp.body[q]))
+        })
+        .collect();
+    let st = structure::structure_wide(p, &wide.iter().copied().collect()).ok()?;
+    wide.extend(lower::branches_around(&st, &headers).unwrap_or_default());
+    Some(wide.into_iter().collect())
 }
 
 /// `VICTORY_LOCAL_EXIT=1`: `p` as two host waves of 32 that each run as a wave of their own

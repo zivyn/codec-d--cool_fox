@@ -891,6 +891,16 @@ fn emit_forms(
         if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
+                // (`VICTORY_LOCAL_EXIT=1`: the program itself first, with the early-out the console takes
+                // for a wave with no lane taken by the host wave)
+                if lower::local_exit()
+                    && let Some(together) = local_exit_form::local_exit(c, native, p, why, true)
+                {
+                    report("local waves (APPROXIMATE, any mask, loops left together), with its early-outs", &together);
+                    if done(&together) {
+                        return together.map(|(shader, _)| shader);
+                    }
+                }
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
                         // (`VICTORY_LOCAL_EXIT=1`: the lanes of a host wave leave the loops together)

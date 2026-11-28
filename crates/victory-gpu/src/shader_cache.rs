@@ -91,9 +91,7 @@ fn build() -> [u8; 32] {
             "VICTORY_LOOP_NOTES",
             "VICTORY_LOOP_WHY",
             "VICTORY_LOOP_LIMITS",
-            "VICTORY_HALF_EXIT",
             "VICTORY_LOCAL_EXIT",
-            "VICTORY_KEEP_LOOP_SKIPS",
             "VICTORY_PEEK",
             "VICTORY_MASK_NUMBERS",
             "VICTORY_BVH_BOUNDS",
@@ -103,6 +101,17 @@ fn build() -> [u8; 32] {
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
+            bytes.push(0);
+        }
+        // The ones that are on unless named `=0` go by the value in force (not by the text of the
+        // variable): a cache made before they were on, or with `=0`, is never served for the other.
+        for (name, on) in ["VICTORY_HALF_EXIT", "VICTORY_KEEP_LOOP_SKIPS"]
+            .into_iter()
+            .zip(victory_shader::emit::default_on_switches())
+        {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(b'=');
+            bytes.push(u8::from(on));
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.

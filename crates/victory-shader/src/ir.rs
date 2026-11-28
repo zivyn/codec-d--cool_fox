@@ -860,7 +860,7 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
                 return None;
             }
         }
-        // (`VICTORY_KEEP_LOOP_SKIPS=1`: a region with a loop in it keeps its skip, `loops_in`)
+        // (`VICTORY_KEEP_LOOP_SKIPS`, on unless `=0`: a region with a loop in it keeps its skip, `loops_in`)
         if keep_loop_skips() && loops_in(&p.blocks, &inside) {
             return None;
         }
@@ -917,8 +917,10 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     Some(rename(blocks, p.wave64, p.vgprs))
 }
 
-/// `VICTORY_KEEP_LOOP_SKIPS=1`: an `s_cbranch_execz` over a region that holds a loop is kept
-/// ([`without_skips`]). Off unless set. Part of the translation: the shader cache keys on it.
+/// An `s_cbranch_execz` over a region that holds a loop is kept ([`without_skips`]). On unless
+/// `VICTORY_KEEP_LOOP_SKIPS=0` (the A/B of 2026-11-28 on the RTX: the alias copy 19.1 -> 1.9 ms,
+/// the commands of the GPU 166.7 -> 140.2 ms, the picture the same). Part of the translation: the
+/// shader cache keys on the value in force.
 ///
 /// The console takes that branch when no lane of the wave is left, and the loop in the region
 /// does not run. With the branch left out the lanes that would have skipped walk the region with
@@ -931,7 +933,7 @@ pub(crate) fn keep_loop_skips() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_LOOP_SKIPS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_LOOP_SKIPS").is_none_or(|v| v != "0"))
 }
 
 #[cfg(test)]
@@ -1849,7 +1851,7 @@ mod tests {
         assert_eq!(skips(&looped), 1);
         TEST_KEEP_LOOP_SKIPS.set(Some(false));
         assert_eq!(skips(&without_skips(&looped, true).expect("left out")), 0);
-        // ... unless `VICTORY_KEEP_LOOP_SKIPS=1`: a wave with no lane left does not run the loop
+        // ... unless `VICTORY_KEEP_LOOP_SKIPS` is on (the default): a wave with no lane left does not run the loop
         TEST_KEEP_LOOP_SKIPS.set(Some(true));
         assert!(without_skips(&looped, true).is_none());
         // a region without a loop is left out as before

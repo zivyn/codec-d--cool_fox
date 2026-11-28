@@ -111,6 +111,18 @@ A switch that is **on** in the code (`VICTORY_RESIDENT_BATCH`, `MAKE_ASIDE`, `PI
 `crates/victory-gpu/src/defaults.rs`) is named with its off value, `VICTORY_AB=10,VICTORY_MAKE_ASIDE=0`: its A phases are the unset
 variable (on), its B phases the `=0` (off). Read B minus A with `bin\ab-verdict.py --b off`.
 
+## Translation-time switches that are on by default
+
+Switches of the translation are in the shader cache key (`victory-gpu/src/shader_cache.rs`) and cannot flip inside a
+process, so they are A/B'd between processes (`VICTORY_X=0` against unset) and the winner becomes the default (rule 14).
+The cache key holds the value in force (`victory_shader::emit::default_on_switches`), not the text of the variable.
+
+| switch | default | since | evidence |
+|---|---|---|---|
+| `VICTORY_KEEP_LOOP_SKIPS` | **on** (`=0` is off) | 2026-11-28 (integ/validation-18) | RTX 4060, LX-A (off) vs LX-B (on): alias copy 19.1 -> 1.9 ms under instrumentation, GPU commands 166.7 -> 140.2 ms in total, no errors, no device removal, identical picture |
+| `VICTORY_HALF_EXIT` | **on** (`=0` is off) | 2026-11-28 (integ/validation-18) | same pilot: DefragHeap's loop cut 7.78 ms -> under 0.5 ms |
+| `VICTORY_LOCAL_EXIT` | off (`=1`, `=2`) | not flipped | fails its RTX unit test; being fixed |
+
 ## Not converted, and why
 
 - `VICTORY_STATE_FILTER`: with the filter off the host list's shadow of its roots, vertex and index buffers is not kept up

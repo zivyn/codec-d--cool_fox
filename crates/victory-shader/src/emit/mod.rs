@@ -195,6 +195,13 @@ pub fn loop_limit_is_named() -> bool {
     loop_limit_named().is_some()
 }
 
+/// The switches that are on unless named `=0` and change the translation (`VICTORY_HALF_EXIT`,
+/// `VICTORY_KEEP_LOOP_SKIPS`), as the values in force: the shader cache keys on these, not on
+/// the text of the variables, so a cache made with the other default is never served.
+pub fn default_on_switches() -> [bool; 2] {
+    [lower::half_exit(), crate::ir::keep_loop_skips()]
+}
+
 /// The stage of a translated program, for its loops' limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LoopStage {

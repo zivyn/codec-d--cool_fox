@@ -172,9 +172,9 @@ fn waterfall_on_32_lanes(half_exit: bool) -> Result<HostShader, crate::ShaderErr
     let bytes = crate::dxbc::build(&[]);
     let c = Container::parse(&bytes).expect("container");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
-    lower::TEST_HALF_EXIT.set(half_exit);
+    lower::TEST_HALF_EXIT.set(Some(half_exit));
     let shader = super::emit(&c, &native, &p, &st, &io, &res);
-    lower::TEST_HALF_EXIT.set(false);
+    lower::TEST_HALF_EXIT.set(None);
     lower::TEST_HOST_WAVE.set(was);
     // (`VICTORY_TEST_DUMP=<folder outside the repository>`: the program as it was translated)
     if let (Some(dir), Ok(s)) = (std::env::var_os("VICTORY_TEST_DUMP"), &shader) {
@@ -186,10 +186,10 @@ fn waterfall_on_32_lanes(half_exit: bool) -> Result<HostShader, crate::ShaderErr
     shader
 }
 
-/// `VICTORY_HALF_EXIT=1` adds the clearing of the half's exchange dword where it leaves the loop,
-/// and nothing without it.
+/// The clearing of the half's exchange dword where it leaves the loop is in the translation unless
+/// `VICTORY_HALF_EXIT=0`.
 #[test]
-fn the_half_exit_switch_changes_the_translation_only_when_set() {
+fn the_half_exit_switch_changes_the_translation_only_when_on() {
     let off = waterfall_on_32_lanes(false).expect("lowered").dxil;
     let on = waterfall_on_32_lanes(true).expect("lowered").dxil;
     assert_eq!(off, waterfall_on_32_lanes(false).expect("lowered").dxil);
@@ -280,7 +280,7 @@ fn a_loop_that_ends_on_the_value_of_lane_63_is_through_in_its_first_round() {
 }
 
 /// `LANE_63_EXIT` as the title's shaders are translated for a host of 32-lane waves, with the skip
-/// over its loop left out (the default) or kept (`VICTORY_KEEP_LOOP_SKIPS=1`).
+/// over its loop kept (the default) or left out (`VICTORY_KEEP_LOOP_SKIPS=0`).
 fn lane_63_exit_on_32_lanes(keep: bool) -> Result<HostShader, crate::ShaderError> {
     let native = native_of(&LANE_63_EXIT, true, 128);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");

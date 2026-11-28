@@ -1544,16 +1544,17 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
-/// `VICTORY_HALF_EXIT=1`: the two host waves of a console wave that exchange in the rounds of a
-/// loop clear their exchange dword when they leave it (`Lower::half_leaves`). Off unless set.
-/// Part of the translation: the shader cache keys on it.
-fn half_exit() -> bool {
+/// The two host waves of a console wave that exchange in the rounds of a loop clear their
+/// exchange dword when they leave it (`Lower::half_leaves`). On unless `VICTORY_HALF_EXIT=0`
+/// (the A/B of 2026-11-28 on the RTX: DefragHeap's loop cut went from 7.78 ms to under 0.5 ms,
+/// the picture the same). Part of the translation: the shader cache keys on the value in force.
+pub(super) fn half_exit() -> bool {
     #[cfg(test)]
-    if TEST_HALF_EXIT.get() {
-        return true;
+    if let Some(on) = TEST_HALF_EXIT.get() {
+        return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_EXIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_EXIT").is_none_or(|v| v != "0"))
 }
 
 /// `VICTORY_LOCAL_EXIT=1`: in the local-waves "any mask" form (`with_local_waves_any`) the
@@ -1593,7 +1594,7 @@ thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_LOOP_NOTES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's `VICTORY_HALF_EXIT`, for its thread only.
-    pub(super) static TEST_HALF_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static TEST_HALF_EXIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// A test's `VICTORY_LOCAL_EXIT`, for its thread only.
     pub(super) static TEST_LOCAL_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's `VICTORY_LOCAL_EXIT=2`, for its thread only.
@@ -4950,7 +4951,7 @@ impl<'a> Lower<'a> {
         })
     }
 
-    /// `VICTORY_HALF_EXIT=1`: when no lane of this host wave goes round a loop again, the
+    /// `VICTORY_HALF_EXIT` (on unless `=0`): when no lane of this host wave goes round a loop again, the
     /// block `leaving` (on the loop's way out) clears this half's exchange dword, which says
     /// "nothing here" to the other half in the rounds it still has to make. Without it the
     /// other half reads what this one last put there (that it had a lane, and that lane's

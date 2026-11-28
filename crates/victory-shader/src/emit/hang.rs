@@ -62,6 +62,9 @@ impl Guard {
 
 /// The guard in force (`None`: the translation is what it was).
 pub(super) fn guard() -> Option<Guard> {
+    if GUARD_OFF.get() {
+        return None;
+    }
     #[cfg(test)]
     if let Some(g) = TEST_GUARD.get() {
         return g;
@@ -108,6 +111,9 @@ pub fn nested_loop_limit(threads: u32) -> u32 {
 }
 
 thread_local! {
+    /// Whether this thread lowers as if the guard were off: the audit looks at the program's own
+    /// barriers, not at the counters the guard makes of them ([`audit_without_the_guard`]).
+    static GUARD_OFF: Cell<bool> = const { Cell::new(false) };
     /// Whether the modules this thread lowers bound their nested loops that hold a group barrier
     /// ([`NESTED_LOOP_LIMIT`]): set while the audited kept skips' form is made.
     static NESTED_BOUND: Cell<bool> = const { Cell::new(false) };
@@ -149,6 +155,12 @@ pub(super) fn forget() {
 pub(super) fn audit_from_now_on() {
     WANT.set(true);
     LAST.take();
+}
+
+/// Lowers as if the guard were off (or as it is) from now on: the audit of a form that has the
+/// guard's counters in place of its barriers would be of the counters' waits.
+pub(super) fn audit_without_the_guard(off: bool) {
+    GUARD_OFF.set(off);
 }
 
 /// Bounds the nested loops with a group barrier of the programs this thread lowers from now on

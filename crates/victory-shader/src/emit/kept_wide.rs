@@ -54,7 +54,12 @@ pub(super) fn attempt(
         // (the audited form bounds the loops that hold a barrier in a loop that holds one, so that
         // the audit's "no barrier a thread can miss" is not paid for in seconds: `hang::NESTED_LOOP_LIMIT`)
         hang::bound_nested_loops(mode == Mode::Audited);
+        // (with the guard on, the form is audited as the program has it, and made again with the
+        // guard's counters where the audit takes it)
+        let guarded = hang::guard().is_some();
+        hang::audit_without_the_guard(guarded);
         let r = widen_seeded(c, native, base, why, false, &kept);
+        hang::audit_without_the_guard(false);
         hang::bound_nested_loops(false);
         hang::stop_auditing();
         if !done(&r) {
@@ -91,6 +96,17 @@ pub(super) fn attempt(
             );
         }
         if safe {
+            if guarded {
+                hang::bound_nested_loops(mode == Mode::Audited);
+                let with_guard = widen_seeded(c, native, base, why, false, &kept);
+                hang::bound_nested_loops(false);
+                if done(&with_guard) {
+                    return Some(with_guard);
+                }
+                if why {
+                    eprintln!("WAVE64-WIDE-CLASS ~{} the form did not lower with the guard's counters", code_digits(c));
+                }
+            }
             return Some(r);
         }
     }

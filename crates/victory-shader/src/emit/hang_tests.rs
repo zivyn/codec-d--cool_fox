@@ -539,6 +539,31 @@ fn the_audit_counts_the_loops_of_group_barriers_apart_from_those_of_the_hosts_wa
     assert!(both.safe(false) && both.nest == 3 && both.barrier_nest == 3, "{}", both.describe());
 }
 
+/// With the guard on the audited form is the same form: audited as the program has it, made with the
+/// guard's counters in place of the barriers, and every thread of the group still passes the same
+/// waits and stores whatever the count.
+#[test]
+fn the_audited_form_is_taken_with_the_guard_on_too() {
+    let guard = hang::Guard { spins: 1 << 12, budget: 1 << 16, loops: 1 << 10 };
+    for (over, body) in walks() {
+        let native = lane_branch(over, body, 64, false);
+        let (plain, plain_form, plain_module) = lowered(&native, Mode::Audited, None);
+        let (guarded, form, module) = lowered(&native, Mode::Audited, Some(guard));
+        assert!(plain.is_ok() && guarded.is_ok(), "{over:?} {body:?}");
+        assert_eq!((plain_form, form), (Form::KeptSkipsWide, Form::KeptSkipsWide), "{over:?} {body:?}");
+        let (plain_module, module) = (plain_module.expect("a module"), module.expect("a module"));
+        assert!(module.listing().len() > plain_module.listing().len(), "the guard's counters are in the form");
+        for s0 in [0, 1, 32, 64] {
+            for count in [0, 2, 5] {
+                let a = sim::run(&plain_module, 64, &[s0, count, 2, 0], 5).expect("run");
+                let b = sim::run(&module, 64, &[s0, count, 2, 0], 5).unwrap_or_else(|e| panic!("{over:?} {body:?} guarded: {e}"));
+                assert!(b.problems.is_empty(), "{over:?} {body:?} s0={s0} count={count}: {:?}", b.problems);
+                assert_eq!(a.stores, b.stores, "{over:?} {body:?} s0={s0} count={count}: the guard changed what is stored");
+            }
+        }
+    }
+}
+
 /// A retry loop that never ends (the data not there, a compare that never takes) is cut at
 /// [`hang::NESTED_LOOP_LIMIT`] rounds in the audited form: the barriers of the walk are the count's
 /// times that many, not the square of the loop limit; without the bound (`strict` is not taken, the

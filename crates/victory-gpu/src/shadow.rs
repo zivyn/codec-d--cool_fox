@@ -4062,6 +4062,59 @@ mod narrow_tests {
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// Shadow mode asks the journal after the gate has answered, and a write told in between (a landing's note, an
+    /// asking of another thread's over a range that shares the pages) is newer than what the gate was asked about, not a
+    /// page the gate left stale: the check must not count it. PR-shadow2 counted 2 spans of 270,000 that way.
+    #[test]
+    fn a_write_noted_after_the_gate_looked_is_not_counted_as_a_span_the_gate_left_stale() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 4;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let copy = one(at, N, 1);
+        let whole = (at, N * PAGE);
+        let mut judged = false;
+        // (Other tests' askings may end the one that stands: the premise is checked and the steps are tried again.)
+        for attempt in 1..=200u32 {
+            // Taken whole, with nothing left in the ledger.
+            crate::watch::ask_once(&[(at, at + whole.1)]);
+            refresh(&copy, whole.0, whole.1);
+            refresh(&copy, whole.0, whole.1);
+            crate::pagedrive::drain();
+            let premise = crate::watch::covered(at, at + whole.1) && copy.copy.ledger().len() == 0 && copy.copy.page_gate(at, at + whole.1);
+            if !premise {
+                crate::watch::ask_once_end();
+                continue;
+            }
+            let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+            let step = ran.clone();
+            // Told after the gate has said yes: a write of ours into the second page while the asking stands.
+            crate::pagedrive::on_seam(Some(Box::new(move || {
+                step.set(true);
+                crate::watch::wrote(at + PAGE + 16 + attempt as usize, 8);
+            })));
+            let missed_before = crate::pagedrive::missed_total();
+            crate::pagedrive::force_mode(Some(1));
+            let _ = copy.copy.nothing_new_noted(whole.0, whole.1);
+            crate::pagedrive::force_mode(None);
+            crate::pagedrive::on_seam(None);
+            let missed = crate::pagedrive::missed_total();
+            crate::watch::ask_once_end();
+            if !ran.get() {
+                continue;
+            }
+            assert_eq!(missed, missed_before, "the check counts a write noted after the gate's look as a stale span");
+            judged = true;
+            break;
+        }
+        assert!(judged, "the premise (a gate that says yes, then a note) was never made");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
     /// Where shaders may write, a refresh leaves the copy alone, in every mode, and the pages the title wrote there
     /// stay stale in the ledger as in the journal, until the flight is done: then the next refresh brings them.
     #[test]
@@ -5402,6 +5455,7 @@ impl Shadow {
                 if mode == 1 {
                     // (Shadow: the answer stays the memo's; the journal says whether the gate would have been wrong.)
                     if gate {
+                        crate::pagedrive::seam();
                         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                         let stale = crate::watch::journal_stale(from, to, self.start as usize / PAGE, &copied, self.ranged(from, to), self.ledger.since());
                         crate::pagedrive::gate_checked(stale);

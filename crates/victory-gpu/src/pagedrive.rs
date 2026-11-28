@@ -588,6 +588,29 @@ pub(crate) fn gate_checked(stale: bool) {
     }
 }
 
+/// A place between the two answers of the shadow check of the gate where a test lets another thread's note come in.
+#[cfg(test)]
+thread_local! {
+    static SEAM: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The test's step between the gate's answer and the journal's (or the other way round; `None` ends it).
+#[cfg(test)]
+pub(crate) fn on_seam(step: Option<Box<dyn FnMut()>>) {
+    SEAM.with(|s| *s.borrow_mut() = step);
+}
+
+/// Runs the test's step, if it set one, at the seam of the shadow check of the gate.
+#[inline]
+pub(crate) fn seam() {
+    #[cfg(test)]
+    SEAM.with(|s| {
+        if let Some(step) = s.borrow_mut().as_mut() {
+            step();
+        }
+    });
+}
+
 /// Mode 2: a span left out by the gate.
 pub(crate) fn gate_hit() {
     count(GATE_HITS, 1);

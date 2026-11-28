@@ -2042,6 +2042,28 @@ mod tests {
         info
     }
 
+    /// `ALIAS` is one switch for the whole process, and tests run on threads side by side: the tests that
+    /// set it hold this for as long as they do, and it is put back to 0 when they are through (or fail).
+    static ALIAS_TESTS: Mutex<()> = Mutex::new(());
+
+    struct AliasSet<'a>(#[allow(dead_code)] MutexGuard<'a, ()>);
+
+    impl AliasSet<'_> {
+        fn take() -> Self {
+            Self(ALIAS_TESTS.lock().unwrap_or_else(|e| e.into_inner()))
+        }
+
+        fn set(&self, value: u8) {
+            ALIAS.store(value, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for AliasSet<'_> {
+        fn drop(&mut self) {
+            ALIAS.store(0, Ordering::Relaxed);
+        }
+    }
+
     #[test]
     fn alloc_honours_alignment_and_frees() {
         for (field, align) in [(0, 16), (4, 16), (0xc, 4096), (0x10, 64 * 1024)] {
@@ -2573,7 +2595,8 @@ mod tests {
     /// that is to be unmapped keeps its hole, and the rest is what it was.
     #[test]
     fn pages_that_show_what_is_asked_are_left_alone() {
-        ALIAS.store(2, Ordering::Relaxed);
+        let alias = AliasSet::take();
+        alias.set(2);
         let pages = allocate(3);
         let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 8 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
         let (a, b) = (reserve(), reserve());
@@ -2601,7 +2624,7 @@ mod tests {
         // A mapped one asked to be unmapped is unmapped.
         assert!(map_aliases(&[(a as u64, 0, PAGE as u64)]));
         assert_eq!(query(a as *const c_void).host.State, MEM_RESERVE);
-        ALIAS.store(0, Ordering::Relaxed);
+        alias.set(0);
         for at in [a, b] {
             assert_eq!(XMemMapPhysicalPages(ptr(at), 8, std::ptr::null()), ptr(at));
         }
@@ -2614,8 +2637,9 @@ mod tests {
     #[test]
     fn one_page_at_many_addresses_and_back() {
         const N: usize = 150;
+        let alias = AliasSet::take();
         for fast in [0, 2] {
-            ALIAS.store(fast, Ordering::Relaxed);
+            alias.set(fast);
             let pages = allocate(3);
             let heap = XMemVirtualAlloc(std::ptr::null_mut(), N * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
             let pool = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
@@ -2662,7 +2686,6 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(pool as *mut c_void, 3, std::ptr::null()), pool as *mut c_void);
             assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         }
-        ALIAS.store(0, Ordering::Relaxed);
     }
 
     /// What a title that maps and unmaps pages all the time costs the

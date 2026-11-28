@@ -97,6 +97,10 @@ $settings = @{
     VICTORY_LEAVE_OUT = '02384a60fda6f2d0,731a39171b568298'
     # Pipelines the title makes are written down, so `victory warm` can make them ahead
     VICTORY_PIPELINE_BOOK = '1'
+    # Memory stack (skornuta): unused texture slots given back, old allocators taken anew, small buffers packed
+    VICTORY_SLOT_EVICT = '1'
+    VICTORY_ALLOCATOR_TRIM = '1'
+    VICTORY_BUDGET_PACK = '1'
 }
 if (-not $SeriesS) {
     if ($Res -eq '1440') { $settings.VICTORY_NATIVE_1440P = '1' }

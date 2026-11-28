@@ -108,6 +108,11 @@ const SETTINGS: &[(&str, &str)] = &[
     ("VICTORY_LEAVE_OUT", "02384a60fda6f2d0,731a39171b568298"),
     // Pipelines the title makes are written down, for `victory warm`
     ("VICTORY_PIPELINE_BOOK", "1"),
+    // Memory stack (skornuta): texture slots left unused are given back, old command allocators
+    // are taken anew, small buffers share card memory (off since .8; on again 2026-11-28)
+    ("VICTORY_SLOT_EVICT", "1"),
+    ("VICTORY_ALLOCATOR_TRIM", "1"),
+    ("VICTORY_BUDGET_PACK", "1"),
 ];
 
 /// Path settings a start keeps from its surroundings; every other
@@ -136,6 +141,11 @@ const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
 
 const RESOLUTIONS: [&str; 3] = ["1440", "1080to1440", "4k"];
 const DLSS_MODES: [&str; 5] = ["off", "dlaa", "quality", "balanced", "performance"];
+/// The Series S scene heights the F1 menu offers and the DLSS mode of each: the picture
+/// is 1920x1080, the scene that mode's share of it (720: the game's own size, and what
+/// it stays at without DLSS: the title's own FidelityFX path from 540 stopped it at the
+/// start, 0xc0000094, a division by zero in the title, 2026-11-28).
+const S_SIZES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
 
 #[derive(clap::Args, Clone, Debug)]
 pub(crate) struct Play {
@@ -281,7 +291,19 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let saved = |k: &str| menu.iter().rev().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
     let series_s = saved("VICTORY_MENU_CONSOLE").map_or(o.series_s, |c| c == "series-s");
     let res = saved("VICTORY_MENU_RES").filter(|r| RESOLUTIONS.contains(r)).unwrap_or(&o.res);
-    let dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
+    let mut dlss = saved("VICTORY_MENU_DLSS").filter(|d| DLSS_MODES.contains(d)).unwrap_or(&o.dlss);
+    // Series S picture: the scene's size, which with DLSS on is its mode (the menu keeps the
+    // two matched); not saved yet, it is the DLSS mode's.
+    let s_res = saved("VICTORY_MENU_S_RES")
+        .and_then(|r| S_SIZES.iter().find(|(h, _)| *h == r))
+        .or_else(|| S_SIZES.iter().find(|(_, m)| *m == dlss))
+        .map_or("720", |(h, _)| *h);
+    if series_s
+        && dlss != "off"
+        && let Some((_, mode)) = S_SIZES.iter().find(|(h, _)| *h == s_res)
+    {
+        dlss = *mode;
+    }
     // 0: off; 2 to 6: that many frames shown for each one rendered (1, from an older file: 2).
     let (mut framegen, mut times) = (o.framegen.is_some(), o.framegen.unwrap_or(2));
     if let Some(saved) = saved("VICTORY_MENU_FRAMEGEN") {
@@ -362,6 +384,7 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     let mut set = |k: &str, v: &str| drop(s.insert(k.to_owned(), v.to_owned()));
     set("VICTORY_MENU_CONSOLE", if series_s { "series-s" } else { "series-x" });
     set("VICTORY_MENU_RES", res);
+    set("VICTORY_MENU_S_RES", if dlss_on { s_res } else { "720" });
     set("VICTORY_MENU_DLSS", if dlss_on { dlss } else { "off" });
     set("VICTORY_MENU_FRAMEGEN", &framegen_x.unwrap_or(0).to_string());
     set("VICTORY_MENU_FG_TYPE", fg_type);
@@ -1098,6 +1121,37 @@ mod tests {
         assert_eq!((get("VICTORY_AMBIENT"), get("VICTORY_EARLY_DEPTH")), (Some("0.5"), None));
         assert_eq!(get("VICTORY_BVH_BUILDER"), None);
         assert_eq!(get("VICTORY_MENU_FRAMEGEN"), Some("6"));
+    }
+
+    #[test]
+    fn the_series_s_picture_sets_the_scene() {
+        let get = |s: &BTreeMap<String, String>, k: &str| s.get(k).cloned();
+        let s_menu = |more: &str| parse_menu(&format!("VICTORY_MENU_CONSOLE=series-s\r\n{more}"));
+        // not saved yet: the DLSS mode's size, and the mode as it was
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=balanced\r\n"), Some(Path::new("x")));
+        assert_eq!(get(&s, "VICTORY_MENU_S_RES").as_deref(), Some("626"));
+        assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("balanced"));
+        // 540 with DLSS: its performance mode, whatever the DLSS line held
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=quality\r\nVICTORY_MENU_S_RES=540\r\n"), Some(Path::new("x")));
+        assert_eq!(get(&s, "VICTORY_DLSS_MODE").as_deref(), Some("performance"));
+        assert_eq!(get(&s, "VICTORY_MENU_DLSS").as_deref(), Some("performance"));
+        assert_eq!(get(&s, "VICTORY_FSR_PATH"), None);
+        // DLAA is 1080
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=dlaa\r\n"), Some(Path::new("x")));
+        assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_MENU_S_RES").as_deref()), (Some("dlaa"), Some("1080")));
+        // without DLSS (off, or no NVIDIA files): the game's 720, never the title's FidelityFX path
+        for (more, dir) in [("VICTORY_MENU_DLSS=off\r\nVICTORY_MENU_S_RES=540\r\n", Some(Path::new("x"))), ("VICTORY_MENU_S_RES=540\r\n", None)] {
+            let (s, _) = settings(&options(), &s_menu(more), dir);
+            assert_eq!((get(&s, "VICTORY_DLSS"), get(&s, "VICTORY_FSR_PATH"), get(&s, "VICTORY_DLSS_MODE")), (None, None, None));
+            assert_eq!(get(&s, "VICTORY_MENU_S_RES").as_deref(), Some("720"));
+        }
+        // 720 without DLSS: the game as it is
+        let (s, _) = settings(&options(), &s_menu("VICTORY_MENU_DLSS=off\r\nVICTORY_MENU_S_RES=720\r\n"), None);
+        assert_eq!((get(&s, "VICTORY_FSR_PATH"), get(&s, "VICTORY_DLSS_MODE")), (None, None));
+        // Series X: the Series S size changes nothing
+        let (s, series_s) = settings(&options(), &parse_menu("VICTORY_MENU_S_RES=540\r\n"), Some(Path::new("x")));
+        assert!(!series_s);
+        assert_eq!((get(&s, "VICTORY_DLSS_MODE").as_deref(), get(&s, "VICTORY_FSR_PATH")), (Some("quality"), None));
     }
 
     #[test]

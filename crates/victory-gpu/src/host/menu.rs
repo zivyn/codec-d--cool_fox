@@ -111,6 +111,19 @@ const ABOUT_FRAMEGEN_RESTART: [&str; 3] = [
     "AFTER THAT IT CHANGES, OR TURNS OFF, LIVE.",
 ];
 const FRAMEGEN: &str = "VICTORY_MENU_FRAMEGEN";
+/// The console, and the picture row of each: only the one of the console picked is shown.
+const CONSOLE: &str = "VICTORY_MENU_CONSOLE";
+const X_RES: &str = "VICTORY_MENU_RES";
+const S_RES: &str = "VICTORY_MENU_S_RES";
+/// The Series S scene sizes and the DLSS mode of each (the picture is 1920x1080). Only DLSS
+/// changes it: the title's own FidelityFX path from 540 stopped it at the start (0xc0000094,
+/// a division by zero in the title, 2026-11-28), so with DLSS off the scene stays at 720.
+const S_MODES: [(&str, &str); 4] = [("1080", "dlaa"), ("720", "quality"), ("626", "balanced"), ("540", "performance")];
+const ABOUT_S_RES: [&str; 3] = [
+    "THE SIZE THE GAME RENDERS AT. THE PICTURE IS 1920X1080.",
+    "OTHER THAN 720 NEEDS DLSS: THIS SETS ITS MODE (1080 IS",
+    "DLAA, 720 QUALITY, 626 BALANCED, 540 PERFORMANCE).",
+];
 /// The note after the first Enter on it: the second one does it.
 const CONFIRM_PRELOAD: &str = "ENTER AGAIN: SAVE, CLOSE THE GAME AND PRELOAD";
 /// The last line of the box: where this build comes from.
@@ -148,7 +161,9 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_MOUSE_CAPTURE", label: "MOUSE CAPTURE", values: UNSET_ON, live: false },
     Item { var: "VICTORY_IME_ENGLISH", label: "ENGLISH KEYBOARD", values: UNSET_ON, live: false },
     Item { var: "VICTORY_MENU_CONSOLE", label: "CONSOLE", values: &[("series-x", "SERIES X"), ("series-s", "SERIES S (FASTER)")], live: false },
-    Item { var: "VICTORY_MENU_RES", label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+    Item { var: X_RES, label: "SERIES X PICTURE", values: &[("1440", "2560X1440"), ("1080to1440", "1080P TO 1440P"), ("4k", "3840X2160")], live: false },
+    // In place of SERIES X PICTURE when CONSOLE is Series S.
+    Item { var: S_RES, label: "SERIES S PICTURE", values: &[("1080", "1920X1080 (DLAA)"), ("720", "1280X720 (THE GAME)"), ("626", "1113X626"), ("540", "960X540 (FASTEST)")], live: false },
     // The layer's switches.
     Item { var: "VICTORY_DLSS_PRESET", label: "DLSS MODEL", values: &[("", "DEFAULT"), ("k", "K"), ("j", "J"), ("m", "M"), ("l", "L")], live: false },
     Item { var: "VICTORY_AMBIENT", label: "LIGHT ESTIMATE", values: &[("0.8", "0.8"), ("1", "1"), ("0.5", "0.5"), ("", "OFF")], live: false },
@@ -483,18 +498,46 @@ impl Menu {
         crate::SETTINGS_MENU_OPEN.load(Ordering::Relaxed)
     }
 
+    /// The value of the setting `var` as the menu holds it now.
+    fn value(&self, var: &str) -> &str {
+        ITEMS.iter().position(|i| i.var == var).map_or("", |i| self.values[i].as_str())
+    }
+
+    /// Row `row` is left out: the picture row of the console not picked.
+    fn hidden(&self, row: usize) -> bool {
+        let series_s = self.value(CONSOLE) == "series-s";
+        ITEMS.get(row).is_some_and(|i| if series_s { i.var == X_RES } else { i.var == S_RES })
+    }
+
+    /// The rows shown, settings then actions.
+    fn rows(&self) -> Vec<usize> {
+        (0..ITEMS.len() + ACTIONS.len()).filter(|r| !self.hidden(*r)).collect()
+    }
+
+    /// The row shown `step` (+1 / -1) from the one picked, round the ends.
+    fn step(&self, step: isize) -> usize {
+        let rows = self.rows();
+        let n = rows.len() as isize;
+        match rows.iter().position(|r| *r == self.at) {
+            Some(p) => rows[(p as isize + step).rem_euclid(n) as usize],
+            None => rows.iter().copied().find(|r| *r > self.at).unwrap_or(rows[0]),
+        }
+    }
+
     fn lines(&self) -> Vec<String> {
         if self.picking {
             return self.pick_lines();
         }
-        let total = ITEMS.len() + ACTIONS.len();
-        let first = self.at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
+        let rows = self.rows();
+        let total = rows.len();
+        let at = rows.iter().position(|r| *r == self.at).unwrap_or(0);
+        let first = at.saturating_sub(ROWS / 2).min(total.saturating_sub(ROWS));
         let mut out = vec![
             "SETTINGS                       F1 OR ESC CLOSES".to_owned(),
             "UP/DOWN PICK  LEFT/RIGHT CHANGE  ENTER DOES IT".to_owned(),
             String::new(),
         ];
-        for row in first..(first + ROWS).min(total) {
+        for &row in &rows[first..(first + ROWS).min(total)] {
             let cursor = if row == self.at { '>' } else { ' ' };
             let line = if let Some(item) = ITEMS.get(row) {
                 let value = &self.values[row];
@@ -518,6 +561,8 @@ impl Menu {
             ABOUT_IMPORT
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == MFG) {
             ABOUT_MFG
+        } else if ITEMS.get(self.at).is_some_and(|i| i.var == S_RES) {
+            ABOUT_S_RES
         } else if ITEMS.get(self.at).is_some_and(|i| i.var == DLSS)
             && !matches!(self.values[self.at].as_str(), "" | "off")
             && std::env::var_os("VICTORY_STREAMLINE_DIR").is_none()
@@ -573,6 +618,28 @@ impl Menu {
         self.note.clear();
         if item.var == FRAMEGEN && !live(item) && !matches!(self.values[i].as_str(), "" | "0") {
             "RESTART REQUIRED TO ENABLE FRAME GENERATION".clone_into(&mut self.note);
+        }
+        self.match_series_s(item.var);
+    }
+
+    /// On Series S the scene's size and DLSS's mode are one choice: a change of either
+    /// (`changed`) sets the other. DLSS off is the game's 720, and 720 picked leaves it off.
+    fn match_series_s(&mut self, changed: &str) {
+        let (Some(dlss), Some(res)) = (ITEMS.iter().position(|i| i.var == DLSS), ITEMS.iter().position(|i| i.var == S_RES)) else {
+            return;
+        };
+        if self.value(CONSOLE) != "series-s" {
+            return;
+        }
+        let off = matches!(self.values[dlss].as_str(), "" | "off");
+        if changed == DLSS {
+            let size = S_MODES.iter().find(|(_, m)| *m == self.values[dlss]).map_or("720", |(s, _)| *s);
+            size.clone_into(&mut self.values[res]);
+        } else if changed == S_RES
+            && !(off && self.values[res] == "720")
+            && let Some((_, mode)) = S_MODES.iter().find(|(s, _)| *s == self.values[res])
+        {
+            (*mode).clone_into(&mut self.values[dlss]);
         }
     }
 
@@ -804,7 +871,6 @@ impl Menu {
         if pressed.is_empty() {
             return;
         }
-        let total = ITEMS.len() + ACTIONS.len();
         for vk in pressed {
             let open = Self::open();
             // Esc in the list of saves goes back to the settings.
@@ -846,8 +912,8 @@ impl Menu {
                 continue;
             }
             match vk {
-                VK_UP => self.at = (self.at + total - 1) % total,
-                VK_DOWN => self.at = (self.at + 1) % total,
+                VK_UP => self.at = self.step(-1),
+                VK_DOWN => self.at = self.step(1),
                 VK_LEFT if self.at < ITEMS.len() => self.change_and_save(self.at, -1),
                 VK_RIGHT if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
                 VK_RETURN if self.at < ITEMS.len() => self.change_and_save(self.at, 1),
@@ -1029,6 +1095,8 @@ mod tests {
                     assert_eq!(about, ABOUT_IMPORT);
                 } else if at < ITEMS.len() && ITEMS[at].var == MFG {
                     assert_eq!(about, ABOUT_MFG);
+                } else if at < ITEMS.len() && ITEMS[at].var == S_RES {
+                    assert_eq!(about, ABOUT_S_RES);
                 } else {
                     assert!(about.iter().all(String::is_empty), "{about:?}");
                 }
@@ -1074,6 +1142,50 @@ mod tests {
         assert!(menu.note.is_empty());
         let lines = menu.lines();
         assert!(lines[lines.len() - 5..lines.len() - 2].iter().all(String::is_empty));
+    }
+
+    #[test]
+    fn the_picture_line_is_the_consoles() {
+        let mut menu = Menu { values: ITEMS.iter().map(|_| String::new()).collect(), started: Vec::new(), at: 0, note: String::new(), changed: false, painted: None, buffers: None, failed: false, imports: Vec::new(), import_at: 0, picking: false };
+        menu.started = menu.values.clone();
+        let at = |var: &str| ITEMS.iter().position(|i| i.var == var).expect("in the menu");
+        let (console, x, s, dlss) = (at(CONSOLE), at(X_RES), at(S_RES), at(DLSS));
+        let shown = |menu: &Menu, label: &str| menu.lines().iter().any(|l| l.contains(label));
+        "series-x".clone_into(&mut menu.values[console]);
+        assert!(shown(&menu, "SERIES X PICTURE") && !shown(&menu, "SERIES S PICTURE"));
+        // down from the console: the Series X line, never the hidden one
+        menu.at = console;
+        assert_eq!(menu.step(1), x);
+        assert!(!menu.rows().contains(&s));
+        "series-s".clone_into(&mut menu.values[console]);
+        assert!(shown(&menu, "SERIES S PICTURE") && !shown(&menu, "SERIES X PICTURE"));
+        assert_eq!(menu.step(1), s);
+        assert_eq!(menu.step(-1), console - 1);
+        // the size and DLSS's mode follow each other on Series S
+        "quality".clone_into(&mut menu.values[dlss]);
+        "720".clone_into(&mut menu.values[s]);
+        menu.change(s, 1);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("626", "balanced"));
+        menu.change(s, 1);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("540", "performance"));
+        menu.change(dlss, -2);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("720", "quality"));
+        // DLSS off is 720, and 720 leaves it off; another size turns DLSS on at its mode
+        menu.change(dlss, -1);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("720", "off"));
+        menu.change(s, -1);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("1080", "dlaa"));
+        "off".clone_into(&mut menu.values[dlss]);
+        "626".clone_into(&mut menu.values[s]);
+        menu.change(s, -1);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("720", "off"));
+        menu.change(s, 2);
+        assert_eq!((menu.values[s].as_str(), menu.values[dlss].as_str()), ("540", "performance"));
+        menu.at = s;
+        assert_eq!(&menu.lines()[menu.lines().len() - 5..menu.lines().len() - 2], ABOUT_S_RES);
+        for line in ABOUT_S_RES {
+            assert!(line.len() <= COLUMNS as usize && line.bytes().all(|b| glyph(b) != glyph(b'#') || b == b'#'), "{line}");
+        }
     }
 
     #[test]

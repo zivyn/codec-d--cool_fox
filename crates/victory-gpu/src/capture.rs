@@ -846,6 +846,11 @@ fn flatness(rows: &[u8], pitch: usize, w: usize, h: usize, bytes: usize, format:
 
 /// What the float texels of a target hold, over the color channels (the first three; the
 /// alpha of four is left out), and in every channel how many are no number or infinite.
+/// `over` counts the color channels whose finite value is larger than the limit
+/// ([`bad_limit`]); `first` is the first texel (rows from the top) with a channel that is no
+/// number or infinite or a color channel over the limit, `bbox` the box of all of them
+/// (x0, y0, x1, y1) and `at_max` the texel of the largest finite color value: where to look
+/// with `victory replay --pixel <id>:x,y` (`VICTORY_NONFINITE_LIMIT`).
 #[derive(Debug, Default, PartialEq)]
 struct Range {
     /// The largest and the smallest finite value.
@@ -855,12 +860,28 @@ struct Range {
     mean: f64,
     nan: u64,
     inf: u64,
+    over: u64,
+    first: Option<(u32, u32)>,
+    bbox: [u32; 4],
+    at_max: (u32, u32),
 }
 
-/// [`Range`] of the rows of a float format (`None` for any other).
-fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Range> {
-    // Channels, and how a channel is read: 32-bit, 16-bit, R11G11B10, or R9G9B9E5 (9).
-    let (channels, kind) = match format {
+/// A value from which a channel is "extreme" (`VICTORY_NONFINITE_LIMIT`, 60000: a half
+/// float's largest is 65504, so what a half target saturates at counts).
+fn bad_limit() -> f32 {
+    static LIMIT: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("VICTORY_NONFINITE_LIMIT")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(60000.0)
+    })
+}
+
+/// The channels a float format has and how a channel is read: 32-bit (32), 16-bit (16),
+/// R11G11B10 (11) or R9G9B9E5 (9); `None` for any other format.
+fn float_layout(format: u32) -> Option<(usize, u32)> {
+    Some(match format {
         2 => (4, 32),
         6 => (3, 32),
         16 => (2, 32),
@@ -871,50 +892,76 @@ fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Op
         26 => (3, 11),
         67 => (3, 9),
         _ => return None,
-    };
+    })
+}
+
+/// Channel `c` of a texel `t` read as `kind` ([`float_layout`]): (a value; whether it is no
+/// number; whether it is an infinity).
+fn channel(kind: u32, c: usize, t: &[u8]) -> (f32, bool, bool) {
+    match kind {
+        32 => {
+            let f = f32::from_le_bytes(t[4 * c..4 * c + 4].try_into().unwrap_or([0; 4]));
+            (f, f.is_nan(), f.is_infinite())
+        }
+        9 => {
+            // Three 9-bit mantissas and one shared exponent: no NaN, no infinity.
+            let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
+            let m = (w >> (9 * c)) & 511;
+            (m as f32 * 2f32.powi((w >> 27) as i32 - 24), false, false)
+        }
+        16 => {
+            let b = u16::from_le_bytes([t[2 * c], t[2 * c + 1]]);
+            let special = (b >> 10) & 0x1f == 0x1f;
+            (half(b), special && b & 0x3ff != 0, special && b & 0x3ff == 0)
+        }
+        _ => {
+            let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
+            let (bits, man) = [(w & 0x7ff, 6), ((w >> 11) & 0x7ff, 6), (w >> 22, 5)][c];
+            let special = (bits >> man) & 0x1f == 0x1f;
+            (small_float(bits, man), special && bits & ((1 << man) - 1) != 0, special && bits & ((1 << man) - 1) == 0)
+        }
+    }
+}
+
+/// [`Range`] of the rows of a float format (`None` for any other).
+fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8], limit: f32) -> Option<Range> {
+    let (channels, kind) = float_layout(format)?;
     let bytes = match kind {
         32 => 4 * channels,
         16 => 2 * channels,
         _ => 4,
     };
-    let mut r = Range { max: f32::MIN, min: f32::MAX, ..Range::default() };
+    let mut r = Range { max: f32::MIN, min: f32::MAX, bbox: [u32::MAX, u32::MAX, 0, 0], ..Range::default() };
     let (mut sum, mut n) = (0f64, 0u64);
+    let mut largest = f32::MIN;
     for y in 0..h {
         let row = rows.get(y * pitch..y * pitch + w * bytes)?;
-        for t in row.chunks_exact(bytes) {
+        for (x, t) in row.chunks_exact(bytes).enumerate() {
+            let mut bad = false;
             for c in 0..channels {
-                // (a value; whether it is no number; whether it is an infinity)
-                let (v, nan, inf) = match kind {
-                    32 => {
-                        let f = f32::from_le_bytes(t[4 * c..4 * c + 4].try_into().unwrap_or([0; 4]));
-                        (f, f.is_nan(), f.is_infinite())
-                    }
-                    9 => {
-                        // Three 9-bit mantissas and one shared exponent: no NaN, no infinity.
-                        let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
-                        let m = (w >> (9 * c)) & 511;
-                        (m as f32 * 2f32.powi((w >> 27) as i32 - 24), false, false)
-                    }
-                    16 => {
-                        let b = u16::from_le_bytes([t[2 * c], t[2 * c + 1]]);
-                        let special = (b >> 10) & 0x1f == 0x1f;
-                        (half(b), special && b & 0x3ff != 0, special && b & 0x3ff == 0)
-                    }
-                    _ => {
-                        let w = u32::from_le_bytes(t.try_into().unwrap_or([0; 4]));
-                        let (bits, man) = [(w & 0x7ff, 6), ((w >> 11) & 0x7ff, 6), (w >> 22, 5)][c];
-                        let special = (bits >> man) & 0x1f == 0x1f;
-                        (small_float(bits, man), special && bits & ((1 << man) - 1) != 0, special && bits & ((1 << man) - 1) == 0)
-                    }
-                };
+                let (v, nan, inf) = channel(kind, c, t);
                 r.nan += u64::from(nan);
                 r.inf += u64::from(inf);
+                bad |= nan || inf;
                 if c < 3 && v.is_finite() {
                     r.max = r.max.max(v);
                     r.min = r.min.min(v);
                     sum += f64::from(v);
                     n += 1;
+                    if v.abs() > limit {
+                        r.over += 1;
+                        bad = true;
+                    }
+                    if v > largest {
+                        largest = v;
+                        r.at_max = (x as u32, y as u32);
+                    }
                 }
+            }
+            if bad {
+                let (x, y) = (x as u32, y as u32);
+                r.first.get_or_insert((x, y));
+                r.bbox = [r.bbox[0].min(x), r.bbox[1].min(y), r.bbox[2].max(x), r.bbox[3].max(y)];
             }
         }
     }
@@ -922,8 +969,68 @@ fn float_range(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Op
         r.max = 0.0;
         r.min = 0.0;
     }
+    if r.first.is_none() {
+        r.bbox = [0; 4];
+    }
     r.mean = if n == 0 { 0.0 } else { sum / n as f64 };
     Some(r)
+}
+
+/// The texels of a float target with a channel that is no number, infinite or (color) over
+/// `limit`: the first `first` in reading order and then the `largest` with the largest
+/// finite color value, as (x, y, the four channels as read; unused ones 0).
+#[allow(clippy::too_many_arguments)]
+fn bad_texels(
+    format: u32,
+    w: usize,
+    h: usize,
+    pitch: usize,
+    rows: &[u8],
+    limit: f32,
+    first: usize,
+    largest: usize,
+) -> Vec<(u32, u32, [f32; 4])> {
+    let Some((channels, kind)) = float_layout(format) else { return Vec::new() };
+    let bytes = match kind {
+        32 => 4 * channels,
+        16 => 2 * channels,
+        _ => 4,
+    };
+    let mut firsts: Vec<(u32, u32, [f32; 4])> = Vec::new();
+    // The largest ones: (magnitude as ordered bits, texel), kept sorted, at most `largest`.
+    let mut top: Vec<(u32, (u32, u32, [f32; 4]))> = Vec::new();
+    for y in 0..h {
+        let Some(row) = rows.get(y * pitch..y * pitch + w * bytes) else { break };
+        for (x, t) in row.chunks_exact(bytes).enumerate() {
+            let mut values = [0f32; 4];
+            let (mut bad, mut magnitude) = (false, 0f32);
+            for c in 0..channels {
+                let (v, nan, inf) = channel(kind, c, t);
+                values[c] = v;
+                bad |= nan || inf || c < 3 && v.is_finite() && v.abs() > limit;
+                if c < 3 && v.is_finite() {
+                    magnitude = magnitude.max(v.abs());
+                }
+            }
+            if !bad {
+                continue;
+            }
+            let texel = (x as u32, y as u32, values);
+            if firsts.len() < first {
+                firsts.push(texel);
+            }
+            let key = magnitude.to_bits();
+            if largest > 0 && (top.len() < largest || key > top[0].0) {
+                let at = top.partition_point(|e| e.0 < key);
+                top.insert(at, (key, texel));
+                if top.len() > largest {
+                    top.remove(0);
+                }
+            }
+        }
+    }
+    firsts.extend(top.into_iter().rev().map(|e| e.1));
+    firsts
 }
 
 /// One line per target in `frame-<frame>-targets.tsv` (in the order the
@@ -965,12 +1072,46 @@ fn target_stats(
     // (An R32_UINT target may be the title's diffuse light, which it packs as R9G9B9E5: its
     // `e5max` and `e5mean` read the words that way, and mean nothing for any other counter.)
     let range = if format == 42 {
-        float_range(67, w, h, pitch, rows).map_or(String::new(), |r| format!("	e5max{:.4e}	e5mean{:.4e}", r.max, r.mean))
+        float_range(67, w, h, pitch, rows, bad_limit())
+            .map_or(String::new(), |r| format!("	e5max{:.4e}	e5mean{:.4e}", r.max, r.mean))
     } else {
-        float_range(format, w, h, pitch, rows).map_or(String::new(), |r| {
-            format!("	max{:.4e}	min{:.4e}	mean{:.4e}	nan{}	inf{}", r.max, r.min, r.mean, r.nan, r.inf)
+        // After `inf`: where to look (`VICTORY_NONFINITE_LIMIT`): the channels over the limit,
+        // the first texel that is no number, infinite or over it, the box of them and the
+        // texel of the largest value; the worst ones are listed in `frame-<n>-bad.tsv`.
+        float_range(format, w, h, pitch, rows, bad_limit()).map_or(String::new(), |r| {
+            let at = |p: (u32, u32)| format!("{},{}", p.0, p.1);
+            let bad = match r.first {
+                Some(p) => format!("{}	bbox{},{},{},{}", at(p), r.bbox[0], r.bbox[1], r.bbox[2], r.bbox[3]),
+                None => "-	bbox-".to_owned(),
+            };
+            format!(
+                "	max{:.4e}	min{:.4e}	mean{:.4e}	nan{}	inf{}	over{}	first{bad}	maxat{}",
+                r.max,
+                r.min,
+                r.mean,
+                r.nan,
+                r.inf,
+                r.over,
+                at(r.at_max)
+            )
         })
     };
+    if range.contains("	first") && !range.contains("	first-") {
+        let listed = bad_texels(format, w, h, pitch, rows, bad_limit(), 16, 16);
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(folder.join(format!("frame-{frame}-bad.tsv")))
+        {
+            for (x, y, v) in listed {
+                let _ = writeln!(
+                    file,
+                    "{i}	{resource:?}	{}x{}	f{format}	{x},{y}	{:e} {:e} {:e} {:e}",
+                    d.Width, d.Height, v[0], v[1], v[2], v[3]
+                );
+            }
+        }
+    }
     let line = format!(
         "{i}	{resource:?}	{}x{}{}	f{}	mips{}	texels{}	raw{}{}	top{top:#x}	topshare{:.1}%	rgba8_{rgba8}	eqh{eqh:.1}%	eqv{eqv:.1}%	flat8_{flat8:.1}%{range}",
         d.Width,
@@ -1522,25 +1663,68 @@ mod stats_tests {
         for (i, w) in words.iter().enumerate() {
             rows[2 * i..2 * i + 2].copy_from_slice(&w.to_le_bytes());
         }
-        let r = float_range(10, 2, 1, 16, &rows).unwrap();
+        let r = float_range(10, 2, 1, 16, &rows, 60000.0).unwrap();
         assert_eq!((r.nan, r.inf), (1, 1));
         assert_eq!((r.max, r.min), (65504.0, 0.5));
         // R11G11B10_FLOAT: red 1.0 (exponent 15), green infinity, blue NaN (exponent 31, mantissa 1).
         let packed = 15u32 << 6 | (0x1f << 6) << 11 | (0x1f << 5 | 1) << 22;
-        let r = float_range(26, 1, 1, 4, &packed.to_le_bytes()).unwrap();
+        let r = float_range(26, 1, 1, 4, &packed.to_le_bytes(), 60000.0).unwrap();
         assert_eq!((r.nan, r.inf, r.max, r.min), (1, 1, 1.0, 1.0));
         // Single 32-bit channels, and a format that is not a float.
         let rows: Vec<u8> = [4.0f32, f32::NAN, f32::NEG_INFINITY, -2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
-        let r = float_range(41, 4, 1, 16, &rows).unwrap();
+        let r = float_range(41, 4, 1, 16, &rows, 60000.0).unwrap();
         assert_eq!((r.nan, r.inf, r.max, r.min, r.mean), (1, 1, 4.0, -2.0, 1.0));
-        assert!(float_range(28, 1, 1, 4, &[0; 4]).is_none());
+        assert!(float_range(28, 1, 1, 4, &[0; 4], 60000.0).is_none());
         // R9G9B9E5: red 511 x 2^(31-24) = 65408 (the largest), green 1 x 2^7, blue 0.
         let w = 511u32 | 1 << 9 | 31 << 27;
-        let r = float_range(67, 1, 1, 4, &w.to_le_bytes()).unwrap();
+        let r = float_range(67, 1, 1, 4, &w.to_le_bytes(), 60000.0).unwrap();
         assert_eq!((r.nan, r.inf, r.max, r.min), (0, 0, 65408.0, 0.0));
         let one = 256u32 | 15 << 27; // red 256 x 2^(15-24) = 0.5; green and blue 0
-        let r = float_range(67, 1, 1, 4, &one.to_le_bytes()).unwrap();
+        let r = float_range(67, 1, 1, 4, &one.to_le_bytes(), 60000.0).unwrap();
         assert_eq!((r.max, r.min), (0.5, 0.0));
+    }
+
+    #[test]
+    fn extreme_and_non_finite_texels_are_located() {
+        // R16G16B16A16_FLOAT, 3 x 2 texels, rows padded to 32 bytes: one texel with a channel at
+        // the half maximum (65504, over a limit of 60000) at (2, 0), a NaN in the green channel
+        // at (1, 1), and a NaN in the alpha only at (0, 1) (alpha is no color, still no number).
+        let put = |rows: &mut Vec<u8>, x: usize, y: usize, v: [u16; 4]| {
+            for (c, w) in v.iter().enumerate() {
+                rows[y * 32 + x * 8 + 2 * c..][..2].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        let one = 0x3c00u16;
+        let mut rows = vec![0u8; 64];
+        for y in 0..2 {
+            for x in 0..3 {
+                put(&mut rows, x, y, [one, one, one, one]);
+            }
+        }
+        put(&mut rows, 2, 0, [0x7bff, one, one, one]);
+        put(&mut rows, 1, 1, [one, 0x7e00, one, one]);
+        put(&mut rows, 0, 1, [one, one, one, 0x7e00]);
+        let r = float_range(10, 3, 2, 32, &rows, 60000.0).unwrap();
+        assert_eq!((r.nan, r.inf, r.over), (2, 0, 1));
+        assert_eq!(r.first, Some((2, 0)));
+        assert_eq!(r.bbox, [0, 0, 2, 1]);
+        assert_eq!(r.at_max, (2, 0));
+        // A clean target has no first texel and an empty box; a higher limit lets 65504 pass.
+        let r = float_range(10, 3, 2, 32, &rows, 70000.0).unwrap();
+        assert_eq!((r.over, r.first), (0, Some((0, 1))));
+        let clean = vec![0u8; 64];
+        let r = float_range(10, 3, 2, 32, &clean, 60000.0).unwrap();
+        assert_eq!((r.over, r.first, r.bbox), (0, None, [0; 4]));
+        // The list: the first one in reading order (2,0) then (0,1), (1,1); the largest by value
+        // last-first: (2,0) is the only finite extreme one, the NaN texels rank by their finite colors.
+        let list = bad_texels(10, 3, 2, 32, &rows, 60000.0, 2, 1);
+        assert_eq!(list.iter().map(|t| (t.0, t.1)).collect::<Vec<_>>(), [(2, 0), (0, 1), (2, 0)]);
+        assert_eq!(list[0].2[0], 65504.0);
+        assert!(bad_texels(10, 3, 2, 32, &clean, 60000.0, 4, 4).is_empty());
+        // R11G11B10: red at the largest finite exponent (30) is 65024-ish, over a limit of 60000.
+        let packed = (30u32 << 6 | 63) | (15 << 6) << 11 | (15 << 5) << 22;
+        let r = float_range(26, 1, 1, 4, &packed.to_le_bytes(), 60000.0).unwrap();
+        assert_eq!((r.over, r.first, r.at_max), (1, Some((0, 0)), (0, 0)));
     }
 
     #[test]

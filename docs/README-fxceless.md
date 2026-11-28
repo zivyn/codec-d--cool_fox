@@ -319,6 +319,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
+| `VICTORY_DUMP_TARGETS=stats` | with the above and `VICTORY_CAPTURE_TRIGGER`, `frame-<n>-targets.tsv` has, for every float target, `max`, `min`, `mean`, `nan`, `inf` and then `over` (color channels past `VICTORY_NONFINITE_LIMIT`, 60000), `first` (the first texel that is no number, infinite or over it), `bbox` and `maxat`; `frame-<n>-bad.tsv` lists the worst texels (16 first, 16 largest) with their channels: where to look with `victory replay --pixel <id>:x,y` |
+| `VICTORY_NAN_SAFE=<bits>` | translation switch (cache key), off: 1 compares, 2 legacy products, 4 clamp, 8 max/min say a NaN or a zero by the bits of the float; the `nan_tests` GPU tests (`-filter nan_tests`) say which ops differ from RDNA2 on a card |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |

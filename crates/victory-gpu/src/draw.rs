@@ -1007,6 +1007,7 @@ macro_rules! once {
     }};
 }
 
+pub(crate) mod access;
 pub(crate) mod fold;
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {

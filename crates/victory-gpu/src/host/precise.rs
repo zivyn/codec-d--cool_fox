@@ -386,6 +386,75 @@ pub(crate) fn value_wait<'a>(wait: &crate::list::ValueWait, along: impl Iterator
     false
 }
 
+/// Bytes `start..end` of one resource: the key is 0 for title memory by its address (the host copies of title
+/// buffers overlap in that space, whatever the copy), or the title's resource address for a texture (all of it).
+pub(crate) type Span = (usize, u64, u64);
+
+/// The most spans a set keeps before it is "anywhere".
+const MOST: usize = 256;
+
+/// What the shaders of one dispatch (or draw) read and write through the views bound for them, by the code of the
+/// shaders and what the draw gives them (`State::access`, for `VICTORY_PRECISE_WAITS`'s model of barriers). `None`:
+/// anywhere. A view whose bytes are not bounded by the analysis counts whole; a shader without analysis, title
+/// memory by address, a view picked by a computed index and a view that is not understood say `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Access {
+    pub(crate) reads: Option<Vec<Span>>,
+    pub(crate) writes: Option<Vec<Span>>,
+}
+
+impl Access {
+    /// Nothing yet.
+    pub(crate) fn none() -> Access {
+        Access { reads: Some(Vec::new()), writes: Some(Vec::new()) }
+    }
+
+    pub(crate) fn read(&mut self, spans: impl IntoIterator<Item = Span>) {
+        Self::add(&mut self.reads, spans);
+    }
+
+    pub(crate) fn write(&mut self, spans: impl IntoIterator<Item = Span>) {
+        Self::add(&mut self.writes, spans);
+    }
+
+    pub(crate) fn read_anywhere(&mut self) {
+        self.reads = None;
+    }
+
+    pub(crate) fn write_anywhere(&mut self) {
+        self.writes = None;
+    }
+
+    fn add(set: &mut Option<Vec<Span>>, spans: impl IntoIterator<Item = Span>) {
+        if let Some(have) = set {
+            have.extend(spans.into_iter().filter(|s| s.1 < s.2));
+            if have.len() > MOST {
+                *set = None;
+            }
+        }
+    }
+}
+
+/// The spans of title memory that `ranges` (relative to a view that starts at `address` and is `len` bytes) name,
+/// clamped to the view; the whole view where the analysis says anywhere.
+pub(crate) fn spans(address: u64, len: u64, ranges: Option<Vec<(u64, u64)>>) -> Vec<Span> {
+    match ranges {
+        None => vec![(0, address, address + len)],
+        Some(ranges) => ranges
+            .into_iter()
+            .filter_map(|(lo, hi)| {
+                let (from, to) = (lo.min(len), hi.min(len));
+                (from < to).then_some((0usize, address + from, address + to))
+            })
+            .collect(),
+    }
+}
+
+/// The groups of the dispatch being bound, if they are known.
+pub(crate) fn groups() -> Option<[u32; 3]> {
+    GROUPS.get()
+}
+
 /// For the frame-rate line.
 pub(crate) fn line(frames: f64) {
     let views: Vec<u64> = VIEWS.iter().map(|v| v.swap(0, Relaxed)).collect();
@@ -630,6 +699,28 @@ mod tests {
         assert!(!signalled_in(&line, 8, 1), "another fence");
         assert!(signalled_in(&line, 9, 2));
         assert!(!signalled_in(&[], 7, 1));
+    }
+
+    #[test]
+    fn spans_are_clamped_to_the_view_and_the_whole_view_is_the_answer_to_anywhere() {
+        assert_eq!(spans(0x1000, 0x100, None), vec![(0, 0x1000, 0x1100)]);
+        assert_eq!(spans(0x1000, 0x100, Some(vec![(0x10, 0x20), (0xf0, 0x200), (0x300, 0x400)])), vec![(0, 0x1010, 0x1020), (0, 0x10f0, 0x1100)]);
+        assert!(spans(0x1000, 0x100, Some(Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn an_access_is_anywhere_past_the_most_spans_and_stays_anywhere() {
+        let mut a = Access::none();
+        a.read((0..MOST).map(|i| (0, i as u64 * 8, i as u64 * 8 + 4)));
+        assert_eq!(a.reads.as_ref().map(Vec::len), Some(MOST));
+        a.read([(0, 1 << 20, (1 << 20) + 4)]);
+        assert_eq!(a.reads, None);
+        a.read([(0, 0, 4)]);
+        assert_eq!(a.reads, None);
+        a.write([(0, 5, 5)]);
+        assert_eq!(a.writes, Some(Vec::new()), "an empty span is nothing");
+        a.write_anywhere();
+        assert_eq!(a.writes, None);
     }
 
     #[test]

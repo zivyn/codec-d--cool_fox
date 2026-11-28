@@ -5929,6 +5929,14 @@ impl Host {
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let copy_queue = f.queue.clone();
+        // With the compute queue of the host (`VICTORY_ASYNC_COMPUTE=2`) the fetch reads the copies only after the
+        // submissions of that queue in the air that write them, and those that come later wait for it ([`lanes`]).
+        let behind_compute = {
+            let mut copies: Vec<u64> = check.as_ref().map_or(&pieces, |c| &c.copies).iter().map(|p| p.0.id()).collect();
+            copies.sort_unstable();
+            copies.dedup();
+            lanes::fetching(self, &copies, &fence, sent)
+        };
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
         // been given to the queue. On the copy queue, those landed here.
@@ -5950,6 +5958,9 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
+                    if let Some((compute, value)) = behind_compute {
+                        queue.Wait(compute, value)?;
+                    }
                     queue.ExecuteCommandLists(&lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();
@@ -5962,6 +5973,9 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some((compute, value)) = behind_compute {
+                    self.queue.Wait(compute, value)?;
+                }
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -6912,7 +6926,7 @@ impl Host {
         // Or the reads are done on the card, behind the flights.
         // Which queue the submission goes to (`VICTORY_ASYNC_COMPUTE=2`): lists of the compute type to the compute queue,
         // the others to the host's; with it on everything is joined to the host's fence by the sequencer ([`lanes`]).
-        let mut route = lanes::Route::begin(self, runs);
+        let mut route = lanes::Route::begin(self, runs, *submitted + 1);
         let on_compute = route.as_ref().is_some_and(|r| r.compute());
         let own = if late && staged_number.is_none() { self.card_steps(runs, on_compute) } else { None };
         if let (Some(route), Some(own)) = (route.as_mut(), own.as_ref()) {

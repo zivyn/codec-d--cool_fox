@@ -680,3 +680,124 @@ void main() {
     // (Row 0 starts at word 0, row 3 at word 3 * 64.)
     assert_eq!((words[0], words[3 * 64 + 3]), (42, 7));
 }
+
+/// What a submission of Q2 writes of host copy 7, as the book keeps it.
+fn writes_copy(id: u64) -> Footprint {
+    let mut fp = Footprint::default();
+    fp.card_write(id, 0, u32::MAX);
+    fp.sealed()
+}
+
+/// The landing thread's fetch of a card copy (a read of the copy) on the drawing queue, with the wait on the
+/// compute queue the book names: compute writes (some of them slow), and the fetch reads after the right wait, so
+/// it sees every write that was in the air when it was made; a fetch of another copy waits for none.
+#[test]
+fn a_fetch_of_a_card_copy_reads_after_the_compute_queue_writes_it() {
+    let Some(mut h) = Harness::new() else { return };
+    let rounds = 12u64;
+    let copy = h.data();
+    let back = h.readback(rounds * 4);
+    // SAFETY: plain creation.
+    let fetch_fence: ID3D12Fence = unsafe { h.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("a fence");
+    let mut book = Book::default();
+    let mut expected = Vec::new();
+    for round in 1..=rounds {
+        let value = round as u32 * 5 + 2;
+        let slow = round % 3 != 0;
+        // The value of the copy once this write has run (the slow one stores a number of its own).
+        expected.push(if slow {
+            slow_result(value)
+        } else {
+            expected.last().copied().unwrap_or(0).wrapping_mul(3).wrapping_add(value)
+        });
+        // The submission is in the air as the route says it ([`Route::waits`], then [`Route::signal`]).
+        let fp = writes_copy(7);
+        book.announce(1, round, &fp);
+        let write = h.step(D3D12_COMMAND_LIST_TYPE_COMPUTE, slow, &copy, value);
+        Harness::run(&h.compute, &write);
+        // SAFETY: our queue and fence.
+        unsafe { h.compute.Signal(&h.fences[1], round).expect("a signal") };
+        book.sent(1, 1, round, fp);
+        // The fetch, on the drawing queue (not ordered against the compute queue but by the book).
+        let (other, same) = (
+            book.fetching(&[8], 0, &fetch_fence, round * 10),
+            book.fetching(&[3, 7], 0, &fetch_fence, round * 10 + 1),
+        );
+        assert_eq!(other, 0, "a copy nothing of the compute queue writes");
+        assert_eq!(same, round, "the newest write of the copy in the air");
+        let read = h.copy(D3D12_COMMAND_LIST_TYPE_DIRECT, &back, round - 1, &copy);
+        // SAFETY: our queues and fences; the wait is for a value queued as a signal.
+        unsafe {
+            h.direct.Wait(&h.fences[1], same).expect("a wait");
+        }
+        Harness::run(&h.direct, &read);
+        // SAFETY: as above.
+        unsafe { h.direct.Signal(&fetch_fence, round * 10 + 1).expect("a signal") };
+        assert!(h.reached(&fetch_fence, round * 10 + 1, 120_000), "round {round}: the queues stand for each other");
+        // SAFETY: a plain query.
+        assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
+    }
+    assert_eq!(h.words(&back, rounds as usize), expected);
+}
+
+/// A submission of Q2 that comes after the fetch and writes what it reads waits for the fetch's fence: the fetch
+/// (behind a slow dispatch on the drawing queue) sees what was there, not what the later write makes; a write of
+/// another copy waits for nothing, and a fetch that is done is forgotten.
+#[test]
+fn a_later_compute_write_of_a_copy_waits_for_the_fetch_that_reads_it() {
+    let Some(mut h) = Harness::new() else { return };
+    let rounds = 8u64;
+    let copy = h.data();
+    let back = h.readback(rounds * 4);
+    // SAFETY: plain creation.
+    let fetch_fence: ID3D12Fence = unsafe { h.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("a fence");
+    let mut book = Book::default();
+    let mut expected = Vec::new();
+    let mut now = 0u32;
+    for round in 1..=rounds {
+        // What is in the copy when the fetch reads it: a slow write on the drawing queue first.
+        let before = round as u32 * 11 + 3;
+        let slow = h.step(D3D12_COMMAND_LIST_TYPE_DIRECT, true, &copy, before);
+        Harness::run(&h.direct, &slow);
+        expected.push(slow_result(before));
+        // The fetch is made (noted in the book), and reads right behind it, once the CPU has looked at the book
+        // (the gate: the fetch cannot be done before).
+        let fetched = round * 2;
+        assert_eq!(book.fetching(&[7], 0, &fetch_fence, fetched), 0, "nothing of the compute queue in the air");
+        let read = h.copy(D3D12_COMMAND_LIST_TYPE_DIRECT, &back, round - 1, &copy);
+        // SAFETY: our queue and fences.
+        unsafe { h.direct.Wait(&h.fences[2], round).expect("a wait") };
+        Harness::run(&h.direct, &read);
+        // SAFETY: as above.
+        unsafe { h.direct.Signal(&fetch_fence, fetched).expect("a signal") };
+        // A write of the copy on the compute queue, made while the fetch is not done: it waits for it.
+        let write = writes_copy(7);
+        let waits = book.fetches_for(&write);
+        assert_eq!(waits.len(), 1, "round {round}");
+        assert_eq!(waits[0].1, fetched);
+        assert!(book.fetches_for(&writes_copy(8)).is_empty(), "another copy waits for nothing");
+        let after = h.step(D3D12_COMMAND_LIST_TYPE_COMPUTE, false, &copy, round as u32);
+        // SAFETY: our queue; the fence is signalled behind the fetch's list.
+        unsafe { h.compute.Wait(&waits[0].0, waits[0].1).expect("a wait") };
+        Harness::run(&h.compute, &after);
+        // SAFETY: our queue and fence; the CPU opens the gate.
+        unsafe {
+            h.compute.Signal(&h.fences[1], round).expect("a signal");
+            h.fences[2].Signal(round).expect("the gate");
+        }
+        assert!(h.reached(&h.fences[1], round, 120_000), "round {round}: the queues stand for each other");
+        now = slow_result(before).wrapping_mul(3).wrapping_add(round as u32);
+        // Done fetches are forgotten.
+        assert!(h.reached(&fetch_fence, fetched, 120_000));
+        assert!(book.fetches_for(&write).is_empty(), "a fetch that is done is not waited for");
+    }
+    assert_eq!(h.words(&back, rounds as usize), expected);
+    // The last write the compute queue made is what the copy holds now.
+    let finals = h.readback(4);
+    let read = h.copy(D3D12_COMMAND_LIST_TYPE_DIRECT, &finals, 0, &copy);
+    Harness::run(&h.direct, &read);
+    // SAFETY: our queue and fence.
+    unsafe { h.direct.Signal(&h.fences[0], 1).expect("a signal") };
+    assert!(h.reached(&h.fences[0], 1, 60_000));
+    assert_eq!(h.words(&finals, 1), [now]);
+}

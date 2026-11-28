@@ -197,6 +197,8 @@ switch is read.
 | `VICTORY_KEEP_SHOWN` | 1 | no | When a slot gets a view of another texture: 0 show nothing, 1 keep a similar one, 2 any same-dimension one. |
 | `VICTORY_LAND_ASIDE` | on (=0 turns off) | yes | Lands a submission's lists aside, on another thread, saving time on the submitting thread. |
 | `VICTORY_LAND_ECHO` | on (=0 turns off) | no | Compares pages 4 KiB at a time and sends up only those that differ from what landed. |
+| `VICTORY_LAND_OWN` | off | yes | Leaves the pieces of shader-written copies that nothing but the title's CPU can read on the card: guarded, landed only when something reads or writes them (integ card propagation, perf/card-propagate). |
+| `VICTORY_LAND_OWN_UNTAKEN` | off | yes | With VICTORY_LAND_OWN, also keeps pieces that other copies lie over when none of those copies ever took their bytes. |
 | `VICTORY_LAND_TAIL_THREADS` | off | yes | Threads for the tail of a landing; 0 uses the ordinary landing threads (max 16). |
 | `VICTORY_LANE_CORE` | off | yes | Pins the lane thread to one logical processor of one core and moves others off it. |
 | `VICTORY_LANE_HIGH` | off | yes | Gives the lane thread the highest priority of the process. |
@@ -222,6 +224,7 @@ switch is read.
 | `VICTORY_PRECISE_BARRIERS` | off | yes | Hold the title UAV waits as precise barriers. |
 | `VICTORY_PRECISE_LOOK` | off | yes | Make and keep precise write ranges beside the declarations. |
 | `VICTORY_PRECISE_WRITES` | off | yes | Declare buffer views as the precise ranges a shader writes. |
+| `VICTORY_PROP_COUNT` | off | yes | Counts per frame the bytes landed GPU to title memory, refreshed title memory to copies and their overlap, with CPU estimates (a diagnostics line). |
 | `VICTORY_QUICK_FIND` | on (=0 turns off) | no | Keep the table of found buffers. |
 | `VICTORY_QUIET_COMPARE` | off | yes | Compare copies against the CPU side and note only what differs. |
 | `VICTORY_QUIET_COPIES` | on (=0 turns off) | no | Keep working buffers of upscalers from being copied whole at every refresh. |
@@ -513,6 +516,10 @@ translation of shaders.
 | `VICTORY_LAND_BESIDE` | on (=0 turns off) | flag |  |  |  | Writes views of guest pages through one of our own mappings. |
 | `VICTORY_LAND_ECHO` | on (=0 turns off) | flag |  | live |  | Compares pages 4 KiB at a time and sends up only those that differ from what landed. |
 | `VICTORY_LAND_LAZY` | off | flag |  |  |  | Makes the tail's landing lazy: the guest is told the copy is owed and it lands later. |
+| `VICTORY_LAND_OWN` | off | flag |  | live |  | Leaves the pieces of shader-written copies that nothing but the title's CPU can read on the card: guarded, landed only when something reads or writes them. |
+| `VICTORY_LAND_OWN_FORCED` | 8 | number |  |  |  | How many landings of a copy's kept pieces our own readers may force before the copy lands eagerly for good. |
+| `VICTORY_LAND_OWN_MB` | 384 | number |  |  |  | Megabytes of kept pieces' bytes; over it, pieces land as before. |
+| `VICTORY_LAND_OWN_UNTAKEN` | off | flag |  | live |  | With VICTORY_LAND_OWN, also keeps pieces that other copies lie over when none of those copies ever took their bytes. |
 | `VICTORY_LAND_QUIET` | off | flag |  |  |  | Leaves large copies out of landings. |
 | `VICTORY_LAND_QUIET_MIN_KB` | 1024 | number |  |  |  | Smallest copy in KiB that quiet landing leaves out. |
 | `VICTORY_LAND_SKIP` | off | flag |  |  |  | Skips landing blocks the guest already had (counted either way). |
@@ -628,6 +635,7 @@ translation of shaders.
 | `VICTORY_PRECISE_LOOK` | off | flag |  | live |  | Make and keep precise write ranges beside the declarations. |
 | `VICTORY_PRECISE_WAITS` | n/a | flag |  |  |  | Names a stage of the precise barrier model. |
 | `VICTORY_PRECISE_WRITES` | off | flag |  | live |  | Declare buffer views as the precise ranges a shader writes. |
+| `VICTORY_PROP_COUNT` | off | flag |  |  | diag | Counts per frame the bytes landed GPU to title memory, refreshed title memory to copies and their overlap (landed to be taken by another copy), with the CPU of each from the landing stamps; one line with the frame line. |
 | `VICTORY_PRECOMPILED` | off | text |  |  |  | Answer pipelines from precompiled pieces: 1, fsr or upscaler for the upscaler, all for any. |
 | `VICTORY_PRECOMPILED_CALLER` | n/a | text |  |  |  | Module name (lower case) that marks a call as coming from the upscaler. |
 | `VICTORY_PRESSURE_LEGACY` | off | flag |  |  |  | Use the memory bounds of a 32 GiB PC on every PC. |

@@ -384,6 +384,8 @@ fn make(dir: &Path, these: &str, shard: Option<PathBuf>) -> Result<()> {
             let _ = std::fs::write(shard.with_extension("keys"), made.join(","));
         }
     };
+    // (After the host is up, which the first library call needs: the cache's library is the first place to look.)
+    let _ = known::use_cache_library(dir);
     known::make(dir, &these, |n, came| {
         let told = match came {
             None => writeln!(out, "at {n}"),

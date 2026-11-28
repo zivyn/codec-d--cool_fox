@@ -545,6 +545,20 @@ pub(crate) fn use_shards(files: &[PathBuf]) {
     *SHARDS.write().unwrap_or_else(|e| e.into_inner()) = shards;
 }
 
+/// From now on a pipeline the library does not have is also looked for in the library file `dir` holds
+/// (a cache a build before made, copied or kept): a `victory warm` process, which starts with an empty
+/// library of its own, then loads what the build before compiled with the same DXIL instead of compiling
+/// it again. What it finds is stored into its own library, so its shard carries it into the cache's
+/// library as any pipeline it made. False if there is no such file.
+pub(crate) fn use_cache_library(dir: &std::path::Path) -> bool {
+    let file = dir.join(LIBRARY_FILE);
+    if !file.is_file() {
+        return false;
+    }
+    use_shards(&[file]);
+    true
+}
+
 /// Writes the pipelines this process made, as a library, to `path` (a
 /// `victory warm` process, whose pipelines the merging process takes into the
 /// cache's library): nothing if there is nothing new since the last call.
@@ -896,6 +910,31 @@ mod tests {
         assert_ne!(a, name("mesh", b"root", &[b"vs", b"ps"], "state"));
         // Parts do not run into each other.
         assert_ne!(a, name("graphics", b"root", &[b"vsp", b"s"], "state"));
+    }
+
+    /// A cache copied from the build before is safe to use: a program's name in the library is made
+    /// of its DXIL, the root signature and the state, so of 50 programs of which one's DXIL changes,
+    /// exactly that one has another name (a miss), the 49 others have the name they had.
+    #[test]
+    fn of_two_builds_only_the_program_whose_code_changed_has_another_name() {
+        let code = |build: u32, n: u32| format!("dxil of program {n}{}", if build == 2 && n == 17 { " changed" } else { "" });
+        let names = |build| {
+            (0..50)
+                .map(|n| name("compute", b"root", &[code(build, n).as_bytes()], ""))
+                .collect::<Vec<_>>()
+        };
+        let (old, new) = (names(1), names(2));
+        let changed: Vec<usize> = (0..50).filter(|&n| old[n] != new[n]).collect();
+        assert_eq!(changed, [17]);
+        // And no two programs share a name, in either build.
+        assert_eq!(old.iter().collect::<HashSet<_>>().len(), 50);
+        assert_eq!(new.iter().collect::<HashSet<_>>().len(), 50);
+    }
+
+    #[test]
+    fn a_folder_without_a_library_is_not_a_place_to_look() {
+        let dir = std::env::temp_dir().join("victory-no-library-here");
+        assert!(!use_cache_library(&dir));
     }
 
     #[test]

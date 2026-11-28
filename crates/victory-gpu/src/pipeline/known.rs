@@ -339,6 +339,12 @@ pub fn library_counts() -> (u64, u64) {
     (super::library::MADE.load(Relaxed), super::library::LOADED.load(Relaxed))
 }
 
+/// A `victory warm` process looks in the cache's pipeline library (the file in `dir`) before it compiles:
+/// a cache copied from the build before has every pipeline whose DXIL did not change.
+pub fn use_cache_library(dir: &Path) -> bool {
+    super::library::use_cache_library(dir)
+}
+
 /// What a `victory warm` process made so far, saved as a library at `path`
 /// (false if nothing is new).
 pub fn save_shard(path: &Path) -> bool {

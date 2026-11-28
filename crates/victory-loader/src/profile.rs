@@ -1,4 +1,7 @@
-//! Where the process's time goes: `VICTORY_PROFILE=<from>,<to>,<ms>,<file>`
+//! Where the process's time goes. `VICTORY_PROFILE=<hz>` is the whole-process sampling profiler
+//! (`sampler.rs`); the list below is the first one, kept for the runs that use it.
+//!
+//! `VICTORY_PROFILE=<from>,<to>,<ms>,<file>`
 //! samples the stacks of the busiest threads every `<ms>` milliseconds
 //! between two times (seconds, as `VICTORY_STACKS`), and writes them counted
 //! to `<file>` at the end (several of them, one after another, with `;`
@@ -58,14 +61,24 @@ fn cpu(thread: HANDLE) -> u64 {
     of(&t[2]) + of(&t[3])
 }
 
-/// Reads `VICTORY_PROFILE` and, if set, starts the thread that samples.
-/// `phase` is asked at each round.
-pub fn profile_on_schedule(phase: fn() -> u32) {
+/// Reads `VICTORY_PROFILE` and, if set, starts the thread that samples: the whole-process profiler
+/// if it is a rate (`1000`), else the list of times. `phase` is asked at each round; `dir` is where the
+/// files go if the run has no capture folder.
+pub fn profile_on_schedule(phase: fn() -> u32, dir: std::path::PathBuf) {
     let Ok(list) = std::env::var("VICTORY_PROFILE") else {
         return;
     };
+    let from_env = |name: &str| std::env::var(name).ok();
+    if let Some(cfg) = crate::sampler::Config::from_env(&list, &from_env, &dir) {
+        crate::sampler::start(cfg, phase);
+        return;
+    }
     let start = Instant::now();
     let all: Vec<_> = list.split(';').filter_map(asked).collect();
+    if all.is_empty() {
+        eprintln!("VIctory: VICTORY_PROFILE={list} is neither a rate (1000) nor from,to,ms,file");
+        return;
+    }
     std::thread::spawn(move || {
         for one in all {
             profile(one, start, phase);

@@ -31,6 +31,8 @@ pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
+#[cfg(all(windows, any(feature = "diagnostics", test)))]
+mod sampler;
 // (The code of these two is built, and its tests run, in every build; only the threads that use them are diagnostics.)
 #[cfg(windows)]
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]

@@ -311,6 +311,7 @@ This table is a selection: every `VICTORY_*` variable, with its default, is in [
 |----------|--------|
 | `VICTORY_LOG=<target>=debug,...` | debug and trace output |
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
+| `VICTORY_PROFILE=1000` | (diagnostics build) the whole process sampled 1000 times a second, every thread, with the title's: folded stacks, a report with the top functions of each thread group (`VICTORY_PROFILE_FROM`/`_TO`/`_FOR`/`_START_FILE` choose the time, `_FILE` where it goes); read with `prof-read.py` against the PDB of the same `victory-diag.exe`. See [switches.md](switches.md) |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_WATCHDOG_HOLD=0` | (any build) our stalls (a frame recording, host pipelines made on a title thread) no longer pause the title's hang watchdog; on by default |

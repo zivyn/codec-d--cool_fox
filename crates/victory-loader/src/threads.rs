@@ -84,6 +84,9 @@ const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 /// `DLL_PROCESS_DETACH`, DLLs in reverse initialisation order, then the
 /// exe's TLS callbacks; then the CRT ends the process.
 extern "C" fn detach_all() {
+    // The sampling profiler writes its files while every thread is still there.
+    #[cfg(feature = "diagnostics")]
+    crate::sampler::finish();
     let attached: Vec<_> = images()
         .iter_mut()
         .filter(|m| m.attached)

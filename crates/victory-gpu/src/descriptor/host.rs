@@ -3284,6 +3284,18 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+        self.constant_view(index, buffer, None, gpu, size);
+    }
+
+    /// [`HostHeap::constant_at`] for a buffer that the caller holds as `held`
+    /// (`Some(buffer.clone())`) for all the slots it makes: a slot that already
+    /// shows it takes no further hold of it, and the others take one when they
+    /// show it, as `constant_at` makes them.
+    pub(crate) fn constant_at_held(&self, index: u32, buffer: &ID3D12Resource, held: &Kept, gpu: u64, size: u32) {
+        self.constant_view(index, buffer, Some(held), gpu, size);
+    }
+
+    fn constant_view(&self, index: u32, buffer: &ID3D12Resource, held: Option<&Kept>, gpu: u64, size: u32) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3322,7 +3334,10 @@ impl HostHeap {
         self.write_stride(index, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        match held {
+            Some(held) => self.keep_ref(index, if holds { held } else { &None }),
+            None => self.keep(index, holds.then(|| buffer.clone())),
+        }
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -5423,6 +5438,36 @@ mod tests {
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// Slots made with the buffer held once by the caller (`VICTORY_LEAN_STEPS`)
+    /// show it as slots made by `constant_at` do, whether they showed it before
+    /// or not, and the device stays.
+    #[test]
+    fn slots_made_with_one_hold_show_the_buffer() {
+        use windows::core::Interface;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some((buffer, _)) = host.upload_buffer(1 << 20) else {
+            return;
+        };
+        // SAFETY: a live upload buffer.
+        let at = unsafe { buffer.GetGPUVirtualAddress() };
+        heap.constant_at(1, &buffer, at, 480);
+        let held = Some(buffer.clone());
+        heap.constant_at_held(2, &buffer, &held, at + 512, 480);
+        // Again: the slot shows it already.
+        heap.constant_at_held(2, &buffer, &held, at + 1024, 480);
+        heap.constant_at_held(1, &buffer, &held, at + 1024, 480);
+        for index in [1, 2] {
+            assert_eq!(heap.kept_in(index).map(|b| b.as_raw()), Some(buffer.as_raw()), "slot {index}");
+        }
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// A null 3D UAV made on the real device leaves it alive.

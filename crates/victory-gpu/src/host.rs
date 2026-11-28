@@ -2947,6 +2947,23 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
     *ranges = out;
 }
 
+/// Whether a submission's steps are prepared with the leaner bookkeeping
+/// (`VICTORY_LEAN_STEPS=1`; off by default): the tables it makes by copy
+/// are the thread's kept ones ([`scratch`]), the list of what its steps do
+/// (`card_steps::does_of`) leaves out the 21,000 refreshes the plan never
+/// looks at, a refresh that comes behind another of the same copy does not
+/// look the copy up again (`Batch::add`), and the slots the card's steps
+/// make are made with one hold on their buffer and one look at the heap for
+/// each thread (`descriptor::constant_slots`), not for each slot.
+///
+/// The steps, the refreshes and the descriptors that come out are the same:
+/// only where the memory of the tables comes from, how often a table is
+/// asked, and how many holds are taken differ.
+fn lean_steps() -> bool {
+    // (May change while the title runs, `VICTORY_AB`: each use reads it once, and a submission's tables and lists are its own.)
+    crate::ab::live_flag!("VICTORY_LEAN_STEPS")
+}
+
 /// Whether anything is in the air.
 fn flying() -> bool {
     if !late() {
@@ -3372,7 +3389,11 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
+    // (With `VICTORY_LEAN_STEPS` the thread's kept table: only looked up.)
+    thread_local! {
+        static PLACES: std::cell::RefCell<ByCopy<Option<usize>>> = std::cell::RefCell::new(ByCopy::default());
+    }
+    let mut places = scratch::Lean::of(&PLACES, lean_steps());
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
@@ -4056,6 +4077,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 mod prefetch;
+mod scratch;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
@@ -6390,7 +6412,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch::new(lean_steps());
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -6403,7 +6425,11 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+            // (With `VICTORY_LEAN_STEPS` the thread's kept table: the ranges are what it holds at the end.)
+            thread_local! {
+                static ASKED: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
+            }
+            let mut spans = scratch::Lean::of(&ASKED, batch.lean);
             for list in runs {
                 for step in &list.deferred().copies {
                     if let Step::Refresh(shadow, address, len) = step
@@ -6416,7 +6442,8 @@ impl Host {
                     }
                 }
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            let ranges: Vec<(usize, usize)> = spans.values().copied().collect();
+            drop(spans);
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -8220,6 +8247,7 @@ impl HostList {
     /// lists of a submission, through many ranges). Copies and fills that
     /// `taken` names (by their place) are left out: they are done on the
     /// card ([`card_steps`]).
+    #[inline(never)]
     fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
@@ -8619,6 +8647,17 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// With [`lean_steps`] (read once, when the submission begins): the copy
+    /// looked up last in `ahead` is remembered.
+    lean: bool,
+    /// The copy `add` looked at last (0: none), and what `ahead` held for it:
+    /// `Some((from, to))` if one range, else `None` (no range, or several: the
+    /// table is looked at). Forgotten whenever `ahead` changes.
+    memo: (usize, Option<(usize, usize)>),
+    /// A range was put into `ahead` that does not begin past the end of the one
+    /// before it in its copy's list: the lists are not looked through by
+    /// bisection.
+    unsorted: bool,
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -9013,11 +9052,66 @@ fn wide_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_TEXTURES").is_none_or(|v| v != "0") && wide_refresh())
 }
 
+/// Whether one of `ranges` holds `[address, end)`. With `sorted` (they are in order and do not overlap: each begins
+/// past the end of the one before) the one that could is found by bisection; else every one is looked at.
+fn ranges_cover(ranges: &[(usize, usize)], address: usize, end: usize, sorted: bool) -> bool {
+    if !sorted || ranges.len() <= 8 {
+        return ranges.iter().any(|&(from, to)| from <= address && end <= to);
+    }
+    // The last that begins at or before the address is the only one that can hold it.
+    let at = ranges.partition_point(|r| r.0 <= address);
+    at > 0 && end <= ranges[at - 1].1
+}
+
 impl Batch {
+    /// A batch for a submission's steps (`lean`: [`lean_steps`], read once).
+    fn new(lean: bool) -> Batch {
+        Batch { lean, ..Batch::default() }
+    }
+
+    /// Whether what `ahead` holds for the copy `key` covers `[address, end)`
+    /// in one range: it is refreshed ahead of the steps already.
+    fn covered(&mut self, key: usize, address: usize, end: usize) -> bool {
+        if !self.lean {
+            return self.ahead.get(&key).is_some_and(|ranges| ranges.iter().any(|&(from, to)| from <= address && end <= to));
+        }
+        // The steps of a list come several on end for one copy (the views of a draw), and what is refreshed ahead
+        // of most copies is one range: the copy is looked up when it is not the one before.
+        if self.memo.0 != key {
+            let one = self.ahead.get(&key).and_then(|ranges| if ranges.len() == 1 { Some(ranges[0]) } else { None });
+            self.memo = (key, one);
+        }
+        match self.memo.1 {
+            Some((from, to)) => from <= address && end <= to,
+            None => self.ahead.get(&key).is_some_and(|ranges| ranges_cover(ranges, address, end, !self.unsorted)),
+        }
+    }
+
+    /// What is refreshed ahead of the steps is no more, for `copy` or for all.
+    fn forget_ahead(&mut self, copy: Option<usize>) {
+        match copy {
+            Some(copy) => {
+                self.ahead.remove(&copy);
+            }
+            None => self.ahead.clear(),
+        }
+        self.memo = (0, None);
+    }
+
+    /// Puts `[from, to)` among what is refreshed ahead of the steps for `copy`.
+    fn put_ahead(&mut self, copy: usize, from: usize, to: usize) {
+        let ranges = self.ahead.entry(copy).or_default();
+        if ranges.last().is_some_and(|last| from < last.1) {
+            self.unsorted = true;
+        }
+        ranges.push((from, to));
+        self.memo = (0, None);
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.ahead.get(&key).is_some_and(|ranges| ranges.iter().any(|&(from, to)| from <= address && end <= to)) {
+        if self.covered(key, address, end) {
             return;
         }
         if narrow_on() {
@@ -9041,7 +9135,7 @@ impl Batch {
         // From here on it is refreshed around what the shaders write. (What
         // is in front of all the steps was, up to here.)
         if !self.front {
-            self.ahead.remove(&(std::sync::Arc::as_ptr(shadow) as usize));
+            self.forget_ahead(Some(std::sync::Arc::as_ptr(shadow) as usize));
         }
         let Some(at) = self.index.remove(&(std::sync::Arc::as_ptr(shadow) as usize)) else {
             return;
@@ -9102,16 +9196,22 @@ impl Batch {
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
         self.flush();
-        self.ahead.clear();
+        self.forget_ahead(None);
         self.textures.clear();
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
-        let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
+        // (With `VICTORY_LEAN_STEPS` the thread's kept table and list, emptied: the copies' holds are let go at the
+        // end, with the list of what the steps touch, whichever way they go out of this function.)
+        thread_local! {
+            static COPIES: std::cell::RefCell<ByCopy<std::sync::Arc<crate::shadow::Shadow>>> = std::cell::RefCell::new(ByCopy::default());
+            static TOUCHES: std::cell::RefCell<Vec<Touch>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut copies = scratch::Lean::of(&COPIES, self.lean);
         let mut due = Vec::new();
-        let mut touches = Vec::new();
+        let mut touches = scratch::Lean::of(&TOUCHES, self.lean);
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);
@@ -9148,13 +9248,13 @@ impl Batch {
         } else {
             Vec::new()
         };
-        let spans: Vec<_> = front_spans_gap(touches.into_iter(), refresh_narrow_gap())
+        let spans: Vec<_> = front_spans_gap(touches.drain(..), refresh_narrow_gap())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         self.front = true;
         for (shadow, from, to) in &spans {
-            self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((*from, *to));
+            self.put_ahead(std::sync::Arc::as_ptr(shadow) as usize, *from, *to);
         }
         let span_ranges: Vec<(usize, usize, usize)> = if checking {
             spans.iter().map(|(shadow, from, to)| (std::sync::Arc::as_ptr(shadow) as usize, *from, *to)).collect()
@@ -9272,7 +9372,7 @@ impl Batch {
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
         for (shadow, from, to) in &due {
-            self.ahead.entry(std::sync::Arc::as_ptr(shadow) as usize).or_default().push((*from, *to));
+            self.put_ahead(std::sync::Arc::as_ptr(shadow) as usize, *from, *to);
         }
         REFRESH_SIZE[3].fetch_add(due.len() as u64, Ordering::Relaxed);
         REFRESH_SIZE[4].fetch_add(due.iter().map(|s| (s.2 - s.1) as u64).sum(), Ordering::Relaxed);
@@ -11972,8 +12072,108 @@ mod refresh_tests {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, ranges_cover};
     use std::sync::Arc;
+
+    /// A small generator of numbers (xorshift).
+    struct Dice(u64);
+
+    impl Dice {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as usize % n
+        }
+    }
+
+    /// By bisection or by looking at all, a range is held by the same ranges when they are in order and apart; and
+    /// whatever the ranges, with `sorted` false every one is looked at.
+    #[test]
+    fn ranges_that_are_apart_are_looked_through_by_bisection() {
+        let mut dice = Dice(0x2545_f491_4f6c_dd1d);
+        for _ in 0..3000 {
+            let mut ranges = Vec::new();
+            let mut at = dice.below(50);
+            for _ in 0..dice.below(40) {
+                let len = dice.below(30);
+                ranges.push((at, at + len));
+                at += len + dice.below(30);
+            }
+            for _ in 0..60 {
+                let address = dice.below(at + 40);
+                let end = address + dice.below(12);
+                let all = ranges.iter().any(|&(from, to)| from <= address && end <= to);
+                assert_eq!(ranges_cover(&ranges, address, end, true), all, "{ranges:?} {address} {end}");
+                assert_eq!(ranges_cover(&ranges, address, end, false), all);
+            }
+            // Ranges that overlap and nest, looked through whole.
+            let mut tangled: Vec<(usize, usize)> = Vec::new();
+            for _ in 0..dice.below(30) {
+                let from = dice.below(200);
+                tangled.push((from, from + dice.below(120)));
+            }
+            tangled.sort_unstable_by_key(|r| std::cmp::Reverse(r.1 - r.0));
+            for _ in 0..60 {
+                let address = dice.below(300);
+                let end = address + dice.below(12);
+                let all = tangled.iter().any(|&(from, to)| from <= address && end <= to);
+                assert_eq!(ranges_cover(&tangled, address, end, false), all);
+            }
+        }
+    }
+
+    /// What a batch adds to its refreshes, or leaves because the copy is refreshed ahead of the steps already, is the same with the
+    /// lean bookkeeping as without, whatever comes between: ranges put ahead (in order or not, one or several for a copy),
+    /// ranges forgotten (one copy's, or all), the copies' steps on end or alternating.
+    #[test]
+    fn a_lean_batch_adds_what_a_plain_one_adds() {
+        use crate::shadow::Shadow;
+        let mut dice = Dice(0x9E37_79B9_7F4A_7C15);
+        let memory = vec![0u8; 4096];
+        let copies: Vec<Arc<Shadow>> = (0..9).map(|i| Shadow::unbacked(0x10_0000 * (i + 1), memory.as_ptr().cast_mut(), 4096, false)).collect();
+        let key = |c: &Arc<Shadow>| Arc::as_ptr(c) as usize;
+        let seen = |b: &Batch| b.refreshes.iter().map(|(c, from, to)| (key(c), *from, *to)).collect::<Vec<_>>();
+        let (mut covered, mut open) = (0, 0);
+        for trial in 0..400 {
+            let (mut plain, mut lean) = (Batch::new(false), Batch::new(true));
+            for step in 0..200 {
+                let c = &copies[if dice.below(3) == 0 { dice.below(copies.len()) } else { (step / 7) % copies.len() }];
+                let base = 0x10_0000 * (copies.iter().position(|x| Arc::ptr_eq(x, c)).unwrap() + 1);
+                match dice.below(12) {
+                    0 | 1 => {
+                        // In order and apart, or not.
+                        let from = base + dice.below(3000);
+                        let to = if trial % 3 == 0 { from + dice.below(400) } else { base + 3000 + dice.below(1000) };
+                        for b in [&mut plain, &mut lean] {
+                            b.put_ahead(key(c), from, to);
+                        }
+                    }
+                    2 => {
+                        let copy = (dice.below(2) == 0).then(|| key(c));
+                        for b in [&mut plain, &mut lean] {
+                            b.forget_ahead(copy);
+                        }
+                    }
+                    _ => {
+                        let at = base + dice.below(4000);
+                        let len = dice.below(300);
+                        let (a, b) = (plain.covered(key(c), at, at + len), lean.covered(key(c), at, at + len));
+                        assert_eq!(a, b, "trial {trial} step {step}: {at:#x}+{len}");
+                        if a {
+                            covered += 1;
+                        } else {
+                            open += 1;
+                        }
+                        plain.add(c, at, len);
+                        lean.add(c, at, len);
+                    }
+                }
+                assert_eq!(seen(&plain), seen(&lean), "trial {trial} step {step}");
+            }
+        }
+        assert!(covered > 500 && open > 500, "{covered} covered, {open} not");
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

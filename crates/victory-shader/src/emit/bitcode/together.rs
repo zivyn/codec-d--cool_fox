@@ -72,10 +72,13 @@ impl Audit {
             parts.truncate(6);
             parts.join(",")
         };
+        let pair = |v: &[Finding]| v.iter().filter(|f| f.why.starts_with("(pair wait)")).count();
         format!(
-            "barriers={} waits={} loops={} nest={} differs={} [{}] loaded={} [{}]",
+            "barriers={} waits={} (pair differs {}, loaded {}) loops={} nest={} differs={} [{}] loaded={} [{}]",
             self.barriers,
             self.waits,
+            pair(&self.differs),
+            pair(&self.loaded),
             self.loops,
             self.nest,
             self.differs.len(),

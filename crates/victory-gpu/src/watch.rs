@@ -5226,8 +5226,8 @@ mod many_askers_tests {
     #[test]
     fn no_write_to_views_is_lost_between_askers_in_stripes() {
         for shards in [64, 2] {
-            writes_to_views_are_not_lost_with::<1>(0, shards);
-            writes_to_views_are_not_lost_with::<1>(50, shards);
+            writes_to_views_are_not_lost_with::<1, 12, 3>(0, shards);
+            writes_to_views_are_not_lost_with::<1, 12, 3>(50, shards);
         }
     }
 
@@ -5236,9 +5236,18 @@ mod many_askers_tests {
     #[test]
     fn no_write_through_another_view_is_lost_between_askers_in_stripes() {
         for shards in [64, 3] {
-            writes_to_views_are_not_lost_with::<3>(0, shards);
-            writes_to_views_are_not_lost_with::<3>(50, shards);
+            writes_to_views_are_not_lost_with::<3, 12, 3>(0, shards);
+            writes_to_views_are_not_lost_with::<3, 12, 3>(50, shards);
         }
+    }
+
+    /// The same over views of 140 blocks (three units), asked about in spans
+    /// of up to 70 blocks, so that an asking is several pieces and the pieces
+    /// of several threads meet in the stripes of the units.
+    #[test]
+    fn no_write_is_lost_across_the_units_of_a_view() {
+        writes_to_views_are_not_lost_with::<3, 140, 70>(0, 64);
+        writes_to_views_are_not_lost_with::<1, 140, 70>(50, 2);
     }
 
     /// The same while the mode changes between every two rounds of each
@@ -5246,8 +5255,8 @@ mod many_askers_tests {
     /// stripes never work at once.
     #[test]
     fn no_write_is_lost_when_the_mode_of_the_guards_changes() {
-        writes_to_views_are_not_lost_with::<3>(0, MIXED);
-        writes_to_views_are_not_lost_with::<1>(50, MIXED);
+        writes_to_views_are_not_lost_with::<3, 12, 3>(0, MIXED);
+        writes_to_views_are_not_lost_with::<1, 12, 3>(50, MIXED);
     }
 
     /// The same of pages shown at three addresses, each of which has copies
@@ -5274,13 +5283,14 @@ mod many_askers_tests {
     }
 
     fn writes_to_views_are_not_lost<const VIEWS: usize>(rest: u64) {
-        writes_to_views_are_not_lost_with::<VIEWS>(rest, 0);
+        writes_to_views_are_not_lost_with::<VIEWS, 12, 3>(rest, 0);
     }
 
-    fn writes_to_views_are_not_lost_with<const VIEWS: usize>(rest: u64, mode: usize) {
+    /// `PAGES` blocks in each view; a thread asks about up to `SPAN` blocks
+    /// either side of the one it wrote.
+    fn writes_to_views_are_not_lost_with<const VIEWS: usize, const PAGES: usize, const SPAN: usize>(rest: u64, mode: usize) {
         tune(mode, 0);
         let rest = std::time::Duration::from_micros(rest);
-        const PAGES: usize = 12;
         const THREADS: usize = 8;
         // SAFETY: views of a section of our own.
         let (section, all): (usize, [usize; VIEWS]) = unsafe {
@@ -5351,8 +5361,8 @@ mod many_askers_tests {
                     for round in 0..500 {
                         tune(mode, round);
                         let page = next(PAGES);
-                        let from = page - next(page.min(3) + 1);
-                        let to = page + 1 + next((PAGES - page).min(3));
+                        let from = page - next(page.min(SPAN) + 1);
+                        let to = page + 1 + next((PAGES - page).min(SPAN));
                         // Written through one view, asked about at another.
                         let (through, asked) = (all[next(VIEWS)], next(VIEWS));
                         #[allow(unused_assignments)]
@@ -5423,7 +5433,8 @@ mod many_askers_tests {
                 });
             }
         });
-        assert!(by_bits.into_inner() > 0, "the bits answered none");
+        // (A span of many blocks is seldom all clean at once.)
+        assert!(SPAN > 3 || by_bits.into_inner() > 0, "the bits answered none");
         assert!(past.into_inner() > 0, "nothing was put past the guards");
         assert!(title_beside.into_inner() > 0, "nothing of the title's was put in beside the guards");
         // (The view stays: at its address other tests' memory would be told
@@ -5602,7 +5613,8 @@ mod many_askers_tests {
             stop.store(true, Ordering::Relaxed);
             assert_eq!(failed, 0);
         });
-        assert!(by_bits.into_inner() > 0, "the bits answered none");
+        // (A span of many blocks is seldom all clean at once.)
+        assert!(SPAN > 3 || by_bits.into_inner() > 0, "the bits answered none");
         // All unmapped: known whole, and nothing but holes.
         writes(at, end, true).expect("a view");
         assert!(super::published(at, end));

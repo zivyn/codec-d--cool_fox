@@ -4698,6 +4698,9 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        if meeting_mode() & 1 != 0 {
+            super::wide_class::note_barrier(self.cur_ir);
+        }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -6103,6 +6106,9 @@ impl<'a> Lower<'a> {
                 if !waits {
                     mode &= !1;
                 }
+                if mode & 1 != 0 {
+                    super::wide_class::note_barrier(self.cur_ir);
+                }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
                 self.s
@@ -6161,6 +6167,9 @@ impl<'a> Lower<'a> {
         if self.pair_meet {
             self.pair_wait(self.cur);
             return;
+        }
+        if meeting_mode() & 1 != 0 {
+            super::wide_class::note_barrier(self.cur_ir);
         }
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;

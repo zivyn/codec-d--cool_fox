@@ -19,12 +19,9 @@ pub enum Form {
     WithoutSkipsDeep,
     /// The skips and early-outs `VICTORY_KEEP_LOOP_SKIPS` keeps over a loop, taken by the whole
     /// wave (the two host waves exchange the decision and go the same way), the rest as in the
-    /// form without skips: the barriers are at those branches, outside the loops. Exact.
+    /// form without skips; only where no branch of it can hang the thread group
+    /// ([`super::wide_class`]). Exact.
     KeptSkipsWide,
-    /// The skips and early-outs over loops left out as before `VICTORY_KEEP_LOOP_SKIPS`, where the
-    /// wave-wide form does not lower: every lane walks the loop, and a wave with no lane left runs
-    /// it to its limit where its exit reads a lane that is off. Exact, and slower there.
-    LoopSkipsLeftOut,
     /// Each host wave a wave of its own, where the wave operations are the allocation idiom. Exact.
     LocalIdiom,
     /// Each host wave a wave of its own, the wave operations answering per half. APPROXIMATE.
@@ -44,25 +41,38 @@ pub enum Form {
     Refused,
 }
 
-/// `VICTORY_KEPT_SKIPS_WIDE=1`: `VICTORY_KEEP_LOOP_SKIPS` applies to the forms of a program that
-/// has to be retried: the skips and early-outs over loops are kept and taken wave-wide
-/// ([`Form::KeptSkipsWide`]), with the forms with them left out after it. Off unless asked for:
-/// that form puts group barriers at branches (its wide set can reach into loops), the shape
-/// that lost the card, and kept skips took exact forms away from 32 programs of the title. Without
-/// it the forms are those of a program without the switch. Part of the translation: the shader
-/// cache keys on the variable.
-pub(super) fn kept_skips_wide() -> bool {
+/// How much of the kept skips' wave-wide form `VICTORY_KEPT_SKIPS_WIDE` allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// `=0`: none.
+    Off,
+    /// The default: where no branch of the form can hang the thread group (class A or B,
+    /// [`super::wide_class`]).
+    Safe,
+    /// `=all`: whatever the classes say (to see the form the title lost the card in).
+    All,
+}
+
+/// `VICTORY_KEPT_SKIPS_WIDE`: with `VICTORY_KEEP_LOOP_SKIPS`, the skips and early-outs over loops of
+/// a program that has to be retried are kept and taken wave-wide ([`Form::KeptSkipsWide`],
+/// [`super::kept_wide`]), where that is safe. Part of the translation: the shader cache keys on
+/// the variable.
+pub(super) fn kept_skips_mode() -> Mode {
     #[cfg(test)]
-    if let Some(on) = TEST_KEPT_SKIPS_WIDE.get() {
-        return on;
+    if let Some(mode) = TEST_KEPT_SKIPS_WIDE.get() {
+        return mode;
     }
-    std::env::var_os("VICTORY_KEPT_SKIPS_WIDE").is_some_and(|v| v == "1")
+    match std::env::var("VICTORY_KEPT_SKIPS_WIDE").ok().as_deref().map(str::trim) {
+        Some("0") => Mode::Off,
+        Some("all") => Mode::All,
+        _ => Mode::Safe,
+    }
 }
 
 #[cfg(test)]
 thread_local! {
     /// A test's `VICTORY_KEPT_SKIPS_WIDE`, for its thread only.
-    pub(super) static TEST_KEPT_SKIPS_WIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    pub(super) static TEST_KEPT_SKIPS_WIDE: std::cell::Cell<Option<Mode>> = const { std::cell::Cell::new(None) };
 }
 
 impl Form {
@@ -79,7 +89,6 @@ impl Form {
             Form::WithoutSkips => "without skips",
             Form::WithoutSkipsDeep => "without skips, scalars followed",
             Form::KeptSkipsWide => "kept skips wave-wide",
-            Form::LoopSkipsLeftOut => "loop skips left out",
             Form::LocalIdiom => "local waves (idiom)",
             Form::LocalApproximate => "local waves (APPROXIMATE)",
             Form::LocalApproximateAnyMask => "local waves (APPROXIMATE, any mask)",

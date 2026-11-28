@@ -164,6 +164,7 @@ switch is read.
 | `VICTORY_CLOSED_IDLE` | on (=0 turns off) | yes | Whether an idle host command list is kept closed instead of open as a reset leaves it. |
 | `VICTORY_COPY_BESIDE` | off | no | Copies of title memory put bytes beside the write guards. |
 | `VICTORY_DROP_EARLY` | off | yes | Leaves out calls that only feed dispatches the host drops. |
+| `VICTORY_DSP_CONVOLVE` | off | no | Computes the audio DSP's mono 1024-frame convolutions (TVs, phone calls, reverb) from the title's own impulse responses; those streams were silence (`VICTORY_DSP_REVERB` stands in only where this does not apply). From VIctory-NVIDIA#77 (Yve), with a faster convolver. |
 | `VICTORY_DSP_REVERB` | off | no | Runs convolution audio streams through a stand-in algorithmic reverb. |
 | `VICTORY_DSP_REVERB_LEVEL` | 1.0 | no | Output level of the stand-in reverb. |
 | `VICTORY_FOLD_VIEWS` | off | yes | Folds view heap indexing into raw user data in draws and shaders. |
@@ -368,6 +369,10 @@ translation of shaders.
 | `VICTORY_DISPLAY_MODE` | 3840x2160 | text |  |  |  | WxH display size reported to the title. |
 | `VICTORY_DRIVER_CACHE` | off | text |  |  |  | =off turns the driver's and runtime's shader caches off for this process. |
 | `VICTORY_DROP_EARLY` | off | flag |  | live |  | Leaves out calls that only feed dispatches the host drops. |
+| `VICTORY_DSP_CONVOLVE` | off | flag |  | live |  | Computes the audio DSP's mono 1024-frame convolutions from the title's impulse responses (TVs, phone calls, reverb). |
+| `VICTORY_DSP_CONVOLVE_CHECK` | on (=0 turns off) | flag |  |  |  | Whether a response is checked to be in the layout read (windows agree with their neighbours in time) before it is used; `=0` takes it as it is. |
+| `VICTORY_DSP_CONVOLVE_GAIN` | 2.0 | number |  | live |  | Scale of the computed convolutions (the PR picked 2 by ear; the hardware's own scaling is not known). |
+| `VICTORY_DSP_CONVOLVE_SIMD` | on (=0 turns off) | flag |  |  |  | Whether the convolution runs the code compiled for AVX2 where the machine has it. |
 | `VICTORY_DSP_IR_DUMP` | n/a | path |  |  |  | Directory where the first 16 audio streams' impulse responses are saved. |
 | `VICTORY_DSP_REVERB` | off | flag |  | live |  | Runs convolution audio streams through a stand-in algorithmic reverb. |
 | `VICTORY_DSP_REVERB_LAYOUT` | off | text |  |  |  | =interleaved selects the interleaved layout for the stand-in reverb streams. |

@@ -41,6 +41,10 @@ on:
         description: Build the card test binaries (tests/memory_cost.rs) to run on a PC with a card
         type: boolean
         default: false
+      bench_audio:
+        description: Measure the audio DSP convolution in release (victory-hle, ignored test), in the job summary
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -209,6 +213,33 @@ jobs:
       - name: Summary
         if: ${{ !cancelled() }}
         run: bash .github/scripts/test-summary.sh "workspace except victory-shader" "$RUNNER_TEMP/test.log"
+
+  # The cost of the audio DSP's convolution on the runner's CPU, optimized
+  # (the unit tests run unoptimized): milliseconds a block, first version
+  # against ours, written to the job summary.
+  bench-audio:
+    if: ${{ inputs.bench_audio }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ env.SAVE_CACHE }}
+      - name: Bench
+        run: |
+          set -o pipefail
+          cargo test --release -p victory-hle --lib --locked -- --ignored --nocapture --test-threads=1 convolution_bench 2>&1 | tee "$RUNNER_TEMP/bench.log"
+      - name: Summary
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## Audio DSP convolution (release, $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null || echo "runner CPU"))"
+            echo '```'
+            grep -h "convolution_bench" "$RUNNER_TEMP/bench.log" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Non-blocking: the fork still has warnings (summary only).
   clippy:

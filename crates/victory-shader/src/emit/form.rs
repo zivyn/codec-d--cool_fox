@@ -44,11 +44,13 @@ pub enum Form {
     Refused,
 }
 
-/// `VICTORY_KEPT_SKIPS_WIDE=1`: the skips and early-outs `VICTORY_KEEP_LOOP_SKIPS` keeps over loops
-/// are taken wave-wide ([`Form::KeptSkipsWide`]) before the forms with the loop skips left out.
-/// Off unless asked for: that form puts group barriers at branches (and its wide set can reach
-/// into loops), the shape that lost the card; the exact form with the skips left out has none.
-/// Part of the translation: the shader cache keys on the variable.
+/// `VICTORY_KEPT_SKIPS_WIDE=1`: `VICTORY_KEEP_LOOP_SKIPS` applies to the forms of a program that
+/// has to be retried: the skips and early-outs over loops are kept and taken wave-wide
+/// ([`Form::KeptSkipsWide`]), with the forms with them left out after it. Off unless asked for:
+/// that form puts group barriers at branches (its wide set can reach into loops), the shape
+/// that lost the card, and kept skips took exact forms away from 32 programs of the title. Without
+/// it the forms are those of a program without the switch. Part of the translation: the shader
+/// cache keys on the variable.
 pub(super) fn kept_skips_wide() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_KEPT_SKIPS_WIDE.get() {

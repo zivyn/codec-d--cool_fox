@@ -189,8 +189,9 @@ fn an_index_into_a_buffer_of_no_known_stride_is_not_known() {
 #[test]
 fn a_descriptor_picked_by_a_computed_index_is_any_of_the_table() {
     let (layout, used) = table_layout();
-    // s_load_dwordx4 s[8:11], s[4:5], s0 (a root constant picks the entry).
-    let mut words = load_descriptor(0).to_vec();
+    // s_lshl_b32 s6, s0, 5; s_load_dwordx4 s[8:11], s[4:5], s6 (a root constant picks the entry).
+    let mut words = vec![0x8F06_8500];
+    words.extend(load_descriptor(6));
     words.extend(store(0, true, false, 0));
     words.push(S_ENDPGM);
     let f = footprint(&words, layout, used, RSRC2_TABLE);

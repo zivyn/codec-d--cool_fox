@@ -60,7 +60,8 @@ pub(super) enum Mode {
     /// `=audited`: only what the audit of the emitted control flow proves clean: as `Strict`
     /// (no barrier behind a branch that differs or is read from memory), and every loop that
     /// holds a group barrier ends by a condition all the threads of the group agree on, or is
-    /// bounded (`audit.bounded`), so that it cannot run to its limit with a barrier in each round.
+    /// bounded (nested ones cut at the group's size), so that it cannot run to its limit with a
+    /// barrier in each round. `VICTORY_KEPT_SKIPS_ONLY=<hash digits>,...` names the programs.
     Audited,
     /// `=all`: whatever the classes say (to see the form the title lost the card in).
     All,

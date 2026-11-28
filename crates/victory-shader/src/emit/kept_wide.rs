@@ -24,6 +24,21 @@ pub(super) fn applicable(p: &ir::Program) -> bool {
             || !ir::drop_skips_as(p, true, true).1.is_empty())
 }
 
+/// `VICTORY_KEPT_SKIPS_ONLY=<hex>[,<hex>...]` with `=audited`: only the programs whose container
+/// hash starts with one of these (the digits of `#...` in the translate listing and in the audit's
+/// lines) take the form: the programs a pilot names, not a list the code keeps. Unset: every program
+/// the audit takes.
+fn named(tag: u32) -> bool {
+    named_in(tag, std::env::var("VICTORY_KEPT_SKIPS_ONLY").ok().as_deref())
+}
+
+/// [`named`] for the switch's value `only` (None: unset). Pure, for testing.
+pub(super) fn named_in(tag: u32, only: Option<&str>) -> bool {
+    let Some(only) = only else { return true };
+    let digits = format!("{:07x}", tag & 0x0FFF_FFFF);
+    only.split(',').map(str::trim).filter(|p| !p.is_empty()).any(|p| digits.starts_with(&p.to_ascii_lowercase()))
+}
+
 /// The program's translation with its kept skips wave-wide, if it lowers that way and every
 /// branch is of class A or B; None for the forms the program has without the switch.
 pub(super) fn attempt(
@@ -80,6 +95,7 @@ pub(super) fn attempt(
             Mode::Audited => audit.as_ref().is_none_or(|a| a.safe(false) && a.barrier_nest <= 2),
             _ => true,
         };
+        let audited = audited && (mode != Mode::Audited || named(super::lower::program_tag()));
         let safe = mode == Mode::All || wide_class::safe(&classes) && audited;
         if why {
             eprintln!(

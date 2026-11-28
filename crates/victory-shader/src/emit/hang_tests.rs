@@ -564,6 +564,19 @@ fn the_audited_form_is_taken_with_the_guard_on_too() {
     }
 }
 
+/// `VICTORY_KEPT_SKIPS_ONLY`: unset, every program; set, those whose hash starts with one of the
+/// digits named (in any case, spaces around the commas allowed), and none if it names nothing.
+#[test]
+fn the_audited_form_can_be_asked_for_by_program() {
+    let tag = 0xF000_0000 | 0x0238_4A6F;
+    assert!(super::kept_wide::named_in(tag, None));
+    assert!(super::kept_wide::named_in(tag, Some("02384a6")));
+    assert!(super::kept_wide::named_in(tag, Some("2233808, 0238")));
+    assert!(super::kept_wide::named_in(tag, Some("02384A")));
+    assert!(!super::kept_wide::named_in(tag, Some("2233808,d89ff74")));
+    assert!(!super::kept_wide::named_in(tag, Some("")));
+}
+
 /// A retry loop that never ends (the data not there, a compare that never takes) is cut at
 /// [`hang::NESTED_LOOP_LIMIT`] rounds in the audited form: the barriers of the walk are the count's
 /// times that many, not the square of the loop limit; without the bound (`strict` is not taken, the

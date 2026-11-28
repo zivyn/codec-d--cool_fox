@@ -73,7 +73,49 @@ pub(crate) struct Pending {
     /// Whether a worker took it from the lanes of what draws have asked for
     /// (a draw is dropped for it now), not from the early ones.
     taken_asked: AtomicBool,
+    /// A per-material ray-tracing resolve (`CS_RaytracingResolve`) that is made in the
+    /// background (`VICTORY_RESOLVE_ASYNC`): a dispatch of it never waits, it is dropped
+    /// while the pipeline is being made. There are about a thousand of these programs
+    /// and the driver takes seconds for each.
+    background: bool,
+    /// Taken by a worker from the resolves' own lane ([`Queue::resolves`]).
+    as_resolve: AtomicBool,
 }
+
+/// Whether the ray-tracing resolves are made in the background
+/// (`VICTORY_RESOLVE_ASYNC=1`; off until a cold start has been measured with it).
+///
+/// The ~1,000 programs that shade the hits of the title's rays (`CS_RaytracingResolve`) are
+/// 60 KB each and cost the driver seconds apiece: on a cold cache the title's first world
+/// frame binds some 175 of them, and the thread that translates the list waited for each
+/// dispatch's pipeline (120 s at most each, [`compute_budget`]). Here a dispatch of one never
+/// waits: it is dropped while the pipeline is being made, as it is when they are left out
+/// (`VICTORY_RT_RESOLVE=0`), and shows again the frame after the pipeline is made. They have
+/// a lane of their own in the queue ([`Queue::resolves`]) that keeps a share of the workers
+/// for the pipelines everything else asks for.
+///
+/// With the structure builder (`VICTORY_BVH_BUILDER=1`) the hits shade what the builder made
+/// and the picture needs them in the frame that asks: they are waited for as every compute
+/// program is.
+///
+/// Ported from `trustno1-coder/VIctory-NVIDIA` #402 (Kikoarl, from `fxceless/victory-fork`
+/// 52dfd12, GPL-3.0-or-later).
+fn resolve_async() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        resolve_async_for(
+            crate::switch::on("VICTORY_RESOLVE_ASYNC"),
+            std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"),
+        )
+    })
+}
+
+fn resolve_async_for(switch: bool, builder: bool) -> bool {
+    switch && !builder
+}
+
+/// Dispatches dropped because their resolve was still being made, since the start.
+static NOT_WAITED: AtomicU64 = AtomicU64::new(0);
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
     shaders
@@ -200,8 +242,10 @@ impl Pending {
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
         let left_out = left_out(&shaders);
+        let background = resolve_async() && named(&shaders, b"CS_RaytracingResolve");
         Pending {
             compute: shaders.iter().any(|s| s.stage == "compute"),
+            background,
             screen,
             scene_input,
             left_out,
@@ -216,6 +260,7 @@ impl Pending {
             seq: AtomicU64::new(0),
             making_at: AtomicU64::new(0),
             taken_asked: AtomicBool::new(false),
+            as_resolve: AtomicBool::new(false),
         }
     }
 
@@ -440,11 +485,27 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p, REQUESTED);
         let frame = crate::frame::current();
-        touch(p, frame);
-        if waited_for(p) {
-            wait_for_compute(p, compute_budget());
+        if p.background {
+            // Made in the background: this dispatch is dropped, whatever the frame has waited.
+            // (It is not in the lane of the frame's own requests either: that one has no
+            // limit of workers.) A resolve a worker made inline (no workers) is returned below.
+            if p.made.get().is_none() {
+                let n = NOT_WAITED.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(
+                        n,
+                        being_made = WAITING.load(Ordering::Relaxed),
+                        "ray-tracing resolves dropped while their pipeline is being made, not waited for (VICTORY_RESOLVE_ASYNC)"
+                    );
+                }
+            }
         } else {
-            wait(p, frame);
+            touch(p, frame);
+            if waited_for(p) {
+                wait_for_compute(p, compute_budget());
+            } else {
+                wait(p, frame);
+            }
         }
     }
     p.made.get()?.as_ref()
@@ -825,6 +886,23 @@ fn slow_limit() -> usize {
     })
 }
 
+/// How many workers may make ray-tracing resolves at once: all but a quarter of the `workers`,
+/// which stay free for the pipelines everything else asks for (`VICTORY_RESOLVE_WORKERS=<n>`:
+/// that many, `0`: every worker).
+fn resolve_limit_for(workers: usize, asked: Option<usize>) -> usize {
+    match asked {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => (workers - workers / 4).max(1),
+    }
+}
+
+fn resolve_limit() -> usize {
+    static ASKED: OnceLock<Option<usize>> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| std::env::var("VICTORY_RESOLVE_WORKERS").ok().and_then(|v| v.trim().parse().ok()));
+    resolve_limit_for(WORKERS.load(Ordering::Relaxed) as usize, asked)
+}
+
 struct Queue {
     /// Requested passes over the screen: before all others, and the only ones
     /// [`SCREEN_WORKERS`] take.
@@ -842,6 +920,11 @@ struct Queue {
     recent_frame: u64,
     /// How many were ever put in `recent`.
     next_seq: u64,
+    /// Requested ray-tracing resolves ([`Pending::background`]), and how many are being made
+    /// ([`resolve_limit`]). They are hundreds at once and take seconds each: in the one lane
+    /// of the requested pipelines every other pipeline a draw asked for stood behind them.
+    resolves: VecDeque<Arc<Pending>>,
+    resolves_now: usize,
 }
 
 /// The place in `Queue::recent` of its first entry (see [`Pending::seq`]).
@@ -858,6 +941,8 @@ impl Queue {
             recent: VecDeque::new(),
             recent_frame: 0,
             next_seq: 0,
+            resolves: VecDeque::new(),
+            resolves_now: 0,
         }
     }
 
@@ -894,6 +979,8 @@ impl Queue {
         p.queue_state.store(priority, Ordering::Relaxed);
         if priority == REQUESTED && p.screen && screens_first() {
             self.screen.push_back(p.clone());
+        } else if priority == REQUESTED && p.background {
+            self.resolves.push_back(p.clone());
         } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else if slow {
@@ -905,6 +992,13 @@ impl Queue {
     }
 
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
+        self.pop_with(screens_only, slow_limit, resolve_limit())
+    }
+
+    /// The next to make: the passes over the screen, what the frame asked for, what draws asked
+    /// for before, then the resolves (while fewer than `resolve_limit` are being made), then
+    /// the early ones and the slow ones.
+    fn pop_with(&mut self, screens_only: bool, slow_limit: usize, resolve_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>, state| {
             std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == state)
@@ -916,6 +1010,18 @@ impl Queue {
             p = unclaimed(&mut self.recent, REQUESTED);
             self.publish();
             p = p.or_else(|| unclaimed(&mut self.requested, REQUESTED));
+            if p.is_none() {
+                // (Not asked for as a frame's draw is: nothing waits for it, so it keeps
+                // the lowest priority whatever `VICTORY_PIPELINE_BOOST` says.)
+                asked = false;
+                if self.resolves_now < resolve_limit {
+                    p = unclaimed(&mut self.resolves, REQUESTED);
+                    if let Some(p) = &p {
+                        p.as_resolve.store(true, Ordering::Relaxed);
+                        self.resolves_now += 1;
+                    }
+                }
+            }
             if p.is_none() {
                 asked = false;
                 p = unclaimed(&mut self.early, EARLY);
@@ -1063,6 +1169,11 @@ fn workers() -> bool {
                             queue.slow_now -= 1;
                             AVAILABLE.notify_all();
                         }
+                        if p.as_resolve.load(Ordering::Relaxed) {
+                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                            queue.resolves_now -= 1;
+                            AVAILABLE.notify_all();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -1139,6 +1250,7 @@ fn drained() {
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             asked_at_the_bind = AHEADS.load(Ordering::Relaxed),
+            resolves_dropped = NOT_WAITED.load(Ordering::Relaxed),
             "host pipelines all made"
         );
         tracing::info!(
@@ -1172,6 +1284,74 @@ mod tests {
         assert_eq!(passes_left_out(true, None, None), (false, false));
         assert_eq!(passes_left_out(true, Some("0"), Some("1")), (false, false));
         assert_eq!(passes_left_out(true, None, Some("0")), (false, true));
+    }
+
+    #[test]
+    fn resolves_queue_behind_draws_and_leave_workers_free() {
+        let of = |background| {
+            let mut p = Pending::new(Vec::new(), None);
+            p.background = background;
+            Arc::new(p)
+        };
+        let (r1, r2, r3, draw1, draw2) = (of(true), of(true), of(true), of(false), of(false));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&r1, REQUESTED), Some(true));
+        assert_eq!(queue.push(&r2, REQUESTED), Some(true));
+        assert_eq!(queue.push(&r3, REQUESTED), Some(true));
+        assert_eq!(queue.push(&draw1, REQUESTED), Some(true));
+
+        // Regular draw pipelines jump ahead of queued resolves.
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &draw1));
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &r1));
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &r2));
+        assert!(r1.as_resolve.load(Ordering::Relaxed));
+        assert!(r2.as_resolve.load(Ordering::Relaxed));
+        assert_eq!(queue.resolves_now, 2);
+        // They keep the lowest priority: nothing waits for them.
+        assert!(!r1.taken_asked.load(Ordering::Relaxed));
+        assert!(draw1.taken_asked.load(Ordering::Relaxed));
+
+        // Once the limit is reached, r3 waits so the workers stay free for the draws.
+        assert!(queue.pop_with(false, 1, 2).is_none());
+        assert_eq!(queue.push(&draw2, REQUESTED), Some(true));
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &draw2));
+
+        // One resolve made frees a place for r3.
+        queue.resolves_now -= 1;
+        assert!(Arc::ptr_eq(&queue.pop_with(false, 1, 2).unwrap(), &r3));
+    }
+
+    #[test]
+    fn the_resolves_take_all_but_a_quarter_of_the_workers_unless_asked() {
+        assert_eq!(resolve_limit_for(16, None), 12);
+        assert_eq!(resolve_limit_for(8, None), 6);
+        assert_eq!(resolve_limit_for(1, None), 1);
+        assert_eq!(resolve_limit_for(0, None), 1);
+        assert_eq!(resolve_limit_for(8, Some(3)), 3);
+        assert_eq!(resolve_limit_for(8, Some(0)), usize::MAX);
+    }
+
+    #[test]
+    fn resolves_in_the_background_follow_the_switch_and_leave_the_builder_alone() {
+        assert!(resolve_async_for(true, false));
+        assert!(!resolve_async_for(false, false));
+        // With the structure builder the hits shade what it made: they are waited for.
+        assert!(!resolve_async_for(true, true));
+    }
+
+    #[test]
+    fn a_resolve_in_the_background_is_dropped_without_waiting() {
+        let mut p = Pending::new(Vec::new(), None);
+        p.background = true;
+        // A worker has it already, so `ready` cannot make it inline.
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        let before = NOT_WAITED.load(Ordering::Relaxed);
+        let began = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(began.elapsed() < Duration::from_secs(1), "a dispatch waited for its resolve");
+        assert!(p.made.get().is_none());
+        assert_eq!(NOT_WAITED.load(Ordering::Relaxed), before + 1);
     }
 
     #[test]

@@ -2380,6 +2380,9 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// What `copies` are to the submission's preparing ([`onepass`]), made when the list was closed (`VICTORY_ONE_PASS`):
+    /// of the number of steps it has, or it is made again.
+    summary: Option<std::sync::Arc<onepass::Summary>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3065,21 +3068,28 @@ fn ask_tokens() -> bool {
 /// What a submission's one asking is about ([`crate::watch::once`]): per host copy the span of the ranges its lists
 /// refresh, if the copy is asked ahead; with `lean` ([`lean_steps`]) in tables the thread keeps.
 fn ask_spans(runs: &[&HostList], lean: bool) -> Vec<(usize, usize)> {
+    ask_spans_where(runs, lean, |shadow| shadow.asked_ahead())
+}
+
+/// [`ask_spans`] for the copies `asked` says yes to (of each, at each of its refreshes), over any lists of steps.
+fn ask_spans_where<L: onepass::StepList>(runs: &[L], lean: bool, asked: impl Fn(&crate::shadow::Shadow) -> bool) -> Vec<(usize, usize)> {
     thread_local! {
         static ASKED: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
     }
     let mut spans = scratch::Lean::of(&ASKED, lean);
     for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step
-                && shadow.asked_ahead()
-            {
-                let span = spans
-                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                    .or_insert((*address, *address + *len));
-                *span = (span.0.min(*address), span.1.max(*address + *len));
+        list.steps(|steps| {
+            for step in steps {
+                if let Step::Refresh(shadow, address, len) = step
+                    && asked(&**shadow)
+                {
+                    let span = spans
+                        .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                        .or_insert((*address, *address + *len));
+                    *span = (span.0.min(*address), span.1.max(*address + *len));
+                }
             }
-        }
+        });
     }
     spans.values().copied().collect()
 }
@@ -3391,74 +3401,162 @@ fn blocked_by_for(written: &[(usize, usize)], fills: &[(usize, usize)], runs: &[
     if written.is_empty() {
         return None;
     }
-    // Destinations of copies at their place, if a step reads them.
-    let mut placed: Vec<(usize, usize)> = Vec::new();
-    for list in runs {
-        for step in &list.deferred().copies {
-            match step {
-                &Step::Copy(dst, src, len) => {
-                    if let Some(_read) = copy_blocked(written, dst, src, len) {
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            if _read {
-                                blame("a buffer copy's source", written, src, len);
-                            } else {
-                                blame("a buffer copy's destination", written, dst, len);
-                            }
-                        }
-                        return Some(WHY_READ);
+    // (With the summaries of the lists' steps [`onepass`] the steps are not walked; a list with a copy at its place is.)
+    let scanned = if summarized() { blocked_summarized(written, fills, runs, count) } else { None };
+    let placed = match scanned.unwrap_or_else(|| blocked_scan(written, fills, runs, count)) {
+        Ok(placed) => placed,
+        Err(why) => return Some(why),
+    };
+    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+}
+
+/// Whether the submission reads from the steps' summaries (`VICTORY_ONE_PASS`, with `VICTORY_LEAN_STEPS`): each use reads
+/// it once and the summaries are the same whichever way they are read.
+fn summarized() -> bool {
+    onepass::on() && lean_steps()
+}
+
+/// What a step that is not a refresh reads, for [`read_stops`].
+enum Reads {
+    /// A title buffer copy: destination, source, bytes.
+    Copy(usize, usize, usize),
+    /// A fill of upload memory: source, bytes.
+    Fill(usize, usize),
+    /// A texture, or a movie plane: from, bytes.
+    Texture(usize, usize),
+    Plane(usize, usize),
+}
+
+/// Whether `written` stops the read (`Some(why)`); `count` whether the kind of read is counted for the frame line.
+fn read_stops(written: &[(usize, usize)], fills: &[(usize, usize)], read: Reads, count: bool) -> Option<usize> {
+    match read {
+        Reads::Copy(dst, src, len) => {
+            if let Some(_read) = copy_blocked(written, dst, src, len) {
+                if count {
+                    LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    if _read {
+                        blame("a buffer copy's source", written, src, len);
+                    } else {
+                        blame("a buffer copy's destination", written, dst, len);
                     }
                 }
-                &Step::Fill(_, src, len, _) => {
-                    if read_blocked(fills, src, len) {
-                        if count {
-                            LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            blame("a fill of upload memory", fills, src, len);
-                        }
-                        return Some(WHY_READ);
-                    }
+                return Some(WHY_READ);
+            }
+        }
+        Reads::Fill(src, len) => {
+            if read_blocked(fills, src, len) {
+                if count {
+                    LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    blame("a fill of upload memory", fills, src, len);
                 }
-                Step::Texture(staging) => {
-                    let (at, len) = staging.memory();
-                    if touches(written, at, at + len) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            blame("a texture", written, at, len);
-                        }
-                        return Some(WHY_READ);
-                    }
+                return Some(WHY_READ);
+            }
+        }
+        Reads::Texture(at, len) => {
+            if touches(written, at, at + len) {
+                if count {
+                    LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    blame("a texture", written, at, len);
                 }
-                &Step::Plane((at, len), _) => {
-                    if touches(written, at, at.saturating_add(len)) {
-                        if count {
-                            LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            blame("a movie plane", written, at, len);
-                        }
-                        return Some(WHY_READ);
-                    }
+                return Some(WHY_READ);
+            }
+        }
+        Reads::Plane(at, len) => {
+            if touches(written, at, at.saturating_add(len)) {
+                if count {
+                    LATE_STATS[17].fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    blame("a movie plane", written, at, len);
                 }
-                Step::Run(_) => return Some(WHY_RUN),
-                Step::Placed(p) => match p.waits(written) {
-                    place::Waits::No => {}
-                    place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
-                    place::Waits::Yes => {
-                        if count {
-                            LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
-                            #[cfg(feature = "diagnostics")]
-                            blame("a buffer copy at its place", written, p.src, p.len);
-                        }
-                        return Some(WHY_READ);
-                    }
-                },
-                Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
+                return Some(WHY_READ);
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    None
+}
+
+/// [`blocked_by`] over the steps: `Err(why)` for the first that stops, else the destinations of copies at their place
+/// that a step reads (the readers are looked for by the caller).
+fn blocked_scan<L: onepass::StepList>(written: &[(usize, usize)], fills: &[(usize, usize)], runs: &[L], count: bool) -> Result<Vec<(usize, usize)>, usize> {
+    // Destinations of copies at their place, if a step reads them.
+    let mut placed: Vec<(usize, usize)> = Vec::new();
+    for list in runs {
+        let stopped = list.steps(|steps| {
+            for step in steps {
+                let stop = match step {
+                    &Step::Copy(dst, src, len) => read_stops(written, fills, Reads::Copy(dst, src, len), count),
+                    &Step::Fill(_, src, len, _) => read_stops(written, fills, Reads::Fill(src, len), count),
+                    Step::Texture(staging) => {
+                        let (at, len) = staging.memory();
+                        read_stops(written, fills, Reads::Texture(at, len), count)
+                    }
+                    &Step::Plane((at, len), _) => read_stops(written, fills, Reads::Plane(at, len), count),
+                    Step::Run(_) => Some(WHY_RUN),
+                    Step::Placed(p) => match p.waits(written) {
+                        place::Waits::No => None,
+                        place::Waits::ForReaders => {
+                            placed.push((p.dst, p.dst + p.len));
+                            None
+                        }
+                        place::Waits::Yes => {
+                            if count {
+                                LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
+                                #[cfg(feature = "diagnostics")]
+                                blame("a buffer copy at its place", written, p.src, p.len);
+                            }
+                            Some(WHY_READ)
+                        }
+                    },
+                    Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => None,
+                };
+                if stop.is_some() {
+                    return stop;
+                }
+            }
+            None
+        });
+        if let Some(why) = stopped {
+            return Err(why);
+        }
+    }
+    Ok(placed)
+}
+
+/// [`blocked_scan`] from the summaries of the lists' steps: the same answer without reading the steps; `None` where a
+/// list has a copy at its place among its steps (the caller scans them all: it is one or two a frame).
+fn blocked_summarized<L: onepass::StepList>(
+    written: &[(usize, usize)],
+    fills: &[(usize, usize)],
+    runs: &[L],
+    count: bool,
+) -> Option<Result<Vec<(usize, usize)>, usize>> {
+    use onepass::Op;
+    for list in runs {
+        let summary = list.summary();
+        if summary.has_placed() {
+            return None;
+        }
+        for &(_, op) in summary.ops() {
+            let stop = match op {
+                Op::Copy { dst, src, len } => read_stops(written, fills, Reads::Copy(dst, src, len), count),
+                Op::Fill { src, len, .. } => read_stops(written, fills, Reads::Fill(src, len), count),
+                Op::Texture(k) => {
+                    let (at, len) = summary.texture_memory(k);
+                    read_stops(written, fills, Reads::Texture(at, len), count)
+                }
+                Op::Plane { at, len } => read_stops(written, fills, Reads::Plane(at, len), count),
+                Op::Run => Some(WHY_RUN),
+                Op::Host { .. } | Op::Placed { .. } => None,
+            };
+            if let Some(why) = stop {
+                return Some(Err(why));
+            }
+        }
+    }
+    Some(Ok(Vec::new()))
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -3467,6 +3565,25 @@ fn blocked_by_for(written: &[(usize, usize)], fills: &[(usize, usize)], runs: &[
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
 fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    stale_merged(stale_where(runs, lean_steps(), |shadow| shadow.writes_pending()))
+}
+
+/// [`stale_under_flights`] by the pass of the submission's steps ([`onepass`]), if it has one.
+fn stale_of(runs: &[&HostList], pass: Option<&mut onepass::Pass>) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    match pass {
+        Some(pass) => stale_merged(pass.stale()),
+        None => stale_under_flights(runs),
+    }
+}
+
+/// The span of what `runs` refresh of each copy that `pending` says shaders may be writing (it is asked once for each
+/// copy, at its first refresh): a flush brings that much up to date at most. With `lean` ([`lean_steps`]) in a table the
+/// thread keeps.
+fn stale_where<L: onepass::StepList>(
+    runs: &[L],
+    lean: bool,
+    pending: impl Fn(&crate::shadow::Shadow) -> bool,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3477,23 +3594,33 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     thread_local! {
         static PLACES: std::cell::RefCell<ByCopy<Option<usize>>> = std::cell::RefCell::new(ByCopy::default());
     }
-    let mut places = scratch::Lean::of(&PLACES, lean_steps());
+    let mut places = scratch::Lean::of(&PLACES, lean);
     for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::Refresh(shadow, address, len) = step {
-                let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
-                    shadow.writes_pending().then(|| {
-                        spans.push((shadow.clone(), *address, *address + *len));
-                        spans.len() - 1
-                    })
-                });
-                if let Some(i) = *place {
-                    let s = &mut spans[i];
-                    (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+        list.steps(|steps| {
+            for step in steps {
+                if let Step::Refresh(shadow, address, len) = step {
+                    let place = places.entry(Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+                        pending(&**shadow).then(|| {
+                            spans.push((shadow.clone(), *address, *address + *len));
+                            spans.len() - 1
+                        })
+                    });
+                    if let Some(i) = *place {
+                        let s = &mut spans[i];
+                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    }
                 }
             }
-        }
+        });
     }
+    spans
+}
+
+/// The spans [`stale_where`] found, without those the title did not write since the copy took them (or, with
+/// `late_exact`, with what can be put in beside the flights' writes put in).
+fn stale_merged(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -3577,6 +3704,15 @@ fn joins_asked() -> (usize, usize) {
         return (if on { 8 } else { 1 }, lists);
     }
     (parts, lists)
+}
+
+/// Whether the list has a title buffer copy or work that may write title memory among its steps (from its summary with
+/// `VICTORY_ONE_PASS`).
+fn writes_title_memory(list: &HostList) -> bool {
+    if summarized() {
+        return onepass::StepList::summary(&list).has_copy_or_run();
+    }
+    list.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))
 }
 
 /// Whether the part `next` can be prepared together with `ahead`, which goes
@@ -4152,6 +4288,7 @@ fn late_line(frames: f64) {
     prefetch::line(frames);
     askaside::line(frames);
     waits::line(frames);
+    onepass::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "submissions sent ahead per frame: {:.1} in {:.1} settles ({:.1} flights each time), {:.1} ms waiting for the card in them; \
@@ -4303,6 +4440,7 @@ mod card_steps;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
+mod onepass;
 mod place;
 mod prefetch;
 mod scratch;
@@ -4652,24 +4790,53 @@ fn declare_once() -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    if summarized() { declared_writes_summarized(runs) } else { declared_writes_steps(runs) }
+}
+
+/// [`declared_writes`] over the steps.
+fn declared_writes_steps<L: onepass::StepList>(runs: &[L]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     // Where each copy is in it, and the ranges seen: dispatches declare the
     // same ranges thousands of times a frame.
     let mut places: ByCopy<usize> = ByCopy::default();
     let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
     for list in runs {
-        for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                if !seen.insert((key, *address, *len)) {
-                    continue;
+        list.steps(|steps| {
+            for step in steps {
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    if !seen.insert((key, *address, *len)) {
+                        continue;
+                    }
+                    let i = *places.entry(key).or_insert_with(|| {
+                        back.push((shadow.clone(), Vec::new()));
+                        back.len() - 1
+                    });
+                    back[i].1.push((*address, *address + *len));
                 }
-                let i = *places.entry(key).or_insert_with(|| {
-                    back.push((shadow.clone(), Vec::new()));
-                    back.len() - 1
-                });
-                back[i].1.push((*address, *address + *len));
             }
+        });
+    }
+    back
+}
+
+/// [`declared_writes`] from the summaries of the lists' steps (the ranges given to shaders are in them, in order).
+fn declared_writes_summarized<L: onepass::StepList>(runs: &[L]) -> Vec<Declared> {
+    let mut back: Vec<Declared> = Vec::new();
+    let mut places: ByCopy<usize> = ByCopy::default();
+    let mut seen = std::collections::HashSet::<(usize, usize, usize), std::hash::BuildHasherDefault<AddressHash>>::default();
+    for list in runs {
+        let summary = list.summary();
+        for (shadow, from, to) in summary.written() {
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            if !seen.insert((key, from, to - from)) {
+                continue;
+            }
+            let i = *places.entry(key).or_insert_with(|| {
+                back.push((shadow.clone(), Vec::new()));
+                back.len() - 1
+            });
+            back[i].1.push((from, to));
         }
     }
     back
@@ -6535,6 +6702,7 @@ impl Host {
         mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
         asking: &mut Option<crate::watch::Standing>,
+        mut pass: Option<&mut onepass::Pass>,
     ) {
         if relay_exact() && card_steps::stage() > 0 {
             for _ in 0..3 {
@@ -6542,7 +6710,7 @@ impl Host {
                 blame_stale(&stale);
                 relay_wait(WHY_STALE, |_| stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to)));
                 ask_for_submission(ranges, asking);
-                stale = stale_under_flights(runs);
+                stale = stale_of(runs, pass.as_deref_mut());
                 if stale.is_empty() {
                     return;
                 }
@@ -6589,8 +6757,18 @@ impl Host {
         let mut aside: Option<askaside::Offered> = None;
         let mut aside_ranges: Vec<(usize, usize)> = Vec::new();
         let mut flights_waited = false;
+        // The steps of the lists looked through once, for what to ask, what flights may write, what is refreshed in front
+        // and the steps themselves (`VICTORY_ONE_PASS=1`, with `VICTORY_LEAN_STEPS`): read once for the submission.
+        let mut pass: Option<scratch::Lean<onepass::Pass>> = (onepass::on() && lean_steps()).then(|| scratch::Lean::of(&onepass::PASS, true));
         if late && askaside::on() && crate::watch::once() && !ask_tokens() && flying() {
-            let ranges = ask_spans(runs, lean_steps());
+            let ranges = match pass.as_mut() {
+                Some(pass) => {
+                    pass.add(runs);
+                    let all = pass.lists();
+                    pass.asks(0..all)
+                }
+                None => ask_spans(runs, lean_steps()),
+            };
             if !ranges.is_empty() {
                 aside = askaside::begin(ranges.clone());
                 if aside.is_some() {
@@ -6696,6 +6874,19 @@ impl Host {
         // The asking of the write watch that stands for this submission
         // (`VICTORY_ASK_TOKENS=1`: one of several that may stand together).
         let mut asking: Option<crate::watch::Standing> = None;
+        // The pass over the steps, in the order the lists go: with the asking begun beside the planning it has the title's
+        // lists already, and the planning's own list goes in front of them; else it is made here (what was looked at
+        // before the planning is let go).
+        if let Some(pass) = pass.as_mut() {
+            if aside.is_some() {
+                if let Some(own) = &own {
+                    pass.add_first(&own.list());
+                }
+            } else {
+                scratch::Reset::reset(&mut **pass);
+                pass.add(runs);
+            }
+        }
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
@@ -6704,7 +6895,10 @@ impl Host {
             // gathered now is the planning's own list, which comes first among `runs`.
             let (ranges, own_ranges) = if aside.is_some() {
                 let own_ranges = if own.is_some() {
-                    ask_spans(&runs[..1], batch.lean)
+                    match pass.as_mut() {
+                        Some(pass) => pass.asks(0..1),
+                        None => ask_spans(&runs[..1], batch.lean),
+                    }
                 } else {
                     Vec::new()
                 };
@@ -6712,7 +6906,14 @@ impl Host {
                 ranges.extend(own_ranges.iter().copied());
                 (ranges, own_ranges)
             } else {
-                (ask_spans(runs, batch.lean), Vec::new())
+                let ranges = match pass.as_mut() {
+                    Some(pass) => {
+                        let all = pass.lists();
+                        pass.asks(0..all)
+                    }
+                    None => ask_spans(runs, batch.lean),
+                };
+                (ranges, Vec::new())
             };
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
@@ -6746,13 +6947,13 @@ impl Host {
                     upcheck::reads(runs);
                 }
             }
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if behind { stale_of(runs, pass.as_deref_mut()) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle_stale(&mut submitted, runs, stale, &ranges, &mut asking);
+                self.settle_stale(&mut submitted, runs, stale, &ranges, &mut asking, pass.as_deref_mut());
                 settled += settling.elapsed();
             }
-        } else if behind && !stale_under_flights(runs).is_empty() {
+        } else if behind && !stale_of(runs, pass.as_deref_mut()).is_empty() {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -6762,14 +6963,28 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
+        // (The records of the pass go with what is ahead by number of copy: they are used together or not at all.)
+        let front_pass = pass.is_some() && refresh_front() && !refresh_sizing() && !refresh_check();
         if refresh_front() {
-            batch.refresh_front(runs, &parts);
+            match pass.as_mut() {
+                Some(pass) if front_pass => batch.refresh_front_pass(pass, &parts),
+                _ => batch.refresh_front(runs, &parts),
+            }
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }
         stage.next("submit: the lists' steps");
-        for list in runs {
-            list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+        // With the summaries of the lists' steps [`onepass`]: the steps the card's plan takes, for each list in order (a
+        // cursor over them, not a look in a table for each fill and copy).
+        let takes: Option<Vec<Vec<usize>>> = (front_pass && own.is_some()).then(|| own.as_ref().map(|own| own.by_list(runs)).unwrap_or_default());
+        for (n, list) in runs.iter().enumerate() {
+            let cursor = if front_pass { pass.as_ref().and_then(|pass| pass.cursor(n)) } else { None };
+            match &takes {
+                Some(takes) => {
+                    list.run_deferred(&mut batch, &air, onepass::taken_in_order(&takes[n]), cursor);
+                }
+                None => list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)), cursor),
+            }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -6777,6 +6992,8 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.fill();
+        // (The holds the pass took on the copies are let go; what is ahead stays with the batch to its end.)
+        drop(pass.take());
         stage.next("submit: the last refreshes");
         batch.flush();
         match asking.take() {
@@ -8545,13 +8762,38 @@ impl HostList {
         Some(source)
     }
 
+    /// What the list's steps are to a submission's pass ([`onepass::Summary`]): the one kept with the list if it is of
+    /// the steps it has, else made now (`lane`: by the thread that submits, counted) and kept.
+    fn kept_summary(&self, lane: bool) -> std::sync::Arc<onepass::Summary> {
+        let mut deferred = self.deferred();
+        if let Some(summary) = &deferred.summary
+            && summary.steps == deferred.copies.len()
+        {
+            return summary.clone();
+        }
+        if lane {
+            onepass::made_on_the_lane();
+        }
+        let summary = std::sync::Arc::new(onepass::Summary::of(&deferred.copies));
+        deferred.summary = Some(summary.clone());
+        summary
+    }
+
+    /// The list is closed and complete: with the pass over the steps on, what they are to the submission's pass is made
+    /// now, by the thread that closed it, not by the submitting thread.
+    pub(crate) fn summarize(&self) {
+        if onepass::on() && lean_steps() {
+            let _ = self.kept_summary(false);
+        }
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
     /// `taken` names (by their place) are left out: they are done on the
     /// card ([`card_steps`]).
     #[inline(never)]
-    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], taken: impl Fn(usize) -> bool) {
+    fn run_deferred(&self, batch: &mut Batch, air: &[(usize, usize)], mut taken: impl FnMut(usize) -> bool, mut cursor: Option<onepass::Cursor<'_>>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         // The time and the bytes of the copies and fills, some 13,000 a
@@ -8559,7 +8801,36 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
-        for (i, step) in self.deferred().copies.iter().enumerate() {
+        let deferred = self.deferred();
+        let steps = &deferred.copies;
+        // With the pass over the steps ([`onepass`]) the refreshes, which are nearly all of them, come from the records
+        // (the steps are not read), the others by their place; the records are of the list as it was when it was looked
+        // through.
+        if cursor.as_mut().is_some_and(|cursor| !cursor.fits(steps.len())) {
+            cursor = None;
+        }
+        let mut plain = 0..steps.len();
+        loop {
+            let i = match cursor.as_mut() {
+                Some(cursor) => match cursor.next() {
+                    onepass::Item::Refresh(number, shadow, from, to) => {
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            refreshes += 1;
+                            refreshed += (to - from) as u64;
+                        }
+                        batch.add_at(number, shadow, from, to - from);
+                        continue;
+                    }
+                    onepass::Item::Step(i) => i,
+                    onepass::Item::End => break,
+                },
+                None => match plain.next() {
+                    Some(i) => i,
+                    None => break,
+                },
+            };
+            let step = &steps[i];
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
             }
@@ -9011,6 +9282,10 @@ struct Batch {
     /// before it in its copy's list: the lists are not looked through by
     /// bisection.
     unsorted: bool,
+    /// With a pass over the steps ([`onepass`], `pass_used`): what is refreshed ahead, by the copy's number in the pass,
+    /// in place of `first`, `rest` and `memo`.
+    ahead_idx: onepass::Ahead,
+    pass_used: bool,
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -9270,6 +9545,13 @@ fn check_front(
             }
         }
     }
+}
+
+/// What `check_front` looks at (`VICTORY_REFRESH_CHECK=1`).
+struct FrontCheck<'a> {
+    copies: &'a ByCopy<std::sync::Arc<crate::shadow::Shadow>>,
+    referenced: &'a [(usize, usize, usize)],
+    span_ranges: &'a [(usize, usize, usize)],
 }
 
 /// What a step is to the copies' refreshes, for [`written_spans`].
@@ -9586,6 +9868,52 @@ fn retain_unnoted(spans: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize,
     retain_where(spans, |(shadow, from, to)| shadow.nothing_new_noted(*from, *to - *from), wide);
 }
 
+/// A pointer that the threads of [`unnoted_spans`] may hold: what it points to is held by the caller until they are done.
+struct Held<T>(*const T);
+
+impl<T> Held<T> {
+    // (A method, so that a closure takes the whole of it, which is `Send`, and not its pointer.)
+    fn get(&self) -> *const T {
+        self.0
+    }
+}
+
+// SAFETY: only read, while the caller, which waits for the threads, holds what it points to.
+unsafe impl<T> Send for Held<T> {}
+unsafe impl<T> Sync for Held<T> {}
+
+fn span_noted(copies: &[std::sync::Arc<crate::shadow::Shadow>], &(number, from, to): &(u32, usize, usize)) -> bool {
+    copies[number as usize].nothing_new_noted(from, to - from)
+}
+
+/// The places among `spans` (copy by number, from, to) of those that no copy has noted as holding nothing new there
+/// ([`crate::shadow::Shadow::nothing_new_noted`]), in order, without holding the copies a second time: as
+/// [`retain_unnoted`], with `wide` in pieces on the kept threads.
+fn unnoted_spans(copies: &[std::sync::Arc<crate::shadow::Shadow>], spans: &[(u32, usize, usize)], wide: bool) -> Vec<usize> {
+    const PART: usize = 256;
+    if !wide || spans.len() < 2 * PART {
+        return (0..spans.len()).filter(|&i| !span_noted(copies, &spans[i])).collect();
+    }
+    let said: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> =
+        std::sync::Arc::new((0..spans.len()).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
+    {
+        let (held_copies, held_spans, said) = (Held(copies.as_ptr()), Held(spans.as_ptr()), said.clone());
+        let (copies_len, spans_len) = (copies.len(), spans.len());
+        crate::shadow::wide_each(spans_len.div_ceil(PART), move |part| {
+            // SAFETY: the caller holds both slices until `wide_each` has returned.
+            let (copies, spans) = unsafe {
+                (std::slice::from_raw_parts(held_copies.get(), copies_len), std::slice::from_raw_parts(held_spans.get(), spans_len))
+            };
+            for i in part * PART..((part + 1) * PART).min(spans_len) {
+                if span_noted(copies, &spans[i]) {
+                    said[i].store(true, Ordering::Relaxed);
+                }
+            }
+        });
+    }
+    (0..spans.len()).filter(|&i| !said[i].load(Ordering::Relaxed)).collect()
+}
+
 thread_local! {
     /// What a lean batch ([`Batch::new`]) keeps ahead of the steps, kept by the thread between submissions.
     static AHEAD_FIRST: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
@@ -9597,6 +9925,9 @@ impl Drop for Batch {
         if self.lean {
             scratch::give(&AHEAD_FIRST, std::mem::take(&mut self.first));
             scratch::give(&AHEAD_REST, std::mem::take(&mut self.rest));
+        }
+        if self.pass_used {
+            scratch::give(&onepass::AHEAD, std::mem::take(&mut self.ahead_idx));
         }
     }
 }
@@ -9654,6 +9985,11 @@ impl Batch {
                 self.rest.clear();
             }
         }
+        if self.pass_used {
+            // (What is ahead by number is forgotten for all copies, also when one is named: a refresh that is then
+            // done is one more, never one less.)
+            self.ahead_idx.forget_all();
+        }
         self.memo = (0, None);
     }
 
@@ -9685,10 +10021,24 @@ impl Batch {
 
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
-        let key = std::sync::Arc::as_ptr(shadow) as usize;
-        if self.covered(key, address, end) {
+        if self.covered(std::sync::Arc::as_ptr(shadow) as usize, address, end) {
             return;
         }
+        self.pend(shadow, address, end);
+    }
+
+    /// [`Batch::add`] of a copy that has `number` in the pass of the submission ([`onepass`]): what is ahead is looked up by it.
+    fn add_at(&mut self, number: usize, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let end = address + len;
+        if self.ahead_idx.covered(number, address, end, !self.unsorted) {
+            return;
+        }
+        self.pend(shadow, address, end);
+    }
+
+    /// The range `[address, end)` of the copy is refreshed with the next flush: merged into what is pending for it.
+    fn pend(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, end: usize) {
+        let key = std::sync::Arc::as_ptr(shadow) as usize;
         if narrow_on() {
             self.parts.entry(key).or_default().push((address, end));
         }
@@ -9839,6 +10189,55 @@ impl Batch {
         } else {
             Vec::new()
         };
+        let check = checking.then(|| FrontCheck { copies: &copies, referenced: &referenced, span_ranges: &span_ranges });
+        self.front_go(spans, due, check, false);
+    }
+
+    /// [`Batch::refresh_front`] for a submission that has its steps looked through ([`onepass`]): the spans come from the
+    /// pass's records, by the copy's number, and what is ahead is kept by that number ([`onepass::Ahead`]). The same
+    /// spans are refreshed. (Not with `VICTORY_REFRESH_SIZING` or `VICTORY_REFRESH_CHECK`, which look at the steps by address.)
+    fn refresh_front_pass(&mut self, pass: &mut onepass::Pass, parts: &[usize]) {
+        let mut due = Vec::new();
+        let wide = wide_textures();
+        pass.front_spans(parts, refresh_narrow_gap(), |staging| {
+            if wide && self.texture_due(staging) {
+                due.push(staging.clone());
+            }
+        });
+        // Those a copy noted as holding nothing new are left out before the copies are held (a hold and a let go of each of
+        // the 9,000 spans a frame, on the submitting thread): the same ones `front_go` would leave out, in the same order.
+        const FEW: usize = 256;
+        let pruned = pass.spans.len() > FEW;
+        let spans: Vec<_> = if pruned {
+            let all = pass.spans.len();
+            let kept = unnoted_spans(&pass.copies, &pass.spans, self.lean);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - kept.len()) as u64, Ordering::Relaxed);
+            kept.into_iter().map(|i| (pass.copies[pass.spans[i].0 as usize].clone(), pass.spans[i].1, pass.spans[i].2)).collect()
+        } else {
+            pass.spans.iter().map(|&(number, from, to)| (pass.copies[number as usize].clone(), from, to)).collect()
+        };
+        self.front = true;
+        if !self.pass_used {
+            self.pass_used = true;
+            self.ahead_idx = scratch::take(&onepass::AHEAD);
+        }
+        self.ahead_idx.begin(pass.copies.len());
+        for &(number, from, to) in &pass.spans {
+            self.ahead_idx.put(number as usize, from, to, &mut self.unsorted);
+        }
+        self.front_go(spans, due, None, pruned);
+    }
+
+    /// The refreshes in front of the steps: `spans` (the copies' ranges) and the textures `due` brought up to date, on
+    /// the threads, once the ones known to hold nothing new are left out (`pruned`: they were, by the caller).
+    fn front_go(
+        &mut self,
+        spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        due: Vec<std::sync::Arc<crate::texture::Staging>>,
+        check: Option<FrontCheck<'_>>,
+        pruned: bool,
+    ) {
         #[cfg(feature = "diagnostics")]
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
@@ -9855,7 +10254,7 @@ impl Batch {
         let mut spans = spans;
         #[cfg(feature = "diagnostics")]
         let mut lap = std::time::Instant::now();
-        if spans.len() > FEW {
+        if spans.len() > FEW && !pruned {
             // Those a copy noted as holding nothing new, and nothing has
             // touched since, need no thread (nor asking ahead).
             #[cfg(feature = "diagnostics")]
@@ -9914,8 +10313,8 @@ impl Batch {
         #[cfg(feature = "diagnostics")]
         Self::lap(&mut lap, crate::copystat::C::FlushEachNs);
         // Before the asking stands no more: the journal says what it found.
-        if checking {
-            check_front(&copies, &referenced, &span_ranges);
+        if let Some(check) = &check {
+            check_front(check.copies, check.referenced, check.span_ranges);
         }
         if ahead {
             crate::watch::ask_ahead_done();

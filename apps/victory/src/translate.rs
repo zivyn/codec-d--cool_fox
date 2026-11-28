@@ -558,7 +558,7 @@ fn translate(
     // "shader does not translate", "host pipeline refused").
     let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
     // (`VICTORY_LOOP_WHY=1` names a program by the start of this hash)
-    if emit::loop_why() {
+    if emit::loop_why() || emit::hang_audit() {
         emit::set_program_tag(&bytes);
     }
     // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates

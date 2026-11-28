@@ -106,9 +106,13 @@ mod f16_level;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 pub mod form;
+mod hang;
+#[cfg(test)]
+mod hang_tests;
 mod kept_wide;
 mod wide_class;
 pub use form::Form;
+pub use hang::{HANG_NOTE, audit_asked_for as hang_audit, say as say_hang_note};
 #[cfg(all(test, windows))]
 mod form_tests;
 #[cfg(all(test, windows))]
@@ -828,6 +832,9 @@ fn emit_forms(
     res: &resource::Resources,
 ) -> (Result<HostShader, ShaderError>, Form) {
     let mut form = Form::Original;
+    if hang::reporting() {
+        hang::forget();
+    }
     let result = emit_forms_in(c, native, p, st, io, res, &mut form, false);
     if result.is_err() {
         form = Form::Refused;
@@ -838,6 +845,20 @@ fn emit_forms(
         && crate::env_on("VICTORY_WAVE_WHY")
     {
         eprintln!("WAVE64-FORM-FINAL ~{} {}", code_digits(c), form.label());
+    }
+    // (`VICTORY_HANG_AUDIT=1`: the audit of the module the program ended in, if it has a group barrier)
+    if native.stage == HwStage::Cs && hang::reporting() {
+        eprintln!(
+            "HANG-FINAL ~{} #{:07x} threads={} {} {}",
+            code_digits(c),
+            lower::program_tag() & 0x0FFF_FFFF,
+            match native.io {
+                crate::native::StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
+                _ => 0,
+            },
+            form.label(),
+            hang::last_audit().map_or("no barriers".to_string(), |a| a.describe())
+        );
     }
     (result, form)
 }

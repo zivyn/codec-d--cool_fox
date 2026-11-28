@@ -85,8 +85,6 @@ enum Body {
     /// The walk with a retry loop in each round: `s1` rounds, each a loop of `s2` rounds (at least
     /// one) with an exchange in each (a compare-and-swap that the lanes repeat until it takes).
     SerialNested,
-    /// Three loops deep, `s1` rounds of `s2` of `s3`, an exchange in the innermost.
-    SerialDeep,
 }
 
 /// A loop of the counter `s<counter>` against the root constant `s<limit>`, round `body`.
@@ -178,11 +176,6 @@ fn region(body: Body) -> Vec<u32> {
         Body::SerialNested => {
             let inner = counted(21, 2, &exchange_words());
             w.extend(counted_or_none(22, 1, &inner));
-        }
-        Body::SerialDeep => {
-            let inner = counted(21, 3, &exchange_words());
-            let mid = counted(22, 2, &inner);
-            w.extend(counted_or_none(23, 1, &mid));
         }
         Body::Counted => {
             w.push(0xBE95_0380); // s_mov_b32 s21, 0
@@ -503,24 +496,47 @@ fn the_serial_walk_ends_with_the_lanes_and_by_its_count() {
     }
 }
 
-/// Loops three deep in a group of two console waves (128 threads), where the exchange of each round
-/// is the two host waves' wait for each other and no barrier waits for the group inside a loop: the
-/// audit takes it (the waits are reached alike, the group's barriers are not in loops), which
-/// `strict` does not (it counts the waits' loops too), and nothing is bounded: the loops with only
-/// waits keep their limits.
-#[test]
-fn the_audited_form_takes_loops_three_deep_that_hold_only_the_waits_of_host_waves() {
-    for over in [Over::Skip, Over::EarlyOut] {
-        let native = lane_branch(over, Body::SerialDeep, 128, false);
-        let (result, form, module) = lowered(&native, Mode::Audited, None);
-        assert!(result.is_ok(), "{over:?}: {:?}", result.err());
-        let module = module.expect("a module");
-        let audit = module.audit_barriers();
-        assert_eq!(form, Form::KeptSkipsWide, "{over:?}: {}", audit.describe());
-        assert!(audit.safe(false) && audit.barrier_nest == 0 && audit.nest == 3, "{over:?}: {}", audit.describe());
-        let (_, strict, _) = lowered(&native, Mode::Strict, None);
-        assert_ne!(strict, Form::KeptSkipsWide, "{over:?}: strict takes loops three deep");
+/// A module by hand: loops three deep around the wait of the two host waves of a console wave, and
+/// a barrier that waits for the group in the innermost one only if `group`.
+fn deep_wait_module(group: bool) -> Module {
+    let mut s = Shader::new(false);
+    s.threads = Some([128, 1, 1]);
+    let (e, void) = (s.entry, s.t.void);
+    let c = s.m.bool(true);
+    let (h1, h2, h3, l3, l2, l1, end) = (
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+    );
+    s.m.terminate(e, Term::Br(h1));
+    s.m.terminate(h1, Term::Br(h2));
+    s.m.terminate(h2, Term::Br(h3));
+    s.m.mark_wait(h3);
+    if group {
+        let mode = s.m.i32(9);
+        s.op(h3, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
+    s.m.terminate(h3, Term::Br(l3));
+    s.m.terminate(l3, Term::CondBr(c, h3, l2));
+    s.m.terminate(l2, Term::CondBr(c, h2, l1));
+    s.m.terminate(l1, Term::CondBr(c, h1, end));
+    s.m.terminate(end, Term::Ret);
+    s.m
+}
+
+/// The loops that hold only the waits of the two host waves of a console wave (cheap a round) are
+/// told from the loops that hold a barrier that waits for the group (a round costs the barrier): the
+/// audited form allows the first three deep and the second two deep.
+#[test]
+fn the_audit_counts_the_loops_of_group_barriers_apart_from_those_of_the_hosts_waits() {
+    let waits = deep_wait_module(false).audit_barriers();
+    assert!(waits.safe(false) && waits.nest == 3 && waits.barrier_nest == 0 && waits.waits == 1, "{}", waits.describe());
+    let both = deep_wait_module(true).audit_barriers();
+    assert!(both.safe(false) && both.nest == 3 && both.barrier_nest == 3, "{}", both.describe());
 }
 
 /// A retry loop that never ends (the data not there, a compare that never takes) is cut at

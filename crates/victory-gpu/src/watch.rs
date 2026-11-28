@@ -3142,16 +3142,25 @@ fn unguard(g: &mut Guards, blocks: &[usize]) {
     } else {
         blocks.iter().map(|&block| (block, block + 1)).collect()
     };
-    for (first, past) in runs {
+    // Whether the call took: a run that spans two allocations (views side by side) is refused whole, and is done
+    // block by block, as every run was before.
+    let give_back = |first: usize, past: usize| -> bool {
         let mut old = 0;
         // SAFETY: blocks we made read-only.
         unsafe {
-            if VirtualProtect((first * BLOCK) as *const _, (past - first) * BLOCK, PAGE_READWRITE, &mut old) != 0
-                && !matches!(old & !PAGE_GUARD, PAGE_READONLY | PAGE_READWRITE)
-            {
+            let done = VirtualProtect((first * BLOCK) as *const _, (past - first) * BLOCK, PAGE_READWRITE, &mut old) != 0;
+            if done && !matches!(old & !PAGE_GUARD, PAGE_READONLY | PAGE_READWRITE) {
                 // Not what we left there: the address is other memory's
                 // (code's, say), which keeps its protection.
                 VirtualProtect((first * BLOCK) as *const _, (past - first) * BLOCK, old, &mut old);
+            }
+            done
+        }
+    };
+    for (first, past) in runs {
+        if !give_back(first, past) && past - first > 1 {
+            for block in first..past {
+                give_back(block, block + 1);
             }
         }
         (first..past).for_each(|block| PROTECTED.clear(block));

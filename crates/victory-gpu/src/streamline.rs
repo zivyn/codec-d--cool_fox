@@ -1256,6 +1256,7 @@ pub(crate) fn submitted(id: u64) {
 /// title's list is now). Whether it recorded anything.
 fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
     let Some(plan) = PLAN.get() else { return false };
+    crate::hotkeys::ensure_started();
     let camera = up.camera;
     let fail = |why: &str| {
         FAILED.fetch_add(1, Relaxed);
@@ -1300,7 +1301,7 @@ fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
             output = ?camera.output,
             mode = plan::sl_mode_name(recorded.mode),
             asked = plan.asked.mode.name(),
-            preset = plan.asked.preset,
+            preset = dlss_preset(),
             optimal = ?recorded.optimal,
             hdr = camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0,
             depth_inverted = camera.depth_inverted(),
@@ -1368,7 +1369,7 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
         if let Some(&(_, _, size)) = calls.optimal.iter().find(|(o, m, _)| *o == output && *m == mode) {
             return size;
         }
-        let options = abi::DlssOptions::new(mode, output, plan.asked.preset);
+        let options = abi::DlssOptions::new(mode, output, dlss_preset());
         let mut settings = abi::DlssOptimalSettings::default();
         // SAFETY: filled options and a structure to fill.
         let code = unsafe { optimal_of(&options, &mut settings) };
@@ -1381,7 +1382,7 @@ fn record(list: *mut c_void, textures: &Textures, camera: &plan::Camera, pre_exp
     let optimal_of_mode = |m: u32| sizes.iter().find(|s| s.0 == m).and_then(|s| s.1);
     let mode = plan::pick_mode(camera.render, output, optimal_of_mode)
         .ok_or_else(|| format!("no DLSS mode takes a {:?} render for a {output:?} output", camera.render))?;
-    let mut options = abi::DlssOptions::new(mode, output, plan.asked.preset);
+    let mut options = abi::DlssOptions::new(mode, output, dlss_preset());
     options.pre_exposure = if pre_exposure > 0.0 { pre_exposure } else { 1.0 };
     options.color_buffers_hdr = abi::boolean(camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0);
     options.use_auto_exposure = abi::boolean(textures[EXPOSURE].is_none());
@@ -1484,10 +1485,109 @@ pub(crate) fn composite_wanted(has: impl Fn(&str) -> bool) -> bool {
 /// generation runs on our swap chain and `VICTORY_FRAMEGEN_HUDLESS` is not 0.
 #[inline]
 pub(crate) fn hudless_wanted() -> bool {
-    HUDLESS_WANTED.load(Relaxed)
+    HUDLESS_WANTED.load(Relaxed) && HUDLESS_ASKED.load(Relaxed)
 }
 
+/// Whether the run can take the colour without the interface (the plan, the
+/// proxied swap chain, the line of submissions).
 static HUDLESS_WANTED: AtomicBool = AtomicBool::new(false);
+/// Whether it is asked for now: on unless a hotkey or the in-process A/B
+/// (`VICTORY_AB=..,VICTORY_FRAMEGEN_HUDLESS=0`) has it off ([`hudless_asked`],
+/// at each present). Only copies and tags follow it, nothing the title sees.
+static HUDLESS_ASKED: AtomicBool = AtomicBool::new(true);
+/// The hotkey's half of what is asked ([`toggle_hudless`]).
+static HUDLESS_KEY: AtomicBool = AtomicBool::new(true);
+
+/// At a present: what is asked of the colour without the interface now (the
+/// hotkey and the A/B). When it changes the copies not tagged yet are let go
+/// (one made before it went off must not be taken for the first frame after
+/// it comes back), and the change is said.
+fn hudless_asked() {
+    let asked = HUDLESS_KEY.load(Relaxed) && crate::ab::live_value!("VICTORY_FRAMEGEN_HUDLESS", bool, crate::ab::unless_zero);
+    if HUDLESS_ASKED.swap(asked, Relaxed) != asked {
+        lock(&HUD_PENDING).clear();
+        lock(&HUD_SUBMITTED).clear();
+        tracing::info!(asked, "DLSS Frame Generation: the colour without the interface is {} from here", if asked { "asked for" } else { "left out" });
+    }
+}
+
+/// A hotkey: the colour without the interface off, or on again from the next
+/// present; what is asked now.
+pub(crate) fn toggle_hudless() -> bool {
+    !HUDLESS_KEY.fetch_xor(true, Relaxed)
+}
+
+/// A hotkey: frame generation off, or on again at the amount the start asked
+/// (2 if it asked none); what is asked now (0 off).
+pub(crate) fn toggle_framegen() -> u32 {
+    let times = if framegen_wanted() != 0 { 0 } else { framegen_on_amount() };
+    set_framegen(times);
+    times
+}
+
+/// The frames shown for each one rendered when frame generation is on: what is asked now, else the
+/// start's, else 2.
+fn framegen_on_amount() -> u32 {
+    on_amount(framegen_wanted(), framegen_times())
+}
+
+/// [`framegen_on_amount`] from what is asked now and what the start asked.
+fn on_amount(now: u32, start: u32) -> u32 {
+    match (now, start) {
+        (0, 0) => 2,
+        (0, start) => start,
+        (now, _) => now,
+    }
+}
+
+/// A hotkey: the next DLSS model preset (default, j, k, l, m); the one asked now.
+pub(crate) fn next_dlss_preset() -> u32 {
+    let next = crate::hotkeys::next_preset(dlss_preset());
+    PRESET_LIVE.store(next, Relaxed);
+    next
+}
+
+/// The DLSS model preset the options name: the start's, until a hotkey turns it.
+fn dlss_preset() -> u32 {
+    match PRESET_LIVE.load(Relaxed) {
+        u32::MAX => PLAN.get().map_or(0, |p| p.asked.preset),
+        preset => preset,
+    }
+}
+
+static PRESET_LIVE: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// What the stats panel says of frame generation and the rest, a line of no
+/// more than 40 characters; `None` where there is nothing of them in the run.
+pub(crate) fn panel_line(fps: f64) -> Option<String> {
+    if !DLSS_READY.load(Acquire) && !framegen_live() {
+        return None;
+    }
+    let (per, live) = (shown_per_frame(), framegen_live());
+    let hudless = if !HUDLESS_WANTED.load(Relaxed) { "NA" } else if HUDLESS_ASKED.load(Relaxed) { "ON" } else { "OFF" };
+    Some(status_line(live, framegen_wanted(), per, fps, hudless, crate::hotkeys::preset_name(dlss_preset())))
+}
+
+/// The panel's line: `live` frame generation can change (it was planned), `wanted` what is asked of it, `per` the
+/// frames shown for each one rendered.
+fn status_line(live: bool, wanted: u32, per: u32, fps: f64, hudless: &str, preset: &str) -> String {
+    let fg = match (live, wanted, per) {
+        (false, ..) => "FG NA".to_owned(),
+        (true, 0, _) => "FG OFF".to_owned(),
+        (true, _, 0 | 1) => format!("FG {wanted}X"),
+        (true, ..) => format!("FG {per}X SHOWN {:.0}", fps * f64::from(per)),
+    };
+    let preset = if preset == "default" { "DEF" } else { preset };
+    format!("{fg}  HUDLESS {hudless}  MODEL {preset}")
+}
+
+/// The presents made with frame generation planned, and the frames shown for them (a present with it off is one).
+pub(crate) fn displayed_counts() -> (u64, u64) {
+    (PRESENTS_ALL.load(Relaxed), DISPLAYED_ALL.load(Relaxed))
+}
+
+static PRESENTS_ALL: AtomicU64 = AtomicU64::new(0);
+static DISPLAYED_ALL: AtomicU64 = AtomicU64::new(0);
 
 /// The host textures of the last presents (their addresses): the textures
 /// the title presents (it has two, in turn).
@@ -1706,6 +1806,7 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
     if !FG_READY.load(Acquire) || !SWAP_CHAIN_PROXIED.load(Acquire) {
         return None;
     }
+    crate::hotkeys::ensure_started();
     // The tagged textures' states are those the submissions before this
     // present left: only the line of submissions orders the two.
     if !crate::queue::line_on() && !CHECKING.load(Relaxed) {
@@ -1713,6 +1814,8 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
         once!(warn, "DLSS Frame Generation: the line of submissions did not start; frame generation stays off");
         return None;
     }
+    // (The hotkey's and the A/B's say on the colour without the interface.)
+    hudless_asked();
     // Where the interface is no plane of its own (Series X): the copy of
     // this texture taken in front of the title's interface composite.
     let hudless = if planes.overlay.is_none() && hudless_wanted() { hudless_for(planes.base.0) } else { None };
@@ -1827,7 +1930,12 @@ pub(crate) fn present_begins(frame: u64, planes: Planes<'_>) -> Option<Presentin
             set_framegen([2, 4, 0, 6][(n / every % 4) as usize]);
         }
     }
-    let wanted = framegen_wanted();
+    // (`VICTORY_AB=..,VICTORY_FRAMEGEN_LIVE`: off in the A phases, on in the B phases, whatever the hotkey says.)
+    let wanted = match crate::ab::pick("VICTORY_FRAMEGEN_LIVE") {
+        Some(true) => framegen_on_amount(),
+        Some(false) => 0,
+        None => framegen_wanted(),
+    };
     let on = on && wanted != 0;
     let times = if on { wanted } else { 0 };
     if on != calls.framegen_on || times != calls.framegen_times {
@@ -1984,7 +2092,7 @@ pub(crate) fn framegen_kind() -> Option<&'static str> {
 /// FSR 3 frame generation shows 2 for any of them), from the next present on.
 pub(crate) fn set_framegen(times: u32) {
     FG_WANTED.store(if times == 0 { 0 } else { times.clamp(2, 6) }, Relaxed);
-    tracing::info!(times, kind = framegen_kind().unwrap_or("none"), "frame generation: asked from the settings menu");
+    tracing::info!(times, kind = framegen_kind().unwrap_or("none"), "frame generation: asked (hotkey, settings menu or check)");
 }
 
 /// For the frame-rate texts: frames shown for each one rendered (1 without frame generation).
@@ -2008,6 +2116,8 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         calls.simulating = Some(frame.wrapping_add(1));
     }
     spent(T_MARKERS, began);
+    // Frames shown for this present: one, or what frame generation says it presented.
+    let mut shown = 1;
     if calls.framegen_on {
         let mut state = abi::DlssgState::default();
         let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
@@ -2016,6 +2126,7 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
         let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
         spent(T_STATE, asked);
         if code == 0 {
+            shown = u64::from(state.num_frames_actually_presented).max(1);
             FG_PER.store(state.num_frames_actually_presented.max(1), Relaxed);
             FG_SHOWN.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
             FG_SHOWN_ALL.fetch_add(u64::from(state.num_frames_actually_presented), Relaxed);
@@ -2028,6 +2139,8 @@ pub(crate) fn present_ends(presenting: Option<Presenting>) {
             }
         }
     }
+    PRESENTS_ALL.fetch_add(1, Relaxed);
+    DISPLAYED_ALL.fetch_add(shown, Relaxed);
     spent(T_AFTER, began);
 }
 
@@ -2386,5 +2499,38 @@ mod composite_tests {
         assert!(!is_pair(&hashes, pipeline(&["bb", "cc"])));
         // No hashes, no match: nothing is copied (the empty `all` is true).
         assert!(!is_pair(&[], pipeline(&["aa", "bb"])));
+    }
+}
+
+#[cfg(test)]
+mod hotkey_tests {
+    use super::{on_amount, status_line};
+
+    #[test]
+    fn frame_generation_comes_back_at_the_amount_that_was_asked() {
+        // Off now: the start's amount, 2 if the start asked none; on now: what is asked.
+        assert_eq!([on_amount(0, 0), on_amount(0, 3), on_amount(0, 6)], [2, 3, 6]);
+        assert_eq!([on_amount(4, 2), on_amount(2, 0)], [4, 2]);
+    }
+
+    #[test]
+    fn the_panels_line_fits_its_box_and_uses_letters_it_has() {
+        let lines = [
+            status_line(false, 0, 1, 28.0, "NA", "default"),
+            status_line(true, 0, 1, 28.0, "ON", "default"),
+            status_line(true, 2, 1, 28.0, "ON", "j"),
+            status_line(true, 2, 2, 28.4, "ON", "default"),
+            status_line(true, 6, 6, 120.0, "OFF", "default"),
+        ];
+        assert_eq!(lines[0], "FG NA  HUDLESS NA  MODEL DEF");
+        assert_eq!(lines[1], "FG OFF  HUDLESS ON  MODEL DEF");
+        // Asked, and not shown yet: what is asked.
+        assert_eq!(lines[2], "FG 2X  HUDLESS ON  MODEL J");
+        assert_eq!(lines[3], "FG 2X SHOWN 57  HUDLESS ON  MODEL DEF");
+        for line in &lines {
+            // The panel's box: 40 characters of capitals, digits, `.`, `/`, `-` and spaces.
+            assert!(line.len() <= 40, "{line}");
+            assert!(line.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || b"./- ".contains(&c)), "{line}");
+        }
     }
 }

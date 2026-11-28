@@ -221,7 +221,9 @@ fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec
         format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
         format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
         format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
+        // With DLSS or frame generation in the run: what they are doing (Ctrl+Shift+F5 to F7, `crate::hotkeys`);
+        // else what the panel itself takes.
+        crate::streamline::panel_line(1e3 / ms.max(0.001)).unwrap_or_else(|| format!("THIS PANEL {:.0} US A FRAME", cost)),
     ]
 }
 

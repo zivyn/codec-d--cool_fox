@@ -112,6 +112,8 @@ mod tiles;
 pub mod signature;
 #[cfg(windows)]
 pub mod streamline;
+#[cfg(windows)]
+mod hotkeys;
 mod switch;
 pub use switch::on as env_on;
 #[cfg(windows)]

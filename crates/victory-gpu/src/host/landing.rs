@@ -733,6 +733,7 @@ impl Host {
             let mut whole: Vec<std::sync::Arc<crate::shadow::Shadow>> = Vec::new();
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
+                plan.check_gpu_ro(differs);
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
@@ -1289,6 +1290,7 @@ impl Host {
         let mut pieces: Vec<(usize, usize, usize, u64)> = Vec::new();
         let mut total = 0u64;
         plan.picked_found(differs);
+        plan.check_gpu_ro(differs);
         for (i, r) in plan.ranges.iter().enumerate().filter(|(_, r)| !r.picked) {
             for p in 0..r.span.pieces {
                 if r.compared && !torn::flagged(differs[(r.at + p) as usize]) {

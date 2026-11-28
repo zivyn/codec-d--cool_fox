@@ -13,6 +13,40 @@ impl CardPlan {
             }
         }
     }
+
+    /// Verification mode (`VICTORY_GPU_RO_CHECK=1`): warns if a piece the
+    /// compare found changed on the card lies in title memory the title
+    /// asked for with read-only GPU page protection (the ranges
+    /// `VICTORY_GPU_RO_SKIP` leaves out of what shaders are declared to write).
+    pub(super) fn check_gpu_ro(&self, differs: &[u32]) {
+        if !crate::shadow::gpu_ro_check() {
+            return;
+        }
+        static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        for r in self.ranges.iter().filter(|r| !r.picked && r.compared) {
+            let (base, shadow_len) = r.shadow.span();
+            for p in 0..r.span.pieces {
+                if !differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d)) {
+                    continue;
+                }
+                let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                let at = base + lo as u64;
+                let len = (hi - lo) as u64;
+                if crate::shadow::overlaps_gpu_readonly(at, len) {
+                    let n = WARNED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n <= 16 || n.is_power_of_two() {
+                        tracing::warn!(
+                            hit = n,
+                            piece = format_args!("{at:#x}..{:#x}", at + len),
+                            declared = format_args!("{:#x}..{:#x}", r.declared.0, r.declared.1),
+                            shadow = format_args!("{base:#x}+{shadow_len:#x}"),
+                            "VICTORY_GPU_RO_CHECK: GPU compare saw changed bytes inside a GPU-read-only region"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Host {

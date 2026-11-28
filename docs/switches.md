@@ -375,6 +375,8 @@ switch is read.
 | `VICTORY_FULL_CARD_PASS` | on (=0 turns off) | flag |  |  |  | Texture pass puts back every slot needing a new host copy. |
 | `VICTORY_GAME_DIR` | n/a | path |  |  |  | Directory of the title's files. |
 | `VICTORY_GPU_LOAD_MS` | 0 (off) | number |  |  |  | Milliseconds of artificial card load added per frame. |
+| `VICTORY_GPU_RO_CHECK` | off | flag |  |  |  | Verification for `VICTORY_GPU_RO_SKIP`: declares full ranges and warns if the compare finds a changed piece in title memory the title asked for GPU-read-only. |
+| `VICTORY_GPU_RO_SKIP` | off | flag |  | live |  | Leaves the pages the title asked for with read-only GPU protection (`PAGE_GRAPHICS_READONLY/EXECUTE/EXECUTE_READ`) out of the ranges shaders are declared to write (the CPU constant ring at the head of the big heap): fewer fills, merges and flight waits. Port of Mikael Jarvinen's VIctory-NVIDIA #1014 (+16% fps on a 3080, one run per arm). |
 | `VICTORY_GPU_TIMING` | off | flag |  |  | diag | Timestamps each noted command and reports card time by command. |
 | `VICTORY_GPU_TIMING_FILE` | n/a | path |  |  |  | File that receives the table of card time by title queue. |
 | `VICTORY_GROUP_SKIP` | off | flag |  |  |  | =1 leaves the barrier wait out for groups that do not need it. |

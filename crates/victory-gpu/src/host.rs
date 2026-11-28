@@ -6236,10 +6236,11 @@ impl Meter {
         }
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
+            let gpu_ro_left = crate::shadow::GPU_RO_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            if passes + compares + gpu_ro_left > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \n                     {gpu_ro_left:.1} MB declared written in GPU-read-only memory clipped (VICTORY_GPU_RO_SKIP)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }

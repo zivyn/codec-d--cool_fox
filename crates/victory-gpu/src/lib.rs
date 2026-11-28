@@ -154,6 +154,8 @@ pub mod addrset;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
+pub use shadow::{title_memory_gpu_readonly, title_memory_gpu_writable};
+#[cfg(windows)]
 pub use watch::mapping_stats;
 #[cfg(windows)]
 pub use watch::{

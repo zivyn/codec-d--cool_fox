@@ -210,7 +210,7 @@ impl Counters {
 fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
     let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
     let (working, private) = crate::copystat::process_memory();
-    let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
+    let [budget, used, _, shared] = host.video_memory_os().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
     vec![
         format!("FPS {:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}", 1e3 / ms.max(0.001)),

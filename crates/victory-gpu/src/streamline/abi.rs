@@ -124,6 +124,8 @@ pub const DLSS_DLAA: u32 = 6;
 // `sl::DLSSGMode`, `sl::DLSSGFlags`.
 pub const DLSSG_OFF: u32 = 0;
 pub const DLSSG_ON: u32 = 1;
+/// `eRequestVRAMEstimate`: `slDLSSGGetState` with options fills `estimatedVRAMUsageInBytes`.
+pub const DLSSG_REQUEST_VRAM_ESTIMATE: u32 = 1 << 2;
 pub const DLSSG_RETAIN_RESOURCES_WHEN_OFF: u32 = 1 << 3;
 
 // `sl::ReflexMode`.

@@ -6191,7 +6191,7 @@ pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
-const BUFFERS: u32 = 2;
+pub(crate) const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
@@ -7041,11 +7041,22 @@ pub(crate) fn compute_legal(state: u32) -> u32 {
 }
 
 impl Host {
+    /// [`Self::video_memory_os`] with the budget less what DLSS and frame
+    /// generation will take of the card and do not hold yet (and the
+    /// back-off after an out-of-VRAM answer; `VICTORY_FRAMEGEN_BUDGET`,
+    /// `crate::streamline::effective_budget`): what the texture room, the
+    /// pool's pressure, the idle sweep and the rest count against.
+    pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
+        let mut memory = self.video_memory_os()?;
+        memory[0] = crate::streamline::effective_budget(memory[0]);
+        Some(memory)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
     /// not fit on the card).
-    pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
+    pub(crate) fn video_memory_os(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
         let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();

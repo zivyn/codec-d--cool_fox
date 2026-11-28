@@ -42,6 +42,8 @@ pub mod device;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -108,6 +110,8 @@ mod sites;
 #[cfg(windows)]
 mod tiles;
 pub mod signature;
+#[cfg(windows)]
+pub mod streamline;
 mod switch;
 pub use switch::on as env_on;
 #[cfg(windows)]

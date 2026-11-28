@@ -1102,10 +1102,16 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        // Streamline is given the device (DLSS, `VICTORY_DLSS`); for frame
+        // generation (`VICTORY_FRAMEGEN`) the direct queue is made through
+        // its device proxy.
+        let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
+            Some(queue) => queue,
+            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })?,
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -1243,6 +1249,12 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The upscaling (`crate::streamline`) recorded in the list, noted for
+    /// the present after its submission; 0 for none.
+    upscale: std::sync::atomic::AtomicU64,
+    /// The copy of the colour without the interface (`crate::streamline`)
+    /// recorded in the list; 0 for none.
+    hudless: std::sync::atomic::AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -2751,7 +2763,7 @@ fn line() -> std::sync::MutexGuard<'static, Line> {
 }
 
 /// Why flights were settled ([`LATE_STATS`]' places from 2 on).
-const WHY_SYNC: usize = 2;
+pub(crate) const WHY_SYNC: usize = 2;
 const WHY_CARD_DONE: usize = 3;
 const WHY_VALUE: usize = 4;
 const WHY_STALE: usize = 5;
@@ -3964,6 +3976,8 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                upscale: std::sync::atomic::AtomicU64::new(0),
+                hudless: std::sync::atomic::AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -4302,6 +4316,8 @@ impl HostList {
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
+        self.upscale.store(0, Ordering::Relaxed);
+        self.hudless.store(0, Ordering::Relaxed);
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -4847,6 +4863,32 @@ impl HostList {
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
+    /// The list recorded upscaling `id` (`crate::streamline`).
+    pub(crate) fn mark_upscale(&self, id: u64) {
+        self.upscale.store(id, Ordering::Relaxed);
+    }
+
+    /// The upscaling the list recorded, taken (0 for none).
+    pub(crate) fn take_upscale(&self) -> u64 {
+        self.upscale.swap(0, Ordering::Relaxed)
+    }
+
+    /// The list recorded the copy of the colour without the interface
+    /// number `id` (`crate::streamline`, frame generation).
+    pub(crate) fn mark_hudless(&self, id: u64) {
+        self.hudless.store(id, Ordering::Relaxed);
+    }
+
+    /// The copy of the colour without the interface the list recorded, 0 for none.
+    pub(crate) fn hudless(&self) -> u64 {
+        self.hudless.load(Ordering::Relaxed)
+    }
+
+    /// As [`HostList::hudless`], taken.
+    pub(crate) fn take_hudless(&self) -> u64 {
+        self.hudless.swap(0, Ordering::Relaxed)
+    }
+
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
@@ -6118,7 +6160,7 @@ impl Host {
 
 /// The swap chain formats a presented texture can be copied into: its own
 /// family's.
-fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+pub(crate) fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     Some(match format.0 {
         27..=32 => DXGI_FORMAT_R8G8B8A8_UNORM,
         87 | 90 | 91 => DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -6225,6 +6267,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
+        crate::streamline::line(frames);
         card_clock_line(frames, ms);
         spans::line(frames);
         crate::echo::line(frames);
@@ -6478,7 +6521,11 @@ impl Meter {
             self.caption = Some(buffer);
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // With frame generation showing more frames than are rendered, both rates.
+        let text = match crate::streamline::shown_per_frame() {
+            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
+            per => format!(" | VIctory {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
+        };
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
@@ -6571,6 +6618,7 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            crate::streamline::resizing();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -6800,7 +6848,19 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // Frame generation: the frame's markers, constants and tags.
+            let presenting = crate::streamline::present_begins(
+                frame,
+                crate::streamline::Planes {
+                    base: (texture, state_u32),
+                    overlay: overlay.filter(|_| composed),
+                    size: [width, height],
+                },
+            );
+            let called = crate::streamline::present_called(&presenting);
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::streamline::present_returned(called);
+            crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -6811,6 +6871,14 @@ impl Host {
             #[cfg(not(feature = "diagnostics"))]
             Some(false)
         }
+    }
+
+    /// Lets the swap chain and what presents with it go, once everything
+    /// sent has run (`victory upscaler-check`: before Streamline is shut
+    /// down; nothing presents afterwards).
+    pub(crate) fn drop_presenter(&self) {
+        settle_now(WHY_SYNC);
+        *self.presenter.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn presenter(
@@ -6840,9 +6908,34 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            // With frame generation, through Streamline's factory proxy and
+            // on its queue proxy: the swap chain is its proxy.
+            let proxied = crate::streamline::swap_chain_factory(&factory).map(|(proxy, queue)| {
+                proxy
+                    .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
+                    .and_then(|s| s.cast::<IDXGISwapChain3>())
+            });
+            let swap_chain = match proxied {
+                Some(Ok(swap_chain)) => {
+                    crate::streamline::swap_chain_made(true, None);
+                    // Frame generation must be off across a change between
+                    // windowed and full screen (Streamline's guide, 12.0):
+                    // the system's own Alt+Enter is not taken for this window.
+                    if let Ok(parent) = swap_chain.GetParent::<IDXGIFactory1>() {
+                        let _ = parent.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+                    }
+                    swap_chain
+                }
+                Some(Err(e)) => {
+                    crate::streamline::swap_chain_made(false, Some(&e));
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?
+                }
+                // (`VICTORY_STREAMLINE_PRESENT=1`, DLSS without frame
+                // generation: Streamline's proxy of it, for its present hook.)
+                None => crate::streamline::present_hooked(
+                    factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
+                ),
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");

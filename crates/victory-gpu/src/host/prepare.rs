@@ -392,6 +392,18 @@ impl Host {
         let mut stage = crate::timeline::span("submit: the submission lock");
         let lock = || self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let mut submitted = if late { lock() } else { front::lock_quiet(lock) };
+        // Upscalings these lists recorded, in submission order: the next
+        // present tags the latest (frame generation).
+        for run in runs {
+            let id = run.take_upscale();
+            if id != 0 {
+                crate::streamline::submitted(id);
+            }
+            let id = run.take_hudless();
+            if id != 0 {
+                crate::streamline::hudless_submitted(id);
+            }
+        }
         // The refreshes of this submission begun while the one before was sent
         // are over before anything is asked or refreshed here, and so is
         // everything stage A did of it (`VICTORY_STAGE_A_STEPS`): its asking, its

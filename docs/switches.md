@@ -229,6 +229,31 @@ switch is read.
 | `VICTORY_WIDE_SPIN` | 0 | yes | Microseconds a wide wait spins awake before sleeping; 0 does not spin. |
 | `VICTORY_WIDE_WHOLE` | on (=0 turns off) | no | Copies a long unwatched range whole on several threads. |
 
+## Added with the VIctory-NVIDIA port (2026-11-28, `feat/nv1-dlss-sr`)
+
+DLSS and frame generation come from the VIctory-NVIDIA fork (trustno1-coder, readmet3xt-lab, DexNom; `docs/dlss.md` there). All off unless asked; none changes the
+translation of shaders.
+
+| Switch | Default | Kind | Translation | A/B | Cache | What it is for |
+|---|---|---|---|---|---|---|
+| `VICTORY_DLSS` | off | flag |  |  |  | `1`: DLSS Super Resolution does the title's FidelityFX upscaling (its `ffxDispatch`), from the same inputs into the same output. Needs NVIDIA's files (`VICTORY_STREAMLINE_DIR`); the title renders through its FidelityFX path (the image is patched, cached in `images\upscaler-<mode>`). |
+| `VICTORY_DLSS_MODE` | quality (dlaa with frame generation alone) | text |  |  |  | dlaa, quality, balanced, performance, ultraperformance: the scene's size, 1, 2/3, 0.58, 1/2, 1/3 of the output. |
+| `VICTORY_DLSS_PRESET` | default | text |  |  |  | The DLSS model: default, j, k, l, m. |
+| `VICTORY_DLSS_JITTER`, `VICTORY_DLSS_MV` | `1,1` | text |  |  |  | Multipliers for the jitter and the motion-vector scale DLSS is given (sign and scale checks). |
+| `VICTORY_DLSS_REACTIVE` | on (=0 turns off) | flag |  |  |  | `0`: the title's reactive mask is not given to DLSS. |
+| `VICTORY_FRAMEGEN` | off | flag |  |  |  | `1`: DLSS Frame Generation on our present (RTX 40 and later, hardware-accelerated GPU scheduling on); needs `VICTORY_THIN=1` or `VICTORY_ASYNC_SUBMIT=1` and `VICTORY_DLSS=1`. About 0.5 GB of video memory more at 1440p. |
+| `VICTORY_FRAMEGEN_X` | 2 | number | | | | Frames shown for each one rendered, 2 to 6 (more than 2 on RTX 50). |
+| `VICTORY_FRAMEGEN_HUDLESS` | on (=0 turns off) | flag |  |  |  | `0`: no colour without the interface is copied or tagged on Series X (generated frames warp the interface). Needs `VICTORY_INTERFACE_COMPOSITE`. |
+| `VICTORY_INTERFACE_COMPOSITE` | unset | text |  |  |  | `<vertex hash>,<pixel hash>` of the title's interface composite pipelines (Series X): the draw in front of which the colour without the interface is copied. Unset: none is copied. The hashes are not in the repository. |
+| `VICTORY_FRAMEGEN_CYCLE`, `VICTORY_FSR_FRAMEGEN`, `VICTORY_FSR_FRAMEGEN_DEBUG`, `VICTORY_FIDELITYFX_DIR` | off | flag/text |  |  |  | AMD FSR 3 frame generation for cards without DLSS frame generation (module `streamline/fsr.rs`; its host hooks are not ported yet: only the module is there). |
+| `VICTORY_FSR_PATH` | off | flag |  |  |  | `1`: the title's FidelityFX path at `VICTORY_DLSS_MODE`'s scale with its own FidelityFX upscaling and no Streamline: the comparison for DLSS. |
+| `VICTORY_NATIVE_1440P`, `VICTORY_RENDER_1080P` | off | flag |  |  |  | Series X retail image at a 2560x1440 output (scene 2560x1440, or 1920x1080 scaled up by the title): the image is patched before it is mapped and cached apart (`native_1440p.rs`). |
+| `VICTORY_STREAMLINE_DIR` | `C:\dev\sdk\streamline-sdk-v2.14.16\bin\x64` (read only, normally absent) | path |  |  |  | The folder of `sl.interposer.dll`, its plugins and `nvngx_dlss.dll`, `nvngx_dlssg.dll` (NVIDIA's, never in the repository). Use a folder on G:. |
+| `VICTORY_STREAMLINE_LOG` | unset | path |  |  |  | A folder for Streamline's own verbose log files. |
+| `VICTORY_STREAMLINE_PRESENT` | off | flag |  |  |  | `1`: DLSS without frame generation with our swap chain as Streamline's proxy of it (no "presentCommon() was not observed"). |
+| `VICTORY_CHECK_TEARDOWN` | on (=0 turns off) | flag |  |  |  | `victory upscaler-check`: shut Streamline down at the end. |
+| `VICTORY_LEAVE_OUT` | unset | text |  |  |  | `<16 hex digits>[,..]`: pipelines whose shader has one of these hashes are left out in every build (the VIctory-NVIDIA fork leaves out the decal heap's relocation program, 11.85 ms of the card a frame there, and the heat-haze pass). Part of the warm book's signature. |
+
 ## All switches, alphabetical
 
 

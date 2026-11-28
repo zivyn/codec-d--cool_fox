@@ -33,6 +33,9 @@ pub enum Form {
     WaveWide,
     /// The same, tried last of all. Exact.
     WaveWideLastResort,
+    /// The same, taken before "without skips, scalars followed" where that form would run an
+    /// exchange of the two host waves after lanes branched alone (`VICTORY_WAVE_WIDE_AUTO`). Exact.
+    WaveWideAuto,
     /// SCC of a mask operation behind a per-lane skip, the skips taken wave-wide. Exact.
     LaneMaskWide,
     /// The program with the edges whose value is constant threaded.
@@ -118,6 +121,7 @@ impl Form {
             Form::LocalApproximateAnyMask => "local waves (APPROXIMATE, any mask)",
             Form::WaveWide => "wave-wide branches",
             Form::WaveWideLastResort => "wave-wide branches (last resort)",
+            Form::WaveWideAuto => "wave-wide branches (auto)",
             Form::LaneMaskWide => "wave-wide lane-mask skips",
             Form::Threaded => "threaded edges",
             Form::Refused => "refused",

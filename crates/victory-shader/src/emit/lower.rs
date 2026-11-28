@@ -4823,6 +4823,7 @@ impl<'a> Lower<'a> {
     fn group_sync(&mut self, block: usize) {
         if meeting_mode() & 1 != 0 {
             super::wide_class::note_barrier(self.cur_ir);
+            super::wide_class::note_meeting(self.cur_ir);
         }
         self.barrier_op(block, meeting_mode());
     }
@@ -6311,6 +6312,7 @@ impl<'a> Lower<'a> {
         }
         if meeting_mode() & 1 != 0 {
             super::wide_class::note_barrier(self.cur_ir);
+            super::wide_class::note_meeting(self.cur_ir);
         }
         self.barrier_op(self.cur, meeting_mode());
     }

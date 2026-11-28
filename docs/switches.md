@@ -113,6 +113,7 @@ the card.
 | `VICTORY_WAVE_OWN_BITS` | on (=0 turns off) | cache key (text) | Allows a wave OR where not every lane runs, using each lane's own bits. |
 | `VICTORY_WAVE_WHY` | off (any value prints) | translator reads it, does not change the output | Prints to stderr why a program keeps 64-lane waves and why waterfall checks failed. |
 | `VICTORY_WAVE_WIDE` | off for most programs, on for two named kernels (=1 forces on, =0 off) | cache key (text) | Translates console waves run as two host waves in the wave-wide form with barriers in branches. |
+| `VICTORY_WAVE_WIDE_AUTO` | off (=1 every program, or a comma list of program names) | cache key (text) | Takes the wave-wide form before "without skips, scalars followed" where the forms before it stopped at an exchange of the two host waves that only a deep-only skip keeps from some lane (the cascade-shadow rasters); refused where it puts a translator group barrier in a loop. |
 | `VICTORY_WAVE_WIDE_FIRST` | a built-in list of one program | cache key (text) | Comma list of program names that take the wave-wide form before any approximate local form. |
 
 **What the guard test sees and what it does not.** `every_switch_the_translator_reads_is_in_the_cache_key` (in
@@ -721,6 +722,7 @@ switch is read.
 | `VICTORY_WAVE_OWN_BITS` | on (=0 turns off) | flag | yes |  |  | Allows a wave OR where not every lane runs, using each lane's own bits. |
 | `VICTORY_WAVE_WHY` | off (any value prints) | flag |  |  |  | Prints to stderr why a program keeps 64-lane waves and why waterfall checks failed. |
 | `VICTORY_WAVE_WIDE` | off for most programs, on for two named kernels (=1 forces on, =0 off) | flag | yes |  |  | Translates console waves run as two host waves in the wave-wide form with barriers in branches. |
+| `VICTORY_WAVE_WIDE_AUTO` | off (=1 every program, or a comma list of program names) | list | yes |  |  | Takes the wave-wide form before "without skips, scalars followed" where the forms before it stopped at an exchange of the two host waves that only a deep-only skip keeps from some lane (the cascade-shadow rasters); refused where it puts a translator group barrier in a loop. |
 | `VICTORY_WAVE_WIDE_FIRST` | a built-in list of one program | list | yes |  |  | Comma list of program names that take the wave-wide form before any approximate local form. |
 | `VICTORY_WHOLE_CHECK` | off | flag |  |  |  | Diagnostic that checks a long range before it is copied whole. |
 | `VICTORY_WIDE_BACK` | on (built-in default 1; =0 turns off) | flag |  |  |  | Copies back across ranges on several threads. |

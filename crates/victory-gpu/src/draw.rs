@@ -5927,6 +5927,38 @@ mod tests {
         assert!(!step(&mut kept, 19, (0, 200), 2));
     }
 
+    /// The descriptors of a table a program's windows read alone are the ones its plan leaves unmade: SRVs the
+    /// translator listed (`HostShader::bindless`), only where every declaration at the descriptor is one.
+    #[test]
+    fn a_table_plan_skips_the_srvs_only_windows_read() {
+        use victory_shader::native::{ResourceType, RootType, UsedResource};
+        let used = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 3,
+        };
+        let declared = [
+            used(ResourceType::Srv, 0),
+            used(ResourceType::Srv, 8),
+            used(ResourceType::Uav, 16),
+            used(ResourceType::Srv, 24),
+            // The same descriptor as the one before, declared as another kind.
+            used(ResourceType::Uav, 24),
+        ];
+        let plan = super::TablePlan::new(&declared, &[], &[(3, 0), (3, 16), (3, 24)]);
+        assert_eq!(plan.groups.len(), 1);
+        // Descriptor 0 is listed and an SRV; 1 is not listed; 2 is listed but a UAV; 3 has an SRV the window reads
+        // and a UAV that is not listed.
+        assert_eq!(plan.groups[0].skip, [0]);
+        let plan = super::TablePlan::new(&declared, &[], &[]);
+        assert!(plan.groups[0].skip.is_empty());
+    }
+
     use super::staging_budget_per_frame;
 
     #[test]

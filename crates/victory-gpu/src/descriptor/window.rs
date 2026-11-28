@@ -18,7 +18,7 @@
 //!   descriptor. No view is created and no descriptor copied for them.
 //!
 //! What the windows rest on: a copy that has a number is held for good (the view of it in the heap is
-//! made once, and a window names it by number), at most [`WINDOW_COPIES`] of them; one more finds no number
+//! made once, and a window names it by number), at most `WINDOW_COPIES` (`victory_shader::emit`) of them; one more finds no number
 //! and its views are made as before.
 
 use std::cell::{Cell, RefCell};
@@ -29,12 +29,14 @@ use crate::shadow::Shadow;
 
 /// `VICTORY_BINDLESS_HOST`: the level (see the module).
 pub(crate) fn level() -> u8 {
-    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| match std::env::var("VICTORY_BINDLESS_HOST").as_deref() {
-        Ok("1") => 1,
-        Ok("2") => 2,
-        _ => 0,
-    })
+    fn mode(text: Option<&str>) -> u8 {
+        match text {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => 0,
+        }
+    }
+    crate::ab::live_value!("VICTORY_BINDLESS_HOST", u8, mode)
 }
 
 /// Whether a table of windows is made for the view heap: shaders translated with

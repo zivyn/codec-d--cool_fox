@@ -3118,7 +3118,22 @@ impl HostHeap {
         self.raw_at(run + number, &shadow.buffer, 0, shadow.width());
         copies.push(shadow.clone());
         shadow.set_copy_number(number);
+        if number % 512 == 0 {
+            tracing::info!(number, "windows: host copies held for good, with their raw views in the view heap");
+        }
         number
+    }
+
+    /// Whether the window `noted` can be written for title slot `index`: the slot has an entry, the range fits, and the
+    /// copy has a number (made now if it has none). A slot whose view is not made for want of this shows nothing right.
+    pub(crate) fn window_ok(&self, index: u32, noted: &super::window::Noted) -> bool {
+        let (shadow, start, end) = noted;
+        self.windows.is_some()
+            && index < victory_shader::emit::SLOT_WINDOWS_COUNT
+            && (self.raw == 0 || index < self.raw)
+            && start < end
+            && *end <= u64::from(u32::MAX)
+            && self.window_number(shadow) != 0
     }
 
     /// Writes the window of title slot `index` for the buffer view that shows bytes `start..end` of the copy
@@ -3318,14 +3333,24 @@ impl HostHeap {
                 views.begin(recording);
             }
             let twins = self.twins.get(index as usize).is_some();
-            // Wanted as a window only, where the view is a buffer's with one: no view is made, no descriptor copied.
-            if only && self.windows.is_some() {
-                if let Some(view) = views.only.get(&words) {
-                    return Some(self.listed_from(index, view, twins, views.start, views.step));
+            // Wanted as a window only, where the view is a buffer's with one the host can write for this slot: no view
+            // is made, no descriptor copied. Otherwise the view is made as always (a slot left unmade would show
+            // whatever it showed before).
+            if only && self.windows.is_some() && !views.no_only.contains(&words) {
+                if !views.only.contains_key(&words) {
+                    match views.make_only(words) {
+                        Some(view) => {
+                            views.only.insert(words, view);
+                        }
+                        None => {
+                            views.no_only.insert(words);
+                        }
+                    }
                 }
-                if let Some(view) = views.make_only(words) {
-                    let listed = self.listed_from(index, &view, twins, views.start, views.step);
-                    views.only.insert(words, view);
+                if let Some(view) = views.only.get(&words)
+                    && view.made.window.as_ref().is_some_and(|w| self.window_ok(index, w))
+                {
+                    let listed = self.listed_from(index, view, twins, views.start, views.step);
                     super::window::count(super::window::SKIPPED);
                     return Some(listed);
                 }
@@ -6972,8 +6997,9 @@ struct ListViews {
     step: usize,
     start: usize,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
-    /// The records of this recording made as windows only (`VICTORY_BINDLESS_HOST=2`).
+    /// The records of this recording made as windows only (`VICTORY_BINDLESS_HOST=2`), and the ones that cannot be.
     only: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    no_only: std::collections::HashSet<[u32; 3], std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     over: Over<std::rc::Rc<ListMade>>,
     /// Slots of this recording's own taken so far.
     local: u32,
@@ -7052,6 +7078,7 @@ impl ListViews {
                 start,
                 made: Default::default(),
                 only: Default::default(),
+                no_only: Default::default(),
                 over: Over::new(),
                 local: 0,
                 counts: [0; 8],
@@ -7077,6 +7104,7 @@ impl ListViews {
         self.recording = recording;
         self.made.clear();
         self.only.clear();
+        self.no_only.clear();
         self.local = 0;
         self.mode = view_cache();
         if self.mode != 0 && self.over.begin(view_clock(), Self::KEEP_SLOTS) {

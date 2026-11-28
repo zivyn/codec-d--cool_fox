@@ -71,6 +71,7 @@ the card.
 
 | switch | default | keyed as | purpose |
 |---|---|---|---|
+| `VICTORY_BINDLESS_BUFFERS` | off | cache key (text) | A program reads the SRV of a descriptor table as raw dwords (`buffer_load_dword*` without an index or format, `s_buffer_load_dword`) through the host's window of its heap slot (copy number, byte, length, in the root SRV `t249`) when the host made one, else through its view; `HostShader::bindless` names the entries only windows read. Needs `VICTORY_BINDLESS_HOST` on the host. |
 | `VICTORY_BVH_BOUNDS` | on (=0 turns off) | cache key (text) | Keeps the ray-structure builder's view accesses near their views and ignores impossible header sizes. |
 | `VICTORY_BVH_FENCES` | on (=0 turns off) | cache key (text) | Puts the structure builder's buffer atomics between two fences. |
 | `VICTORY_BVH_MISS` | off | cache key (text) | Every ray-tracing node test answers "nothing hit" without reading the node (a box has no child, anything else is the triangle miss), so a walk ends where it began and reads no title memory; never while `VICTORY_BVH_BUILDER=1`. |
@@ -308,6 +309,8 @@ translation of shaders.
 | `VICTORY_BETWEEN_FIT` | off | flag |  |  |  | (integ/validation-27, VRAM2) The buffer `between` of a list of the card-steps pool is the size its plans need (at least 256 KiB, a power of two, at most the 4 MiB cap) instead of always 4 MiB; the pool hands back the smallest buffer that is big enough. Est. 80 to 160 MB of the card. Read once. |
 | `VICTORY_BARRIER_LOOK` | off | flag |  |  |  | Reads the title's barrier groups and counts which need a wait for earlier shader writes. |
 | `VICTORY_BARRIER_TEST` | off | text |  |  | diag | Timing experiment: leaves out barrier waits for groups, indirect passes or both (values groups, indirect, both). |
+| `VICTORY_BINDLESS_CENSUS` | off | path |  |  |  | Tool (`translate`): appends a line for each program that has table entries only windows read (`VICTORY_BINDLESS_BUFFERS`). |
+| `VICTORY_BINDLESS_HOST` | 0 | number |  | live |  | The host's side of `VICTORY_BINDLESS_BUFFERS`: 1 writes the window of each buffer view beside the view (a table of windows is made for shaders translated with the switch whatever the level); 2 also leaves unmade, in the tables made for a draw, the views its program reads through windows alone. |
 | `VICTORY_BIND_CACHE` | on (=0 turns off) | flag |  |  |  | Skips re-setting render targets and depth on the host list when they are unchanged. |
 | `VICTORY_BOOK` | on (=0 turns off) | flag |  |  | diag | Keeps a record of the title's memory objects to explain device faults; 0 keeps none. |
 | `VICTORY_BUFFER_NAN` | off | text |  |  | diag | (integ/validation-23, diag) Scans buffers the watched compute programs write for NaN and infinities: `all` or `@<list file>`. |
@@ -316,6 +319,7 @@ translation of shaders.
 | `VICTORY_BUFFER_PROBE` | off | list |  |  |  | Hex addresses of title buffers whose title memory and copy contents are logged now and then. |
 | `VICTORY_BUFFER_WHOLE` | off | list |  |  |  | Hex addresses of title buffers taken whole from title memory at every refresh (experiment). |
 | `VICTORY_BURY_LAG` | 64 (16 on a PC with 32 GiB or less) | number |  |  |  | Submissions that must finish before a released object or reset host list is dropped. |
+| `VICTORY_BINDLESS_BUFFERS` | off | flag | yes |  |  | A program reads the SRV of a descriptor table as raw dwords through the host's window of its heap slot when there is one (`VICTORY_BINDLESS_HOST`), else through its view. |
 | `VICTORY_BVH_BOUNDS` | on (=0 turns off) | flag | yes |  |  | Keeps the ray-structure builder's view accesses near their views and ignores impossible header sizes. |
 | `VICTORY_BVH_BUILDER` | off | flag |  |  |  | Runs the title's ray-tracing structure builder on the host; otherwise its dispatches are dropped. |
 | `VICTORY_BVH_FENCES` | on (=0 turns off) | flag | yes |  |  | Puts the structure builder's buffer atomics between two fences. |

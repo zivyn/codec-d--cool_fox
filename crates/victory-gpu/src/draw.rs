@@ -1055,6 +1055,8 @@ macro_rules! once {
 }
 
 pub(crate) mod access;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod bufnan;
 pub(crate) mod fold;
 
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
@@ -3670,6 +3672,13 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();
+        // What it wrote, scanned for NaN and infinities (`VICTORY_BUFFER_NAN`); that replaces the
+        // list's compute root signature and pipeline.
+        #[cfg(feature = "diagnostics")]
+        if self.buffer_scan(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(stage) = p.stages.first()
             && let Some(role) = stage.shader.ambient

@@ -83,6 +83,7 @@ fn build() -> [u8; 32] {
             "VICTORY_UNIFORM_LOADS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_F32_FTZ",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",

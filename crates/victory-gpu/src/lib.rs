@@ -17,6 +17,8 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod bufscan;
 mod asked;
 mod changes;
 pub mod defaults;

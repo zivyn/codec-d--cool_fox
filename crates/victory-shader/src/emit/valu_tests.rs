@@ -363,9 +363,14 @@ const fn mtbuf(op: u8, vdata: u8, srsrc: u8, format: u8) -> [u32; 2] {
 /// Stores `v1` to the buffer, then reads it back into `v0` with the tbuffer
 /// load `op` in buffer format `format`.
 fn tbuffer_load_of_v1(op: u8, format: u8) -> HostShader {
+    build_valu_cs(&tbuffer_body(op, format))
+}
+
+/// The body of [`tbuffer_load_of_v1`].
+pub(super) fn tbuffer_body(op: u8, format: u8) -> Vec<u32> {
     let mut body = buffer_store_dword(1, 8, 0).to_vec();
     body.extend(mtbuf(op, 0, 8, format));
-    build_valu_cs(&body)
+    body
 }
 
 #[test]

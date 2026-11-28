@@ -1061,8 +1061,7 @@ fn f16_nearest_on() -> bool {
     if let Some(on) = TEST_F16_NEAREST.get() {
         return on;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_F16_NEAREST").is_some_and(|v| v == "1"))
+    super::f16_level::level() >= 1
 }
 
 #[cfg(test)]
@@ -4297,6 +4296,17 @@ impl<'a> Lower<'a> {
         let tie = self.s.m.bin(c, Bin::And, tie, odd);
         let up = self.s.m.bin(c, Bin::Or, nearer, tie);
         self.s.m.select(c, up, hi, lo)
+    }
+
+    /// `f` as an f16 in the low bits, as a 16-bit result that is no arithmetic operation of the
+    /// program gets one (an interpolated value, a 16-bit load or store of a float format): the
+    /// host's conversion, or the nearest half with `VICTORY_F16_NEAREST=2`.
+    fn f16_result(&mut self, f: V) -> V {
+        if super::f16_level::mix_and_packed() {
+            return self.f16_nearest(f);
+        }
+        let i32t = self.s.t.i32;
+        self.s.op(self.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
     }
 
     /// `(a >> off[4:0]) & ((1 << width) - 1)`, sign-extended from the field's
@@ -8030,9 +8040,8 @@ impl<'a> Lower<'a> {
                 let m = self.s.m.i32(0xFFFF);
                 self.s.m.bin(c, Bin::And, x, m)
             } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                let f = self.as_float(x);
+                self.f16_result(f)
             });
         }
         let mut out = Vec::new();
@@ -8804,10 +8813,7 @@ impl<'a> Lower<'a> {
                         None => Ok(None),
                     }
                 };
-                let to_f16 = |l: &mut Self, f: V| {
-                    let i32t = l.s.t.i32;
-                    l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-                };
+                let to_f16 = |l: &mut Self, f: V| l.f16_result(f);
                 let h = 2 * attribute.channel + u8::from(attribute.high);
                 let c = self.cur;
                 if name == "v_interp_p1ll_f16" {

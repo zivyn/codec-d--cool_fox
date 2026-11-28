@@ -797,9 +797,13 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                // (to nearest as the console does, with `VICTORY_F16_NEAREST=2`)
+                let h = if super::f16_level::mix_and_packed() {
+                    self.f16_nearest(r)
+                } else {
+                    self.s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r])
+                };
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -2018,8 +2022,12 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                if super::f16_level::mix_and_packed() {
+                    self.f16_nearest(f)
+                } else {
+                    self.s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                }
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {

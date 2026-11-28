@@ -192,6 +192,8 @@ pub(crate) enum Attr {
     ReadOnly = 3,
     /// Barriers.
     NoDuplicate = 4,
+    /// The entry point: 32-bit denormals flushed (`"fp32-denorm-mode"="ftz"`, shader model 6.2).
+    Fp32Ftz = 5,
 }
 
 struct Func {
@@ -596,9 +598,20 @@ impl Module {
             }
             w.record(3, &r);
         }
+        // (a fifth one only for the entry that asks for flushed denormals: a module without it
+        // is written as before)
+        let ftz = self.funcs.iter().any(|f| f.attr == Some(Attr::Fp32Ftz));
+        if ftz {
+            let mut r = vec![5, 0xFFFF_FFFF, 4];
+            for text in ["fp32-denorm-mode", "ftz"] {
+                r.extend(text.bytes().map(u64::from));
+                r.push(0);
+            }
+            w.record(3, &r);
+        }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=if ftz { 5 } else { 4 } {
             w.record(2, &[id]);
         }
         w.exit();

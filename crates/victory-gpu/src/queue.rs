@@ -1020,6 +1020,10 @@ extern "system" fn present(
             before_sync();
             crate::probe_watch::sample(frame);
         }
+        if crate::bufscan::due(frame) {
+            before_sync();
+            crate::bufscan::sample(frame);
+        }
         if crate::capture::dump_due(frame) {
             before_sync();
             crate::capture::dump_targets(crate::capture::dump_name(frame));

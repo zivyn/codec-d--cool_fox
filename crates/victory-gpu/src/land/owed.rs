@@ -38,6 +38,7 @@
 //! What it takes: the pages are private memory, committed, read-write; the
 //! copy is that of a buffer in a default heap; the landing is the tail's.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 
@@ -92,10 +93,20 @@ pub(crate) struct Unit {
     /// Told when a thread other than the lander touches the unit (the copies
     /// of its pieces are then ones the title reads).
     touched: Box<dyn Fn() + Send + Sync>,
+    /// A unit kept across landings (`crate::land::own`, [`keep`]): the piece it is of stays owed until something reads
+    /// or writes its pages, whatever lands meanwhile; a later landing of the same piece takes the place of its bytes.
+    /// It is in [`KEPT`], not in [`UNITS`], and `finish_all` and `run_pending` leave it alone.
+    keep: bool,
+    /// What piece a kept unit is of: the copy's number and the piece's offset.
+    key: (u64, usize),
+    /// Told when one of our own readers (not a thread that touched the page) lands a kept unit.
+    forced: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// The units not done with, until the next landing begins.
 static UNITS: RwLock<Vec<Arc<Unit>>> = RwLock::new(Vec::new());
+/// The units kept across landings, by their first page: they never overlap.
+static KEPT: RwLock<BTreeMap<usize, Arc<Unit>>> = RwLock::new(BTreeMap::new());
 /// How many are not done.
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 /// The page ranges (from, to) of units that were done with and forgotten by
@@ -112,8 +123,8 @@ static DONE_CV: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 /// Since the last frame-rate line: units, their bytes, touches that landed one
 /// (and the microseconds they took), waits for another thread's landing, units
 /// landed after the title was told and the microseconds that took.
-pub(crate) static STATS: [std::sync::atomic::AtomicU64; 10] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+pub(crate) static STATS: [std::sync::atomic::AtomicU64; 11] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 pub(crate) const UNITS_N: usize = 0;
 pub(crate) const BYTES: usize = 1;
 pub(crate) const TOUCHES: usize = 2;
@@ -127,6 +138,8 @@ pub(crate) const UNARMED: usize = 7;
 /// what the landing left out for them, are there too).
 pub(crate) const CHECKED: usize = 8;
 pub(crate) const DIFFERING: usize = 9;
+/// Kept units landed by one of our own readers.
+pub(crate) const FORCED: usize = 10;
 
 /// The page ranges (from, to; whole pages) that cover `ranges` (from, to),
 /// where those that share a page are one: a page of two units would be unguarded
@@ -178,6 +191,9 @@ pub(crate) fn register(units: Vec<(usize, usize, Land, Box<dyn Fn() + Send + Syn
             armed: std::sync::atomic::AtomicBool::new(true),
             land: Mutex::new(Some(land)),
             touched,
+            keep: false,
+            key: (0, 0),
+            forced: None,
         });
         UNITS
             .write()
@@ -200,6 +216,108 @@ pub(crate) fn register(units: Vec<(usize, usize, Land, Box<dyn Fn() + Send + Syn
     }
     let _ = armed;
     refused
+}
+
+/// What [`keep`] did with a piece.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The piece was owed already and still is: its bytes are these now, the guard stays.
+    Replaced,
+    /// A new unit, its pages guarded.
+    New,
+}
+
+/// Leaves a piece owed across landings (`crate::land::own`): the pages `[from, to)` (title addresses of the piece's
+/// bytes) are guarded, and `land` lands them when anything reads or writes one, whoever that is and whenever that
+/// is: the pages are the title's memory as it will be, not as it is. A landing of the same piece (`key`) while it is
+/// owed only takes the place of what `land` lands, which is how the bytes of every frame's flight go nowhere when
+/// nothing reads them.
+///
+/// Whatever else is owed over any of its pages lands first (a unit of another piece that shares one, or one that is
+/// being landed). When that cannot be done, or the pages cannot be guarded (they are not private committed
+/// read-write memory), the piece is given back to be landed now.
+pub(crate) fn keep(
+    key: (u64, usize),
+    from: usize,
+    to: usize,
+    land: Land,
+    touched: Box<dyn Fn() + Send + Sync>,
+    forced: Box<dyn Fn() + Send + Sync>,
+) -> Result<Kept, Land> {
+    let (a, b) = (from / PAGE * PAGE, to.next_multiple_of(PAGE));
+    let same = KEPT.read().unwrap_or_else(|e| e.into_inner()).get(&a).filter(|u| u.key == key && u.to == b).cloned();
+    if let Some(unit) = same {
+        // (The lander takes it under this lock after it won the state: a unit seen pending with its bytes still here
+        // has not been given to a lander, and is not.)
+        let mut slot = unit.land.lock().unwrap_or_else(|e| e.into_inner());
+        if unit.state.load(Ordering::SeqCst) == PENDING && slot.is_some() {
+            *slot = Some(land);
+            return Ok(Kept::Replaced);
+        }
+    }
+    for other in units_in(a, b - a) {
+        ensure(&other);
+    }
+    // (A thread that is landing a unit does not wait for another's: if one is still there, the piece is landed now.)
+    if !units_in(a, b - a).is_empty() {
+        return Err(land);
+    }
+    let unit = Arc::new(Unit {
+        from: a,
+        to: b,
+        state: AtomicU8::new(PENDING),
+        armed: std::sync::atomic::AtomicBool::new(true),
+        land: Mutex::new(Some(land)),
+        touched,
+        keep: true,
+        key,
+        forced: Some(forced),
+    });
+    KEPT.write().unwrap_or_else(|e| e.into_inner()).insert(a, unit.clone());
+    ACTIVE.fetch_add(1, Ordering::SeqCst);
+    if crate::inplace::private_whole(a, b - a) && guard(a, b - a, true) {
+        STATS[UNITS_N].fetch_add(1, Ordering::Relaxed);
+        STATS[BYTES].fetch_add((b - a) as u64, Ordering::Relaxed);
+        return Ok(Kept::New);
+    }
+    // Not armed: given back, as done.
+    unit.armed.store(false, Ordering::SeqCst);
+    STATS[UNARMED].fetch_add(1, Ordering::Relaxed);
+    if unit.state.compare_exchange(PENDING, LANDING, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+        let land = unit.land.lock().unwrap_or_else(|e| e.into_inner()).take();
+        unit.state.store(DONE, Ordering::SeqCst);
+        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        let mut kept = KEPT.write().unwrap_or_else(|e| e.into_inner());
+        if kept.get(&a).is_some_and(|u| Arc::ptr_eq(u, &unit)) {
+            kept.remove(&a);
+        }
+        return Err(land.unwrap_or_else(|| Box::new(|| {})));
+    }
+    // A thread that read or wrote one of its pages meanwhile has it: it is landed when that one is done.
+    ensure(&unit);
+    Err(Box::new(|| {}))
+}
+
+/// Whether the piece `key`, whose pages are `[from, to)`, is owed and no lander has it.
+pub(crate) fn kept_pending(key: (u64, usize), from: usize, to: usize) -> bool {
+    let (a, b) = (from / PAGE * PAGE, to.next_multiple_of(PAGE));
+    KEPT.read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&a)
+        .is_some_and(|u| u.key == key && u.to == b && u.state.load(Ordering::SeqCst) == PENDING)
+}
+
+/// How many units are kept now.
+pub(crate) fn kept_count() -> usize {
+    KEPT.read().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Every kept unit is landed, by this thread: when the switch that keeps them is turned off, and in the tests.
+pub(crate) fn finish_kept() {
+    let all: Vec<Arc<Unit>> = KEPT.read().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+    for unit in &all {
+        ensure(unit);
+    }
 }
 
 /// `PAGE_GUARD` on or off the pages `[at, at + len)`.
@@ -238,6 +356,11 @@ fn ensure(unit: &Unit) {
             guard(unit.from, unit.to - unit.from, false);
             unit.state.store(DONE, Ordering::SeqCst);
             ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            if unit.keep {
+                // Out of the set of kept units, and remembered as done ([`finished_lately`]): after it is done, so
+                // that a thread that touched a page while it was owed never finds it done before it is.
+                retire(unit);
+            }
             let _held = DONE_CV.0.lock().unwrap_or_else(|e| e.into_inner());
             DONE_CV.1.notify_all();
         }
@@ -262,13 +385,33 @@ fn ensure(unit: &Unit) {
 
 fn units_in(at: usize, len: usize) -> Vec<Arc<Unit>> {
     let end = at.saturating_add(len);
-    UNITS
+    let mut found: Vec<Arc<Unit>> = UNITS
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|u| u.from < end && at < u.to && u.state.load(Ordering::SeqCst) != DONE)
         .cloned()
-        .collect()
+        .collect();
+    let kept = KEPT.read().unwrap_or_else(|e| e.into_inner());
+    // (They never overlap: the last that begins before `end`, and those before it while they reach `at`.)
+    found.extend(
+        kept.range(..end)
+            .rev()
+            .take_while(|(_, u)| u.to > at)
+            .filter(|(_, u)| u.state.load(Ordering::SeqCst) != DONE)
+            .map(|(_, u)| u.clone()),
+    );
+    found
+}
+
+/// Out of the kept units, and remembered for a while as done ([`finished_lately`]).
+fn retire(unit: &Unit) {
+    let mut kept = KEPT.write().unwrap_or_else(|e| e.into_inner());
+    // (Noted before it leaves the set, as `finish_all` does.)
+    FINISHED.lock().unwrap_or_else(|e| e.into_inner()).push((unit.from, unit.to, std::time::Instant::now()));
+    if kept.get(&unit.from).is_some_and(|u| std::ptr::eq(Arc::as_ptr(u), unit)) {
+        kept.remove(&unit.from);
+    }
 }
 
 /// For the handler of `crate::watch`, on a guard page violation at `at`:
@@ -316,6 +459,15 @@ pub(crate) fn finished_lately(at: usize) -> bool {
     {
         return true;
     }
+    if KEPT
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=at)
+        .next_back()
+        .is_some_and(|(_, u)| within(u.from, u.to) && u.state.load(Ordering::SeqCst) == DONE && u.armed.load(Ordering::SeqCst))
+    {
+        return true;
+    }
     let now = std::time::Instant::now();
     FINISHED
         .lock()
@@ -336,7 +488,12 @@ pub(crate) fn land_range(at: usize, len: usize) {
         return;
     }
     for unit in units_in(at, len) {
+        let owed = unit.keep && unit.state.load(Ordering::SeqCst) == PENDING;
         ensure(&unit);
+        if owed && let Some(forced) = &unit.forced {
+            forced();
+            STATS[FORCED].fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -893,5 +1050,218 @@ mod tests {
         assert_eq!(refused.len(), 1);
         assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
         finish_all();
+    }
+
+    /// What `keep` is given to land: counts its runs and writes `byte` over the pages.
+    fn lands(at: usize, byte: u8, runs: &Arc<AtomicUsize>) -> Land {
+        let runs = runs.clone();
+        Box::new(move || {
+            runs.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the unguarded pages of the test's allocation.
+            unsafe { std::ptr::write_bytes(at as *mut u8, byte, PAGE) };
+        })
+    }
+
+    /// A piece kept across landings: the landing of the same piece takes the place of the bytes and lands nothing,
+    /// the guard stays, and the first read of the title's lands the newest bytes, once.
+    #[test]
+    fn a_kept_piece_takes_the_newest_bytes_and_lands_them_once_when_read() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let at = memory(3);
+        let (first, second) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let told = Arc::new(AtomicBool::new(false));
+        let seen = told.clone();
+        let key = (7, 0);
+        let kept = keep(
+            key,
+            at + PAGE,
+            at + 2 * PAGE,
+            lands(at + PAGE, 0x11, &first),
+            Box::new(move || seen.store(true, Ordering::SeqCst)),
+            quiet(),
+        );
+        assert_eq!(kept.ok(), Some(Kept::New));
+        assert!(kept_pending(key, at + PAGE, at + 2 * PAGE));
+        let kept = keep(key, at + PAGE, at + 2 * PAGE, lands(at + PAGE, 0x22, &second), quiet(), quiet());
+        assert_eq!(kept.ok(), Some(Kept::Replaced));
+        assert_eq!(kept_count(), 1, "one unit for the one piece");
+        assert_eq!((first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)), (0, 0), "nothing landed yet");
+        // The relay's next landing and the lander's background pass leave it alone.
+        finish_all();
+        run_pending();
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+        assert!(kept_pending(key, at + PAGE, at + 2 * PAGE));
+        // The title's thread reads a byte of it: the newest bytes, landed once, and the copy told.
+        let byte = std::thread::spawn(move || {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + PAGE + 5) as *const u8).read_volatile() }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(byte, 0x22, "the read sees the newest landing, never the first or the bytes from before");
+        assert_eq!((first.load(Ordering::SeqCst), second.load(Ordering::SeqCst)), (0, 1));
+        assert!(told.load(Ordering::SeqCst));
+        assert_eq!(kept_count(), 0);
+        assert!(!kept_pending(key, at + PAGE, at + 2 * PAGE));
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        // A page beside it was never guarded.
+        // SAFETY: inside the allocation.
+        assert_eq!(unsafe { *(at as *const u8) }, 0);
+        release(at);
+    }
+
+    /// The same piece after it landed is a new unit, guarded again.
+    #[test]
+    fn a_piece_that_landed_is_kept_again_by_the_next_landing() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let at = memory(2);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let key = (8, 0);
+        assert_eq!(keep(key, at, at + PAGE, lands(at, 1, &runs), quiet(), quiet()).ok(), Some(Kept::New));
+        finish_kept();
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(kept_count(), 0);
+        assert_eq!(keep(key, at, at + PAGE, lands(at, 2, &runs), quiet(), quiet()).ok(), Some(Kept::New));
+        // (A read of ours, as the refresh of another copy would make.)
+        let mut buffer = [0u8; 16];
+        assert!(crate::host::read_into(at as *const u8, &mut buffer));
+        assert_eq!(buffer, [2u8; 16]);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(kept_count(), 0);
+        release(at);
+    }
+
+    /// A read of ours lands a kept piece first and is told (a copy whose pieces our own readers keep forcing goes
+    /// eager); a read of the title's thread is not that.
+    #[test]
+    fn our_own_reads_land_a_kept_piece_and_say_so() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let at = memory(1);
+        let (runs, forced) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let counted = forced.clone();
+        let kept = keep(
+            (9, 0),
+            at,
+            at + PAGE,
+            lands(at, 0x5a, &runs),
+            quiet(),
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert_eq!(kept.ok(), Some(Kept::New));
+        let mut buffer = [0u8; 8];
+        assert!(crate::host::read_into((at + 100) as *const u8, &mut buffer));
+        assert_eq!(buffer, [0x5a; 8]);
+        assert_eq!((runs.load(Ordering::SeqCst), forced.load(Ordering::SeqCst)), (1, 1));
+        release(at);
+    }
+
+    /// A piece that shares a page with a piece owed lands that one first (they are never two units over a page), and
+    /// a piece whose pages cannot be guarded is given back.
+    #[test]
+    fn a_piece_over_the_page_of_another_lands_that_first_and_what_cannot_be_guarded_comes_back() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let at = memory(3);
+        let runs = Arc::new(AtomicUsize::new(0));
+        assert_eq!(keep((1, 0), at, at + PAGE, lands(at, 3, &runs), quiet(), quiet()).ok(), Some(Kept::New));
+        // Another piece (another key) over the same page.
+        let other = Arc::new(AtomicUsize::new(0));
+        assert_eq!(keep((2, 0), at + 100, at + 200, lands(at + PAGE, 4, &other), quiet(), quiet()).ok(), Some(Kept::New));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the first landed before the second was kept");
+        assert_eq!(kept_count(), 1);
+        finish_kept();
+        assert_eq!(other.load(Ordering::SeqCst), 1);
+        // Not private memory: given back, to be landed now.
+        let refused = keep((3, 0), PAGE, 2 * PAGE, Box::new(|| {}), quiet(), quiet());
+        assert!(refused.is_err());
+        assert_eq!(kept_count(), 0);
+        assert_eq!(ACTIVE.load(Ordering::SeqCst), 0);
+        release(at);
+    }
+
+    /// The whole of it with a copy in the card's memory, as `crate::land::own` makes it: what shaders wrote to a
+    /// piece is not merged into title memory, the title's CPU that then reads the piece sees it (the red check: a read
+    /// that found the bytes from before would fail here), and the byte the title wrote after the fetch stands.
+    #[test]
+    fn a_title_read_after_a_gpu_write_sees_the_new_data_and_the_titles_own_bytes_stand() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        let at = memory(2);
+        // Title memory holds 0x10 everywhere, and so does the copy's CPU side.
+        // SAFETY: the test's allocation.
+        unsafe { std::ptr::write_bytes(at as *mut u8, 0x10, 2 * PAGE) };
+        let mut side = vec![0x10u8; 2 * PAGE];
+        let copy = crate::shadow::Shadow::unbacked(at as u64, side.as_mut_ptr(), (2 * PAGE) as u64, true);
+        // The flight wrote 0x20 over the first 1000 bytes of the piece; byte 2000 of the card's is a value the title
+        // sent up before the fetch and then changed in title memory.
+        let mut flight = vec![0x10u8; 2 * PAGE];
+        flight[..1000].fill(0x20);
+        flight[2000] = 0x33;
+        let stored = crate::land::own::Stored::of(&flight);
+        let skips = vec![(2000usize, 2001usize)];
+        let land = crate::land::own::lander(copy.clone(), 0, 2 * PAGE, stored, skips);
+        let (touched, forced) = crate::land::own::tellers(&copy);
+        // The title's own write to the byte, in title memory, before the piece is guarded.
+        // SAFETY: the test's allocation.
+        unsafe { ((at + 2000) as *mut u8).write(0x44) };
+        assert_eq!(keep((copy.id(), 0), at, at + 2 * PAGE, land, touched, forced).ok(), Some(Kept::New));
+        let title = std::thread::spawn(move || {
+            // SAFETY: inside the allocation: the title's thread reads a byte the flight wrote, the one it wrote
+            // itself, and one nobody wrote.
+            unsafe {
+                (
+                    ((at + 10) as *const u8).read_volatile(),
+                    ((at + 2000) as *const u8).read_volatile(),
+                    ((at + 5000) as *const u8).read_volatile(),
+                )
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(title, (0x20, 0x44, 0x10), "the flight's bytes, the title's own byte, and what nobody wrote");
+        assert_eq!(copy.own_forced_count(), 0, "a thread of the title touching it is not one of ours");
+        assert!(copy.title_read(), "and the copy is eager from then on");
+        assert_eq!(kept_count(), 0);
+        release(at);
+    }
+
+    /// `offer` keeps the pieces of a copy nothing else covers, hands back those the title was seen to read, and a
+    /// second flight over a piece owed replaces its bytes with no guard to arm.
+    #[test]
+    fn offered_pieces_are_kept_and_a_second_flight_replaces_their_bytes() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        let at = memory(4);
+        let mut side = vec![0u8; 4 * PAGE];
+        let copy = crate::shadow::Shadow::unbacked(at as u64, side.as_mut_ptr(), (4 * PAGE) as u64, true);
+        copy.mark_gpu_only();
+        let mut fetch = vec![0x77u8; 4 * PAGE];
+        let data = fetch.as_mut_ptr() as usize;
+        let before = crate::land::own::held();
+        let pieces = vec![(copy.clone(), 0, PAGE, 0u64), (copy.clone(), 2 * PAGE, 3 * PAGE, (2 * PAGE) as u64)];
+        let rest = crate::land::own::offer(pieces, data, 0);
+        assert!(rest.is_empty(), "both are ownable: {:?}", rest.iter().map(|r| (r.1, r.2)).collect::<Vec<_>>());
+        assert_eq!(kept_count(), 2);
+        assert_eq!(crate::land::own::held() - before, 2 * PAGE as u64);
+        // The next flight: the same piece, new bytes: replaced, the same unit, the same memory held.
+        fetch.fill(0x88);
+        let rest = crate::land::own::offer(vec![(copy.clone(), 0, PAGE, 0u64)], data, 0);
+        assert!(rest.is_empty());
+        assert_eq!(kept_count(), 2);
+        assert_eq!(crate::land::own::held() - before, 2 * PAGE as u64);
+        // Nothing was merged: title memory beside the pieces is as it was.
+        // SAFETY: the allocation, a page no piece covers.
+        assert_eq!(unsafe { *((at + PAGE) as *const u8) }, 0);
+        // A read lands the newest.
+        let mut buffer = [0u8; 4];
+        assert!(crate::host::read_into((at + 3) as *const u8, &mut buffer));
+        assert_eq!(buffer, [0x88; 4], "the second flight's bytes");
+        // The title's thread was seen to read the copy: its pieces are handed back.
+        copy.note_title_read();
+        let rest = crate::land::own::offer(vec![(copy.clone(), 3 * PAGE, 4 * PAGE, (3 * PAGE) as u64)], data, 0);
+        assert_eq!(rest.len(), 1);
+        finish_kept();
+        release(at);
     }
 }

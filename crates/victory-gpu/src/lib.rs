@@ -102,6 +102,8 @@ mod sizes;
 #[cfg(windows)]
 mod pagedrive;
 #[cfg(windows)]
+mod propcount;
+#[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
 mod standin;

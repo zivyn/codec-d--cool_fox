@@ -955,6 +955,12 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
+        crate::propcount::fetched(&pieces);
+        // Pieces nothing but the title's CPU can read stay on the card (`VICTORY_LAND_OWN`): their bytes are kept,
+        // their pages guarded, and they land if anything reads or writes one.
+        if land::own::on() && land::on() && check.is_none() {
+            pieces = land::own::offer(std::mem::take(&mut pieces), data, after);
+        }
         let merging = std::time::Instant::now();
         let _merging = crate::timeline::span("landing: merging fetched pieces");
         let mut written = 0;
@@ -1091,6 +1097,10 @@ impl Host {
         // What an earlier landing still owes is in before this one begins, and
         // so before any signal behind it is told.
         crate::land::owed::finish_all();
+        // The switch that keeps pieces on the card was turned off (`VICTORY_AB`): what is kept lands now.
+        if !crate::land::own::on() && crate::land::owed::kept_count() > 0 {
+            crate::land::owed::finish_kept();
+        }
         let landing = std::time::Instant::now();
         let _tail = crate::land::tail(tail);
         let (mut card_us, mut pc_us) = (0u64, 0u64);

@@ -14,6 +14,8 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 pub(crate) mod host;
 #[cfg(windows)]
 pub(crate) mod sparse;
+#[cfg(windows)]
+pub(crate) mod usage;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -157,6 +159,10 @@ fn mirror(handle: u64) {
         Some(host) => {
             drop(pending);
             if let Some(host) = host {
+                // SAFETY: the handle is a descriptor slot in title memory.
+                if !heap.samplers() && unsafe { (handle as *const u32).read_unaligned() } == VIEW_TAG {
+                    host.usage().written(index, host.count());
+                }
                 host.mirror(index, handle, false);
             }
         }
@@ -547,6 +553,7 @@ fn sync_round(early: bool) -> bool {
                         step,
                         mirrored_count,
                         if log_past_on { Some(&mut out.past_slots) } else { None },
+                        &mut |slot| host.usage().found_past(slot),
                     );
                     out.past += n;
                     out.past_highest = out.past_highest.max(highest);
@@ -574,6 +581,7 @@ fn sync_round(early: bool) -> bool {
                             .map_or(0, u32::from_le_bytes)
                     };
                     if !samplers && word(0) == VIEW_TAG {
+                        host.usage().found(index);
                         // A draw's own table: the draw makes what it
                         // reads of it (`draw.rs` `tables`).
                         if host.copied_tabled(index, frame) {
@@ -638,6 +646,11 @@ fn sync_round(early: bool) -> bool {
             }
         });
         spent[2] += since(began);
+        // The views pinned past the host's slots, made again if the title
+        // changed their records; those that waited for a table's slot.
+        if !samplers {
+            host.tail_sync(start, step);
+        }
         if let Some(highest) = past_highest {
             past_slots.sort_unstable();
             for &slot in &past_slots {
@@ -717,6 +730,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    usage_line();
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -765,6 +779,23 @@ pub(crate) fn sync_line(frames: f64) {
     );
 }
 
+/// Says what the title does with each of its big view heaps (the ones of
+/// 65,536 slots or more), when it changed since last said ([`usage::Usage`]).
+#[cfg(windows)]
+fn usage_line() {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if heap.samplers() || heap.desc.count < 1 << 16 {
+            continue;
+        }
+        if let Some(Some(host)) = heap.host.get() {
+            host.usage().line(heap.desc.count, host.count(), host.tail_pinned());
+        }
+    }
+}
+
 /// Title descriptor slots in a changed byte range that have host counterparts.
 /// `range_end` is exclusive.
 #[cfg(windows)]
@@ -795,6 +826,7 @@ fn views_past(
     step: u64,
     mirrored_count: u32,
     mut slots: Option<&mut Vec<u32>>,
+    found_at: &mut dyn FnMut(u32),
 ) -> (u64, Option<u32>) {
     let step = step as usize;
     if step < 4 {
@@ -807,6 +839,7 @@ fn views_past(
         let Some(record) = page.get(at..at + step) else { break };
         if u32::from_le_bytes([record[0], record[1], record[2], record[3]]) == VIEW_TAG {
             found = (found.0 + 1, Some(slot as u32));
+            found_at(slot as u32);
             if let Some(slots) = slots.as_deref_mut()
                 && slots.len() < PAST_SLOTS
             {
@@ -1907,13 +1940,15 @@ mod tests {
             page.extend(record(if matches!(slot, 12 | 14 | 17) { VIEW_TAG } else { 0 }));
         }
         let mut slots = Vec::new();
-        assert_eq!(views_past(&page, 10 * step, step as u64, 14, Some(&mut slots)), (2, Some(17)));
+        assert_eq!(views_past(&page, 10 * step, step as u64, 14, Some(&mut slots), &mut |_| {}), (2, Some(17)));
         assert_eq!(slots, [14, 17]);
-        assert_eq!(views_past(&page, 10 * step, step as u64, 18, None), (0, None));
-        assert_eq!(views_past(&page, 10 * step, step as u64, 0, None), (3, Some(17)));
+        assert_eq!(views_past(&page, 10 * step, step as u64, 18, None, &mut |_| {}), (0, None));
+        assert_eq!(views_past(&page, 10 * step, step as u64, 0, None, &mut |_| {}), (3, Some(17)));
         // A page that does not start on a record: the first whole one counts
         // and a cut-off last one does not.
-        assert_eq!(views_past(&page[8..page.len() - 8], 10 * step + 8, step as u64, 0, None), (2, Some(14)));
+        let mut seen = Vec::new();
+        assert_eq!(views_past(&page[8..page.len() - 8], 10 * step + 8, step as u64, 0, None, &mut |s| seen.push(s)), (2, Some(14)));
+        assert_eq!(seen, [12, 14], "every slot found is told");
     }
 
     /// A round covers every ask made before it began, and only those.

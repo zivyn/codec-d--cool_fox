@@ -96,18 +96,16 @@ impl TableGroup {
         Some(&self.entries[self.by_descriptor[i].1])
     }
 
-    fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
+    /// The highest slot of the title's heap this group's entries reach.
+    fn last_slot(&self, heap: &crate::descriptor::Heap, table: u64) -> Option<u32> {
         let index_at = |dword: u32| {
             table
                 .checked_add(u64::from(dword) * 4)
                 .and_then(|end| heap.index(end))
         };
         match index_at(self.max_dword) {
-            Some(i) => i >= host_count,
-            None => self
-                .entries
-                .iter()
-                .any(|u| index_at(u.table_offset_dwords).is_some_and(|i| i >= host_count)),
+            Some(i) => Some(i),
+            None => self.entries.iter().filter_map(|u| index_at(u.table_offset_dwords)).max(),
         }
     }
 }
@@ -4013,8 +4011,16 @@ impl State {
             let needs_snapshot = group.has_cbv
                 || match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(&Root::Table(table)) => self.heap_of(table).is_some_and(|heap| {
-                        heap.host()
-                            .is_some_and(|host| group.needs_snapshot(heap, host.count(), table))
+                        heap.host().is_some_and(|host| {
+                            // (What the title's tables do with its heap is
+                            // counted: `descriptor::usage`.)
+                            let last = group.last_slot(heap, table);
+                            let snapshot = last.is_some_and(|i| i >= host.count());
+                            if let Some(last) = last {
+                                host.usage().table(last, snapshot);
+                            }
+                            snapshot
+                        })
                     }),
                     _ => false,
                 };

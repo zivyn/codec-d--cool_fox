@@ -64,6 +64,16 @@ in that order of size:
 - **Cube reflections too blurred, wrong materials**: DXIL's `Log` is base 2, and
   normalized buffer codes were one step off.
 - **Every ray missed**: the dispatch flag that says counts are threads, not groups.
+- **The view heap is 1,000,000 views on NVIDIA, the title's has 1,245,184** (RTX 4060, resource binding tier 3: the
+  driver takes no heap above 1,000,000, whatever the tier says; the host asks for a heap of each size from 4 M down
+  and searches between 1,000,000 and 1.5 M, `host view heaps hold ...`). The title's slots past the ones the host
+  mirrors are its per-frame tables' ring (records copied in as bytes, a block of 4,096 slots a frame): a draw
+  whose table reaches past them gets a table made afresh in dynamic slots from the title's records, so what it
+  reads is right. A view the title makes there by a call is pinned in the dynamic slot of its index
+  (`VICTORY_TITLE_TAIL=0`: not). What is not covered: a shader that picks a view by an index it computes at or
+  past the host's null slot (999,999) reads a null slot; the one `WARN` of a view lost says so. The line
+  `title view heap use: ...` counts the highest slot written, the 4,096-slot blocks touched, the records past
+  the host's slots by calls and as bytes, and the tables read in place or through snapshots.
 
 ## Measured and not worth it
 

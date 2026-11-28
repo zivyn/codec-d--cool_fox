@@ -96,6 +96,7 @@ fn build() -> [u8; 32] {
             "VICTORY_MASK_NUMBERS",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_LEGACY_ASSUME",
+            "VICTORY_NAN_SAFE",
             "VICTORY_WAVE_WIDE_FIRST",
             "VICTORY_VIEW_INDEX",
             "VICTORY_FOLD_VIEWS",

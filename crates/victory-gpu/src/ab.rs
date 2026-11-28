@@ -106,20 +106,25 @@ pub(crate) fn pick(switch: &str) -> Option<bool> {
 }
 
 /// The number of `switch` among those that change.
-pub(crate) fn bit(switch: &str) -> Option<u32> {
+pub fn bit(switch: &str) -> Option<u32> {
     Some(asked()?.switches.iter().position(|s| s == switch)? as u32)
 }
 
 /// What `switch` is when it is on in the phases that change it (`<switch>=<value>`), if a value was given.
-pub(crate) fn value_b(switch: &str) -> Option<&'static str> {
+pub fn value_b(switch: &str) -> Option<&'static str> {
     let asked = asked()?;
     let at = asked.switches.iter().position(|s| s == switch)?;
     asked.values[at].as_deref()
 }
 
 /// Whether the switch of that number is on now.
-pub(crate) fn on(bit: u32) -> bool {
+pub fn on(bit: u32) -> bool {
     BITS.load(Relaxed) >> bit & 1 != 0
+}
+
+/// The switches that are on now, a bit each (for logs that tag what they count with the arm).
+pub fn bits() -> u32 {
+    BITS.load(Relaxed)
 }
 
 /// A switch that is off unless its variable is `1`; with `VICTORY_AB` naming it (diagnostics builds), off and on

@@ -28,7 +28,7 @@ use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub mod capture;
-pub mod overlap;
+pub mod live;
 pub mod stats;
 use stats::COUNTERS;
 
@@ -311,7 +311,7 @@ pub extern "system" fn AcpHalReleaseShapeContexts() -> HRESULT {
 // and take whatever lies between read and write.
 // shortcut: each enabled context decodes from a cold state and the overlap
 // buffer is ignored (titles copy it between consecutive contexts of one
-// voice), unless `VICTORY_XMA_OVERLAP=1`: see [`overlap`].
+// voice); keep decoder state there if a title's seams turn out audible.
 
 use victory_formats::xma;
 
@@ -427,17 +427,8 @@ impl Xma {
         );
         #[cfg(feature = "diagnostics")]
         dump_input(index, context);
-        let decoder = if overlap::enabled() {
-            heap_bytes(context.get(8), overlap::TOKEN_BYTES)
-                .and_then(|b| overlap::restore(b, context.channels(), sample_rate(context)))
-        } else {
-            None
-        };
-        if decoder.is_some() {
-            tracing::debug!(index, "XMA voice continues from its overlap buffer");
-        }
         *slot = Some(Voice {
-            decoder,
+            decoder: None,
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
@@ -467,12 +458,6 @@ impl Xma {
             return;
         };
         COUNTERS.voice_disabled();
-        if overlap::enabled()
-            && voice.trace.frames > 0
-            && let Some(decoder) = &voice.decoder
-        {
-            keep_overlap(context, decoder);
-        }
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -597,14 +582,6 @@ fn pump(context: Context, voice: &mut Voice) {
     }
 }
 
-/// Keeps the decoder for the context that gets a copy of this one's overlap
-/// buffer.
-fn keep_overlap(context: Context, decoder: &xma::Decoder) {
-    if let Some(buffer) = heap_bytes(context.get(8), overlap::TOKEN_BYTES) {
-        overlap::save(buffer, decoder, sample_rate(context));
-    }
-}
-
 /// A context's sample rate.
 fn sample_rate(context: Context) -> u32 {
     const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
@@ -623,24 +600,6 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
             return false;
         }
         voice.ended = false;
-        // With the overlap kept, a refill goes on from the decoder only soon
-        // after the input ran out: a later one is another sound's, and its
-        // start must not be joined to the old tail.
-        if overlap::enabled()
-            && let Some(ended) = voice.trace.ended_ms
-            && overlap::stale(
-                voice
-                    .trace
-                    .since
-                    .elapsed()
-                    .as_millis()
-                    .saturating_sub(ended),
-            )
-            && let Some(decoder) = &mut voice.decoder
-        {
-            decoder.reset();
-            COUNTERS.overlap(stats::Overlap::Reset);
-        }
         if context.field(2, 26, 5) == INPUT_INVALID {
             context.set_field(2, 26, 6, 0);
         }
@@ -649,16 +608,11 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let mut current = context.field(4, 31, 1);
     if valid & (1 << current) == 0 {
         if valid & (1 << (1 - current)) == 0 {
-            // Out of input: the overlap tail, then nothing; or, with the
-            // overlap kept, the decoder as it is for the stream's next input.
+            // Out of input: the overlap tail, then nothing.
             if let Some(decoder) = &mut voice.decoder {
-                if overlap::enabled() {
-                    keep_overlap(context, decoder);
-                } else {
-                    let mut tail = Vec::new();
-                    decoder.flush(&mut tail);
-                    voice.pcm.extend(tail);
-                }
+                let mut tail = Vec::new();
+                decoder.flush(&mut tail);
+                voice.pcm.extend(tail);
             }
             voice.ended = true;
             voice.trace.room_since = None;
@@ -1630,30 +1584,5 @@ mod tests {
         assert_eq!((m.message_count)(acp), 1, "disconnected");
         (m.release)(acp);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
-    }
-
-    /// A context's overlap buffer gets the token of its voice's decoder; a
-    /// copy of the buffer in another context (a stereo 48 kHz one like it)
-    /// finds the decoder, a cold buffer does not.
-    #[test]
-    fn the_overlap_buffer_carries_the_decoder_to_the_next_context() {
-        let _serial = lock(&CONTEXT_TESTS);
-        let (mut buffer, mut apu) = (std::ptr::null_mut(), 0);
-        assert_eq!(ApuAlloc(&mut buffer, &mut apu, 0x400, 0x100, 2), S_OK);
-        // SAFETY: the allocation was just made.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), 0x400) };
-        let mut words = [0u32; 16];
-        let context = Context(words.as_mut_ptr());
-        context.set(1, 1 << 29 | 3 << 27);
-        context.set(8, apu);
-        assert!(overlap::restore(&bytes[..16], 2, 48_000).is_none());
-        keep_overlap(context, &xma::Decoder::new(2, 48_000));
-        let copy = bytes.to_vec();
-        assert!(overlap::restore(&copy, 2, 48_000).is_some());
-        assert!(overlap::restore(&copy, 1, 48_000).is_none());
-        ApuFree(buffer);
-        // A buffer that is not title memory is left alone.
-        context.set(8, 0);
-        keep_overlap(context, &xma::Decoder::new(2, 48_000));
     }
 }

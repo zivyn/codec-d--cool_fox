@@ -135,6 +135,8 @@ mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
+mod nan_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod view_index_tests;
@@ -361,6 +363,39 @@ pub fn legacy_assume() -> bool {
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LEGACY_ASSUME").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_NAN_SAFE`: a set of [`nan_safe_bits`] (decimal or `0x` hex; 0, none, when unset)
+/// for the places where the title's float code depends on what a NaN or an infinity does and
+/// the host driver may not do the same: the NaN is spelled out in integer arithmetic (a
+/// driver that treats floats as numbers cannot fold it away). Off by default; a diagnostic for
+/// the hot spot in the hair (`nan_tests` run on the card say which ops need it). Part of the
+/// translation: the shader cache keys on it.
+pub fn nan_safe() -> u32 {
+    #[cfg(test)]
+    if let Some(bits) = lower::TEST_NAN_SAFE.get() {
+        return bits;
+    }
+    static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BITS.get_or_init(|| {
+        let value = std::env::var("VICTORY_NAN_SAFE").ok();
+        parse_set(value.as_deref(), 0, nan_safe_bits::ALL)
+    })
+}
+
+/// The bits of [`nan_safe`].
+pub mod nan_safe_bits {
+    /// The float compares of the unordered family (`v_cmp_u/o/nge/nlg/ngt/nle/neq/nlt`) and the
+    /// ordered ones: a NaN is told by its bits, and never by the compare itself.
+    pub const COMPARE: u32 = 1;
+    /// `v_mul_legacy_f32` and the like: the zero of a factor is told by its bits.
+    pub const LEGACY: u32 = 2;
+    /// The clamp bit of a float result (`DX10_CLAMP`): a NaN gives 0, by its bits.
+    pub const CLAMP: u32 = 4;
+    /// `v_max_f32`/`v_min_f32` (and the 3-operand forms): the operand that is a number is
+    /// chosen by the bits of the other.
+    pub const MAX_MIN: u32 = 8;
+    pub const ALL: u32 = 15;
 }
 
 /// Which of a translated program's group barriers wait for the whole

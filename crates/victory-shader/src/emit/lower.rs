@@ -1307,6 +1307,8 @@ thread_local! {
     /// A test's `VICTORY_LOOP_LIMITS`, for its thread only.
     pub(super) static TEST_LOOP_LIMITS: std::cell::RefCell<Option<super::LoopLimits>> = const { std::cell::RefCell::new(None) };
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`super::nan_safe`], for its thread only.
+    pub(super) static TEST_NAN_SAFE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     /// A test's choice for [`super::legacy_assume`], for its thread only.
     pub(super) static TEST_LEGACY_ASSUME: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -4191,6 +4193,20 @@ impl<'a> Lower<'a> {
     /// FMax/FMin, but -0 orders below +0 (RDNA2 ISA, `v_max_f32`), where
     /// the compare and select DXIL specifies gives either zero.
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
+        let r = self.max_min_plain(max, a, b);
+        // `VICTORY_NAN_SAFE`: where one is a NaN the other is the answer (RDNA2 ISA), said by
+        // the bits, so no driver can take the operands for numbers. (A real RDNA host's own
+        // instruction does it.)
+        if super::nan_safe() & super::nan_safe_bits::MAX_MIN == 0 || host_rdna() & super::rdna::MAX_MIN != 0 {
+            return r;
+        }
+        let c = self.cur;
+        let (na, nb) = (self.is_nan_f32(a), self.is_nan_f32(b));
+        let t = self.s.m.select(c, nb, a, r);
+        self.s.m.select(c, na, b, t)
+    }
+
+    fn max_min_plain(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
         if host_rdna() & super::rdna::MAX_MIN != 0 {
@@ -4322,6 +4338,60 @@ impl<'a> Lower<'a> {
         let abs = self.s.m.bin(c, Bin::And, bits, mask);
         let inf = self.s.m.i32(0x7F80_0000);
         self.s.m.cmp(c, pred::IUGT, abs, inf)
+    }
+
+    /// Whether an f32 value is a zero of either sign, tested in integer arithmetic.
+    fn is_zero_f32(&mut self, f: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mask = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mask);
+        let zero = self.s.m.i32(0);
+        self.s.m.cmp(c, pred::EQ, abs, zero)
+    }
+
+    /// A float compare (`v_cmp_<op>_f32`, `op` the part before the type) with the NaN told by
+    /// the bits of the operands (`VICTORY_NAN_SAFE`): `u` and `o` are the NaN test; the
+    /// ordered compares are false with a NaN among the operands, and the negated ones (`nge`,
+    /// `nlg`, `ngt`, `nle`, `neq`, `nlt`) true, whatever the driver believes of floats.
+    fn nan_safe_compare(&mut self, op: &str, a: V, b: V) -> Result<V, Why> {
+        let c = self.cur;
+        let (na, nb) = (self.is_nan_f32(a), self.is_nan_f32(b));
+        let nan = self.s.m.bin(c, Bin::Or, na, nb);
+        let yes = self.s.m.bool(true);
+        let not = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Xor, x, yes);
+        let (negated, base) = match op {
+            "u" => return Ok(nan),
+            "o" => return Ok(not(self, nan)),
+            "lt" | "eq" | "le" | "gt" | "ge" | "lg" => (false, op),
+            "nge" => (true, "ge"),
+            "nlg" => (true, "lg"),
+            "ngt" => (true, "gt"),
+            "nle" => (true, "le"),
+            "neq" => (true, "eq"),
+            "nlt" => (true, "lt"),
+            _ => return Err("a compare"),
+        };
+        let ordered = match base {
+            "lg" => {
+                let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                self.s.m.bin(c, Bin::Or, lt, gt)
+            }
+            _ => {
+                let p = match base {
+                    "lt" => pred::OLT,
+                    "eq" => pred::OEQ,
+                    "le" => pred::OLE,
+                    "gt" => pred::OGT,
+                    _ => pred::OGE,
+                };
+                self.s.m.cmp(c, p, a, b)
+            }
+        };
+        let number = not(self, nan);
+        let held = self.s.m.bin(c, Bin::And, ordered, number);
+        Ok(if negated { not(self, held) } else { held })
     }
 
     /// The median of three. With a NaN among them the hardware gives the
@@ -4464,6 +4534,11 @@ impl<'a> Lower<'a> {
         }
         let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
+        if super::nan_safe() & super::nan_safe_bits::LEGACY != 0 {
+            let (az, bz) = (self.is_zero_f32(a), self.is_zero_f32(b));
+            let z = self.s.m.bin(c, Bin::Or, az, bz);
+            return self.s.m.select(c, z, zero, m);
+        }
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
@@ -5160,7 +5235,14 @@ impl<'a> Lower<'a> {
             }
         }
         if v.clamp {
+            let before = f;
             f = self.unary(7, f);
+            if super::nan_safe() & super::nan_safe_bits::CLAMP != 0 {
+                // DX10_CLAMP: a NaN gives 0.
+                let nan = self.is_nan_f32(before);
+                let zero = self.s.m.f32(0);
+                f = self.s.m.select(self.cur, nan, zero, f);
+            }
         }
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a float result outside a VGPR");
@@ -11130,7 +11212,9 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                if op == "lg" {
+                if super::nan_safe() & super::nan_safe_bits::COMPARE != 0 && !matches!(op, "f" | "tru") {
+                    self.nan_safe_compare(op, a, b)?
+                } else if op == "lg" {
                     // Ordered and not equal, false for a NaN, as `olt | ogt`.
                     // `fcmp one` means the same, but the AMD D3D12 driver
                     // runs it as unordered (true for a NaN) where NVIDIA

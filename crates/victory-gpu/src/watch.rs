@@ -490,15 +490,20 @@ pub(crate) fn slow_asks() -> [u64; 3] {
 /// written by an asking of its own number, as from any thread that asks, and
 /// the submission still asks for itself. A page the title writes again after
 /// such a round faults once more.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_ASK_EARLY=2`: a submission's asking decides at each one
+/// whether to note the pages it found for the thread; the thread, begun at the first, keeps the pace it was begun
+/// with, asks the pieces that were noted whatever the switch says, and has none left a second or so after it is off
+/// (the count of each piece is halved every 64 rounds): leave out the first seconds of a phase, `VICTORY_AB_SKIP=3`.
+/// What it asks is what a submission asks for itself, and a page found written is in the journal either way.)
 fn early() -> Option<std::time::Duration> {
-    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
-    *EVERY.get_or_init(|| {
-        let ms = match std::env::var("VICTORY_ASK_EARLY") {
-            Ok(v) => v.trim().parse::<f64>().unwrap_or(2.0),
-            Err(_) => 0.0,
-        };
-        std::time::Duration::try_from_secs_f64(ms / 1000.0).ok().filter(|d| !d.is_zero())
-    })
+    crate::ab::live_value!("VICTORY_ASK_EARLY", Option<std::time::Duration>, early_every)
+}
+
+/// The pace of [`early`] as the text of the variable says: none if it is not set, 2 ms if it is not a number.
+fn early_every(text: Option<&str>) -> Option<std::time::Duration> {
+    let ms = text.map_or(0.0, |v| v.trim().parse::<f64>().unwrap_or(2.0));
+    std::time::Duration::try_from_secs_f64(ms / 1000.0).ok().filter(|d| !d.is_zero())
 }
 
 /// The pieces of memory (by [`EARLY_PIECE`] pages) that submissions' askings
@@ -3238,6 +3243,14 @@ mod tests {
     // opening` failed so). The runtime maps under the same lock
     // (`title_memory_remapping`), so the tests that map do too.
     use super::*;
+
+    /// `VICTORY_ASK_EARLY` in the phases of `VICTORY_AB`: none while unset, the named pace while on.
+    #[test]
+    fn the_early_asking_goes_by_the_text_of_the_variable() {
+        let ms = |text| early_every(text).map(|d| d.as_micros());
+        assert_eq!([None, Some("0"), Some("2"), Some(" 0.5 "), Some("x")].map(ms), [None, None, Some(2000), Some(500), Some(2000)]);
+    }
+
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };

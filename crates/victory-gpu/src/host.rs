@@ -281,9 +281,12 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 /// Whether threads that ask for new memory to be made resident or mapped at
 /// the same time are served by one call (on by default;
 /// `VICTORY_RESIDENT_BATCH=0`: a call or round trip for each).
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_RESIDENT_BATCH=0`: each call reads it once and returns
+/// when its own memory is resident or mapped by one way or the other; a call that goes by itself while others are
+/// served by a batch is a call the device takes from any thread.)
 fn batch_residency() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENT_BATCH").is_none_or(|v| v != "0"))
+    crate::ab::live_value!("VICTORY_RESIDENT_BATCH", bool, crate::ab::unless_zero)
 }
 
 /// What a batch of [`resident`] calls holds: a heap or resource of the device's.

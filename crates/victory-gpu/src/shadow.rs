@@ -1853,9 +1853,13 @@ struct Workers {
 /// Waits awake until `there` says so, `VICTORY_WIDE_SPIN` microseconds at
 /// most (0, the default: not at all): asleep, a thread is woken in 50 us and
 /// more, 95 times a frame.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_WIDE_SPIN=200`: read at each wait, which keeps nothing.)
 fn spin(there: impl Fn() -> bool) {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    fn micros(text: Option<&str>) -> u64 {
+        text.and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    }
+    let most = crate::ab::live_value!("VICTORY_WIDE_SPIN", u64, micros);
     if most == 0 {
         return;
     }
@@ -6392,9 +6396,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 
 /// Whether a title buffer's copy is made with the buffer map free
 /// (`VICTORY_MAKE_ASIDE=0`: under its lock, as before).
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_MAKE_ASIDE=0`: read once for the buffer asked for. A
+/// thread that makes the copy under the lock while another is making one aside makes a second copy of the same
+/// bytes: the one that comes second finds the place taken and is let go of, as a copy that lost its place is.)
 fn made_aside() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MAKE_ASIDE").is_none_or(|v| v != "0"))
+    crate::ab::live_value!("VICTORY_MAKE_ASIDE", bool, crate::ab::unless_zero)
 }
 
 /// A list of title addresses in an environment variable (hex, comma apart): the buffers that hold

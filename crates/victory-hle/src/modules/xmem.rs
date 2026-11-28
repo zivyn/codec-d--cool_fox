@@ -464,7 +464,11 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // Pages a heap of the card's stands on (`VICTORY_ZEROCOPY`) cannot be freed: it is let go of, and the
+            // call made again when the lists that held it have run.
+            if VirtualFree(address, 0, MEM_RELEASE) == 0 && victory_gpu::title_memory_unpin_wait(address as usize, 0) {
+                VirtualFree(address, 0, MEM_RELEASE);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -497,6 +501,9 @@ mod section_mb;
 struct Section {
     handle: HANDLE,
     pages: usize,
+    /// Made committed whole (`SEC_COMMIT`): its pages need no commit call, and the GPU side can open it as one heap
+    /// (`VICTORY_ZEROCOPY`, on Wine always).
+    whole: bool,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
     window: std::sync::OnceLock<usize>,
@@ -541,7 +548,7 @@ impl Section {
             if run == 0 {
                 continue; // another worker committed it meanwhile
             }
-            if !commit(base + page * PAGE, run * PAGE) {
+            if !self.whole && !commit(base + page * PAGE, run * PAGE) {
                 return None;
             }
             for p in page..page + run {
@@ -569,7 +576,7 @@ impl Section {
         if lean() && done() {
             return true;
         }
-        if !counted(Call::Commit, || commit(base, len)) {
+        if !self.whole && !counted(Call::Commit, || commit(base, len)) {
             return false;
         }
         for p in pages {
@@ -825,7 +832,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        if !commit(at.Value as usize, len) {
+        if !slice.section.whole && !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
         }
@@ -2070,7 +2077,14 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
-    unsafe { VirtualFree(address, size, kind) }
+    let freed = unsafe { VirtualFree(address, size, kind) };
+    // Pages a heap of the card's stands on cannot be freed (`VICTORY_ZEROCOPY`): what is in place there was let go
+    // of by the call above; the lists that hold it run and drop it, and then the call is made again.
+    // SAFETY: as above.
+    if freed == 0 && victory_gpu::title_memory_unpin_wait(address as usize, size) {
+        return unsafe { VirtualFree(address, size, kind) };
+    }
+    freed
 }
 
 pub(crate) fn module() -> HleModule {

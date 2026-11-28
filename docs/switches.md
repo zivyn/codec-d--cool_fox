@@ -852,6 +852,14 @@ translation of shaders.
 | `VICTORY_WRITE_SITES` | off (unset) | path |  |  |  | File naming title write sites that are made to look first (flags, registers). |
 | `VICTORY_WRITE_SKIP` | on (=0 turns off) | flag |  |  |  | Skips comparing ranges known not to have been written since the last pass. |
 | `VICTORY_XMA_DUMP` | off (unset) | path |  |  | diag | Directory the audio decoder saves its input context words and streams to. |
+| `VICTORY_ZEROCOPY` | off | number |  |  |  | Zero copy (perf/zero-copy): 1 the title memory the title declares read-only to the GPU (its page protection: constant rings, dynamic data) is read by the GPU in place through a heap opened on the title's own pages, no copy in the card's memory, no send up, no guard; given only to ranges the title is seen to write (the bytes sent up into it); 2 also title buffers of upload heaps with no unordered access. Process-level (read once); tasks zerocopy1. |
+| `VICTORY_ZEROCOPY_SECTIONS` | on with VICTORY_ZEROCOPY (=0 keeps reserved) | flag |  |  |  | With VICTORY_ZEROCOPY the title's physical pages are made in sections committed whole (SEC_COMMIT; reserved if the host cannot commit that much), so the GPU side can open them as one heap; 0 keeps them reserved, and view memory stays copies. |
+| `VICTORY_ZEROCOPY_OBSERVE` | 90 | number |  |  |  | Frames a declared range is watched (bytes sent up into it) before it is given to the GPU in place; 0 gives it at its first ask. |
+| `VICTORY_ZEROCOPY_MIN_UP_KB` | 16 | number |  |  |  | KiB a frame the title must write into a declared range (sent up) for it to be given in place. |
+| `VICTORY_ZEROCOPY_CELL_MB` | 64 | number |  |  |  | The most MiB one in-place cell holds; a longer declared range is cut in cells on a grid of this size. |
+| `VICTORY_ZEROCOPY_MB` | 512 | number |  |  |  | The most MiB of title memory the zero-copy classes hold in place at once. |
+| `VICTORY_ZEROCOPY_MIN_KB` | 64 | number |  |  |  | With VICTORY_ZEROCOPY=2: the least KiB of a title buffer of an upload heap to be placed. |
+| `VICTORY_ZEROCOPY_BUFFER_MB` | 64 | number |  |  |  | With VICTORY_ZEROCOPY=2: the most MiB of such a buffer. |
 | `VICTORY_XMA_PRIORITY` | highest | text |  |  |  | Audio decoder thread priority: normal, critical, anything else highest. |
 | `VICTORY_XOR_READBACK` | on (=0 turns off) | flag |  |  |  | (integ/validation-23) Lands the read-back of textures the title reads on the CPU in the XOR tile modes too. |
 | `VICTORY_XOR_UPLOAD` | on (=0 turns off) | flag |  |  |  | Uploads XOR-swizzled textures by the tile configuration; =0 refuses them. |

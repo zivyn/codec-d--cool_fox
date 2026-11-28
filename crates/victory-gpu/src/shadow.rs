@@ -28,6 +28,7 @@ mod current;
 use current::Current;
 mod overlap;
 mod own;
+pub(crate) mod zero;
 pub(crate) use overlap::{OverlapIndex, overlap_index};
 pub(crate) use own::{CLASSES, OwnClass};
 
@@ -3211,7 +3212,7 @@ impl Drop for Shadow {
         crate::pagedrive::retire(&self.ledger);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.start, self.len);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -4454,6 +4455,7 @@ pub fn title_memory_gpu_readonly(at: usize, len: usize) {
     *all = merged;
     update_gpu_ro_bounds(&all);
     drop(all);
+    zero::bump();
     tracing::info!(
         start = format_args!("{start:#x}"),
         len = format_args!("{len:#x}"),
@@ -4490,6 +4492,8 @@ pub fn title_memory_gpu_writable(at: usize, len: usize) {
     }
     *all = next;
     update_gpu_ro_bounds(&all);
+    drop(all);
+    zero::bump();
 }
 
 /// Whether anything is noted as GPU-read-only at or after `at` (a cheap look, for the free path to ask the size of
@@ -4610,6 +4614,15 @@ impl Shadow {
         &self.ledger
     }
 
+    /// Shaders were declared to write a title buffer that is in place: they write the title's own bytes, which no
+    /// flight's rules know of (`VICTORY_ZEROCOPY`: only for a buffer the log shows nothing was ever fetched from).
+    /// Counted, and told for the first few.
+    fn wrote_in_place(&self) {
+        if !self.window {
+            crate::inplace::zero_wrote(self.start, self.len);
+        }
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -4636,6 +4649,7 @@ impl Shadow {
         shadow.place = Some((placed.heap, placed.bias));
         // Nothing refreshes it.
         crate::pagedrive::retire(&shadow.ledger);
+        crate::inplace::pinned(start, len);
         shadow
     }
 
@@ -4737,6 +4751,7 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            self.wrote_in_place();
             return;
         }
         self.written.store(true, Ordering::Relaxed);
@@ -4753,6 +4768,7 @@ impl Shadow {
     /// is found in them afterwards, and nothing waits on them.
     pub(crate) fn shader_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.place.is_some() {
+            self.wrote_in_place();
             return;
         }
         let len = len.min(self.left(address));
@@ -7310,6 +7326,9 @@ struct Entry {
     shadow: Option<Arc<Shadow>>,
     /// In a heap the title's CPU cannot write ([`Shadow::mark_gpu_only`]).
     gpu_only: bool,
+    /// In a heap the title's CPU writes (upload) and shaders cannot (no unordered access): the card has nothing to
+    /// add to the title's own bytes (`VICTORY_ZEROCOPY=2`, [`mark_cpu_written`]).
+    cpu_written: bool,
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
@@ -7545,9 +7564,23 @@ pub(crate) fn register(resource: usize, start: u64, len: u64, gpu_only: bool) {
             end: start + len,
             shadow: None,
             gpu_only,
+            cpu_written: false,
         },
     );
     changed(start, start + len);
+}
+
+/// The buffer registered at (`start`, `resource`) lies in a heap the title's CPU writes and no shader can write
+/// (an upload heap, no unordered access): the class `VICTORY_ZEROCOPY=2` gives to the title's own memory.
+pub(crate) fn mark_cpu_written(resource: usize, start: u64) {
+    if crate::inplace::zero_level() < 2 {
+        return;
+    }
+    // (Before any copy is made: nothing asks before the resource is handed out.)
+    let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = map.get_mut(&(start, resource)) {
+        entry.cpu_written = true;
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -7593,6 +7626,15 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         }
     }
     {
+        // The cells of memory the title declares read-only to the GPU.
+        let cells = zero::let_go(at, end);
+        if !cells.is_empty() {
+            moved(6);
+            changed(at, end);
+        }
+        gone.extend(cells);
+    }
+    {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers_for(2);
         for (key, entry) in map.range_mut(..(end, 0)).rev().take(256) {
@@ -7616,7 +7658,22 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
     let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
+    spans.extend(zero::spans());
     spans
+}
+
+/// For the 10-second line of `VICTORY_ZEROCOPY` (`crate::inplace`): what is being watched before a range is given to
+/// the card.
+pub(crate) fn zero_report() -> String {
+    zero::report()
+}
+
+/// A send up of `ranges` (offsets in `shadow`'s bytes) is about to be made: `VICTORY_ZEROCOPY` counts the bytes that
+/// go into ranges the title declares read-only to the GPU, to give to the card only those the title keeps writing.
+pub(crate) fn zero_observe(shadow: &Shadow, ranges: &[(usize, usize)]) {
+    if crate::inplace::zero_level() > 0 && !shadow.in_place() {
+        zero::observe(shadow.start, ranges);
+    }
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
@@ -7673,6 +7730,13 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let _time = crate::opcost::time(crate::opcost::Op::Lookup);
+    // Memory the title declares read-only to the GPU: the title's own bytes, in place (`VICTORY_ZEROCOPY`), before
+    // any copy (a copy of it is what is no longer made).
+    if crate::inplace::zero_level() > 0
+        && let Some(cell) = zero::serve(address, len)
+    {
+        return Some(cell);
+    }
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
@@ -7711,7 +7775,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     if entry.shadow.is_some() {
         return entry.shadow.clone();
     }
-    let (end_of, blen, gpu_only) = (entry.end, entry.end - key.0, entry.gpu_only);
+    let (end_of, blen, gpu_only, cpu_written) = (entry.end, entry.end - key.0, entry.gpu_only, entry.cpu_written);
     // Rounded up so that views ending in the buffer's last 256 bytes fit.
     // Shaders write some buffers (unordered access), so not upload memory.
     let size = blen.next_multiple_of(1 << 16);
@@ -7721,6 +7785,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     // are read too often to stay in the PC's.
     let big = cards() && (size >= card_limits().0 || card_all());
     if !big && let Some(placed) = crate::inplace::place_for(key.0, blen, false) {
+        entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, blen, false)));
+        return entry.shadow.clone();
+    }
+    // A buffer in a heap the title's CPU writes and no shader can write (`VICTORY_ZEROCOPY=2`): its own bytes, in
+    // place, whatever its size (bigger ones are the card's copies today, filled up over the bus at every change).
+    if (cpu_written && zero::wants_buffer(blen) || zero::listed(blen)) && let Some(placed) = crate::inplace::place_zero(key.0, blen, false) {
         entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, blen, false)));
         return entry.shadow.clone();
     }

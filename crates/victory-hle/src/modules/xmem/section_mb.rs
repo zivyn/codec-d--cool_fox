@@ -29,6 +29,16 @@
 
 use super::*;
 
+/// Whether physical pages are made in sections committed whole (`VICTORY_ZEROCOPY` set and not `0`;
+/// `VICTORY_ZEROCOPY_SECTIONS=0` keeps them reserved): the title's pages can then be read by the GPU where they lie.
+pub(super) fn whole_sections() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| {
+        std::env::var("VICTORY_ZEROCOPY").is_ok_and(|v| !v.trim().is_empty() && v.trim() != "0")
+            && !std::env::var("VICTORY_ZEROCOPY_SECTIONS").is_ok_and(|v| v.trim() == "0")
+    });
+    *ON
+}
+
 /// The most pages one section holds; `usize::MAX` for no limit (one section
 /// for each request, as before).
 pub(super) fn section_pages() -> usize {
@@ -76,26 +86,37 @@ pub(super) fn allocate_physical(n: usize, per: usize) -> std::io::Result<usize> 
         // first mapped or written (`commit`): the title asks for 6.1 GiB at
         // once, which a busy host often cannot commit (error 1450).
         // SAFETY: plain section creation.
-        let handle = unsafe {
+        let make = |kind| unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 std::ptr::null(),
-                // Under Wine a committed section is a sparse file, free until
-                // touched, and committing a reserved one page by page costs a
-                // wineserver request each that scans every range committed so
-                // far: commit it whole there.
-                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                PAGE_READWRITE | kind,
                 (size as u64 >> 32) as u32,
                 size as u32,
                 std::ptr::null(),
             )
         };
+        // Under Wine a committed section is a sparse file, free until
+        // touched, and committing a reserved one page by page costs a
+        // wineserver request each that scans every range committed so
+        // far: commit it whole there. With `VICTORY_ZEROCOPY` it is made
+        // committed whole too, so that the GPU side can open it as one heap
+        // and read the title's pages in place; if the host cannot commit
+        // that much at once the section is made reserved, as it was.
+        let mut whole = on_wine() || whole_sections();
+        let mut handle = make(if whole { SEC_COMMIT } else { SEC_RESERVE });
+        if handle.is_null() && whole && !on_wine() {
+            tracing::warn!(pages, error = %std::io::Error::last_os_error(), "a physical-pages section could not be made committed whole: reserved, its pages stay copies for VICTORY_ZEROCOPY");
+            whole = false;
+            handle = make(SEC_RESERVE);
+        }
         if handle.is_null() {
             // Read before the sections made so far close (`sections` drops).
             return Err(std::io::Error::last_os_error());
         }
         sections.push(Arc::new(Section {
             handle,
+            whole,
             pages,
             window: std::sync::OnceLock::new(),
             committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
@@ -106,7 +127,7 @@ pub(super) fn allocate_physical(n: usize, per: usize) -> std::io::Result<usize> 
         // For the GPU side's in-place census: only a committed section can be
         // opened as a host heap.
         let bytes = (section.pages * PAGE) as u64;
-        victory_gpu::title_memory_section(section.handle as usize, bytes, on_wine());
+        victory_gpu::title_memory_section(section.handle as usize, bytes, section.whole);
     }
     let mut table = page_table_mut();
     let first = table.next_page;

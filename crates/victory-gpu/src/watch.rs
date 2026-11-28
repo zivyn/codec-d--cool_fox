@@ -3750,6 +3750,12 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    // What is in place there (`crate::inplace`) goes first: it holds the pages, which cannot be freed or guarded
+    // while it stands (the lists that hold it let go of it when they have run: `title_memory_unpin_wait`).
+    if crate::inplace::any_pinned() {
+        let len = if len != 0 { len } else { allocation_end(at, at).saturating_sub(at) };
+        crate::inplace::title_memory_freeing(at, len);
+    }
     // Pages noted as GPU-read-only in it are the title's no more (the whole allocation when `len` is 0).
     if crate::shadow::gpu_readonly_after(at) {
         let len = if len != 0 { len } else { allocation_end(at, at).saturating_sub(at) };
@@ -3789,6 +3795,17 @@ pub fn title_memory_freed(at: usize, len: usize) {
     // (Memory that is still a view is not freed by that call, which fails:
     // it must not stay read-only.)
     open(&mut g, at, end * BLOCK);
+}
+
+/// The title's `VirtualFree` of `[at, at + len)` (`len` 0: the whole allocation) failed: waits for what is in place
+/// there to be let go of (two seconds at most), so that the call can be made again. `false`: nothing was held open
+/// there, or still is.
+pub fn title_memory_unpin_wait(at: usize, len: usize) -> bool {
+    if !crate::inplace::any_pinned() {
+        return false;
+    }
+    let len = if len != 0 { len } else { allocation_end(at, at).saturating_sub(at) };
+    crate::inplace::unpin_wait(at, len)
 }
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.

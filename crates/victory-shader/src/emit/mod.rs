@@ -130,6 +130,7 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod loop_limit_tests;
+mod local_exit_form;
 #[cfg(all(test, windows))]
 mod local_exit_tests;
 #[cfg(all(test, windows))]
@@ -856,7 +857,7 @@ fn emit_forms(
                     // (`VICTORY_LOCAL_EXIT=2`: the lanes of a host wave leave the loops together)
                     if !exact
                         && lower::local_exit_all()
-                        && let Some(together) = local_exit(c, native, p, why, false)
+                        && let Some(together) = local_exit_form::local_exit(c, native, p, why, false)
                     {
                         report(&format!("local waves (APPROXIMATE, loops left together), {name}"), &together);
                         if done(&together) {
@@ -873,7 +874,7 @@ fn emit_forms(
             if idiom(p, st) == exact {
                 if !exact
                     && lower::local_exit_all()
-                    && let Some(together) = local_exit(c, native, p, why, false)
+                    && let Some(together) = local_exit_form::local_exit(c, native, p, why, false)
                 {
                     report("local waves (APPROXIMATE, loops left together)", &together);
                     if done(&together) {
@@ -894,7 +895,7 @@ fn emit_forms(
                     if let Some((p, st, io, res)) = f {
                         // (`VICTORY_LOCAL_EXIT=1`: the lanes of a host wave leave the loops together)
                         if lower::local_exit()
-                            && let Some(together) = local_exit(c, native, p, why, true)
+                            && let Some(together) = local_exit_form::local_exit(c, native, p, why, true)
                         {
                             report(&format!("local waves (APPROXIMATE, any mask, loops left together), {name}"), &together);
                             if done(&together) {
@@ -909,7 +910,7 @@ fn emit_forms(
                     }
                 }
                 if lower::local_exit()
-                    && let Some(together) = local_exit(c, native, p, why, true)
+                    && let Some(together) = local_exit_form::local_exit(c, native, p, why, true)
                 {
                     report("local waves (APPROXIMATE, any mask, loops left together)", &together);
                     if done(&together) {
@@ -1128,102 +1129,6 @@ fn widen(
 fn code_digits(c: &Container) -> String {
     let code = c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)).map_or(&[][..], |p| p.data);
     blake3::hash(code).to_hex()[..8].to_owned()
-}
-
-/// The blocks closed by a branch that leaves a loop (one successor inside the loop of a back edge,
-/// one outside) and that the console takes for the whole wave ([`structure::Structured::wave_any`]:
-/// `execz`, `execnz`, `vccz`, `vccnz`, SCC of a mask operation), by block.
-fn loop_exits(p: &ir::Program, st: &structure::Structured) -> Vec<usize> {
-    let order = ir::reverse_postorder(&p.blocks);
-    let mut index = vec![usize::MAX; p.blocks.len()];
-    for (i, &b) in order.iter().enumerate() {
-        index[b] = i;
-    }
-    let mut out = std::collections::BTreeSet::new();
-    for &latch in &order {
-        for header in p.blocks[latch].exit.successors() {
-            // (a back edge goes to a block that is not later in the order)
-            if index[header] > index[latch] {
-                continue;
-            }
-            // the loop: the header and what reaches the latch without passing it
-            let mut body = vec![false; p.blocks.len()];
-            body[header] = true;
-            let mut stack = vec![latch];
-            while let Some(b) = stack.pop() {
-                if std::mem::replace(&mut body[b], true) {
-                    continue;
-                }
-                stack.extend(p.blocks[b].preds.iter().copied().filter(|&q| index[q] != usize::MAX));
-            }
-            for b in (0..body.len()).filter(|&b| body[b]) {
-                if let ir::Exit::Branch { taken, not_taken } = p.blocks[b].exit
-                    && st.wave_any.get(b).copied().flatten().is_some()
-                    && !(body[taken] && body[not_taken])
-                {
-                    out.insert(b);
-                }
-            }
-        }
-    }
-    out.into_iter().collect()
-}
-
-/// `VICTORY_LOCAL_EXIT=1`: `p` as two host waves of 32 that each run as a wave of their own
-/// ([`lower::with_local_waves_any`]) with the branches that leave a loop taken by the host wave
-/// together, the way the console takes them for its wave ([`loop_exits`]; [`lower::local_exit`]
-/// says why): the lanes of a host wave leave a loop in the same round. The branches around them
-/// follow, as in [`widen`], so that every lane of the host wave is where the question is asked.
-/// None when the program has no such branch or the form does not lower: the caller goes on with
-/// the plain form of the same program.
-fn local_exit(
-    c: &Container,
-    native: &NativeProgram,
-    p: &ir::Program,
-    why: bool,
-    any: bool,
-) -> Option<Result<(HostShader, Option<u32>), ShaderError>> {
-    let first = structure::structure(p).ok()?;
-    let mut wide: std::collections::HashSet<usize> = loop_exits(p, &first).into_iter().collect();
-    if wide.is_empty() {
-        return None;
-    }
-    loop {
-        let st = structure::structure_wide(p, &wide).ok()?;
-        let io = io::raise(p, native).ok()?;
-        let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
-        lower::take_needs();
-        let r = if any {
-            lower::with_local_waves_any(|| emit_program(c, native, p, &st, &io, &res))
-        } else {
-            lower::with_local_waves(|| emit_program(c, native, p, &st, &io, &res))
-        };
-        let needs = lower::take_needs();
-        let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. }) if lower::needs_every_lane(what));
-        let more: Vec<usize> = if stuck {
-            lower::branches_around(&st, &needs)
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|b| !wide.contains(b))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        if more.is_empty() {
-            if why {
-                let mut sorted: Vec<usize> = wide.iter().copied().collect();
-                sorted.sort_unstable();
-                eprintln!(
-                    "WAVE64-LOCAL-EXIT ~{} {} branches taken by the host wave together, {}: {sorted:?}",
-                    code_digits(c),
-                    sorted.len(),
-                    if r.is_ok() { "lowered" } else { "NOT lowered" }
-                );
-            }
-            return Some(r);
-        }
-        wide.extend(more);
-    }
 }
 
 /// The translated program, and the wave size it requires of the host.

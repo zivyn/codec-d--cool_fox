@@ -467,6 +467,15 @@ pub(crate) fn save_read_back(
     buffer: &ID3D12Resource,
     footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
 ) {
+    save_read_back_as(&format!("frame-{frame}"), buffer, footprint);
+}
+
+/// [`save_read_back`] as `<name>.png` in the capture folder (`VICTORY_AB_SHOTS`: `ab-<phase>-<arm>`).
+pub(crate) fn save_read_back_as(
+    name: &str,
+    buffer: &ID3D12Resource,
+    footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
     let f = footprint.Footprint;
     let bgra = match f.Format {
         DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => false,
@@ -485,7 +494,7 @@ pub(crate) fn save_read_back(
         }
         let len = f.RowPitch as usize * f.Height as usize;
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+        save_as(name, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
     }
 }

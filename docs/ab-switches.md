@@ -16,6 +16,7 @@ VICTORY_AB=<seconds>,<switch>[=<value>][,<switch>..]
 VICTORY_AB_START=<seconds>     # first phase begins this long after the world is found (default: at the first present)
 VICTORY_AB_SKIP=<seconds>      # left out at the start of each phase (default 1)
 VICTORY_AB_BUNDLE=1            # the phases alternate between all the named switches off and all on (a bundle against none)
+VICTORY_AB_SHOTS=N              # a picture of every phase of every Nth cycle (1: every phase), ab-<phase>-<A|B>.png in VICTORY_CAPTURE's folder
 ```
 
 - Phase 0 has every named switch **off** (A), phase 1 has bit 0 on (B), and so on: with one switch A, B, A, B, ...;
@@ -34,6 +35,17 @@ VICTORY_AB_BUNDLE=1            # the phases alternate between all the named swit
   per-second lines of the log (what the submit thread worked, the card, the CPU) are given to their arm by time with
   `bin\bench1-ab.py <tag>` (outside the repo, in `G:\victory-work\bin`). The pilot kills the process, so there is no summary
   at exit: the last `so far` line is the summary.
+
+### Pictures of both arms (image-affecting switches)
+
+`VICTORY_AB_SHOTS=N` (needs `VICTORY_CAPTURE`, which `auto-run.ps1` always sets to the run's `frames` folder; nothing is ever
+written to the working directory): a second and a half before a phase ends (never earlier than half a second after the
+part left out at its start) the next present of the host reads its frame back and saves it at half size as
+`ab-<phase>-A.png` / `ab-<phase>-B.png` (several switches: `ab-<phase>-b<bits>.png`). N counts cycles: with one switch
+or a bundle a cycle is an A phase and the B phase after it, so `N=1` saves every phase and `N=4` saves a pair out of every
+fourth, always both arms from the same stretch of the process. The picture is asked for by `ab::presented` (the title's
+present call) and taken by the host's present, which can be a frame or two behind: the margin keeps it inside its phase.
+`bench1-ab.py --shots <tag> [--crop x0,y0,x1,y1]` builds the montage and the difference per pair.
 
 ### Recipe (window spot)
 

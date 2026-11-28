@@ -12,6 +12,12 @@
 //! `VICTORY_AB_BUNDLE=1`: the phases alternate between all the named switches off and all on (a bundle against none),
 //! not every combination.
 //!
+//! `VICTORY_AB_SHOTS=N` (with `VICTORY_CAPTURE=<folder>`; the pilot's `auto-run.ps1` always has one): a picture of every
+//! phase of every Nth cycle (a cycle is a pair for one switch or a bundle, `2^n` combinations of `n` switches; 1: every
+//! phase), saved by the host's next present a second and a half before the phase ends as `ab-<phase>-<A|B>.png`
+//! (`ab-<phase>-b<bits>` with several switches), at half size like the capture's other frames. Pictures of both arms
+//! from the same process: `bench1-ab.py --shots <tag>` makes the montage and the difference of each pair.
+//!
 //! `VICTORY_AB_START=<seconds>`: the first phase begins that many seconds
 //! after the world is found (the second's draws per frame between 3000 and
 //! 5500 and under 260 ms a frame, three seconds in a row: what the pilot's
@@ -74,6 +80,8 @@ struct Config {
     /// `VICTORY_AB_BUNDLE=1`: the phases alternate between every named switch off and every one on, not all
     /// combinations (a bundle against none).
     bundle: bool,
+    /// `VICTORY_AB_SHOTS=N`: a picture of every phase of every Nth cycle (0: none), see [`shot_due`].
+    shots: u64,
 }
 
 fn config() -> &'static Config {
@@ -84,6 +92,7 @@ fn config() -> &'static Config {
             start_after: number("VICTORY_AB_START"),
             skip: number("VICTORY_AB_SKIP").unwrap_or(1.0),
             bundle: std::env::var_os("VICTORY_AB_BUNDLE").is_some_and(|v| v == "1"),
+            shots: number("VICTORY_AB_SHOTS").map_or(0, |v| v as u64),
         }
     })
 }
@@ -176,6 +185,73 @@ pub(crate) fn unless_zero(text: Option<&str>) -> bool {
     text.is_none_or(|v| v != "0")
 }
 
+/// How many phases come before the arms are the same again: a pair for one switch or a bundle, `2^n` combinations of
+/// `n` switches.
+fn cycle_len(switches: usize, bundle: bool) -> u64 {
+    if bundle { 2 } else { 1 << switches }
+}
+
+/// Whether phase `phase` is given a picture with `VICTORY_AB_SHOTS=shots`: every phase of every `shots`th cycle, so that
+/// the pictures that are taken come in the arms that make a cycle, the pair or the combinations, from one stretch of the
+/// run. (A cycle's first phase is the one with every switch off.)
+fn shot_due(phase: u64, shots: u64, cycle: u64) -> bool {
+    shots > 0 && cycle > 0 && (phase / cycle) % shots == 0
+}
+
+/// The name of a phase's picture: `ab-<phase>-A` or `-B` with one switch or a bundle (A: off, B: on), and
+/// `ab-<phase>-b<bits>` with several switches (the bits of the ones that are on).
+fn shot_name(phase: u64, bits: u32, two_arms: bool) -> String {
+    if two_arms {
+        format!("ab-{phase}-{}", if bits == 0 { 'A' } else { 'B' })
+    } else {
+        format!("ab-{phase}-b{bits}")
+    }
+}
+
+/// A picture asked for by the phase under way: its number and bits. It is taken by the next present of the host, which
+/// may come a frame or two after the title's (so it is asked for before the phase ends, not at its end).
+static SHOT: Mutex<Option<(u64, u32)>> = Mutex::new(None);
+static SHOT_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn arm_shot(phase: u64, bits: u32) {
+    *SHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some((phase, bits));
+    SHOT_ARMED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// What is asked for and not taken yet is dropped: the phase it was for is over.
+fn clear_shot() {
+    SHOT_ARMED.store(false, std::sync::atomic::Ordering::Release);
+    *SHOT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The phase and bits of the picture asked for, which then is not asked for any more.
+fn take_pending() -> Option<(u64, u32)> {
+    if !SHOT_ARMED.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    let taken = SHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    SHOT_ARMED.store(false, std::sync::atomic::Ordering::Release);
+    taken
+}
+
+/// At a present of the host: the name of the picture this frame is to be saved as (`VICTORY_AB_SHOTS`), if one is asked for.
+pub(crate) fn take_shot() -> Option<String> {
+    let (phase, bits) = take_pending()?;
+    Some(shot_name(phase, bits, asked()?.switches.len() == 1 || config().bundle))
+}
+
+/// Whether pictures can be saved: there is a capture folder (never the working directory).
+fn can_shoot() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::capture::folder().is_some()
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        false
+    }
+}
+
 /// What the run has seen of the phase under way.
 struct Phase {
     started: Instant,
@@ -187,6 +263,8 @@ struct Phase {
     draws: u64,
     /// Of the phases that ended: their bits, the mean frame time and the frames counted.
     means: Vec<(u32, f64, usize)>,
+    /// This phase's picture was asked for.
+    shot_armed: bool,
 }
 
 /// The seconds of presents: where the world is found.
@@ -320,7 +398,7 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
             asked.switches.join(" "),
             config.skip
         );
-        Phase { started: now, number: 0, began: now, last: now, drawn, frames: Vec::new(), draws: 0, means: Vec::new() }
+        Phase { started: now, number: 0, began: now, last: now, drawn, frames: Vec::new(), draws: 0, means: Vec::new(), shot_armed: false }
     });
     let bits = |number: u64| {
         if config.bundle {
@@ -335,6 +413,18 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
         p.draws += drawn.saturating_sub(p.drawn);
     }
     (p.last, p.drawn) = (now, drawn);
+    // A picture of this phase, asked for a second and a half before it ends (after what is left out at its start).
+    if config.shots > 0 && !p.shot_armed {
+        let arm_at = (asked.seconds - 1.5).max(config.skip + 0.5);
+        if arm_at < asked.seconds
+            && (now - p.began).as_secs_f64() >= arm_at
+            && shot_due(p.number, config.shots, cycle_len(asked.switches.len(), config.bundle))
+            && can_shoot()
+        {
+            arm_shot(p.number, bits(p.number));
+            p.shot_armed = true;
+        }
+    }
     if let Some((ms, draws, frames)) = second {
         tracing::info!(
             "A/B second: phase {} bits {} settled {}: {ms:.1} ms/frame over {frames:.0} frames, {draws:.0} draws a frame",
@@ -378,6 +468,8 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     BITS.store(will, Relaxed);
     (p.number, p.began, p.draws) = (number, now, 0);
     p.frames.clear();
+    p.shot_armed = false;
+    clear_shot();
 }
 
 #[cfg(test)]
@@ -437,6 +529,38 @@ mod tests {
     #[test]
     fn a_switch_that_is_on_unless_zero_is_off_only_in_the_phases_that_name_zero() {
         assert_eq!([None, Some("1"), Some(""), Some("0")].map(unless_zero), [true, true, true, false]);
+    }
+
+    #[test]
+    fn pictures_come_from_every_phase_of_every_nth_cycle_named_by_phase_and_arm() {
+        // One switch (a cycle of two): every cycle is every pair; every 2nd cycle is phases 0, 1, 4, 5, 8, 9.
+        let due = |shots, cycle| (0..10).filter(|&p| shot_due(p, shots, cycle)).collect::<Vec<u64>>();
+        assert_eq!(due(1, 2), (0..10).collect::<Vec<u64>>());
+        assert_eq!(due(2, 2), vec![0, 1, 4, 5, 8, 9]);
+        assert_eq!(due(3, 2), vec![0, 1, 6, 7]);
+        // Two switches (a cycle of four) and none asked for.
+        assert_eq!(due(2, 4), vec![0, 1, 2, 3, 8, 9]);
+        assert!(due(0, 2).is_empty());
+        assert_eq!(cycle_len(1, false), 2);
+        assert_eq!(cycle_len(3, false), 8);
+        assert_eq!(cycle_len(5, true), 2);
+        assert_eq!(shot_name(4, 0, true), "ab-4-A");
+        assert_eq!(shot_name(5, 1, true), "ab-5-B");
+        assert_eq!(shot_name(7, 0b111, true), "ab-7-B");
+        assert_eq!(shot_name(6, 0b10, false), "ab-6-b2");
+    }
+
+    #[test]
+    fn a_picture_asked_for_is_taken_once_and_dropped_when_its_phase_is_over() {
+        // (Nothing else in the tests asks for pictures: this is the only one that touches them.)
+        clear_shot();
+        assert_eq!(take_pending(), None);
+        arm_shot(6, 1);
+        assert_eq!(take_pending(), Some((6, 1)));
+        assert_eq!(take_pending(), None);
+        arm_shot(8, 0);
+        clear_shot();
+        assert_eq!(take_pending(), None);
     }
 
     #[test]

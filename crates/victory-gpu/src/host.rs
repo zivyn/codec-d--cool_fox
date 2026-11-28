@@ -64,7 +64,7 @@ use self::landing::{
     land, late_threads, read_backs, relay_exact, relay_wait,
 };
 #[cfg(test)]
-use self::landing::flagged_pieces;
+use self::landing::{declared_writes_steps, declared_writes_summarized, flagged_pieces, relay_copy};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.

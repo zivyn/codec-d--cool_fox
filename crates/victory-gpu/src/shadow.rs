@@ -3407,6 +3407,12 @@ mod piece_tests {
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
 fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+    stale_pages_since(base, copied, a, e, written, 0)
+}
+
+/// [`stale_pages_in`] leaving out the writes noted up to the asking `since` (the shadow check: a copy made after
+/// them took the page after the write, `Ledger::since`).
+fn stale_pages_since(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)], since: u64) -> Vec<usize> {
     (a / PAGE..e.div_ceil(PAGE))
         .filter(|&page| page >= base)
         .filter(|&page| match copied.get(page - base) {
@@ -3414,7 +3420,7 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
             Some(0) => true,
             Some(&at) => written
                 .binary_search_by_key(&page, |&(p, _)| p)
-                .is_ok_and(|i| written[i].1 > at),
+                .is_ok_and(|i| written[i].1 > at && written[i].1 > since),
         })
         .collect()
 }
@@ -3791,6 +3797,198 @@ mod narrow_tests {
         assert_eq!(crate::pagedrive::missed_total(), missed_before, "the journal says pages stale that the ledger does not hold");
         assert!(crate::pagedrive::compared_total() > compared_before, "the shadow check compared nothing");
         assert!(crate::pagedrive::driven_total() > driven_before, "the ledger decided nothing");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A page that two ranges share (one ends in the middle of it, the next begins there): the first range refreshed twice
+    /// must not make the ledger forget a write in the half of the page that belongs to the second. The walk takes the
+    /// half when the second range is refreshed; the ledger must too (rev2: `copy_stale` settles a page the range holds
+    /// only in part with the bound of the range's stamp).
+    #[test]
+    fn a_page_shared_by_two_ranges_keeps_its_write_for_the_second_after_the_first_is_refreshed_twice() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 3;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let half = PAGE / 2;
+        let missed_before = crate::pagedrive::missed_total();
+        let copies = vec![one(at, N, 0), one(at, N, 1), one(at, N, 2)];
+        let whole = [(at, at + N * PAGE)];
+        // Both copies take everything, twice (fresh memory may be told written by the first asking).
+        for _ in 0..2 {
+            crate::watch::ask_once(&whole);
+            for c in &copies {
+                refresh(c, at, N * PAGE);
+            }
+            crate::watch::ask_once_end();
+        }
+        // The title writes page 1 in the half that belongs to the second range.
+        // SAFETY: inside the allocation.
+        unsafe { ((at + PAGE + half + 8192) as *mut u8).write_volatile(0x5a) };
+        // The first range (page 0 and the first half of page 1) is refreshed twice, each time under an asking.
+        for _ in 0..2 {
+            crate::watch::ask_once(&whole);
+            for c in &copies {
+                refresh(c, at, PAGE + half);
+            }
+            crate::watch::ask_once_end();
+        }
+        // The second range (the other half of page 1 and page 2).
+        crate::watch::ask_once(&whole);
+        for c in &copies {
+            refresh(c, at + PAGE + half, 2 * PAGE - half);
+        }
+        crate::watch::ask_once_end();
+        for c in &copies {
+            assert_eq!(
+                c.side[PAGE + half + 8192],
+                0x5a,
+                "mode {}: the write in the second range's half of the shared page never reached the copy",
+                c.mode
+            );
+        }
+        assert_eq!(crate::pagedrive::missed_total(), missed_before, "the shadow check found the ledger forgetting a page the journal holds stale");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The same, at random: copies in the three modes refreshed in ranges that begin and end in the middle of pages
+    /// (so most pages are shared by two ranges), whole refreshes now and then, the title writing between them: each
+    /// ends as title memory is in the bytes it was refreshed in, and again after a final look at everything, and the
+    /// shadow check never finds the ledger forgetting a page.
+    #[test]
+    fn refreshes_in_ranges_that_cut_pages_end_as_the_walk_does_in_the_three_modes() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 12;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let title = |from: usize, len: usize| -> Vec<u8> {
+            // SAFETY: inside the allocation.
+            unsafe { std::slice::from_raw_parts((at + from) as *const u8, len) }.to_vec()
+        };
+        let missed_before = crate::pagedrive::missed_total();
+        let copies = vec![one(at, N, 0), one(at, N, 1), one(at, N, 2)];
+        let mut seed = 0x0dd_ba11_f00d_u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 8) as usize
+        };
+        let mut byte = 0u8;
+        let whole = [(at, at + N * PAGE)];
+        // Everything once, as a title's first look.
+        crate::watch::ask_once(&whole);
+        for c in &copies {
+            refresh(c, at, N * PAGE);
+        }
+        crate::watch::ask_once_end();
+        for round in 0..600 {
+            for _ in 0..1 + random() % 4 {
+                byte = byte.wrapping_add(1).max(1);
+                let offset = random() % (N * PAGE);
+                // SAFETY: inside the allocation.
+                unsafe { ((at + offset) as *mut u8).write_volatile(byte) };
+            }
+            let (from, len) = if round % 25 == 24 {
+                (0, N * PAGE)
+            } else {
+                let from = random() % (N * PAGE - 1);
+                (from, (1 + random() % (4 * PAGE)).min(N * PAGE - from))
+            };
+            let asking = random() % 3 != 0;
+            if asking {
+                crate::watch::ask_once(&[((at + from) / PAGE * PAGE, (at + from + len).div_ceil(PAGE) * PAGE)]);
+            }
+            for c in &copies {
+                refresh(c, at + from, len);
+            }
+            if asking {
+                crate::watch::ask_once_end();
+            }
+            let wanted = title(from, len);
+            for c in &copies {
+                assert!(c.side[from..from + len] == wanted[..], "round {round}: mode {} does not hold what the title holds in {from:#x}+{len:#x}", c.mode);
+            }
+        }
+        // The ranges that cut pages leave the ends stale, as the walk does: a last look at everything, in two cuts of
+        // a page, ends as the title is.
+        let cut = N / 2 * PAGE + PAGE / 3;
+        crate::watch::ask_once(&whole);
+        for c in &copies {
+            refresh(c, at, cut);
+            refresh(c, at + cut, N * PAGE - cut);
+        }
+        crate::watch::ask_once_end();
+        let wanted = title(0, N * PAGE);
+        for c in &copies {
+            assert!(c.side == wanted, "mode {} does not end as the title's memory is", c.mode);
+        }
+        assert_eq!(crate::pagedrive::missed_total(), missed_before, "the journal says pages stale that the ledger does not hold");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A note made before a copy existed (a kernel asking that straddles the range an asking stands for notes the page
+    /// under a number above the standing asking's, and the notes are applied to the copies there are) is not a loss when
+    /// the copy made after it takes the page: the copy read the title's memory after the write, the journal calls the
+    /// page stale only because of the number the copy took it under. The shadow check must not count it (rev2).
+    #[test]
+    fn a_note_applied_before_the_copy_existed_is_not_counted_as_a_page_the_ledger_missed() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 4;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let inside = 3 * PAGE;
+        let mut judged = false;
+        // (Other tests' askings may end the one that stands: the premise is checked and the steps are tried again.)
+        for attempt in 1..=50u8 {
+            crate::watch::ask_once(&[(at, at + inside)]);
+            // SAFETY: inside the allocation.
+            unsafe { ((at + 2 * PAGE + 9) as *mut u8).write_volatile(attempt) };
+            // A range that goes past what the asking stands for: the kernel is asked, the page is noted under a new number.
+            let _ = crate::watch::writes(at + 2 * PAGE, at + N * PAGE, false);
+            // The notes are in the ledgers there are, which do not hold the copies made after this.
+            crate::pagedrive::drain();
+            let premise = crate::watch::asked(at, at + inside).is_some_and(|(asked, pages)| {
+                pages.iter().any(|&(page, noted)| page == (at + 2 * PAGE) / PAGE && noted > asked)
+            });
+            if !premise {
+                crate::watch::ask_once_end();
+                continue;
+            }
+            let missed_before = crate::pagedrive::missed_total();
+            let copies = vec![one(at, N, 1), one(at, N, 2)];
+            // (The first look of a copy may be a plain copy of everything: the later ones are the ones the ledgers judge.)
+            for _ in 0..3 {
+                for c in &copies {
+                    refresh(c, at, inside);
+                }
+            }
+            let still = crate::watch::covered(at, at + inside);
+            crate::watch::ask_once_end();
+            for c in &copies {
+                // SAFETY: inside the allocation.
+                let wanted = unsafe { ((at + 2 * PAGE + 9) as *const u8).read_volatile() };
+                assert_eq!(c.side[2 * PAGE + 9], wanted, "mode {}: the copy does not hold the page's bytes", c.mode);
+            }
+            if still {
+                assert_eq!(crate::pagedrive::missed_total(), missed_before, "the check counts a note older than the copy as a page the ledger missed");
+                judged = true;
+                break;
+            }
+        }
+        assert!(judged, "the premise (a note above the standing asking's number, before the copy) was never made");
         // SAFETY: ours.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
@@ -5042,6 +5240,7 @@ impl Shadow {
         }
         let stale = stale_pages_in(base, copied, a, e, written);
         if mode == 1 {
+            let stale = stale_pages_since(base, copied, a, e, written, self.ledger.since());
             let held = stale_pages_in(base, copied, a, e, &crate::pagedrive::written(&self.ledger, a, e));
             crate::pagedrive::compare_under(&stale, &held, (a, e));
         }
@@ -5204,7 +5403,7 @@ impl Shadow {
                     // (Shadow: the answer stays the memo's; the journal says whether the gate would have been wrong.)
                     if gate {
                         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                        let stale = crate::watch::journal_stale(from, to, self.start as usize / PAGE, &copied, self.ranged(from, to));
+                        let stale = crate::watch::journal_stale(from, to, self.start as usize / PAGE, &copied, self.ranged(from, to), self.ledger.since());
                         crate::pagedrive::gate_checked(stale);
                     }
                     false
@@ -5226,15 +5425,19 @@ impl Shadow {
         if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) {
             return false;
         }
+        // The coverage first, then the notes, then the ledger: a note and the coverage that vouches for it come in
+        // one step (an asking notes its pages and publishes that it stands), so a coverage seen first has all its
+        // notes queued before the drain below, and a coverage that comes after is not seen at all (rev2: the other
+        // order saw an empty ledger, then a coverage whose notes had come in between).
+        if !crate::watch::covered(from, to) {
+            return false;
+        }
         crate::pagedrive::drain();
         let ranged = self.ranged(from, to);
         if ranged == 0 || self.ledger.any_after(from / PAGE, to.div_ceil(PAGE), ranged) {
             return false;
         }
-        if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
-            return false;
-        }
-        crate::watch::covered(from, to)
+        !self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from)
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
@@ -5662,6 +5865,10 @@ impl Shadow {
         let (mut runs, mut run) = (Vec::new(), None::<(usize, bool)>);
         // Pages taken before and written since: in the order of their runs.
         let mut again_at: Vec<(usize, u64)> = Vec::new();
+        // (Shadow check: the pages the journal says to take again, but not for the notes made before the ledger existed.)
+        let mut journal: Vec<usize> = Vec::new();
+        let since = self.ledger.since();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let last = (to - 1) / PAGE;
         // Pages taken, by cause ([`CAUSES`]).
         let mut cause = [0u64; 4];
@@ -5675,11 +5882,11 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             let taken = (*at).max(ranged);
+            let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
             if taken == 0 || write > taken {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                if whole {
                     *at = now;
                     if mode > 0 && write != 0 {
                         settles.push((page, now));
@@ -5689,6 +5896,9 @@ impl Shadow {
                 let again = taken != 0;
                 if again {
                     again_at.push((page, taken));
+                    if mode == 1 && write > since {
+                        journal.push(page);
+                    }
                 }
                 cause[if !again {
                     0
@@ -5706,9 +5916,13 @@ impl Shadow {
                 run.get_or_insert((page, again));
             } else {
                 if mode > 0 && write != 0 {
-                    // Current: an entry of the ledger that is not newer than the copy goes.
-                    settles.push((page, taken));
-                    if held.binary_search_by_key(&page, |&(p, _)| p).is_ok_and(|i| held[i].1 <= taken) {
+                    // Current: an entry of the ledger that is not newer than the copy goes. A page the range holds
+                    // only in part is current in its own half and no more: `ranged` vouches for the bytes of
+                    // `[from, to)`, not for the half that another range holds (rev2: the write there was lost), so it
+                    // goes by the page's own stamp, as the copy branch above leaves it.
+                    let bound = if whole { taken } else { *at };
+                    settles.push((page, bound));
+                    if held.binary_search_by_key(&page, |&(p, _)| p).is_ok_and(|i| held[i].1 <= bound) {
                         redundant += 1;
                     }
                 }
@@ -5719,7 +5933,6 @@ impl Shadow {
         }
         if mode > 0 {
             if mode == 1 {
-                let journal: Vec<usize> = again_at.iter().map(|&(page, _)| page).collect();
                 crate::pagedrive::compare_refresh(&journal, &held, (from, to));
                 crate::pagedrive::extra(redundant);
             }

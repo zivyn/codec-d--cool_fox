@@ -33,6 +33,14 @@ pub(super) fn on() -> bool {
     crate::ab::live_value!("VICTORY_ASK_ASIDE", bool, crate::ab::unless_zero)
 }
 
+/// Whether a submission offers its asking to the thread: only with flights in the air (`flying`, asked last: with none
+/// there is nothing to go beside), and never for a submission stage A prepared (`staged`: its asking was made, and what is
+/// offered here is not joined before the lane's `ask_once_end`, so it would end the asking of the stage after it and
+/// stand over its pages: rev2).
+pub(super) fn wanted(late: bool, staged: bool, flying: impl FnOnce() -> bool) -> bool {
+    late && !staged && on() && crate::watch::once() && !ask_tokens() && flying()
+}
+
 /// What is offered to the thread and whether it is at it.
 struct State {
     work: Option<Vec<(usize, usize)>>,
@@ -178,6 +186,17 @@ pub(super) fn line(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A submission that stage A prepared is never offered, whatever else says yes; one that is not follows the switches.
+    #[test]
+    fn a_submission_stage_a_prepared_does_not_offer_its_asking() {
+        let never = || -> bool { panic!("asked of flights for a submission that is not offered") };
+        assert!(!wanted(true, true, never), "staged");
+        assert!(!wanted(false, false, never), "not sent ahead");
+        assert!(!wanted(true, true, || true));
+        assert_eq!(wanted(true, false, || true), on() && crate::watch::once() && !ask_tokens());
+        assert!(!wanted(true, false, || false), "nothing in the air");
+    }
 
     /// What is offered is made before the holder's drop returns, and a second is refused while the first is not over.
     #[test]

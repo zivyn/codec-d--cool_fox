@@ -85,7 +85,8 @@ the card.
 | `VICTORY_HOST_RDNA` | off | cache key (value) | Translate as for an AMD RDNA host (only the exact value 1 turns it on). |
 | `VICTORY_HOST_WAVE` | off | cache key (value) | Same as the host max wave setting: translate for a GPU with waves of at most this many lanes. |
 | `VICTORY_KEEP_LOOP_SKIPS` | on (=0 turns off) | cache key (value) | Keeps the early-outs and skips over loops in the translated shader. |
-| `VICTORY_KEPT_SKIPS_WIDE` | on, safe classes at integ/validation-22 (=0 off, =all every class); off unless =1 or =all in integ/validation-23 | cache key (text at integ/validation-22, value in force at integ/validation-23) | Takes the kept loop skips in their wave-wide form (with VICTORY_KEEP_LOOP_SKIPS); a hang suspect, off in integ/validation-23. |
+| `VICTORY_KEPT_SKIPS_WIDE` | on, safe classes at integ/validation-22 (=0 off, =all every class); off unless =1 or =all in integ/validation-23 | cache key (text at integ/validation-22, value in force at integ/validation-23) | Takes the kept loop skips in their wave-wide form (with VICTORY_KEEP_LOOP_SKIPS); a hang suspect, off in integ/validation-23. `=audited` (integ/validation-27, fix/defrag1, with the hang guard on): the form is audited as the program has it, then made wide. |
+| `VICTORY_KEPT_SKIPS_ONLY` | off | cache key (text) | (integ/validation-27, fix/defrag1) With `VICTORY_KEPT_SKIPS_WIDE=audited`: the comma list of program tags (seven hex digits) the audited kept skips' form is taken for; the others keep the old form. Env only. |
 | `VICTORY_LEGACY_ASSUME` | off | cache key (text) | Writes legacy multiplies as the host product where no factor can be infinity or NaN. |
 | `VICTORY_LOCAL_EXIT` | off | cache key (text) | Translates console wave64 loops as two host waves of 32 that leave together (=1 screen programs, =2 broader). |
 | `VICTORY_LOOP_LIMITS` | off | cache key (text) | Table of per-program, per-stage iteration limits for translated loops. |
@@ -476,7 +477,8 @@ translation of shaders.
 | `VICTORY_KEEP_SNAPSHOTS` | on (=0 turns off) | flag |  |  |  | Keeps snapshots of declared memory ranges between submissions instead of taking each afresh. |
 | `VICTORY_KEEP_SNAPSHOTS_MB` | 1024 | number |  |  |  | Megabytes of snapshots kept between submissions. |
 | `VICTORY_KEEP_VIEWS` | on (=0 turns off) | flag |  |  |  | Keeps a replaced view alive until its use ends instead of nulling it at once. |
-| `VICTORY_KEPT_SKIPS_WIDE` | on, safe classes at integ/validation-22 (=0 off, =all every class); off unless =1 or =all in integ/validation-23 | text | yes |  |  | Takes the kept loop skips in their wave-wide form (with VICTORY_KEEP_LOOP_SKIPS); a hang suspect, off in integ/validation-23. |
+| `VICTORY_KEPT_SKIPS_WIDE` | on, safe classes at integ/validation-22 (=0 off, =all every class); off unless =1 or =all in integ/validation-23 | text | yes |  |  | Takes the kept loop skips in their wave-wide form (with VICTORY_KEEP_LOOP_SKIPS); a hang suspect, off in integ/validation-23. `=audited` (integ/validation-27, fix/defrag1, with the hang guard on): the form is audited as the program has it, then made wide. |
+| `VICTORY_KEPT_SKIPS_ONLY` | off | text | yes |  |  | (integ/validation-27, fix/defrag1) With `VICTORY_KEPT_SKIPS_WIDE=audited`: the program tags (seven hex digits, comma list) the audited kept skips' form is taken for. Env only. |
 | `VICTORY_KEYS` | off | list |  |  |  | Scripted key presses: seconds:key pairs separated by commas, held for the set time. |
 | `VICTORY_KEYS_FILE` | off | path |  |  |  | File whose contents give the keys held right now, re-read at most every 10 ms. |
 | `VICTORY_KNOWN_HOLES` | on (=0 turns off) | flag |  |  |  | Treats placeholder views as known for what they are, to cut lock waits. |

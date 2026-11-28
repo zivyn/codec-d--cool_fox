@@ -109,7 +109,7 @@ pub(crate) struct Host {
     presenter: Mutex<Option<Presenter>>,
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
-    adapter: Option<IDXGIAdapter3>,
+    pub(crate) adapter: Option<IDXGIAdapter3>,
     /// 1-descriptor shader-visible fallback heaps bound when a command list
     /// omits a view or sampler heap while using directly-indexed root signatures.
     fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,

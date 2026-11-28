@@ -705,6 +705,9 @@ switch is read.
 | `VICTORY_VIEW_INLINE` | on (=0 turns off) | flag |  |  |  | Views stay inline in their records rather than each becoming a table entry. |
 | `VICTORY_VIEW_LIMIT` | n/a (host probes the heap limit) | number | yes |  |  | Tool parameter: translates as on a host whose view heap has this null slot. |
 | `VICTORY_VIEW_THREADS` | 4 (6 for the records pool; clamped 1 to 16) | number |  |  |  | Threads that make descriptors and records. |
+| `VICTORY_VRAM_HOLD` | off | flag |  |  |  | Keeps the hot allocations in the card's memory: residency priorities on every hot allocation (maximum for render targets and depth, high for the other textures made whole and the card buffers), the trim of heaps with no tile, and the limit of the card's whole use past the budget (`VICTORY_VRAM_OVER_MB`, 400 here). |
+| `VICTORY_VRAM_OS` | on (=0 turns off) | flag |  |  |  | Reads the kernel's statistics of this process's video memory (demoted bytes by priority class, allocations in a segment they do not prefer, evictions) and says them in the `vram os` line every 5 s; asks the system for budget change events. |
+| `VICTORY_VRAM_OVER_MB` | off (400 with `VICTORY_VRAM_HOLD`) | number |  |  |  | How far past the system's budget the card's whole use may stand, in MB, before the texture room says no (free room inside blocks and heaps does not count against it). |
 | `VICTORY_WAIT_ASK` | off | flag |  |  |  | Asks whether memory is committed before waiting on it. |
 | `VICTORY_WAIT_FORCE` | on (=0 turns off) | flag |  |  |  | Forces the held wait to finish across frames; =0 keeps it held. |
 | `VICTORY_WAIT_NICE` | off | flag |  |  |  | Replaces the title's busy-wait loops with eased waits. |

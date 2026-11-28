@@ -575,6 +575,7 @@ impl HostPipeline {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_TABLE_STRIDES
                             || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
+                            || slot == victory_shader::emit::SLOT_VIEW_WINDOWS
                             || slot == victory_shader::emit::SLOT_MEMORY
                     };
                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {

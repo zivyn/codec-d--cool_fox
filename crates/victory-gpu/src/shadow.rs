@@ -124,6 +124,9 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// The number the host's view heap gave the copy for the windows of its buffer views
+    /// (`VICTORY_BINDLESS_HOST`, `descriptor::window`): 0 none.
+    copy_number: std::sync::atomic::AtomicU32,
     /// Of a copy with two sides: only the dwords the title changed go up,
     /// as with [`send_changed`] ([`by_address`]).
     changes_only: std::sync::atomic::AtomicBool,
@@ -4586,6 +4589,16 @@ impl Shadow {
         self.id
     }
 
+    /// The number the view heap gave the copy for windows (0: none yet).
+    pub(crate) fn copy_number(&self) -> u32 {
+        self.copy_number.load(Ordering::Acquire)
+    }
+
+    /// The view heap gave the copy this number for windows.
+    pub(crate) fn set_copy_number(&self, number: u32) {
+        self.copy_number.store(number, Ordering::Release);
+    }
+
     /// The pages noted written since the copy took them (`crate::pagedrive`).
     pub(crate) fn ledger(&self) -> &crate::pagedrive::Ledger {
         &self.ledger
@@ -4673,6 +4686,7 @@ impl Shadow {
             ledger: crate::pagedrive::ledger_of(start, len, id),
             card: None,
             window: false,
+            copy_number: std::sync::atomic::AtomicU32::new(0),
             changes_only: Default::default(),
             mapped: false,
             place: None,

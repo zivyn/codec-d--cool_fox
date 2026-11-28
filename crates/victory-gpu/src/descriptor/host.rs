@@ -228,6 +228,15 @@ pub(crate) struct HostHeap {
     /// them the title address of the view at each slot, two dwords a slot
     /// (`victory_shader::emit::SLOT_VIEW_ADDRESSES`).
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps, when windows are wanted ([`super::window`]): the window of the buffer view at each title
+    /// slot (`victory_shader::emit::SLOT_VIEW_WINDOWS`), four dwords a slot, an upload buffer of
+    /// `SLOT_WINDOWS_COUNT` entries, its GPU address and its mapping. Zeros: no window.
+    windows: Option<(ID3D12Resource, u64, usize)>,
+    /// The copies that have a number in this heap (copy `n` is `window_copies[n - 1]`): held for good, as the
+    /// raw view of each in the run of slots below is.
+    window_copies: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>>,
+    /// The first slot of that run (`u32::MAX`: not made yet); copy `n`'s raw view is `n` past it.
+    window_run: std::sync::atomic::AtomicU32,
     /// Title slots holding a ray-tracing acceleration structure's view: the
     /// memory they name is made ready for the shaders that pick a view from
     /// the heap and walk what its address says.
@@ -1755,6 +1764,19 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let windows = (!sampler && super::window::table_wanted())
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_WINDOWS_COUNT) * 16;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "windows of buffer views by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let sparse = crate::lean::heap_sparse();
         let h = HostHeap {
             // The per-slot arrays: a lock and an option of a pointer (24 bytes) per slot kept, 8 per
@@ -1796,6 +1818,9 @@ impl HostHeap {
             tail_want: Mutex::default(),
             usage: super::usage::Usage::new(),
             strides,
+            windows,
+            window_copies: Mutex::new(Vec::new()),
+            window_run: std::sync::atomic::AtomicU32::new(u32::MAX),
             structures: Slots::new(count as usize),
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
@@ -3025,6 +3050,104 @@ impl HostHeap {
         }
     }
 
+    /// Slot `to` is written with a descriptor: it has no window from now on (one that is written for it
+    /// comes after).
+    #[inline]
+    fn window_clear(&self, to: u32) {
+        if let Some((_, _, data)) = &self.windows
+            && to < victory_shader::emit::SLOT_WINDOWS_COUNT
+            && (self.raw == 0 || to < self.raw)
+        {
+            // SAFETY: inside the mapping; a shader reads the number while it is written (a single aligned
+            // dword: the one it had, or none).
+            unsafe { (*data as *mut u32).add(to as usize * 4).write_volatile(0) };
+        }
+    }
+
+    /// The GPU address of the table of windows by title slot.
+    pub(crate) fn windows_gpu(&self) -> Option<u64> {
+        self.windows.as_ref().map(|w| w.1)
+    }
+
+    /// The table of windows, for the list that binds it to keep.
+    pub(crate) fn windows_buffer(&self) -> Option<&ID3D12Resource> {
+        self.windows.as_ref().map(|w| &w.0)
+    }
+
+    /// The first slot of the run of the copies' raw views (`USER_WINDOW_BASE`); 0 before there is one (no
+    /// window names a copy then).
+    pub(crate) fn window_base(&self) -> u32 {
+        match self.window_run.load(std::sync::atomic::Ordering::Acquire) {
+            u32::MAX => 0,
+            first => first,
+        }
+    }
+
+    /// The number of `shadow` among the copies that have a raw view in this heap for windows, made now if it
+    /// has none; 0 if no number is left (or another heap has the copies).
+    fn window_number(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> u32 {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        let number = shadow.copy_number();
+        if number != 0 {
+            return number;
+        }
+        // One heap numbers the copies (a copy's number is its own, not a heap's).
+        static HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let me = std::ptr::from_ref(self) as usize;
+        if HEAP.compare_exchange(0, me, AcqRel, Acquire).is_err_and(|other| other != me) {
+            return 0;
+        }
+        let mut copies = self.window_copies.lock().unwrap_or_else(|e| e.into_inner());
+        let number = shadow.copy_number();
+        if number != 0 {
+            return number;
+        }
+        if copies.len() >= victory_shader::emit::WINDOW_COPIES as usize {
+            return 0;
+        }
+        let mut run = self.window_run.load(Acquire);
+        if run == u32::MAX {
+            let Some(first) = self.dynamic(victory_shader::emit::WINDOW_COPIES + 1) else {
+                return 0;
+            };
+            self.window_run.store(first, Release);
+            run = first;
+        }
+        let number = copies.len() as u32 + 1;
+        // The raw view of the whole copy, for good: reads past its end return zeros.
+        self.raw_at(run + number, &shadow.buffer, 0, shadow.width());
+        copies.push(shadow.clone());
+        shadow.set_copy_number(number);
+        number
+    }
+
+    /// Writes the window of title slot `index` for the buffer view that shows bytes `start..end` of the copy
+    /// `noted` names ([`super::window::note`]), after the slot's descriptor was written.
+    pub(crate) fn write_window(&self, index: u32, noted: Option<super::window::Noted>) {
+        let Some((_, _, data)) = &self.windows else {
+            return;
+        };
+        let Some((shadow, start, end)) = noted else {
+            return;
+        };
+        if index >= victory_shader::emit::SLOT_WINDOWS_COUNT || start >= end || end > u64::from(u32::MAX) {
+            return;
+        }
+        let number = self.window_number(&shadow);
+        if number == 0 {
+            super::window::count(super::window::NO_NUMBER);
+            return;
+        }
+        // SAFETY: inside the mapping; the number last, as `window_clear` writes it first.
+        unsafe {
+            let at = (*data as *mut u32).add(index as usize * 4);
+            at.add(1).write_volatile(start as u32);
+            at.add(2).write_volatile((end - start) as u32);
+            at.write_volatile(number);
+        }
+        super::window::count(super::window::WRITTEN);
+    }
+
     /// Writes the title address `view` starts at (0: none) for title slot
     /// `index` into the host's table of view addresses
     /// ([`victory_shader::emit::SLOT_VIEW_ADDRESSES`]), and notes whether
@@ -3163,6 +3286,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        super::window::clear();
         let kept = make_twinned(view, self.at(index), self.twin(index));
         if kept.is_none() {
             null_for(view, self.at(index));
@@ -3170,7 +3294,9 @@ impl HostHeap {
         self.put(index);
         self.twin_made(index, kept.is_some() && twinned(view));
         self.write_stride(index, if kept.is_some() { view_stride_word(view) } else { 0 });
+        let window = kept.is_some().then(super::window::take).flatten();
         self.keep(index, kept.flatten());
+        self.write_window(index, window);
     }
 
     /// Makes slot `index` (a dynamic one) the view the record `words` names,
@@ -3178,7 +3304,7 @@ impl HostHeap {
     /// made one, else as [`HostHeap::make_at`] does, and keeps that
     /// ([`ListViews`]). What is known of the record in this recording;
     /// `None` (the slot is not made): not a view kept so.
-    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32) -> Option<Listed> {
+    pub(crate) fn make_listed(&self, recording: u64, words: [u32; 3], index: u32, only: bool) -> Option<Listed> {
         if self.sampler {
             return None;
         }
@@ -3192,6 +3318,19 @@ impl HostHeap {
                 views.begin(recording);
             }
             let twins = self.twins.get(index as usize).is_some();
+            // Wanted as a window only, where the view is a buffer's with one: no view is made, no descriptor copied.
+            if only && self.windows.is_some() {
+                if let Some(view) = views.only.get(&words) {
+                    return Some(self.listed_from(index, view, twins, views.start, views.step));
+                }
+                if let Some(view) = views.make_only(words) {
+                    let listed = self.listed_from(index, &view, twins, views.start, views.step);
+                    views.only.insert(words, view);
+                    super::window::count(super::window::SKIPPED);
+                    return Some(listed);
+                }
+                super::window::count(super::window::FELL_BACK);
+            }
             if let Some(view) = views.made.get(&words) {
                 views.counts[0] += 1;
                 return Some(self.listed_from(index, view, twins, views.start, views.step));
@@ -3207,6 +3346,12 @@ impl HostHeap {
     /// (from the thread's heap that begins at `start`, `step` bytes a slot).
     fn listed_from(&self, index: u32, view: &ListView, twins: bool, start: usize, step: usize) -> Listed {
         let made = &*view.made;
+        if made.at == u32::MAX {
+            // A window only: the slot keeps the descriptor it has.
+            self.write_stride(index, made.stride_word);
+            self.write_window(index, made.window.clone());
+            return view.listed;
+        }
         let slot = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step };
         self.copy_from(index, slot(made.at));
         if made.twin && twins {
@@ -3217,12 +3362,16 @@ impl HostHeap {
         }
         self.write_stride(index, made.stride_word);
         self.keep_ref(index, &made.kept);
+        if made.window.is_some() {
+            self.write_window(index, made.window.clone());
+        }
         view.listed
     }
 
     /// As [`HostHeap::copy_to`], from the slot `from`, which the card does not
     /// see.
     fn copy_from(&self, to: u32, from: D3D12_CPU_DESCRIPTOR_HANDLE) {
+        self.window_clear(to);
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -3576,6 +3725,9 @@ impl HostHeap {
     }
 
     fn copy_to(&self, to: u32, which: u32) {
+        if which == 0 {
+            self.window_clear(to);
+        }
         #[cfg(feature = "diagnostics")]
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
@@ -3789,6 +3941,7 @@ impl HostHeap {
             }
             self.quick_is(index, 0);
             self.made.set(index, if later { 0 } else { key });
+            super::window::clear();
             let kept = if later {
                 None
             } else {
@@ -3801,7 +3954,9 @@ impl HostHeap {
                 self.put(index);
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
+            let window = kept.is_some().then(super::window::take).flatten();
             self.keep(index, kept.flatten());
+            self.write_window(index, window);
             self.quick_is(index, if later { 0 } else { key });
             drop(held);
             self.unmake_stale(index, stale);
@@ -4329,6 +4484,15 @@ fn buffer_srv(
     if desc.Shader4ComponentMapping != D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING {
         desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     }
+    // Wanted as a window only (`VICTORY_BINDLESS_HOST=2`): the bytes its raw twin would show, noted, and
+    // nothing made. A view whose twin would not begin on 16 bytes is made.
+    if super::window::only()
+        && twin.is_some()
+        && let Some((first, count, 0)) = twin_window(desc.Format, first, count, stride, raw, width)
+    {
+        super::window::note(&shadow, first * 4, (first + u64::from(count)) * 4);
+        return Some(None);
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -4338,6 +4502,10 @@ fn buffer_srv(
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {
+            if by == 0 {
+                // The window is the twin's bytes.
+                super::window::note(&shadow, first * 4, (first + u64::from(count)) * 4);
+            }
             desc.Format = DXGI_FORMAT_R32_TYPELESS;
             desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
                 FirstElement: first,
@@ -6618,11 +6786,11 @@ mod tests {
         let mut slot_mem = [0u32; 8];
         crate::descriptor::record(slot_mem.as_mut_ptr() as u64, u16x4);
         let rec = [slot_mem[0], slot_mem[1], slot_mem[2]];
-        assert!(heap.make_listed(0x1234, rec, s0).is_some());
+        assert!(heap.make_listed(0x1234, rec, s0, false).is_some());
         assert_eq!(read_stride(s0), 8 | VIEW_INTEGER);
         heap.make_null(s0 + 3);
         assert_eq!(read_stride(s0 + 3), 0);
-        assert!(heap.make_listed(0x1234, rec, s0 + 3).is_some());
+        assert!(heap.make_listed(0x1234, rec, s0 + 3, false).is_some());
         assert_eq!(read_stride(s0 + 3), 8 | VIEW_INTEGER);
     }
 }
@@ -6700,6 +6868,9 @@ struct ListMade {
     kept: Kept,
     kind: Option<victory_shader::native::ResourceType>,
     texture: bool,
+    /// The window of a buffer view ([`super::window`]); with `at` past the slots, the view is a window only: no
+    /// descriptor was made.
+    window: Option<super::window::Noted>,
 }
 
 struct ListView {
@@ -6801,6 +6972,8 @@ struct ListViews {
     step: usize,
     start: usize,
     made: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
+    /// The records of this recording made as windows only (`VICTORY_BINDLESS_HOST=2`).
+    only: std::collections::HashMap<[u32; 3], ListView, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
     over: Over<std::rc::Rc<ListMade>>,
     /// Slots of this recording's own taken so far.
     local: u32,
@@ -6878,6 +7051,7 @@ impl ListViews {
                 step,
                 start,
                 made: Default::default(),
+                only: Default::default(),
                 over: Over::new(),
                 local: 0,
                 counts: [0; 8],
@@ -6902,6 +7076,7 @@ impl ListViews {
         }
         self.recording = recording;
         self.made.clear();
+        self.only.clear();
         self.local = 0;
         self.mode = view_cache();
         if self.mode != 0 && self.over.begin(view_clock(), Self::KEEP_SLOTS) {
@@ -6953,16 +7128,20 @@ impl ListViews {
                 }
             },
         };
+        super::window::clear();
         let kept = make_twinned(&view, self.slot(at), Some(self.slot(at + 1)))?;
         self.counts[if keep { 3 } else { 4 }] += 1;
+        let texture = is_texture_view(&view);
+        super::window::count(if texture { super::window::OTHERS_MADE } else { super::window::BUFFERS_MADE });
         let made = std::rc::Rc::new(ListMade {
             twin: twinned(&view),
             stride_word: view_stride_word(&view),
             kind: crate::draw::view_kind(&view),
-            texture: is_texture_view(&view),
+            texture,
             view,
             at,
             kept,
+            window: super::window::take(),
         });
         // (Only one that lies in the part of the heap that is kept.)
         if keep && at < Self::KEEP_SLOTS {
@@ -6976,6 +7155,34 @@ impl ListViews {
             }
             self.over.map.insert(words, (stamp, (lo, hi), made.clone()));
         }
+        Some(ListView::of(made))
+    }
+
+    /// The record `words` names as a window only: it is a buffer view with a window (the bytes its raw twin
+    /// shows), and nothing is made for it. None: it is not, and the caller makes it.
+    fn make_only(&mut self, words: [u32; 3]) -> Option<ListView> {
+        let view = super::view_at(words[1], words[2])?;
+        if matches!(view, View::Constant(..)) || is_texture_view(&view) {
+            return None;
+        }
+        super::window::clear();
+        super::window::set_only(true);
+        // (Slots the made view would take; none is written.)
+        let scratch = Self::KEEP_SLOTS + Self::LOCAL_SLOTS;
+        let made = make_twinned(&view, self.slot(scratch), Some(self.slot(scratch + 1)));
+        super::window::set_only(false);
+        made?;
+        let window = super::window::take()?;
+        let made = std::rc::Rc::new(ListMade {
+            twin: false,
+            stride_word: view_stride_word(&view),
+            kind: crate::draw::view_kind(&view),
+            texture: false,
+            view,
+            at: u32::MAX,
+            kept: None,
+            window: Some(window),
+        });
         Some(ListView::of(made))
     }
 
@@ -7016,17 +7223,19 @@ pub(crate) fn listed_view(recording: u64, words: [u32; 3]) -> Option<View> {
     LIST_VIEWS.with(|views| {
         let views = views.borrow();
         let views = views.as_ref().filter(|v| v.recording == recording)?;
-        views.made.get(&words).map(|m| m.made.view.clone())
+        views.made.get(&words).or_else(|| views.only.get(&words)).map(|m| m.made.view.clone())
     })
 }
 
 /// Notes what is known of the record `words` in `recording`.
 pub(crate) fn note_listed(recording: u64, words: [u32; 3], listed: Listed) {
     LIST_VIEWS.with(|views| {
-        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording)
-            && let Some(made) = views.made.get_mut(&words)
-        {
-            made.listed = listed;
+        if let Some(views) = views.borrow_mut().as_mut().filter(|v| v.recording == recording) {
+            if let Some(made) = views.made.get_mut(&words) {
+                made.listed = listed;
+            } else if let Some(made) = views.only.get_mut(&words) {
+                made.listed = listed;
+            }
         }
     });
 }
@@ -7218,9 +7427,9 @@ mod view_cache_tests {
         TEST_VIEW_CLOCK.with(|c| c.set(Some(1000)));
         TEST_VIEW_CACHE.store(2, Relaxed);
         // (Recording numbers of this test alone.)
-        let made = heap.make_listed(0xcafe_0001, words, s).is_some();
-        assert!(heap.make_listed(0xcafe_0001, words, s + 1).is_some() == made);
-        assert!(heap.make_listed(0xcafe_0002, words, s + 2).is_some() == made);
+        let made = heap.make_listed(0xcafe_0001, words, s, false).is_some();
+        assert!(heap.make_listed(0xcafe_0001, words, s + 1, false).is_some() == made);
+        assert!(heap.make_listed(0xcafe_0002, words, s + 2, false).is_some() == made);
         let c = counts();
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
         if !made {
@@ -7234,7 +7443,7 @@ mod view_cache_tests {
         // The copies are others: made again (in the same slot), not kept.
         TEST_VIEW_CACHE.store(1, Relaxed);
         crate::shadow::pin_world_for_test(Some(101));
-        assert!(heap.make_listed(0xcafe_0003, words, s + 3).is_some());
+        assert!(heap.make_listed(0xcafe_0003, words, s + 3, false).is_some());
         let c = counts();
         TEST_VIEW_CACHE.store(u8::MAX, Relaxed);
         crate::shadow::pin_world_for_test(None);
@@ -7264,13 +7473,13 @@ mod batched_copy_tests {
         let words = [slot_mem[0], slot_mem[1], slot_mem[2]];
         let s = heap.dynamic(4).unwrap();
         let recording = 0xbeef_0001;
-        if heap.make_listed(recording, words, s).is_none() {
+        if heap.make_listed(recording, words, s, false).is_none() {
             return; // the view does not make on this adapter
         }
         let before = BATCHED[1].load(Relaxed);
         copies_hold(true);
         // (The second ask in the recording copies the descriptor of the first.)
-        let held = heap.make_listed(recording, words, s + 1).is_some() && heap.make_listed(recording, words, s + 2).is_some();
+        let held = heap.make_listed(recording, words, s + 1, false).is_some() && heap.make_listed(recording, words, s + 2, false).is_some();
         copies_flush();
         copies_hold(false);
         assert!(held);

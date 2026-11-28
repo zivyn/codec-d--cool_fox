@@ -16,6 +16,8 @@ pub(crate) mod host;
 pub(crate) mod sparse;
 #[cfg(windows)]
 pub(crate) mod usage;
+#[cfg(windows)]
+pub(crate) mod window;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(

@@ -837,6 +837,26 @@ fn emit_forms_in(
                 }
             }
         }
+        // The same two forms as they were before `VICTORY_KEEP_LOOP_SKIPS`, for a program whose
+        // skips (or early-outs) over loops it kept: with those left out, the first that lowers
+        // exactly (the form the program had without the switch).
+        let mut left_out: Vec<(&str, Option<(ir::Program, structure::Structured, io::Io, resource::Resources)>)> = Vec::new();
+        let mut left_out_done = None;
+        if !early_kept.is_empty() {
+            left_out.push(("without early-outs, loop skips left out", form("without early-outs, loop skips left out", ir::drop_early_outs_as(p, false).0)));
+        }
+        if !skips_kept.is_empty() {
+            left_out.push(("without skips, loop skips left out", form("without skips, loop skips left out", ir::drop_skips_as(p, false, false).0)));
+        }
+        for (name, f) in &left_out {
+            if let Some((p, st, io, res)) = f {
+                let again = emit_program(c, native, p, st, io, res);
+                report(name, &again);
+                if left_out_done.is_none() && done(&again) {
+                    left_out_done = Some(again);
+                }
+            }
+        }
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
@@ -919,28 +939,19 @@ fn emit_forms_in(
                 // Where that does not lower either: the forms as they were before the switch, with
                 // the skips over loops left out (exact; a wave with no lane left walks the loop,
                 // which is what the switch avoids). Still before any approximate form.
-                if early_kept.len() + skips_kept.len() + deep_kept.len() > 0 {
-                    let left_out = [
-                        ("without early-outs, loop skips left out", ir::drop_early_outs_as(p, false).0, !early_kept.is_empty()),
-                        ("without skips, loop skips left out", ir::drop_skips_as(p, false, false).0, !skips_kept.is_empty()),
-                        (
-                            "without skips, scalars followed, loop skips left out",
-                            if deep_on { ir::drop_skips_as(p, true, false).0 } else { None },
-                            !deep_kept.is_empty(),
-                        ),
-                    ];
-                    for (name, program, kept) in left_out {
-                        if !kept {
-                            continue;
-                        }
-                        if let Some((p, st, io, res)) = form(name, program) {
-                            let again = emit_program(c, native, &p, &st, &io, &res);
-                            report(name, &again);
-                            if done(&again) {
-                                *form_out = Form::LoopSkipsLeftOut;
-                                return again.map(|(shader, _)| shader);
-                            }
-                        }
+                if let Some(again) = left_out_done.take() {
+                    *form_out = Form::LoopSkipsLeftOut;
+                    return again.map(|(shader, _)| shader);
+                }
+                if !deep_kept.is_empty()
+                    && deep_on
+                    && let Some((p, st, io, res)) = form("without skips, scalars followed, loop skips left out", ir::drop_skips_as(p, true, false).0)
+                {
+                    let again = emit_program(c, native, &p, &st, &io, &res);
+                    report("without skips, scalars followed, loop skips left out", &again);
+                    if done(&again) {
+                        *form_out = Form::LoopSkipsLeftOut;
+                        return again.map(|(shader, _)| shader);
                     }
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
@@ -1003,22 +1014,15 @@ fn emit_forms_in(
                     return local.map(|(shader, _)| shader);
                 }
             }
-            // The exact local form (no barrier) of the program with the loop skips left out, as
-            // it was before `VICTORY_KEEP_LOOP_SKIPS`: each host wave on its own does not mind
-            // a wave with no lane walking a loop whose exit reads no other lane.
-            if exact && early_kept.len() + skips_kept.len() > 0 {
-                let left_out = [
-                    ("without early-outs, loop skips left out", ir::drop_early_outs_as(p, false).0, !early_kept.is_empty()),
-                    ("without skips, loop skips left out", ir::drop_skips_as(p, false, false).0, !skips_kept.is_empty()),
-                ];
-                for (name, program, kept) in left_out {
-                    if !kept {
-                        continue;
-                    }
-                    if let Some((p, st, io, res)) = form(name, program)
-                        && idiom(&p, &st)
+            // Where the program had no exact form with barriers before the switch either: its exact
+            // local form (no barrier), as it was without the switch: each host wave on its own does
+            // not mind a wave with no lane walking a loop whose exit reads no other lane.
+            if exact && left_out_done.is_none() {
+                for (name, f) in &left_out {
+                    if let Some((p, st, io, res)) = f
+                        && idiom(p, st)
                     {
-                        let local = lower::with_local_waves(|| emit_program(c, native, &p, &st, &io, &res));
+                        let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (idiom), {name}"), &local);
                         if done(&local) {
                             *form_out = Form::LocalIdiom;

@@ -33,6 +33,35 @@
 //! asks or refreshes anything ([`join`]): the two are never at the same
 //! copies at once. The asking is one that stands beside others
 //! (`watch::ask_standing`).
+//!
+//! # Stage A (`VICTORY_STAGE_A=1`): begun before the steps, with a copy owned by one stage at a time
+//!
+//! The offer after the take leaves the steps, the snapshots and the card's copies of a
+//! submission (the larger part of what is beside it) without anything to go beside them. With
+//! the switch the thread is offered the next submission's spans earlier, as soon as the
+//! planning of this one is made ([`offer_early`]), and the lane's steps of this one, its
+//! snapshots and its own asking and refreshing go on at the same time. What makes that safe is
+//! that a host copy has one owner at a time:
+//!
+//! - the thread owns the copies that this submission does nothing to ([`InUse`]: no step of
+//!   its lists, nor of the planning's own list, refreshes, declares or places on the copy, and
+//!   none of them writes title memory where the span lies, and no step of ours runs that may
+//!   write anywhere) from the offer to [`join_early`], which the lane calls before it
+//!   declares what its shaders write, takes what goes up to the card or does anything with
+//!   the card's side of a copy;
+//! - the lane owns all the others until the take, and gives them to the thread at the offer
+//!   after the take, as before ([`offer`]): what the early offer left out of the spans is what
+//!   this one offers (a span the thread did is not offered twice);
+//! - the thread asks and refreshes as the other offer does (a standing asking, `Batch::update`),
+//!   which leaves alone what flights in the air declared written, and what the title or the
+//!   lane writes while it works has a higher number than what it read, so the next asking
+//!   (the lane's own, for this submission, which comes later) finds it. The thread gives
+//!   nothing to the queue and takes no lock of the submission, so fences, signals and
+//!   `QUEUE_ORDER` are still the lane's alone.
+//!
+//! What is not done on the thread: the title's bytes under flights' writes (they wait for the
+//! flights, and the flight of this very submission is not in the line yet at the early
+//! offer), the steps (they write title memory in their order), the planning.
 
 use super::*;
 
@@ -58,13 +87,13 @@ pub(super) fn may_offer(own: bool, nothing_sent: bool) -> bool {
 static OFFERED_EVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Offered work, being done, and the wait for it to be over.
-struct Gate<W> {
+pub(super) struct Gate<W> {
     state: Mutex<(Option<W>, bool)>,
     changed: std::sync::Condvar,
 }
 
 impl<W> Gate<W> {
-    const fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Gate { state: Mutex::new((None, false)), changed: std::sync::Condvar::new() }
     }
 
@@ -73,7 +102,7 @@ impl<W> Gate<W> {
     }
 
     /// Offers `work`: refused (given back) if some is offered or being done.
-    fn offer(&self, work: W) -> Result<(), W> {
+    pub(super) fn offer(&self, work: W) -> Result<(), W> {
         let mut state = self.lock();
         if state.0.is_some() || state.1 {
             return Err(work);
@@ -86,7 +115,7 @@ impl<W> Gate<W> {
 
     /// The thread that does it: waits for work and takes it; it is being done
     /// until [`Gate::done`].
-    fn take(&self) -> W {
+    pub(super) fn take(&self) -> W {
         let mut state = self.lock();
         loop {
             if let Some(work) = state.0.take() {
@@ -97,13 +126,13 @@ impl<W> Gate<W> {
         }
     }
 
-    fn done(&self) {
+    pub(super) fn done(&self) {
         self.lock().1 = false;
         self.changed.notify_all();
     }
 
     /// Waits until nothing is offered or being done; whether it had to.
-    fn join(&self) -> bool {
+    pub(super) fn join(&self) -> bool {
         let mut state = self.lock();
         let waited = state.0.is_some() || state.1;
         while state.0.is_some() || state.1 {
@@ -115,15 +144,25 @@ impl<W> Gate<W> {
 
 /// What is to be refreshed: per host copy, the span, as the next submission's
 /// own refreshing would make it.
-type Spans = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
+pub(super) type Spans = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
 
-static GATE: Gate<Spans> = Gate::new();
+/// What the thread is given: whether it is the early offer ([`offer_early`]), and the spans.
+type Offered = (bool, Spans);
+
+static GATE: Gate<Offered> = Gate::new();
+
+thread_local! {
+    /// On the lane, between the early offer and the one after the take: the spans of the next
+    /// submission that the early offer did not give away (all of them if it gave none, the next
+    /// submission having been asked for once).
+    static PLAN: std::cell::RefCell<Option<Spans>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Since the last frame-rate line: offers made, offers with nothing to
 /// refresh (no next submission known, or its copies are being given to the
 /// sends), refreshes done, their spans, bytes asked, microseconds the thread
 /// worked, and microseconds the next preparing waited for it.
-static STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+static STATS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
 const OFFERED: usize = 0;
 const NOTHING: usize = 1;
 const DONE: usize = 2;
@@ -132,6 +171,15 @@ const BYTES: usize = 4;
 const WORKED: usize = 5;
 const WAITED: usize = 6;
 const REFUSED: usize = 7;
+/// Early offers made, spans given in them, spans kept for the take (a step of the submission is at their copy),
+/// early offers not made because a step of ours may write anywhere, microseconds the lane waited at [`join_early`],
+/// and microseconds the thread worked on early offers.
+const EARLY: usize = 8;
+const EARLY_SPANS: usize = 9;
+const EARLY_KEPT: usize = 10;
+const EARLY_VETO: usize = 11;
+const EARLY_WAITED: usize = 12;
+const EARLY_WORKED: usize = 13;
 
 /// The spans of the refreshes of the lists at `lists` (host lists, as the
 /// addresses the line gave), as [`Batch::refresh_front`] makes them for one
@@ -141,7 +189,7 @@ const REFUSED: usize = 7;
 ///
 /// The addresses name host lists that nothing changes or takes while this
 /// runs ([`crate::queue::take_ahead`]).
-unsafe fn spans_of(lists: &[usize], excluding: &[usize]) -> Spans {
+pub(super) unsafe fn spans_of(lists: &[usize], excluding: &[usize]) -> Spans {
     let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
     let mut touches = Vec::new();
     for &at in lists {
@@ -170,28 +218,179 @@ unsafe fn spans_of(lists: &[usize], excluding: &[usize]) -> Spans {
         .collect()
 }
 
+/// What a submission's steps still do to host copies and title memory between its planning
+/// and the end of its snapshots, where the next submission's refreshes may not be
+/// ([`offer_early`]).
+#[derive(Default, Debug, PartialEq)]
+pub(super) struct InUse {
+    /// The copies (by address, in order) that a step refreshes, declares written or places on.
+    copies: Vec<usize>,
+    /// The title memory that a step writes or places, in order, joined.
+    ranges: Vec<(usize, usize)>,
+    /// A step of ours that may write title memory anywhere ([`Step::Run`]).
+    unknown: bool,
+}
+
+impl InUse {
+    /// What `lists` (the submission's, and the planning's own list) do.
+    pub(super) fn of(lists: &[&HostList]) -> InUse {
+        let mut used = InUse::default();
+        let mut written = Vec::new();
+        for list in lists {
+            used.note_all(list.deferred().copies.iter(), &mut written);
+        }
+        used.finish(written)
+    }
+
+    fn note_all<'a>(&mut self, steps: impl Iterator<Item = &'a Step>, written: &mut Vec<(usize, usize)>) {
+        let mut last = 0;
+        for step in steps {
+            match step {
+                Step::Refresh(shadow, ..) | Step::GpuWrite(shadow, ..) => {
+                    // (Most come several times on end.)
+                    let key = std::sync::Arc::as_ptr(shadow) as usize;
+                    if key != last {
+                        self.copies.push(key);
+                        last = key;
+                    }
+                }
+                Step::Placed(p) => {
+                    self.copies.push(std::sync::Arc::as_ptr(&p.shadow) as usize);
+                    written.push((p.dst, p.dst + p.len));
+                    written.push((p.src, p.src + p.len));
+                }
+                &Step::Copy(dst, _, len) => written.push((dst, dst + len)),
+                Step::Run(_) => self.unknown = true,
+                // (A fill reads title memory and writes the list's own upload memory; a host step, a texture and a
+                // plane write memory that is no copy's.)
+                Step::Fill(..) | Step::Host(..) | Step::Texture(_) | Step::Plane(..) => {}
+            }
+        }
+    }
+
+    fn finish(mut self, written: Vec<(usize, usize)>) -> InUse {
+        self.copies.sort_unstable();
+        self.copies.dedup();
+        join_ranges(&mut self.ranges, written);
+        self
+    }
+
+    /// Whether the thread may begin a span of a copy now.
+    fn leaves(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize) -> bool {
+        self.copies.binary_search(&(std::sync::Arc::as_ptr(shadow) as usize)).is_err() && !touches(&self.ranges, from, to)
+    }
+}
+
+/// `spans` as what the thread may begin now and what waits for the take.
+fn split_spans(spans: Spans, used: &InUse) -> (Spans, Spans) {
+    spans.into_iter().partition(|(shadow, from, to)| used.leaves(shadow, *from, *to))
+}
+
+/// Whether the early offer is made (`VICTORY_STAGE_A=1`, with the asking that stands beside others).
+///
+/// (May change while the title runs, `VICTORY_AB`: [`offer_early`] reads it once for a submission, [`join_early`] and
+/// [`join`] look at the gate whatever it says.)
+fn early_on() -> bool {
+    on() && crate::queue::stage_a() && crate::watch::once()
+}
+
+/// In the planning of a submission, after the steps that the card is given are chosen and before the lane waits
+/// for flights, asks or refreshes anything: offers the refreshes of the next submission that touch no copy this one
+/// does something to ([`InUse`]) to the thread ([`crate::queue::take_ahead`] names the next one); the rest is kept
+/// for [`offer`], after the take. Whether the thread was given any.
+///
+/// The lane calls [`join_early`] before it declares what its shaders write.
+pub(super) fn offer_early(runs: &[&HostList], own: Option<&HostList>) -> bool {
+    PLAN.with(|p| p.borrow_mut().take());
+    if !early_on() {
+        return false;
+    }
+    let Some(next) = crate::queue::take_ahead() else {
+        return false;
+    };
+    // SAFETY: from `take_ahead`, on our thread of submissions, which is the
+    // one that takes the entry out of the line.
+    let spans = unsafe { spans_of(&next, &[]) };
+    if spans.is_empty() {
+        return false;
+    }
+    let mut lists: Vec<&HostList> = runs.to_vec();
+    lists.extend(own);
+    let used = InUse::of(&lists);
+    if used.unknown {
+        // A step of ours may write title memory where the thread reads it, and ends the askings that stand.
+        STATS[EARLY_VETO].fetch_add(1, Ordering::Relaxed);
+        PLAN.with(|p| *p.borrow_mut() = Some(spans));
+        return false;
+    }
+    let (now, later) = split_spans(spans, &used);
+    STATS[EARLY_KEPT].fetch_add(later.len() as u64, Ordering::Relaxed);
+    let mut offered = false;
+    let mut left = later;
+    if !now.is_empty() {
+        start();
+        OFFERED_EVER.store(true, Ordering::Release);
+        let count = now.len() as u64;
+        match GATE.offer((true, now)) {
+            Ok(()) => {
+                STATS[EARLY].fetch_add(1, Ordering::Relaxed);
+                STATS[EARLY_SPANS].fetch_add(count, Ordering::Relaxed);
+                offered = true;
+            }
+            Err((_, now)) => {
+                // (Not over, which the top of the preparing waits for: not reached.)
+                STATS[REFUSED].fetch_add(1, Ordering::Relaxed);
+                left.extend(now);
+            }
+        }
+    }
+    PLAN.with(|p| *p.borrow_mut() = Some(left));
+    offered
+}
+
+/// Before the lane declares what its shaders write, and takes what goes up to the card: what was
+/// offered early is over, so that every copy is the lane's again.
+pub(super) fn join_early() {
+    if !OFFERED_EVER.load(Ordering::Acquire) {
+        return;
+    }
+    let began = std::time::Instant::now();
+    if GATE.join() {
+        STATS[EARLY_WAITED].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
 /// After the submission's bytes are taken: offers the refreshes of the
 /// submission that comes next, if our thread of submissions named it
-/// ([`crate::queue::take_ahead`]). `excluding`: copies (by address) that this
+/// ([`crate::queue::take_ahead`]), or what is left of them after the early offer
+/// ([`offer_early`]). `excluding`: copies (by address) that this
 /// submission still does something to, which are left alone.
 pub(super) fn offer(excluding: &[usize]) {
     if !on() {
         return;
     }
-    let Some(next) = crate::queue::take_ahead() else {
-        STATS[NOTHING].fetch_add(1, Ordering::Relaxed);
-        return;
+    let spans: Spans = match PLAN.with(|p| p.borrow_mut().take()) {
+        Some(left) => left
+            .into_iter()
+            .filter(|(shadow, ..)| !excluding.contains(&(std::sync::Arc::as_ptr(shadow) as usize)))
+            .collect(),
+        None => {
+            let Some(next) = crate::queue::take_ahead() else {
+                STATS[NOTHING].fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            // SAFETY: from `take_ahead`, on our thread of submissions, which is the
+            // one that takes the entry out of the line.
+            unsafe { spans_of(&next, excluding) }
+        }
     };
-    // SAFETY: from `take_ahead`, on our thread of submissions, which is the
-    // one that takes the entry out of the line.
-    let spans = unsafe { spans_of(&next, excluding) };
     if spans.is_empty() {
         STATS[NOTHING].fetch_add(1, Ordering::Relaxed);
         return;
     }
     start();
     OFFERED_EVER.store(true, Ordering::Release);
-    match GATE.offer(spans) {
+    match GATE.offer((false, spans)) {
         Ok(()) => {
             STATS[OFFERED].fetch_add(1, Ordering::Relaxed);
         }
@@ -227,12 +426,20 @@ fn start() {
             crate::cores::keep_on_fast_cores("victory-prefetch");
             crate::cores::prioritize("victory-prefetch", crate::cores::Role::Helper);
             loop {
-                let spans = GATE.take();
+                let (early, spans) = GATE.take();
                 let began = std::time::Instant::now();
-                let _span = crate::timeline::span("refreshes of the next submission, begun early");
+                let _span = crate::timeline::span(if early {
+                    "refreshes of the next submission, begun before the steps"
+                } else {
+                    "refreshes of the next submission, begun early"
+                });
                 // (A refresh that panicked is the next preparing's to do.)
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(spans)));
-                STATS[WORKED].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let spent = began.elapsed().as_micros() as u64;
+                STATS[WORKED].fetch_add(spent, Ordering::Relaxed);
+                if early {
+                    STATS[EARLY_WORKED].fetch_add(spent, Ordering::Relaxed);
+                }
                 GATE.done();
             }
         });
@@ -244,7 +451,7 @@ fn start() {
 
 /// The write watch asked about the copies' spans, and each brought up to date
 /// unless it is known to hold nothing new, as `Batch::refresh_front` does.
-fn run(mut spans: Spans) {
+pub(super) fn run(mut spans: Spans) {
     // Per copy, what is asked about (once, as a submission's own asking is).
     let mut ranges: ByCopy<(usize, usize)> = ByCopy::default();
     for (shadow, from, to) in &spans {
@@ -308,6 +515,19 @@ pub(super) fn line(frames: f64) {
         s[WAITED] / 1000.0 / frames,
         (s[WORKED] - s[WAITED]).max(0.0) / 1000.0 / frames
     );
+    if crate::queue::stage_a() {
+        tracing::info!(
+            "stage A, the refreshes begun before the steps (VICTORY_STAGE_A), per frame: {:.1} offered with {:.1} spans, {:.1} spans kept for \
+             the take (a step of the submission is at their copy), {:.2} not offered because a step of ours may write anywhere; the thread \
+             worked {:.1} ms on them, the lane waited {:.1} ms for them before it declared its shaders' writes",
+            s[EARLY] / frames,
+            s[EARLY_SPANS] / frames,
+            s[EARLY_KEPT] / frames,
+            s[EARLY_VETO] / frames,
+            s[EARLY_WORKED] / 1000.0 / frames,
+            s[EARLY_WAITED] / 1000.0 / frames
+        );
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +669,216 @@ mod copy_tests {
         // SAFETY: ours.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
+
+    /// A copy as the lane has it: the title's memory, the copy's CPU side (leaked: the test ends with the process), and
+    /// what the card holds of it.
+    struct Held {
+        at: usize,
+        shadow: std::sync::Arc<Shadow>,
+        side: usize,
+        card: Vec<u8>,
+    }
+
+    impl Held {
+        fn new() -> Held {
+            let at = memory();
+            let side: &'static mut [u8] = Box::leak(vec![0u8; N * PAGE].into_boxed_slice());
+            let shadow = Shadow::unbacked(at as u64, side.as_mut_ptr(), (N * PAGE) as u64, true);
+            Held { at, shadow, side: side.as_ptr() as usize, card: vec![0u8; N * PAGE] }
+        }
+
+        fn side(&self) -> &[u8] {
+            // SAFETY: leaked, the length of the allocation; only refreshes write it and the test reads it between them.
+            unsafe { std::slice::from_raw_parts(self.side as *const u8, N * PAGE) }
+        }
+
+        fn title(&self) -> &[u8] {
+            // SAFETY: the allocation, read when nothing writes it.
+            unsafe { std::slice::from_raw_parts(self.at as *const u8, N * PAGE) }
+        }
+
+        fn take(&mut self) {
+            for (a, b) in self.shadow.take_dirty() {
+                let held = self.side;
+                // SAFETY: as `side`.
+                let held = unsafe { std::slice::from_raw_parts(held as *const u8, N * PAGE) };
+                self.card[a..b].copy_from_slice(&held[a..b]);
+            }
+        }
+    }
+
+    /// The thread of stage A and the lane at the same time, with the title's own threads writing all through: what
+    /// the lane's submission does something to is the lane's (what it refreshes, what it writes, what it declares),
+    /// the thread is given the others, the lane takes what goes up to the card once the thread is joined, and the
+    /// thread is given the rest after the take, as `offer_early` and `offer` do. After the lane's next preparing
+    /// asks and refreshes, every byte of every copy the card holds is the title's, 500 rounds of random writes.
+    #[test]
+    fn two_stages_beside_the_lane_leave_no_stale_byte_for_the_card() {
+        use super::{InUse, split_spans};
+        use crate::host::Step;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const COPIES: usize = 6;
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copies: Vec<Held> = (0..COPIES).map(|_| Held::new()).collect();
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for c in copies.iter_mut() {
+            refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+            c.take();
+        }
+        let (mut early_spans, mut late_spans) = (0usize, 0usize);
+        for round in 0..500 {
+            // The title writes for the submission and the next.
+            for _ in 0..(next() % 8) {
+                let c = (next() % COPIES as u64) as usize;
+                write(copies[c].at, (next() % (N * PAGE) as u64) as usize, (next() % 255) as u8 + 1);
+            }
+            // What the lane's submission does: refreshes some copies, copies into a page of one, declares a range of one.
+            let mut steps: Vec<Step> = Vec::new();
+            let mut named = Vec::new();
+            for c in 0..COPIES {
+                if next() % 3 == 0 {
+                    steps.push(Step::Refresh(copies[c].shadow.clone(), copies[c].at, N * PAGE));
+                    named.push(c);
+                }
+            }
+            let copy_to = (next() % 3 == 0).then(|| ((next() % COPIES as u64) as usize, (next() % N as u64) as usize));
+            if let Some((c, page)) = copy_to {
+                let at = copies[c].at + page * PAGE;
+                steps.push(Step::Copy(at, at, PAGE));
+            }
+            let declare = named.first().map(|&c| (c, (next() % N as u64) as usize));
+            if let Some((c, _)) = declare {
+                steps.push(Step::GpuWrite(copies[c].shadow.clone(), copies[c].at, PAGE));
+            }
+            let mut used = InUse::default();
+            let mut written = Vec::new();
+            used.note_all(steps.iter(), &mut written);
+            let used = used.finish(written);
+            assert!(!used.unknown);
+            // The next submission refreshes a span of each copy.
+            let spans: super::Spans = (0..COPIES)
+                .map(|c| {
+                    let from = (next() % N as u64) as usize;
+                    let to = (from + 1 + (next() % 6) as usize).min(N);
+                    (copies[c].shadow.clone(), copies[c].at + from * PAGE, copies[c].at + to * PAGE)
+                })
+                .collect();
+            let (now, later) = split_spans(spans, &used);
+            for (shadow, from, to) in &now {
+                assert!(used.leaves(shadow, *from, *to), "a span of a copy the submission does something to was given away");
+            }
+            for (shadow, from, to) in &later {
+                assert!(!used.leaves(shadow, *from, *to), "a span of a free copy was kept");
+            }
+            (early_spans, late_spans) = (early_spans + now.len(), late_spans + later.len());
+            // The title's other threads, writing while all this goes on.
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let writer = {
+                let stop = stop.clone();
+                let targets: Vec<usize> = copies.iter().map(|c| c.at).collect();
+                let mut s = next() | 1;
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        write(targets[(s % COPIES as u64) as usize], ((s >> 8) % (N * PAGE) as u64) as usize, (s >> 40) as u8 | 1);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            // Stage A, beside the lane's asking, refreshing and steps.
+            let stage = std::thread::spawn(move || super::run(now));
+            for &c in &named {
+                refresh(&copies[c].shadow, copies[c].at, &[(0, N * PAGE)]);
+            }
+            if let Some((c, page)) = copy_to {
+                let at = copies[c].at + page * PAGE;
+                for i in (0..PAGE).step_by(64) {
+                    write(at, i + 3, (round % 200) as u8 + 1);
+                }
+                crate::watch::wrote(at, PAGE);
+            }
+            let mut ranges = Vec::new();
+            if let Some((c, page)) = declare {
+                let range = (copies[c].at + page * PAGE, copies[c].at + (page + 1) * PAGE);
+                copies[c].shadow.writing(range.0, range.1 - range.0);
+                ranges.push((c, range));
+            }
+            // The lane is at the place before its shaders' writes are declared and the take: the thread is over.
+            stage.join().unwrap();
+            for c in copies.iter_mut() {
+                c.take();
+            }
+            // After the take, the rest is given to the thread; the lane sends meanwhile.
+            let rest = std::thread::spawn(move || super::run(later));
+            std::thread::yield_now();
+            rest.join().unwrap();
+            // The flight lands, before the next preparing refreshes the copy again.
+            for &(c, range) in &ranges {
+                copies[c].shadow.copy_back_done(&[range]);
+            }
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+            // The next preparing's own asking and refresh, and its take: nothing stale is left.
+            for c in copies.iter_mut() {
+                refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+                c.take();
+            }
+            for (i, c) in copies.iter().enumerate() {
+                assert!(c.card == c.title(), "a byte of copy {i} that the card holds is not the title's after round {round}");
+                assert!(c.side() == c.title(), "a byte of copy {i}'s CPU side is not the title's after round {round}");
+            }
+        }
+        assert!(early_spans > 0 && late_spans > 0, "the stress had both kinds of span: {early_spans} early, {late_spans} late");
+        for c in &copies {
+            // SAFETY: ours.
+            unsafe { VirtualFree(c.at as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// A range the submission declares written is left alone by the thread that is given the copy after the take,
+    /// until the flight has landed, whichever of the two stages refreshes it.
+    #[test]
+    fn a_range_declared_by_the_submission_waits_for_its_landing_whichever_stage_refreshes_it() {
+        use crate::host::Step;
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copy = Held::new();
+        refresh(&copy.shadow, copy.at, &[(0, N * PAGE)]);
+        copy.take();
+        let range = (copy.at + 2 * PAGE, copy.at + 3 * PAGE);
+        // The submission names the copy (its steps declare the range): the thread is not given it early.
+        let steps = [Step::GpuWrite(copy.shadow.clone(), range.0, PAGE)];
+        let mut used = super::InUse::default();
+        let mut written = Vec::new();
+        used.note_all(steps.iter(), &mut written);
+        let used = used.finish(written);
+        let spans: super::Spans = vec![(copy.shadow.clone(), copy.at, copy.at + N * PAGE)];
+        let (now, later) = super::split_spans(spans, &used);
+        assert!(now.is_empty(), "the lane's until the take");
+        copy.shadow.writing(range.0, range.1 - range.0);
+        write(copy.at, 2 * PAGE + 5, 9);
+        write(copy.at, 4 * PAGE + 5, 8);
+        copy.take();
+        // After the take the thread is given it; the flight is not landed.
+        std::thread::spawn(move || super::run(later)).join().unwrap();
+        assert!(copy.shadow.writes_pending_in(range.0, range.1));
+        assert_eq!(copy.side()[4 * PAGE + 5], 8, "outside the range it is copied");
+        assert_eq!(copy.side()[2 * PAGE + 5], 0, "inside it waits for the landing");
+        copy.shadow.copy_back_done(&[range]);
+        refresh(&copy.shadow, copy.at, &[(0, N * PAGE)]);
+        copy.take();
+        assert_eq!(copy.side()[2 * PAGE + 5], 9, "taken when the flight has landed");
+        assert!(copy.card == copy.title());
+        // SAFETY: ours.
+        unsafe { VirtualFree(copy.at as *mut _, 0, MEM_RELEASE) };
+    }
 }
 
 #[cfg(test)]
@@ -510,6 +940,97 @@ mod tests {
         gate.join();
         assert!(over.load(Ordering::SeqCst));
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+        worker.join().unwrap();
+    }
+
+    fn copy(start: u64) -> Arc<crate::shadow::Shadow> {
+        let side: &'static mut [u8] = Box::leak(vec![0u8; 16 * 4096].into_boxed_slice());
+        crate::shadow::Shadow::unbacked(start, side.as_mut_ptr(), 16 * 4096, false)
+    }
+
+    fn in_use(steps: &[crate::host::Step]) -> super::InUse {
+        let mut used = super::InUse::default();
+        let mut written = Vec::new();
+        used.note_all(steps.iter(), &mut written);
+        used.finish(written)
+    }
+
+    /// A copy that a step refreshes, declares written or places on is the lane's until the take, and so is any span
+    /// where a step writes title memory; copies that only fills and host steps look at are not.
+    #[test]
+    fn what_the_steps_name_or_write_is_not_given_to_the_thread() {
+        use crate::host::Step;
+        let (a, b, c, d) = (copy(0x1000_0000), copy(0x2000_0000), copy(0x3000_0000), copy(0x4000_0000));
+        let used = in_use(&[
+            Step::Refresh(a.clone(), 0x1000_0000, 4096),
+            Step::Refresh(a.clone(), 0x1000_1000, 4096),
+            Step::GpuWrite(b.clone(), 0x2000_0000, 4096),
+            Step::Copy(0x3000_2000, 0x9000_0000, 4096),
+            Step::Fill(0x5000_0000, 0x4000_0000, 4096, None),
+            Step::Host(Box::new(|| {}), (0x4000_0000, 0x4000_1000)),
+        ]);
+        assert!(!used.unknown);
+        assert!(!used.leaves(&a, 0x1000_8000, 0x1000_9000), "named by a refresh: the whole copy");
+        assert!(!used.leaves(&b, 0x2000_8000, 0x2000_9000), "named by a declaration: the whole copy");
+        assert!(!used.leaves(&c, 0x3000_2000, 0x3000_3000), "where a title copy writes");
+        assert!(!used.leaves(&c, 0x3000_2800, 0x3000_3800), "where a title copy writes, in part");
+        assert!(used.leaves(&c, 0x3000_0000, 0x3000_1000), "the rest of its copy is free");
+        assert!(used.leaves(&c, 0x3000_3000, 0x3000_4000));
+        assert!(used.leaves(&d, 0x4000_0000, 0x4000_1000), "only read by a fill and a host step");
+    }
+
+    /// A step of ours that may write title memory anywhere keeps the early offer from being made.
+    #[test]
+    fn a_step_that_may_write_anywhere_stops_the_early_offer() {
+        use crate::host::Step;
+        let used = in_use(&[Step::Run(Box::new(|| {}))]);
+        assert!(used.unknown);
+        assert!(!in_use(&[]).unknown);
+    }
+
+    /// The spans come back as two lists in their order: what the thread may begin and what waits for the take.
+    #[test]
+    fn the_spans_are_split_by_what_the_submission_does() {
+        use crate::host::Step;
+        let (a, c, d) = (copy(0x1000_0000), copy(0x3000_0000), copy(0x4000_0000));
+        let used = in_use(&[Step::Refresh(a.clone(), 0x1000_0000, 4096), Step::Copy(0x3000_2000, 0x9000_0000, 4096)]);
+        let spans = vec![
+            (a.clone(), 0x1000_0000, 0x1000_4000),
+            (c.clone(), 0x3000_0000, 0x3000_1000),
+            (c.clone(), 0x3000_2000, 0x3000_3000),
+            (d.clone(), 0x4000_0000, 0x4000_8000),
+        ];
+        let (now, later) = super::split_spans(spans, &used);
+        let key = |s: &(Arc<crate::shadow::Shadow>, usize, usize)| (s.1, s.2);
+        assert_eq!(now.iter().map(key).collect::<Vec<_>>(), vec![(0x3000_0000, 0x3000_1000), (0x4000_0000, 0x4000_8000)]);
+        assert_eq!(later.iter().map(key).collect::<Vec<_>>(), vec![(0x1000_0000, 0x1000_4000), (0x3000_2000, 0x3000_3000)]);
+    }
+
+    /// What is offered early is over before what is offered after the take can be: the lane waits for it ahead of
+    /// declaring its shaders' writes (`join_early`), and an offer made while it is not over is refused, so a copy is
+    /// never in two stages' hands at once, and the two are done in the order they were offered.
+    #[test]
+    fn what_was_offered_before_the_steps_is_over_before_the_offer_after_the_take_is_taken() {
+        let gate: Arc<Gate<(bool, u32)>> = Arc::new(Gate::new());
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let worker = {
+            let (gate, order) = (gate.clone(), order.clone());
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    let work = gate.take();
+                    std::thread::sleep(Duration::from_millis(40));
+                    order.lock().unwrap().push(work);
+                    gate.done();
+                }
+            })
+        };
+        assert!(gate.offer((true, 1)).is_ok());
+        assert_eq!(gate.offer((false, 2)), Err((false, 2)), "not while the early one is not over");
+        assert!(gate.join(), "the lane waited for the thread");
+        assert_eq!(*order.lock().unwrap(), vec![(true, 1)], "over before the lane goes on");
+        assert!(gate.offer((false, 2)).is_ok());
+        gate.join();
+        assert_eq!(*order.lock().unwrap(), vec![(true, 1), (false, 2)]);
         worker.join().unwrap();
     }
 }

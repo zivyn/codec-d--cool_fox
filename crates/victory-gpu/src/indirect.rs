@@ -3269,7 +3269,7 @@ void main(uint3 group : SV_GroupID) {
             // The commands: the run's words are the dwords of the calls that differ, from the lowest to the highest.
             let layout = [(0u32, 3u32)];
             let head = call(0);
-            let mut vary = vec![None];
+            let mut vary = vec![0u64];
             let mut values = head.to_vec();
             for k in 1..CALLS {
                 vary = crate::draw::fold::varying(&layout, &head, &vary, &call(k));

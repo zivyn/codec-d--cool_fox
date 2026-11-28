@@ -25,7 +25,7 @@
 //! was; the host takes each program as it finds it.
 
 use super::super::shader::USER_ROOT_VIEW_INDEX;
-use super::{Lower, ResourceType, RootType, V, flags};
+use super::{Lower, ResourceType, RootType, V};
 
 #[cfg(test)]
 thread_local! {
@@ -63,7 +63,6 @@ impl Lower<'_> {
         }
         let index = self.host_word(RootType::Other(USER_ROOT_VIEW_INDEX), slot, 0);
         let entry = self.s.entry;
-        self.s.flags |= flags::RAW_BUFFERS;
         // (Raw buffer, no flags: as the root SRV's own handle is annotated.)
         let h = self
             .s

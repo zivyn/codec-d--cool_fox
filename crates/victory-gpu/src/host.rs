@@ -2894,6 +2894,22 @@ fn ask_spans(runs: &[&HostList], lean: bool) -> Vec<(usize, usize)> {
 
 /// [`ask_spans`] for the copies `asked` says yes to (of each, at each of its refreshes), over any lists of steps.
 fn ask_spans_where<L: onepass::StepList>(runs: &[L], lean: bool, asked: impl Fn(&crate::shadow::Shadow) -> bool) -> Vec<(usize, usize)> {
+    ask_spans_each(runs, lean, asked, None)
+}
+
+/// [`ask_spans`] without the refreshes the thread of the entry takes as done (`VICTORY_STAGE_A_FRONT2`: a range that lies
+/// whole inside a span the second thread of stage A asked about and refreshed).
+fn ask_spans_skipping(runs: &[&HostList], lean: bool, skip: &front2::Certified) -> Vec<(usize, usize)> {
+    ask_spans_each(runs, lean, |shadow| shadow.asked_ahead(), (!skip.is_empty()).then_some(skip))
+}
+
+/// [`ask_spans_where`], leaving out the ranges `skip` covers.
+fn ask_spans_each<L: onepass::StepList>(
+    runs: &[L],
+    lean: bool,
+    asked: impl Fn(&crate::shadow::Shadow) -> bool,
+    skip: Option<&front2::Certified>,
+) -> Vec<(usize, usize)> {
     thread_local! {
         static ASKED: std::cell::RefCell<ByCopy<(usize, usize)>> = std::cell::RefCell::new(ByCopy::default());
     }
@@ -2903,6 +2919,7 @@ fn ask_spans_where<L: onepass::StepList>(runs: &[L], lean: bool, asked: impl Fn(
             for step in steps {
                 if let Step::Refresh(shadow, address, len) = step
                     && asked(&**shadow)
+                    && !skip.is_some_and(|skip| skip.covers(std::sync::Arc::as_ptr(shadow) as usize, *address, *address + *len))
                 {
                     let span = spans
                         .entry(std::sync::Arc::as_ptr(shadow) as usize)
@@ -3743,6 +3760,7 @@ mod place;
 pub(crate) mod precise;
 mod prefetch;
 mod front;
+mod front2;
 mod plan;
 pub(crate) mod relax;
 mod scratch;

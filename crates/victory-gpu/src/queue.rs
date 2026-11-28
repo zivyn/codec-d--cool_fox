@@ -501,8 +501,15 @@ pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
 /// (addresses, in order) of the entry after it of the same queue, if it is a submission whose lists are known
 /// (`VICTORY_STAGE_A_DEEP`). It stays in the line, at its place.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) fn deeper_next() -> Option<Vec<usize>> {
     behind::deeper()
+}
+
+/// [`deeper_next`] with the entry's number.
+#[cfg(windows)]
+pub(crate) fn deeper_next_entry() -> Option<(u64, Vec<usize>)> {
+    behind::deeper_entry()
 }
 
 /// The host lists (addresses) of the submission that comes next after the one

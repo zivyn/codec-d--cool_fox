@@ -56,8 +56,10 @@ pub(super) fn late_line(frames: f64) {
     }
     prefetch::line(frames);
     front::frame_line(frames);
+    front2::frame_line(frames);
     plan::frame_line(frames);
     askaside::line(frames);
+    askaside::front_line(frames);
     waits::line(frames);
     onepass::line(frames);
     let s: Vec<f64> = LATE_STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();

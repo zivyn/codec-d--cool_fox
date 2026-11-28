@@ -80,6 +80,19 @@
 //!     committed (the descriptor slots made) only at the point of no return, after the line's generation was looked at
 //!     again; before that, giving the submission back leaves no trace.
 //!
+//! 11. **The asking beside the planning (`VICTORY_STAGE_A_ASK_ASIDE`).** The plan for the card (7 ms a frame, in the few
+//!     submissions that have one) and the asking of the write watch (3.6 ms a frame) do not depend on each other: with the
+//!     plan about to be made, the asking of the submission's own lists is offered to a thread of its own
+//!     ([`askaside::begin_front`], as the thread of submissions does for its own) and joined where the asking used to be; what
+//!     the plan's list adds is asked after the join (`watch::ask_more`), and a wait for flights in between (they land title
+//!     memory) makes the whole asking be made again, as on the thread of submissions.
+//! 12. **A second thread for the entry after the next (`VICTORY_STAGE_A_FRONT2`, [`front2`]).** With the number taken, the
+//!     asking and the refreshes of the spans of the entry after the next that this submission leaves alone, by copy and by
+//!     range, and that nothing in the air writes, are done by a thread of their own beside the steps here, and left as a
+//!     certificate: when that entry's turn comes this thread takes the spans that still stand as done (neither asked nor
+//!     refreshed again). Ownership of every copy and range across the three stages, and what each condition rests on, is in
+//!     [`front2`].
+//!
 //! What is not done on the thread: the snapshots, the declarations of picked ranges, the
 //! take (they are stage B), and the submissions that wait for flights unless a bit says wait or the plan is made.
 
@@ -113,9 +126,28 @@ pub(super) struct Front {
 /// `VICTORY_STAGE_A_DEEP` the lists of the entry after this one, if it is a submission of the same queue
 /// whose lists are known.
 struct Asked {
+    /// The number the line gave the entry, and the lists and parts it has now.
+    entry: u64,
     lists: Vec<usize>,
     parts: Vec<usize>,
-    deeper: Option<Vec<usize>>,
+    /// The entry after it (its number and lists), named when `VICTORY_STAGE_A_DEEP` or `VICTORY_STAGE_A_FRONT2` is on.
+    deeper: Option<(u64, Vec<usize>)>,
+    /// What the second thread did for this entry while the one before was prepared (`VICTORY_STAGE_A_FRONT2`).
+    cert: Option<front2::Cert>,
+}
+
+/// An asking begun beside the planning (`VICTORY_STAGE_A_ASK_ASIDE`) that is not used: whichever way the thread leaves
+/// before the place where it is joined (a decline, a panic), it waits for it and ends it, so that no asking is left standing.
+#[derive(Default)]
+struct AsideAsking(Option<askaside::Offered>);
+
+impl Drop for AsideAsking {
+    fn drop(&mut self) {
+        if let Some(offered) = self.0.take() {
+            offered.join();
+            crate::watch::ask_once_end();
+        }
+    }
 }
 
 static GATE: prefetch::Gate<Asked> = prefetch::Gate::new();
@@ -280,22 +312,24 @@ pub(super) fn offer() -> bool {
     if !on() || split_pending_here() {
         return false;
     }
-    let Some((_, lists, parts)) = crate::queue::prefold_next() else {
+    let Some((entry, lists, parts)) = crate::queue::prefold_next() else {
         return false;
     };
     if lists.is_empty() {
         return false;
     }
     // (The entry after the next, named now: when the thread runs, the line may have moved on.)
-    let deeper = if relax::deep() { crate::queue::deeper_next() } else { None };
+    let deeper = if relax::deep() || front2::on() { crate::queue::deeper_next_entry() } else { None };
     if relax::deep() {
         STATS[if deeper.is_some() { DEEP_ASKED } else { DEEP_NONE }].fetch_add(1, Ordering::Relaxed);
     }
+    // What the second thread did for this entry, if the join of the submission before waited for it.
+    let cert = front2::retire();
     start();
     OFFERED_EVER.store(true, Ordering::Release);
     LANE.with(|l| l.set(true));
     HOLD.set(true);
-    match GATE.offer(Asked { lists, parts, deeper }) {
+    match GATE.offer(Asked { entry, lists, parts, deeper, cert }) {
         Ok(()) => {
             STATS[OFFERS].fetch_add(1, Ordering::Relaxed);
             true
@@ -396,6 +430,7 @@ fn start() {
             crate::cores::prioritize("victory-front", crate::cores::Role::Helper);
             loop {
                 let asked = GATE.take();
+                crate::sched::front_sync();
                 let began = std::time::Instant::now();
                 let _span = crate::timeline::span("stage A of the next submission");
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match host() {
@@ -476,6 +511,9 @@ impl Host {
         // else is done, and not committed until the point of no return below.
         let mut ahead: Option<plan::Planned> = None;
         let mut refused: Option<&'static str> = None;
+        // The asking of the submission's own lists begun beside the plan (`VICTORY_STAGE_A_ASK_ASIDE`).
+        let aside_wanted = askaside::front_wanted();
+        let mut aside = AsideAsking::default();
         {
             let (written, copies) = {
                 let line = line();
@@ -486,6 +524,12 @@ impl Host {
                 let copied = card_steps::copied_read(&copies, &runs);
                 let mut waiting = blocked || copied;
                 if blocked && !copied && seen.need & !bits == 0 && plan::on() {
+                    if aside_wanted {
+                        let ranges = ask_spans(&runs, lean_steps());
+                        if !ranges.is_empty() {
+                            aside.0 = askaside::begin_front(ranges);
+                        }
+                    }
                     match self.plan_ahead(&runs) {
                         plan::Tried::Planned(planned) => {
                             ahead = Some(planned);
@@ -550,10 +594,44 @@ impl Host {
             }
             None => (&runs[..], asked.parts.clone()),
         };
+        // What the second thread asked about and refreshed for this entry while the one before was prepared, and still stands
+        // (`VICTORY_STAGE_A_FRONT2`): taken as done, neither asked nor refreshed again. Judged now, with the plan known (the
+        // copies its list and any later list name are not taken as done) and what is in the air looked at again.
+        let cert_after = asked.cert.as_ref().map(front2::Cert::after);
+        let certified = match &asked.cert {
+            Some(cert) => {
+                let air = line().written.clone();
+                let mut extra: Vec<&HostList> = Vec::new();
+                if let Some(planned) = &ahead {
+                    extra.push(planned.chosen.list());
+                }
+                extra.extend(runs.iter().skip(cert.lists_len()).copied());
+                cert.usable(asked.entry, &asked.lists, STARTED.load(Ordering::Acquire), &air, &front2::Held::of(&extra))
+            }
+            None => front2::Certified::default(),
+        };
         let mut batch = Batch::new(lean_steps());
-        let ranges = ask_spans(lists, batch.lean);
+        let ranges = ask_spans_skipping(lists, batch.lean, &certified);
         let mut asking: Option<crate::watch::Standing> = None;
-        ask_for_submission(&ranges, &mut asking);
+        match aside.0.take() {
+            Some(offered) => {
+                // The asking made beside the planning is over (a drop of the holder waits for it).
+                offered.join();
+                if waits.is_some() {
+                    // What flights landed since is title memory written: everything is asked again, as after any wait.
+                    askaside::redone();
+                    ask_for_submission(&ranges, &mut asking);
+                } else if ahead.is_some() {
+                    // The plan's own list names a few more copies.
+                    let own = ask_spans(&lists[..1], batch.lean);
+                    if !own.is_empty() {
+                        askaside::more(own.len());
+                        crate::watch::ask_more(&own);
+                    }
+                }
+            }
+            None => ask_for_submission(&ranges, &mut asking),
+        }
         let end = |asking: &mut Option<crate::watch::Standing>| match asking.take() {
             Some(standing) => crate::watch::end_standing(standing),
             None => crate::watch::ask_once_end(),
@@ -619,16 +697,32 @@ impl Host {
             planned.chosen.commit();
         }
         // Nothing is declined from here on: the submission has its number, and its steps are done.
-        let number = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        let previous = STARTED.fetch_add(1, Ordering::AcqRel);
+        let number = previous + 1;
         crate::shadow::preparing(number);
+        // The certificate was made for the number before this one: if another submission took one in between (a thread
+        // that waited for its number gave up waiting), nothing is taken as done, and the refreshes are made after all (the
+        // asking left out ranges only; what the refresh needs it asks itself).
+        let certified = if cert_after.is_none_or(|after| after == previous) {
+            certified
+        } else {
+            front2::number_moved();
+            front2::Certified::default()
+        };
         // The entry after this one has the refreshes of the copies this submission does nothing to begun now, beside
-        // this one's asking, refreshes and steps (`VICTORY_STAGE_A_DEEP`): the lane joins them before it asks, refreshes or
-        // takes anything for this submission, and so no copy is in two stages' hands.
-        if let Some(next) = &asked.deeper {
-            prefetch::offer_deep(lists, next);
+        // this one's asking, refreshes and steps (`VICTORY_STAGE_A_DEEP`, or with `VICTORY_STAGE_A_FRONT2` by a thread of its
+        // own, which leaves a certificate): the lane joins them before it asks, refreshes or takes anything for this
+        // submission, and so no copy is in two stages' hands.
+        if let Some((entry, next)) = &asked.deeper {
+            if front2::on() {
+                let plan_held = ahead.as_ref().map(|planned| front2::Held::of(&[planned.chosen.list()])).unwrap_or_default();
+                front2::offer(&asked.lists, plan_held, (*entry, next.as_slice()), number);
+            } else if relax::deep() {
+                prefetch::offer_deep(lists, next);
+            }
         }
         let air = line().written.clone();
-        batch.refresh_front(lists, &parts);
+        batch.refresh_front_skipping(lists, &parts, Some(&certified));
         for list in lists {
             // (The steps the card does are left out, as the thread of submissions does with its own plan.)
             list.run_deferred(&mut batch, &air, |i| ahead.as_ref().is_some_and(|planned| planned.chosen.takes(list, i)), None);

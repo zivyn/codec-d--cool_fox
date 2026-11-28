@@ -21,8 +21,10 @@ impl Host {
             return;
         }
         late_threads();
-        // The thread of stage A is done with the submission before any decision is made about it.
+        // The thread of stage A is done with the submission before any decision is made about it (and the one that
+        // asks and refreshes the entry after it: every copy is the lane's again).
         front::join();
+        front2::join();
         if let Some(cut) = {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             card_steps::cut_for(&runs)
@@ -398,6 +400,7 @@ impl Host {
             // (The thread of stage A first: what it offered to the thread of the refreshes, beside its steps
             // [`relax::deep`], is offered while it works, and is there to be waited for after it is done.)
             front::join();
+            front2::join();
             prefetch::join();
             front::take(runs, parts)
         } else {

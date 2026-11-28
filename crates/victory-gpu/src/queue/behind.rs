@@ -219,6 +219,14 @@ pub(super) fn deeper() -> Option<Vec<usize>> {
     LANE.deeper()
 }
 
+/// [`deeper`] with the entry's number (`VICTORY_STAGE_A_FRONT2`: what was done for it is told by its number).
+pub(super) fn deeper_entry() -> Option<(u64, Vec<usize>)> {
+    if !DOING.get() {
+        return None;
+    }
+    LANE.deeper_entry()
+}
+
 /// Tests: stage A's question answers yes.
 #[cfg(test)]
 static FORCE_STAGE_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -472,6 +480,11 @@ impl<W: Work> Lane<W> {
     /// same queue, marked `prepared`): what the next entry of that queue after it is, as the addresses of its host lists
     /// in the order they run, if it is a submission whose lists are known. Nothing is taken or marked.
     pub(super) fn deeper(&self) -> Option<Vec<usize>> {
+        self.deeper_entry().map(|entry| entry.1)
+    }
+
+    /// [`Lane::deeper`] with the number of the entry.
+    pub(super) fn deeper_entry(&self) -> Option<(u64, Vec<usize>)> {
         let state = self.lock();
         let queue = state.running?;
         let first = state.items.front()?;
@@ -482,7 +495,7 @@ impl<W: Work> Lane<W> {
         if next.what.folded() || !next.what.runs() {
             return None;
         }
-        next.what.peek()
+        next.what.peek().map(|lists| (next.number, lists))
     }
 
     /// Does one entry: the oldest that is the first of its queue and free to

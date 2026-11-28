@@ -836,6 +836,14 @@ impl Batch {
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
     pub(super) fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
+        self.refresh_front_skipping(runs, parts, None);
+    }
+
+    /// [`Batch::refresh_front`], leaving the spans `skip` covers to what was done for them already: a span of the lists
+    /// that lies whole inside one the second thread of stage A asked about and refreshed (`VICTORY_STAGE_A_FRONT2`) is put
+    /// among what is refreshed ahead, so that the steps that name it do not refresh it again, and is not refreshed (nor
+    /// looked at) here.
+    pub(super) fn refresh_front_skipping(&mut self, runs: &[&HostList], parts: &[usize], skip: Option<&front2::Certified>) {
         // (With `VICTORY_LEAN_STEPS` the thread's kept table and list, emptied: the copies' holds are let go at the
         // end, with the list of what the steps touch, whichever way they go out of this function.)
         thread_local! {
@@ -888,10 +896,22 @@ impl Batch {
         } else {
             front_spans_gap(touches.drain(..), refresh_narrow_gap())
         };
-        let spans: Vec<_> = found.into_iter().filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to))).collect();
+        let mut spans: Vec<_> = found.into_iter().filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to))).collect();
         self.front = true;
         for (shadow, from, to) in &spans {
             self.put_ahead(std::sync::Arc::as_ptr(shadow) as usize, *from, *to);
+        }
+        if let Some(skip) = skip.filter(|skip| !skip.is_empty()) {
+            let before = spans.len();
+            let mut bytes = 0usize;
+            spans.retain(|(shadow, from, to)| {
+                let done = skip.covers(std::sync::Arc::as_ptr(shadow) as usize, *from, *to);
+                if done {
+                    bytes += *to - *from;
+                }
+                !done
+            });
+            front2::taken_as_done(before - spans.len(), bytes);
         }
         let span_ranges: Vec<(usize, usize, usize)> = if checking {
             spans.iter().map(|(shadow, from, to)| (std::sync::Arc::as_ptr(shadow) as usize, *from, *to)).collect()

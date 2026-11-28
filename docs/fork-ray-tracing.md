@@ -40,7 +40,7 @@ nothing. With `VICTORY_BVH_BUILDER=1`:
 | the probe ray activation (1 dispatch a frame) | runs; `VICTORY_ACTIVATE_RAYS=0` leaves it out: tiles of the screen probes are then never marked and keep what they held, which shows as blocks of the picture's tiles (and runs without it showed the white-out) | runs; `VICTORY_ACTIVATE_RAYS=0` leaves it out |
 | trace programs (probes, visibility buffer, irradiance cache, shadows, reflections) | run on empty structures | run on the built ones |
 | title memory by address (`memory.rs`) | only what a stray trace touches | the arenas: about 1 GB in 19 arenas in a run of the opening; by the code each page is twice in the PC's memory (reserved and staged) and once on the card, twice while shader writes are compared (`shadow::Card::before`) |
-| the indirect-light stand-in (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_AIR`) | applies | rests once the builder has run |
+| the indirect-light stand-in (`VICTORY_AMBIENT`, `VICTORY_AMBIENT_AIR`) | applies | rests once the builder has run (`VICTORY_AMBIENT_RT=1`: it runs as a floor under the traced light) |
 
 Cost of the hit-shading programs being made by default: about 1,000 compute pipelines, ~10 minutes
 of compiling on a cache that has never made them (a cache warmed before this default has none of

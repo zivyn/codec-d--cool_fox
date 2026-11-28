@@ -33,6 +33,8 @@ pub(crate) enum Check {
 /// Every switch that may be named, sorted by name.
 pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_ALIAS_BATCH", Kind::Flag),
+    ("VICTORY_AMBIENT_AIR", Kind::Float),
+    ("VICTORY_AMBIENT_DIRECTION", Kind::Float),
     ("VICTORY_AMBIENT_GAIN", Kind::Float),
     ("VICTORY_ASK_ASIDE", Kind::OnByDefault),
     ("VICTORY_ASK_CACHE", Kind::Flag),

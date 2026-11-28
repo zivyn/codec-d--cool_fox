@@ -53,7 +53,21 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around, and with `,max:<level>`
-//! by a constant too (the multiple alone grows with the room).
+//! by a constant too (the multiple alone grows with the room). The multiple is live in the A/B
+//! (`VICTORY_AB=12,VICTORY_AMBIENT_AIR=0`: A the built-in 1.5, B the title's own air, no bound):
+//! the console's picture has a warm veil that grows toward the window, and this tells how much of
+//! the walls' light and of that gradient is the air the bound holds down (GI3).
+//!
+//! `VICTORY_AMBIENT_DIRECTION=<k>` (1.2) is the weight of the directional term of the estimate (the
+//! first-order harmonics: a surface faces the brighter side of what is seen). 0 leaves the mean alone,
+//! which is the way to tell, in one process (`VICTORY_AB`), how much of a wall's light the direction
+//! gives (the wall faces the camera, so the term is small there by construction: GI3).
+//!
+//! `VICTORY_AMBIENT_RT=1` lets the stand-in run while the structure builder lights
+//! (`VICTORY_BVH_BUILDER=1`) as a floor under the title's own traced light: what the program left is
+//! kept up to 64 times the estimate (`VICTORY_AMBIENT_TRUST` is not read), so a bounce that the rays
+//! really found stays, and where the rays still find nothing (the structures are not complete) the
+//! estimate holds the surface up. Without it the stand-in rests once the builder has run.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -201,9 +215,36 @@ fn air_set() -> (f32, f32) {
     *SET.get_or_init(|| air_setting(&crate::defaults::var("VICTORY_AMBIENT_AIR").unwrap_or_default()))
 }
 
-fn air() -> f32 {
-    air_set().0
+/// The multiple of `VICTORY_AMBIENT_AIR` for the text of a phase (`None`: the variable unset, the built-in one).
+fn parse_air(text: Option<&str>) -> f32 {
+    air_setting(text.or_else(|| crate::defaults::default_of("VICTORY_AMBIENT_AIR")).unwrap_or_default()).0
 }
+
+/// The multiple now (live in the A/B: read at each dispatch of the air's program; 0 leaves the title's air alone).
+fn air() -> f32 {
+    crate::ab::live_value!("VICTORY_AMBIENT_AIR", f32, parse_air)
+}
+
+/// `VICTORY_AMBIENT_DIRECTION`: the weight of the directional term, 0 up to 8; anything else is the built-in 1.2.
+const DIRECTION: f32 = 1.2;
+
+fn parse_direction(text: Option<&str>) -> f32 {
+    text.and_then(|t| t.trim().parse().ok()).filter(|v: &f32| v.is_finite() && (0.0..=8.0).contains(v)).unwrap_or(DIRECTION)
+}
+
+/// The weight now (live in the A/B, read at each dispatch of the resolve).
+fn direction() -> f32 {
+    crate::ab::live_value!("VICTORY_AMBIENT_DIRECTION", f32, parse_direction)
+}
+
+/// Whether the stand-in also runs while the structure builder lights (`VICTORY_AMBIENT_RT=1`).
+pub(crate) fn with_traced() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_RT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// How far what the title's program left may be believed when it has traced it (`VICTORY_AMBIENT_RT`).
+const TRACED_TRUST: f32 = 64.0;
 
 /// How far what the title's program left may be believed, as a multiple of the estimate
 /// (`VICTORY_AMBIENT_TRUST=<multiple>`; unset: 4). What it left is bounded in brightness by
@@ -245,7 +286,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -254,7 +295,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float base; float air_max;
+    float follow; float most; float air; float base; float air_max; float direction;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -434,7 +475,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
         sum += w;
     }
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
-    found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+    found = all + direction * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     found = max(found, float3(1.0, 0.98, 0.94) * base * open);
@@ -565,17 +606,18 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> Result<[u32; 
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 13];
+    let mut words = [0u32; 14];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
     words[6] = views.size[0];
     words[7] = views.size[1];
     words[8] = 0.04f32.to_bits();
-    words[9] = trust().to_bits();
+    words[9] = (if with_traced() { TRACED_TRUST } else { trust() }).to_bits();
     words[10] = air().to_bits();
     words[11] = base.to_bits();
     words[12] = air_set().1.to_bits();
+    words[13] = direction().to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -583,7 +625,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> Result<[u32; 
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 14, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -773,6 +815,34 @@ mod tests {
         assert_eq!(air_setting(" 0.5 , max: 0.25 "), (0.5, 0.25));
         assert_eq!(air_setting("off,max:3"), (0.0, 3.0));
         assert_eq!(air_setting("1,max:-2"), (1.0, f32::MAX));
+    }
+
+    #[test]
+    fn the_air_multiple_reads_as_the_setting_and_unset_is_the_built_in() {
+        assert_eq!(parse_air(None), 1.5);
+        assert_eq!(parse_air(Some("0")), 0.0);
+        assert_eq!(parse_air(Some("3")), 3.0);
+        assert_eq!(parse_air(Some("2.5,max:4")), 2.5);
+        assert_eq!(parse_air(Some("off")), 0.0);
+    }
+
+    #[test]
+    fn the_direction_is_a_weight_from_zero_or_the_built_in() {
+        assert_eq!(parse_direction(None), 1.2);
+        assert_eq!(parse_direction(Some("0")), 0.0);
+        assert_eq!(parse_direction(Some(" 2.4 ")), 2.4);
+        assert_eq!(parse_direction(Some("8")), 8.0);
+        for odd in ["", "-1", "8.5", "nan", "inf", "more"] {
+            assert_eq!(parse_direction(Some(odd)), 1.2, "{odd:?}");
+        }
+    }
+
+    /// The constants the passes take are the 14 the root signature and the cbuffer have.
+    #[test]
+    fn the_constants_of_the_passes_are_as_many_as_the_shader_has() {
+        assert!(SOURCE.contains("num32BitConstants=14"));
+        let fields = SOURCE.split("cbuffer Set : register(b0) {").nth(1).and_then(|t| t.split("};").next()).unwrap();
+        assert_eq!(fields.matches(';').count(), 14);
     }
 
     /// What the executable alone is set to (`crate::defaults`) reads as the launcher's text did.

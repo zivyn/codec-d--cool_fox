@@ -3,6 +3,7 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+mod bvh_check;
 mod census;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -175,6 +176,16 @@ enum Command {
     /// docs/replay.md).
     #[cfg(all(windows, feature = "diagnostics"))]
     Replay(replay::Replay),
+    /// Check the ray-tracing structures in a dump of the title memory by
+    /// address (`VICTORY_MEMORY_DUMP`, diagnostics builds): which are whole,
+    /// which have a fault, which overlap another.
+    BvhCheck {
+        /// The folder the run wrote `pages.txt` and `arena-<n>.bin` to.
+        folder: PathBuf,
+        /// One line per structure.
+        #[arg(long)]
+        list: bool,
+    },
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -255,6 +266,7 @@ fn main() -> Result<()> {
         }
         #[cfg(all(windows, feature = "diagnostics"))]
         Command::Replay(options) => replay::run(options),
+        Command::BvhCheck { folder, list } => bvh_check::run(&folder, list),
         Command::Config => show_config(),
     }
 }

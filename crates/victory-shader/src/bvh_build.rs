@@ -25,11 +25,12 @@
 //!   not reached), so a structure the title's builder made can be told from
 //!   garbage, and one that overlaps another from one that does not.
 //!
-//! Header: only what is known from dumps is written. Dword 0 holds the
-//! version (6), dword 1 the size in 64-byte nodes, dword 3 the number of
-//! elements, dwords 4-9 the bounds, dword 12 the root's pointer. The
-//! offsets of dwords 10, 13 and 14 are not written: this builder keeps no
-//! parent table and mixes its box and triangle nodes.
+//! Header: only what is known from dumps is written ([`Header`]). Dword 0
+//! holds the version (6) in the low half and marks in the high one, dword 1
+//! the index of the last 64-byte node (the size is one more: the header is
+//! counted), dword 3 the number of elements, dwords 4-9 the bounds, dword 12
+//! the root's pointer. The offsets of dwords 10, 13 and 14 are not written:
+//! this builder keeps no parent table and mixes its box and triangle nodes.
 //!
 //! A triangle node made here holds one triangle as vertices 0, 1, 2 (the
 //! first being the one neither barycentric weighs, I's the second, J's the
@@ -85,6 +86,46 @@ impl Built {
     /// The structure's size in 64-byte nodes.
     pub fn nodes(&self) -> usize {
         self.words.len() / NODE
+    }
+}
+
+/// What the header of a structure says (the fields that are known).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Header {
+    /// The marks in the high half of dword 0: 0x8000 a bottom level, 0x4
+    /// compacted, 0x2 rehydrated, 0x100 still packed.
+    pub marks: u32,
+    /// The structure's size in 64-byte nodes, the header counted.
+    pub nodes: usize,
+    pub elements: u32,
+    pub bounds: Bounds,
+    pub root: u32,
+}
+
+impl Header {
+    pub const BOTTOM: u32 = 0x8000;
+    pub const PACKED: u32 = 0x100;
+
+    /// The header at the start of `words`, if they are one: version 6 and a
+    /// size of at least the header and one node, at most 2^21 nodes (128 MiB).
+    pub fn read(words: &[u32]) -> Option<Self> {
+        let words: &[u32; HEADER] = words.get(..HEADER)?.try_into().ok()?;
+        let nodes = words[1] as usize + 1;
+        (words[0] & 0xffff == VERSION && (2..=1 << 21).contains(&nodes)).then(|| Self {
+            marks: words[0] >> 16,
+            nodes,
+            elements: words[3],
+            bounds: std::array::from_fn(|k| f32::from_bits(words[4 + k])),
+            root: words[12],
+        })
+    }
+
+    pub fn bottom(&self) -> bool {
+        self.marks & Self::BOTTOM != 0
+    }
+
+    pub fn packed(&self) -> bool {
+        self.marks & Self::PACKED != 0
     }
 }
 
@@ -339,7 +380,7 @@ pub fn build(triangles: &[Triangle], options: Options) -> Built {
     };
     let nodes = (b.words.len() / NODE) as u32;
     b.words[0] = VERSION;
-    b.words[1] = nodes;
+    b.words[1] = nodes - 1;
     b.words[3] = prims.len() as u32;
     for (k, x) in bounds.iter().enumerate() {
         b.words[4 + k] = x.to_bits();
@@ -842,7 +883,7 @@ mod tests {
         let r = check(&b.words, b.root).unwrap();
         assert_eq!(r.reached, 0);
         assert_eq!(
-            walk(&b, Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0)),
+            walk(&b, Ray::new([0.0; 3], [0.0, 0.0, 1.0], 10.0), true),
             (None, 0)
         );
         // A triangle with a vertex that is not a number is left out.
@@ -964,7 +1005,12 @@ mod tests {
         let t = soup(40, 4);
         let b = build(&t, Options::default());
         assert_eq!(b.words[0], VERSION);
-        assert_eq!(b.words[1] as usize, b.nodes());
+        assert_eq!(b.words[1] as usize + 1, b.nodes());
+        let h = Header::read(&b.words).unwrap();
+        assert_eq!(
+            (h.nodes, h.elements, h.root, h.packed()),
+            (b.nodes(), 40, b.root, false)
+        );
         assert_eq!(b.words[3], 40);
         assert_eq!(b.words[12], b.root);
         let bounds: Vec<f32> = b.words[4..10].iter().map(|&w| f32::from_bits(w)).collect();
@@ -1039,7 +1085,7 @@ mod tests {
         memory.truncate(at * NODE);
         memory.extend(&b.words[HEADER..]);
         let size = memory.len() / NODE;
-        memory[1] = size as u32;
+        memory[1] = size as u32 - 1;
         // The first's root still names its nodes; some are now the second's
         // and its pointers lead to places of their own structure.
         let result = check_strict(&memory, a.root);

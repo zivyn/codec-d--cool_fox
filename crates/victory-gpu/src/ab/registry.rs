@@ -71,6 +71,7 @@ pub(crate) const LIVE: &[(&str, Kind)] = &[
     ("VICTORY_JOIN_WIDE_MB", Kind::Count),
     ("VICTORY_KEEP_FAST", Kind::Flag),
     ("VICTORY_KEEP_SHOWN", Kind::Flag),
+    ("VICTORY_LAND_AHEAD", Kind::OnByDefault),
     ("VICTORY_LAND_ASIDE", Kind::OnByDefault),
     ("VICTORY_LAND_ECHO", Kind::Flag),
     ("VICTORY_LAND_OWN", Kind::Flag),

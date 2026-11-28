@@ -136,7 +136,121 @@ std::arch::global_asm!(
     "ret",
 );
 
+/// [`victory_safe_merge`] with the three streams (what the card holds, what it held, title memory) asked for
+/// ahead: `$pf` bytes in front of the block being looked at, in each. It does what that loop does, block by block, in
+/// the same order, and leaves what it leaves when a page is not there (the same blocks left, the same counts); only
+/// the lines are on their way when they are wanted. A piece comes in 4 KiB pages, and the hardware's prefetch stops
+/// at the end of each, so each page began with a miss on each of the three, one after the other; the reach of the
+/// request here is over the end of the page into the next one of the piece, which is where the next call begins.
+/// (Title memory is asked for only where a block differs: a page the card left as it was is never touched.)
+macro_rules! merge_kernel {
+    ($name:literal, $at:literal, $after:literal, $failed:literal, $pf:literal, $partial:literal) => {
+        std::arch::global_asm!(
+            concat!(".globl ", $name),
+            concat!(".globl ", $at),
+            concat!(".globl ", $after),
+            concat!(".globl ", $failed),
+            concat!($name, ":"),
+            "xor r10d, r10d",
+            "xor r11d, r11d",
+            "test r9, r9",
+            "jz 6f",
+            "vpcmpeqd ymm5, ymm5, ymm5",
+            "2:",
+            concat!("prefetcht0 byte ptr [rdx + ", $pf, "]"),
+            concat!("prefetcht0 byte ptr [r8 + ", $pf, "]"),
+            "vmovdqu ymm0, ymmword ptr [rdx]",
+            "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+            "vpmovmskb eax, ymm1",
+            "cmp eax, -1",
+            "je 5f",
+            concat!("prefetcht0 byte ptr [rcx + ", $pf, "]"),
+            concat!($at, ":"),
+            "vmovdqu ymm2, ymmword ptr [rcx]",
+            "vpblendvb ymm3, ymm0, ymm2, ymm1",
+            "vpcmpeqd ymm4, ymm3, ymm2",
+            "vmovmskps eax, ymm4",
+            "xor eax, 255",
+            "jz 4f",
+            "cmp eax, 255",
+            "je 3f",
+            "vpxor ymm4, ymm4, ymm5",
+            $partial,
+            "jmp 7f",
+            "3:",
+            "vmovdqu ymmword ptr [rcx], ymm3",
+            concat!($after, ":"),
+            "7:",
+            "popcnt eax, eax",
+            "add r11, rax",
+            "4:",
+            "inc r10",
+            "vmovdqu ymmword ptr [r8], ymm0",
+            "5:",
+            "add rcx, 32",
+            "add rdx, 32",
+            "add r8, 32",
+            "dec r9",
+            "jnz 2b",
+            "6:",
+            concat!($failed, ":"),
+            "vzeroupper",
+            "mov rax, qword ptr [rsp + 40]",
+            "mov qword ptr [rax], r10",
+            "mov qword ptr [rax + 8], r11",
+            "mov rax, r9",
+            "ret",
+        );
+    };
+}
+
+merge_kernel!("victory_safe_merge_p256", "victory_safe_merge_p256_at", "victory_safe_merge_p256_after", "victory_safe_merge_p256_failed", 256, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+merge_kernel!("victory_safe_merge_p512", "victory_safe_merge_p512_at", "victory_safe_merge_p512_after", "victory_safe_merge_p512_failed", 512, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+merge_kernel!("victory_safe_merge_p1024", "victory_safe_merge_p1024_at", "victory_safe_merge_p1024_after", "victory_safe_merge_p1024_failed", 1024, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+merge_kernel!("victory_safe_merge_p2048", "victory_safe_merge_p2048_at", "victory_safe_merge_p2048_after", "victory_safe_merge_p2048_failed", 2048, "vpmaskmovd ymmword ptr [rcx], ymm4, ymm3");
+
+// What the merge's parts cost, for the benchmark (tests only; neither is the merge): the loop with a store of the
+// whole block where it stores some dwords (which the title's threads would see as a write of the dwords beside),
+// and the loop that only looks at what the card holds and what it held and brings the second up to the first.
+#[cfg(test)]
+merge_kernel!("victory_diag_whole", "victory_diag_whole_at", "victory_diag_whole_after", "victory_diag_whole_failed", 1024, "vmovdqu ymmword ptr [rcx], ymm3");
+#[cfg(test)]
+std::arch::global_asm!(
+    ".globl victory_diag_held",
+    "victory_diag_held:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "2:",
+    "prefetcht0 byte ptr [rdx + 1024]",
+    "prefetcht0 byte ptr [r8 + 1024]",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "vzeroupper",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], r10",
+    "mov qword ptr [rax + 8], r11",
+    "xor eax, eax",
+    "ret",
+);
+
 unsafe extern "system" {
+    #[cfg(test)]
+    fn victory_diag_whole(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    #[cfg(test)]
+    fn victory_diag_held(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
     fn victory_safe_copy(dst: *mut u8, src: *const u8, len: usize) -> u32;
     fn victory_safe_copy_at();
     fn victory_safe_copy_after();
@@ -149,6 +263,22 @@ unsafe extern "system" {
     fn victory_safe_merge_at();
     fn victory_safe_merge_after();
     fn victory_safe_merge_failed();
+    fn victory_safe_merge_p256(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_p256_at();
+    fn victory_safe_merge_p256_after();
+    fn victory_safe_merge_p256_failed();
+    fn victory_safe_merge_p512(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_p512_at();
+    fn victory_safe_merge_p512_after();
+    fn victory_safe_merge_p512_failed();
+    fn victory_safe_merge_p1024(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_p1024_at();
+    fn victory_safe_merge_p1024_after();
+    fn victory_safe_merge_p1024_failed();
+    fn victory_safe_merge_p2048(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge_p2048_at();
+    fn victory_safe_merge_p2048_after();
+    fn victory_safe_merge_p2048_failed();
 }
 
 /// What [`merge`] did.
@@ -179,6 +309,76 @@ pub(crate) struct Merged {
 /// [`copy`]'s. The stretch lies in one page of 4 KiB of title memory. [`on`]
 /// must have been asked.
 pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
+    // SAFETY: the caller's.
+    unsafe { merge_with(kernel(), title, now, held, len, take) }
+}
+
+/// What the loop over whole blocks of 32 bytes is: [`victory_safe_merge`], or one of the same loop that asks for the
+/// bytes it will want ahead of itself.
+pub(crate) type Kernel = unsafe extern "system" fn(*mut u8, *const u8, *mut u8, usize, *mut [u64; 2]) -> usize;
+
+/// The kernels, by name, the first the loop as it was; they leave the same bytes and the same counts, whatever the
+/// memory is (the tests compare them).
+#[allow(dead_code)]
+pub(crate) fn kernels() -> [(&'static str, Kernel); 5] {
+    [
+        ("plain", victory_safe_merge),
+        ("ahead 256", victory_safe_merge_p256),
+        ("ahead 512", victory_safe_merge_p512),
+        ("ahead 1024", victory_safe_merge_p1024),
+        ("ahead 2048", victory_safe_merge_p2048),
+    ]
+}
+
+/// The two loops that cost what parts of the merge do (see `victory_diag_whole`): not the merge, never to be used as
+/// one.
+#[cfg(test)]
+pub(crate) fn diagnostic_kernels() -> [(&'static str, Kernel); 2] {
+    [("whole stores", victory_diag_whole), ("card and copy only", victory_diag_held)]
+}
+
+/// The kernel that asks ahead, as used when [`ahead`] is on.
+fn ahead_kernel() -> Kernel {
+    victory_safe_merge_p1024
+}
+
+/// Whether the merge asks for its bytes ahead (`VICTORY_LAND_AHEAD`, on unless `=0`; the A/B flips it at any
+/// instant: each call takes the kernel once, and either leaves the same bytes).
+pub(crate) fn ahead() -> bool {
+    crate::ab::live_value!("VICTORY_LAND_AHEAD", bool, crate::ab::unless_zero)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A kernel a test makes this thread use whatever the switch says.
+    static KERNEL: std::cell::Cell<Option<Kernel>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `kernel` as the one [`kernel`] gives on this thread.
+#[cfg(test)]
+pub(crate) fn with_kernel<R>(kernel: Kernel, f: impl FnOnce() -> R) -> R {
+    let before = KERNEL.replace(Some(kernel));
+    let out = f();
+    KERNEL.set(before);
+    out
+}
+
+/// The kernel [`merge`] runs now.
+pub(crate) fn kernel() -> Kernel {
+    #[cfg(test)]
+    {
+        if let Some(kernel) = KERNEL.get() {
+            return kernel;
+        }
+    }
+    if ahead() { ahead_kernel() } else { victory_safe_merge }
+}
+
+/// [`merge`] with the loop over whole blocks that `kernel` is.
+///
+/// # Safety
+/// [`merge`]'s.
+pub(crate) unsafe fn merge_with(kernel: Kernel, title: *mut u8, now: *const u8, held: *mut u8, len: usize, take: bool) -> Merged {
     let mut out = Merged { there: true, ..Merged::default() };
     let mut at = 0;
     while at < len {
@@ -218,7 +418,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             unsafe {
                 std::ptr::copy_nonoverlapping(now.add(at), new.as_mut_ptr().add(into), n);
                 std::ptr::copy_nonoverlapping(held.add(at), old.as_mut_ptr().add(into), n);
-                let stuck = victory_safe_merge(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
+                let stuck = kernel(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
                 out.there &= stuck == 0;
                 let from = if stuck != 0 && take { new.as_ptr() } else { old.as_ptr() };
                 std::ptr::copy_nonoverlapping(from.add(into), held.add(at), n);
@@ -227,7 +427,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
         } else {
             let blocks = left / 32;
             // SAFETY: whole blocks of the stretch.
-            let stuck = unsafe { victory_safe_merge(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
+            let stuck = unsafe { kernel(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
             if stuck != 0 {
                 out.there = false;
                 if take {
@@ -412,8 +612,16 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     if (from..to).contains(&at) {
         return Some(victory_safe_put_failed as *const () as usize);
     }
-    let (from, to) = (victory_safe_merge_at as *const () as usize, victory_safe_merge_after as *const () as usize);
-    (from..to).contains(&at).then_some(victory_safe_merge_failed as *const () as usize)
+    let merges: [(unsafe extern "system" fn(), unsafe extern "system" fn(), unsafe extern "system" fn()); 5] = [
+        (victory_safe_merge_at, victory_safe_merge_after, victory_safe_merge_failed),
+        (victory_safe_merge_p256_at, victory_safe_merge_p256_after, victory_safe_merge_p256_failed),
+        (victory_safe_merge_p512_at, victory_safe_merge_p512_after, victory_safe_merge_p512_failed),
+        (victory_safe_merge_p1024_at, victory_safe_merge_p1024_after, victory_safe_merge_p1024_failed),
+        (victory_safe_merge_p2048_at, victory_safe_merge_p2048_after, victory_safe_merge_p2048_failed),
+    ];
+    merges.iter().find_map(|&(from, to, failed)| {
+        ((from as usize)..(to as usize)).contains(&at).then_some(failed as usize)
+    })
 }
 
 #[cfg(test)]
@@ -611,6 +819,69 @@ mod tests {
                 // SAFETY: as above; the addresses are no one's.
                 let done = unsafe { merge(std::ptr::without_provenance_mut(0x1000 + at), now.as_ptr(), held.as_mut_ptr(), len, take) };
                 assert!(done.there && done.new == 0);
+            }
+        }
+    }
+
+    /// Every kernel leaves what the plain loop leaves, byte for byte and count for count, over any start and
+    /// length (also across a page), with title memory that is there, that is read-only from the second page on,
+    /// and that is not there from the second page on: the same bytes of both memories, the same counts, the
+    /// same blocks left.
+    #[test]
+    fn every_kernel_stops_where_the_plain_one_does() {
+        assert!(on());
+        let pages = Pages::new(2 << 12);
+        let mut seed = 9u32;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        let mut old = 0;
+        for round in 0..600usize {
+            let at = random() % 2000;
+            let len = (random() % 7000 + 1).min(8192 - 64 - at);
+            let held0: Vec<u8> = (0..len).map(|_| random() as u8).collect();
+            let mut now = held0.clone();
+            for _ in 0..random() % (len / [64usize, 8, 2, 1][round % 4] + 1) {
+                let i = random() % len;
+                if random() % 3 == 0 {
+                    now[i] ^= 1 << (random() % 8);
+                } else {
+                    let i = i & !3;
+                    for b in &mut now[i..(i + 4).min(len)] {
+                        *b = random() as u8;
+                    }
+                }
+            }
+            let title0: Vec<u8> = (0..8192).map(|i| if random() % 5 == 0 && i >= at && i < at + len { now[i - at] } else { random() as u8 }).collect();
+            let take = round % 2 == 0;
+            let mut first: Option<(Merged, Vec<u8>, Vec<u8>)> = None;
+            for (name, kernel) in kernels() {
+                // SAFETY: our two pages; the broken one is made whole again after the call.
+                let outcome = unsafe {
+                    std::ptr::copy_nonoverlapping(title0.as_ptr(), pages.0, 8192);
+                    match round % 3 {
+                        0 => {
+                            VirtualFree(pages.0.add(4096).cast(), 4096, MEM_DECOMMIT);
+                        }
+                        1 => {
+                            VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READONLY, &mut old);
+                        }
+                        _ => {}
+                    }
+                    let mut held = held0.clone();
+                    let done = merge_with(kernel, pages.0.add(at), now.as_ptr(), held.as_mut_ptr(), len, take);
+                    VirtualAlloc(pages.0.add(4096).cast(), 4096, MEM_COMMIT, PAGE_READWRITE);
+                    VirtualProtect(pages.0.add(4096).cast(), 4096, PAGE_READWRITE, &mut old);
+                    (done, held, std::slice::from_raw_parts(pages.0, 8192).to_vec())
+                };
+                if let Some(plain) = first.as_ref() {
+                    assert!(*plain == outcome, "round {round}, {name}: not what the plain loop left");
+                } else {
+                    first = Some(outcome);
+                }
             }
         }
     }

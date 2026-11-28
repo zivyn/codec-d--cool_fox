@@ -557,3 +557,405 @@ fn what_landing_costs() {
 fn the_tail_threads_go_by_the_text_of_the_variable() {
     assert_eq!([None, Some("0"), Some(" 6 "), Some("99"), Some("x")].map(tail_of), [0, 0, 6, 16, 0]);
 }
+
+/// Committed memory of ours, released at the end.
+struct Plain(usize, usize, bool);
+
+/// What the memory title bytes land in is: plain, as the kernel's write watch sees it (the bits are reset before
+/// each run, as a refresh does), or a view of a section, as the title's heaps are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Memory {
+    Plain,
+    WriteWatch,
+    Section,
+}
+
+impl Plain {
+    fn new(len: usize) -> Plain {
+        Plain::of(Memory::Plain, len)
+    }
+
+    fn of(kind: Memory, len: usize) -> Plain {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        if kind == Memory::Section {
+            // SAFETY: a pagefile section of our own and a view of it (never given back: a measurement).
+            let at = unsafe {
+                let section =
+                    CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, (len >> 32) as u32, len as u32, std::ptr::null());
+                assert!(!section.is_null());
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, len).Value as usize
+            };
+            assert_ne!(at, 0);
+            return Plain(at, len, true);
+        }
+        let watch = if kind == Memory::WriteWatch { MEM_WRITE_WATCH } else { 0 };
+        // SAFETY: plain allocation.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | watch, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        Plain(at, len, false)
+    }
+
+    /// The kernel's write watch of the memory, as a refresh leaves it.
+    fn reset_watch(&self) {
+        // SAFETY: our allocation (a no-op for memory that is not watched).
+        unsafe { windows_sys::Win32::System::Memory::ResetWriteWatch(self.0 as _, self.1) };
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the allocation, whole.
+        unsafe { std::slice::from_raw_parts(self.0 as *const u8, self.1) }
+    }
+
+    fn put(&self, at: usize, bytes: &[u8]) {
+        assert!(at + bytes.len() <= self.1);
+        // SAFETY: inside the allocation.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (self.0 + at) as *mut u8, bytes.len()) };
+    }
+}
+
+impl Drop for Plain {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        if !self.2 {
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.0 as _, 0, MEM_RELEASE) };
+        }
+    }
+}
+
+/// Every kernel of the merge (the plain loop and the ones that ask for their bytes ahead) lands a piece as the
+/// model says (the card's new bytes in title memory and in the copy's side, no other byte of either touched) and
+/// all leave the same, bit for bit: at every start and end of a piece, with parts left out, with the card's writes
+/// as bytes, dwords and runs from a few to every one, and with the title holding other bytes, some the card's own.
+#[test]
+fn every_kernel_lands_a_piece_as_the_plain_loop_does() {
+    assert!(crate::safecopy::on());
+    const SIZE: usize = 8 * PAGE;
+    let region = Plain::new(SIZE);
+    let mut random = Random(11);
+    let kernels = crate::safecopy::kernels();
+    for round in 0..900usize {
+        let from = random.next() % 3000;
+        let len = match round % 3 {
+            0 => random.next() % 200 + 1,
+            1 => random.next() % 5000 + 1,
+            _ => random.next() % 20000 + 1,
+        }
+        .min(SIZE - 64 - from);
+        let base: Vec<u8> = (0..len).map(|_| random.next() as u8).collect();
+        let mut now = base.clone();
+        for _ in 0..random.next() % (1 + len / [64usize, 8, 2, 1][round % 4]) {
+            let at = random.next() % len;
+            match random.next() % 4 {
+                0 => now[at] = random.next() as u8,
+                1 => {
+                    let at = at & !3;
+                    for b in &mut now[at..(at + 4).min(len)] {
+                        *b = random.next() as u8;
+                    }
+                }
+                2 => {
+                    for b in &mut now[at..(at + random.next() % 300).min(len)] {
+                        *b = random.next() as u8;
+                    }
+                }
+                _ => now[at] ^= 1,
+            }
+        }
+        // The title's own writes, some the very bytes the card brings.
+        let mut there = base.clone();
+        for _ in 0..random.next() % 50 {
+            let at = random.next() % len;
+            there[at] = if random.next() % 3 == 0 { now[at] } else { random.next() as u8 };
+        }
+        // Left out: some ranges, anywhere.
+        let mut parts = vec![(0, len)];
+        for _ in 0..round % 4 {
+            let a = random.next() % len;
+            let b = (a + random.next() % 400).min(len);
+            parts = parts
+                .into_iter()
+                .flat_map(|(x, y)| [(x, y.min(a)), (x.max(b), y)])
+                .filter(|(x, y)| x < y)
+                .collect();
+        }
+        let take = round % 2 == 0;
+        let mut expect_held = base.clone();
+        let mut expect = vec![0xC3u8; SIZE];
+        expect[from..from + len].copy_from_slice(&there);
+        for &(a, b) in &parts {
+            for i in a..b {
+                if now[i] != base[i] {
+                    expect[from + i] = now[i];
+                    expect_held[i] = now[i];
+                }
+            }
+        }
+        let mut first: Option<(u64, Vec<u8>, Vec<u8>)> = None;
+        for (name, kernel) in crate::safecopy::kernels().into_iter().chain([("the switch's", crate::safecopy::kernel())]) {
+            region.put(0, &vec![0xC3u8; SIZE]);
+            region.put(from, &there);
+            let mut held = base.clone();
+            let mut notes = Notes::default();
+            // SAFETY: vectors of `len` bytes, memory of ours.
+            let put = crate::safecopy::with_kernel(kernel, || unsafe {
+                piece_at(region.0 + from, now.as_ptr(), held.as_mut_ptr(), &parts, take, &mut notes, false, false, std::ptr::null())
+            });
+            notes.flush();
+            assert!(held == expect_held, "round {round}, {name}: the copy's side");
+            assert!(region.bytes() == &expect[..], "round {round}, {name}: title memory");
+            let outcome = (put, held, region.bytes().to_vec());
+            if let Some(plain) = first.as_ref() {
+                assert!(*plain == outcome, "round {round}, {name}: not what the plain loop left");
+            } else {
+                first = Some(outcome);
+            }
+        }
+    }
+    assert_eq!(kernels.len(), 5);
+}
+
+/// What the merge costs per frame of landing, as the log's frame is made (ignored: a measurement, in release):
+/// 1,140 pieces, about 57 MB of a 192 MB heap in 64 KiB blocks, seven in ten whole blocks, the rest a run from the
+/// middle or a few KiB; four in five pages of a piece with a new byte, nearly every block of them new, most dwords
+/// of those; the title holding other bytes in a few dwords. Memory is made cold (a 256 MB sweep) before each run.
+/// For each kernel, with the next piece's head asked for or not, on one thread and on three (the landing's) with the
+/// jobs of [`jobs`]: the least wall time of five runs, and the threads' time.
+#[test]
+#[ignore]
+fn land_merge_bench() {
+    bench_landing(Memory::Plain, true);
+    bench_landing(Memory::WriteWatch, false);
+    bench_landing(Memory::Section, false);
+}
+
+fn bench_landing(memory: Memory, every_kernel: bool) {
+    assert!(crate::safecopy::on());
+    const HEAP: usize = 192 << 20;
+    const BLOCKS: usize = HEAP / BLOCK;
+    const PIECES: usize = 1140;
+    let mut random = Random(0x5eed);
+    let (title, held) = (Plain::of(memory, HEAP), Plain::new(HEAP));
+    let held0: Vec<u8> = (0..HEAP / 8).flat_map(|_| (((random.next() as u64) << 24) ^ random.next() as u64).to_le_bytes()).collect();
+    let mut title0 = held0.clone();
+    for _ in 0..HEAP / 4 / 33 {
+        let i = random.next() % (HEAP / 4);
+        title0[i * 4..i * 4 + 4].copy_from_slice(&(random.next() as u32).to_le_bytes());
+    }
+    // The pieces: distinct blocks, in order.
+    let mut blocks: Vec<usize> = (0..BLOCKS).collect();
+    for i in (1..BLOCKS).rev() {
+        blocks.swap(i, random.next() % (i + 1));
+    }
+    blocks.truncate(PIECES);
+    blocks.sort_unstable();
+    let pieces: Vec<(usize, usize)> = blocks
+        .iter()
+        .map(|&b| match random.next() % 20 {
+            0..=13 => (b * BLOCK, BLOCK),
+            14..=16 => {
+                let from = (random.next() % (BLOCK / 2)) & !3;
+                let len = (random.next() % (BLOCK - from)).max(PAGE) & !3;
+                (b * BLOCK + from, len.min(BLOCK - from))
+            }
+            _ => {
+                let from = random.next() % (BLOCK - 4096);
+                (b * BLOCK + from, random.next() % 4096 + 1)
+            }
+        })
+        .collect();
+    // What the card holds: where the heap's pages are new, and how.
+    let mut at = Vec::with_capacity(PIECES);
+    let mut card: Vec<u8> = Vec::new();
+    for &(from, len) in &pieces {
+        at.push(card.len());
+        let mut piece = held0[from..from + len].to_vec();
+        let mut page_new = std::collections::HashMap::new();
+        for i in (0..len).step_by(32) {
+            let page = (from + i) / PAGE;
+            let new = *page_new.entry(page).or_insert_with(|| random.next() % 100 < 78);
+            if new && random.next() % 100 < 96 {
+                for d in (i..(i + 32).min(len)).step_by(4) {
+                    if random.next() % 100 < 85 {
+                        let end = (d + 4).min(len);
+                        if random.next() % 10 == 0 {
+                            piece[d] ^= 0x5A;
+                        } else {
+                            piece[d..end].copy_from_slice(&(random.next() as u32).to_le_bytes()[..end - d]);
+                        }
+                    }
+                }
+            }
+        }
+        card.extend_from_slice(&piece);
+    }
+    let bytes: usize = pieces.iter().map(|p| p.1).sum();
+    let jobs = jobs(&pieces);
+    let scratch = vec![1u8; 256 << 20];
+    let cold = || {
+        let mut sum = 0u64;
+        for c in scratch.chunks_exact(8) {
+            sum = sum.wrapping_add(u64::from_le_bytes(c.try_into().expect("eight")));
+        }
+        std::hint::black_box(sum);
+    };
+    let reset = || {
+        for &(from, len) in &pieces {
+            title.put(from, &title0[from..from + len]);
+            held.put(from, &held0[from..from + len]);
+        }
+        title.reset_watch();
+        cold();
+    };
+    let (card_at, title_at, held_at) = (card.as_ptr() as usize, title.0, held.0);
+    let run = |kernel: crate::safecopy::Kernel, heads: bool, threads: usize| -> (f64, f64) {
+        let next = AtomicUsize::new(0);
+        let busy = AtomicU64::new(0);
+        let started = std::time::Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    crate::safecopy::with_kernel(kernel, || {
+                        let mut notes = Notes::default();
+                        loop {
+                            let j = next.fetch_add(1, Ordering::Relaxed);
+                            if j >= jobs.len() {
+                                break;
+                            }
+                            let working = std::time::Instant::now();
+                            for i in jobs[j].clone() {
+                                if heads {
+                                    let first = i == jobs[j].start;
+                                    for n in [i, i + 1] {
+                                        if let Some(&(from, len)) = pieces.get(n).filter(|_| n == i + 1 || first) {
+                                            prefetch((card_at + at[n]) as *const u8, len);
+                                            prefetch((held_at + from) as *const u8, len);
+                                            prefetch((title_at + from) as *const u8, len);
+                                        }
+                                    }
+                                }
+                                let (from, len) = pieces[i];
+                                // SAFETY: each job its own pieces of the memory.
+                                unsafe {
+                                    piece_at(
+                                        title_at + from,
+                                        (card_at + at[i]) as *const u8,
+                                        (held_at + from) as *mut u8,
+                                        &[(0, len)],
+                                        true,
+                                        &mut notes,
+                                        false,
+                                        false,
+                                        std::ptr::null(),
+                                    )
+                                };
+                            }
+                            busy.fetch_add(working.elapsed().as_micros() as u64, Ordering::Relaxed);
+                        }
+                        notes.flush();
+                    });
+                });
+            }
+        });
+        (started.elapsed().as_secs_f64() * 1e3, busy.load(Ordering::Relaxed) as f64 / 1e3)
+    };
+    let digest = || -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for &(from, len) in &pieces {
+            for chunk in [title.bytes(), held.bytes()].map(|b| &b[from..from + len]) {
+                for c in chunk.chunks(8) {
+                    let mut w = [0u8; 8];
+                    w[..c.len()].copy_from_slice(c);
+                    h = (h ^ u64::from_le_bytes(w)).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        h
+    };
+    if memory == Memory::Plain {
+        let mut brand = Vec::new();
+        for leaf in 0x8000_0002u32..=0x8000_0004 {
+            // SAFETY: the instruction is there on any processor that has AVX2.
+            let r = unsafe { std::arch::x86_64::__cpuid(leaf) };
+            for word in [r.eax, r.ebx, r.ecx, r.edx] {
+                brand.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        println!("land_merge_bench: processor {}", String::from_utf8_lossy(&brand).trim_matches(char::from(0)).trim());
+    }
+    println!(
+        "land_merge_bench: {memory:?} memory, {PIECES} pieces, {:.1} MB of {} MB, {} jobs",
+        bytes as f64 / 1e6,
+        HEAP >> 20,
+        jobs.len()
+    );
+    let mut expect = None;
+    let all = crate::safecopy::kernels();
+    let mut chosen: Vec<(&str, crate::safecopy::Kernel)> =
+        if every_kernel { all.to_vec() } else { vec![all[0], all[3]] };
+    if every_kernel {
+        chosen.extend(crate::safecopy::diagnostic_kernels());
+    }
+    for (name, kernel) in chosen {
+        let diagnostic = name == "whole stores" || name == "card and copy only";
+        for heads in [false, true] {
+            if diagnostic && !heads {
+                continue;
+            }
+            if !every_kernel && heads != (name != "plain") {
+                continue;
+            }
+            let mut line = format!("land_merge_bench: {memory:?} {name:<10} next heads {heads:<5}");
+            for threads in [1usize, 3] {
+                let mut best = (f64::MAX, f64::MAX);
+                let mut split = (0.0, 0.0);
+                let mut walls = Vec::new();
+                for _ in 0..5 {
+                    reset();
+                    STATS[stat::DIFFER_US].store(0, Ordering::Relaxed);
+                    STATS[stat::KERNEL_US].store(0, Ordering::Relaxed);
+                    let (wall, cpu) = run(kernel, heads, threads);
+                    walls.push(wall);
+                    if wall < best.0 {
+                        best = (wall, cpu);
+                        split = (
+                            STATS[stat::DIFFER_US].load(Ordering::Relaxed) as f64 / 1e3,
+                            STATS[stat::KERNEL_US].load(Ordering::Relaxed) as f64 / 1e3,
+                        );
+                    }
+                    let d = digest();
+                    if name != "card and copy only" {
+                        assert_eq!(*expect.get_or_insert(d), d, "{name}: not what the plain loop left");
+                    }
+                }
+                walls.sort_by(f64::total_cmp);
+                line += &format!(
+                    " | {threads} thread{}: {:.1} ms (median {:.1}), threads' time {:.1} ms (differ pass {:.1}, page loop {:.1}), {:.2} GB/s",
+                    if threads > 1 { "s" } else { "" },
+                    best.0,
+                    walls[2],
+                    best.1,
+                    split.0,
+                    split.1,
+                    bytes as f64 / best.0 / 1e6
+                );
+            }
+            println!("{line}");
+        }
+    }
+    if every_kernel {
+        // The floor: the card's bytes copied over title memory, cold, with nothing compared.
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            reset();
+            let started = std::time::Instant::now();
+            for (i, &(from, len)) in pieces.iter().enumerate() {
+                // SAFETY: the piece's bytes in the two memories, which do not overlap.
+                unsafe { std::ptr::copy_nonoverlapping((card_at + at[i]) as *const u8, (title_at + from) as *mut u8, len) };
+            }
+            best = best.min(started.elapsed().as_secs_f64() * 1e3);
+        }
+        println!("land_merge_bench: {memory:?} floor, the card's bytes copied over title memory on one thread: {best:.1} ms, {:.2} GB/s", bytes as f64 / best / 1e6);
+    }
+}

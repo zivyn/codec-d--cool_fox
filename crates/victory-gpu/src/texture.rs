@@ -2001,8 +2001,20 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
-        once!(?desc, "texture contents in an XOR mode not uploaded");
+    if !crate::resource::detilable(&layout) {
+        let d = &layout.desc;
+        once!(
+            ?desc,
+            swizzle = d.swizzle.name(),
+            width = d.width,
+            height = d.height,
+            depth_or_slices = d.depth,
+            mips = d.mips,
+            samples = d.samples,
+            element_bytes = d.element_bytes,
+            block = d.block,
+            "texture contents in a layout without addresses (or a XOR mode with VICTORY_XOR_UPLOAD=0) not uploaded"
+        );
         return None;
     }
     let host = host()?;

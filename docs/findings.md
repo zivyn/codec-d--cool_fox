@@ -58,6 +58,11 @@ in that order of size:
   now made on the host through a slot of the bound view heap and a CPU-only copy of the view (textures
   and raw or typed buffers; structured buffers and views that are not unordered access are left out, as
   the host refuses them). `VICTORY_CLEAR_UAV=0`: off. Not yet compared in the game.
+- **One of the water's read-backs failed in every run** (`could not be tiled e=Unsupported`): the
+  tiler had no addressing for the pipe and bank XOR swizzle modes (`_X`, `_T`), which render
+  targets and depth buffers use. They are in now (`victory-formats`, from addrlib's RB+ patterns;
+  the pipes and packers of a Series X are an estimate, `VICTORY_TILE_GPU=8,4` tries others) and
+  the warning names the mode, size and format of the texture.
 - **A device loss about every 16 minutes**: a page fault inside a texture made in the same
   tenth of a second. A slot showed it before its upload had run.
   `VICTORY_SHOW_AFTER=1`; none in the sessions since (likely fixed, not proven).

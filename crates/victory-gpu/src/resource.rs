@@ -1336,7 +1336,7 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
         return 0;
     };
     let layout = &t.planes[0].layout;
-    if layout.desc.swizzle.xor() {
+    if !detilable(layout) {
         return 0;
     }
     let block = u64::from(layout.desc.block.max(1));
@@ -1346,6 +1346,18 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
         base -= 1;
     }
     base
+}
+
+/// Whether the host reads a texture of `layout` from title memory: every
+/// layout with addresses. The XOR modes (`_X`, `_T`) are in unless
+/// `VICTORY_XOR_UPLOAD=0` (the tile configuration they are laid out by is an
+/// estimate, `victory_formats::texture::Gpu`); `SW_4KB_R_X` and multisampled
+/// ones have no addresses.
+pub(crate) fn detilable(layout: &victory_formats::texture::Layout) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    layout.addressable()
+        && (!layout.desc.swizzle.xor()
+            || *ON.get_or_init(|| std::env::var("VICTORY_XOR_UPLOAD").as_deref() != Ok("0")))
 }
 
 /// The bytes of title memory a placed texture with the resource description
@@ -1606,9 +1618,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
-            // What the upload can read: a console layout, no XOR mode
-            // (`crate::texture` `staging`).
-            let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // What the upload can read: a console layout with addresses
+            // ([`detilable`], `crate::texture` `staging`).
+            let readable = texture_layout(&r.desc).is_some_and(|t| detilable(&t.planes[0].layout));
             // With the card short of room every such texture is made
             // level by level, whole in title memory or not: the levels
             // that do not fit get no memory ([`level_cap_for`]) and the
@@ -2695,7 +2707,7 @@ fn host_texture_as(
         && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
-        && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
+        && texture_layout(desc).is_some_and(|t| detilable(&t.planes[0].layout))
         // SAFETY: the description has the host layout, as below.
         && let Some(t) = unsafe {
             crate::pool::texture(

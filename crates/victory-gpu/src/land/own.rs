@@ -47,6 +47,12 @@ pub(crate) fn on() -> bool {
     crate::ab::live_flag!("VICTORY_LAND_OWN")
 }
 
+/// Whether a piece that other copies lie over, none of which ever took its bytes, stays on the card too
+/// (`VICTORY_LAND_OWN_UNTAKEN=1`; live in the A/B; needs [`on`]).
+pub(crate) fn untaken_on() -> bool {
+    crate::ab::live_flag!("VICTORY_LAND_OWN_UNTAKEN")
+}
+
 /// The most bytes kept (`VICTORY_LAND_OWN_MB`).
 fn most() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
@@ -104,13 +110,15 @@ pub(crate) fn held() -> u64 {
 
 /// Since the last frame-rate line: bytes of pieces by class; pieces kept new, replaced, given back to be landed
 /// now, refused for the memory cap; bytes copied out.
-static STATS: [AtomicU64; CLASSES + 6] = [const { AtomicU64::new(0) }; CLASSES + 6];
+static STATS: [AtomicU64; CLASSES + 7] = [const { AtomicU64::new(0) }; CLASSES + 7];
 const NEW: usize = CLASSES;
 const REPLACED: usize = CLASSES + 1;
 const GIVEN: usize = CLASSES + 2;
 const CAPPED: usize = CLASSES + 3;
 const COPIED: usize = CLASSES + 4;
 const OFFERED: usize = CLASSES + 5;
+/// Kept pieces landed at once because a copy over them had taken their bytes by the time the guard was armed.
+const RECHECKED: usize = CLASSES + 6;
 
 /// What lands a piece from `stored`: the merge `land_card_with` makes of a fetched piece, leaving out `skips`.
 pub(crate) fn lander(
@@ -149,7 +157,10 @@ pub(crate) fn offer(pieces: Vec<Fetched>, data: usize, after: u64) -> Vec<Fetche
         return pieces;
     }
     let index = crate::shadow::overlap_index();
+    let over_too = untaken_on();
     let mut rest = Vec::with_capacity(pieces.len());
+    // The pieces newly kept, to be looked at again once their guards are armed.
+    let mut armed: Vec<((u64, usize), usize, usize, Arc<Shadow>)> = Vec::new();
     for piece in pieces {
         let (lo, hi, at) = (piece.1, piece.2, piece.3 as usize);
         let n = hi - lo;
@@ -165,7 +176,7 @@ pub(crate) fn offer(pieces: Vec<Fetched>, data: usize, after: u64) -> Vec<Fetche
             piece.0.own_class(lo, hi, &index)
         };
         STATS[class as usize].fetch_add(n as u64, Ordering::Relaxed);
-        if class != OwnClass::Ownable {
+        if class != OwnClass::Ownable && !(class == OwnClass::OwnableOver && over_too) {
             rest.push(piece);
             continue;
         }
@@ -184,6 +195,7 @@ pub(crate) fn offer(pieces: Vec<Fetched>, data: usize, after: u64) -> Vec<Fetche
         match owed::keep(key, from, to, land, touched, forced) {
             Ok(owed::Kept::New) => {
                 STATS[NEW].fetch_add(1, Ordering::Relaxed);
+                armed.push((key, from, to, piece.0.clone()));
             }
             Ok(owed::Kept::Replaced) => {
                 STATS[REPLACED].fetch_add(1, Ordering::Relaxed);
@@ -196,7 +208,30 @@ pub(crate) fn offer(pieces: Vec<Fetched>, data: usize, after: u64) -> Vec<Fetche
             }
         }
     }
+    recheck(armed);
     rest
+}
+
+/// Pieces kept just now, their guards armed: a copy made or refreshed over one while the piece was being decided,
+/// before its guard stood, read the title's bytes from before and would not read them again (nothing noted a write).
+/// If any copy over a piece has taken its bytes, the piece lands now, which notes the write for every copy and so
+/// has that copy take them again. A copy that has not taken them reads them later, through the guard.
+fn recheck(armed: Vec<((u64, usize), usize, usize, Arc<Shadow>)>) {
+    if armed.is_empty() {
+        return;
+    }
+    // (Made after the guards: a copy that is not in it was made after them, and reads through them.)
+    let index = crate::shadow::overlap_index();
+    for (key, from, to, shadow) in armed {
+        let taken = index
+            .others_over(shadow.id(), from as u64, to as u64)
+            .iter()
+            .any(|b| !b.untaken(from as u64, to as u64));
+        if taken {
+            STATS[RECHECKED].fetch_add(1, Ordering::Relaxed);
+            owed::land_kept(key, from, to);
+        }
+    }
 }
 
 /// For the frame-rate line, over `frames` frames.
@@ -210,14 +245,17 @@ pub(crate) fn line(frames: f64) {
     }
     let mb = |v: f64| v / (1 << 20) as f64;
     tracing::info!(
-        "pieces left on the card per frame (VICTORY_LAND_OWN={}): {:.0} offered; kept new {:.1} (guards armed), replaced {:.1} (no guard, no merge), landed at once because they could not be kept {:.1}; {:.1} MB copied out; by class of what was offered: ownable {:.1} MB, overlapped by another copy {:.1}, seen read {:.1}, not private {:.1}, not default-heap {:.1}, forced often {:.1}, over the memory cap {:.1}; {} units and {:.1} MB held now (cap {} MB)",
+        "pieces left on the card per frame (VICTORY_LAND_OWN={}, VICTORY_LAND_OWN_UNTAKEN={}): {:.0} offered; kept new {:.1} (guards armed), replaced {:.1} (no guard, no merge), landed at once because they could not be kept {:.1}, landed at once because a copy over them had taken their bytes {:.1}; {:.1} MB copied out; by class of what was offered: ownable {:.1} MB, ownable under copies that never took it {:.1}, overlapped by a copy that took it {:.1}, seen read {:.1}, not private {:.1}, not default-heap {:.1}, forced often {:.1}, over the memory cap {:.1}; {} units and {:.1} MB held now (cap {} MB)",
         u8::from(on()),
+        u8::from(untaken_on()),
         s[OFFERED],
         s[NEW],
         s[REPLACED],
         s[GIVEN],
+        s[RECHECKED],
         mb(s[COPIED]),
         mb(s[0]),
+        mb(s[6]),
         mb(s[1]),
         mb(s[2]),
         mb(s[3]),

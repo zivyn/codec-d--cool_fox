@@ -307,6 +307,15 @@ pub(crate) fn kept_pending(key: (u64, usize), from: usize, to: usize) -> bool {
         .is_some_and(|u| u.key == key && u.to == b && u.state.load(Ordering::SeqCst) == PENDING)
 }
 
+/// Lands the kept piece `key` over the pages of `[from, to)` now, if it is still owed.
+pub(crate) fn land_kept(key: (u64, usize), from: usize, to: usize) {
+    let a = from / PAGE * PAGE;
+    let unit = KEPT.read().unwrap_or_else(|e| e.into_inner()).get(&a).filter(|u| u.key == key && u.to == to.next_multiple_of(PAGE)).cloned();
+    if let Some(unit) = unit {
+        ensure(&unit);
+    }
+}
+
 /// How many units are kept now.
 pub(crate) fn kept_count() -> usize {
     KEPT.read().unwrap_or_else(|e| e.into_inner()).len()

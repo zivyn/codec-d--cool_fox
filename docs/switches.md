@@ -190,6 +190,7 @@ switch is read.
 | `VICTORY_LAND_ASIDE` | on (=0 turns off) | yes | Lands a submission's lists aside, on another thread, saving time on the submitting thread. |
 | `VICTORY_LAND_ECHO` | on (=0 turns off) | no | Compares pages 4 KiB at a time and sends up only those that differ from what landed. |
 | `VICTORY_LAND_OWN` | off | yes | Leaves the pieces of shader-written copies that nothing but the title's CPU can read on the card: guarded, landed only when something reads or writes them (integ card propagation, perf/card-propagate). |
+| `VICTORY_LAND_OWN_UNTAKEN` | off | yes | With VICTORY_LAND_OWN, also keeps pieces that other copies lie over when none of those copies ever took their bytes. |
 | `VICTORY_LAND_TAIL_THREADS` | off | yes | Threads for the tail of a landing; 0 uses the ordinary landing threads (max 16). |
 | `VICTORY_LANE_CORE` | off | yes | Pins the lane thread to one logical processor of one core and moves others off it. |
 | `VICTORY_LANE_HIGH` | off | yes | Gives the lane thread the highest priority of the process. |
@@ -504,6 +505,7 @@ translation of shaders.
 | `VICTORY_LAND_OWN` | off | flag |  | live |  | Leaves the pieces of shader-written copies that nothing but the title's CPU can read on the card: guarded, landed only when something reads or writes them. |
 | `VICTORY_LAND_OWN_FORCED` | 8 | number |  |  |  | How many landings of a copy's kept pieces our own readers may force before the copy lands eagerly for good. |
 | `VICTORY_LAND_OWN_MB` | 384 | number |  |  |  | Megabytes of kept pieces' bytes; over it, pieces land as before. |
+| `VICTORY_LAND_OWN_UNTAKEN` | off | flag |  | live |  | With VICTORY_LAND_OWN, also keeps pieces that other copies lie over when none of those copies ever took their bytes. |
 | `VICTORY_LAND_QUIET` | off | flag |  |  |  | Leaves large copies out of landings. |
 | `VICTORY_LAND_QUIET_MIN_KB` | 1024 | number |  |  |  | Smallest copy in KiB that quiet landing leaves out. |
 | `VICTORY_LAND_SKIP` | off | flag |  |  |  | Skips landing blocks the guest already had (counted either way). |

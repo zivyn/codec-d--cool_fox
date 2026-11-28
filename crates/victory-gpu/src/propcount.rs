@@ -194,13 +194,16 @@ pub(crate) fn line(frames: f64, land: &[u64]) {
     let us = |i: usize| land.get(i).copied().unwrap_or(0) as f64 / 1000.0 / frames.max(1.0);
     let landing_ms = us(crate::land::stat::CARD_ALL) + us(crate::land::stat::NOTES);
     let share = |part: f64, whole: f64| if whole > 0.0 { part / whole } else { 0.0 };
-    // (The order of `OwnClass`: ownable, overlapped, read, not private, not gpu-only, forced.)
+    // (The order of `OwnClass`: ownable, overlapped, read, not private, not gpu-only, forced, ownable under copies
+    // that never took the bytes.)
     tracing::info!(
-        "card propagation counters per frame (VICTORY_PROP_COUNT=1): landings fetched {:.0} pieces, {:.1} MB: ownable {:.1} MB ({:.0} pieces; a copy in the card's memory of a default-heap buffer, private memory, no other copy over it, title not seen reading it), overlapped by another copy {:.1}, seen read {:.1}, not private memory {:.1}, not a default-heap buffer {:.1}, kept eager for forced reads {:.1}; merged into title memory {:.1} MB in {:.0} pieces; landing CPU on all threads {:.1} ms (merge jobs {:.1}, guards and notes {:.1}), of it the ownable share about {:.1} ms",
+        "card propagation counters per frame (VICTORY_PROP_COUNT=1): landings fetched {:.0} pieces, {:.1} MB: ownable {:.1} MB ({:.0} pieces; a copy in the card's memory of a default-heap buffer, private memory, no other copy over it, title not seen reading it), ownable under copies that never took the bytes {:.1} MB ({:.0} pieces), overlapped by a copy that took them {:.1}, seen read {:.1}, not private memory {:.1}, not a default-heap buffer {:.1}, kept eager for forced reads {:.1}; merged into title memory {:.1} MB in {:.0} pieces; landing CPU on all threads {:.1} ms (merge jobs {:.1}, guards and notes {:.1}), of it the ownable share about {:.1} ms and with the copies that never took the bytes {:.1} ms",
         pieces,
         mb(total),
         mb(f[0]),
         f[CLASSES],
+        mb(f[6]),
+        f[CLASSES + 6],
         mb(f[1]),
         mb(f[2]),
         mb(f[3]),
@@ -212,6 +215,7 @@ pub(crate) fn line(frames: f64, land: &[u64]) {
         us(crate::land::stat::CARD_ALL),
         us(crate::land::stat::NOTES),
         landing_ms * share(f[0], total),
+        landing_ms * share(f[0] + f[6], total),
     );
     tracing::info!(
         "card propagation counters per frame: refreshes took {:.0} runs, {:.1} MB, {:.1} ms on all threads; pages a landing put into title memory in the last {} frames: {:.1} MB, of them {:.1} MB by the taking copy's own landing (its echo) and {:.1} MB by another copy's landing (landed to be taken again by a copy it did not come from; {:.1} MB of those from copies the title was not seen to read, which is the round trip nobody read: about {:.1} ms of refresh by share and {:.1} ms of landing by share of the fetched bytes)",

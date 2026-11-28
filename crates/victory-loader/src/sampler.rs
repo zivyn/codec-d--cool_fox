@@ -1,8 +1,10 @@
 //! The whole-process sampling profiler: `VICTORY_PROFILE=<hz>` (diagnostics build).
 //!
 //! One thread (`victory-profile`) wakes `<hz>` times a second. For every thread of the process (ours,
-//! the title's, the driver's and the system's pools) whose processor cycles moved since it was last
-//! seen (`QueryThreadCycleTime`: a thread that waited costs one cheap call), it suspends the thread,
+//! the title's, the driver's and the system's pools) that used at least `VICTORY_PROFILE_MIN_KC` thousand
+//! cycles since it was last sampled (`QueryThreadCycleTime`: a thread that waited costs one cheap call;
+//! stopping a thread costs it itself ~60 thousand cycles, so any change of its count cannot be the test),
+//! it suspends the thread,
 //! reads its context, unwinds the stack with the x64 unwind data of the module each frame is in
 //! (`RtlVirtualUnwind`, fed by a table of our own, so no lock of the system's is taken while a thread
 //! is stopped), and resumes it. Between the suspend and the resume nothing allocates, logs or takes
@@ -104,6 +106,14 @@ pub(crate) struct Config {
     /// it writes its files and ends.
     pub from: Duration,
     pub to: Option<Duration>,
+    /// Instead of `from`: the profile begins when this file exists (the driver of a run makes it when the
+    /// world is reached), and lasts `length` if that is given (else until `to` or the end).
+    pub start_file: Option<PathBuf>,
+    pub length: Option<Duration>,
+    /// A thread is sampled when it has used at least this many cycles since its last sample (stopping a
+    /// thread costs it itself some tens of thousands of cycles, so that one that waits would look busy
+    /// to the next round if any change counted).
+    pub min_cycles: u64,
 }
 
 impl Config {
@@ -157,6 +167,14 @@ impl Config {
             duty,
             from,
             to,
+            start_file: var("VICTORY_PROFILE_START_FILE")
+                .filter(|f| !f.trim().is_empty())
+                .map(|f| PathBuf::from(f.trim())),
+            length: number("VICTORY_PROFILE_FOR")
+                .and_then(secs)
+                .filter(|l| !l.is_zero()),
+            min_cycles: (number("VICTORY_PROFILE_MIN_KC").unwrap_or(300.0).max(0.0) * 1000.0)
+                as u64,
         })
     }
 }
@@ -935,7 +953,6 @@ impl State {
         };
         state.kiuser = state.modules.begin_of(address).unwrap_or(address);
         state.refresh_threads();
-        state.begin_window();
         Ok(state)
     }
 
@@ -1108,7 +1125,7 @@ impl State {
             return;
         };
         let last = self.threads[i].cycles_last;
-        if cycles == last && !force {
+        if cycles.saturating_sub(last) < self.cfg.min_cycles.max(1) && !force {
             self.threads[i].idle += 1;
             self.threads[i].streak = self.threads[i].streak.saturating_add(1);
             self.stats.idle += 1;
@@ -1621,13 +1638,17 @@ fn run(mut state: State) {
     let mut next_refresh = Instant::now() + REFRESH;
     let mut next_write = Instant::now() + state.cfg.every;
     eprintln!(
-        "VIctory: the profile is set ({} Hz, from {} s, to {}, file {}, timer {})",
+        "VIctory: the profile is set ({} Hz, from {}, to {}, file {}, timer {})",
         state.cfg.hz,
-        state.cfg.from.as_secs_f64(),
-        state
-            .cfg
-            .to
-            .map_or("the end".to_string(), |t| format!("{} s", t.as_secs_f64())),
+        match &state.cfg.start_file {
+            Some(f) => format!("the file {}", f.display()),
+            None => format!("{} s", state.cfg.from.as_secs_f64()),
+        },
+        match (state.cfg.length, state.cfg.to) {
+            (Some(l), _) => format!("{} s after", l.as_secs_f64()),
+            (None, Some(t)) => format!("{} s", t.as_secs_f64()),
+            (None, None) => "the end".to_string(),
+        },
         state.cfg.file.display(),
         if high {
             "high resolution"
@@ -1635,20 +1656,34 @@ fn run(mut state: State) {
             "low resolution"
         }
     );
+    // When the profile began, once it has.
+    let mut origin: Option<Duration> = None;
     while !STOP.load(Ordering::SeqCst) {
         let since = state.started.elapsed();
-        if state.cfg.to.is_some_and(|to| since >= to) {
+        if origin.is_none() {
+            let go = match &state.cfg.start_file {
+                Some(file) => file.exists(),
+                None => since >= state.cfg.from,
+            };
+            if go {
+                origin = Some(since);
+                eprintln!("VIctory: the profile begins");
+            }
+        }
+        let end = match (origin, state.cfg.length) {
+            (Some(o), Some(length)) => Some(o + length),
+            _ => state.cfg.to,
+        };
+        if end.is_some_and(|end| since >= end) {
             break;
         }
-        let sampling = since >= state.cfg.from
-            && match state.cfg.duty {
-                None => true,
-                Some((on, off)) => {
-                    // (The cycle begins when the profile does, not when the process does.)
-                    let phase = (since - state.cfg.from).as_secs_f64() % (on + off).as_secs_f64();
-                    phase < on.as_secs_f64()
-                }
-            };
+        let sampling = origin.is_some_and(|o| match state.cfg.duty {
+            None => true,
+            // (The cycle begins when the profile does.)
+            Some((on, off)) => {
+                (since - o).as_secs_f64() % (on + off).as_secs_f64() < on.as_secs_f64()
+            }
+        });
         if sampling {
             state.begin_window();
             state.sample_round(false);
@@ -1769,6 +1804,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!((c.from, c.to), (Duration::from_secs(240), None));
+        // The least a thread must have run to be looked at: 300 thousand cycles, or what is asked.
+        assert_eq!(c.min_cycles, 300_000);
+        let c = Config::from_env("100", &env(&[("VICTORY_PROFILE_MIN_KC", "800")]), dir).unwrap();
+        assert_eq!(c.min_cycles, 800_000);
+        // Or from the moment a file appears, for so long.
+        let c = Config::from_env(
+            "100",
+            &env(&[
+                ("VICTORY_PROFILE_START_FILE", "G:\\runs\\a\\go"),
+                ("VICTORY_PROFILE_FOR", "120"),
+            ]),
+            dir,
+        )
+        .unwrap();
+        assert_eq!(c.start_file, Some(PathBuf::from("G:\\runs\\a\\go")));
+        assert_eq!(c.length, Some(Duration::from_secs(120)));
         // A duty that is not two times is none.
         let c = Config::from_env("100", &env(&[("VICTORY_PROFILE_DUTY", "10")]), dir).unwrap();
         assert_eq!(c.duty, None);
@@ -1981,10 +2032,13 @@ mod tests {
         let cfg = Config::from_env("1000", &env(&[]), dir.path())
             .map(|c| Config {
                 file: file.clone(),
+                // (Stopping the waiter costs it some tens of thousands of cycles: far less than this.)
+                min_cycles: 800_000,
                 ..c
             })
             .unwrap();
         let mut state = State::new(cfg, no_phase).unwrap();
+        state.begin_window();
         for round in 0..300 {
             // The waiter does not run: it is sampled by force, now and then (and, not having run for a
             // while, it is looked at one round in eight in between).
@@ -2045,7 +2099,11 @@ mod tests {
             .sum();
         assert_eq!(in_tree, in_file);
         assert_eq!(in_tree, state.stats.samples);
-        assert!(state.stats.thinned > 20, "{} looks left out", state.stats.thinned);
+        assert!(
+            state.stats.thinned > 20,
+            "{} looks left out",
+            state.stats.thinned
+        );
         // The weights are the cycles the thread used between its first sample's baseline and its last.
         let t = state
             .threads

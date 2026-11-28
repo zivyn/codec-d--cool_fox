@@ -935,7 +935,7 @@ impl State {
         let mut last: HANDLE = null_mut();
         let mut kept = false;
         // Whether the walk ran to the end: only then is a thread not seen one that ended.
-        let mut complete = false;
+        let complete;
         loop {
             let mut next: HANDLE = null_mut();
             // SAFETY: `last` is null or a thread handle of ours from the call before; `next` is written.

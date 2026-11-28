@@ -305,10 +305,24 @@ fn pick_idle<T>(idle: &mut Vec<T>, closed: impl Fn(&T) -> bool, want: bool) -> O
 /// run, as a title's list is after its reset, or a new one. `closed`: closed (a
 /// title's list that is not recording is, until its reset), else open.
 #[cfg(windows)]
-fn fresh_list(closed: bool) -> Option<crate::host::HostList> {
+fn fresh_list(closed: bool, kind: u32) -> Option<crate::host::HostList> {
+    // (A title's compute list is of the compute type with `VICTORY_ASYNC_COMPUTE=2`, every other one is not.)
+    let compute = crate::host::lanes::want_compute(kind);
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = pick_idle(&mut idle.0, |i| i.2, closed);
+        let mut taken = pick_idle(&mut idle.0, |i| i.2, closed);
+        if let Some(Idle(list, ..)) = &taken
+            && list.is_compute() != compute
+        {
+            // The last that is of the other type is put back, the pool is looked through for the type that is wanted.
+            let other = taken.take();
+            let at = idle.0.iter().rposition(|i| i.0.is_compute() == compute);
+            if let Some(at) = at {
+                let same = idle.0.iter().rposition(|i| i.0.is_compute() == compute && i.2 == closed).unwrap_or(at);
+                taken = Some(idle.0.remove(same));
+            }
+            idle.0.extend(other);
+        }
         if let Some(Idle(_, bytes, _)) = &taken {
             idle.1 -= bytes;
         }
@@ -316,7 +330,7 @@ fn fresh_list(closed: bool) -> Option<crate::host::HostList> {
     };
     let (list, is_closed) = match idle {
         Some(Idle(list, _, is_closed)) => (list, is_closed),
-        None => (crate::host::host().and_then(|h| h.new_list().ok())?, false),
+        None => (crate::host::host().and_then(|h| h.new_list_of(compute).ok())?, false),
     };
     match (closed, is_closed) {
         (true, false) => list.close(),
@@ -392,7 +406,7 @@ fn cut(this: This, wait: ValueWait) {
         list.gate.push(wait);
         return;
     }
-    let Some(fresh) = fresh_list(false) else {
+    let Some(fresh) = fresh_list(false, list.kind) else {
         // shortcut: without a new host list the wait stands before the part
         // it was recorded in.
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -470,12 +484,12 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             continue;
         }
         // The title's next call on its list is a reset, which wants it closed.
-        let Some(fresh) = fresh_list(true) else {
-            continue;
-        };
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        let Some(fresh) = fresh_list(true, list.kind) else {
+            continue;
+        };
         let Some(host) = list.host.replace(fresh) else {
             continue;
         };
@@ -540,7 +554,8 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             continue;
         }
         // The title's next call on its list is a reset, which wants it closed.
-        let Some(fresh) = fresh_list(true) else {
+        // SAFETY: one of our lists (see below).
+        let Some(fresh) = fresh_list(true, unsafe { (*this.cast::<List>()).kind }) else {
             continue;
         };
         let list = this.cast_mut().cast::<List>();
@@ -668,7 +683,7 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list_of(crate::host::lanes::want_compute(kind)) {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -2555,7 +2570,7 @@ fn value_written(this: This, address: u64, value: u64) {
         let Some(current) = list.host.as_ref() else {
             return;
         };
-        let Some(fresh) = fresh_list(false) else {
+        let Some(fresh) = fresh_list(false, list.kind) else {
             return;
         };
         current.close();

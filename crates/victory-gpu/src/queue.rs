@@ -10,7 +10,7 @@ use crate::resource::PAGEABLE_IIDS;
 #[cfg(windows)]
 mod behind;
 #[cfg(windows)]
-mod timelines;
+pub(crate) mod timelines;
 
 const QUEUE_IIDS: [Iid; 4] = [
     guid(

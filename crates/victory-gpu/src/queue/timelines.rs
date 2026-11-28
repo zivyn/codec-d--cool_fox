@@ -1,6 +1,8 @@
 //! The title's queues as two timelines, on the way to running its compute
 //! queue on a queue of ours (`VICTORY_ASYNC_COMPUTE=1`, stage 1: nothing runs
-//! anywhere else yet).
+//! anywhere else; `=2`, stage 2: the compute lane's submissions run on a
+//! compute queue of the host, `crate::host::lanes`, which takes the lane and
+//! the waits this module resolves from [`current`]).
 //!
 //! The title runs work on a graphics queue and a compute queue and orders
 //! them with fences and memory values: the compute queue waits for what the
@@ -40,7 +42,7 @@ const ASKS_MOST: usize = 256;
 
 /// One of the two timelines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Lane {
+pub(crate) enum Lane {
     Graphics,
     Compute,
 }
@@ -48,7 +50,7 @@ pub(super) enum Lane {
 impl Lane {
     /// The lane of a title queue of kind `kind` (0 graphics, 1 copy, 2
     /// compute): the compute queue has its own, the rest are the graphics one.
-    pub(super) fn of(kind: u32) -> Lane {
+    pub(crate) fn of(kind: u32) -> Lane {
         if kind == 2 {
             Lane::Compute
         } else {
@@ -56,7 +58,7 @@ impl Lane {
         }
     }
 
-    pub(super) fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Lane::Graphics => 0,
             Lane::Compute => 1,
@@ -67,9 +69,9 @@ impl Lane {
 /// A submission of a lane, by its number among the lane's (1, 2, ...; 0 is
 /// "nothing yet").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Dep {
-    pub(super) lane: Lane,
-    pub(super) number: u64,
+pub(crate) struct Dep {
+    pub(crate) lane: Lane,
+    pub(crate) number: u64,
 }
 
 /// A submission as the model numbered it.
@@ -269,20 +271,57 @@ fn with<T>(f: impl FnOnce(&mut Model) -> T) -> T {
     f(model.get_or_insert_with(Model::default))
 }
 
-/// `VICTORY_ASYNC_COMPUTE=1`: the line's compute work is numbered and its
-/// waits resolved, and the host queue is given the lanes' fences. Read at each
-/// use (`VICTORY_AB`): a switch that comes on finds the lanes as they are
-/// (waits it did not see are unresolved, counted, and never waited for), one
-/// that goes off leaves fences and numbers that nothing reads.
-pub(super) fn on() -> bool {
+/// What `VICTORY_ASYNC_COMPUTE` says: 0 off, 1 the line's compute work is
+/// numbered and its waits resolved with the host queue given the lanes' fences
+/// (stage 1: nothing runs elsewhere), 2 the compute lane's submissions run on a
+/// queue of the host's own (stage 2, `crate::host::lanes`).
+pub(crate) fn mode_of(text: Option<&str>) -> u8 {
+    match text.map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    }
+}
+
+/// [`mode_of`] of the switch, read at each use (`VICTORY_AB`: `VICTORY_AB=10,VICTORY_ASYNC_COMPUTE=2` is stage 2 in
+/// the phases that have its bit, off in the others; without a value, stage 1): a switch that comes on finds the
+/// lanes as they are (waits it did not see are unresolved, counted, and never waited for), one that goes off leaves
+/// fences and numbers that nothing reads. Needs the submit line.
+pub(crate) fn mode() -> u8 {
     static SEEN: AtomicBool = AtomicBool::new(false);
-    let on = crate::ab::live_flag!("VICTORY_ASYNC_COMPUTE") && super::behind::on();
-    if on && !SEEN.swap(true, Relaxed) {
+    let mode = crate::ab::live_value!("VICTORY_ASYNC_COMPUTE", u8, mode_of);
+    let mode = if mode > 0 && super::behind::on() { mode } else { 0 };
+    if mode == 1 && !SEEN.swap(true, Relaxed) {
         tracing::info!(
             "VICTORY_ASYNC_COMPUTE: the title's compute queue is numbered as a timeline of its own (stage 1: one host queue)"
         );
     }
-    on
+    mode
+}
+
+/// Whether the lanes are numbered at all (stages 1 and 2).
+pub(super) fn on() -> bool {
+    mode() > 0
+}
+
+/// The submission the line's thread is sending now, among the title's lanes
+/// (stage 2): its lane, its number there and the submissions of the other lane
+/// it waits for, as the title's waits resolve.
+#[derive(Clone, Debug)]
+pub(crate) struct Current {
+    pub(crate) lane: Lane,
+    pub(crate) number: u64,
+    pub(crate) waits: Vec<Dep>,
+}
+
+thread_local! {
+    static CURRENT: std::cell::RefCell<Option<Current>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`Current`] on the line's thread, between [`begin`] and [`end`] of a
+/// submission in stage 2.
+pub(crate) fn current() -> Option<Current> {
+    CURRENT.with(|c| c.borrow().clone())
 }
 
 fn lane_of(queue: usize) -> Lane {
@@ -319,16 +358,28 @@ pub(super) fn value_wait(queue: usize, wait: &crate::list::ValueWait) {
 }
 
 /// A submission of `queue` is about to go, with the values its lists write.
-/// The waits of it on the other lane are made on the host queue.
+/// The waits of it on the other lane are made on the host queue (stage 1), or
+/// left to `crate::host::lanes` with [`current`] (stage 2).
 pub(super) fn begin(
     host: &crate::host::Host,
     queue: usize,
     writes: &[(usize, u64)],
 ) -> Option<Plan> {
-    if !on() {
+    let mode = mode();
+    if mode == 0 {
         return None;
     }
     let plan = with(|m| m.run(lane_of(queue), writes));
+    if mode == 2 {
+        CURRENT.with(|c| {
+            *c.borrow_mut() = Some(Current {
+                lane: plan.lane,
+                number: plan.number,
+                waits: plan.waits.clone(),
+            });
+        });
+        return Some(plan);
+    }
     let fences = fences(host)?;
     for dep in &plan.waits {
         if with(|m| m.can_wait(*dep)) {
@@ -339,11 +390,17 @@ pub(super) fn begin(
 }
 
 /// The submission of `plan` has been given to the host queue: its lane's
-/// fence is signalled with its number.
+/// fence is signalled with its number (stage 1), or the lanes are told where
+/// it went (stage 2).
 pub(super) fn end(host: &crate::host::Host, plan: Option<Plan>) {
     let Some(plan) = plan else {
         return;
     };
+    if CURRENT.with(|c| c.borrow_mut().take()).is_some() {
+        crate::host::lanes::planned(plan.lane, plan.number);
+        with(|m| m.signalled(plan.lane, plan.number));
+        return;
+    }
     if let Some(fences) = fences(host) {
         host.queue_signal(&fences[plan.lane.index()], plan.number);
         with(|m| m.signalled(plan.lane, plan.number));
@@ -392,6 +449,7 @@ pub(super) fn line(frames: f64) {
     if !on() {
         return;
     }
+    crate::host::lanes::line(frames);
     let s = with(|m| std::mem::take(&mut m.stats));
     let f = |n: u64| n as f64 / frames;
     tracing::info!(

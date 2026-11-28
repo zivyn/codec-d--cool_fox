@@ -358,7 +358,15 @@ fn give_back(streams: Vec<Vec<u64>>) {
 
 /// A list of ours, closed.
 fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
+    let compute = crate::host::lanes::want_compute(kind);
+    let found = {
+        let mut backs = held(&BACKS);
+        // (The host list that goes with it is of the type the kind wants: `VICTORY_ASYNC_COMPUTE=2`.)
+        // SAFETY: lists of ours nobody uses.
+        let at = backs.iter().rposition(|&b| unsafe { (*(b as *const List)).host.as_ref().is_some_and(|h| h.is_compute() == compute) });
+        at.map(|at| backs.remove(at))
+    };
+    if let Some(back) = found {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;

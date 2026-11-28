@@ -1,0 +1,1038 @@
+//! The title's compute queue on a compute queue of the host
+//! (`VICTORY_ASYNC_COMPUTE=2`, stage 2; `=1` is stage 1, the bookkeeping of
+//! `crate::queue::timelines`, and nothing else).
+//!
+//! The host gives everything the title submits, graphics and async compute, to
+//! one queue. The title overlaps its compute queue with its graphics queue on
+//! the console, so the card works the two one after the other where it could
+//! work them side by side. With the switch the submissions of the title's
+//! compute queue go to a host queue of type compute, when they can, and the
+//! rest of the host goes on as it was.
+//!
+//! The pieces, and why each is there:
+//!
+//! - Two host queues, Q1 (the one there always was) and Q2 (compute), each
+//!   with a fence of its own ([`Lanes::fences`]) that it signals behind each
+//!   submission, with the value the host numbers the submission by.
+//! - A sequencer ([`Lanes::order`], a copy queue that does no work): for each
+//!   submission it waits for the fence of the queue the submission went to and
+//!   then signals the host's one fence (`Host::fence`) with the same value, in
+//!   the order the submissions were given. The host's fence then still says
+//!   "everything up to this value has run", whichever queue ran it, so the
+//!   flights, their landing, the retirement of what they used (`bury`), and
+//!   every wait of the CPU for the card go on exactly as with one queue. (Two
+//!   queues signalling the one fence would go back and forth over it.)
+//! - Lists of the compute type for the title's compute lists
+//!   ([`want_compute`]): a compute queue runs nothing else, and the host list of
+//!   a title list is made before anyone knows where it goes. A compute list runs
+//!   on either queue.
+//! - Which submissions go to Q2 ([`unfit`]): all their lists are compute lists
+//!   and none of them names a texture (a texture's state is the host's to
+//!   track in submission order, and the transitions to the states a compute
+//!   queue may not use are made on Q1), a copy back, a step of ours that may
+//!   write anywhere, or the card's own steps for reads of what flights write
+//!   (those go behind the flights on the queue they are on, so the submission
+//!   keeps to it). Anything else goes to Q1 as it always did.
+//! - What a submission waits for on the other queue ([`Book::waits_for`]): the
+//!   submissions of the other lane the title's own waits resolved to (stage 1),
+//!   the title queue's previous submission if that ran on the other host queue
+//!   (a title queue is in order), and the submissions in the air on the other
+//!   queue that it shares memory with ([`Footprint`]): what one reads or
+//!   writes of title memory and of the pieces of host copies in the card's
+//!   memory the sends, hashes and compares of the two touch. With nothing in
+//!   common nothing waits, and that is where the overlap is. A wait is only
+//!   ever queued for a value whose signal is already queued, so two queues
+//!   cannot wait for each other.
+//! - A flip of the switch (`VICTORY_AB`) drains both queues first
+//!   ([`flip`]), at the next submission: the host's fence is signalled by Q1
+//!   alone with the switch off and by the sequencer alone with it on, and two
+//!   signallers must never have values in the air at once.
+
+use std::collections::VecDeque;
+
+use super::*;
+use crate::queue::timelines::{self, Lane as Title};
+
+/// Where a list of the title's kind `kind` is made: the compute type for the
+/// title's compute lists when stage 2 is asked for (at all: with `VICTORY_AB`
+/// naming `VICTORY_ASYNC_COMPUTE=2` the lists are made so in both phases, and
+/// the phase without it runs them on Q1, where they are as good).
+pub(crate) fn want_compute(kind: u32) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    kind == 2
+        && *ASKED.get_or_init(|| {
+            let env = std::env::var("VICTORY_ASYNC_COMPUTE").ok();
+            timelines::mode_of(env.as_deref()) == 2
+                || crate::ab::value_b("VICTORY_ASYNC_COMPUTE")
+                    .is_some_and(|v| timelines::mode_of(Some(v)) == 2)
+        })
+}
+
+// ---------------------------------------------------------------------
+// What a submission touches, and what has to wait for what (no D3D12).
+
+/// A key, and a range in the key's units: key 0 is title memory (bytes), any
+/// other is a host copy in the card's memory by its number plus one (pieces).
+type Run = (u64, u64, u64);
+
+/// Sorts runs and joins those that touch or overlap, within a key.
+fn normalize(runs: &mut Vec<Run>) {
+    runs.retain(|r| r.1 < r.2);
+    runs.sort_unstable();
+    let mut at = 0;
+    for i in 1..runs.len() {
+        let next = runs[i];
+        let last = &mut runs[at];
+        if next.0 == last.0 && next.1 <= last.2 {
+            last.2 = last.2.max(next.2);
+        } else {
+            at += 1;
+            runs[at] = next;
+        }
+    }
+    if !runs.is_empty() {
+        runs.truncate(at + 1);
+    }
+}
+
+/// Whether two normalized lists of runs share a unit.
+fn overlaps(a: &[Run], b: &[Run]) -> bool {
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        if x.0 != y.0 {
+            if x.0 < y.0 {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        } else if x.2 <= y.1 {
+            i += 1;
+        } else if y.2 <= x.1 {
+            j += 1;
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// What a submission reads and writes that another submission, running at the
+/// same time, must not read or write the other way. Reads of one with reads of
+/// the other are no conflict.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub(super) struct Footprint {
+    reads: Vec<Run>,
+    writes: Vec<Run>,
+    /// A step of ours that may write title memory anywhere.
+    any: bool,
+}
+
+impl Footprint {
+    pub(super) fn read(&mut self, from: usize, to: usize) {
+        self.reads.push((0, from as u64, to as u64));
+    }
+
+    pub(super) fn write(&mut self, from: usize, to: usize) {
+        self.writes.push((0, from as u64, to as u64));
+    }
+
+    /// Pieces `[first, end)` of copy `id` in the card's memory are only
+    /// compared.
+    pub(super) fn card_read(&mut self, id: u64, first: u32, end: u32) {
+        self.reads.push((id + 1, u64::from(first), u64::from(end)));
+    }
+
+    /// Pieces `[first, end)` of copy `id` are sent to, hashed, or compared and
+    /// hashed again.
+    pub(super) fn card_write(&mut self, id: u64, first: u32, end: u32) {
+        self.writes.push((id + 1, u64::from(first), u64::from(end)));
+    }
+
+    /// Ready to be compared: runs sorted and joined.
+    pub(super) fn sealed(mut self) -> Self {
+        normalize(&mut self.reads);
+        normalize(&mut self.writes);
+        self
+    }
+
+    /// Whether the two cannot run at the same time. Both sealed.
+    pub(super) fn conflicts(&self, other: &Footprint) -> bool {
+        self.any
+            || other.any
+            || overlaps(&self.writes, &other.reads)
+            || overlaps(&self.writes, &other.writes)
+            || overlaps(&self.reads, &other.writes)
+    }
+}
+
+/// Why a submission of the compute lane did not go to Q2, and why a wait was
+/// made.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub(super) struct Stats {
+    /// Submissions sent, by queue.
+    sent: [u64; 2],
+    /// Submissions of the compute lane kept on Q1: a list that is not of the
+    /// compute type, a texture or a copy back, a step of ours that may write
+    /// anywhere, the card's own steps behind flights.
+    kept: [u64; 4],
+    /// Waits made on the other queue: for what the title waited for, for the
+    /// title queue's previous submission, for memory shared, and the
+    /// submissions that waited for none (the overlap).
+    waits: [u64; 3],
+    free: u64,
+    /// Flips of the switch (each drains both queues).
+    flips: u64,
+}
+
+const KEPT_TYPE: usize = 0;
+const KEPT_TEXTURE: usize = 1;
+const KEPT_RUN: usize = 2;
+const KEPT_STEPS: usize = 3;
+
+/// The two queues as the host numbers them: what was signalled on each, what
+/// is in the air, and where the title's submissions went.
+#[derive(Default)]
+pub(super) struct Book {
+    /// The last value queued as a signal on each queue's fence.
+    signalled: [u64; 2],
+    /// The submissions in the air, per queue, by value.
+    flying: [Vec<(u64, Footprint)>; 2],
+    /// By title lane: the queue and value of its last submission.
+    last: [Option<(usize, u64)>; 2],
+    /// By title lane: number, queue and value of the submissions the title's
+    /// waits may name.
+    planned: [VecDeque<(u64, usize, u64)>; 2],
+    stats: Stats,
+}
+
+/// The most submissions the title's waits may name back.
+const PLANNED: usize = 512;
+
+impl Book {
+    /// What a submission that goes to queue `target` (0 or 1), of title lane
+    /// `title`, waits for on the other queue: the value on the other queue's
+    /// fence, 0 for none. `deps`: the title's own waits as (title lane,
+    /// number); `completed`: what each queue's fence reports now (what is done
+    /// is not waited for). `fp` sealed.
+    pub(super) fn waits_for(
+        &mut self,
+        target: usize,
+        title: usize,
+        deps: &[(usize, u64)],
+        fp: &Footprint,
+        completed: [u64; 2],
+    ) -> u64 {
+        let other = 1 - target;
+        for q in 0..2 {
+            self.flying[q].retain(|(v, _)| *v > completed[q]);
+        }
+        let mut want = 0u64;
+        for &(lane, number) in deps {
+            let v = match self.planned[lane].iter().rev().find(|p| p.0 == number) {
+                Some(&(_, queue, v)) => {
+                    if queue == other {
+                        v
+                    } else {
+                        0
+                    }
+                }
+                // Not known any more: everything queued there.
+                None => self.signalled[other],
+            };
+            if v > completed[other] && v > want {
+                want = v;
+                self.stats.waits[0] += 1;
+            }
+        }
+        if let Some((queue, v)) = self.last[title]
+            && queue == other
+            && v > completed[other]
+            && v > want
+        {
+            want = v;
+            self.stats.waits[1] += 1;
+        }
+        // The newest first: the first that conflicts is the one to wait for.
+        for (v, other_fp) in self.flying[other].iter().rev() {
+            if *v <= want {
+                break;
+            }
+            if fp.conflicts(other_fp) {
+                want = *v;
+                self.stats.waits[2] += 1;
+                break;
+            }
+        }
+        if want == 0 {
+            self.stats.free += 1;
+        }
+        want
+    }
+
+    /// A submission went to queue `target` with `value` as its signal.
+    pub(super) fn sent(&mut self, target: usize, title: usize, value: u64, fp: Footprint) {
+        self.signalled[target] = self.signalled[target].max(value);
+        self.flying[target].push((value, fp));
+        self.last[title] = Some((target, value));
+        self.stats.sent[target] += 1;
+    }
+
+    /// The title's submission `number` of lane `title` has been given out
+    /// (all of its parts): the title's waits name it from here on.
+    pub(super) fn planned(&mut self, title: usize, number: u64) {
+        if let Some((queue, value)) = self.last[title] {
+            let planned = &mut self.planned[title];
+            if planned.len() >= PLANNED {
+                planned.pop_front();
+            }
+            planned.push_back((number, queue, value));
+        }
+    }
+}
+
+static BOOK: Mutex<Option<Book>> = Mutex::new(None);
+
+fn book<T>(f: impl FnOnce(&mut Book) -> T) -> T {
+    let mut book = BOOK.lock().unwrap_or_else(|e| e.into_inner());
+    f(book.get_or_insert_with(Book::default))
+}
+
+/// The title's submission `number` of `lane` has been given out
+/// (`crate::queue::timelines::end`).
+pub(crate) fn planned(lane: Title, number: u64) {
+    book(|b| b.planned(lane.index(), number));
+}
+
+/// For the frame-rate line.
+pub(crate) fn line(frames: f64) {
+    if timelines::mode() != 2 {
+        return;
+    }
+    let s = book(|b| std::mem::take(&mut b.stats));
+    let f = |n: u64| n as f64 / frames;
+    tracing::info!(
+        "the compute lane on a queue of its own per frame (VICTORY_ASYNC_COMPUTE=2): {:.1} submissions sent to the compute queue, {:.1} to the drawing queue; \
+         {:.1} compute-lane submissions kept on the drawing queue (a list that is not of the compute type {:.1}, a texture {:.1}, a step of ours {:.1}, the card's own steps behind flights {:.1}); \
+         waits on the other queue: for what the title waited for {:.1}, for the title queue's last submission {:.1}, for memory both touch {:.1}, none {:.1}; flips {}",
+        f(s.sent[1]),
+        f(s.sent[0]),
+        f(s.kept.iter().sum()),
+        f(s.kept[KEPT_TYPE]),
+        f(s.kept[KEPT_TEXTURE]),
+        f(s.kept[KEPT_RUN]),
+        f(s.kept[KEPT_STEPS]),
+        f(s.waits[0]),
+        f(s.waits[1]),
+        f(s.waits[2]),
+        f(s.free),
+        s.flips
+    );
+}
+
+// ---------------------------------------------------------------------
+// The queues.
+
+/// Q2 and what the two queues are joined by.
+pub(super) struct Lanes {
+    compute: ID3D12CommandQueue,
+    order: ID3D12CommandQueue,
+    /// Signalled by Q1 and Q2 behind their submissions.
+    fences: [ID3D12Fence; 2],
+}
+
+// SAFETY: D3D12 queues and fences are free-threaded.
+unsafe impl Send for Lanes {}
+// SAFETY: as above.
+unsafe impl Sync for Lanes {}
+
+fn lanes(host: &Host) -> Option<&'static Lanes> {
+    static LANES: OnceLock<Option<Lanes>> = OnceLock::new();
+    LANES
+        .get_or_init(|| match make(&host.device) {
+            Ok(lanes) => {
+                tracing::info!(
+                    "VICTORY_ASYNC_COMPUTE=2: the title's compute lane runs on a compute queue of the host, joined to the host's fence by a sequencer queue"
+                );
+                Some(lanes)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no compute queue for VICTORY_ASYNC_COMPUTE=2: everything stays on one queue");
+                None
+            }
+        })
+        .as_ref()
+}
+
+fn make(device: &ID3D12Device) -> windows::core::Result<Lanes> {
+    // SAFETY: plain object creation.
+    unsafe {
+        let queue = |kind| {
+            device.CreateCommandQueue::<ID3D12CommandQueue>(&D3D12_COMMAND_QUEUE_DESC {
+                Type: kind,
+                ..Default::default()
+            })
+        };
+        Ok(Lanes {
+            compute: queue(D3D12_COMMAND_LIST_TYPE_COMPUTE)?,
+            order: queue(D3D12_COMMAND_LIST_TYPE_COPY)?,
+            fences: [
+                device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+                device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
+            ],
+        })
+    }
+}
+
+/// Whether the host's fence has been signalled by the sequencer since the last
+/// flip.
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The switch changed (or this is the first submission): both queues are
+/// drained, so that the host's fence is signalled by one thing at a time.
+/// `submitted` is the last value signalled on it, under the submission lock.
+fn flip(host: &Host, run: bool, submitted: u64) {
+    if RUNNING.load(Ordering::Acquire) == run {
+        return;
+    }
+    // SAFETY: the host's fence and event, under the submission lock.
+    unsafe {
+        if submitted > 0
+            && host.fence.GetCompletedValue() < submitted
+            && host
+                .fence
+                .SetEventOnCompletion(submitted, host.event)
+                .is_ok()
+        {
+            let was = working(false);
+            WaitForSingleObject(host.event, INFINITE);
+            working(was);
+        }
+    }
+    *BOOK.lock().unwrap_or_else(|e| e.into_inner()) = Some(Book::default());
+    book(|b| b.stats.flips += 1);
+    RUNNING.store(run, Ordering::Release);
+}
+
+// ---------------------------------------------------------------------
+// What goes where.
+
+/// Why a list cannot go to Q2, if it cannot.
+fn unfit(list: &HostList) -> Option<usize> {
+    if !list.compute {
+        return Some(KEPT_TYPE);
+    }
+    let named = !list
+        .states
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty()
+        || !list
+            .twins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+    let d = list.deferred();
+    if named
+        || !d.backs.is_empty()
+        || !d.texture_backs.is_empty()
+        || !d.textures.is_empty()
+        || !d.plane_uploads.is_empty()
+    {
+        return Some(KEPT_TEXTURE);
+    }
+    d.copies
+        .iter()
+        .any(|step| matches!(step, Step::Run(_) | Step::Texture(_) | Step::Plane(..)))
+        .then_some(KEPT_RUN)
+}
+
+/// What the steps of `runs` read and write of title memory.
+fn steps_footprint(runs: &[&HostList]) -> Footprint {
+    let mut fp = Footprint::default();
+    for list in runs {
+        for step in &list.deferred().copies {
+            match step {
+                &Step::Copy(dst, src, len) => {
+                    fp.write(dst, dst + len);
+                    fp.read(src, src + len);
+                }
+                &Step::Fill(_, src, len, _) => fp.read(src, src + len),
+                Step::Refresh(shadow, address, len) => {
+                    fp.read(*address, *address + *len);
+                    fp.card_read(shadow.id(), 0, u32::MAX);
+                }
+                Step::GpuWrite(shadow, address, len) => {
+                    fp.write(*address, *address + *len);
+                    fp.card_write(shadow.id(), 0, u32::MAX);
+                }
+                &Step::Host(_, (from, to)) => fp.read(from, to),
+                Step::Run(_) => fp.any = true,
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    fp.read(at, at + len);
+                }
+                &Step::Plane((at, len), _) => fp.read(at, at + len),
+                // (A copy done on the card between host copies: one or two a frame, whichever resources they are.)
+                Step::Placed(_) => fp.any = true,
+            }
+        }
+    }
+    fp
+}
+
+/// A submission on its way to a queue.
+pub(super) struct Route {
+    /// 0: Q1, the host's queue; 1: Q2.
+    target: usize,
+    /// The title lane (0 graphics, 1 compute).
+    title: usize,
+    deps: Vec<(usize, u64)>,
+    fp: Footprint,
+    waited: bool,
+}
+
+impl Route {
+    /// For a submission sent ahead (`late`) whose runs are `runs`; `submitted`
+    /// is the last value signalled on the host's fence. `None` with the
+    /// switch off (or without what stage 2 needs): the submission goes as it
+    /// always did. `keep`: it must stay on Q1 (its steps were prepared by
+    /// another thread, or done on the card).
+    pub(super) fn begin(
+        host: &Host,
+        runs: &[&HostList],
+        late: bool,
+        keep: bool,
+        submitted: u64,
+    ) -> Option<Route> {
+        if !late {
+            // (A submission that is waited for settles every flight first: nothing of the sequencer's is in the air.)
+            return None;
+        }
+        let run = timelines::mode() == 2 && relay();
+        let lanes = if run { lanes(host) } else { None };
+        flip(host, lanes.is_some(), submitted);
+        lanes?;
+        let current = timelines::current();
+        let title = current.as_ref().map_or(0, |c| c.lane.index());
+        let deps = current.map_or_else(Vec::new, |c| {
+            c.waits.iter().map(|d| (d.lane.index(), d.number)).collect()
+        });
+        let mut why = keep.then_some(KEPT_STEPS);
+        if title == 1 && why.is_none() {
+            why = runs.iter().find_map(|list| unfit(list));
+        }
+        if title == 1
+            && let Some(why) = why
+        {
+            book(|b| b.stats.kept[why] += 1);
+        }
+        let target = usize::from(title == 1 && why.is_none());
+        Some(Route {
+            target,
+            title,
+            deps,
+            fp: steps_footprint(runs),
+            waited: false,
+        })
+    }
+
+    /// Whether the submission goes to Q2 (its lists, and everything the host
+    /// adds for it, are of the compute type).
+    pub(super) fn compute(&self) -> bool {
+        self.target == 1
+    }
+
+    /// The queue the submission goes to.
+    pub(super) fn queue<'a>(&self, host: &'a Host) -> &'a ID3D12CommandQueue {
+        match (self.target, lanes(host)) {
+            (1, Some(lanes)) => &lanes.compute,
+            _ => &host.queue,
+        }
+    }
+
+    /// What the card's plan for the submission touches of the host copies in
+    /// its memory, and what it declares written of title memory: the copies
+    /// sent up to (`dirty`, with `whole` sent whole), hashed and compared
+    /// (`declared`), and only compared (`looked`). A copy is one resource with
+    /// one state at a time (the lists that send up to it move it between
+    /// states), so it is taken whole: nothing that uses it runs on the other
+    /// queue at the same time as what changes it.
+    pub(super) fn card(
+        &mut self,
+        dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)],
+        whole: &[std::sync::Arc<crate::shadow::Shadow>],
+        declared: &[Declared],
+        looked: &[&crate::picked::Range],
+    ) {
+        let _ = whole;
+        for (shadow, _) in dirty {
+            self.fp.card_write(shadow.id(), 0, u32::MAX);
+        }
+        for (shadow, ranges) in declared {
+            self.fp.card_write(shadow.id(), 0, u32::MAX);
+            for &(from, to) in ranges {
+                self.fp.write(from, to);
+            }
+        }
+        for l in looked {
+            self.fp.card_read(l.0.id(), 0, u32::MAX);
+        }
+    }
+
+    /// Before anything of the submission is given to its queue: the queue
+    /// waits for what the other queue must have done first. Once.
+    pub(super) fn waits(&mut self, host: &Host) {
+        if self.waited {
+            return;
+        }
+        self.waited = true;
+        let Some(lanes) = lanes(host) else {
+            return;
+        };
+        let fp = std::mem::take(&mut self.fp).sealed();
+        // SAFETY: plain queries of fences of ours.
+        let completed = lanes
+            .fences
+            .each_ref()
+            .map(|f| unsafe { f.GetCompletedValue() });
+        let other = 1 - self.target;
+        let want = book(|b| b.waits_for(self.target, self.title, &self.deps, &fp, completed));
+        self.fp = fp;
+        if want > 0 {
+            // SAFETY: our queue and fence; the value was queued as a signal.
+            if let Err(e) = unsafe { self.queue(host).Wait(&lanes.fences[other], want) } {
+                fail(format_args!(
+                    "a queue could not be told to wait for the other ({e})"
+                ));
+            }
+        }
+    }
+
+    /// Behind the submission's lists: the queue's fence takes the
+    /// submission's value, and the sequencer gives it to the host's fence once
+    /// the queue has got there. In place of the host queue's signal of the
+    /// host's fence.
+    pub(super) fn signal(&mut self, host: &Host, value: u64) -> windows::core::Result<()> {
+        self.waits(host);
+        let Some(lanes) = lanes(host) else {
+            // SAFETY: our queue and fence.
+            return unsafe { host.queue.Signal(&host.fence, value) };
+        };
+        let fence = &lanes.fences[self.target];
+        // SAFETY: our queues and fences, behind the lock that numbers the signals.
+        unsafe {
+            self.queue(host).Signal(fence, value)?;
+            lanes.order.Wait(fence, value)?;
+            lanes.order.Signal(&host.fence, value)?;
+        }
+        let fp = std::mem::take(&mut self.fp).sealed();
+        book(|b| b.sent(self.target, self.title, value, fp));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    /// A tiny deterministic generator.
+    pub(super) struct Dice(u64);
+
+    impl Dice {
+        pub(super) fn new(seed: u64) -> Dice {
+            Dice(seed)
+        }
+
+        pub(super) fn next(&mut self, n: u64) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0 % n
+        }
+    }
+
+    fn fp(reads: &[(u64, u64)], writes: &[(u64, u64)]) -> Footprint {
+        let mut f = Footprint::default();
+        for &(a, b) in reads {
+            f.read(a as usize, b as usize);
+        }
+        for &(a, b) in writes {
+            f.write(a as usize, b as usize);
+        }
+        f.sealed()
+    }
+
+    #[test]
+    fn reads_alone_never_conflict_and_a_write_conflicts_with_what_it_touches() {
+        let a = fp(&[(0, 100)], &[]);
+        let b = fp(&[(50, 150)], &[]);
+        assert!(!a.conflicts(&b));
+        let w = fp(&[], &[(90, 95)]);
+        assert!(a.conflicts(&w) && w.conflicts(&a), "a write inside a read");
+        assert!(!b.conflicts(&fp(&[], &[(0, 50)])), "next to it");
+        assert!(b.conflicts(&fp(&[], &[(149, 200)])), "its last byte");
+        let ww = fp(&[], &[(10, 20)]);
+        assert!(ww.conflicts(&fp(&[], &[(19, 30)])), "two writes");
+        assert!(!ww.conflicts(&fp(&[], &[(20, 30)])));
+        let mut any = Footprint::default();
+        any.any = true;
+        assert!(
+            any.conflicts(&Footprint::default()),
+            "a step that may write anywhere"
+        );
+    }
+
+    #[test]
+    fn pieces_of_a_copy_conflict_only_in_the_same_copy() {
+        let mut a = Footprint::default();
+        a.card_write(7, 0, 4);
+        let mut b = Footprint::default();
+        b.card_read(7, 3, 5);
+        let mut c = Footprint::default();
+        c.card_write(8, 0, 4);
+        let (a, b, c) = (a.sealed(), b.sealed(), c.sealed());
+        assert!(a.conflicts(&b));
+        assert!(!a.conflicts(&c), "another copy");
+        // Pieces and bytes are not the same unit.
+        let bytes = fp(&[], &[(0, 4)]);
+        assert!(!a.conflicts(&bytes));
+    }
+
+    /// The runs of a random footprint against a brute-force picture of what it covers.
+    #[test]
+    fn normalizing_keeps_what_is_covered() {
+        let mut dice = Dice(0x9e37_79b9_7f4a_7c15);
+        for _ in 0..300 {
+            let mut runs: Vec<Run> = Vec::new();
+            for _ in 0..dice.next(12) {
+                let key = dice.next(3);
+                let a = dice.next(60);
+                runs.push((key, a, a + dice.next(20)));
+            }
+            let mut covered = [[false; 80]; 3];
+            for &(k, a, b) in &runs {
+                for x in a..b {
+                    covered[k as usize][x as usize] = true;
+                }
+            }
+            normalize(&mut runs);
+            let mut after = [[false; 80]; 3];
+            for &(k, a, b) in &runs {
+                assert!(a < b);
+                for x in a..b {
+                    assert!(!after[k as usize][x as usize], "no unit twice");
+                    after[k as usize][x as usize] = true;
+                }
+            }
+            assert_eq!(covered, after);
+            assert!(
+                runs.windows(2).all(|w| w[0].0 < w[1].0 || w[0].2 < w[1].1),
+                "joined"
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_agrees_with_a_brute_force_look() {
+        let mut dice = Dice(0x2545_f491_4f6c_dd1d);
+        let mut made = |dice: &mut Dice| {
+            let mut runs: Vec<Run> = Vec::new();
+            for _ in 0..dice.next(6) {
+                let a = dice.next(100);
+                runs.push((dice.next(2), a, a + 1 + dice.next(10)));
+            }
+            normalize(&mut runs);
+            runs
+        };
+        for _ in 0..2000 {
+            let (a, b) = (made(&mut dice), made(&mut dice));
+            let brute = a
+                .iter()
+                .any(|x| b.iter().any(|y| x.0 == y.0 && x.1 < y.2 && y.1 < x.2));
+            assert_eq!(overlaps(&a, &b), brute, "{a:?} {b:?}");
+        }
+    }
+
+    #[test]
+    fn a_wait_is_for_what_the_title_waited_for_the_last_of_its_queue_and_what_is_shared() {
+        let mut b = Book::default();
+        // Graphics (Q1) value 5 wrote [0,10); title lane 0 number 1.
+        b.sent(0, 0, 5, fp(&[], &[(0, 10)]));
+        b.planned(0, 1);
+        b.sent(0, 0, 6, fp(&[], &[(100, 110)]));
+        b.planned(0, 2);
+        let mine = fp(&[], &[(500, 510)]);
+        // Nothing in common and nothing waited for: free.
+        assert_eq!(b.waits_for(1, 1, &[], &mine, [0, 0]), 0);
+        assert_eq!(b.stats.free, 1);
+        // The title waited for graphics number 1: value 5.
+        assert_eq!(b.waits_for(1, 1, &[(0, 1)], &mine, [0, 0]), 5);
+        // Shared memory with the newest in the air: value 6.
+        assert_eq!(b.waits_for(1, 1, &[], &fp(&[(105, 106)], &[]), [0, 0]), 6);
+        // The older one only.
+        assert_eq!(b.waits_for(1, 1, &[], &fp(&[(5, 6)], &[]), [0, 0]), 5);
+        // What the other queue has done is not waited for.
+        assert_eq!(
+            b.waits_for(1, 1, &[(0, 2)], &fp(&[(105, 106)], &[]), [6, 0]),
+            0
+        );
+        assert_eq!(b.stats.waits, [1, 0, 2]);
+    }
+
+    #[test]
+    fn a_title_queue_stays_in_order_across_host_queues() {
+        let mut b = Book::default();
+        b.sent(1, 1, 3, Footprint::default().sealed());
+        // The next of the title's compute queue goes to Q1: after value 3 on Q2.
+        assert_eq!(
+            b.waits_for(0, 1, &[], &Footprint::default().sealed(), [0, 0]),
+            3
+        );
+        assert_eq!(b.stats.waits[1], 1);
+        // On its own queue nothing is waited for.
+        let mut b = Book::default();
+        b.sent(1, 1, 3, Footprint::default().sealed());
+        assert_eq!(
+            b.waits_for(1, 1, &[], &Footprint::default().sealed(), [0, 0]),
+            0
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_known_any_more_waits_for_everything_queued() {
+        let mut b = Book::default();
+        for v in 1..=3u64 {
+            b.sent(0, 0, v, Footprint::default().sealed());
+        }
+        assert_eq!(
+            b.waits_for(1, 1, &[(0, 99)], &Footprint::default().sealed(), [0, 0]),
+            3
+        );
+    }
+
+    // The queues as the card runs them, to see that what the host asks for
+    // can be met and what it orders is ordered.
+
+    #[derive(Clone, Copy, Debug)]
+    enum Cmd {
+        Wait(usize, u64),
+        Signal(usize, u64),
+        Work(usize),
+    }
+
+    /// Fences 0 and 1 are the queues', 2 is the host's. Queue 2 is the
+    /// sequencer.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ended {
+        Done(Vec<Cmd2>),
+        Stalled,
+    }
+
+    /// What ran, in order, for the checks.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Cmd2 {
+        Work(usize),
+        Host(u64),
+    }
+
+    /// Runs the queues like a card: each in its order, a wait standing until
+    /// its fence has the value. A choice of which queue goes next from `dice`.
+    fn run(queues: &[Vec<Cmd>; 3], dice: &mut Dice) -> Ended {
+        let mut at = [0usize; 3];
+        let mut fence = [0u64; 3];
+        let mut log = Vec::new();
+        loop {
+            let ready: Vec<usize> = (0..3)
+                .filter(|&q| match queues[q].get(at[q]) {
+                    None => false,
+                    Some(Cmd::Wait(f, v)) => fence[*f] >= *v,
+                    Some(_) => true,
+                })
+                .collect();
+            if ready.is_empty() {
+                return if (0..3).all(|q| at[q] == queues[q].len()) {
+                    Ended::Done(log)
+                } else {
+                    Ended::Stalled
+                };
+            }
+            let q = ready[dice.next(ready.len() as u64) as usize];
+            match queues[q][at[q]] {
+                Cmd::Wait(..) => {}
+                Cmd::Signal(f, v) => {
+                    fence[f] = v;
+                    if f == 2 {
+                        log.push(Cmd2::Host(v));
+                    }
+                }
+                Cmd::Work(id) => log.push(Cmd2::Work(id)),
+            }
+            at[q] += 1;
+        }
+    }
+
+    /// A random title: submissions on its two lanes with random memory, some
+    /// eligible for Q2, some waiting for submissions of the other lane, as the
+    /// host would send them. Returns the queues' commands and what each
+    /// submission touched.
+    fn host_sends(
+        dice: &mut Dice,
+        submissions: usize,
+    ) -> ([Vec<Cmd>; 3], Vec<(usize, Footprint, Vec<usize>, usize)>) {
+        let mut queues: [Vec<Cmd>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut book = Book::default();
+        let mut sent = Vec::new();
+        // The completed values: nothing, so that every wait is made.
+        let mut numbers = [0u64; 2];
+        let mut value = 0u64;
+        for id in 0..submissions {
+            let title = dice.next(2) as usize;
+            numbers[title] += 1;
+            let eligible = title == 1 && dice.next(4) != 0;
+            let target = usize::from(eligible);
+            let mut f = Footprint::default();
+            for _ in 0..dice.next(4) {
+                let a = dice.next(8) * 100;
+                if dice.next(2) == 0 {
+                    f.read(a as usize, a as usize + 50);
+                } else {
+                    f.write(a as usize, a as usize + 50);
+                }
+            }
+            let f = f.sealed();
+            // The title waits for an earlier submission of the other lane now and then.
+            let mut deps = Vec::new();
+            let mut must = Vec::new();
+            if numbers[1 - title] > 0 && dice.next(3) == 0 {
+                let n = 1 + dice.next(numbers[1 - title]);
+                deps.push((1 - title, n));
+                // Which submission was number n of that lane?
+                if let Some(at) =
+                    sent.iter()
+                        .position(|s: &(usize, Footprint, Vec<usize>, usize)| {
+                            s.3 == (1 - title) * 1_000_000 + n as usize
+                        })
+                {
+                    must.push(at);
+                }
+            }
+            let want = book.waits_for(target, title, &deps, &f, [0, 0]);
+            assert!(
+                want <= book.signalled[1 - target],
+                "a wait for what was never queued"
+            );
+            value += 1;
+            if want > 0 {
+                queues[target].push(Cmd::Wait(1 - target, want));
+            }
+            queues[target].push(Cmd::Work(id));
+            queues[target].push(Cmd::Signal(target, value));
+            queues[2].push(Cmd::Wait(target, value));
+            queues[2].push(Cmd::Signal(2, value));
+            book.sent(target, title, value, f.clone());
+            book.planned(title, numbers[title]);
+            sent.push((target, f, must, title * 1_000_000 + numbers[title] as usize));
+        }
+        (queues, sent)
+    }
+
+    #[test]
+    fn whatever_the_title_waits_for_the_queues_never_stand_for_each_other() {
+        let mut dice = Dice(0x1234_5678_9abc_def1);
+        for round in 0..400 {
+            let (queues, _) = host_sends(&mut dice, 5 + (round % 40));
+            for _ in 0..3 {
+                assert!(
+                    matches!(run(&queues, &mut dice), Ended::Done(_)),
+                    "round {round}: {queues:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_wait_for_a_value_nobody_signals_is_seen_as_a_stall() {
+        let queues: [Vec<Cmd>; 3] = [
+            vec![Cmd::Wait(1, 5), Cmd::Work(0)],
+            vec![Cmd::Work(1), Cmd::Signal(1, 4)],
+            Vec::new(),
+        ];
+        assert_eq!(run(&queues, &mut Dice(7)), Ended::Stalled);
+        // Two queues that wait for each other.
+        let queues: [Vec<Cmd>; 3] = [
+            vec![Cmd::Wait(1, 1), Cmd::Signal(0, 1)],
+            vec![Cmd::Wait(0, 1), Cmd::Signal(1, 1)],
+            Vec::new(),
+        ];
+        assert_eq!(run(&queues, &mut Dice(8)), Ended::Stalled);
+    }
+
+    /// The host's fence is signalled in the order the submissions were given,
+    /// whatever order the queues finish them in; and what conflicts, or was
+    /// named by the title, runs one after the other.
+    #[test]
+    fn conflicting_work_runs_in_order_and_the_hosts_fence_goes_up_by_one_thing() {
+        let mut dice = Dice(0x0dd_ba11_f00d);
+        for round in 0..400 {
+            let n = 5 + (round % 50);
+            let (queues, sent) = host_sends(&mut dice, n);
+            for _ in 0..4 {
+                let Ended::Done(log) = run(&queues, &mut dice) else {
+                    panic!("round {round} stalled");
+                };
+                let place = |id: usize| log.iter().position(|c| *c == Cmd2::Work(id)).unwrap();
+                let hosts: Vec<u64> = log
+                    .iter()
+                    .filter_map(|c| {
+                        if let Cmd2::Host(v) = c {
+                            Some(*v)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    hosts.windows(2).all(|w| w[0] < w[1]),
+                    "the host's fence only goes up"
+                );
+                for j in 0..sent.len() {
+                    for i in 0..j {
+                        let (qi, fi, _, ti) =
+                            (&sent[i].0, &sent[i].1, &sent[i].2, sent[i].3 / 1_000_000);
+                        let (qj, fj, _, tj) =
+                            (&sent[j].0, &sent[j].1, &sent[j].2, sent[j].3 / 1_000_000);
+                        // The same queue is in order by itself.
+                        if qi != qj && (fi.conflicts(fj) || (ti == tj)) {
+                            assert!(place(i) < place(j), "round {round}: {i} before {j}");
+                        }
+                    }
+                }
+                // What the title named runs before the one that waited.
+                for (j, s) in sent.iter().enumerate() {
+                    for &i in &s.2 {
+                        if sent[i].0 != s.0 {
+                            assert!(
+                                place(i) < place(j),
+                                "round {round}: the title's wait, {i} before {j}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn what_is_done_is_not_waited_for() {
+        let mut b = Book::default();
+        b.sent(0, 0, 4, fp(&[], &[(0, 10)]));
+        let mine = fp(&[(5, 6)], &[]);
+        assert_eq!(b.waits_for(1, 1, &[], &mine, [3, 0]), 4);
+        assert_eq!(b.waits_for(1, 1, &[], &mine, [4, 0]), 0, "the card has it");
+        assert!(b.flying[0].is_empty(), "and it is no longer in the air");
+    }
+}
+
+#[cfg(all(test, windows))]
+mod warp;

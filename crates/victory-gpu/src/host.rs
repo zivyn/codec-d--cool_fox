@@ -3382,6 +3382,12 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    blocked_by_for(written, written, runs, count)
+}
+
+/// [`blocked_by`], with what a fill of upload memory reads judged against `fills` and everything else against
+/// `written` (the same ranges, or fewer for the fills: [`join_refusal`]).
+fn blocked_by_for(written: &[(usize, usize)], fills: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
     if written.is_empty() {
         return None;
     }
@@ -3405,11 +3411,11 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
-                    if read_blocked(written, src, len) {
+                    if read_blocked(fills, src, len) {
                         if count {
                             LATE_STATS[16].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
-                            blame("a fill of upload memory", written, src, len);
+                            blame("a fill of upload memory", fills, src, len);
                         }
                         return Some(WHY_READ);
                     }
@@ -3538,21 +3544,105 @@ fn joins_asked() -> (usize, usize) {
 /// those give their shaders, write back or write when they are done, and it
 /// changes no title memory that they read ([`Step::Copy`], [`Step::Run`]).
 pub(crate) fn joinable<'a>(ahead: impl Iterator<Item = &'a HostList>, next: &[&HostList]) -> bool {
-    if next.iter().any(|l| l.deferred().copies.iter().any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))) {
-        return false;
-    }
-    let ahead: Vec<&HostList> = ahead.collect();
-    let mut written: Vec<(usize, usize)> = declared_writes(&ahead).into_iter().flat_map(|(_, ranges)| ranges).collect();
-    for list in &ahead {
-        let deferred = list.deferred();
-        written.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
-        written.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| (at, at + rows.saturating_sub(1) * pitch + row)));
-    }
-    let mut joined = Vec::new();
-    join_ranges(&mut joined, written);
-    blocked_by(&joined, next, false).is_none()
+    join_refusal(ahead, next).is_none()
 }
 
+/// Why a part cannot be prepared together with the ones in front of it ([`joinable`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NoJoin {
+    /// It copies title memory or runs a step of ours (`Step::Copy`, `Step::Run`).
+    CopyOrRun,
+    /// It reads title memory that the lists in front write when they are done (or declare writable in ranges under
+    /// [`join_wide`]), by a fill, a texture, a plane or a placed copy.
+    Written,
+    /// Only what ranges of [`join_wide`] or more, declared writable by the lists in front, make it read ones' memory:
+    /// refused here, joined with `VICTORY_JOIN_WIDE_MB` (counted with diagnostics).
+    WideOnly,
+}
+
+/// Ranges of this many MiB or more, declared written by the lists in front of a part, do not keep it from being
+/// prepared with them for what its fills of upload memory read (`VICTORY_JOIN_WIDE_MB=<n>`; 0, off, by default).
+///
+/// Why: a submission declares written the whole of every view its shaders may store through (the 182 MB heap that
+/// holds the title's rings of constants as well), and a fill of the next part that reads a ring inside it is "read
+/// what the part in front writes": no join, whatever the shaders write. The title's CPU writes those constants
+/// before its call, which is before the group is prepared, so the bytes a fill reads are right when they are read
+/// in the order of the group; what is not right is a fill that reads bytes the shaders in front write (a result
+/// read back by the CPU and put up again within one frame). Nothing here can tell the two: an experiment, with the
+/// picture to judge it by (a wrong fill is a frame of a stale constant), not a proof. Textures, planes, placed
+/// copies, copies and steps of ours are judged by every range as before.
+///
+/// (May change while the title runs, `VICTORY_AB=..,VICTORY_JOIN_WIDE_MB=4`: each decision to join reads it once and
+/// keeps no state; the parts joined go on as one submission either way.)
+fn join_wide() -> usize {
+    fn mib(text: Option<&str>) -> usize {
+        text.and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+    let megabytes = crate::ab::live_value!("VICTORY_JOIN_WIDE_MB", usize, mib);
+    megabytes << 20
+}
+
+/// [`joinable`] with the reason it is not.
+pub(crate) fn join_refusal<'a>(
+    ahead: impl Iterator<Item = &'a HostList>,
+    next: &[&HostList],
+) -> Option<NoJoin> {
+    join_refusal_with(ahead, next, join_wide(), cfg!(feature = "diagnostics"))
+}
+
+/// [`join_refusal`] with the size of the ranges that do not count for fills (`wide`, 0: all count) and whether a
+/// refusal that only they cause is told apart (`classify`: [`NoJoin::WideOnly`], else [`NoJoin::Written`]).
+fn join_refusal_with<'a>(
+    ahead: impl Iterator<Item = &'a HostList>,
+    next: &[&HostList],
+    wide: usize,
+    classify: bool,
+) -> Option<NoJoin> {
+    if next.iter().any(|l| {
+        l.deferred()
+            .copies
+            .iter()
+            .any(|s| matches!(s, Step::Copy(..) | Step::Run(_)))
+    }) {
+        return Some(NoJoin::CopyOrRun);
+    }
+    let ahead: Vec<&HostList> = ahead.collect();
+    // What shaders may write (whole views), and what the lists write for sure when they are done (values, texture
+    // read-backs): only the first can be wide by what it declares and not by what it does.
+    let declared: Vec<(usize, usize)> = declared_writes(&ahead)
+        .into_iter()
+        .flat_map(|(_, ranges)| ranges)
+        .collect();
+    let mut sure: Vec<(usize, usize)> = Vec::new();
+    for list in &ahead {
+        let deferred = list.deferred();
+        sure.extend(deferred.writes.iter().map(|&(at, _, bytes)| (at, at + bytes)));
+        sure.extend(deferred.backs.iter().map(|&(_, at, [row, rows, pitch])| {
+            (at, at + rows.saturating_sub(1) * pitch + row)
+        }));
+    }
+    // Without the wide declared ones, for what the fills read.
+    let narrow: Option<Vec<(usize, usize)>> = (wide > 0 || classify).then(|| {
+        let mut narrow: Vec<(usize, usize)> = Vec::new();
+        let under = if wide > 0 { wide } else { 4 << 20 };
+        let small = declared.iter().copied().filter(|r| r.1 - r.0 < under);
+        join_ranges(&mut narrow, small.chain(sure.iter().copied()));
+        narrow
+    });
+    let mut joined = Vec::new();
+    join_ranges(&mut joined, declared.into_iter().chain(sure));
+    if blocked_by(&joined, next, false).is_none() {
+        return None;
+    }
+    match narrow {
+        // (Fills judged by the narrow ones: if nothing else stands in the way, it joins, with the switch on.)
+        Some(narrow) if blocked_by_for(&joined, &narrow, next, false).is_none() => {
+            (wide == 0).then_some(NoJoin::WideOnly)
+        }
+        _ => Some(NoJoin::Written),
+    }
+}
 /// Whether a bottom-of-pipe write of `list` meets `wait`.
 pub(crate) fn will_meet(list: &HostList, wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
@@ -12715,6 +12805,82 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+    };
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// A part whose fill reads upload memory inside a range that the part in front declares writable is refused;
+    /// with `VICTORY_JOIN_WIDE_MB` it is joined when the range is that wide, and only then; every other kind of
+    /// read, and a copy of title memory, keep it out whatever the width.
+    #[test]
+    fn a_fill_inside_a_wide_declaration_joins_only_when_asked_and_nothing_else_does() {
+        let Some(host) = host() else {
+            return;
+        };
+        const LEN: usize = 16 << 20;
+        // SAFETY: memory of our own, never freed.
+        let start = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                LEN,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(start, 0);
+        crate::shadow::register(0x6a11, start as u64, (LEN / 2) as u64, false);
+        let copy = crate::shadow::find(start as u64, 64).unwrap();
+        // In front: shaders may write the first 8 MiB; or one 64 KiB range of it.
+        let wide_list = host.new_list().unwrap();
+        copy.gpu_writes(&wide_list, start as u64, (LEN / 2) as u64);
+        wide_list.close();
+        let narrow_list = host.new_list().unwrap();
+        copy.gpu_writes(&narrow_list, (start + (1 << 20) - 4096) as u64, 64 << 10);
+        narrow_list.close();
+        let nothing = host.new_list().unwrap();
+        nothing.close();
+        // Behind: a fill of upload memory from 1 MiB into the copy; a copy of title memory.
+        let fills = host.new_list().unwrap();
+        let (staging, staged) = fills.upload(host, 4096).unwrap();
+        fills.defer_fill_buffer(&staging, staged, (start + (1 << 20)) as *const u8, 500);
+        fills.close();
+        let copies = host.new_list().unwrap();
+        copies.defer_copy(
+            (start + LEN / 2 + 4096) as *mut u8,
+            (start + 4096) as *const u8,
+            64,
+        );
+        copies.close();
+        let four = 4 << 20;
+        let no = |ahead: &HostList, next: &HostList, wide: usize, classify: bool| {
+            join_refusal_with(std::iter::once(ahead), &[next], wide, classify)
+        };
+        // As before: the wide range keeps the fill out; told apart when asked to.
+        assert_eq!(no(&wide_list, &fills, 0, false), Some(NoJoin::Written));
+        assert_eq!(no(&wide_list, &fills, 0, true), Some(NoJoin::WideOnly));
+        // Asked: it joins.
+        assert_eq!(no(&wide_list, &fills, four, false), None);
+        assert_eq!(no(&wide_list, &fills, four, true), None);
+        // A range under the width still keeps it out, as it is read.
+        assert_eq!(no(&narrow_list, &fills, four, false), Some(NoJoin::Written));
+        // A range of the width that the fill does not read does not matter, and neither does nothing in front.
+        assert_eq!(no(&nothing, &fills, four, false), None);
+        assert_eq!(no(&nothing, &fills, 0, false), None);
+        // A copy of title memory is never joined, wide or not.
+        assert_eq!(
+            no(&wide_list, &copies, four, false),
+            Some(NoJoin::CopyOrRun)
+        );
+        assert_eq!(no(&nothing, &copies, four, false), Some(NoJoin::CopyOrRun));
+        assert!(!joinable(std::iter::once(&wide_list), &[&copies]));
     }
 }
 

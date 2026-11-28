@@ -135,7 +135,7 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 }
 
 /// Whether `shaders` hold one of the title's programs that shade ray-tracing hits.
-pub(super) fn is_resolve(shaders: &[Arc<Shader>]) -> bool {
+pub(super) fn shaders_are_resolve(shaders: &[Arc<Shader>]) -> bool {
     named(shaders, b"CS_RaytracingResolve")
 }
 

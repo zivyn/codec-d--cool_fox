@@ -932,7 +932,7 @@ fn hand_out(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
-    let rt_resolve = make::is_resolve(&shaders);
+    let rt_resolve = make::shaders_are_resolve(&shaders);
     #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.

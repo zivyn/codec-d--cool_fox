@@ -4,7 +4,9 @@
 //! is code every lane runs, so the two host waves exchange in it. Taken only where no branch of
 //! the form can hang the thread group ([`super::wide_class`]): a group barrier under a branch that
 //! the waves of a group may decide differently is how the device was lost.
-//! The form is out unless `VICTORY_KEPT_SKIPS_WIDE=1` (the safe classes) or `=all` (whatever the classes say).
+//! The form is out unless `VICTORY_KEPT_SKIPS_WIDE=1` (the classes and the audit with memory reads
+//! taken as alike), `=audited` (what the audit proves clean, nested loops with a barrier bounded),
+//! `=strict`, `=classes` or `=all` (whatever the classes say).
 
 use super::form::{self, Mode};
 use super::hang;
@@ -20,6 +22,21 @@ pub(super) fn applicable(p: &ir::Program) -> bool {
         && (!ir::drop_early_outs_as(p, true).1.is_empty()
             || !ir::drop_skips_as(p, false, true).1.is_empty()
             || !ir::drop_skips_as(p, true, true).1.is_empty())
+}
+
+/// `VICTORY_KEPT_SKIPS_ONLY=<hex>[,<hex>...]` with `=audited`: only the programs whose container
+/// hash starts with one of these (the digits of `#...` in the translate listing and in the audit's
+/// lines) take the form: the programs a pilot names, not a list the code keeps. Unset: every program
+/// the audit takes.
+fn named(tag: u32) -> bool {
+    named_in(tag, std::env::var("VICTORY_KEPT_SKIPS_ONLY").ok().as_deref())
+}
+
+/// [`named`] for the switch's value `only` (None: unset). Pure, for testing.
+pub(super) fn named_in(tag: u32, only: Option<&str>) -> bool {
+    let Some(only) = only else { return true };
+    let digits = format!("{:07x}", tag & 0x0FFF_FFFF);
+    only.split(',').map(str::trim).filter(|p| !p.is_empty()).any(|p| digits.starts_with(&p.to_ascii_lowercase()))
 }
 
 /// The program's translation with its kept skips wave-wide, if it lowers that way and every
@@ -49,7 +66,16 @@ pub(super) fn attempt(
         }
         let base = program.as_ref().unwrap_or(p);
         hang::audit_from_now_on();
+        // (the audited form bounds the loops that hold a barrier in a loop that holds one, so that
+        // the audit's "no barrier a thread can miss" is not paid for in seconds: `hang::NESTED_LOOP_LIMIT`)
+        hang::bound_nested_loops(mode == Mode::Audited);
+        // (with the guard on, the form is audited as the program has it, and made again with the
+        // guard's counters where the audit takes it)
+        let guarded = hang::guard().is_some();
+        hang::audit_without_the_guard(guarded);
         let r = widen_seeded(c, native, base, why, false, &kept);
+        hang::audit_without_the_guard(false);
+        hang::bound_nested_loops(false);
         hang::stop_auditing();
         if !done(&r) {
             continue;
@@ -62,8 +88,14 @@ pub(super) fn attempt(
         let audited = match mode {
             Mode::Safe => audit.as_ref().is_none_or(|a| a.safe(true)),
             Mode::Strict => audit.as_ref().is_none_or(|a| a.safe(false) && a.nest <= 1),
+            // (no barrier behind a branch that differs, or that reads memory: every thread of the
+            // group passes each barrier the same number of times; loops with a barrier that waits
+            // for the group nest two deep at most, the inner one bounded; the waits of the two
+            // host waves of a console wave, cheap a round, nest as they do)
+            Mode::Audited => audit.as_ref().is_none_or(|a| a.safe(false) && a.barrier_nest <= 2),
             _ => true,
         };
+        let audited = audited && (mode != Mode::Audited || named(super::lower::program_tag()));
         let safe = mode == Mode::All || wide_class::safe(&classes) && audited;
         if why {
             eprintln!(
@@ -80,6 +112,17 @@ pub(super) fn attempt(
             );
         }
         if safe {
+            if guarded {
+                hang::bound_nested_loops(mode == Mode::Audited);
+                let with_guard = widen_seeded(c, native, base, why, false, &kept);
+                hang::bound_nested_loops(false);
+                if done(&with_guard) {
+                    return Some(with_guard);
+                }
+                if why {
+                    eprintln!("WAVE64-WIDE-CLASS ~{} the form did not lower with the guard's counters", code_digits(c));
+                }
+            }
             return Some(r);
         }
     }

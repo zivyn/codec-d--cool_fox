@@ -78,6 +78,36 @@ enum Body {
     /// Two skips in a row: the lanes below 40 go on from the first region into a loop of two rounds,
     /// the others leave (so a half may have no lane for the second region).
     TwoSkips,
+    /// A serial walk: a loop of as many rounds as the second root constant says (`s1`, 0 rounds
+    /// skip it), the same for every lane and every half, one exchange in each round (the shape of
+    /// a list walked by one lane for a count read from the data).
+    Serial,
+    /// The walk with a retry loop in each round: `s1` rounds, each a loop of `s2` rounds (at least
+    /// one) with an exchange in each (a compare-and-swap that the lanes repeat until it takes).
+    SerialNested,
+}
+
+/// A loop of the counter `s<counter>` against the root constant `s<limit>`, round `body`.
+fn counted(counter: u32, limit: u32, body: &[u32]) -> Vec<u32> {
+    let mut w = vec![0xBE80_0380 | counter << 16]; // s_mov_b32 s<counter>, 0
+    w.extend_from_slice(body);
+    w.extend_from_slice(&[
+        0x8000_8100 | counter << 16 | counter, // s_add_u32 s<counter>, s<counter>, 1
+        0xBF0A_0000 | limit << 8 | counter,    // s_cmp_lt_u32 s<counter>, s<limit>
+        0xBF85_0000 | (-(body.len() as i32 + 3) as u16 as u32), // s_cbranch_scc1 back to the round
+    ]);
+    w
+}
+
+/// `counted`, skipped when `s<limit>` is 0.
+fn counted_or_none(counter: u32, limit: u32, body: &[u32]) -> Vec<u32> {
+    let l = counted(counter, limit, body);
+    let mut w = vec![
+        0xBF06_8000 | limit,                 // s_cmp_eq_u32 s<limit>, 0
+        0xBF85_0000 | l.len() as u32,        // s_cbranch_scc1 past the loop
+    ];
+    w.extend(l);
+    w
 }
 
 /// `v4 = v0 + 1; lds[t] = v4; out[t] = lds[(t + 16) & 63]`.
@@ -141,6 +171,11 @@ fn region(body: Body) -> Vec<u32> {
                 0xBF88_0000 | second.len() as u32, // s_cbranch_execz past the second region
             ]);
             w.extend(second);
+        }
+        Body::Serial => w.extend(counted_or_none(21, 1, &exchange_words())),
+        Body::SerialNested => {
+            let inner = counted(21, 2, &exchange_words());
+            w.extend(counted_or_none(22, 1, &inner));
         }
         Body::Counted => {
             w.push(0xBE95_0380); // s_mov_b32 s21, 0
@@ -372,6 +407,197 @@ fn the_audit_sees_every_problem_the_model_finds_in_every_form() {
     found.done();
 }
 
+/// The serial walks (the loop of a list walked by the lanes below `s0`, for a count from the data,
+/// alone and with a retry loop in each round), as a skip and as an early-out.
+fn walks() -> Vec<(Over, Body)> {
+    let mut v = Vec::new();
+    for over in [Over::Skip, Over::EarlyOut] {
+        for body in [Body::Serial, Body::SerialNested] {
+            v.push((over, body));
+        }
+    }
+    v
+}
+
+/// The walk in the audited kept skips' form.
+fn walk_module(over: Over, body: Body, mode: Mode) -> (Form, Module) {
+    let native = lane_branch(over, body, 64, false);
+    let (result, form, module) = lowered(&native, mode, None);
+    assert!(result.is_ok(), "{over:?} {body:?} {mode:?}: {:?}", result.err());
+    (form, module.expect("a module"))
+}
+
+/// The barriers every thread passed, which must be the same list for all of them.
+fn walk_barriers(module: &Module, s0: u32, count: u32, retries: u32, seed: u64) -> usize {
+    let report = sim::run(module, 64, &[s0, count, retries, 0], seed)
+        .unwrap_or_else(|e| panic!("s0={s0} count={count} retries={retries}: {e}"));
+    assert!(
+        report.problems.is_empty() && report.alike(),
+        "s0={s0} count={count} retries={retries} seed={seed}: {:?} alike={}",
+        report.problems,
+        report.alike()
+    );
+    report.barriers[0].len()
+}
+
+/// A walk whose count and retries come from the data, in the audited form: the audit takes it
+/// (and the loops nest two deep, which `strict` does not take), and in the model every thread of
+/// the group passes the same barriers whatever the count, the retries and the lanes that have work
+/// (none, one, one half, all), with every interleaving tried.
+#[test]
+fn the_audited_form_takes_the_serial_walks_and_every_thread_passes_the_same_barriers() {
+    for (over, body) in walks() {
+        let (form, module) = walk_module(over, body, Mode::Audited);
+        assert_eq!(form, Form::KeptSkipsWide, "{over:?} {body:?}: {}", module.audit_barriers().describe());
+        let audit = module.audit_barriers();
+        assert!(audit.safe(false) && audit.nest <= 2, "{over:?} {body:?}: {}", audit.describe());
+        if body == Body::SerialNested {
+            assert_eq!(audit.nest, 2, "{}", audit.describe());
+            let (_, strict, _) = lowered(&lane_branch(over, body, 64, false), Mode::Strict, None);
+            assert_ne!(strict, Form::KeptSkipsWide, "strict takes loops two deep");
+        }
+        for s0 in [0, 1, 16, 32, 33, 48, 64] {
+            for count in [0, 1, 3, 9] {
+                for retries in [1, 2, 5] {
+                    for seed in 1..=2 {
+                        walk_barriers(&module, s0, count, retries, seed);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The loop ends as soon as no lane has work and by its own count: with no lane in the branch (the
+/// data not there, all lanes empty) the group passes no barrier of the walk, whatever the count; with lanes it
+/// passes the same number in each round and ends after the count's rounds (the exit is the scalar
+/// count's: the same in every thread, so the halves leave in the same round).
+#[test]
+fn the_serial_walk_ends_with_the_lanes_and_by_its_count() {
+    for (over, body) in walks() {
+        let (_, module) = walk_module(over, body, Mode::Audited);
+        // (what the program passes outside the walk, with no lane in it and no round)
+        let outside = walk_barriers(&module, 0, 0, 1, 3);
+        for count in [0, 1, 5, 4000] {
+            assert_eq!(walk_barriers(&module, 0, count, 1, 3), outside, "{over:?} {body:?}: lanes empty, count {count}");
+        }
+        for s0 in [1, 32, 33, 64] {
+            let none = walk_barriers(&module, s0, 0, 1, 3);
+            let per_round = walk_barriers(&module, s0, 1, 1, 3) - none;
+            assert!(per_round > 0, "{over:?} {body:?} s0={s0}: no barrier in a round");
+            for count in [2, 3, 9] {
+                assert_eq!(
+                    walk_barriers(&module, s0, count, 1, 3),
+                    none + count as usize * per_round,
+                    "{over:?} {body:?} s0={s0}: {count} rounds"
+                );
+            }
+        }
+    }
+}
+
+/// A module by hand: loops three deep around the wait of the two host waves of a console wave, and
+/// a barrier that waits for the group in the innermost one only if `group`.
+fn deep_wait_module(group: bool) -> Module {
+    let mut s = Shader::new(false);
+    s.threads = Some([128, 1, 1]);
+    let (e, void) = (s.entry, s.t.void);
+    let c = s.m.bool(true);
+    let (h1, h2, h3, l3, l2, l1, end) = (
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+        s.m.new_block(),
+    );
+    s.m.terminate(e, Term::Br(h1));
+    s.m.terminate(h1, Term::Br(h2));
+    s.m.terminate(h2, Term::Br(h3));
+    s.m.mark_wait(h3);
+    if group {
+        let mode = s.m.i32(9);
+        s.op(h3, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+    s.m.terminate(h3, Term::Br(l3));
+    s.m.terminate(l3, Term::CondBr(c, h3, l2));
+    s.m.terminate(l2, Term::CondBr(c, h2, l1));
+    s.m.terminate(l1, Term::CondBr(c, h1, end));
+    s.m.terminate(end, Term::Ret);
+    s.m
+}
+
+/// The loops that hold only the waits of the two host waves of a console wave (cheap a round) are
+/// told from the loops that hold a barrier that waits for the group (a round costs the barrier): the
+/// audited form allows the first three deep and the second two deep.
+#[test]
+fn the_audit_counts_the_loops_of_group_barriers_apart_from_those_of_the_hosts_waits() {
+    let waits = deep_wait_module(false).audit_barriers();
+    assert!(waits.safe(false) && waits.nest == 3 && waits.barrier_nest == 0 && waits.waits == 1, "{}", waits.describe());
+    let both = deep_wait_module(true).audit_barriers();
+    assert!(both.safe(false) && both.nest == 3 && both.barrier_nest == 3, "{}", both.describe());
+}
+
+/// With the guard on the audited form is the same form: audited as the program has it, made with the
+/// guard's counters in place of the barriers, and every thread of the group still passes the same
+/// waits and stores whatever the count.
+#[test]
+fn the_audited_form_is_taken_with_the_guard_on_too() {
+    let guard = hang::Guard { spins: 1 << 12, budget: 1 << 16, loops: 1 << 10 };
+    for (over, body) in walks() {
+        let native = lane_branch(over, body, 64, false);
+        let (plain, plain_form, plain_module) = lowered(&native, Mode::Audited, None);
+        let (guarded, form, module) = lowered(&native, Mode::Audited, Some(guard));
+        assert!(plain.is_ok() && guarded.is_ok(), "{over:?} {body:?}");
+        assert_eq!((plain_form, form), (Form::KeptSkipsWide, Form::KeptSkipsWide), "{over:?} {body:?}");
+        let (plain_module, module) = (plain_module.expect("a module"), module.expect("a module"));
+        assert!(module.listing().len() > plain_module.listing().len(), "the guard's counters are in the form");
+        for s0 in [0, 1, 32, 64] {
+            for count in [0, 2, 5] {
+                let a = sim::run(&plain_module, 64, &[s0, count, 2, 0], 5).expect("run");
+                let b = sim::run(&module, 64, &[s0, count, 2, 0], 5).unwrap_or_else(|e| panic!("{over:?} {body:?} guarded: {e}"));
+                assert!(b.problems.is_empty(), "{over:?} {body:?} s0={s0} count={count}: {:?}", b.problems);
+                assert_eq!(a.stores, b.stores, "{over:?} {body:?} s0={s0} count={count}: the guard changed what is stored");
+            }
+        }
+    }
+}
+
+/// `VICTORY_KEPT_SKIPS_ONLY`: unset, every program; set, those whose hash starts with one of the
+/// digits named (in any case, spaces around the commas allowed), and none if it names nothing.
+#[test]
+fn the_audited_form_can_be_asked_for_by_program() {
+    let tag = 0xF000_0000 | 0x0238_4A6;
+    assert!(super::kept_wide::named_in(tag, None));
+    assert!(super::kept_wide::named_in(tag, Some("02384a6")));
+    assert!(super::kept_wide::named_in(tag, Some("2233808, 0238")));
+    assert!(super::kept_wide::named_in(tag, Some("02384A")));
+    assert!(!super::kept_wide::named_in(tag, Some("2233808,d89ff74")));
+    assert!(!super::kept_wide::named_in(tag, Some("")));
+}
+
+/// A retry loop that never ends (the data not there, a compare that never takes) is cut at
+/// [`hang::NESTED_LOOP_LIMIT`] rounds in the audited form: the barriers of the walk are the count's
+/// times that many, not the square of the loop limit; without the bound (`strict` is not taken, the
+/// classes alone take it) the same inputs pass more.
+#[test]
+fn a_retry_loop_in_the_audited_form_is_cut_at_its_bound() {
+    let (_, bounded) = walk_module(Over::Skip, Body::SerialNested, Mode::Audited);
+    let (form, unbounded) = walk_module(Over::Skip, Body::SerialNested, Mode::Classes);
+    assert_eq!(form, Form::KeptSkipsWide);
+    let limit = hang::NESTED_LOOP_LIMIT as usize;
+    for (module, cut) in [(&bounded, true), (&unbounded, false)] {
+        let one = walk_barriers(module, 1, 3, 1, 4);
+        let two = walk_barriers(module, 1, 3, 2, 4);
+        let per_retry = (two - one) / 3;
+        assert!(per_retry > 0);
+        let many = walk_barriers(module, 1, 3, 200, 4);
+        let rounds = if cut { limit } else { 200 };
+        assert_eq!(many, one + 3 * (rounds - 1) * per_retry, "cut={cut}: {many} barriers for 3 x 200 retries");
+    }
+}
+
 /// A module by hand: a branch on the thread's own parity, a barrier on one side (and on the
 /// other, if `both`), and one after the join.
 fn parity_module(both: bool, together: bool) -> Module {
@@ -414,6 +640,39 @@ fn the_audit_and_the_model_see_a_barrier_behind_a_branch_on_the_threads_own_valu
     }
     let module = parity_module(false, true);
     assert!(module.audit_barriers().differs.is_empty(), "a decision the group exchanged was flagged");
+}
+
+/// A module by hand: a branch on the thread's own parity to a block that ends the program (what a
+/// loop's limit does to a thread that reaches it), and a barrier after the join.
+fn cut_module(marked: bool) -> Module {
+    let mut s = Shader::new(false);
+    s.threads = Some([64, 1, 1]);
+    let (e, i32t, void) = (s.entry, s.t.i32, s.t.void);
+    let flat = s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+    let (one, zero) = (s.m.i32(1), s.m.i32(0));
+    let bit = s.m.bin(e, Bin::And, flat, one);
+    let c = s.m.cmp(e, pred::NE, bit, zero);
+    let (cut, join) = (s.m.new_block(), s.m.new_block());
+    if marked {
+        s.m.mark_abort(cut);
+    }
+    s.m.terminate(e, Term::CondBr(c, cut, join));
+    s.m.terminate(cut, Term::Ret);
+    let mode = s.m.i32(9);
+    s.op(join, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    s.m.terminate(join, Term::Ret);
+    s.m
+}
+
+/// A thread that a loop's limit cuts leaves the program: that is an error path, not a branch the
+/// audit follows (every loop of the program has one, and with them every barrier after a loop would
+/// be a finding). The same exit that is not the limit's is a finding.
+#[test]
+fn the_exit_of_a_thread_cut_by_a_loops_limit_is_no_flow_of_the_program() {
+    let cut = cut_module(true).audit_barriers();
+    assert!(cut.safe(false) && cut.cuts == 1, "{}", cut.describe());
+    let other = cut_module(false).audit_barriers();
+    assert!(!other.safe(true) && other.cuts == 0, "{}", other.describe());
 }
 
 /// With the guard on, a barrier is counters and a wait: the shapes still pass the same barriers

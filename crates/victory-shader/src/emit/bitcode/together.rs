@@ -51,6 +51,16 @@ pub(crate) struct Audit {
     /// limit costs the limit's number of barriers; in a loop in a loop, its square).
     pub loops: usize,
     pub nest: usize,
+    /// How deep the loops with a barrier that waits for the group nest (without the loops that
+    /// only hold the waits of the host waves of a console wave, which cost little a round).
+    pub barrier_nest: usize,
+    /// The branches to a loop's limit exit (a thread that reaches the limit leaves the program):
+    /// left out of the control flow the audit follows, since a loop that reaches its limit has
+    /// stopped doing what the program does. Without the limit's exits every barrier below is
+    /// reached by every thread; a thread cut at the limit leaves before the barriers after it, as
+    /// it does in every form of the program that has loops (the hardware counts a thread that
+    /// has left as arrived).
+    pub cuts: usize,
     /// Barriers in the region of a branch whose condition [`Level::Differs`].
     pub differs: Vec<Finding>,
     /// Barriers in the region of a branch on a value read from memory ([`Level::Loaded`]).
@@ -74,9 +84,10 @@ impl Audit {
         };
         let pair = |v: &[Finding]| v.iter().filter(|f| f.why.starts_with("(pair wait)")).count();
         format!(
-            "barriers={} waits={} (pair differs {}, loaded {}) loops={} nest={} differs={} [{}] loaded={} [{}]",
+            "barriers={} waits={} cuts={} (pair differs {}, loaded {}) loops={} nest={} differs={} [{}] loaded={} [{}]",
             self.barriers,
             self.waits,
+            self.cuts,
             pair(&self.differs),
             pair(&self.loaded),
             self.loops,
@@ -151,6 +162,11 @@ impl Module {
         self.waits.push(b);
     }
 
+    /// Marks block `b` as the one a thread stopped by a loop's iteration limit leaves through.
+    pub fn mark_abort(&mut self, b: usize) {
+        self.aborts.push(b);
+    }
+
     /// The names of the functions a call of `f` goes to.
     fn func_name(&self, f: u32) -> &str {
         &self.funcs[f as usize].name
@@ -160,12 +176,14 @@ impl Module {
     /// keep threads of the group from them.
     pub(crate) fn audit_barriers(&self) -> Audit {
         let mut audit = self.audit_with(false);
+        audit.barrier_nest = audit.nest;
         if !self.waits.is_empty() {
             let pair = self.audit_with(true);
             audit.waits = pair.barriers;
             let tell = |f: Finding| Finding { why: format!("(pair wait) {}", f.why), ..f };
             audit.differs.extend(pair.differs.into_iter().map(tell));
             audit.loaded.extend(pair.loaded.into_iter().map(tell));
+            audit.cuts = audit.cuts.max(pair.cuts);
             audit.loops = audit.loops.max(pair.loops);
             audit.nest = audit.nest.max(pair.nest);
         }
@@ -187,8 +205,14 @@ impl Module {
         }
         seen[0] = true;
         let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let is_abort = |b: usize| self.aborts.contains(&b);
         while let Some(b) = stack.pop() {
             for &s in super::successors(self.blocks[b].term).iter() {
+                // (the exit of a thread cut by a loop's limit is no flow of the program)
+                if is_abort(s) {
+                    audit.cuts += 1;
+                    continue;
+                }
                 succ[b].push(s);
                 if !seen[s] {
                     seen[s] = true;
@@ -347,6 +371,10 @@ impl Module {
                     }
                 }
                 if let Some(Term::CondBr(c, t, f)) = blk.term {
+                    // (a loop's limit check: the back edge, or out of the program)
+                    if is_abort(t) || is_abort(f) {
+                        continue;
+                    }
                     let l = level_of(&level, c);
                     if l > branch_level[b] {
                         branch_level[b] = l;

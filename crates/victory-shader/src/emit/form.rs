@@ -57,6 +57,12 @@ pub(super) enum Mode {
     Strict,
     /// `=classes`: the classes alone (what `=1` was before the audit).
     Classes,
+    /// `=audited`: only what the audit of the emitted control flow proves clean: as `Strict`
+    /// (no barrier behind a branch that differs or is read from memory), and every loop that
+    /// holds a group barrier ends by a condition all the threads of the group agree on, or is
+    /// bounded (nested ones cut at the group's size), so that it cannot run to its limit with a
+    /// barrier in each round. `VICTORY_KEPT_SKIPS_ONLY=<hash digits>,...` names the programs.
+    Audited,
     /// `=all`: whatever the classes say (to see the form the title lost the card in).
     All,
 }
@@ -77,12 +83,14 @@ pub(super) fn kept_skips_mode() -> Mode {
         Some("all") => Mode::All,
         Some("strict") => Mode::Strict,
         Some("classes") => Mode::Classes,
+        Some("audited") => Mode::Audited,
         Some("1") => Mode::Safe,
         _ => Mode::Off,
     }
 }
 
-/// [`kept_skips_mode`] as a number for the shader cache key (0 off, 1 safe, 2 all, 3 strict, 4 classes).
+/// [`kept_skips_mode`] as a number for the shader cache key (0 off, 1 safe, 2 all, 3 strict,
+/// 4 classes, 5 audited).
 pub(super) fn kept_skips_code() -> u8 {
     match kept_skips_mode() {
         Mode::Off => 0,
@@ -90,6 +98,7 @@ pub(super) fn kept_skips_code() -> u8 {
         Mode::All => 2,
         Mode::Strict => 3,
         Mode::Classes => 4,
+        Mode::Audited => 5,
     }
 }
 

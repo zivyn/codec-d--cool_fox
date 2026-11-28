@@ -112,6 +112,9 @@ pub(crate) struct Shadow {
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
+    /// The pages of title memory noted written since the copy took them
+    /// (`VICTORY_PAGE_REFRESH`, [`crate::pagedrive`]).
+    ledger: Arc<crate::pagedrive::Ledger>,
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
@@ -3166,6 +3169,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        crate::pagedrive::retire(&self.ledger);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3621,6 +3625,177 @@ mod narrow_tests {
         // SAFETY: ours.
         unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
     }
+    /// One copy of the model's memory, refreshed in a mode of `VICTORY_PAGE_REFRESH` (the side is where its bytes are).
+    struct One {
+        side: Vec<u8>,
+        copy: std::sync::Arc<Shadow>,
+        mode: u8,
+        live: bool,
+    }
+
+    fn one(at: usize, n: usize, mode: u8) -> One {
+        let mut side = vec![0u8; n * PAGE];
+        let copy = Shadow::unbacked(at as u64, side.as_mut_ptr(), (n * PAGE) as u64, false);
+        One { side, copy, mode, live: true }
+    }
+
+    /// `update`, in the copy's mode.
+    fn refresh(c: &One, address: usize, len: usize) -> usize {
+        crate::pagedrive::force_mode(Some(c.mode));
+        let copied = c.copy.update(address, len);
+        crate::pagedrive::force_mode(None);
+        copied
+    }
+
+    /// Three copies of write-watched memory (the walk, the walk with the ledger beside it, the ledger) refreshed in
+    /// the same random ranges over many rounds, with the title writing between them, an asking that stands now and
+    /// then, and more copies made and retired on the way: each ends as title memory is wherever it was refreshed, the
+    /// three answer a look the same way, and the shadow check never finds a page stale by the journal that the ledger
+    /// lacks.
+    #[test]
+    fn a_refresh_driven_by_the_ledger_ends_as_the_walk_does_and_the_check_misses_nothing() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 24;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let write = |page: usize, offset: usize, byte: u8| {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + offset) as *mut u8).write_volatile(byte) }
+        };
+        let title = |from: usize, len: usize| -> Vec<u8> {
+            // SAFETY: inside the allocation.
+            unsafe { std::slice::from_raw_parts((at + from) as *const u8, len) }.to_vec()
+        };
+        let missed_before = crate::pagedrive::missed_total();
+        let compared_before = crate::pagedrive::compared_total();
+        let mut copies = vec![one(at, N, 0), one(at, N, 1), one(at, N, 2)];
+        let mut seed = 0x5eed_1234_abcd_u64;
+        let mut random = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 8) as usize
+        };
+        let mut byte = 0u8;
+        for round in 0..400 {
+            // The title writes, in pages at random (some more than once between two refreshes).
+            for _ in 0..1 + random() % 5 {
+                byte = byte.wrapping_add(1).max(1);
+                write(random() % N, 5 + random() % 4000, byte);
+            }
+            let from = random() % N;
+            let to = (from + 1 + random() % 6).min(N);
+            let (a, len) = (at + from * PAGE, (to - from) * PAGE);
+            let asking = random() % 2 == 0;
+            if asking {
+                crate::watch::ask_once(&[(a, a + len)]);
+            }
+            for c in copies.iter().filter(|c| c.live) {
+                refresh(c, a, len);
+            }
+            if asking {
+                crate::watch::ask_once_end();
+            }
+            let wanted = title(from * PAGE, len);
+            for (i, c) in copies.iter().enumerate().filter(|(_, c)| c.live) {
+                assert!(c.side[from * PAGE..to * PAGE] == wanted[..], "round {round}: copy {i} (mode {}) does not hold what the title holds in pages {from}..{to}", c.mode);
+            }
+            // The looks, with the asking standing: the three copies of one history say the same.
+            if round % 3 == 0 {
+                let (la, ll) = (at + (random() % N) * PAGE, PAGE * (1 + random() % 3));
+                let ll = ll.min(at + N * PAGE - la);
+                crate::watch::ask_once(&[(la, la + ll)]);
+                let before = crate::watch::covered(la, la + ll);
+                let answers: Vec<bool> = copies[..3]
+                    .iter()
+                    .map(|c| {
+                        crate::pagedrive::force_mode(Some(c.mode));
+                        let same = c.copy.nothing_new(la, ll);
+                        crate::pagedrive::force_mode(None);
+                        same
+                    })
+                    .collect();
+                let after = crate::watch::covered(la, la + ll);
+                crate::watch::ask_once_end();
+                if before && after {
+                    assert!(answers[0] == answers[1] && answers[1] == answers[2], "round {round}: looks at {la:#x}+{ll:#x} say {answers:?} in the three modes");
+                }
+            }
+            // More copies made (of everything, never taken), and the older of those retired.
+            if round % 40 == 39 {
+                copies.push(one(at, N, 2));
+                copies.push(one(at, N, 1));
+                let old: Vec<usize> = (3..copies.len()).filter(|&i| copies[i].live).collect();
+                if old.len() > 4 {
+                    let i = old[random() % old.len()];
+                    crate::pagedrive::retire(copies[i].copy.ledger());
+                    copies[i].live = false;
+                }
+            }
+        }
+        // Everything, once more, and every copy is the title's memory.
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        for c in copies.iter().filter(|c| c.live) {
+            refresh(c, at, N * PAGE);
+        }
+        crate::watch::ask_once_end();
+        let wanted = title(0, N * PAGE);
+        for (i, c) in copies.iter().enumerate().filter(|(_, c)| c.live) {
+            assert!(c.side == wanted, "copy {i} (mode {}) does not end as the title's memory is", c.mode);
+        }
+        assert_eq!(crate::pagedrive::missed_total(), missed_before, "the journal says pages stale that the ledger does not hold");
+        assert!(crate::pagedrive::compared_total() > compared_before, "the shadow check compared nothing");
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Where shaders may write, a refresh leaves the copy alone, in every mode, and the pages the title wrote there
+    /// stay stale in the ledger as in the journal, until the flight is done: then the next refresh brings them.
+    #[test]
+    fn what_the_title_wrote_under_a_flights_range_waits_in_the_ledger_for_the_flight_to_land() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(crate::safecopy::on());
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const N: usize = 8;
+        // SAFETY: memory of ours, released at the end.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), N * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(at, 0);
+        let write = |page: usize, offset: usize, byte: u8| {
+            // SAFETY: inside the allocation.
+            unsafe { ((at + page * PAGE + offset) as *mut u8).write_volatile(byte) }
+        };
+        let copies = vec![one(at, N, 0), one(at, N, 1), one(at, N, 2)];
+        let missed_before = crate::pagedrive::missed_total();
+        for c in &copies {
+            refresh(c, at, N * PAGE);
+            // Shaders may write the second half.
+            c.copy.pending.lock().unwrap().push((at + 4 * PAGE, at + 8 * PAGE));
+        }
+        write(2, 1, 11);
+        write(5, 2, 22);
+        crate::watch::ask_once(&[(at, at + N * PAGE)]);
+        for c in &copies {
+            crate::pagedrive::force_mode(Some(c.mode));
+            assert!(c.copy.stale_under_writes(at + 4 * PAGE, 4 * PAGE), "mode {}: the title wrote page 5 under the flight's range", c.mode);
+            crate::pagedrive::force_mode(None);
+            refresh(c, at, N * PAGE);
+            assert_eq!(c.side[2 * PAGE + 1], 11, "mode {}: the page outside the range", c.mode);
+            assert_eq!(c.side[5 * PAGE + 2], 0, "mode {}: the page under the flight's range is left alone", c.mode);
+        }
+        // The flight is done: the page the title wrote under it is taken.
+        for c in &copies {
+            c.copy.pending.lock().unwrap().clear();
+            refresh(c, at, N * PAGE);
+            assert_eq!(c.side[5 * PAGE + 2], 22, "mode {}: the page under the range is taken when it is free", c.mode);
+        }
+        crate::watch::ask_once_end();
+        assert_eq!(crate::pagedrive::missed_total(), missed_before);
+        // SAFETY: ours.
+        unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
+    }
 }
 
 #[cfg(test)]
@@ -3869,6 +4044,11 @@ impl Shadow {
         self.id
     }
 
+    /// The pages noted written since the copy took them (`crate::pagedrive`).
+    pub(crate) fn ledger(&self) -> &crate::pagedrive::Ledger {
+        &self.ledger
+    }
+
     /// Whether it is no copy but title memory in place (`crate::inplace`).
     pub(crate) fn in_place(&self) -> bool {
         self.place.is_some()
@@ -3893,6 +4073,8 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        // Nothing refreshes it.
+        crate::pagedrive::retire(&shadow.ledger);
         shadow
     }
 
@@ -3913,6 +4095,8 @@ impl Shadow {
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
         Shadow {
             landings: Mutex::default(),
             landing: Default::default(),
@@ -3942,10 +4126,8 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
-            id: {
-                static NEXT: AtomicU64 = AtomicU64::new(1);
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            },
+            id,
+            ledger: crate::pagedrive::ledger_of(start, len, id),
             card: None,
             window: false,
             changes_only: Default::default(),
@@ -4449,9 +4631,10 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
+        let mode = crate::pagedrive::mode();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+        busy.into_iter().any(|(a, e)| match crate::watch::asked_with(a, e, mode != 2) {
+            Some((_, written)) => !self.stale_by_mode(mode, base, &copied, a, e, &written).is_empty(),
             None => true,
         })
     }
@@ -4499,6 +4682,7 @@ impl Shadow {
         // copy in the PC's memory in the snapshot.
         let busy = if crate::watch::light() { joined(busy) } else { busy };
         let base = start / PAGE;
+        let mode = crate::pagedrive::mode();
         for (a, e) in busy {
             // What is owed there is landed before the lock is taken alone.
             crate::land::owed::land_range(a, e - a);
@@ -4509,13 +4693,13 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let detecting = std::time::Instant::now();
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = crate::watch::writes_with(a, e, true, mode != 2) else {
                 note_stale(1);
                 return true;
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+                self.stale_by_mode(mode, base, &copied, a, e, &written)
             };
             UNDER[4].fetch_add(detecting.elapsed().as_nanos() as u64, Ordering::Relaxed);
             UNDER[0].fetch_add(1, Ordering::Relaxed);
@@ -4599,10 +4783,15 @@ impl Shadow {
             drop(merging);
             {
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                let mut settles: Vec<(usize, u64)> = Vec::new();
                 for page in taken {
                     if let Some(at) = copied.get_mut(page - base) {
                         *at = now;
+                        settles.push((page, now));
                     }
+                }
+                if mode > 0 {
+                    self.ledger.settle(&settles);
                 }
             }
             UNDER[7].fetch_add(putting.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -4670,6 +4859,21 @@ impl Shadow {
             }
             Ok(Some(runs))
         })
+    }
+
+    /// The pages of `[a, e)` that the copy took before and the title wrote since, as `copied` (from page `base`) and the
+    /// journal's `written` say (`mode` 0 and 1) or the ledger says (`mode` 2: `written` is not walked); in mode 1 the
+    /// ledger's answer is compared with the journal's (`crate::pagedrive`).
+    fn stale_by_mode(&self, mode: u8, base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+        if mode == 2 {
+            return stale_pages_in(base, copied, a, e, &crate::pagedrive::written(&self.ledger, a, e));
+        }
+        let stale = stale_pages_in(base, copied, a, e, written);
+        if mode == 1 {
+            let held = stale_pages_in(base, copied, a, e, &crate::pagedrive::written(&self.ledger, a, e));
+            crate::pagedrive::compare_under(&stale, &held, (a, e));
+        }
+        stale
     }
 
     /// At submission: copies what changed of `[address, address + len)`
@@ -4770,7 +4974,17 @@ impl Shadow {
             return false;
         }
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let ranged = self.ranged(from, to);
+        // (Read once: the switch may change while the title runs.)
+        let same = match crate::pagedrive::mode() {
+            2 => crate::pagedrive::nothing_new(&self.ledger, from, to, start / PAGE, &copied, ranged),
+            1 => {
+                let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, ranged);
+                crate::pagedrive::check_look(&self.ledger, from, to, start / PAGE, &copied, ranged);
+                same
+            }
+            _ => crate::watch::nothing_new(from, to, start / PAGE, &copied, ranged),
+        };
         drop(copied);
         if same && memo {
             if crate::watch::untouched_since(from, to, tick) {
@@ -4825,11 +5039,15 @@ impl Shadow {
             return self.copy(from, to);
         }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            // (Read once: the switch may change while the title runs.)
+            let mode = crate::pagedrive::mode();
+            if let Some((now, written)) = crate::watch::writes_with(from, to, true, mode != 2) {
+                // Driven: the pages are the ledger's, not a walk of the journal's entries in the range.
+                let written = if mode == 2 { crate::pagedrive::written(&self.ledger, from, to) } else { written };
                 // (A range whose blocks rest after a write has no guard now.)
                 let guarded = crate::watch::guarded(from, to) || self.watched.load(Ordering::Relaxed) == GUARDED;
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, mode);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -5195,9 +5413,14 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], mode: u8) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        // The pages the ledger holds in the range (the shadow check, `VICTORY_PAGE_REFRESH=1`), and the entries a page
+        // taken removes (`settles`, with the copy's lock held).
+        let held = if mode == 1 { crate::pagedrive::written(&self.ledger, from, to) } else { Vec::new() };
+        let mut settles: Vec<(usize, u64)> = Vec::new();
+        let mut redundant = 0u64;
         let mut writes = written.iter().peekable();
         // Pages the range holds in part are never noted in `copied`, and
         // were copied again at every refresh of the range, written or not:
@@ -5227,6 +5450,9 @@ impl Shadow {
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                    if mode > 0 && write != 0 {
+                        settles.push((page, now));
+                    }
                 }
                 // Cut where pages taken before meet pages never taken.
                 let again = taken != 0;
@@ -5247,9 +5473,26 @@ impl Shadow {
                     run = None;
                 }
                 run.get_or_insert((page, again));
-            } else if let Some((first, known)) = run.take() {
-                runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+            } else {
+                if mode > 0 && write != 0 {
+                    // Current: an entry of the ledger that is not newer than the copy goes.
+                    settles.push((page, taken));
+                    if held.binary_search_by_key(&page, |&(p, _)| p).is_ok_and(|i| held[i].1 <= taken) {
+                        redundant += 1;
+                    }
+                }
+                if let Some((first, known)) = run.take() {
+                    runs.push(((first * PAGE).max(from), (page * PAGE).min(to), known));
+                }
             }
+        }
+        if mode > 0 {
+            if mode == 1 {
+                let journal: Vec<usize> = again_at.iter().map(|&(page, _)| page).collect();
+                crate::pagedrive::compare_refresh(&journal, &held, (from, to));
+                crate::pagedrive::extra(redundant);
+            }
+            self.ledger.settle(&settles);
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some((first, known)) = run {
@@ -5980,6 +6223,7 @@ impl Shadow {
         let held = *at != 0 && *at >= before && (clean || crate::watch::block_published(block));
         if held {
             *at = (*at).max(now);
+            self.ledger.settle(&[(block, *at)]);
         }
         held
     }

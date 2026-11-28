@@ -9710,6 +9710,8 @@ impl Batch {
             for step in &list.deferred().copies {
                 match step {
                     Step::Refresh(shadow, at, len) => {
+                        #[cfg(feature = "diagnostics")]
+                        crate::pagedrive::step_seen(shadow.ledger());
                         let key = std::sync::Arc::as_ptr(shadow) as usize;
                         if key != last {
                             copies.entry(key).or_insert_with(|| shadow.clone());
@@ -10604,6 +10606,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         spans::line(frames);
         crate::shadow::back_line(frames);
+        crate::pagedrive::line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         #[cfg(feature = "diagnostics")]

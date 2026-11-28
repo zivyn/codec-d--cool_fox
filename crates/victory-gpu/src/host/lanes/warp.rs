@@ -700,7 +700,7 @@ fn a_fetch_of_a_card_copy_reads_after_the_compute_queue_writes_it() {
     // SAFETY: plain creation.
     let fetch_fence: ID3D12Fence = unsafe { h.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.expect("a fence");
     let mut book = Book::default();
-    let mut expected = Vec::new();
+    let mut expected: Vec<u32> = Vec::new();
     for round in 1..=rounds {
         let value = round as u32 * 5 + 2;
         let slow = round % 3 != 0;

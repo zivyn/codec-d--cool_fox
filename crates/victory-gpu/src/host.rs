@@ -2971,7 +2971,7 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
 }
 
 /// Whether a submission's steps are prepared with the leaner bookkeeping
-/// (`VICTORY_LEAN_STEPS=1`; off by default): the tables it makes by copy
+/// (on unless `VICTORY_LEAN_STEPS=0`): the tables it makes by copy
 /// are the thread's kept ones ([`scratch`]), the list of what its steps do
 /// (`card_steps::does_of`) leaves out the 21,000 refreshes the plan never
 /// looks at, a refresh that comes behind another of the same copy does not
@@ -2987,11 +2987,11 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
 /// asked, and how many holds are taken differ.
 fn lean_steps() -> bool {
     // (May change while the title runs, `VICTORY_AB`: each use reads it once, and a submission's tables and lists are its own.)
-    crate::ab::live_flag!("VICTORY_LEAN_STEPS")
+    crate::ab::live_value!("VICTORY_LEAN_STEPS", bool, crate::ab::unless_zero)
 }
 
 /// Whether what a submission does for the copies in the card's memory is made with the leaner bookkeeping
-/// (`VICTORY_LEAN_CARD=1`; off by default): the copies whose CPU side changed are found through a queue of the
+/// (on unless `VICTORY_LEAN_CARD=0`): the copies whose CPU side changed are found through a queue of the
 /// touched ones, not by a look at all 900 for each of the 28 submissions a frame (`shadow::card_dirty`); the bytes
 /// taken out of the CPU sides (44 MB a frame, in 15 submissions of under the 4 MB that went to threads, so
 /// copied by the submitting thread into memory the card reads) are copied by the threads that write the pairs,
@@ -3000,23 +3000,23 @@ fn lean_steps() -> bool {
 pub(crate) fn lean_card() -> bool {
     // (May change while the title runs, `VICTORY_AB`: each use reads it once and what it makes does not outlive
     // the submission; the queue of touched copies is kept whichever way they are found.)
-    crate::ab::live_flag!("VICTORY_LEAN_CARD")
+    crate::ab::live_value!("VICTORY_LEAN_CARD", bool, crate::ab::unless_zero)
 }
 
 /// Whether the submitting thread leaves the landed lists (reset, their upload memory and descriptor slots given back)
 /// to the thread that settles flights, which does it when it is asked to ([`late_helper`]), and not at the end of each
-/// submission it sends (`VICTORY_LAND_ASIDE=1`; off by default): 1.4 ms a frame of the submitting thread's.
+/// submission it sends (on unless `VICTORY_LAND_ASIDE=0`): 1.4 ms a frame of the submitting thread's.
 ///
 /// What the lists hold is let go a moment later, and what is let go goes to the next list that asks for it, which
 /// takes new memory when there is none: every call of `land` takes what is due when it is made (`bury_lag` behind).
 fn land_aside() -> bool {
     // (May change while the title runs, `VICTORY_AB`: each submission takes the answer once, and either way every
     // list landed is given back by the next `land`, whoever makes it.)
-    crate::ab::live_flag!("VICTORY_LAND_ASIDE")
+    crate::ab::live_value!("VICTORY_LAND_ASIDE", bool, crate::ab::unless_zero)
 }
 
 /// Whether the snapshots of the ranges shaders may write are copied by the kept threads while the submitting thread
-/// goes on, and waited for before the lists go to the card (`VICTORY_SNAP_ASIDE=1`; off by default): the 3.5 ms a
+/// goes on, and waited for before the lists go to the card (on unless `VICTORY_SNAP_ASIDE=0`): the 3.5 ms a
 /// frame of the "snapshots" stage ([`crate::shadow::take_snapshots_aside`] says why the bytes stay as they are).
 ///
 /// The wait ([`crate::shadow::snapshots_wait`]) comes after what the thread does next ("copies in the card's
@@ -3026,7 +3026,7 @@ fn land_aside() -> bool {
 fn snap_aside() -> bool {
     // (May change while the title runs, `VICTORY_AB`: each submission takes the answer once, and a submission that
     // gave snapshots away waits for them before it sends, whatever the switch says by then.)
-    crate::ab::live_flag!("VICTORY_SNAP_ASIDE")
+    crate::ab::live_value!("VICTORY_SNAP_ASIDE", bool, crate::ab::unless_zero)
 }
 
 /// Whether anything is in the air.

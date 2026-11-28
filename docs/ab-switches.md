@@ -118,10 +118,35 @@ shots of the run (both arms are in every shot; the arm is in the `A/B second` li
 | `VICTORY_FOLD_VIEWS` (extends `VICTORY_INDIRECT_FOLD`; the programs must have been translated with `VICTORY_VIEW_INDEX=1` or `VICTORY_FOLD_VIEWS=1` in the environment: that is read once by the translator and is part of the shader cache's key, so name this switch in the A/B with `VICTORY_VIEW_INDEX=1` set for both arms) | `draw::fold::State::fold_step`, once per run, at its head (`views_on`, kept in `Run::views`) | what the programs do is the same in both arms: they read the title's root SRVs through the view heap slot the host puts in a dword of the user data (the same one-view slot, with the same size, that a root descriptor table pointed at before); the switch only decides whether those views are part of what a run needs the same (`fold_views`): off, a changed view ends the run as the table did; on, it is one more dword that differs, set by the command. A run keeps what it began with, so flipping inside a stream is safe | `varying_marks_the_dwords_that_differ_from_the_head`, `ranges_are_the_dwords_that_differ`, `warp_folded_executions_with_changing_views` |
 | `VICTORY_ASYNC_COMPUTE` | `queue::timelines::on`, at each use (`signal`, `wait`, `value_wait`, `begin`, `end`, `line`; needs the submit line, `VICTORY_ASYNC_SUBMIT`/THIN) | stage 1 only numbers the line's submissions on two lanes (graphics, compute) and resolves the title's fence and memory-value waits to submissions of the other lane; the host queue gets two lane fences, a signal after each submission and a wait only for a number whose signal is already queued on the same queue (met by its order, never a hang); nothing is submitted anywhere else, so the card sees the same work in the same order; a switch that comes on mid-run finds unresolved waits (counted, never waited for), one that goes off leaves two fences and counters that nothing reads | `a_fence_wait_names_the_submission_the_signal_came_after`, `the_first_signal_that_reaches_the_value_is_the_one`, `a_value_wait_names_the_submission_that_wrote_what_it_accepts`, `what_a_lane_finishes_out_of_order_is_retired_in_order`, `a_host_wait_is_made_only_for_a_signal_that_is_queued`, `dependencies_only_name_submissions_that_exist`, WARP `a_compute_queue_goes_on_when_the_graphics_queue_signals_its_number`, `on_one_queue_a_wait_for_an_earlier_signal_is_met_at_once` |
 
-A switch that is **on** in the code (`VICTORY_RESIDENT_BATCH`, `MAKE_ASIDE`, `PIPELINE_PRIORITY`, `LEVELS_RETRY`, and the ones of
+A switch that is **on** in the code (`VICTORY_RESIDENT_BATCH`, `MAKE_ASIDE`, `PIPELINE_PRIORITY`, `LEVELS_RETRY`, the seven of the lane listed below, and the ones of
 `crates/victory-gpu/src/defaults.rs`) is named with its off value, `VICTORY_AB=10,VICTORY_MAKE_ASIDE=0`: its A phases are the unset
 variable (on), its B phases the `=0` (off). Read B minus A with `bin\ab-verdict.py --b off`.
 | `VICTORY_PAGE_REFRESH` (`=1` shadow, `=2` driven; name it with its value, `=2`) | `pagedrive::mode`, at each look (`Shadow::nothing_new`), refresh (`update_free`, `copy_stale`) and look under flights' ranges (`stale_under_writes`, `merge_under_writes`) | the copies' ledgers (`pagedrive::Ledger`: the pages noted written since the copy took them, told by `Journal::note` in the same step and by the other views of the page's physical page) are kept from the start whenever the variable is named (in the environment or in `VICTORY_AB`), so a flip finds them exact; only what reads them changes. `=1`: the walk of the journal decides and the ledger is asked beside it, counting `looks`/pages `MISSED` (a page the journal calls stale and the ledger lacks: must be 0) and `extra`; `=2`: the ledger decides which pages are stale and whether a look finds nothing new, and the journal is asked only whether its asking covers the range, never walked (the answer of a look and the pages of a refresh are the same by the invariant of `pagedrive`; a ledger that holds more than the journal calls stale is looked at again and cleared). Entries are removed only under the copy's `copied` lock by a refresh that took the page under an asking at least as new, so a flip between two decisions of one refresh cannot lose a page | `a_ledger_holds_every_page_the_journal_calls_stale_through_creation_retirement_and_aliases`, `a_note_newer_than_the_refresh_stays_and_an_older_one_goes`, `notes_reach_only_the_copies_that_cover_the_page`, `notes_are_in_the_ledger_when_the_drain_of_the_thread_that_made_them_returns`, `a_refresh_driven_by_the_ledger_ends_as_the_walk_does_and_the_check_misses_nothing`, `what_the_title_wrote_under_a_flights_range_waits_in_the_ledger_for_the_flight_to_land` |
+
+## Switches of the lane that are on by default
+
+Seven switches of the submitting thread's lane are **on** in the code since 2026-11-28 (integ/validation-19), by rule 14.
+Each is named with its off value in `VICTORY_AB` (`VICTORY_AB=10,VICTORY_LEAN_STEPS=0`: A is the unset variable, on; B is `=0`,
+off; read B minus A with `binb-verdict.py --b off`), and `=0` turns it off in a plain run. The table above describes what
+each does (the rows still say "off" where they speak of the unset variable of the time they were written).
+
+Evidence: the pilot's ALL-LANE bundle of all seven on against all seven off, in two processes on the RTX 4060 (window spot):
+-4.11 +-0.85 and -3.79 +-0.92 ms a frame (B minus A, 95 % interval), a win in 2 of 2, with `KEEP_CHECK` stale 0 in all
+211 lines (no byte of a copy was older than the title's).
+
+| switch | default | since |
+|---|---|---|
+| `VICTORY_LEAN_STEPS` | **on** (`=0` is off) | 2026-11-28 |
+| `VICTORY_CLOSED_IDLE` | **on** (`=0` is off) | 2026-11-28 |
+| `VICTORY_LAND_ASIDE` | **on** (`=0` is off) | 2026-11-28 |
+| `VICTORY_LEAN_CARD` | **on** (`=0` is off) | 2026-11-28 |
+| `VICTORY_SNAP_ASIDE` | **on** (`=0` is off) | 2026-11-28 |
+| `VICTORY_ASK_ASIDE` | **on** (`=0` is off) | 2026-11-28 |
+| `VICTORY_ASK_MERGE` | **on** (`=0` is off) | 2026-11-28 |
+
+The others from the same branches (`VICTORY_ONE_PASS`, `VICTORY_UNDER_TRY`, `VICTORY_WAIT_ORDER`, `VICTORY_PRECISE_*`,
+`VICTORY_JOIN_WAITS`, `VICTORY_FOLD_VIEWS`, `VICTORY_VIEW_INDEX`, `VICTORY_ASYNC_COMPUTE`, `VICTORY_QUIET_COMPARE`,
+`VICTORY_CAPTURE_BUFFER_WORDS`, the page-refresh modes) stay off until they have a win of their own.
 
 ## Translation-time switches that are on by default
 

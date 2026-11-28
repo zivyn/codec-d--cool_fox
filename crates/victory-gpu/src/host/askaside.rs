@@ -1,5 +1,5 @@
 //! The write watch asked about a submission's ranges on a thread of ours while the submitting thread plans, waits for
-//! flights and sweeps (`VICTORY_ASK_ASIDE=1`; off by default).
+//! flights and sweeps (on unless `VICTORY_ASK_ASIDE=0`).
 //!
 //! A submission sent ahead begins with the steps it hands to the card (`card_steps`, 6 to 8 ms a frame, 2 to 4 ms in
 //! each of the few submissions that have any), the wait for the flights it reads from and the once-a-second sweep,
@@ -30,7 +30,7 @@ use super::*;
 /// (`VICTORY_ASK_ASIDE` may change while the title runs, `VICTORY_AB`: a submission reads it once, offers or not, and
 /// joins what it offered; the asking that results is the one a submission makes either way.)
 pub(super) fn on() -> bool {
-    crate::ab::live_flag!("VICTORY_ASK_ASIDE")
+    crate::ab::live_value!("VICTORY_ASK_ASIDE", bool, crate::ab::unless_zero)
 }
 
 /// What is offered to the thread and whether it is at it.

@@ -272,7 +272,7 @@ fn pools() -> bool {
 }
 
 /// Whether a list that has run is closed after its reset when it is put away
-/// (`VICTORY_CLOSED_IDLE=1`; off by default).
+/// (on unless `VICTORY_CLOSED_IDLE=0`).
 ///
 /// A submission takes the host side of each of its lists (about 215 a frame)
 /// and gives the title's list a new one, closed, for the title's reset to
@@ -286,7 +286,7 @@ fn pools() -> bool {
 fn closed_idle() -> bool {
     // (May change while the title runs, `VICTORY_AB`: each list says whether it is closed, and
     // whoever takes one makes it as it wants it.)
-    crate::ab::live_flag!("VICTORY_CLOSED_IDLE")
+    crate::ab::live_value!("VICTORY_CLOSED_IDLE", bool, crate::ab::unless_zero)
 }
 
 /// Takes from `idle` the last that is closed (`want`) or open, else the last

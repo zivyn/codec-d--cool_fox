@@ -690,7 +690,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     ask_rest(ranges);
 }
 
-/// Whether [`ask_once`] asks in one pass (`VICTORY_ASK_MERGE=1`; off by default): the ranges sorted once, joined by
+/// Whether [`ask_once`] asks in one pass (on unless `VICTORY_ASK_MERGE=0`): the ranges sorted once, joined by
 /// the gap ([`ask_gap`]) into runs, every run asked (a range that lies alone as well, which [`ask_rest`] asks one
 /// by one after [`ask_ahead`] has left it), under one hold of the ranges and one number. What it notes in the
 /// journal and what it leaves standing are what the two parts leave, with fewer holds, filters and looks at the
@@ -699,7 +699,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// (May change while the title runs, `VICTORY_AB`: each asking takes the answer once, and an asking leaves the same
 /// kind of thing standing either way.)
 fn merged() -> bool {
-    crate::ab::live_flag!("VICTORY_ASK_MERGE")
+    crate::ab::live_value!("VICTORY_ASK_MERGE", bool, crate::ab::unless_zero)
 }
 
 /// With the asking that stands ([`ask_once`], made before) kept, asks about the `ranges` that it does not hold, and

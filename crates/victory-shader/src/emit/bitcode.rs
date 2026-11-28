@@ -235,6 +235,11 @@ pub(crate) struct Module {
     /// Values the two host waves of a console wave agree on by an exchange
     /// ([`Module::mark_together`]).
     together: std::collections::HashSet<u32>,
+    /// Values the two host waves of one console wave agree on, though other console waves of the
+    /// group may not ([`Module::mark_paired`]), and the blocks where they wait for each other
+    /// ([`Module::mark_wait`]).
+    paired: std::collections::HashSet<u32>,
+    waits: Vec<usize>,
 }
 
 impl Module {

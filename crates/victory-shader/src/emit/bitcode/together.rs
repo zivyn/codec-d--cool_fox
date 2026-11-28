@@ -44,6 +44,9 @@ pub(crate) struct Finding {
 pub(crate) struct Audit {
     /// The barriers that wait for the group.
     pub barriers: usize,
+    /// The waits of the two host waves of a console wave for each other, by counters of their own
+    /// ([`Module::mark_wait`]); they are audited for the two halves, not for the group.
+    pub waits: usize,
     /// The loops with such a barrier in them, and how deep they nest (a loop that runs to its
     /// limit costs the limit's number of barriers; in a loop in a loop, its square).
     pub loops: usize,
@@ -70,8 +73,9 @@ impl Audit {
             parts.join(",")
         };
         format!(
-            "barriers={} loops={} nest={} differs={} [{}] loaded={} [{}]",
+            "barriers={} waits={} loops={} nest={} differs={} [{}] loaded={} [{}]",
             self.barriers,
+            self.waits,
             self.loops,
             self.nest,
             self.differs.len(),
@@ -131,6 +135,19 @@ impl Module {
         }
     }
 
+    /// Marks `v` as the same in the two host waves of a console wave (what they read after a
+    /// meeting), though not in the other console waves of the group.
+    pub fn mark_paired(&mut self, v: V) {
+        if let V::Inst(i) = v {
+            self.paired.insert(i);
+        }
+    }
+
+    /// Marks block `b` as a wait of the two host waves of a console wave for each other.
+    pub fn mark_wait(&mut self, b: usize) {
+        self.waits.push(b);
+    }
+
     /// The names of the functions a call of `f` goes to.
     fn func_name(&self, f: u32) -> &str {
         &self.funcs[f as usize].name
@@ -139,6 +156,24 @@ impl Module {
     /// The group barriers of the module and where they stand against the branches that can
     /// keep threads of the group from them.
     pub(crate) fn audit_barriers(&self) -> Audit {
+        let mut audit = self.audit_with(false);
+        if !self.waits.is_empty() {
+            let pair = self.audit_with(true);
+            audit.waits = pair.barriers;
+            let tell = |f: Finding| Finding { why: format!("(pair wait) {}", f.why), ..f };
+            audit.differs.extend(pair.differs.into_iter().map(tell));
+            audit.loaded.extend(pair.loaded.into_iter().map(tell));
+            audit.loops = audit.loops.max(pair.loops);
+            audit.nest = audit.nest.max(pair.nest);
+        }
+        audit
+    }
+
+    /// The audit of the barriers that wait for the group (`pair` false), or of the waits of the
+    /// two host waves of a console wave for each other (what the halves read after a meeting is
+    /// then alike, as it is in one console wave).
+    fn audit_with(&self, pair: bool) -> Audit {
+        let same = |i: u32| self.together.contains(&i) || pair && self.paired.contains(&i);
         let n = self.blocks.len();
         let mut audit = Audit::default();
         // the blocks reached from the entry, and their predecessors
@@ -158,15 +193,19 @@ impl Module {
                 }
             }
         }
-        // the barriers that wait for the group (mode bit 0)
+        // the barriers that wait for the group (mode bit 0), or the waits of the pairs
         let mut sync: Vec<usize> = Vec::new();
-        for (b, blk) in self.blocks.iter().enumerate().filter(|(b, _)| seen[*b]) {
-            for &i in &blk.body {
-                if let Op::Call(f, args) = &self.insts[i as usize].op
-                    && self.func_name(*f) == "dx.op.barrier"
-                    && args.get(1).and_then(|&m| self.int_value(m)).is_some_and(|m| m & 1 != 0)
-                {
-                    sync.push(b);
+        if pair {
+            sync.extend(self.waits.iter().copied().filter(|&b| seen[b]));
+        } else {
+            for (b, blk) in self.blocks.iter().enumerate().filter(|(b, _)| seen[*b]) {
+                for &i in &blk.body {
+                    if let Op::Call(f, args) = &self.insts[i as usize].op
+                        && self.func_name(*f) == "dx.op.barrier"
+                        && args.get(1).and_then(|&m| self.int_value(m)).is_some_and(|m| m & 1 != 0)
+                    {
+                        sync.push(b);
+                    }
                 }
             }
         }
@@ -251,7 +290,7 @@ impl Module {
                 let blk = &self.blocks[b];
                 for &i in blk.phis.iter().chain(&blk.body) {
                     let inst = &self.insts[i as usize];
-                    let mut l = if self.together.contains(&i) {
+                    let mut l = if same(i) {
                         Level::Same
                     } else {
                         match &inst.op {
@@ -288,7 +327,7 @@ impl Module {
                         }
                     };
                     // a value made inside a loop some threads left earlier than others
-                    if matches!(inst.op, Op::Phi(_)) || !self.together.contains(&i) {
+                    if matches!(inst.op, Op::Phi(_)) || !same(i) {
                         for (k, body) in loops.iter().enumerate() {
                             if body[b] {
                                 if loop_differs[k][0] {
@@ -362,7 +401,7 @@ impl Module {
                 if !reg[b] {
                     continue;
                 }
-                let why = self.root_cause(&level, d);
+                let why = self.root_cause(&level, d, &same);
                 let finding = Finding { barrier: b, branch: d, why };
                 if branch_level[d] == Level::Differs {
                     audit.differs.push(finding);
@@ -382,7 +421,7 @@ impl Module {
     }
 
     /// What makes the condition of block `d`'s branch differ (a short name).
-    fn root_cause(&self, level: &[Level], d: usize) -> String {
+    fn root_cause(&self, level: &[Level], d: usize, same: &dyn Fn(u32) -> bool) -> String {
         let Some(Term::CondBr(c, ..)) = self.blocks[d].term else { return "?".into() };
         let mut v = c;
         let mut guard = 0;
@@ -411,7 +450,7 @@ impl Module {
             let next = operands
                 .iter()
                 .copied()
-                .find(|&o| matches!(o, V::Inst(j) if level[j as usize] == at && !self.together.contains(&j)));
+                .find(|&o| matches!(o, V::Inst(j) if level[j as usize] == at && !same(j)));
             match next {
                 Some(o) if guard < 200 => v = o,
                 _ => {

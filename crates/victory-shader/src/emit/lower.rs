@@ -4867,6 +4867,7 @@ impl<'a> Lower<'a> {
         for b in self.block.iter_mut().filter(|b| **b == Some(at)) {
             *b = Some(head);
         }
+        self.s.m.mark_wait(head);
         let wait = self.s.m.new_block();
         self.s.m.terminate(head, Term::Br(wait));
         // (an atomic: the read is made every time round, and sees the other wave's store)
@@ -4962,6 +4963,9 @@ impl<'a> Lower<'a> {
             self.s.m.mark_together(lo);
             self.s.m.mark_together(hi);
         }
+        // (in a group of several console waves, the two halves of one agree)
+        self.s.m.mark_paired(lo);
+        self.s.m.mark_paired(hi);
         if !self.lean {
             // the slots are written again only after every thread read them
             self.meet(at);

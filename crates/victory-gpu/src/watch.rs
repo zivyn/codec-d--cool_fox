@@ -203,14 +203,22 @@ fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
     use std::sync::atomic::Ordering::Relaxed;
     let began = std::time::Instant::now();
     let got = f();
+    let ns = began.elapsed().as_nanos() as u64;
     WAITS[what][0].fetch_add(1, Relaxed);
-    WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    WAITS[what][1].fetch_add(ns, Relaxed);
+    crate::host::waits::note(waited_for(what), ns);
     got
 }
 
 #[cfg(not(feature = "diagnostics"))]
-fn waited<T>(_: usize, f: impl FnOnce() -> T) -> T {
-    f()
+fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
+    crate::host::waits::timed(waited_for(what), f)
+}
+
+/// What the lane waits for when a wait of `what` (the numbers of [`WAITS`]) is its own.
+fn waited_for(what: usize) -> crate::host::waits::Wait {
+    use crate::host::waits::Wait;
+    [Wait::Hold, Wait::Journal, Wait::Journal, Wait::Guards][what]
 }
 
 /// Since the last line: the protection changes of guarding (calls, nanoseconds,

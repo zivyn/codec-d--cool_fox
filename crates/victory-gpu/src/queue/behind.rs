@@ -158,9 +158,26 @@ pub(super) fn pipeline_prepare() -> bool {
         return true;
     }
     // (May change while the title runs, `VICTORY_AB`: what it asks of the item at hand is read once, and the refreshes
-    // begun stay joined, `crate::host::prefetch::join`.)
-    crate::ab::live_flag!("VICTORY_PIPELINE_PREPARE")
+    // begun stay joined, `crate::host::prefetch::join`.) Stage A is the same thread, begun earlier.
+    let asked = crate::ab::live_flag!("VICTORY_PIPELINE_PREPARE");
+    asked || stage_a()
 }
+
+/// Whether the next submission's refreshes are offered before the steps of the one being prepared, for the copies it
+/// does nothing to (`VICTORY_STAGE_A=1`; off by default; it takes the refreshes of [`pipeline_prepare`] with it):
+/// see `crate::host::prefetch`.
+pub(super) fn stage_a() -> bool {
+    #[cfg(test)]
+    if FORCE_STAGE_A.load(Relaxed) {
+        return true;
+    }
+    // (May change while the title runs, `VICTORY_AB`: read once for an item at hand, and what was offered stays joined.)
+    crate::ab::live_flag!("VICTORY_STAGE_A")
+}
+
+/// Tests: stage A's question answers yes.
+#[cfg(test)]
+static FORCE_STAGE_A: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tests: the pipeline's questions answer yes.
 #[cfg(test)]

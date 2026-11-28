@@ -474,6 +474,13 @@ pub(crate) fn pipeline_prepare() -> bool {
     behind::pipeline_prepare() && behind::on()
 }
 
+/// Whether the next submission's refreshes are offered before the steps of the one being prepared
+/// (`VICTORY_STAGE_A=1`), for the copies it does nothing to.
+#[cfg(windows)]
+pub(crate) fn stage_a() -> bool {
+    behind::stage_a() && behind::on()
+}
+
 /// The host lists (addresses) of the submission that comes next after the one
 /// our thread is preparing, asked once ([`behind`]).
 #[cfg(windows)]

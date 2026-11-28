@@ -6454,6 +6454,12 @@ impl Host {
         // what they write.
         // Or the reads are done on the card, behind the flights.
         let own = if late { self.card_steps(runs) } else { None };
+        // The next submission's refreshes of the copies this one does nothing to begin on the thread of
+        // `prefetch` now, beside what this one does up to its snapshots (`VICTORY_STAGE_A=1`); they are over
+        // at `join_early`, before anything of this submission's that the card sees.
+        if late {
+            prefetch::offer_early(runs, own.as_ref().map(|own| own.list()));
+        }
         // A round of the heaps' records asked for as the submission came into
         // the line (`VICTORY_HEAPS_EARLY`), unless it has to wait for flights.
         let mut early = if late { crate::queue::heaps_round() } else { 0 };
@@ -6652,6 +6658,8 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         split.part(3);
+        stage.next("submit: waiting for the refreshes begun before the steps");
+        prefetch::join_early();
         stage.next("submit: copies in the card's memory");
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may

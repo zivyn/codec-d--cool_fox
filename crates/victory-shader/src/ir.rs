@@ -1860,6 +1860,36 @@ mod tests {
         TEST_KEEP_LOOP_SKIPS.set(None);
     }
 
+    /// The early-out of a wave with no lane left (`s_cbranch_execz` to the end of the program)
+    /// over a loop: with `VICTORY_KEEP_LOOP_SKIPS` on a wave with no lane must not walk the loop
+    /// (it runs to its limit when its exit reads a lane that is off, as the table walk does).
+    /// `without_skips` takes the `ends(taken)` way out before it asks `loops_in`, and
+    /// `without_early_outs` never asks, so both drop this skip.
+    #[test]
+    fn an_early_out_over_a_loop_is_kept_when_asked() {
+        let mut w = vec![
+            0x7D88_0000,                      // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A,                      // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0000 | LOOP.len() as u32,  // s_cbranch_execz to the end
+        ];
+        w.extend_from_slice(&LOOP);
+        w.push(S_ENDPGM);
+        let p = build_words(&w, true);
+        assert_eq!(skips(&p), 1);
+        TEST_KEEP_LOOP_SKIPS.set(Some(true));
+        let by_skips = without_skips(&p, true);
+        let by_early_outs = without_early_outs(&p);
+        TEST_KEEP_LOOP_SKIPS.set(None);
+        assert!(
+            by_skips.as_ref().is_none_or(|q| skips(q) == 1),
+            "without_skips dropped the early-out over a loop"
+        );
+        assert!(
+            by_early_outs.as_ref().is_none_or(|q| skips(q) == 1),
+            "without_early_outs dropped the early-out over a loop"
+        );
+    }
+
     #[test]
     fn joins_get_phis_only_where_values_differ() {
         let code = [

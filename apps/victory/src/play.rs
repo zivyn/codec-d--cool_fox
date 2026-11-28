@@ -868,7 +868,10 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
     // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
     // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
+    // Only with DLSS Frame Generation ready or on: its swap chain (Streamline's) is what held
+    // a first run at 14 fps (#515, #574); without it a first run plays at full speed.
     if !s.contains_key("VICTORY_WARMUP_RESTART")
+        && s.get("VICTORY_FRAMEGEN").is_some_and(|v| v == "1")
         && let Some(mark) = warmup_mark(&home, &program)
         && !mark.exists()
     {

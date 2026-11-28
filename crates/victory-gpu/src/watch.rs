@@ -4970,6 +4970,25 @@ mod tests {
         }
     }
 
+    /// This thread owns the memory of `spans` (address, bytes) until it is dropped: no fault of it opens a block
+    /// beside its own in any other ([`lean::OWN_IN_TEST`]).
+    pub(super) struct OwnFor;
+
+    impl OwnFor {
+        pub(super) fn set(spans: &[(usize, usize)]) -> OwnFor {
+            lean::OWN_IN_TEST.with(|own| {
+                *own.borrow_mut() = spans.iter().map(|&(at, len)| (at / BLOCK, (at + len).div_ceil(BLOCK))).collect();
+            });
+            OwnFor
+        }
+    }
+
+    impl Drop for OwnFor {
+        fn drop(&mut self) {
+            lean::OWN_IN_TEST.with(|own| own.borrow_mut().clear());
+        }
+    }
+
     /// The pages, of those written, that a check was not told of.
     fn missed(told: &[usize], wrote: &[usize]) -> Vec<usize> {
         wrote.iter().copied().filter(|page| !told.contains(page)).collect()
@@ -4984,6 +5003,7 @@ mod tests {
         const BLOCKS: usize = 16;
         let _lean = LeanFor::set(4, 0, false);
         let (section, guarded, other) = two_views(BLOCKS * BLOCK);
+        let _own = OwnFor::set(&[(guarded, BLOCKS * BLOCK), (other, BLOCKS * BLOCK)]);
         let page = |block: usize| guarded / PAGE + block;
         let end = guarded + BLOCKS * BLOCK;
         assert_eq!(guard(guarded, end), Some((0..BLOCKS).map(page).collect()));
@@ -5025,6 +5045,33 @@ mod tests {
         unsafe { ((guarded + 14 * BLOCK + 8) as *mut u64).write_volatile(4) };
         let told = guard(guarded, end).expect("a view");
         assert_eq!(missed(&told, &[page(14)]), [page(14)], "a write nobody was told of is found missing");
+        drop_views(section, &[guarded, other], BLOCKS * BLOCK);
+    }
+
+    /// A fault opens beside its block only blocks of memory its thread owns, in a test (what lies next to a view
+    /// is another test's, with its own locks): hot and read-only as they are, the blocks past the owned ones stay
+    /// as they are, and the ones within are opened.
+    #[test]
+    fn a_fault_opens_no_hot_block_past_the_memory_its_thread_owns() {
+        const BLOCKS: usize = 8;
+        let _lean = LeanFor::set(8, 0, false);
+        let (section, guarded, other) = two_views(BLOCKS * BLOCK);
+        let end = guarded + BLOCKS * BLOCK;
+        // Blocks 0 to 3 are this test's; 4 to 7 are "another test's", lying next to them.
+        let _own = OwnFor::set(&[(guarded, 4 * BLOCK), (other, BLOCKS * BLOCK)]);
+        assert_eq!(guard(guarded, end).map(|pages| pages.len()), Some(BLOCKS));
+        let frame = crate::frame::current();
+        for block in 0..BLOCKS {
+            lean::faulted(guarded / BLOCK + block, frame);
+        }
+        let open_in = |view: usize| (0..BLOCKS).filter(|&b| writable(view + b * BLOCK)).collect::<Vec<_>>();
+        assert!(open_in(guarded).is_empty());
+        // SAFETY: a view of ours, read-write once the handler has opened it.
+        unsafe { ((guarded + 2 * BLOCK + 8) as *mut u64).write_volatile(1) };
+        assert_eq!(open_in(guarded), [0, 1, 2, 3], "its own hot blocks, and none of those past them");
+        // SAFETY: as above; a fault in the foreign part opens that block alone.
+        unsafe { ((guarded + 5 * BLOCK + 8) as *mut u64).write_volatile(3) };
+        assert_eq!(open_in(guarded), [0, 1, 2, 3, 5], "a block in the foreign part opens alone");
         drop_views(section, &[guarded, other], BLOCKS * BLOCK);
     }
 
@@ -5982,6 +6029,8 @@ mod many_askers_tests {
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
                     super::lean::LEAN_IN_TEST.set(lean);
+                    // (Only the views of this test: the blocks beside them are other tests', under other locks.)
+                    super::lean::OWN_IN_TEST.with(|own| *own.borrow_mut() = all.iter().map(|&at| (at / PAGE, at / PAGE + PAGES)).collect());
                     let mut last = [0u64; VIEWS];
                     for round in 0..300usize {
                         tune(mode, round);
@@ -6015,6 +6064,8 @@ mod many_askers_tests {
                 s.spawn(move || {
                     super::REST_IN_TEST.set(rest);
                     super::lean::LEAN_IN_TEST.set(lean);
+                    // (Only the views of this test: the blocks beside them are other tests', under other locks.)
+                    super::lean::OWN_IN_TEST.with(|own| *own.borrow_mut() = all.iter().map(|&at| (at / PAGE, at / PAGE + PAGES)).collect());
                     let mut last = [[0u64; PAGES]; VIEWS];
                     let mut seed = t as u64 * 7919 + 1;
                     let mut next = |n: usize| {

@@ -53,6 +53,34 @@ thread_local! {
     pub(crate) static LEAN_IN_TEST: Cell<Lean> = const { Cell::new(Lean::OFF) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The memory (block ranges, past the last) a test's threads own: a fault opens beside its block only blocks of
+    /// these (none given: any). The tests of the guards run side by side in one process, their views lie next to each
+    /// other, each thread works in its own mode of the guards (stripes, the one lock) and the block bits are
+    /// global: a fault that opened the hot blocks beside its own, in another test's view, would do so under locks that
+    /// test's threads do not hold, and race with them (a block made read-only and noted, or opened, by both: noted
+    /// guarded and clean while writable, so that the title's writes are not told). In the title all threads share
+    /// one mode (changed only through the gate), so there the blocks beside are always under the same locks.
+    pub(crate) static OWN_IN_TEST: std::cell::RefCell<Vec<(usize, usize)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether a fault may open `block` beside its own (in a test: only memory the test owns).
+fn may_open(block: usize) -> bool {
+    #[cfg(test)]
+    {
+        OWN_IN_TEST.with(|own| {
+            let own = own.borrow();
+            own.is_empty() || own.iter().any(|&(first, past)| (first..past).contains(&block))
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = block;
+        true
+    }
+}
+
 /// `VICTORY_FAULT_AROUND`: the most blocks a fault opens (0: one).
 pub(super) fn around() -> usize {
     #[cfg(test)]
@@ -214,11 +242,11 @@ pub(super) fn plan(block: usize, frame: u64) -> (usize, usize) {
     }
     let mut extra = n - 1;
     let (mut first, mut past) = (block, block + 1);
-    while extra > 0 && super::PROTECTED.any(past, past + 1) && hot(past, frame) {
+    while extra > 0 && may_open(past) && super::PROTECTED.any(past, past + 1) && hot(past, frame) {
         past += 1;
         extra -= 1;
     }
-    while extra > 0 && first > 0 && super::PROTECTED.any(first - 1, first) && hot(first - 1, frame)
+    while extra > 0 && first > 0 && may_open(first - 1) && super::PROTECTED.any(first - 1, first) && hot(first - 1, frame)
     {
         first -= 1;
         extra -= 1;

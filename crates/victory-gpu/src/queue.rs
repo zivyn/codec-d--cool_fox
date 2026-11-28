@@ -497,6 +497,14 @@ pub(crate) fn prefold_next() -> Option<(u64, Vec<usize>, Vec<usize>)> {
     behind::prefold()
 }
 
+/// While our thread does an entry and the first of the line has been named by [`prefold_next`]: the host lists
+/// (addresses, in order) of the entry after it of the same queue, if it is a submission whose lists are known
+/// (`VICTORY_STAGE_A_DEEP`). It stays in the line, at its place.
+#[cfg(windows)]
+pub(crate) fn deeper_next() -> Option<Vec<usize>> {
+    behind::deeper()
+}
+
 /// The host lists (addresses) of the submission that comes next after the one
 /// our thread is preparing, asked once ([`behind`]).
 #[cfg(windows)]

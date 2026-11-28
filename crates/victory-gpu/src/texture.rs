@@ -902,7 +902,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // again if it detiles (the next list then uploads once more).
     {
         let staging = staging.clone();
-        list.defer_host(move || {
+        list.defer_host(crate::host::relax::Kind::UploadNoted, move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
         });
@@ -911,7 +911,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // that show that one are made again once this upload has run.
     if staging.first == staging.level0 && copy.grown.swap(false, Relaxed) {
         let start = staging.memory as u64;
-        list.defer_host(move || crate::descriptor::host::levels_changed_after(start));
+        list.defer_host(crate::host::relax::Kind::LevelsChanged, move || crate::descriptor::host::levels_changed_after(start));
     }
     let noted = staging.clone();
     // Levels on demand (`crate::tiles`): after the check below, in the
@@ -928,11 +928,11 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
         // Once per submission however many of its lists sample the texture.
         list.defer_texture(staging);
         // Then what the list's copy puts in the host copy is known.
-        list.defer_host(move || noted.note_held());
+        list.defer_host(crate::host::relax::Kind::HeldNoted, move || noted.note_held());
         return;
     };
     list.defer_texture(staging.clone());
-    list.defer_host(move || {
+    list.defer_host(crate::host::relax::Kind::TilesGiven, move || {
         let waiting = on_demand.uploaded(staging.detiled.load(Relaxed), staging.memory as u64);
         staging.waiting_cap.store(waiting.unwrap_or(0), Relaxed);
         staging.waiting.store(if waiting.is_some() { crate::host::moment().max(1) } else { 0 }, Relaxed);
@@ -1210,7 +1210,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
         fresh: fresh & !unzeroed,
         ran: std::sync::atomic::AtomicBool::new(false),
     };
-    list.defer_host(move || {
+    list.defer_host(crate::host::relax::Kind::TilesClaimed, move || {
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
     });

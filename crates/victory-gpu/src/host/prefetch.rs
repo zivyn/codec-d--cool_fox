@@ -162,7 +162,7 @@ thread_local! {
 /// refresh (no next submission known, or its copies are being given to the
 /// sends), refreshes done, their spans, bytes asked, microseconds the thread
 /// worked, and microseconds the next preparing waited for it.
-static STATS: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+static STATS: [std::sync::atomic::AtomicU64; 19] = [const { std::sync::atomic::AtomicU64::new(0) }; 19];
 const OFFERED: usize = 0;
 const NOTHING: usize = 1;
 const DONE: usize = 2;
@@ -180,6 +180,14 @@ const EARLY_KEPT: usize = 10;
 const EARLY_VETO: usize = 11;
 const EARLY_WAITED: usize = 12;
 const EARLY_WORKED: usize = 13;
+/// Offers of the entry after the next ([`offer_deep`], `VICTORY_STAGE_A_DEEP`) made, spans given in them, spans kept back
+/// (a step of the submission being prepared is at their copy), offers not made because a step of ours may write
+/// anywhere, and offers refused (the gate was not free).
+const DEEP: usize = 14;
+const DEEP_SPANS: usize = 15;
+const DEEP_KEPT: usize = 16;
+const DEEP_VETO: usize = 17;
+const DEEP_REFUSED: usize = 18;
 
 /// The spans of the refreshes of the lists at `lists` (host lists, as the
 /// addresses the line gave), as [`Batch::refresh_front`] makes them for one
@@ -346,6 +354,65 @@ pub(super) fn offer_early(runs: &[&HostList], own: Option<&HostList>) -> bool {
     }
     PLAN.with(|p| *p.borrow_mut() = Some(left));
     offered
+}
+
+/// The thread of stage A, once it has the number of the submission whose lists are `runs`: offers the refreshes of the
+/// entry after it (`next`: its host lists, as the addresses the line gave) that touch no copy this submission does
+/// something to ([`InUse`]), to the thread of the refreshes, beside this submission's asking, refreshing and steps
+/// (`VICTORY_STAGE_A_DEEP=1`). Whether any was offered.
+///
+/// Ownership is as for [`offer_early`], one entry deeper: a host copy is in one stage's hands at a time.
+///
+/// - What this submission refreshes, declares written or places on, and the title memory its steps write, is not
+///   given (the copies named in [`InUse`]): the thread of stage A is the only one to touch those until the lane's take
+///   of this submission, and the lane's take is behind [`join`], which waits for this offer's work too (the lane joins
+///   the thread of stage A first, so an offer made while it worked is there to be waited for).
+/// - A step of ours that may write anywhere ends the askings that stand and the offer is not made ([`InUse::unknown`]).
+/// - The refreshes are those of the early offer (a standing asking beside the thread's own, `Batch::update`): they
+///   leave alone what flights in the air declared written, the previous submission's own among them (it is registered
+///   before stage A of this one is offered), and what the title writes while they run has a higher number than what
+///   they read, so the asking of the entry's own preparing, which comes later, finds it.
+/// - What the take of this submission sends is taken after the join, so a copy refreshed here for the entry after it
+///   holds, at that take, bytes of title memory newer than the submission's: only copies no list of this submission
+///   refreshes (so none of its lists reads them through the card's copy as of its own frame, `InUse`).
+///
+/// # Safety (of the addresses)
+///
+/// `next` names host lists of an entry of the line, which only the thread of submissions takes out of it, and it does
+/// not before this submission has been taken by it, after [`join`] and the thread of stage A being done.
+pub(super) fn offer_deep(runs: &[&HostList], next: &[usize]) -> bool {
+    if !early_on() {
+        return false;
+    }
+    // SAFETY: as above.
+    let spans = unsafe { spans_of(next, &[]) };
+    if spans.is_empty() {
+        return false;
+    }
+    let used = InUse::of(runs);
+    if used.unknown {
+        STATS[DEEP_VETO].fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let (now, later) = split_spans(spans, &used);
+    STATS[DEEP_KEPT].fetch_add(later.len() as u64, Ordering::Relaxed);
+    if now.is_empty() {
+        return false;
+    }
+    start();
+    OFFERED_EVER.store(true, Ordering::Release);
+    let count = now.len() as u64;
+    match GATE.offer((true, now)) {
+        Ok(()) => {
+            STATS[DEEP].fetch_add(1, Ordering::Relaxed);
+            STATS[DEEP_SPANS].fetch_add(count, Ordering::Relaxed);
+            true
+        }
+        Err(_) => {
+            STATS[DEEP_REFUSED].fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
 }
 
 /// Before the lane declares what its shaders write, and takes what goes up to the card: what was
@@ -515,6 +582,18 @@ pub(super) fn line(frames: f64) {
         s[WAITED] / 1000.0 / frames,
         (s[WORKED] - s[WAITED]).max(0.0) / 1000.0 / frames
     );
+    if super::relax::deep() {
+        tracing::info!(
+            "stage A, the refreshes of the entry after the next begun beside the next's steps (VICTORY_STAGE_A_DEEP), per frame: {:.1} offered with {:.1} spans, {:.1} spans kept back (a step of the next submission is at their copy), {:.2} not offered because a step of ours may write anywhere, {:.2} refused (the thread was not free); the thread worked {:.1} ms in all on early offers, the lane waited {:.1} ms for it at the join",
+            s[DEEP] / frames,
+            s[DEEP_SPANS] / frames,
+            s[DEEP_KEPT] / frames,
+            s[DEEP_VETO] / frames,
+            s[DEEP_REFUSED] / frames,
+            s[EARLY_WORKED] / 1000.0 / frames,
+            s[WAITED] / 1000.0 / frames
+        );
+    }
     if crate::queue::stage_a() {
         tracing::info!(
             "stage A, the refreshes begun before the steps (VICTORY_STAGE_A), per frame: {:.1} offered with {:.1} spans, {:.1} spans kept for \
@@ -843,6 +922,230 @@ mod copy_tests {
         }
     }
 
+    /// STAGE3: the stress above with the steps stage A's thread may now do (`VICTORY_STAGE_A_RELAX`) and the entry after
+    /// the next refreshed beside the next's steps (`VICTORY_STAGE_A_DEEP`). Two entries a round, E1 and E2: each has
+    /// refreshes, a title buffer copy, a declaration, `Host` steps of every kind (some of them kinds nothing lets
+    /// through), movie planes and now and then a `Run`; the bits are drawn each round. What `relax::Seen` lets through
+    /// is done by a thread (the thread of stage A) while E2's untouched copies are refreshed beside it by a second
+    /// (the deep offer, `split_spans` of E1's `InUse`); what it does not is done by the lane. Then the lane's take, the
+    /// rest of E2's spans to the thread, E2's own steps, E2's take, the landing of both, and the next preparing's own
+    /// refresh, with the title's other threads writing all through: every byte the card holds and every byte of every
+    /// CPU side is the title's, every step ran once and the steps of E1 before those of E2, the lists prepared are the
+    /// lists run. 500 rounds.
+    #[test]
+    fn relaxed_steps_and_the_deep_offer_leave_no_stale_byte_and_run_every_step_once_in_order() {
+        use super::{InUse, split_spans};
+        use crate::host::Step;
+        use crate::host::relax::{self, Class, Kind};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        const COPIES: usize = 6;
+
+        // What a thread does for an entry's steps (the model of `Batch::run_deferred`: in order, the title buffer copy noted
+        // to the journal while the asking stands, a declaration, a closure that logs where it ran).
+        enum M {
+            Refresh(Arc<Shadow>, usize),
+            Copy(usize, u8),
+            Declare(Arc<Shadow>, usize),
+            Host(usize, usize),
+            Run(usize, u8),
+        }
+        type Log = Arc<Mutex<Vec<(usize, usize, usize)>>>;
+        fn do_steps(steps: Vec<M>, bases: Vec<usize>, log: Log, round: usize) -> Vec<(Arc<Shadow>, (usize, usize))> {
+            let ranges: Vec<(usize, usize)> = bases.iter().map(|&at| (at, at + N * PAGE)).collect();
+            let standing = crate::watch::ask_standing(&ranges, None);
+            let mut declared = Vec::new();
+            for step in steps {
+                match step {
+                    M::Refresh(shadow, at) => refresh(&shadow, at, &[(0, N * PAGE)]),
+                    M::Copy(dst, value) => {
+                        for i in (0..PAGE).step_by(64) {
+                            write(dst, i + 3, value);
+                        }
+                        crate::watch::wrote(dst, PAGE);
+                    }
+                    M::Declare(shadow, at) => {
+                        shadow.writing(at, PAGE);
+                        declared.push((shadow, (at, at + PAGE)));
+                    }
+                    M::Host(entry, idx) => log.lock().unwrap().push((round, entry, idx)),
+                    M::Run(at, value) => {
+                        // Writes title memory where nobody was told, and ends every asking that stands.
+                        write(at, 7, value);
+                        crate::watch::end_standing_all();
+                        crate::watch::ask_once_end();
+                    }
+                }
+            }
+            crate::watch::end_standing(standing);
+            declared
+        }
+
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let mut copies: Vec<Held> = (0..COPIES).map(|_| Held::new()).collect();
+        let mut seed = 0x5eed_0003_dee9_1234u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for c in copies.iter_mut() {
+            refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+            c.take();
+        }
+        let soft = [Kind::SlotFlip, Kind::LevelsChanged, Kind::BudgetNotes, Kind::UploadNoted, Kind::HeldNoted, Kind::Diagnostics, Kind::RectVertices];
+        let hard = [Kind::TilesGiven, Kind::TilesClaimed, Kind::MemoryLanded];
+        let log: Log = Arc::default();
+        let (mut by_thread, mut by_lane, mut deep_spans, mut kept_spans) = (0usize, 0usize, 0usize, 0usize);
+        for round in 0..500 {
+            // The title writes for both entries.
+            for _ in 0..(next() % 8) {
+                let c = (next() % COPIES as u64) as usize;
+                write(copies[c].at, (next() % (N * PAGE) as u64) as usize, (next() % 255) as u8 + 1);
+            }
+            let bits = (next() % 8) as u32;
+            let mut real: [Vec<Step>; 2] = [Vec::new(), Vec::new()];
+            let mut model: [Vec<M>; 2] = [Vec::new(), Vec::new()];
+            let mut expected: Vec<(usize, usize, usize)> = Vec::new();
+            for e in 0..2 {
+                let mut hosts = 0usize;
+                for c in 0..COPIES {
+                    if next() % 3 == 0 {
+                        real[e].push(Step::Refresh(copies[c].shadow.clone(), copies[c].at, N * PAGE));
+                        model[e].push(M::Refresh(copies[c].shadow.clone(), copies[c].at));
+                    }
+                }
+                if next() % 3 == 0 {
+                    let c = (next() % COPIES as u64) as usize;
+                    let at = copies[c].at + (next() % N as u64) as usize * PAGE;
+                    real[e].push(Step::Copy(at, at, PAGE));
+                    model[e].push(M::Copy(at, (round % 200) as u8 + 1));
+                }
+                if next() % 3 == 0 {
+                    let c = (next() % COPIES as u64) as usize;
+                    let at = copies[c].at + (next() % N as u64) as usize * PAGE;
+                    real[e].push(Step::GpuWrite(copies[c].shadow.clone(), at, PAGE));
+                    model[e].push(M::Declare(copies[c].shadow.clone(), at));
+                }
+                for _ in 0..(next() % 4) {
+                    let kind = if next() % 6 == 0 { hard[(next() % 3) as usize] } else { soft[(next() % 7) as usize] };
+                    let range = if kind == Kind::RectVertices { (0x4000_0000, 0x4000_0100) } else { (0, 0) };
+                    real[e].push(Step::Host(Box::new(|| {}), range, kind));
+                    model[e].push(M::Host(e, hosts));
+                    expected.push((round, e, hosts));
+                    hosts += 1;
+                }
+                if next() % 8 == 0 {
+                    real[e].push(Step::Plane((0x5000_0000, 64), Box::new(|| {})));
+                    model[e].push(M::Host(e, hosts));
+                    expected.push((round, e, hosts));
+                    hosts += 1;
+                }
+                if next() % 14 == 0 {
+                    let c = (next() % COPIES as u64) as usize;
+                    real[e].push(Step::Run(Box::new(|| {})));
+                    model[e].push(M::Run(copies[c].at + (next() % N as u64) as usize * PAGE, (round % 200) as u8 + 1));
+                }
+            }
+            // E1: what the thread may do of it, by the bits of the round. (Judged twice, the second time from the kinds.)
+            let mut seen = relax::Seen::default();
+            seen.steps(real[0].iter());
+            let never = real[0].iter().any(|s| match s {
+                Step::Run(_) => true,
+                Step::Host(_, _, kind) => matches!(kind.class(), Class::Unproven(_)),
+                _ => false,
+            });
+            assert_eq!(seen.hard.is_some(), never, "round {round}: the scan and the kinds agree on what is never done");
+            let accepted = seen.hard.is_none() && seen.need & !bits == 0;
+            // The lists prepared are the lists run: the thread's and the lane's ids of E1's lists, in order and parts.
+            let ids: Vec<usize> = (0..3).map(|i| round * 16 + i).collect();
+            assert!(crate::host::front::same_lists(&ids, &[2], &ids, &[2]));
+            assert!(!crate::host::front::same_lists(&ids, &[2], &ids[..2], &[2]), "E2's lists are not E1's");
+            // E2's spans: a span of each copy.
+            let spans: super::Spans = (0..COPIES)
+                .map(|c| {
+                    let from = (next() % N as u64) as usize;
+                    let to = (from + 1 + (next() % 6) as usize).min(N);
+                    (copies[c].shadow.clone(), copies[c].at + from * PAGE, copies[c].at + to * PAGE)
+                })
+                .collect();
+            let mut used = InUse::default();
+            let mut written = Vec::new();
+            used.note_all(real[0].iter(), &mut written);
+            let used = used.finish(written);
+            let (now, later) = if used.unknown { (Vec::new(), spans) } else { split_spans(spans, &used) };
+            for (shadow, from, to) in &now {
+                assert!(used.leaves(shadow, *from, *to), "round {round}: a span of a copy E1 does something to was given away");
+            }
+            (deep_spans, kept_spans) = (deep_spans + now.len(), kept_spans + later.len());
+            let stop = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let stop = stop.clone();
+                let targets: Vec<usize> = copies.iter().map(|c| c.at).collect();
+                let mut s = next() | 1;
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        s ^= s << 13;
+                        s ^= s >> 7;
+                        s ^= s << 17;
+                        write(targets[(s % COPIES as u64) as usize], ((s >> 8) % (N * PAGE) as u64) as usize, (s >> 40) as u8 | 1);
+                        std::thread::yield_now();
+                    }
+                })
+            };
+            let bases: Vec<usize> = copies.iter().map(|c| c.at).collect();
+            let first = std::mem::take(&mut model[0]);
+            let second = std::mem::take(&mut model[1]);
+            // E1 on the thread or on the lane, with E2's free spans refreshed beside it as the deep offer (or, with the
+            // lane, the early offer) does.
+            let beside = std::thread::spawn(move || super::run(now));
+            let mut declared = if accepted {
+                by_thread += 1;
+                let (bases, log) = (bases.clone(), log.clone());
+                std::thread::spawn(move || do_steps(first, bases, log, round)).join().unwrap()
+            } else {
+                by_lane += 1;
+                do_steps(first, bases.clone(), log.clone(), round)
+            };
+            // The lane joins both before it takes (the thread of stage A first, then the thread of the refreshes).
+            beside.join().unwrap();
+            for c in copies.iter_mut() {
+                c.take();
+            }
+            // After the take: the rest of E2's spans to the thread (joined before E2's own preparing asks or refreshes),
+            // and E2's own preparing.
+            std::thread::spawn(move || super::run(later)).join().unwrap();
+            declared.extend(do_steps(second, bases, log.clone(), round));
+            for c in copies.iter_mut() {
+                c.take();
+            }
+            // Both flights land before the next preparing refreshes the copies again.
+            for (shadow, range) in &declared {
+                shadow.copy_back_done(&[*range]);
+            }
+            stop.store(true, Ordering::Relaxed);
+            writer.join().unwrap();
+            for c in copies.iter_mut() {
+                refresh(&c.shadow, c.at, &[(0, N * PAGE)]);
+                c.take();
+            }
+            for (i, c) in copies.iter().enumerate() {
+                assert!(c.card == c.title(), "round {round}: a byte of copy {i} that the card holds is not the title's");
+                assert!(c.side() == c.title(), "round {round}: a byte of copy {i}'s CPU side is not the title's");
+            }
+            // Every step ran once, E1's before E2's.
+            assert_eq!(*log.lock().unwrap(), expected, "round {round}: steps run once each, in the order of the entries");
+            log.lock().unwrap().clear();
+        }
+        assert!(by_thread > 40 && by_lane > 40, "both paths were taken: {by_thread} on the thread, {by_lane} on the lane");
+        assert!(deep_spans > 0 && kept_spans > 0, "the deep offer had both kinds of span: {deep_spans} given, {kept_spans} kept");
+        for c in &copies {
+            // SAFETY: ours.
+            unsafe { VirtualFree(c.at as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
     /// A range the submission declares written is left alone by the thread that is given the copy after the take,
     /// until the flight has landed, whichever of the two stages refreshes it.
     #[test]
@@ -967,7 +1270,7 @@ mod tests {
             Step::GpuWrite(b.clone(), 0x2000_0000, 4096),
             Step::Copy(0x3000_2000, 0x9000_0000, 4096),
             Step::Fill(0x5000_0000, 0x4000_0000, 4096, None),
-            Step::Host(Box::new(|| {}), (0x4000_0000, 0x4000_1000)),
+            Step::Host(Box::new(|| {}), (0x4000_0000, 0x4000_1000), crate::host::relax::Kind::RectVertices),
         ]);
         assert!(!used.unknown);
         assert!(!used.leaves(&a, 0x1000_8000, 0x1000_9000), "named by a refresh: the whole copy");

@@ -3464,7 +3464,7 @@ impl State {
                 use windows::core::Interface;
                 let raw = texture.as_raw() as usize;
                 let asked = crate::host::submissions();
-                list.defer_host(move || {
+                list.defer_host(crate::host::relax::Kind::Diagnostics, move || {
                     let (started, finished) = crate::host::submissions();
                     crate::book::note(raw, || {
                         format!(
@@ -4566,7 +4566,7 @@ impl State {
             };
             let (from, to, stride) = (from as usize, to as usize, stride as usize);
             let n = rects as usize;
-            list.defer_host_read(from, n * 3 * stride, move || {
+            list.defer_host_read(crate::host::relax::Kind::RectVertices, from, n * 3 * stride, move || {
                 // The vertices are read through the kernel, at submission; in
                 // place only if that fails, with no change of mapping under
                 // the read (see `crate::watch::title_memory_reading`): while

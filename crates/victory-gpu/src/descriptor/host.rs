@@ -2563,7 +2563,7 @@ impl HostHeap {
             }
         }
         let guard = PendingGuard(id);
-        list.defer_host(move || {
+        list.defer_host(crate::host::relax::Kind::SlotFlip, move || {
             // Call a `&self` method so Rust 2021+ moves the whole `guard`
             // into this closure rather than copying `guard.0` and dropping
             // `guard` immediately at the end of `flip()`.

@@ -59,8 +59,22 @@
 //!    sent, the line's first entry is not the next one (the second half is on the stack): nothing is
 //!    offered then ([`split_pending`]), or the lists the thread prepared would not be those that come next.
 //!
+//! 8. **What more it may do (`VICTORY_STAGE_A_RELAX`, [`relax`]).** Point 4 is the default: steps that run closures
+//!    decline the submission. Each kind of `Host` step says what it is ([`relax::Kind`]) and what it does to what
+//!    others read; the ones that only note something for later (with the submission's number, which the thread takes
+//!    before its steps), read title memory into the list's own scratch, or fill a movie plane, are let through by a
+//!    bit each; the ones that call the host queue or write what the send of the submission before reads, and
+//!    `Step::Run`, never are. Bits 8 and 16 make the thread wait, at most 150 ms in all and before any step, for the flights
+//!    the submission reads from or whose declared bytes it must refresh, where the thread of submissions would have
+//!    planned the reads for the card or waited: a wait that is not over gives the submission back, as before. Every
+//!    decline names what it needs ([`Declined`]), and the frame line counts by need and by kind of step.
+//! 9. **The entry after the next (`VICTORY_STAGE_A_DEEP`).** With the next submission's number taken the thread offers
+//!    the refreshes of the entry after it (named by the lane when it offered the next: [`crate::queue::deeper_next`])
+//!    to the thread of the refreshes, for the copies the next submission does nothing to (`prefetch::offer_deep`).
+//!    The lane joins this thread first and the other second, before it takes anything of the next submission.
+//!
 //! What is not done on the thread: the snapshots, the declarations of picked ranges, the
-//! take (they are stage B), and the submissions that wait for flights.
+//! take (they are stage B), and the submissions that wait for flights unless a bit says wait.
 
 use super::*;
 
@@ -82,10 +96,13 @@ pub(super) struct Front {
     placed: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, Vec<u8>)>,
 }
 
-/// What the thread is asked: the lists (addresses, in order) and where their parts begin.
+/// What the thread is asked: the lists (addresses, in order) and where their parts begin, and with
+/// `VICTORY_STAGE_A_DEEP` the lists of the entry after this one, if it is a submission of the same queue
+/// whose lists are known.
 struct Asked {
     lists: Vec<usize>,
     parts: Vec<usize>,
+    deeper: Option<Vec<usize>>,
 }
 
 static GATE: prefetch::Gate<Asked> = prefetch::Gate::new();
@@ -171,39 +188,76 @@ thread_local! {
 
 /// Since the last frame-rate line: offers, submissions done, those declined (and why), the microseconds the thread
 /// worked, the thread of submissions waited at [`join`], and the submissions it took the work of.
-static STATS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static STATS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 const OFFERS: usize = 0;
 const DONE_OK: usize = 1;
 const DECLINED: usize = 2;
 const WORKED: usize = 3;
 const WAITED: usize = 4;
 const TAKEN: usize = 5;
-static WHY: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+/// Waits for flights on the thread (`VICTORY_STAGE_A_RELAX` bits 8 and 16): done, given up on, the microseconds
+/// waited, and the offers that had steps the bits let through (counted done or not).
+const WAITS_OK: usize = 6;
+const WAITS_GAVE_UP: usize = 7;
+const WAITS_US: usize = 8;
+const RELAXED: usize = 9;
+/// Offers given to the thread with the entry after the next named (`VICTORY_STAGE_A_DEEP`), and those that named none.
+const DEEP_ASKED: usize = 10;
+const DEEP_NONE: usize = 11;
+static WHY: Mutex<Vec<(String, u64)>> = Mutex::new(Vec::new());
+/// Declined offers by what they would have needed of `VICTORY_STAGE_A_RELAX` (bits) and by kind of step.
+static NEEDS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
+static KINDS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
-fn declined(why: &'static str) {
-    STATS[DECLINED].fetch_add(1, Ordering::Relaxed);
-    let mut all = WHY.lock().unwrap_or_else(|e| e.into_inner());
-    match all.iter_mut().find(|w| w.0 == why) {
-        Some(w) => w.1 += 1,
-        None => all.push((why, 1)),
+/// Why the thread gave a submission back before any step was done, and what of `VICTORY_STAGE_A_RELAX` it would have
+/// needed besides (what was found out before the decision: not all of it is always looked at).
+pub(super) struct Declined {
+    why: String,
+    need: u32,
+    kinds: Vec<&'static str>,
+}
+
+impl From<&'static str> for Declined {
+    fn from(why: &'static str) -> Declined {
+        Declined { why: why.to_string(), need: 0, kinds: Vec::new() }
     }
 }
 
-/// Whether the steps of `lists` are of the kinds the thread may do ([`self`]'s fourth point).
-fn steps_ok<'a>(steps: impl Iterator<Item = &'a Step>) -> Result<(), &'static str> {
-    for step in steps {
-        match step {
-            Step::Run(_) => return Err("a step of ours that may write anywhere"),
-            Step::Host(..) | Step::Plane(..) => return Err("a step of ours that works on other threads' state"),
-            Step::Copy(..) | Step::Fill(..) | Step::Refresh(..) | Step::GpuWrite(..) | Step::Texture(_) | Step::Placed(_) => {}
+fn declined(why: Declined) {
+    STATS[DECLINED].fetch_add(1, Ordering::Relaxed);
+    {
+        let mut all = WHY.lock().unwrap_or_else(|e| e.into_inner());
+        match all.iter_mut().find(|w| w.0 == why.why) {
+            Some(w) => w.1 += 1,
+            None => all.push((why.why, 1)),
         }
     }
-    Ok(())
+    if why.need != 0 {
+        let mut all = NEEDS.lock().unwrap_or_else(|e| e.into_inner());
+        match all.iter_mut().find(|n| n.0 == why.need) {
+            Some(n) => n.1 += 1,
+            None => all.push((why.need, 1)),
+        }
+    }
+    if !why.kinds.is_empty() {
+        let mut all = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+        for kind in why.kinds {
+            match all.iter_mut().find(|k| k.0 == kind) {
+                Some(k) => k.1 += 1,
+                None => all.push((kind, 1)),
+            }
+        }
+    }
 }
 
 /// Whether what `front` was prepared for is the lists at `runs` (addresses), in order, with the same parts.
 fn same(front: &Front, runs: &[usize], parts: &[usize]) -> bool {
-    front.parts == parts && front.lists == runs
+    same_lists(&front.lists, &front.parts, runs, parts)
+}
+
+/// [`same`] for the lists and parts themselves.
+pub(super) fn same_lists(prepared: &[usize], prepared_parts: &[usize], runs: &[usize], parts: &[usize]) -> bool {
+    prepared_parts == parts && prepared == runs
 }
 
 /// After the submission being prepared has taken what goes up to the card and put its places into the copies:
@@ -219,11 +273,16 @@ pub(super) fn offer() -> bool {
     if lists.is_empty() {
         return false;
     }
+    // (The entry after the next, named now: when the thread runs, the line may have moved on.)
+    let deeper = if relax::deep() { crate::queue::deeper_next() } else { None };
+    if relax::deep() {
+        STATS[if deeper.is_some() { DEEP_ASKED } else { DEEP_NONE }].fetch_add(1, Ordering::Relaxed);
+    }
     start();
     OFFERED_EVER.store(true, Ordering::Release);
     LANE.with(|l| l.set(true));
     HOLD.set(true);
-    match GATE.offer(Asked { lists, parts }) {
+    match GATE.offer(Asked { lists, parts, deeper }) {
         Ok(()) => {
             STATS[OFFERS].fetch_add(1, Ordering::Relaxed);
             true
@@ -323,7 +382,7 @@ fn start() {
                 let _span = crate::timeline::span("stage A of the next submission");
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match host() {
                     Some(host) => host.front(&asked),
-                    None => Err("no host"),
+                    None => Err("no host".into()),
                 }));
                 match result {
                     Ok(Ok(front)) => {
@@ -356,39 +415,87 @@ impl Host {
     /// Stage A of the submission whose lists are `asked`, on the thread of stage A: the same as the first half of
     /// [`Host::submit`] makes of a submission that waits for nothing ([`self`]'s third and fourth points), or a
     /// reason why it is not done, given before any step is.
-    fn front(&self, asked: &Asked) -> Result<Front, &'static str> {
+    fn front(&self, asked: &Asked) -> Result<Front, Declined> {
         // SAFETY: the entry is the first of the line and nothing takes it, or changes what it holds, before the
         // thread of submissions has called [`join`] (`Host::execute_parts` begins with it): the host lists do not move.
         let runs: Vec<&HostList> = asked.lists.iter().map(|&at| unsafe { &*(at as *const HostList) }).collect();
+        // What it may do beyond the first version: read once, and what is decided is for this submission alone.
+        let bits = relax::bits();
+        let mut seen = relax::Seen::default();
         for list in &runs {
-            steps_ok(list.deferred().copies.iter())?;
+            seen.steps(list.deferred().copies.iter());
+        }
+        if let Some(why) = seen.hard {
+            return Err(Declined { why: format!("a step that no bit lets through: {why}"), need: 0, kinds: Vec::new() });
         }
         if !late() || !relay_exact() || !pending_flights() {
-            return Err("the relay is not on as this needs");
+            return Err("the relay is not on as this needs".into());
         }
         if !refresh_front() {
-            return Err("refreshes are not made ahead of the steps");
+            return Err("refreshes are not made ahead of the steps".into());
         }
         if split_blocked() != 0 {
-            return Err("submissions are cut where they wait");
+            return Err("submissions are cut where they wait".into());
         }
         if upcheck::on() {
-            return Err("the check of copies runs between submissions");
+            return Err("the check of copies runs between submissions".into());
         }
         // Behind flights, as the thread of submissions would find it (no sweep, no settle).
         if !flying() {
-            return Err("nothing in the air: the thread of submissions sweeps");
+            return Err("nothing in the air: the thread of submissions sweeps".into());
         }
         if late_free_present() {
-            return Err("the present's own sweep");
+            return Err("the present's own sweep".into());
         }
         if card_steps::cut_for(&runs).is_some() {
-            return Err("the submission is cut for places");
+            return Err("the submission is cut for places".into());
         }
+        // Flights that write what it reads: the thread of submissions plans the reads for the card or waits for them.
+        let mut need = seen.need;
+        let mut waits: Option<&'static str> = None;
         {
-            let written = line().written.clone();
-            if blocked_by(&written, &runs, false).is_some() || late_blocked_counted(&runs, false).is_some() {
-                return Err("it waits for flights it reads from");
+            let (written, copies) = {
+                let line = line();
+                (line.written.clone(), card_steps::copies(&line))
+            };
+            if !written.is_empty() && (blocked_by(&written, &runs, false).is_some() || card_steps::copied_read(&copies, &runs)) {
+                waits = Some(relax::what_waits(&written, &copies, &runs));
+                need |= relax::WAIT_READS;
+            }
+        }
+        // (All its waits for flights together are bounded: the threads that wait for a number are held back for 200 ms.)
+        let waiting = std::time::Instant::now();
+        let left = || relax::TOTAL_WAIT.saturating_sub(waiting.elapsed());
+        let missing = need & !bits;
+        if missing != 0 {
+            let why = match waits {
+                Some(what) if missing == relax::WAIT_READS => format!("it waits for flights it reads from: {what}"),
+                _ => {
+                    let what = waits.map(|w| format!(" (flights: {w})")).unwrap_or_default();
+                    format!("it needs these of VICTORY_STAGE_A_RELAX: {}{what}", relax::describe(missing))
+                }
+            };
+            return Err(Declined { why, need, kinds: seen.kinds });
+        }
+        if need & !relax::WAIT_READS != 0 {
+            STATS[RELAXED].fetch_add(1, Ordering::Relaxed);
+        }
+        if waits.is_some() {
+            // Landed, as `relay_wait` for the reads does in the thread of submissions (it takes no lock of ours).
+            let began = std::time::Instant::now();
+            let landed = relax::wait_flights(
+                |line| blocked_by(&line.written, &runs, false).is_none() && !card_steps::copied_read(&card_steps::copies(line), &runs),
+                left(),
+            );
+            STATS[WAITS_US].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+            if !landed {
+                STATS[WAITS_GAVE_UP].fetch_add(1, Ordering::Relaxed);
+                return Err(Declined { why: "flights it reads from did not land in time".into(), need, kinds: seen.kinds });
+            }
+            STATS[WAITS_OK].fetch_add(1, Ordering::Relaxed);
+            // (The line moved while it waited.)
+            if !flying() {
+                return Err("nothing in the air after the wait: the thread of submissions sweeps".into());
             }
         }
         let mut batch = Batch::new(lean_steps());
@@ -399,15 +506,54 @@ impl Host {
             Some(standing) => crate::watch::end_standing(standing),
             None => crate::watch::ask_once_end(),
         };
-        // What the title wrote under flights' writes that cannot be put in beside them waits for them (the thread
-        // of submissions settles): not here.
-        if !stale_under_flights(&runs).is_empty() {
-            end(&mut asking);
-            return Err("title bytes under flights' writes wait for them");
+        // What the title wrote under flights' writes that cannot be put in beside them waits for them: the thread of
+        // submissions settles, or with bit 16 the thread waits for the flights that declared them, as `settle_stale`
+        // does (three times at most: what is left after that waits as before).
+        let mut stale = stale_under_flights(&runs);
+        if !stale.is_empty() {
+            need |= relax::WAIT_STALE;
+            if bits & relax::WAIT_STALE == 0 || card_steps::stage() == 0 {
+                end(&mut asking);
+                let why = if bits & relax::WAIT_STALE == 0 {
+                    "title bytes under flights' writes wait for them (VICTORY_STAGE_A_RELAX bit 16)"
+                } else {
+                    "title bytes under flights' writes wait for them (the card's steps are off)"
+                };
+                return Err(Declined { why: why.into(), need, kinds: seen.kinds });
+            }
+            for _ in 0..3 {
+                let began = std::time::Instant::now();
+                let landed = relax::wait_flights(
+                    |_| stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to)),
+                    left(),
+                );
+                STATS[WAITS_US].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if !landed {
+                    break;
+                }
+                // What they landed is title memory written: asked and looked at again.
+                ask_for_submission(&ranges, &mut asking);
+                stale = stale_under_flights(&runs);
+                if stale.is_empty() {
+                    break;
+                }
+            }
+            if !stale.is_empty() {
+                STATS[WAITS_GAVE_UP].fetch_add(1, Ordering::Relaxed);
+                end(&mut asking);
+                return Err(Declined { why: "title bytes under flights' writes were still there after waiting".into(), need, kinds: seen.kinds });
+            }
+            STATS[WAITS_OK].fetch_add(1, Ordering::Relaxed);
         }
         // Nothing is declined from here on: the submission has its number, and its steps are done.
         let number = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         crate::shadow::preparing(number);
+        // The entry after this one has the refreshes of the copies this submission does nothing to begun now, beside
+        // this one's asking, refreshes and steps (`VICTORY_STAGE_A_DEEP`): the lane joins them before it asks, refreshes or
+        // takes anything for this submission, and so no copy is in two stages' hands.
+        if let Some(next) = &asked.deeper {
+            prefetch::offer_deep(&runs, next);
+        }
         let air = line().written.clone();
         batch.refresh_front(&runs, &asked.parts);
         for list in &runs {
@@ -423,7 +569,9 @@ impl Host {
 /// For the frame-rate line.
 pub(super) fn frame_line(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64).collect();
-    let why: Vec<(&'static str, u64)> = std::mem::take(&mut *WHY.lock().unwrap_or_else(|e| e.into_inner()));
+    let why: Vec<(String, u64)> = std::mem::take(&mut *WHY.lock().unwrap_or_else(|e| e.into_inner()));
+    let needs: Vec<(u32, u64)> = std::mem::take(&mut *NEEDS.lock().unwrap_or_else(|e| e.into_inner()));
+    let kinds: Vec<(&'static str, u64)> = std::mem::take(&mut *KINDS.lock().unwrap_or_else(|e| e.into_inner()));
     if !crate::queue::stage_front() {
         return;
     }
@@ -431,8 +579,7 @@ pub(super) fn frame_line(frames: f64) {
     why.sort_by_key(|w| std::cmp::Reverse(w.1));
     let why: Vec<String> = why.iter().map(|(text, n)| format!("{:.2} {text}", *n as f64 / frames)).collect();
     tracing::info!(
-        "stage A of the next submission beside the sending of this one (VICTORY_STAGE_A_STEPS), per frame: {:.1} asked for, {:.1} done, {:.1} taken by the \
-         thread of submissions, {:.1} declined [{}]; the thread worked {:.1} ms, the thread of submissions waited {:.1} ms for it",
+        "stage A of the next submission beside the sending of this one (VICTORY_STAGE_A_STEPS), per frame: {:.1} asked for, {:.1} done, {:.1} taken by the thread of submissions, {:.1} declined [{}]; the thread worked {:.1} ms, the thread of submissions waited {:.1} ms for it",
         s[OFFERS] / frames,
         s[DONE_OK] / frames,
         s[TAKEN] / frames,
@@ -440,6 +587,27 @@ pub(super) fn frame_line(frames: f64) {
         why.join("; "),
         s[WORKED] / 1000.0 / frames,
         s[WAITED] / 1000.0 / frames
+    );
+    // What the declines say about what to relax next: what each declined offer would have needed of
+    // VICTORY_STAGE_A_RELAX (all of it that was looked at), and the kinds of step that need a bit.
+    let mut needs = needs;
+    needs.sort_by_key(|n| std::cmp::Reverse(n.1));
+    let needs: Vec<String> = needs.iter().map(|(mask, n)| format!("{:.2} need [{}]", *n as f64 / frames, relax::describe(*mask))).collect();
+    let mut kinds = kinds;
+    kinds.sort_by_key(|k| std::cmp::Reverse(k.1));
+    let kinds: Vec<String> = kinds.iter().map(|(name, n)| format!("{:.2} {name}", *n as f64 / frames)).collect();
+    tracing::info!(
+        "stage A, what to relax next (VICTORY_STAGE_A_RELAX={}, VICTORY_STAGE_A_DEEP={}), per frame: the declined offers by what they would need {{{}}}; by kind of step they hold {{{}}}; {:.2} done with steps the bits let through; waits for flights on the thread: {:.2} done, {:.2} given up, {:.1} ms; offers with the entry after the next named {:.2}, with none {:.2}",
+        relax::bits(),
+        u8::from(relax::deep()),
+        needs.join("; "),
+        kinds.join("; "),
+        s[RELAXED] / frames,
+        s[WAITS_OK] / frames,
+        s[WAITS_GAVE_UP] / frames,
+        s[WAITS_US] / 1000.0 / frames,
+        s[DEEP_ASKED] / frames,
+        s[DEEP_NONE] / frames
     );
 }
 
@@ -450,10 +618,17 @@ mod tests {
     #[test]
     fn steps_that_run_closures_decline_the_submission() {
         let clean = [Step::Copy(8, 16, 4), Step::Fill(1, 2, 3, None)];
-        assert_eq!(steps_ok(clean.iter()), Ok(()));
-        assert!(steps_ok([Step::Run(Box::new(|| {}))].iter()).is_err());
-        assert!(steps_ok([Step::Host(Box::new(|| {}), (0, 0))].iter()).is_err());
-        assert!(steps_ok([Step::Plane((0, 4), Box::new(|| {}))].iter()).is_err());
+        let look = |steps: &[Step]| {
+            let mut seen = relax::Seen::default();
+            seen.steps(steps.iter());
+            seen
+        };
+        assert!(look(&clean).hard.is_none() && look(&clean).need == 0);
+        assert!(look(&[Step::Run(Box::new(|| {}))]).hard.is_some(), "a title copy that may write anywhere: never");
+        // Host steps that note for later and plane fills are let through by a bit each, not by default.
+        let host = Step::Host(Box::new(|| {}), (0, 0), relax::Kind::SlotFlip);
+        assert_eq!(look(std::slice::from_ref(&host)).need, relax::BOOKKEEPING);
+        assert_eq!(look(&[Step::Plane((0, 4), Box::new(|| {}))]).need, relax::PLANES);
     }
 
     /// The lists the thread prepared must be those the thread of submissions runs, in the same order and parts.

@@ -211,7 +211,7 @@ pub(super) fn copied_read<L: onepass::StepList>(copies: &[Writer], runs: &[L]) -
             Step::Refresh(shadow, at, len) => copies
                 .iter()
                 .any(|w| w.from < *at + *len && *at < w.to && w.shadow.as_ref().is_none_or(|s| !Arc::ptr_eq(s, shadow))),
-            Step::Host(_, (from, to)) => copies.iter().any(|w| w.from < *to && *from < w.to),
+            Step::Host(_, (from, to), _) => copies.iter().any(|w| w.from < *to && *from < w.to),
             Step::Plane((at, len), _) => copies.iter().any(|w| w.from < at.saturating_add(*len) && *at < w.to),
             _ => false,
         }))
@@ -559,7 +559,7 @@ pub(super) fn does_of_in<L: onepass::StepList>(
                         to: at.saturating_add(len),
                         asked: touches(written, at, at.saturating_add(len)),
                     },
-                    &Step::Host(_, (from, to)) if from < to => Does::Read { from, to, asked: false },
+                    &Step::Host(_, (from, to), _) if from < to => Does::Read { from, to, asked: false },
                     Step::Refresh(shadow, at, len) => Does::Refresh {
                         shadow: Arc::as_ptr(shadow) as usize,
                         from: *at,

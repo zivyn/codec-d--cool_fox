@@ -2356,8 +2356,8 @@ enum Step {
     /// Work that may write title memory.
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only, and the title memory it reads
-    /// (from, to; empty for none).
-    Host(Box<dyn Fn() + Send>, (usize, usize)),
+    /// (from, to; empty for none), and what the work is ([`relax::Kind`]).
+    Host(Box<dyn Fn() + Send>, (usize, usize), relax::Kind),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
     GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Brings a texture's staging buffer up to date: once per submission,
@@ -4491,6 +4491,7 @@ mod place;
 pub(crate) mod precise;
 mod prefetch;
 mod front;
+pub(crate) mod relax;
 mod scratch;
 mod send;
 mod stage;
@@ -6817,8 +6818,10 @@ impl Host {
         // everything stage A did of it (`VICTORY_STAGE_A_STEPS`): its asking, its
         // refreshes and its steps, which are not done again.
         let staged = if late {
-            prefetch::join();
+            // (The thread of stage A first: what it offered to the thread of the refreshes, beside its steps
+            // [`relax::deep`], is offered while it works, and is there to be waited for after it is done.)
             front::join();
+            prefetch::join();
             front::take(runs, parts)
         } else {
             None
@@ -8663,7 +8666,7 @@ impl HostList {
                     words.add(k).write_volatile(0);
                 }
             });
-            deferred.copies.push(Step::Host(notes, (0, 0)));
+            deferred.copies.push(Step::Host(notes, (0, 0), relax::Kind::BudgetNotes));
             drop(deferred);
             if let Some(card) = card {
                 self.zero_card_budget(card);
@@ -8884,14 +8887,17 @@ impl HostList {
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
-    pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work), (0, 0)));
+    ///
+    /// `kind` says what the work is, for what a thread other than the one that submits may do
+    /// ([`relax`], `VICTORY_STAGE_A_RELAX`).
+    pub(crate) fn defer_host(&self, kind: relax::Kind, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Host(Box::new(work), (0, 0), kind));
     }
 
     /// As [`HostList::defer_host`], for work that reads `len` bytes of title
     /// memory at `from`.
-    pub(crate) fn defer_host_read(&self, from: usize, len: usize, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Host(Box::new(work), (from, from + len)));
+    pub(crate) fn defer_host_read(&self, kind: relax::Kind, from: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Host(Box::new(work), (from, from + len), kind));
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -9043,7 +9049,7 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                     continue;
                 }
-                Step::Run(work) | Step::Host(work, _) => {
+                Step::Run(work) | Step::Host(work, ..) => {
                     batch.fill();
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();

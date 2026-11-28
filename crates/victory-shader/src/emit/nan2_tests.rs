@@ -444,6 +444,91 @@ fn level_2_reaches_the_mixed_and_packed_results_that_level_1_does_not() {
     }
 }
 
+/// What the two defaults do together: the console flushes 32-bit denormals and keeps the 16-bit
+/// ones (`0xC0`), and the translation now asks the driver for the first
+/// (`"fp32-denorm-mode"="ftz"`) while rounding 16-bit results to nearest (level 2). A driver may
+/// take the flush for its 16-bit conversions too (PTX `cvt.ftz.f16.f32` flushes a half denormal
+/// result, and `cvt.ftz.f32.f16` a half denormal input), which turns the hair simulation's small
+/// 16-bit state (below 6.1e-5) into zero where the console keeps it. Neither test above covered
+/// the pair: they ran with the flush off. Card only (WARP's answer here is not the question).
+#[test]
+fn the_flush_on_keeps_the_16_bit_denormals_the_console_keeps_on_the_card() {
+    // results: a half denormal comes out of the mixed-precision result and of the plain conversion
+    let denormal_results: Vec<([u32; 4], bool)> = [
+        (4e-8, 1.0),
+        (-4e-8, 1.0),
+        (1e-6, 1.0),
+        (3e-5, 1.0),
+        (-3e-5, 1.0),
+        (6.0e-5, 1.0),
+        (1.2e-5, 0.5),
+        (1e-4, 1.0),
+    ]
+    .into_iter()
+    .map(|(a, b)| ([bits(a), bits(b), 0, 0], false))
+    .collect();
+    let mut report = Vec::new();
+    fn cvt_want(i: [u32; 4]) -> Want {
+        Want::LowHalf(f16_rne(f(i[0])))
+    }
+    let results: [(&'static str, Vec<u32>, fn([u32; 4]) -> Want); 2] = [
+        ("mixlo", mixlo_body(), mixlo_want),
+        ("v_cvt_f16_f32", vec![vop1(0x00A, 0, vgpr(1))], cvt_want),
+    ];
+    for (name, body, want) in results {
+        let (bad, seen) = answer(
+            name,
+            150,
+            body,
+            denormal_results.clone(),
+            CARD,
+            true,
+            2,
+            want,
+        );
+        eprintln!(
+            "NAN2 {name}, flush on + level 2, half denormal results: {} of {seen} answers differ",
+            bad.len()
+        );
+        report.extend(bad);
+    }
+    // inputs: a half denormal is a normal f32 and must come through the conversion exactly
+    let denormal_inputs: Vec<([u32; 4], bool)> =
+        [0x0001u32, 0x0010, 0x01F9, 0x03FF, 0x8001, 0x83FF]
+            .into_iter()
+            .map(|h| ([h, 0, 0, 0], false))
+            .collect();
+    let (bad, seen) = answer(
+        "v_cvt_f32_f16",
+        150,
+        vec![vop1(0x00B, 0, vgpr(1))],
+        denormal_inputs,
+        CARD,
+        true,
+        2,
+        |i| {
+            let h = i[0] as u16;
+            let magnitude = f32::from(h & 0x7FFF) * f32::from_bits(0x3380_0000); // 2^-24
+            Want::Num(if h & 0x8000 != 0 {
+                -magnitude
+            } else {
+                magnitude
+            })
+        },
+    );
+    eprintln!(
+        "NAN2 v_cvt_f32_f16, flush on, half denormal inputs: {} of {seen} answers differ",
+        bad.len()
+    );
+    report.extend(bad);
+    assert!(
+        report.is_empty(),
+        "the flush of 32-bit denormals reaches the 16-bit ones on this driver (the console keeps \
+         them):\n{}",
+        report.join("\n")
+    );
+}
+
 /// The flush is a different module (an attribute on the entry), only where asked for, and the
 /// validator takes it (`build_valu_cs` runs `dxil.dll` over every program it builds).
 #[test]

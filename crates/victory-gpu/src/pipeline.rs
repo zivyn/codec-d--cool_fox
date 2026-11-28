@@ -687,16 +687,80 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The shader hashes whose draws and dispatches are left out now: the ones
+/// `VICTORY_SKIP_PIPELINES` lists, and, when `VICTORY_LIVE_FILE` names a file,
+/// the ones its `skip=<hash>,<hash>,...` lines list (the file is read again
+/// once a second, so a driver script can switch passes off and on in one
+/// process; an empty or missing file leaves the variable's list). `None`
+/// when nothing is listed, which is all one atomic load.
 #[cfg(all(windows, feature = "diagnostics"))]
-fn skipped_shader(p: &Pipeline) -> Option<&str> {
-    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
-    let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+fn skip_set() -> Option<Arc<Vec<String>>> {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::time::Instant;
+    struct Live {
+        text: String,
+        set: Arc<Vec<String>>,
+    }
+    static ENV: OnceLock<Arc<Vec<String>>> = OnceLock::new();
+    static FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    static ANY: AtomicBool = AtomicBool::new(true);
+    static NEXT_MS: AtomicU64 = AtomicU64::new(0);
+    static START: OnceLock<Instant> = OnceLock::new();
+    static LIVE: Mutex<Option<Live>> = Mutex::new(None);
+    let env = ENV.get_or_init(|| {
+        let set = Arc::new(parse_skip_hashes(&std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default()));
+        let file = std::env::var_os("VICTORY_LIVE_FILE").filter(|p| !p.is_empty()).map(std::path::PathBuf::from);
+        ANY.store(!set.is_empty() || file.is_some(), Ordering::Relaxed);
+        let _ = FILE.set(file);
+        set
     });
-    if hashes.is_empty() {
+    if !ANY.load(Ordering::Relaxed) {
         return None;
     }
+    let Some(Some(file)) = FILE.get() else {
+        return Some(env.clone());
+    };
+    let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    let due = NEXT_MS.load(Ordering::Relaxed);
+    if now >= due && NEXT_MS.compare_exchange(due, now + 1000, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if live.as_ref().is_none_or(|l| l.text != text) {
+            let set = Arc::new(live_skip_hashes(&text, env));
+            tracing::info!(
+                file = %file.display(),
+                passes = set.len(),
+                from_file = set.len() - env.len().min(set.len()),
+                "live skip list changed: the draws and dispatches of these programs are left out (VICTORY_LIVE_FILE, skip=)"
+            );
+            *live = Some(Live { text, set });
+        }
+    }
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    Some(live.as_ref().map_or_else(|| env.clone(), |l| l.set.clone())).filter(|set| !set.is_empty())
+}
+
+/// The list a live file makes: the variable's hashes, then those of every
+/// `skip=` line (other keys, comments and bad hashes are ignored).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn live_skip_hashes(text: &str, env: &[String]) -> Vec<String> {
+    let mut all = env.to_vec();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else { continue };
+        if key.trim() == "skip" {
+            for hash in parse_skip_hashes(value) {
+                if !all.contains(&hash) {
+                    all.push(hash);
+                }
+            }
+        }
+    }
+    all
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skipped_shader(p: &Pipeline) -> Option<&str> {
+    let hashes = skip_set()?;
     p.shaders
         .iter()
         .find(|shader| hashes.contains(&shader.hash))
@@ -1030,6 +1094,19 @@ mod tests {
         if std::env::var_os("VICTORY_SKIP_BVH_SKINNING").is_none() {
             assert!(super::bvh_skin_hashes().is_empty());
         }
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_live_file_adds_its_skip_lines_to_the_variable() {
+        let env = vec!["0011223344556677".to_owned()];
+        assert_eq!(super::live_skip_hashes("", &env), env);
+        assert_eq!(super::live_skip_hashes("# nothing\nambient=0\nno equals sign", &env), env);
+        // Several lines and several hashes a line; repeats and bad hashes are dropped; other keys do not matter.
+        let text = "ambient_air=0\nskip = 0123456789ABCDEF, 0011223344556677,xyz\nskip=89abcdef01234567\nskipx=aaaaaaaaaaaaaaaa\n";
+        assert_eq!(super::live_skip_hashes(text, &env), ["0011223344556677", "0123456789abcdef", "89abcdef01234567"]);
+        // A line that names none leaves nothing listed by the file.
+        assert_eq!(super::live_skip_hashes("skip=\r\n", &[]), Vec::<String>::new());
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]
